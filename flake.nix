@@ -433,15 +433,155 @@
           '';
         };
 
+        # Test-only container images with pre-cached dependencies
+        # These are kept separate from release images to prevent bloat
+        testContainers = {
+          # Use our existing ollama image as base for testing (avoids pulling external image)
+          ollama-base = ollamaImage;
+
+          # Download qwen3:0.6b model with proper reproducible hash
+          # This uses a fixed-output derivation that will be cached by hash
+          qwen3-model = pkgs.runCommand "qwen3-0.6b-model" {
+            # Fixed-output derivation for reproducible caching
+            # To get the correct hash:
+            # 1. Run `nix build .#qwen3-model` (will fail with hash mismatch)
+            # 2. Update this hash with the expected hash from error message
+            # 3. Model will then be cached reproducibly by content hash
+            outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            outputHashAlgo = "sha256";
+            outputHashMode = "recursive";
+
+            nativeBuildInputs = with pkgs; [ ollama curl cacert ];
+
+            # Add meta information for documentation
+            meta = with pkgs.lib; {
+              description = "Qwen3 0.6B language model (cached for testing)";
+              longDescription = ''
+                Pre-downloaded qwen3:0.6b model for reproducible testing.
+                This derivation downloads the model once and caches it by content hash.
+              '';
+              homepage = "https://ollama.com/library/qwen3";
+              platforms = platforms.linux;
+            };
+          } ''
+            echo "🔄 Setting up qwen3:0.6b model download (reproducible)..."
+
+            # Create output directory structure
+            mkdir -p $out/models
+
+            # Set up environment for ollama
+            export OLLAMA_MODELS=$out/models
+            export HOME=$(mktemp -d)
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+
+            # Start ollama server in isolated environment
+            echo "🚀 Starting temporary Ollama server..."
+            ollama serve > ollama.log 2>&1 &
+            OLLAMA_PID=$!
+
+            # Function to cleanup on exit
+            cleanup() {
+              echo "🧹 Cleaning up Ollama server..."
+              kill $OLLAMA_PID 2>/dev/null || true
+              wait $OLLAMA_PID 2>/dev/null || true
+            }
+            trap cleanup EXIT
+
+            # Wait for ollama to be ready
+            echo "⏳ Waiting for Ollama server..."
+            for i in {1..30}; do
+              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+                echo "✅ Ollama server ready"
+                break
+              fi
+              sleep 2
+              if [ $i -eq 30 ]; then
+                echo "❌ Ollama server failed to start"
+                cat ollama.log
+                exit 1
+              fi
+            done
+
+            # Download the model
+            echo "📥 Downloading qwen3:0.6b model (will be cached by hash)..."
+            if ! ollama pull qwen3:0.6b; then
+              echo "❌ Failed to download qwen3:0.6b"
+              cat ollama.log
+              exit 1
+            fi
+
+            # Verify download
+            if ! ollama list | grep -q "qwen3:0.6b"; then
+              echo "❌ Model verification failed"
+              ollama list
+              exit 1
+            fi
+
+            # Stop ollama (cleanup will handle this too)
+            cleanup
+
+            echo "✅ qwen3:0.6b model cached at $out/models"
+            echo "📊 Model cache contents:"
+            find $out/models -type f -exec ls -lh {} \; | head -5
+          '';
+
+          # Ollama container with qwen3:0.6b model pre-loaded (~560MB cached)
+          ollama-qwen3 = nix2containerPkgs.nix2container.buildImage {
+            name = "nanna-coder-test-ollama-qwen3";
+            tag = "latest";
+
+            # Base this on our existing ollama image
+            fromImage = ollamaImage;
+
+            copyToRoot = pkgs.buildEnv {
+              name = "ollama-qwen3-env";
+              paths = [
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+                # Copy the pre-downloaded model
+                testContainers.qwen3-model
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+            };
+
+            config = {
+              Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
+              Env = [
+                "OLLAMA_HOST=0.0.0.0"
+                "OLLAMA_PORT=11434"
+                "OLLAMA_MODELS=/models"
+                "PATH=/bin"
+              ];
+              WorkingDir = "/app";
+              ExposedPorts = {
+                "11434/tcp" = {};
+              };
+              Volumes = {
+                "/root/.ollama" = {};
+              };
+            };
+
+            # Use reproducible timestamp from flake
+            created = builtins.substring 0 8 self.lastModifiedDate;
+            maxLayers = 100;
+          };
+        };
+
       in
       {
         packages = {
           default = nanna-coder;
           inherit nanna-coder harness;
 
-          # Container images
+          # Container images (production)
           harnessImage = harnessImage;
           ollamaImage = ollamaImage;
+
+          # Test-only container images (kept separate from release)
+          inherit (testContainers) ollama-base ollama-qwen3 qwen3-model;
 
           # Configuration files
           inherit podConfig composeConfig;

@@ -30,6 +30,18 @@ jobs:
     - name: Setup Nix cache
       uses: DeterminateSystems/magic-nix-cache-action@main
 
+    - name: Pre-build test containers (cached)
+      run: |
+        echo "🔄 Building test containers for caching..."
+        # Build test containers in parallel for speed
+        nix build .#ollama-base .#qwen3-model .#ollama-qwen3 --print-build-logs
+
+        # Load test containers into podman for integration tests
+        echo "📦 Loading test containers into podman..."
+        podman load -i $(nix build .#ollama-qwen3 --print-out-paths --no-link)/image.tar
+
+        echo "✅ Test containers ready for integration tests"
+
     - name: Run tests
       run: nix develop --command cargo test --workspace --verbose
 

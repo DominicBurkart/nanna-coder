@@ -5,8 +5,8 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use ollama_rs::{
-    Ollama,
     generation::chat::{ChatMessage as OllamaChatMessage, MessageRole as OllamaRole},
+    Ollama,
 };
 use tracing::{debug, error, info};
 
