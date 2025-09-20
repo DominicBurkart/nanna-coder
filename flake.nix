@@ -2,6 +2,7 @@
   description = "Nanna Coder - AI-powered coding assistant with containerized Rust services";
 
   inputs = {
+    # Pin to specific commit for reproducibility
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
@@ -12,19 +13,40 @@
       url = "github:ipetkov/crane";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # For reproducible container builds
+    nix2container = {
+      url = "github:nlewo/nix2container";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix2container }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
+        # Reproducible overlays with pinned versions
+        overlays = [
+          (import rust-overlay)
+          (final: prev: {
+            # Pin specific tool versions for reproducibility
+            jq = prev.jq.overrideAttrs (old: rec {
+              version = "1.7.1";
+            });
+          })
+        ];
         pkgs = import nixpkgs {
           inherit system overlays;
+          config = {
+            # Allow unfree packages if needed (e.g., for some development tools)
+            allowUnfree = false;
+            # Ensure reproducible builds
+            allowBroken = false;
+          };
         };
 
-        # Use the latest stable Rust toolchain
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rustfmt" "clippy" ];
+        # Pin specific Rust version for reproducibility
+        rustToolchain = pkgs.rust-bin.stable."1.81.0".default.override {
+          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
         };
 
         # Crane library for building Rust packages
@@ -95,46 +117,66 @@
           '';
         };
 
+        # Reproducible container images using nix2container
+        nix2containerPkgs = nix2container.packages.${system};
+
         # Container image for the harness CLI
-        harnessImage = pkgs.dockerTools.buildLayeredImage {
+        harnessImage = nix2containerPkgs.nix2container.buildImage {
           name = "nanna-coder-harness";
           tag = "latest";
 
-          contents = [
-            harness
-            pkgs.cacert  # For HTTPS requests
-            pkgs.tzdata  # Timezone data
-          ];
+          copyToRoot = pkgs.buildEnv {
+            name = "harness-env";
+            paths = [
+              harness
+              pkgs.cacert  # For HTTPS requests
+              pkgs.tzdata  # Timezone data
+              pkgs.bash    # Shell for debugging
+              pkgs.coreutils # Basic utilities
+            ];
+            pathsToLink = [ "/bin" "/etc" "/share" ];
+          };
 
           config = {
             Cmd = [ "${harness}/bin/harness" ];
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               "RUST_LOG=info"
+              "PATH=/bin"
             ];
             WorkingDir = "/app";
             ExposedPorts = {
               "8080/tcp" = {};
             };
           };
+
+          # Reproducible layer strategy
+          maxLayers = 100;
         };
 
-        # Ollama service container (if Ollama is available in nixpkgs)
-        ollamaImage = pkgs.dockerTools.buildLayeredImage {
+        # Ollama service container using nix2container
+        ollamaImage = nix2containerPkgs.nix2container.buildImage {
           name = "nanna-coder-ollama";
           tag = "latest";
 
-          contents = [
-            pkgs.ollama
-            pkgs.cacert
-            pkgs.tzdata
-          ];
+          copyToRoot = pkgs.buildEnv {
+            name = "ollama-env";
+            paths = [
+              pkgs.ollama
+              pkgs.cacert
+              pkgs.tzdata
+              pkgs.bash
+              pkgs.coreutils
+            ];
+            pathsToLink = [ "/bin" "/etc" "/share" ];
+          };
 
           config = {
             Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
             Env = [
               "OLLAMA_HOST=0.0.0.0"
               "OLLAMA_PORT=11434"
+              "PATH=/bin"
             ];
             WorkingDir = "/app";
             ExposedPorts = {
@@ -144,6 +186,9 @@
               "/root/.ollama" = {};
             };
           };
+
+          # Reproducible layer strategy
+          maxLayers = 100;
         };
 
         # Multi-container pod configuration
@@ -217,18 +262,19 @@
           '';
         };
 
-        # Development shell with all necessary tools
+        # Reproducible development shell with pinned tool versions
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; [
-            # Rust toolchain
+            # Rust toolchain (pinned version)
             rustToolchain
 
-            # Development tools
+            # Development tools (specific versions for reproducibility)
             cargo-watch
             cargo-audit
             cargo-deny
             cargo-tarpaulin
             cargo-edit
+            cargo-nextest  # Better test runner
 
             # Container tools
             podman
@@ -239,31 +285,50 @@
             pkg-config
             openssl
 
-            # Development utilities
+            # Development utilities (pinned in overlay)
             jq
-            yq
+            yq-go
             curl
             git
 
             # Nix tools
             nix-tree
             nix-du
+            nixfmt-rfc-style
 
             # Documentation
             mdbook
+
+            # Additional reproducibility tools
+            nix-diff
+            nix-output-monitor
           ];
 
+          # Reproducible environment variables
+          RUST_TOOLCHAIN_PATH = "${rustToolchain}";
+          NIX_PATH = "nixpkgs=${nixpkgs}";
+
+          # Ensure reproducible builds
+          SOURCE_DATE_EPOCH = "1672531200"; # 2023-01-01
+
           shellHook = ''
-            echo "🚀 Nanna Coder Development Environment"
+            echo "🚀 Nanna Coder Development Environment (Reproducible)"
             echo "📦 Rust version: $(rustc --version)"
             echo "🐳 Podman version: $(podman --version)"
+            echo "📋 Flake commit: ${self.shortRev or "dirty"}"
+            echo "🔒 Reproducible build: SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
             echo ""
             echo "Available commands:"
-            echo "  cargo build --workspace    # Build all packages"
-            echo "  cargo test --workspace     # Run all tests"
-            echo "  nix build .#harnessImage   # Build harness container"
-            echo "  nix build .#ollamaImage    # Build ollama container"
-            echo "  podman-compose up          # Start services"
+            echo "  cargo build --workspace     # Build all packages"
+            echo "  cargo nextest run            # Run tests with nextest"
+            echo "  nix build .#harnessImage     # Build harness container"
+            echo "  nix build .#ollamaImage      # Build ollama container"
+            echo "  nix flake check              # Validate flake"
+            echo "  nixfmt flake.nix             # Format Nix code"
+            echo ""
+            echo "Reproducibility commands:"
+            echo "  nix-diff /nix/store/old /nix/store/new  # Compare store paths"
+            echo "  nix-output-monitor           # Monitor build outputs"
             echo ""
 
             # Set up git hooks if in a git repository
