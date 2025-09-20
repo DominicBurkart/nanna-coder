@@ -1,0 +1,8 @@
+[package]
+name = "image-builder"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+
+[dependencies]
