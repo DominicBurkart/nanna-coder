@@ -2,6 +2,10 @@
 name = "model"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AI model abstraction and provider implementations for nanna-coder"
+repository.workspace = true
 
 [lib]
 

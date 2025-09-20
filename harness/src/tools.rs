@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -80,6 +80,12 @@ impl EchoTool {
     }
 }
 
+impl Default for EchoTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Tool for EchoTool {
     fn definition(&self) -> ToolDefinition {
@@ -134,6 +140,12 @@ impl CalculatorTool {
     }
 }
 
+impl Default for CalculatorTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Tool for CalculatorTool {
     fn definition(&self) -> ToolDefinition {
@@ -149,7 +161,9 @@ impl Tool for CalculatorTool {
                             "operation".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("The operation: add, subtract, multiply, divide".to_string()),
+                                description: Some(
+                                    "The operation: add, subtract, multiply, divide".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -171,7 +185,11 @@ impl Tool for CalculatorTool {
                         );
                         props
                     }),
-                    required: Some(vec!["operation".to_string(), "a".to_string(), "b".to_string()]),
+                    required: Some(vec![
+                        "operation".to_string(),
+                        "a".to_string(),
+                        "b".to_string(),
+                    ]),
                 },
             },
         }
@@ -185,19 +203,19 @@ impl Tool for CalculatorTool {
                 message: "Missing or invalid 'operation' parameter".to_string(),
             })?;
 
-        let a = args
-            .get("a")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'a' parameter".to_string(),
-            })?;
+        let a =
+            args.get("a")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ToolError::InvalidArguments {
+                    message: "Missing or invalid 'a' parameter".to_string(),
+                })?;
 
-        let b = args
-            .get("b")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'b' parameter".to_string(),
-            })?;
+        let b =
+            args.get("b")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ToolError::InvalidArguments {
+                    message: "Missing or invalid 'b' parameter".to_string(),
+                })?;
 
         let result = match operation {
             "add" => a + b,

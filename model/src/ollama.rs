@@ -1,24 +1,26 @@
 use crate::config::OllamaConfig;
 use crate::provider::{ModelError, ModelProvider, ModelResult};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole,
-    ModelInfo, Usage,
+    ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole, ModelInfo, Usage,
 };
 use async_trait::async_trait;
 use ollama_rs::{
-    generation::chat::{ChatMessage as OllamaChatMessage, MessageRole as OllamaRole},
     Ollama,
+    generation::chat::{ChatMessage as OllamaChatMessage, MessageRole as OllamaRole},
 };
 use tracing::{debug, error, info};
 
 pub struct OllamaProvider {
     client: Ollama,
+    #[allow(dead_code)]
     config: OllamaConfig,
 }
 
 impl OllamaProvider {
     pub fn new(config: OllamaConfig) -> ModelResult<Self> {
-        config.validate().map_err(|msg| ModelError::InvalidConfig { message: msg })?;
+        config
+            .validate()
+            .map_err(|msg| ModelError::InvalidConfig { message: msg })?;
 
         let host = if config.base_url.ends_with("/v1") {
             config.base_url[..config.base_url.len() - 3].to_string()
@@ -44,6 +46,7 @@ impl OllamaProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn convert_message_from_ollama(msg: &OllamaChatMessage) -> ChatMessage {
         let role = match msg.role {
             OllamaRole::System => MessageRole::System,
@@ -85,7 +88,7 @@ impl OllamaProvider {
                 } else {
                     // Convert to the right reqwest error type
                     ModelError::Unknown {
-                        message: format!("Network error: {}", e)
+                        message: format!("Network error: {}", e),
                     }
                 }
             }
@@ -136,7 +139,8 @@ impl ModelProvider for OllamaProvider {
         let usage = Some(Usage {
             prompt_tokens: response.prompt_eval_count.unwrap_or(0) as u32,
             completion_tokens: response.eval_count.unwrap_or(0) as u32,
-            total_tokens: (response.prompt_eval_count.unwrap_or(0) + response.eval_count.unwrap_or(0)) as u32,
+            total_tokens: (response.prompt_eval_count.unwrap_or(0)
+                + response.eval_count.unwrap_or(0)) as u32,
         });
 
         info!("Chat request completed successfully");

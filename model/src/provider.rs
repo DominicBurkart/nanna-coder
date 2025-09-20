@@ -49,7 +49,7 @@ pub trait StreamingModelProvider: ModelProvider {
 
     async fn chat_stream(
         &self,
-        request: ChatRequest
+        request: ChatRequest,
     ) -> ModelResult<impl futures::Stream<Item = Result<Self::StreamItem, Self::StreamError>>>;
 }
 
@@ -99,9 +99,7 @@ mod tests {
     async fn test_mock_provider() {
         let provider = MockProvider;
 
-        let request = ChatRequest::new("mock-model", vec![
-            ChatMessage::user("Hello")
-        ]);
+        let request = ChatRequest::new("mock-model", vec![ChatMessage::user("Hello")]);
 
         let response = provider.chat(request).await.unwrap();
         assert_eq!(response.choices.len(), 1);

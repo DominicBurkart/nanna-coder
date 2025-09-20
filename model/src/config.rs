@@ -130,9 +130,10 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut config = OllamaConfig::default();
-
-        config.base_url = "".to_string();
+        let mut config = OllamaConfig {
+            base_url: "".to_string(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.base_url = "invalid-url".to_string();
@@ -160,6 +161,9 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: OllamaConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.base_url, deserialized.base_url);
-        assert_eq!(config.default_context_length, deserialized.default_context_length);
+        assert_eq!(
+            config.default_context_length,
+            deserialized.default_context_length
+        );
     }
 }

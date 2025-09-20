@@ -2,7 +2,6 @@ mod tools;
 
 use clap::{Parser, Subcommand};
 use model::prelude::*;
-use serde_json::json;
 use std::io::{self, Write};
 use tools::{CalculatorTool, EchoTool, ToolRegistry};
 use tracing::{error, info};
@@ -63,8 +62,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             temperature,
         } => {
             if let Some(initial_prompt) = prompt {
-                single_chat(&provider, &tool_registry, &model, &initial_prompt, tools, temperature)
-                    .await?;
+                single_chat(
+                    &provider,
+                    &tool_registry,
+                    &model,
+                    &initial_prompt,
+                    tools,
+                    temperature,
+                )
+                .await?;
             } else {
                 interactive_chat(&provider, &tool_registry, &model, tools, temperature).await?;
             }
@@ -111,10 +117,16 @@ async fn single_chat(
         if let Some(tool_calls) = &choice.message.tool_calls {
             println!("\nTool calls:");
             for tool_call in tool_calls {
-                println!("  Calling {}: {:?}", tool_call.function.name, tool_call.function.arguments);
+                println!(
+                    "  Calling {}: {:?}",
+                    tool_call.function.name, tool_call.function.arguments
+                );
 
                 match tool_registry
-                    .execute(&tool_call.function.name, tool_call.function.arguments.clone())
+                    .execute(
+                        &tool_call.function.name,
+                        tool_call.function.arguments.clone(),
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -152,7 +164,10 @@ async fn interactive_chat(
     enable_tools: bool,
     temperature: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting interactive chat with {} (tools: {})", model, enable_tools);
+    println!(
+        "Starting interactive chat with {} (tools: {})",
+        model, enable_tools
+    );
     println!("Type 'quit' or 'exit' to end the conversation.\n");
 
     let mut messages = vec![];
@@ -177,7 +192,8 @@ async fn interactive_chat(
         messages.push(ChatMessage::user(input));
 
         loop {
-            let mut request = ChatRequest::new(model, messages.clone()).with_temperature(temperature);
+            let mut request =
+                ChatRequest::new(model, messages.clone()).with_temperature(temperature);
 
             if enable_tools {
                 let tool_definitions = tool_registry.get_definitions();
@@ -194,10 +210,16 @@ async fn interactive_chat(
             if let Some(tool_calls) = &choice.message.tool_calls {
                 println!("\n[Tool calls]");
                 for tool_call in tool_calls {
-                    println!("  Calling {}: {:?}", tool_call.function.name, tool_call.function.arguments);
+                    println!(
+                        "  Calling {}: {:?}",
+                        tool_call.function.name, tool_call.function.arguments
+                    );
 
                     match tool_registry
-                        .execute(&tool_call.function.name, tool_call.function.arguments.clone())
+                        .execute(
+                            &tool_call.function.name,
+                            tool_call.function.arguments.clone(),
+                        )
                         .await
                     {
                         Ok(result) => {
@@ -238,9 +260,14 @@ async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error
         println!("  No models found. Make sure Ollama is running and has models installed.");
     } else {
         for model in models {
-            println!("  - {} ({})", model.name,
-                model.size.map(|s| format!("{:.1} GB", s as f64 / 1_000_000_000.0))
-                    .unwrap_or_else(|| "unknown size".to_string()));
+            println!(
+                "  - {} ({})",
+                model.name,
+                model
+                    .size
+                    .map(|s| format!("{:.1} GB", s as f64 / 1_000_000_000.0))
+                    .unwrap_or_else(|| "unknown size".to_string())
+            );
         }
     }
 

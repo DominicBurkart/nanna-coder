@@ -2,6 +2,10 @@
 name = "harness"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Test harness and CLI for nanna-coder AI assistant"
+repository.workspace = true
 
 [[bin]]
 name = "harness"
