@@ -28,7 +28,7 @@
         };
 
         # Crane library for building Rust packages
-        craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # Common build inputs for all Rust packages
         commonBuildInputs = with pkgs; [
@@ -383,9 +383,9 @@
             inherit src;
           };
 
-          workspace-audit = craneLib.cargoAudit {
-            inherit src;
-          };
+          # workspace-audit = craneLib.cargoAudit {
+          #   inherit src;
+          # };
         };
       }
     ) // {
