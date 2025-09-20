@@ -1,11 +1,13 @@
 # Rust
 /target/
+**/*.rs.bk
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
@@ -13,6 +15,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
 
 # Runtime data
 pids
@@ -21,6 +24,7 @@ pids
 
 # Coverage directory used by tools like istanbul
 coverage/
+tarpaulin-report.html
 
 # Dependency directories
 node_modules/
@@ -31,10 +35,13 @@ node_modules/
 # Temporary files
 *.tmp
 *.temp
+tmp/
+temp/
 
 # Ollama models and data
 models/
 .ollama/
+ollama_data/
 
 # Environment variables
 .env
@@ -42,3 +49,14 @@ models/
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Nix
+result
+result-*
+
+# Direnv
+.direnv/
+
+# Local development
+.local/
+.cache/
