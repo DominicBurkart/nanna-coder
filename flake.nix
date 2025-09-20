@@ -326,34 +326,77 @@
             echo "  nix-output-monitor           # Monitor build outputs"
             echo ""
 
-            # Set up git hooks if in a git repository
+            # Set up comprehensive git hooks if in a git repository
             if [ -d .git ]; then
-              echo "Setting up git hooks..."
+              echo "Setting up production-grade git hooks..."
               mkdir -p .git/hooks
 
               cat > .git/hooks/pre-commit << 'EOF'
             #!/usr/bin/env bash
             set -e
 
-            echo "🔍 Running pre-commit checks..."
+            echo "🔍 Running comprehensive pre-commit checks..."
 
             # Format check
+            echo "📝 Checking formatting..."
             cargo fmt --all -- --check
 
-            # Clippy
+            # Clippy linting
+            echo "🔍 Running clippy..."
             cargo clippy --workspace --all-targets -- -D warnings
 
-            # Tests
-            cargo test --workspace
+            # Tests (including doctests)
+            echo "🧪 Running tests..."
+            cargo test --workspace --all-features
 
-            # Audit
-            cargo audit
+            # License and dependency scanning
+            echo "📋 Checking licenses and dependencies..."
+            cargo deny check
 
-            # Security review (placeholder)
-            echo "✅ Pre-commit checks passed!"
+            # Security review with Claude (if available)
+            echo "🔒 Running security review..."
+            if command -v claude >/dev/null 2>&1; then
+              git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? If so, return a list of security/compliance problems to fix before the commit can be completed." | tee /tmp/claude_review
+              if grep -qi "problem\|secret\|token\|pii\|leak" /tmp/claude_review; then
+                echo "🚨 Security issues found above. Please fix before committing."
+                exit 1
+              fi
+            else
+              echo "⚠️  Claude CLI not available, skipping automated security review"
+            fi
+
+            # Coverage check with comparison to main
+            echo "📊 Checking test coverage..."
+            if command -v cargo-tarpaulin >/dev/null 2>&1; then
+              NEW=$(cargo tarpaulin --skip-clean --ignore-tests -q --output-format text | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+
+              # Get main branch coverage (if possible)
+              git stash -q 2>/dev/null || true
+              if git checkout main -q 2>/dev/null; then
+                OLD=$(cargo tarpaulin --skip-clean --ignore-tests -q --output-format text | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+                git checkout - -q
+                git stash pop -q 2>/dev/null || true
+
+                # Compare coverage using awk
+                if awk "BEGIN { exit !($NEW >= $OLD) }"; then
+                  echo "✅ Coverage: $NEW% >= $OLD%"
+                else
+                  echo "❌ Coverage dropped: $NEW% < $OLD%"
+                  exit 1
+                fi
+              else
+                echo "ℹ️  Could not check coverage against main branch"
+                git stash pop -q 2>/dev/null || true
+              fi
+            else
+              echo "⚠️  cargo-tarpaulin not available, skipping coverage check"
+            fi
+
+            echo "✅ All pre-commit checks passed!"
             EOF
 
               chmod +x .git/hooks/pre-commit
+              echo "✅ Production-grade pre-commit hook installed"
             fi
           '';
         };
@@ -443,10 +486,109 @@
             inherit src;
           };
 
+          # TODO: Re-enable audit once advisory-db is properly configured
           # workspace-audit = craneLib.cargoAudit {
           #   inherit src;
           # };
+
+          workspace-deny = pkgs.runCommand "cargo-deny-check" {
+            buildInputs = [ pkgs.cargo-deny rustToolchain ];
+          } ''
+            cd ${src}
+            export CARGO_HOME=$(mktemp -d)
+            cargo deny check
+            touch $out
+          '';
+
+          workspace-coverage = pkgs.runCommand "cargo-tarpaulin-coverage" {
+            buildInputs = [ pkgs.cargo-tarpaulin rustToolchain ] ++ commonBuildInputs;
+            nativeBuildInputs = commonNativeBuildInputs;
+          } ''
+            cd ${src}
+            export CARGO_HOME=$(mktemp -d)
+
+            # Run coverage and extract percentage
+            COVERAGE=$(cargo tarpaulin --skip-clean --ignore-tests -q --output-format text | \
+                      grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+
+            # Minimum coverage threshold (can be adjusted)
+            MIN_COVERAGE="70.0"
+
+            # Compare coverage using awk since bc might not be available
+            if awk "BEGIN { exit !($COVERAGE >= $MIN_COVERAGE) }"; then
+              echo "✅ Coverage: $COVERAGE% >= $MIN_COVERAGE%"
+              echo "$COVERAGE" > $out
+            else
+              echo "❌ Coverage too low: $COVERAGE% < $MIN_COVERAGE%"
+              exit 1
+            fi
+          '';
         };
       }
-    );
+    ) // {
+      # Cross-compilation support for additional architectures
+      packages.aarch64-linux =
+        let
+          crossPkgs = import nixpkgs {
+            system = "aarch64-linux";
+            overlays = [ (import rust-overlay) ];
+          };
+        in {
+          default = crossPkgs.rustPlatform.buildRustPackage {
+            pname = "nanna-coder";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildInputs = with crossPkgs; [ pkg-config openssl ];
+            nativeBuildInputs = with crossPkgs; [ pkg-config ];
+
+            meta = {
+              description = "AI-powered coding assistant (aarch64-linux)";
+              platforms = [ "aarch64-linux" ];
+            };
+          };
+        };
+
+      packages.x86_64-darwin =
+        let
+          crossPkgs = import nixpkgs {
+            system = "x86_64-darwin";
+            overlays = [ (import rust-overlay) ];
+          };
+        in {
+          default = crossPkgs.rustPlatform.buildRustPackage {
+            pname = "nanna-coder";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildInputs = with crossPkgs; [ crossPkgs.darwin.apple_sdk.frameworks.Security ];
+
+            meta = {
+              description = "AI-powered coding assistant (x86_64-darwin)";
+              platforms = [ "x86_64-darwin" ];
+            };
+          };
+        };
+
+      packages.aarch64-darwin =
+        let
+          crossPkgs = import nixpkgs {
+            system = "aarch64-darwin";
+            overlays = [ (import rust-overlay) ];
+          };
+        in {
+          default = crossPkgs.rustPlatform.buildRustPackage {
+            pname = "nanna-coder";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildInputs = with crossPkgs; [ crossPkgs.darwin.apple_sdk.frameworks.Security ];
+
+            meta = {
+              description = "AI-powered coding assistant (aarch64-darwin/Apple Silicon)";
+              platforms = [ "aarch64-darwin" ];
+            };
+          };
+        };
+    };
 }

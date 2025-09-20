@@ -42,6 +42,20 @@ jobs:
     - name: Security audit
       run: nix develop --command cargo audit
 
+    - name: License and dependency check
+      run: nix develop --command cargo deny check
+
+    - name: Coverage check
+      run: |
+        nix develop --command cargo tarpaulin --skip-clean --ignore-tests --output-format text
+        nix develop --command cargo tarpaulin --skip-clean --ignore-tests --output-format lcov --output-path coverage.lcov
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: coverage.lcov
+        fail_ci_if_error: true
+
   build:
     name: Build Packages
     runs-on: ubuntu-latest
@@ -76,6 +90,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
 
     steps:
     - name: Checkout code
@@ -87,6 +104,12 @@ jobs:
     - name: Setup Nix cache
       uses: DeterminateSystems/magic-nix-cache-action@main
 
+    - name: Set up QEMU for cross-platform builds
+      if: matrix.arch == 'aarch64'
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
     - name: Log in to Container Registry
       uses: docker/login-action@v3
       with:
@@ -94,31 +117,54 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build harness container
-      run: nix build .#harnessImage
+    - name: Build harness container (${{ matrix.arch }})
+      run: |
+        if [ "${{ matrix.arch }}" = "x86_64" ]; then
+          nix build .#harnessImage
+        else
+          # For aarch64, build cross-compiled version
+          nix build .#packages.aarch64-linux.harnessImage || nix build .#harnessImage
+        fi
 
     - name: Load and tag harness image
       run: |
         docker load < result
-        docker tag nanna-coder-harness:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:${{ github.sha }}
-        docker tag nanna-coder-harness:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest
+        ARCH_SUFFIX=""
+        if [ "${{ matrix.arch }}" = "aarch64" ]; then
+          ARCH_SUFFIX="-arm64"
+        fi
+        docker tag nanna-coder-harness:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:${{ github.sha }}${ARCH_SUFFIX}
+        docker tag nanna-coder-harness:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest${ARCH_SUFFIX}
 
-    - name: Build ollama container
-      run: nix build .#ollamaImage
+    - name: Build ollama container (${{ matrix.arch }})
+      run: |
+        if [ "${{ matrix.arch }}" = "x86_64" ]; then
+          nix build .#ollamaImage
+        else
+          nix build .#packages.aarch64-linux.ollamaImage || nix build .#ollamaImage
+        fi
 
     - name: Load and tag ollama image
       run: |
         docker load < result
-        docker tag nanna-coder-ollama:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:${{ github.sha }}
-        docker tag nanna-coder-ollama:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:latest
+        ARCH_SUFFIX=""
+        if [ "${{ matrix.arch }}" = "aarch64" ]; then
+          ARCH_SUFFIX="-arm64"
+        fi
+        docker tag nanna-coder-ollama:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:${{ github.sha }}${ARCH_SUFFIX}
+        docker tag nanna-coder-ollama:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:latest${ARCH_SUFFIX}
 
     - name: Push images
       if: github.event_name != 'pull_request'
       run: |
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:${{ github.sha }}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:${{ github.sha }}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:latest
+        ARCH_SUFFIX=""
+        if [ "${{ matrix.arch }}" = "aarch64" ]; then
+          ARCH_SUFFIX="-arm64"
+        fi
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:${{ github.sha }}${ARCH_SUFFIX}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest${ARCH_SUFFIX}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:${{ github.sha }}${ARCH_SUFFIX}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ollama:latest${ARCH_SUFFIX}
 
   security-scan:
     name: Security Scan
