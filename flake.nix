@@ -27,12 +27,7 @@
         # Reproducible overlays with pinned versions
         overlays = [
           (import rust-overlay)
-          (final: prev: {
-            # Pin specific tool versions for reproducibility
-            jq = prev.jq.overrideAttrs (old: rec {
-              version = "1.7.1";
-            });
-          })
+          # Additional pinned packages can be added here
         ];
         pkgs = import nixpkgs {
           inherit system overlays;
@@ -316,7 +311,7 @@
             echo "📦 Rust version: $(rustc --version)"
             echo "🐳 Podman version: $(podman --version)"
             echo "📋 Flake commit: ${self.shortRev or "dirty"}"
-            echo "🔒 Reproducible build: SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            echo "🔒 Reproducible build: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
             echo ""
             echo "Available commands:"
             echo "  cargo build --workspace     # Build all packages"
@@ -453,22 +448,5 @@
           # };
         };
       }
-    ) // {
-      # Cross-compilation support
-      packages.aarch64-linux =
-        let
-          pkgs = import nixpkgs {
-            system = "aarch64-linux";
-            overlays = [ (import rust-overlay) ];
-          };
-        in self.packages.x86_64-linux;
-
-      packages.x86_64-darwin =
-        let
-          pkgs = import nixpkgs {
-            system = "x86_64-darwin";
-            overlays = [ (import rust-overlay) ];
-          };
-        in self.packages.x86_64-linux;
-    };
+    );
 }
