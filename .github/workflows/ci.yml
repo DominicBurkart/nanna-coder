@@ -58,12 +58,21 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Binary Cache)
-      if: runner.os != 'Windows'
+      if: runner.os != 'Windows' && secrets.CACHIX_AUTH_TOKEN != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
         pushFilter: "(-source$|nixpkgs.tar.gz$)"
+
+    - name: Note Cachix status
+      if: runner.os != 'Windows'
+      run: |
+        if [ -z "${{ secrets.CACHIX_AUTH_TOKEN }}" ]; then
+          echo "⚠️ CACHIX_AUTH_TOKEN not configured - using default Nix cache only"
+        else
+          echo "✅ Cachix binary cache configured"
+        fi
 
     - name: Setup Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -171,6 +180,7 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Binary Cache)
+      if: secrets.CACHIX_AUTH_TOKEN != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
@@ -329,6 +339,7 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Binary Cache)
+      if: secrets.CACHIX_AUTH_TOKEN != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
@@ -480,6 +491,7 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Binary Cache)
+      if: secrets.CACHIX_AUTH_TOKEN != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
@@ -487,8 +499,16 @@ jobs:
         pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Push to binary cache
-      if: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
+      if: secrets.CACHIX_AUTH_TOKEN != ''
       run: nix run .#push-cache
+
+    - name: Note cache status
+      run: |
+        if [ -z "${{ secrets.CACHIX_AUTH_TOKEN }}" ]; then
+          echo "⚠️ Skipping binary cache push - CACHIX_AUTH_TOKEN not configured"
+        else
+          echo "✅ Binary cache push completed"
+        fi
 
     - name: Cache analytics and reporting
       run: |
@@ -527,6 +547,7 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Binary Cache)
+      if: secrets.CACHIX_AUTH_TOKEN != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
