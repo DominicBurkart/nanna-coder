@@ -1,0 +1,127 @@
+name: Cache Migration Test (Free Alternative)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Test cache-nix-action as free alternative to Magic Nix Cache
+  test-cache-nix-action:
+    name: Test cache-nix-action (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    # Use cache-nix-action instead of magic-nix-cache
+    - name: Cache Nix store (Free GitHub Alternative)
+      uses: nix-community/cache-nix-action@v5
+      with:
+        # Cache key includes OS and lock file hash
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        # Garbage collection before caching to optimize storage
+        gc-before-save: true
+        # Cache for 7 days to balance freshness vs space
+        gc-max-store-size-linux: 1073741824
+        gc-max-store-size-macos: 1073741824
+
+    - name: Note cache strategy
+      run: |
+        echo "📦 Using cache-nix-action for free GitHub-native Nix caching"
+        echo "🔄 Cache storage: GitHub Actions cache (10GB limit per repo)"
+        echo "🎯 Benefits: No secrets required, works with forks/PRs"
+        echo "⚡ Alternative to Magic Nix Cache (deprecated Feb 2025)"
+
+    - name: Test basic Nix build
+      run: |
+        echo "🔨 Testing basic package build with cache-nix-action..."
+        nix build .#nanna-coder --no-link --print-build-logs
+
+    - name: Test development shell
+      run: |
+        echo "🐚 Testing development shell with cached dependencies..."
+        nix develop --command cargo --version
+
+    - name: Test container build (Linux only)
+      if: runner.os == 'Linux'
+      run: |
+        echo "🐳 Testing container build with cached dependencies..."
+        nix build .#harnessImage --no-link
+
+  # Compare performance with different cache strategies
+  test-no-cache-baseline:
+    name: Baseline (No Cache) - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix (No Cache)
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Note: No caching baseline
+      run: |
+        echo "📊 Baseline test - no binary caching"
+        echo "⏱️ This will show full build time without any cache"
+
+    - name: Test basic build (no cache)
+      run: |
+        echo "🔨 Building without any cache (baseline)..."
+        time nix build .#nanna-coder --no-link --print-build-logs
+
+  # Summary job for cache migration analysis
+  cache-migration-summary:
+    name: Cache Migration Summary
+    runs-on: ubuntu-latest
+    needs: [test-cache-nix-action, test-no-cache-baseline]
+    if: always()
+
+    steps:
+    - name: Generate Migration Summary
+      run: |
+        echo "## 🔄 Cache Migration Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "**Date**: $(date)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "### 📊 Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Strategy | Status | Notes |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| cache-nix-action | ${{ needs.test-cache-nix-action.result }} | Free GitHub-native alternative |" >> $GITHUB_STEP_SUMMARY
+        echo "| No cache baseline | ${{ needs.test-no-cache-baseline.result }} | Performance comparison |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "### 🎯 Migration Recommendations" >> $GITHUB_STEP_SUMMARY
+        echo "- **Urgent**: Magic Nix Cache deprecated February 1, 2025" >> $GITHUB_STEP_SUMMARY
+        echo "- **Free Alternative**: cache-nix-action (nix-community)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Storage**: Uses GitHub's 10GB cache limit per repository" >> $GITHUB_STEP_SUMMARY
+        echo "- **Benefits**: No secrets, works with forks/PRs, community maintained" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Determine overall migration status
+        if [[ "${{ needs.test-cache-nix-action.result }}" == "success" ]]; then
+          echo "### ✅ Migration Status: READY" >> $GITHUB_STEP_SUMMARY
+          echo "cache-nix-action is working and ready for migration" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### ⚠️ Migration Status: NEEDS ATTENTION" >> $GITHUB_STEP_SUMMARY
+          echo "cache-nix-action test failed - investigate before migration" >> $GITHUB_STEP_SUMMARY
+        fi
