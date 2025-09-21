@@ -86,6 +86,7 @@ jobs:
 
     - name: Install additional tools (non-Nix)
       if: runner.os != 'Linux'
+      shell: bash
       run: |
         cargo install cargo-nextest cargo-audit cargo-deny
         if [ "${{ matrix.test-type }}" = "security" ]; then
