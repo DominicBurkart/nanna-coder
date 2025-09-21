@@ -23,3 +23,8 @@ tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+futures = "0.3"
