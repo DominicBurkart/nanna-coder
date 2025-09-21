@@ -939,7 +939,9 @@ mod tests {
         // In test environments, the tracing subscriber may already be initialized
         match telemetry.initialize().await {
             Ok(_) => assert!(telemetry.initialized),
-            Err(TelemetryError::InitializationFailed { reason }) if reason.contains("global default trace dispatcher has already been set") => {
+            Err(TelemetryError::InitializationFailed { reason })
+                if reason.contains("global default trace dispatcher has already been set") =>
+            {
                 // This is expected in parallel test runs - consider the test successful
                 println!("Tracing subscriber already initialized (expected in CI)");
             }
