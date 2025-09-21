@@ -129,6 +129,7 @@ jobs:
 
     - name: Run unit tests
       if: matrix.test-type == 'unit'
+      shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo nextest run --workspace --lib
@@ -138,6 +139,7 @@ jobs:
 
     - name: Run integration tests
       if: matrix.test-type == 'integration'
+      shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix run .#container-test
@@ -147,6 +149,7 @@ jobs:
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
+      shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo clippy --workspace --all-targets -- -D warnings
@@ -158,6 +161,7 @@ jobs:
 
     - name: Run security checks
       if: matrix.test-type == 'security'
+      shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo audit
@@ -260,6 +264,7 @@ jobs:
 
     - name: Setup cross-compilation (aarch64)
       if: matrix.cross
+      shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
           # Use Nix for cross-compilation on Linux
