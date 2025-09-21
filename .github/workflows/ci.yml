@@ -53,26 +53,22 @@ jobs:
       if: runner.os != 'Windows'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
+    - name: Cache Nix store (Free GitHub-native caching)
       if: runner.os != 'Windows'
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: runner.os != 'Windows' && secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
+        gc-max-store-size-macos: 1073741824
 
-    - name: Note Cachix status
+    - name: Note cache strategy
       if: runner.os != 'Windows'
       run: |
-        if [ -z "${{ secrets.CACHIX_AUTH_TOKEN }}" ]; then
-          echo "⚠️ CACHIX_AUTH_TOKEN not configured - using default Nix cache only"
-        else
-          echo "✅ Cachix binary cache configured"
-        fi
+        echo "📦 Using cache-nix-action for free GitHub-native Nix caching"
+        echo "🔄 Cache storage: GitHub Actions cache (10GB limit per repo)"
+        echo "⚡ Migrated from deprecated Magic Nix Cache and Cachix"
 
     - name: Setup Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -176,16 +172,13 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+    - name: Cache Nix store (Free GitHub-native caching)
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ github.job }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
 
     - name: Run benchmarks
       run: |
@@ -234,15 +227,12 @@ jobs:
 
     - name: Setup Nix cache (Linux)
       if: runner.os == 'Linux'
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Linux)
-      if: runner.os == 'Linux' && secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-build-${{ matrix.target }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
 
     - name: Setup Rust toolchain (macOS)
       if: runner.os == 'macOS'
@@ -335,16 +325,13 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+    - name: Cache Nix store (Free GitHub-native caching)
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ github.job }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
 
     - name: Set up QEMU for cross-platform builds
       if: matrix.arch == 'aarch64'
@@ -487,28 +474,19 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+    - name: Cache Nix store (Free GitHub-native caching)
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ github.job }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
 
-    - name: Push to binary cache
-      if: secrets.CACHIX_AUTH_TOKEN != ''
-      run: nix run .#push-cache
-
-    - name: Note cache status
+    - name: Note cache strategy
       run: |
-        if [ -z "${{ secrets.CACHIX_AUTH_TOKEN }}" ]; then
-          echo "⚠️ Skipping binary cache push - CACHIX_AUTH_TOKEN not configured"
-        else
-          echo "✅ Binary cache push completed"
-        fi
+        echo "📦 Using cache-nix-action for all binary caching"
+        echo "🔄 Cache managed automatically by GitHub Actions"
+        echo "✅ No external binary cache services required"
 
     - name: Cache analytics and reporting
       run: |
@@ -543,16 +521,13 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+    - name: Cache Nix store (Free GitHub-native caching)
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ github.job }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
 
     - name: Build release artifacts
       run: |

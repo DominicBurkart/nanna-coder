@@ -39,17 +39,15 @@ jobs:
       if: runner.os != 'Windows'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache
+    - name: Cache Nix store (Free GitHub-native caching)
       if: runner.os != 'Windows'
-      uses: DeterminateSystems/magic-nix-cache-action@main
-
-    - name: Configure Cachix (Binary Cache)
-      if: runner.os != 'Windows' && secrets.CACHIX_AUTH_TOKEN != ''
-      uses: cachix/cachix-action@v12
+      uses: nix-community/cache-nix-action@v5
       with:
-        name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs.tar.gz$)"
+        primary-key: nix-${{ matrix.os }}-${{ matrix.test-type }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ matrix.os }}-${{ matrix.test-type }}-
+        gc-before-save: true
+        gc-max-store-size-linux: 1073741824
+        gc-max-store-size-macos: 1073741824
 
     - name: Setup Rust toolchain (Windows/macOS)
       if: runner.os != 'Linux'
