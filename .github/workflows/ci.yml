@@ -22,7 +22,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         rust: [stable, beta]
-        test-type: [unit, integration, lint, security]
+        test-type: [unit, integration, lint]
+        # security: temporarily disabled due to incomplete tarpaulin implementation
         include:
           # Add Windows for stable Rust only
           - os: windows-latest
@@ -39,11 +40,11 @@ jobs:
           # Skip integration tests on macOS (no container support)
           - os: macos-latest
             test-type: integration
-          # Skip security tests on non-Linux (tools not available)
-          - os: macos-latest
-            test-type: security
-          - os: windows-latest
-            test-type: security
+          # Security tests temporarily disabled (incomplete tarpaulin implementation)
+          # - os: macos-latest
+          #   test-type: security
+          # - os: windows-latest
+          #   test-type: security
 
     steps:
     - name: Checkout code
@@ -59,7 +60,6 @@ jobs:
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
         gc-max-store-size-macos: 1073741824
 
@@ -100,10 +100,10 @@ jobs:
       if: matrix.test-type == 'integration' && runner.os == 'Linux'
       run: |
         echo "🔄 Building test containers for caching..."
-        nix build .#qwen3-model .#qwen3-container --print-build-logs
+        nix build .#ollamaImage --print-build-logs
 
         echo "📦 Loading test containers into podman..."
-        podman load -i $(nix build .#qwen3-container --print-out-paths --no-link)/image.tar
+        podman load -i $(nix build .#ollamaImage --print-out-paths --no-link)
 
         echo "✅ Test containers ready for integration tests"
 
@@ -159,11 +159,11 @@ jobs:
       if: always() && runner.os == 'Linux'
       run: nix run .#cache-analytics
 
-  # Parallel performance benchmarking
+  # Parallel performance benchmarking (temporarily disabled - no benchmarks configured)
   benchmark:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: false  # Temporarily disabled until benchmarks are properly configured
 
     steps:
     - name: Checkout code
@@ -177,7 +177,6 @@ jobs:
       with:
         primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ github.job }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
 
     - name: Run benchmarks
@@ -231,7 +230,6 @@ jobs:
       with:
         primary-key: nix-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-build-${{ matrix.target }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
 
     - name: Setup Rust toolchain (macOS)
@@ -330,7 +328,6 @@ jobs:
       with:
         primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ github.job }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
 
     - name: Set up QEMU for cross-platform builds
@@ -479,7 +476,6 @@ jobs:
       with:
         primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ github.job }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
 
     - name: Note cache strategy
@@ -526,7 +522,6 @@ jobs:
       with:
         primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ github.job }}-
-        gc-before-save: true
         gc-max-store-size-linux: 1073741824
 
     - name: Build release artifacts
@@ -561,7 +556,7 @@ jobs:
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [test-matrix, build-matrix, build-containers, benchmark]
+    needs: [test-matrix, build-matrix, build-containers]  # benchmark: temporarily disabled
     if: always()
 
     steps:
@@ -582,7 +577,7 @@ jobs:
         echo "| Test Matrix | ${{ needs.test-matrix.result }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Build Matrix | ${{ needs.build-matrix.result }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Container Builds | ${{ needs.build-containers.result }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Benchmarks | ${{ needs.benchmark.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Benchmarks | disabled |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
         echo "### 🏗️ Build Artifacts" >> $GITHUB_STEP_SUMMARY

@@ -916,7 +916,7 @@ impl<'a> TraceGuard<'a> {
     }
 }
 
-impl<'a> Drop for TraceGuard<'a> {
+impl Drop for TraceGuard<'_> {
     fn drop(&mut self) {
         if let Some(trace) = self.trace.take() {
             self.telemetry.finish_trace(trace);

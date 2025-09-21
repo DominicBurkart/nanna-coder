@@ -8,12 +8,12 @@ use crate::types::{
     ToolDefinition, Usage,
 };
 use async_trait::async_trait;
-use std::time::Instant;
 use ollama_rs::{
     generation::chat::{ChatMessage as OllamaChatMessage, MessageRole as OllamaRole},
     Ollama,
 };
 use std::time::Duration;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 pub struct OllamaProvider {
