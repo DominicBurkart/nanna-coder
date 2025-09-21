@@ -1479,6 +1479,25 @@
               };
               maxLayers = 100;
             }) else null;
+
+          # Container loading utilities for CI
+          load-ollama-image = if pkgs.stdenv.isLinux then
+            (pkgs.writeShellScriptBin "load-ollama-image" ''
+              echo "📦 Loading ollama image using nix2container JSON format..."
+              IMAGE_PATH=$(nix build .#ollamaImage --print-out-paths --no-link)
+              echo "Image built at: $IMAGE_PATH"
+
+              # Use skopeo to load the nix2container JSON format
+              if command -v skopeo >/dev/null 2>&1; then
+                echo "Using skopeo to load image..."
+                skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
+              else
+                echo "Installing skopeo..."
+                nix-env -iA nixpkgs.skopeo
+                skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
+              fi
+              echo "✅ Image loaded successfully"
+            '') else null;
         }
       );
     };

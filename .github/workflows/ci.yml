@@ -103,7 +103,8 @@ jobs:
         nix build .#ollamaImage --print-build-logs
 
         echo "📦 Loading test containers into podman (nix2container format)..."
-        podman load < $(nix build .#ollamaImage --print-out-paths --no-link)
+        # nix2container creates JSON manifests, not tar archives - use custom loader
+        nix run .#load-ollama-image
 
         echo "✅ Test containers ready for integration tests"
 
