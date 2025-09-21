@@ -56,12 +56,30 @@ jobs:
 
     - name: Cache Nix store (Free GitHub-native caching)
       if: runner.os != 'Windows'
+      id: nix-cache
       uses: nix-community/cache-nix-action@v5
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
         gc-max-store-size-linux: 1073741824
         gc-max-store-size-macos: 1073741824
+
+    - name: GitHub Actions Cache Status
+      if: runner.os != 'Windows'
+      run: |
+        echo "📊 === GitHub Actions Cache Status ==="
+        echo "🔑 Cache Key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}"
+        echo "📦 Cache Action: nix-community/cache-nix-action@v5"
+
+        if [ "${{ steps.nix-cache.outputs.cache-hit }}" = "true" ]; then
+          echo "✅ CACHE HIT: Dependencies restored from GitHub Actions cache"
+          echo "🚀 Build performance: OPTIMIZED"
+        elif [ "${{ steps.nix-cache.outputs.cache-hit }}" = "false" ]; then
+          echo "⚠️ CACHE MISS: Building dependencies from scratch"
+          echo "🐌 Build performance: Initial run (next run will be faster)"
+        else
+          echo "🔍 Cache status: Unknown (action may not support cache-hit output)"
+        fi
 
     - name: Note cache strategy
       if: runner.os != 'Windows'
