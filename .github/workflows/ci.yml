@@ -63,7 +63,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Setup Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -175,7 +175,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Run benchmarks
       run: |
@@ -232,7 +232,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Setup Rust toolchain (macOS)
       if: runner.os == 'macOS'
@@ -333,7 +333,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Set up QEMU for cross-platform builds
       if: matrix.arch == 'aarch64'
@@ -484,7 +484,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Push to binary cache
       if: secrets.CACHIX_AUTH_TOKEN != null
@@ -531,7 +531,7 @@ jobs:
       with:
         name: nanna-coder
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+        pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Build release artifacts
       run: |
