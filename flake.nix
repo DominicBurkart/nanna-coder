@@ -903,7 +903,8 @@
 
             echo ""
             echo "💾 Local Nix Store Stats:"
-            nix store optimise --dry-run
+            echo "  Store size: $(du -sh /nix/store 2>/dev/null | cut -f1 || echo 'N/A')"
+            echo "  Optimization available: $(nix store optimise --dry-run 2>/dev/null || echo 'Command not available in this Nix version')"
 
             echo ""
             echo "🔍 Build Dependencies Analysis:"

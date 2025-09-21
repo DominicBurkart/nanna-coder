@@ -102,8 +102,8 @@ jobs:
         echo "🔄 Building test containers for caching..."
         nix build .#ollamaImage --print-build-logs
 
-        echo "📦 Loading test containers into podman..."
-        podman load -i $(nix build .#ollamaImage --print-out-paths --no-link)
+        echo "📦 Loading test containers into podman (nix2container format)..."
+        podman load < $(nix build .#ollamaImage --print-out-paths --no-link)
 
         echo "✅ Test containers ready for integration tests"
 
