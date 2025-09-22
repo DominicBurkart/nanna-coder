@@ -1498,6 +1498,59 @@
               fi
               echo "✅ Image loaded successfully"
             '') else null;
+
+          # Universal container loading utility for CI builds
+          load-container-image = if pkgs.stdenv.isLinux then
+            (pkgs.writeShellScriptBin "load-container-image" ''
+              if [ $# -eq 0 ]; then
+                echo "Usage: load-container-image <image-name> [tag]"
+                echo "Examples:"
+                echo "  load-container-image harness"
+                echo "  load-container-image ollama latest"
+                exit 1
+              fi
+
+              IMAGE_NAME="$1"
+              TAG="''${2:-latest}"
+
+              echo "📦 Loading container image: $IMAGE_NAME:$TAG"
+
+              # Handle the 'result' symlink created by nix build
+              if [ -L result ]; then
+                IMAGE_PATH=$(readlink -f result)
+                echo "📂 Image path: $IMAGE_PATH"
+
+                # Check if it's a nix2container JSON format
+                if file "$IMAGE_PATH" | grep -q "JSON"; then
+                  echo "🔧 Detected nix2container JSON format, using skopeo..."
+
+                  # Install skopeo if needed
+                  if ! command -v skopeo >/dev/null 2>&1; then
+                    echo "📥 Installing skopeo..."
+                    nix-env -iA nixpkgs.skopeo
+                  fi
+
+                  # Load using skopeo for JSON format
+                  skopeo copy "nix:$IMAGE_PATH" "docker-daemon:ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG"
+                  echo "✅ JSON image loaded via skopeo"
+                else
+                  echo "🔧 Detected tar format, using docker load..."
+                  # Traditional tar format
+                  docker load < "$IMAGE_PATH"
+                  echo "✅ Tar image loaded via docker load"
+                fi
+              else
+                echo "❌ Error: 'result' symlink not found"
+                echo "Run 'nix build' first to create the image"
+                exit 1
+              fi
+
+              echo "🏷️ Tagging image as: ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG"
+              # Tag the loaded image appropriately for registry push
+              docker tag "ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG" "ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG" 2>/dev/null || true
+
+              echo "✅ Container image $IMAGE_NAME:$TAG ready for push"
+            '') else null;
         }
       );
     };

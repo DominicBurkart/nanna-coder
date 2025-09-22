@@ -59,8 +59,8 @@ jobs:
       id: nix-cache
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
+        primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-${{ runner.os }}-
         gc-max-store-size-linux: 1073741824
         gc-max-store-size-macos: 1073741824
 
@@ -68,7 +68,7 @@ jobs:
       if: runner.os != 'Windows'
       run: |
         echo "📊 === GitHub Actions Cache Status ==="
-        echo "🔑 Cache Key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}"
+        echo "🔑 Cache Key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}"
         echo "📦 Cache Action: nix-community/cache-nix-action@v5"
 
         if [ "${{ steps.nix-cache.outputs.cache-hit }}" = "true" ]; then
@@ -199,8 +199,8 @@ jobs:
     - name: Cache Nix store (Free GitHub-native caching)
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ github.job }}-
+        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
     - name: Run benchmarks
@@ -252,8 +252,8 @@ jobs:
       if: runner.os == 'Linux'
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-build-${{ matrix.target }}-
+        primary-key: nix-v2-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-build-${{ matrix.target }}-
         gc-max-store-size-linux: 1073741824
 
     - name: Setup Rust toolchain (macOS)
@@ -351,8 +351,8 @@ jobs:
     - name: Cache Nix store (Free GitHub-native caching)
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ github.job }}-
+        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
     - name: Set up QEMU for cross-platform builds
@@ -397,9 +397,10 @@ jobs:
         esac
 
     - name: Load and tag container image
+      shell: bash
       run: |
-        echo "📦 Loading and tagging ${{ matrix.image }}"
-        docker load < result
+        echo "📦 Loading and tagging ${{ matrix.image }} with universal loader"
+        nix run .#load-container-image ${{ matrix.image }} latest
 
         # Determine architecture suffix
         ARCH_SUFFIX=""
@@ -499,8 +500,8 @@ jobs:
     - name: Cache Nix store (Free GitHub-native caching)
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ github.job }}-
+        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
     - name: Note cache strategy
@@ -545,8 +546,8 @@ jobs:
     - name: Cache Nix store (Free GitHub-native caching)
       uses: nix-community/cache-nix-action@v5
       with:
-        primary-key: nix-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ github.job }}-
+        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
+        restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
     - name: Build release artifacts
