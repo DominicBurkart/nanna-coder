@@ -333,13 +333,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        image: [harness, ollama, qwen3-container, llama3-container]
-        exclude:
-          # Only build model containers on x86_64 for now
-          - arch: aarch64
-            image: qwen3-container
-          - arch: aarch64
-            image: llama3-container
+        image: [harness, ollama]
 
     steps:
     - name: Checkout code
