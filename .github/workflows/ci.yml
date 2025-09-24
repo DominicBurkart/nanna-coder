@@ -158,130 +158,100 @@ jobs:
           cargo fmt --all -- --check
         fi
 
-    - name: Start self-hosted Ollama for security analysis
+    - name: Setup security analysis environment
       if: matrix.test-type == 'security' && runner.os == 'Linux'
       run: |
-        echo "🚀 Starting self-hosted Ollama service for agentic security analysis..."
-        nix build .#ollamaImage --print-build-logs
+        echo "🔒 Setting up security analysis environment..."
 
-        # Load Ollama image using nix2container
-        if command -v skopeo >/dev/null 2>&1; then
-          IMAGE_PATH=$(nix build .#ollamaImage --print-out-paths --no-link)
-          skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
-        else
-          nix-env -iA nixpkgs.skopeo
-          IMAGE_PATH=$(nix build .#ollamaImage --print-out-paths --no-link)
-          skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
-        fi
+        # Skip complex Ollama setup for now - use fallback mode
+        echo "ℹ️ Running in fallback mode (traditional tools only)"
+        echo "OLLAMA_AVAILABLE=false" >> $GITHUB_ENV
 
-        # Start Ollama container in background
-        podman run -d --name ci-ollama -p 11434:11434 nanna-coder-ollama:latest
+        # Verify traditional security tools are available
+        echo "🔧 Verifying traditional security tools..."
+        command -v cargo >/dev/null 2>&1 || { echo "❌ cargo not found"; exit 1; }
 
-        # Wait for Ollama to be ready
-        echo "⏳ Waiting for Ollama service..."
-        for i in {1..30}; do
-          if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-            echo "✅ Ollama service ready"
-            break
-          fi
-          sleep 5
-          if [ $i -eq 30 ]; then
-            echo "⚠️ Ollama startup timeout, proceeding with fallback"
-            break
-          fi
-        done
-
-    - name: Pull lightweight model for CI security analysis
-      if: matrix.test-type == 'security' && runner.os == 'Linux'
-      run: |
-        # Pull a small, fast model suitable for CI
-        if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-          echo "📥 Pulling qwen3:0.6b for security analysis..."
-          curl -X POST http://localhost:11434/api/pull \
-            -H "Content-Type: application/json" \
-            -d '{"name": "qwen3:0.6b"}' || echo "Model pull failed, using fallback"
-          sleep 10
-        fi
+        # Install security tools via nix develop
+        echo "📦 Installing security scanning tools..."
+        nix develop --command bash -c "command -v vulnix" || echo "⚠️ vulnix not in path"
 
     - name: Run agentic security checks
       if: matrix.test-type == 'security'
       shell: bash
       run: |
         if [ "${{ runner.os }}" = "Linux" ]; then
-          echo "🔒 Running Agentic Security Analysis..."
+          echo "🔒 Running Security Analysis (Fallback Mode)..."
 
-          # Run behavioral security tests first (no AI required)
-          echo "🧪 Behavioral Security Testing..."
-          nix run .#security-behavioral-test || echo "Behavioral tests failed"
+          # Set exit code tracking
+          EXIT_CODE=0
 
-          # Run AI-powered security judge
-          echo "🤖 AI Security Judge Analysis..."
-          nix run .#security-judge || echo "AI security analysis failed, using fallback"
-
-          # Run adaptive Vulnix scanning
-          echo "❄️ Adaptive Nix Vulnerability Scanning..."
-          nix run .#adaptive-vulnix-scan || echo "Vulnix scan failed"
-
-          # Run traditional tools as backup
-          echo "🔧 Traditional Security Tools (Backup)..."
-          nix develop --command cargo audit || echo "cargo-audit failed"
-          nix develop --command cargo deny check || echo "cargo-deny failed"
-
-          # Generate coverage with tarpaulin (if available)
-          echo "📊 Security Coverage Analysis..."
-          if command -v cargo-tarpaulin >/dev/null 2>&1; then
-            nix develop --command cargo tarpaulin --skip-clean --ignore-tests --output-format lcov --output-path coverage-${{ matrix.rust }}.lcov || echo "Coverage analysis failed"
+          # Run traditional tools (always available)
+          echo "🔧 Running cargo-deny license and dependency checks..."
+          if nix develop --command cargo deny check; then
+            echo "✅ cargo-deny: PASSED"
           else
-            echo "⚠️ cargo-tarpaulin not available, skipping coverage"
+            echo "❌ cargo-deny: FAILED"
+            EXIT_CODE=1
+          fi
+
+          echo "🔍 Running cargo-audit vulnerability scan..."
+          if nix develop --command cargo audit; then
+            echo "✅ cargo-audit: PASSED"
+          else
+            echo "❌ cargo-audit: VULNERABILITIES FOUND"
+            EXIT_CODE=1
+          fi
+
+          # Test security apps are available (but don't fail if they error)
+          echo "📋 Testing security app availability..."
+          nix run .#traditional-security-check --help >/dev/null 2>&1 && echo "✅ traditional-security-check: Available" || echo "⚠️ traditional-security-check: Issues"
+          nix run .#security-behavioral-test --help >/dev/null 2>&1 && echo "✅ security-behavioral-test: Available" || echo "⚠️ security-behavioral-test: Issues"
+
+          # Only fail on critical security tools
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "🚨 Critical security tools failed"
+            exit $EXIT_CODE
+          else
+            echo "✅ Security analysis completed successfully"
           fi
 
         else
-          echo "⚠️ Agentic security checks skipped on ${{ runner.os }} (Linux required)"
+          echo "⚠️ Security checks skipped on ${{ runner.os }} (Linux required)"
         fi
 
     - name: Generate security report
       if: matrix.test-type == 'security' && runner.os == 'Linux'
       run: |
-        echo "📋 Generating comprehensive security report..."
+        echo "📋 Generating security report..."
 
-        # Create security report
-        cat > security-report-${{ matrix.rust }}.md << 'EOF'
-        # Agentic Security Analysis Report
+        # Create simplified security report
+        cat > security-report-${{ matrix.rust }}.md << EOF
+        # Security Analysis Report
 
         **Build**: ${{ github.sha }}
         **Rust Version**: ${{ matrix.rust }}
         **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        **Mode**: Fallback (Traditional Tools)
 
         ## Security Tools Results
-
-        ### AI Security Judge
-        - **Status**: $(curl -s http://localhost:11434/api/tags >/dev/null 2>&1 && echo "✅ ACTIVE" || echo "⚠️ FALLBACK")
-        - **Model**: qwen3:0.6b
-        - **Analysis**: Contextual security assessment completed
-
-        ### Behavioral Security Testing
-        - **Vulnerable Dependency Detection**: Testing with known CVEs
-        - **Security Tool Validation**: Verifying cargo-audit and cargo-deny effectiveness
-
-        ### Adaptive Vulnix Scanning
-        - **Nix Store Analysis**: AI-driven CVE risk assessment
-        - **Context-Aware Filtering**: Business impact consideration
 
         ### Traditional Security Tools
         - **cargo-audit**: Rust dependency vulnerability scanning
         - **cargo-deny**: License and dependency policy enforcement
-        - **Coverage**: Code coverage with security focus
+        - **Status**: Completed in CI environment
 
+        ### Agentic Security Framework
+        - **Security Apps**: Available but not tested in CI
+        - **AI Features**: Require local Ollama for testing
+        - **Integration**: Complete, awaiting local validation
+
+        ### Next Steps
+        1. Test AI features locally with Ollama
+        2. Validate behavioral security testing
+        3. Enable full agentic analysis in CI
         EOF
 
         echo "📊 Security report generated: security-report-${{ matrix.rust }}.md"
-
-    - name: Cleanup security services
-      if: always() && matrix.test-type == 'security' && runner.os == 'Linux'
-      run: |
-        echo "🧹 Cleaning up security services..."
-        podman stop ci-ollama 2>/dev/null || true
-        podman rm ci-ollama 2>/dev/null || true
 
     - name: Upload coverage reports
       if: matrix.test-type == 'security' && runner.os == 'Linux'

@@ -402,15 +402,32 @@
             fi
 
             # AI-powered security review if Ollama available
-            if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+            if curl -s -m 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
               echo "🤖 AI security analysis..."
 
-              # Get staged changes for AI analysis
+              # Get staged changes with input sanitization
               STAGED_CHANGES=$(git diff --cached)
               if [ -n "$STAGED_CHANGES" ]; then
-                SECURITY_ANALYSIS=$(echo "$STAGED_CHANGES" | curl -s -X POST http://localhost:11434/api/generate \
+                # Sanitize input - remove potential secrets before AI analysis
+                SANITIZED_CHANGES=$(echo "$STAGED_CHANGES" | \
+                  sed 's/\(password\|secret\|key\|token\)=[^ ]*/\1=***REDACTED***/gi' | \
+                  sed 's/\(["\x27][^"\x27]*\(password\|secret\|key\|token\)[^"\x27]*["'\'']\)/***REDACTED***/gi' | \
+                  head -c 4000)  # Limit input size
+
+                # Use timeout and proper JSON escaping
+                SECURITY_ANALYSIS=$(echo "$SANITIZED_CHANGES" | \
+                  python3 -c "
+import json, sys
+content = sys.stdin.read()
+payload = {
+  'model': 'qwen3:0.6b',
+  'prompt': 'You are a security engineer reviewing code changes. Look for: 1) Obvious vulnerabilities 2) Injection risks 3) Unsafe patterns. Reply SECURE if safe, or list specific issues. Do not echo back the code.\n\nCode changes:\n' + content,
+  'stream': False
+}
+print(json.dumps(payload))
+" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                   -H "Content-Type: application/json" \
-                  -d '{"model": "qwen3:0.6b", "prompt": "You are a security engineer reviewing code changes for an AI coding assistant. Analyze for: 1) Secrets/credentials 2) Injection vulnerabilities 3) Supply chain risks 4) Container security issues. Reply SECURE if safe, or list specific issues.\n\nCode changes:\n'"$STAGED_CHANGES"'", "stream": false}' 2>/dev/null | \
+                  -d @- 2>/dev/null | \
                   jq -r '.response' 2>/dev/null || echo "SECURE")
 
                 if echo "$SECURITY_ANALYSIS" | grep -qi "issue\|problem\|vulnerability\|risk\|insecure"; then
@@ -651,7 +668,7 @@
             # Wait for ollama to be ready
             echo "⏳ Waiting for Ollama server..."
             for i in {1..30}; do
-              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+              if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
                 echo "✅ Ollama server ready"
                 break
               fi
@@ -1231,8 +1248,15 @@
             echo "🔒 Agentic Security Analysis - Model-as-Judge"
             echo "============================================="
 
+            # Configurable Ollama endpoint
+            OLLAMA_HOST=''${OLLAMA_HOST:-localhost}
+            OLLAMA_PORT=''${OLLAMA_PORT:-11434}
+            OLLAMA_URL="http://$OLLAMA_HOST:$OLLAMA_PORT"
+
+            echo "🌐 Using Ollama endpoint: $OLLAMA_URL"
+
             # Check if Ollama is running
-            if ! curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+            if ! curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
               echo "⚠️  Ollama not running. Starting local Ollama server..."
               podman run -d --name security-ollama -p 11434:11434 nanna-coder-ollama:latest || {
                 echo "❌ Failed to start Ollama. Using fallback traditional tools."
@@ -1255,7 +1279,7 @@
 
             echo "📋 Analyzing cargo-deny configuration..."
             if [ -f "deny.toml" ]; then
-              DENY_ANALYSIS=$(cat deny.toml | curl -s -X POST http://localhost:11434/api/generate \
+              DENY_ANALYSIS=$(cat deny.toml | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                 -H "Content-Type: application/json" \
                 -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$SECURITY_PROMPT\n\nCargo-deny configuration:\n$(cat deny.toml)\", \"stream\": false}" | \
                 jq -r '.response')
@@ -1278,7 +1302,7 @@
               # Extract security-relevant parts of flake.nix
               SECURITY_EXTRACT=$(grep -A 5 -B 5 -i "security\|vulnix\|audit\|openssl\|cacert" flake.nix | head -50)
 
-              NIX_ANALYSIS=$(echo "$SECURITY_EXTRACT" | curl -s -X POST http://localhost:11434/api/generate \
+              NIX_ANALYSIS=$(echo "$SECURITY_EXTRACT" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                 -H "Content-Type: application/json" \
                 -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$SECURITY_PROMPT\n\nNix security configuration:\n$SECURITY_EXTRACT\", \"stream\": false}" | \
                 jq -r '.response')
@@ -1355,7 +1379,7 @@
             fi
 
             # AI analysis of test results
-            if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+            if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
               echo "🤖 AI Analysis of behavioral test results..."
 
               TEST_RESULTS="Behavioral Security Test Results:
@@ -1363,7 +1387,7 @@
               - cargo-deny blocking: $DENY_PASS/1
               - Test dependencies: openssl 0.10.64 (known CVE-2024-6119)"
 
-              AI_ANALYSIS=$(echo "$TEST_RESULTS" | curl -s -X POST http://localhost:11434/api/generate \
+              AI_ANALYSIS=$(echo "$TEST_RESULTS" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                 -H "Content-Type: application/json" \
                 -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"Analyze these security tool test results. What do they tell us about real-world protection? What are the implications for an AI coding assistant project?\n\n$TEST_RESULTS\", \"stream\": false}" | \
                 jq -r '.response')
@@ -1398,6 +1422,11 @@
             echo "🎯 AI-Driven Threat Model Analysis"
             echo "=================================="
 
+            # Configurable Ollama endpoint
+            OLLAMA_HOST=''${OLLAMA_HOST:-localhost}
+            OLLAMA_PORT=''${OLLAMA_PORT:-11434}
+            OLLAMA_URL="http://$OLLAMA_HOST:$OLLAMA_PORT"
+
             # Check for git changes to analyze
             if git rev-parse --git-dir > /dev/null 2>&1; then
               echo "📊 Analyzing recent code changes for threat model updates..."
@@ -1419,7 +1448,7 @@
               Container Images: harness, ollama, model containers
               Network Exposure: HTTP API (port 8080), Ollama API (port 11434)"
 
-              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+              if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
                 echo "🤖 AI Threat Model Analysis..."
 
                 THREAT_PROMPT="You are a cybersecurity expert analyzing an AI coding assistant project.
@@ -1434,7 +1463,7 @@
 
                 Focus on threats specific to an AI coding assistant that processes user code."
 
-                THREAT_ANALYSIS=$(echo "$THREAT_SURFACE" | curl -s -X POST http://localhost:11434/api/generate \
+                THREAT_ANALYSIS=$(echo "$THREAT_SURFACE" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                   -H "Content-Type: application/json" \
                   -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$THREAT_PROMPT\n\nProject Information:\n$THREAT_SURFACE\", \"stream\": false}" | \
                   jq -r '.response')
@@ -1464,6 +1493,11 @@
             echo "📊 Dependency Risk Profiling"
             echo "============================"
 
+            # Configurable Ollama endpoint
+            OLLAMA_HOST=''${OLLAMA_HOST:-localhost}
+            OLLAMA_PORT=''${OLLAMA_PORT:-11434}
+            OLLAMA_URL="http://$OLLAMA_HOST:$OLLAMA_PORT"
+
             # Analyze Cargo dependencies
             if [ -f "Cargo.toml" ]; then
               echo "🦀 Analyzing Rust dependencies..."
@@ -1471,7 +1505,7 @@
               # Extract dependencies with versions
               RUST_DEPS=$(grep -A 100 "\\[dependencies\\]" Cargo.toml | grep -E "^[a-zA-Z0-9_-]+ =" | head -20)
 
-              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+              if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
                 RISK_PROMPT="You are a security expert analyzing software dependencies for risk.
 
                 For each dependency, assess:
@@ -1483,7 +1517,7 @@
 
                 Provide risk ratings (LOW/MEDIUM/HIGH) with justification."
 
-                RUST_RISK_ANALYSIS=$(echo "$RUST_DEPS" | curl -s -X POST http://localhost:11434/api/generate \
+                RUST_RISK_ANALYSIS=$(echo "$RUST_DEPS" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                   -H "Content-Type: application/json" \
                   -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$RISK_PROMPT\n\nRust Dependencies:\n$RUST_DEPS\", \"stream\": false}" | \
                   jq -r '.response')
@@ -1501,8 +1535,8 @@
               # Extract key Nix packages
               NIX_PACKAGES=$(grep -E "(pkgs\\.|inputs\\.|url =)" flake.nix | head -20)
 
-              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-                NIX_RISK_ANALYSIS=$(echo "$NIX_PACKAGES" | curl -s -X POST http://localhost:11434/api/generate \
+              if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+                NIX_RISK_ANALYSIS=$(echo "$NIX_PACKAGES" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                   -H "Content-Type: application/json" \
                   -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$RISK_PROMPT\n\nNix Dependencies/Inputs:\n$NIX_PACKAGES\", \"stream\": false}" | \
                   jq -r '.response')
@@ -1524,6 +1558,11 @@
           adaptive-vulnix-scan = pkgs.writeShellScriptBin "adaptive-vulnix-scan" ''
             echo "🔧 Adaptive Vulnix Security Scanning"
             echo "===================================="
+
+            # Configurable Ollama endpoint
+            OLLAMA_HOST=''${OLLAMA_HOST:-localhost}
+            OLLAMA_PORT=''${OLLAMA_PORT:-11434}
+            OLLAMA_URL="http://$OLLAMA_HOST:$OLLAMA_PORT"
 
             # Create adaptive vulnix configuration
             VULNIX_CONFIG=$(mktemp)
@@ -1558,7 +1597,7 @@
               echo "$VULNIX_OUTPUT"
 
               # AI analysis of vulnix output if available
-              if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+              if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
                 echo ""
                 echo "🤖 AI Analysis of Vulnix Results..."
 
@@ -1574,7 +1613,7 @@
 
                 Focus on practical risk assessment, not just CVSS scores."
 
-                AI_VULNIX_ANALYSIS=$(echo "$VULNIX_OUTPUT" | curl -s -X POST http://localhost:11434/api/generate \
+                AI_VULNIX_ANALYSIS=$(echo "$VULNIX_OUTPUT" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                   -H "Content-Type: application/json" \
                   -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$VULNIX_PROMPT\n\nVulnix Output:\n$VULNIX_OUTPUT\", \"stream\": false}" | \
                   jq -r '.response')
@@ -1650,6 +1689,11 @@
             echo "🔐 Nix Store Provenance Validation"
             echo "=================================="
 
+            # Configurable Ollama endpoint
+            OLLAMA_HOST=''${OLLAMA_HOST:-localhost}
+            OLLAMA_PORT=''${OLLAMA_PORT:-11434}
+            OLLAMA_URL="http://$OLLAMA_HOST:$OLLAMA_PORT"
+
             # Check flake lock for suspicious changes
             if [ -f "flake.lock" ]; then
               echo "🔍 Analyzing flake.lock for provenance..."
@@ -1663,7 +1707,7 @@
                   echo "$LOCK_CHANGES" | head -20
 
                   # AI analysis of lock changes if available
-                  if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+                  if curl -s -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
                     echo ""
                     echo "🤖 AI Analysis of Provenance Changes..."
 
@@ -1677,7 +1721,7 @@
 
                     Reply TRUSTED if changes look legitimate, or SUSPICIOUS with specific concerns."
 
-                    PROVENANCE_ANALYSIS=$(echo "$LOCK_CHANGES" | curl -s -X POST http://localhost:11434/api/generate \
+                    PROVENANCE_ANALYSIS=$(echo "$LOCK_CHANGES" | timeout 60 curl -s -X POST "$OLLAMA_URL/api/generate" \
                       -H "Content-Type: application/json" \
                       -d "{\"model\": \"qwen3:0.6b\", \"prompt\": \"$PROVENANCE_PROMPT\n\nFlake Lock Changes:\n$LOCK_CHANGES\", \"stream\": false}" | \
                       jq -r '.response')
