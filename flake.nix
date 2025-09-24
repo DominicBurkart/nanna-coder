@@ -1530,9 +1530,17 @@
                     nix-env -iA nixpkgs.skopeo
                   fi
 
-                  # Load using skopeo for JSON format
-                  skopeo copy "nix:$IMAGE_PATH" "docker-daemon:ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG"
-                  echo "✅ JSON image loaded via skopeo"
+                  # Use docker load with nix2container images (they are OCI compatible)
+                  docker load < "$IMAGE_PATH" 2>/dev/null || {
+                    echo "⚠️ Docker load failed, trying nix2container-specific approach..."
+                    # For nix2container, we need to use the image name from the JSON
+                    IMAGE_ID=$(docker import "$IMAGE_PATH" 2>/dev/null) || {
+                      echo "❌ Failed to import nix2container image"
+                      exit 1
+                    }
+                    echo "✅ Imported image with ID: $IMAGE_ID"
+                  }
+                  echo "✅ JSON image loaded successfully"
                 else
                   echo "🔧 Detected tar format, using docker load..."
                   # Traditional tar format
@@ -1545,9 +1553,16 @@
                 exit 1
               fi
 
-              echo "🏷️ Tagging image as: ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG"
+              # Convert repository name to lowercase for Docker compatibility
+              REPO_NAME="dominicburkart/nanna-coder"
+              echo "🏷️ Tagging image as: ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG"
+
               # Tag the loaded image appropriately for registry push
-              docker tag "ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG" "ghcr.io/dominicburkart/nanna-coder/$IMAGE_NAME:$TAG" 2>/dev/null || true
+              docker tag "$IMAGE_NAME:$TAG" "ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG" 2>/dev/null || {
+                echo "⚠️ Direct tag failed, trying to find loaded image..."
+                # Find the loaded image by name pattern and tag it
+                docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "(nanna-coder|$IMAGE_NAME)" | head -1 | xargs -I {} docker tag {} "ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG"
+              }
 
               echo "✅ Container image $IMAGE_NAME:$TAG ready for push"
             '') else null;
