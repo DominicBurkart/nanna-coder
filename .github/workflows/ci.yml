@@ -195,6 +195,8 @@ jobs:
           fi
 
           echo "🔍 Running cargo-audit vulnerability scan..."
+          # Clean advisory database to avoid git clone conflicts in CI
+          rm -rf ~/.cargo/advisory-db
           if nix develop --command cargo audit; then
             echo "✅ cargo-audit: PASSED"
           else
