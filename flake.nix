@@ -411,7 +411,7 @@
                 # Sanitize input - remove potential secrets before AI analysis
                 SANITIZED_CHANGES=$(echo "$STAGED_CHANGES" | \
                   sed 's/\(password\|secret\|key\|token\)=[^ ]*/\1=***REDACTED***/gi' | \
-                  sed 's/\(["\x27][^"\x27]*\(password\|secret\|key\|token\)[^"\x27]*["'\'']\)/***REDACTED***/gi' | \
+                  sed 's/["'"'"'][^"'"'"']*\(password\|secret\|key\|token\)[^"'"'"']*["'"'"']/***REDACTED***/gi' | \
                   head -c 4000)  # Limit input size
 
                 # Use timeout and proper JSON escaping
