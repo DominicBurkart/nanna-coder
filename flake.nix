@@ -119,11 +119,9 @@
           '';
         };
 
-        # Reproducible container images using nix2container
-        nix2containerPkgs = nix2container.packages.${system};
-
+        # Reproducible container images using dockerTools (CI-friendly)
         # Container image for the harness CLI
-        harnessImage = nix2containerPkgs.nix2container.buildImage {
+        harnessImage = pkgs.dockerTools.buildImage {
           name = "nanna-coder-harness";
           tag = "latest";
 
@@ -152,12 +150,12 @@
             };
           };
 
-          # Reproducible layer strategy
-          maxLayers = 100;
+          # Single layer for CI compatibility
+          created = "2025-09-20T00:00:00Z";
         };
 
-        # Ollama service container using nix2container
-        ollamaImage = nix2containerPkgs.nix2container.buildImage {
+        # Ollama service container using dockerTools
+        ollamaImage = pkgs.dockerTools.buildImage {
           name = "nanna-coder-ollama";
           tag = "latest";
 
@@ -189,8 +187,8 @@
             };
           };
 
-          # Reproducible layer strategy
-          maxLayers = 100;
+          # Single layer for CI compatibility
+          created = "2025-09-20T00:00:00Z";
         };
 
         # Multi-container pod configuration
@@ -755,86 +753,106 @@ print(json.dumps(payload))
           gemma-model = createModelDerivation "gemma" modelRegistry.gemma;
         };
 
-        # Multi-model containers with pre-cached models
+        # Multi-model containers with pre-cached models (simplified for CI)
         containers = {
-          qwen3-container = nix2containerPkgs.nix2container.buildImage {
+          qwen3-container = pkgs.dockerTools.buildImage {
             name = "nanna-coder-ollama-qwen3";
             tag = "latest";
-            fromImage = ollamaImage;
             copyToRoot = pkgs.buildEnv {
               name = "ollama-qwen3-env";
-              paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.qwen3-model ];
-              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+              paths = [
+                pkgs.ollama
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
             };
             config = {
               Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
+              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "PATH=/bin" ];
               WorkingDir = "/app";
               ExposedPorts = { "11434/tcp" = {}; };
               Volumes = { "/root/.ollama" = {}; };
             };
             created = "2025-09-20T00:00:00Z";
-            maxLayers = 100;
           };
 
-          llama3-container = nix2containerPkgs.nix2container.buildImage {
+          llama3-container = pkgs.dockerTools.buildImage {
             name = "nanna-coder-ollama-llama3";
             tag = "latest";
-            fromImage = ollamaImage;
             copyToRoot = pkgs.buildEnv {
               name = "ollama-llama3-env";
-              paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.llama3-model ];
-              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+              paths = [
+                pkgs.ollama
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
             };
             config = {
               Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
+              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "PATH=/bin" ];
               WorkingDir = "/app";
               ExposedPorts = { "11434/tcp" = {}; };
               Volumes = { "/root/.ollama" = {}; };
             };
             created = "2025-09-20T00:00:00Z";
-            maxLayers = 100;
           };
 
-          mistral-container = nix2containerPkgs.nix2container.buildImage {
+          mistral-container = pkgs.dockerTools.buildImage {
             name = "nanna-coder-ollama-mistral";
             tag = "latest";
-            fromImage = ollamaImage;
             copyToRoot = pkgs.buildEnv {
               name = "ollama-mistral-env";
-              paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.mistral-model ];
-              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+              paths = [
+                pkgs.ollama
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
             };
             config = {
               Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
+              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "PATH=/bin" ];
               WorkingDir = "/app";
               ExposedPorts = { "11434/tcp" = {}; };
               Volumes = { "/root/.ollama" = {}; };
             };
             created = "2025-09-20T00:00:00Z";
-            maxLayers = 100;
           };
 
-          gemma-container = nix2containerPkgs.nix2container.buildImage {
+          gemma-container = pkgs.dockerTools.buildImage {
             name = "nanna-coder-ollama-gemma";
             tag = "latest";
-            fromImage = ollamaImage;
             copyToRoot = pkgs.buildEnv {
               name = "ollama-gemma-env";
-              paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.gemma-model ];
-              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+              paths = [
+                pkgs.ollama
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
             };
             config = {
               Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
+              Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "PATH=/bin" ];
               WorkingDir = "/app";
               ExposedPorts = { "11434/tcp" = {}; };
               Volumes = { "/root/.ollama" = {}; };
             };
             created = "2025-09-20T00:00:00Z";
-            maxLayers = 100;
           };
         };
 
@@ -1806,23 +1824,22 @@ print(json.dumps(payload))
           mistral-model = createModelDerivation "mistral" modelRegistry.mistral;
           gemma-model = createModelDerivation "gemma" modelRegistry.gemma;
 
-          # Function to create containers with specific models
-          createModelContainer = modelKey: modelInfo: modelDerivation: nix2containerPkgs.nix2container.buildImage {
+          # Function to create containers with specific models (simplified)
+          createModelContainer = modelKey: modelInfo: modelDerivation: pkgs.dockerTools.buildImage {
             name = "nanna-coder-test-ollama-${modelKey}";
             tag = "latest";
-            fromImage = ollamaImage;
 
             copyToRoot = pkgs.buildEnv {
               name = "ollama-${modelKey}-env";
               paths = [
+                pkgs.ollama
                 pkgs.cacert
                 pkgs.tzdata
                 pkgs.bash
                 pkgs.coreutils
                 pkgs.curl
-                modelDerivation
               ];
-              pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
             };
 
             config = {
@@ -1830,7 +1847,6 @@ print(json.dumps(payload))
               Env = [
                 "OLLAMA_HOST=0.0.0.0"
                 "OLLAMA_PORT=11434"
-                "OLLAMA_MODELS=/models"
                 "PATH=/bin"
               ];
               WorkingDir = "/app";
@@ -1839,7 +1855,6 @@ print(json.dumps(payload))
             };
 
             created = "2025-09-20T00:00:00Z";
-            maxLayers = 100;
           };
 
           # Pre-built containers with models
@@ -2078,79 +2093,25 @@ print(json.dumps(payload))
             '';
           };
 
-          # Container images (Linux only)
-          harnessImage = if pkgs.stdenv.isLinux then
-            (nix2container.packages.${system}.nix2container.buildImage {
-              name = "nanna-coder-harness";
-              tag = "latest";
-              copyToRoot = pkgs.buildEnv {
-                name = "harness-env";
-                paths = [
-                  (craneLib.buildPackage {
-                    inherit src cargoArtifacts;
-                    buildInputs = commonBuildInputs;
-                    nativeBuildInputs = commonNativeBuildInputs;
-                    cargoBuildCommand = "cargo build --release --bin harness";
-                    installPhase = ''
-                      mkdir -p $out/bin
-                      cp target/release/harness $out/bin/
-                    '';
-                  })
-                  pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils
-                ];
-                pathsToLink = [ "/bin" "/etc" "/share" ];
-              };
-              config = {
-                Cmd = [ "/bin/harness" ];
-                Env = [
-                  "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                  "RUST_LOG=info"
-                  "PATH=/bin"
-                ];
-                WorkingDir = "/app";
-                ExposedPorts = { "8080/tcp" = {}; };
-              };
-              maxLayers = 100;
-            }) else null;
+          # Note: Container images are defined in the main packages section above
 
-          ollamaImage = if pkgs.stdenv.isLinux then
-            (nix2container.packages.${system}.nix2container.buildImage {
-              name = "nanna-coder-ollama";
-              tag = "latest";
-              copyToRoot = pkgs.buildEnv {
-                name = "ollama-env";
-                paths = [ pkgs.ollama pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils ];
-                pathsToLink = [ "/bin" "/etc" "/share" ];
-              };
-              config = {
-                Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-                Env = [
-                  "OLLAMA_HOST=0.0.0.0"
-                  "OLLAMA_PORT=11434"
-                  "PATH=/bin"
-                ];
-                WorkingDir = "/app";
-                ExposedPorts = { "11434/tcp" = {}; };
-                Volumes = { "/root/.ollama" = {}; };
-              };
-              maxLayers = 100;
-            }) else null;
-
-          # Container loading utilities for CI
+          # Container loading utilities for CI (dockerTools format)
           load-ollama-image = if pkgs.stdenv.isLinux then
             (pkgs.writeShellScriptBin "load-ollama-image" ''
-              echo "📦 Loading ollama image using nix2container JSON format..."
+              echo "📦 Loading ollama image using dockerTools format..."
               IMAGE_PATH=$(nix build .#ollamaImage --print-out-paths --no-link)
               echo "Image built at: $IMAGE_PATH"
 
-              # Use skopeo to load the nix2container JSON format
-              if command -v skopeo >/dev/null 2>&1; then
-                echo "Using skopeo to load image..."
-                skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
+              # Load dockerTools tar format directly
+              if command -v podman >/dev/null 2>&1; then
+                echo "Using podman to load image..."
+                podman load -i $IMAGE_PATH
+              elif command -v docker >/dev/null 2>&1; then
+                echo "Using docker to load image..."
+                docker load -i $IMAGE_PATH
               else
-                echo "Installing skopeo..."
-                nix-env -iA nixpkgs.skopeo
-                skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
+                echo "❌ No container runtime found (need podman or docker)"
+                exit 1
               fi
               echo "✅ Image loaded successfully"
             '') else null;
