@@ -2070,17 +2070,8 @@ print(json.dumps(payload))
             nativeBuildInputs = commonNativeBuildInputs;
           };
         in
-        {
-          nanna-coder = craneLib.buildPackage {
-            inherit src cargoArtifacts;
-            buildInputs = commonBuildInputs;
-            nativeBuildInputs = commonNativeBuildInputs;
-            cargoBuildCommand = "cargo build --workspace --release";
-            cargoCheckCommand = "cargo check --workspace";
-            cargoTestCommand = "cargo test --workspace";
-          };
-
-          harness = craneLib.buildPackage {
+        (let
+          harnessPkg = craneLib.buildPackage {
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
@@ -2092,8 +2083,79 @@ print(json.dumps(payload))
               cp target/release/harness $out/bin/
             '';
           };
+        in {
+          nanna-coder = craneLib.buildPackage {
+            inherit src cargoArtifacts;
+            buildInputs = commonBuildInputs;
+            nativeBuildInputs = commonNativeBuildInputs;
+            cargoBuildCommand = "cargo build --workspace --release";
+            cargoCheckCommand = "cargo check --workspace";
+            cargoTestCommand = "cargo test --workspace";
+          };
 
-          # Note: Container images are defined in the main packages section above
+          harness = harnessPkg;
+
+          # Container images (Linux only) - redefine for cross-platform support
+          harnessImage = if pkgs.stdenv.isLinux then pkgs.dockerTools.buildImage {
+            name = "nanna-coder-harness";
+            tag = "latest";
+            copyToRoot = pkgs.buildEnv {
+              name = "harness-env";
+              paths = [
+                harnessPkg
+                pkgs.cacert  # For HTTPS requests
+                pkgs.tzdata  # Timezone data
+                pkgs.bash    # Shell for debugging
+                pkgs.coreutils # Basic utilities
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
+            };
+            config = {
+              Cmd = [ "${harnessPkg}/bin/harness" ];
+              Env = [
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+                "RUST_LOG=info"
+                "PATH=/bin"
+              ];
+              WorkingDir = "/app";
+              ExposedPorts = {
+                "8080/tcp" = {};
+              };
+            };
+            created = "2025-09-20T00:00:00Z";
+          } else null;
+
+          ollamaImage = if pkgs.stdenv.isLinux then pkgs.dockerTools.buildImage {
+            name = "nanna-coder-ollama";
+            tag = "latest";
+            copyToRoot = pkgs.buildEnv {
+              name = "ollama-env";
+              paths = [
+                pkgs.ollama
+                pkgs.cacert
+                pkgs.tzdata
+                pkgs.bash
+                pkgs.coreutils
+              ];
+              pathsToLink = [ "/bin" "/etc" "/share" ];
+            };
+            config = {
+              Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
+              Env = [
+                "OLLAMA_HOST=0.0.0.0"
+                "OLLAMA_PORT=11434"
+                "PATH=/bin"
+              ];
+              WorkingDir = "/app";
+              ExposedPorts = {
+                "11434/tcp" = {};
+              };
+              Volumes = {
+                "/root/.ollama" = {};
+              };
+            };
+            created = "2025-09-20T00:00:00Z";
+          } else null;
 
           # Container loading utilities for CI (dockerTools format)
           load-ollama-image = if pkgs.stdenv.isLinux then
@@ -2115,7 +2177,7 @@ print(json.dumps(payload))
               fi
               echo "✅ Image loaded successfully"
             '') else null;
-        }
+        })
       );
     };
 }
