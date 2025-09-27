@@ -54,39 +54,8 @@ jobs:
       if: runner.os != 'Windows'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      if: runner.os != 'Windows'
-      id: nix-cache
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ runner.os }}-
-        gc-max-store-size-linux: 1073741824
-        gc-max-store-size-macos: 1073741824
 
-    - name: GitHub Actions Cache Status
-      if: runner.os != 'Windows'
-      run: |
-        echo "📊 === GitHub Actions Cache Status ==="
-        echo "🔑 Cache Key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}"
-        echo "📦 Cache Action: nix-community/cache-nix-action@v5"
 
-        if [ "${{ steps.nix-cache.outputs.cache-hit }}" = "true" ]; then
-          echo "✅ CACHE HIT: Dependencies restored from GitHub Actions cache"
-          echo "🚀 Build performance: OPTIMIZED"
-        elif [ "${{ steps.nix-cache.outputs.cache-hit }}" = "false" ]; then
-          echo "⚠️ CACHE MISS: Building dependencies from scratch"
-          echo "🐌 Build performance: Initial run (next run will be faster)"
-        else
-          echo "🔍 Cache status: Unknown (action may not support cache-hit output)"
-        fi
-
-    - name: Note cache strategy
-      if: runner.os != 'Windows'
-      run: |
-        echo "📦 Using cache-nix-action for free GitHub-native Nix caching"
-        echo "🔄 Cache storage: GitHub Actions cache (10GB limit per repo)"
-        echo "⚡ Migrated from deprecated Magic Nix Cache and Cachix"
 
     - name: Setup Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -111,9 +80,6 @@ jobs:
           cargo install cargo-tarpaulin
         fi
 
-    - name: Optimize CI cache settings (Nix)
-      if: runner.os == 'Linux'
-      run: nix run .#ci-cache-optimize
 
     - name: Pre-build test containers (Integration tests only)
       if: matrix.test-type == 'integration' && runner.os == 'Linux'
@@ -179,9 +145,6 @@ jobs:
         fail_ci_if_error: false
         flags: ${{ matrix.rust }}
 
-    - name: Cache analytics and performance metrics
-      if: always() && runner.os == 'Linux'
-      run: nix run .#cache-analytics
 
   # Parallel performance benchmarking (temporarily disabled - no benchmarks configured)
   benchmark:
@@ -196,12 +159,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
 
     - name: Run benchmarks
       run: |
@@ -248,13 +205,6 @@ jobs:
       if: runner.os == 'Linux'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache (Linux)
-      if: runner.os == 'Linux'
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-build-${{ matrix.target }}-
-        gc-max-store-size-linux: 1073741824
 
     - name: Setup Rust toolchain (macOS)
       if: runner.os == 'macOS'
@@ -342,12 +292,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
 
     - name: Set up QEMU for cross-platform builds
       if: matrix.arch == 'aarch64'
@@ -478,38 +422,6 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
 
-  cache-maintenance:
-    name: Cache Maintenance
-    runs-on: ubuntu-latest
-    needs: [test-matrix, build-matrix, build-containers]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Nix
-      uses: DeterminateSystems/nix-installer-action@main
-
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
-
-    - name: Note cache strategy
-      run: |
-        echo "📦 Using cache-nix-action for all binary caching"
-        echo "🔄 Cache managed automatically by GitHub Actions"
-        echo "✅ No external binary cache services required"
-
-    - name: Cache analytics and reporting
-      run: |
-        echo "## 📊 Binary Cache Performance Report" >> $GITHUB_STEP_SUMMARY
-        echo "Generated: $(date)" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        nix run .#cache-analytics >> $GITHUB_STEP_SUMMARY
 
   # Parallel multi-platform release builds
   release:
@@ -537,12 +449,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
 
     - name: Build release artifacts
       run: |

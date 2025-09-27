@@ -18,13 +18,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-debug-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-debug-${{ github.job }}-
-        gc-before-save: true
-        gc-max-store-size-linux: 1073741824
 
     - name: Test Nix flake evaluation
       run: |
@@ -47,8 +40,6 @@ jobs:
     - name: Test CI command availability
       run: |
         echo "⚡ Testing CI commands..."
-        nix run .#ci-cache-optimize --help || echo "ci-cache-optimize available"
-        nix run .#cache-analytics --help || echo "cache-analytics available"
         nix run .#container-test --help || echo "container-test available"
         echo "✅ CI commands available"
 
@@ -63,13 +54,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-debug-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-debug-${{ github.job }}-
-        gc-before-save: true
-        gc-max-store-size-linux: 1073741824
 
     - name: Test with GitHub cache setup
       run: |
@@ -77,11 +61,6 @@ jobs:
         nix build .#nanna-coder --no-link
         echo "✅ GitHub cache integration working"
 
-    - name: Test CI optimization commands
-      run: |
-        echo "⚡ Testing CI optimization..."
-        nix run .#ci-cache-optimize
-        echo "✅ CI optimization successful"
 
   debug-nix-containers:
     name: Debug Nix Container Builds
@@ -94,13 +73,6 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-debug-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-debug-${{ github.job }}-
-        gc-before-save: true
-        gc-max-store-size-linux: 1073741824
 
     - name: Test container image builds
       run: |
@@ -125,18 +97,7 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: nix-debug-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-debug-${{ github.job }}-
-        gc-before-save: true
-        gc-max-store-size-linux: 1073741824
 
-    - name: Note cache strategy
-      run: |
-        echo "📦 Using cache-nix-action for GitHub-native caching"
-        echo "🔄 No external binary cache dependencies"
 
     - name: Run single test matrix job (stable, ubuntu, unit)
       run: |
@@ -144,8 +105,3 @@ jobs:
         nix develop --command cargo nextest run --workspace --lib
         echo "✅ Single matrix job successful"
 
-    - name: Test cache analytics
-      run: |
-        echo "📊 Testing cache analytics..."
-        nix run .#cache-analytics
-        echo "✅ Cache analytics successful"
