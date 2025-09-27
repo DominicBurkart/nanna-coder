@@ -111,7 +111,7 @@ jobs:
     - name: Test model containers
       run: |
         echo "🤖 Testing model containers..."
-        nix build .#qwen3-model --no-link
+        nix build .#ollamaImage --no-link
         echo "✅ Model container build successful"
 
   debug-enterprise-single-job:
