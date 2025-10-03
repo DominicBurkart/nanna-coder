@@ -22,8 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         rust: [stable, beta]
-        test-type: [unit, integration, lint]
-        # security: temporarily disabled due to incomplete tarpaulin implementation
+        test-type: [unit, integration, lint, security]
         include:
           # Add Windows for stable Rust only
           - os: windows-latest
@@ -40,11 +39,11 @@ jobs:
           # Skip integration tests on macOS (no container support)
           - os: macos-latest
             test-type: integration
-          # Security tests temporarily disabled (incomplete tarpaulin implementation)
-          # - os: macos-latest
-          #   test-type: security
-          # - os: windows-latest
-          #   test-type: security
+          # Skip security tests on macOS and Windows (Linux only)
+          - os: macos-latest
+            test-type: security
+          - os: windows-latest
+            test-type: security
 
     steps:
     - name: Checkout code
