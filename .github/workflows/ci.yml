@@ -165,7 +165,7 @@ jobs:
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo audit
           nix develop --command cargo deny check
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --output-format lcov --output-path coverage-${{ matrix.rust }}.lcov
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir .
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
@@ -174,7 +174,7 @@ jobs:
       if: matrix.test-type == 'security' && runner.os == 'Linux'
       uses: codecov/codecov-action@v3
       with:
-        file: coverage-${{ matrix.rust }}.lcov
+        file: lcov.info
         fail_ci_if_error: false
         flags: ${{ matrix.rust }}
 
