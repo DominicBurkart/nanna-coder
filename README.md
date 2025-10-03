@@ -1,6 +1,6 @@
 # Nanna Coder
 
-A highly opnionated local coding assistant (WIP).  
+A highly opinionated local coding assistant (WIP).  
 
 ## Technologies
 - [Ollama](https://ollama.ai/)
