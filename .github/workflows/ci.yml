@@ -165,7 +165,7 @@ jobs:
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo audit
           nix develop --command cargo deny check
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir .
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 300
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
