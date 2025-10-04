@@ -10,3 +10,4 @@ repository.workspace = true
 [lib]
 
 [dependencies]
+thiserror = "1.0"
