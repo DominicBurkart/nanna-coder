@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod container;
 pub mod monitoring;
 pub mod observability;
@@ -23,3 +24,9 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{CalculatorTool, EchoTool, Tool, ToolError, ToolRegistry, ToolResult};
+
+// Export agent types
+pub use agent::{
+    AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
+    AgentState,
+};

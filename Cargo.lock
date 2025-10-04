@@ -832,6 +832,9 @@ dependencies = [
 [[package]]
 name = "image-builder"
 version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "indexmap"
