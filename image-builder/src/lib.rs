@@ -1,3 +1,10 @@
+pub mod nix_builder;
+
+pub use nix_builder::{
+    Architecture, BuildOutput, BuildSpec, CacheCleanPolicy, CacheCleanResult, CacheConfig,
+    CacheEntry, CacheWarmSpec, NixBuilder, NixBuilderError, NixBuilderResult,
+};
+
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
