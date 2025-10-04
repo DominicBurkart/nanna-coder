@@ -409,9 +409,10 @@ jobs:
         echo "Loading image using: nix run .#${NIX_ATTR}.copyToDockerDaemon"
         nix run .#${NIX_ATTR}.copyToDockerDaemon
 
-        # Tag for registry
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest
+        # Tag for registry (convert repository name to lowercase for Docker compatibility)
+        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
 
     - name: Push container images
       if: github.event_name != 'pull_request'
@@ -434,8 +435,10 @@ jobs:
             ;;
         esac
 
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest
+        # Convert repository name to lowercase for Docker compatibility
+        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
 
   security-scan:
     name: Security Scan
@@ -447,10 +450,14 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Set lowercase repository name
+      id: repo
+      run: echo "lowercase=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest
+        image-ref: ${{ env.REGISTRY }}/${{ steps.repo.outputs.lowercase }}/harness:latest
         format: 'sarif'
         output: 'trivy-results.sarif'
 
