@@ -331,7 +331,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64]  # Disabled aarch64 - cross-compilation not working
         image: [harness, ollama]
 
     steps:
@@ -348,12 +348,6 @@ jobs:
         restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
-    - name: Set up QEMU for cross-platform builds
-      if: matrix.arch == 'aarch64'
-      uses: docker/setup-qemu-action@v3
-      with:
-        platforms: arm64
-
     - name: Log in to Container Registry
       if: github.event_name != 'pull_request'
       uses: docker/login-action@v3
@@ -368,18 +362,10 @@ jobs:
 
         case "${{ matrix.image }}" in
           "harness")
-            if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              nix build .#harnessImage
-            else
-              nix build .#packages.aarch64-linux.harnessImage || nix build .#harnessImage
-            fi
+            nix build .#harnessImage
             ;;
           "ollama")
-            if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              nix build .#ollamaImage
-            else
-              nix build .#packages.aarch64-linux.ollamaImage || nix build .#ollamaImage
-            fi
+            nix build .#ollamaImage
             ;;
           "qwen3-container")
             nix build .#qwen3-container
@@ -392,49 +378,45 @@ jobs:
     - name: Load and tag container image
       shell: bash
       run: |
-        echo "📦 Loading and tagging ${{ matrix.image }} with universal loader"
-        nix run .#load-container-image ${{ matrix.image }} latest
+        echo "📦 Loading ${{ matrix.image }} container using nix2container's copyToDockerDaemon"
 
-        # Determine architecture suffix
-        ARCH_SUFFIX=""
-        if [ "${{ matrix.arch }}" = "aarch64" ]; then
-          ARCH_SUFFIX="-arm64"
-        fi
-
-        # Determine image name based on matrix.image
+        # Determine image name and nix attribute based on matrix.image
         case "${{ matrix.image }}" in
           "harness")
             IMAGE_NAME="nanna-coder-harness"
             REGISTRY_NAME="harness"
+            NIX_ATTR="harnessImage"
             ;;
           "ollama")
             IMAGE_NAME="nanna-coder-ollama"
             REGISTRY_NAME="ollama"
+            NIX_ATTR="ollamaImage"
             ;;
           "qwen3-container")
             IMAGE_NAME="nanna-coder-ollama-qwen3"
             REGISTRY_NAME="ollama-qwen3"
+            NIX_ATTR="qwen3-container"
             ;;
           "llama3-container")
             IMAGE_NAME="nanna-coder-ollama-llama3"
             REGISTRY_NAME="ollama-llama3"
+            NIX_ATTR="llama3-container"
             ;;
         esac
 
+        # Use nix2container's built-in copyToDockerDaemon helper
+        # This uses skopeo with the nix: transport that understands nix2container JSON format
+        echo "Loading image using: nix run .#${NIX_ATTR}.copyToDockerDaemon"
+        nix run .#${NIX_ATTR}.copyToDockerDaemon
+
         # Tag for registry
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}${ARCH_SUFFIX}
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest${ARCH_SUFFIX}
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest
 
     - name: Push container images
       if: github.event_name != 'pull_request'
       run: |
         echo "🚀 Pushing ${{ matrix.image }} images"
-
-        # Determine architecture suffix
-        ARCH_SUFFIX=""
-        if [ "${{ matrix.arch }}" = "aarch64" ]; then
-          ARCH_SUFFIX="-arm64"
-        fi
 
         # Determine registry name
         case "${{ matrix.image }}" in
@@ -452,8 +434,8 @@ jobs:
             ;;
         esac
 
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}${ARCH_SUFFIX}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest${ARCH_SUFFIX}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest
 
   security-scan:
     name: Security Scan
