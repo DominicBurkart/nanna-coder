@@ -22,8 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         rust: [stable, beta]
-        test-type: [unit, integration, lint]
-        # security: temporarily disabled due to incomplete tarpaulin implementation
+        test-type: [unit, integration, lint, security]
         include:
           # Add Windows for stable Rust only
           - os: windows-latest
@@ -40,11 +39,11 @@ jobs:
           # Skip integration tests on macOS (no container support)
           - os: macos-latest
             test-type: integration
-          # Security tests temporarily disabled (incomplete tarpaulin implementation)
-          # - os: macos-latest
-          #   test-type: security
-          # - os: windows-latest
-          #   test-type: security
+          # Skip security tests on macOS and Windows (Linux only)
+          - os: macos-latest
+            test-type: security
+          - os: windows-latest
+            test-type: security
 
     steps:
     - name: Checkout code
@@ -166,7 +165,7 @@ jobs:
         if [ "${{ runner.os }}" = "Linux" ]; then
           nix develop --command cargo audit
           nix develop --command cargo deny check
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --output-format lcov --output-path coverage-${{ matrix.rust }}.lcov
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 300
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
@@ -175,7 +174,7 @@ jobs:
       if: matrix.test-type == 'security' && runner.os == 'Linux'
       uses: codecov/codecov-action@v3
       with:
-        file: coverage-${{ matrix.rust }}.lcov
+        file: lcov.info
         fail_ci_if_error: false
         flags: ${{ matrix.rust }}
 
@@ -332,7 +331,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64]  # Disabled aarch64 - cross-compilation not working
         image: [harness, ollama]
 
     steps:
@@ -349,12 +348,6 @@ jobs:
         restore-prefixes-first-match: nix-v2-${{ github.job }}-
         gc-max-store-size-linux: 1073741824
 
-    - name: Set up QEMU for cross-platform builds
-      if: matrix.arch == 'aarch64'
-      uses: docker/setup-qemu-action@v3
-      with:
-        platforms: arm64
-
     - name: Log in to Container Registry
       if: github.event_name != 'pull_request'
       uses: docker/login-action@v3
@@ -369,18 +362,10 @@ jobs:
 
         case "${{ matrix.image }}" in
           "harness")
-            if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              nix build .#harnessImage
-            else
-              nix build .#packages.aarch64-linux.harnessImage || nix build .#harnessImage
-            fi
+            nix build .#harnessImage
             ;;
           "ollama")
-            if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              nix build .#ollamaImage
-            else
-              nix build .#packages.aarch64-linux.ollamaImage || nix build .#ollamaImage
-            fi
+            nix build .#ollamaImage
             ;;
           "qwen3-container")
             nix build .#qwen3-container
@@ -393,49 +378,46 @@ jobs:
     - name: Load and tag container image
       shell: bash
       run: |
-        echo "📦 Loading and tagging ${{ matrix.image }} with universal loader"
-        nix run .#load-container-image ${{ matrix.image }} latest
+        echo "📦 Loading ${{ matrix.image }} container using nix2container's copyToDockerDaemon"
 
-        # Determine architecture suffix
-        ARCH_SUFFIX=""
-        if [ "${{ matrix.arch }}" = "aarch64" ]; then
-          ARCH_SUFFIX="-arm64"
-        fi
-
-        # Determine image name based on matrix.image
+        # Determine image name and nix attribute based on matrix.image
         case "${{ matrix.image }}" in
           "harness")
             IMAGE_NAME="nanna-coder-harness"
             REGISTRY_NAME="harness"
+            NIX_ATTR="harnessImage"
             ;;
           "ollama")
             IMAGE_NAME="nanna-coder-ollama"
             REGISTRY_NAME="ollama"
+            NIX_ATTR="ollamaImage"
             ;;
           "qwen3-container")
             IMAGE_NAME="nanna-coder-ollama-qwen3"
             REGISTRY_NAME="ollama-qwen3"
+            NIX_ATTR="qwen3-container"
             ;;
           "llama3-container")
             IMAGE_NAME="nanna-coder-ollama-llama3"
             REGISTRY_NAME="ollama-llama3"
+            NIX_ATTR="llama3-container"
             ;;
         esac
 
-        # Tag for registry
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}${ARCH_SUFFIX}
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest${ARCH_SUFFIX}
+        # Use nix2container's built-in copyToDockerDaemon helper
+        # This uses skopeo with the nix: transport that understands nix2container JSON format
+        echo "Loading image using: nix run .#${NIX_ATTR}.copyToDockerDaemon"
+        nix run .#${NIX_ATTR}.copyToDockerDaemon
+
+        # Tag for registry (convert repository name to lowercase for Docker compatibility)
+        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
+        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
 
     - name: Push container images
       if: github.event_name != 'pull_request'
       run: |
         echo "🚀 Pushing ${{ matrix.image }} images"
-
-        # Determine architecture suffix
-        ARCH_SUFFIX=""
-        if [ "${{ matrix.arch }}" = "aarch64" ]; then
-          ARCH_SUFFIX="-arm64"
-        fi
 
         # Determine registry name
         case "${{ matrix.image }}" in
@@ -453,8 +435,10 @@ jobs:
             ;;
         esac
 
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:${{ github.sha }}${ARCH_SUFFIX}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${REGISTRY_NAME}:latest${ARCH_SUFFIX}
+        # Convert repository name to lowercase for Docker compatibility
+        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
 
   security-scan:
     name: Security Scan
@@ -466,10 +450,14 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Set lowercase repository name
+      id: repo
+      run: echo "lowercase=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/harness:latest
+        image-ref: ${{ env.REGISTRY }}/${{ steps.repo.outputs.lowercase }}/harness:latest
         format: 'sarif'
         output: 'trivy-results.sarif'
 
