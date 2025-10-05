@@ -72,9 +72,9 @@ let
     push-cache = pkgs.writeShellScriptBin "push-cache" ''
       echo "🚀 Pushing builds to binary cache..."
 
-      if [ -z "$CACHIX_AUTH_TOKEN" ]; then
-        echo "❌ CACHIX_AUTH_TOKEN not set. Please configure authentication."
-        echo "💡 Run: export CACHIX_AUTH_TOKEN=your_token"
+      if [ -z "$CACHIX_AUTH" ]; then
+        echo "❌ CACHIX_AUTH not set. Please configure authentication."
+        echo "💡 Run: export CACHIX_AUTH=your_token"
         exit 1
       fi
 

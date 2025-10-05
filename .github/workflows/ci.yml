@@ -58,7 +58,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
         skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
@@ -68,7 +68,7 @@ jobs:
         echo "📊 === Cachix Binary Cache Status ==="
         echo "🔑 Cache: nanna-coder.cachix.org"
         echo "📦 Cache Action: cachix/cachix-action@v15"
-        echo "🔒 Authentication: ${{ secrets.CACHIX_AUTH_TOKEN != '' && 'Configured' || 'Missing' }}"
+        echo "🔒 Authentication: ${{ secrets.CACHIX_AUTH != '' && 'Configured' || 'Missing' }}"
 
         if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
           echo "🔐 Fork PR: Read-only cache access"
@@ -191,7 +191,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Run benchmarks
@@ -244,7 +244,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Setup Rust toolchain (macOS)
@@ -337,7 +337,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
         skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
@@ -476,7 +476,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Note cache strategy
@@ -522,7 +522,7 @@ jobs:
       uses: cachix/cachix-action@v15
       with:
         name: nanna-coder
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        authToken: '${{ secrets.CACHIX_AUTH }}'
         pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Build release artifacts

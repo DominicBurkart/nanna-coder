@@ -98,13 +98,13 @@ else
     echo "✅ PASS: cache-nix-action removed from ci.yml"
 fi
 
-# Test 9: Verify CACHIX_AUTH_TOKEN is referenced in workflows
+# Test 9: Verify CACHIX_AUTH is referenced in workflows
 echo ""
-echo "Test 9: Verify workflows reference CACHIX_AUTH_TOKEN secret"
-if grep -q "CACHIX_AUTH_TOKEN" "$WORKFLOW_FILE"; then
-    echo "✅ PASS: ci.yml references CACHIX_AUTH_TOKEN"
+echo "Test 9: Verify workflows reference CACHIX_AUTH secret"
+if grep -q "CACHIX_AUTH" "$WORKFLOW_FILE"; then
+    echo "✅ PASS: ci.yml references CACHIX_AUTH"
 else
-    echo "❌ FAIL: ci.yml does not reference CACHIX_AUTH_TOKEN"
+    echo "❌ FAIL: ci.yml does not reference CACHIX_AUTH"
     exit 1
 fi
 
@@ -126,7 +126,7 @@ echo ""
 echo "Next steps:"
 echo "1. Create Cachix cache at app.cachix.org"
 echo "2. Update flake.nix with real public key"
-echo "3. Add CACHIX_AUTH_TOKEN to GitHub secrets"
+echo "3. Add CACHIX_AUTH to GitHub secrets"
 echo "4. Run workflow to test end-to-end integration"
 echo ""
 echo "See CACHIX_SETUP.md for detailed instructions"

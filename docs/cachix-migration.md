@@ -69,14 +69,14 @@ All workflows now use `cachix/cachix-action@v15`:
   uses: cachix/cachix-action@v15
   with:
     name: nanna-coder
-    authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    authToken: '${{ secrets.CACHIX_AUTH }}'
     pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
     skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 ```
 
 **Key Features:**
 - **Public read access**: Anyone can download from cache
-- **Authenticated push**: Only CI with `CACHIX_AUTH_TOKEN` can upload
+- **Authenticated push**: Only CI with `CACHIX_AUTH` can upload
 - **Fork protection**: Forks read but don't push (security)
 - **Push filter**: Excludes source tarballs to save bandwidth
 
@@ -171,7 +171,7 @@ pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 ### Authentication
 
 **CI Push Access:**
-- Requires `CACHIX_AUTH_TOKEN` secret
+- Requires `CACHIX_AUTH` secret
 - Only configured in repository settings
 - Not accessible to fork PRs
 
@@ -245,7 +245,7 @@ nix run .#setup-cache
 **Symptom:** CI builds successfully but cache not updated
 
 **Check:**
-1. Is `CACHIX_AUTH_TOKEN` secret configured?
+1. Is `CACHIX_AUTH` secret configured?
 2. Is job running on main branch (not fork PR)?
 3. Check CI logs for "Pushing to cache" messages
 
@@ -254,7 +254,7 @@ nix run .#setup-cache
 # In CI workflow, add diagnostic step:
 - name: Debug Cachix
   run: |
-    echo "Auth token configured: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}"
+    echo "Auth token configured: ${{ secrets.CACHIX_AUTH != '' }}"
     echo "Is fork PR: ${{ github.event.pull_request.head.repo.fork }}"
 ```
 
@@ -310,7 +310,7 @@ nix run .#setup-cache
 - [x] Create Cachix cache at app.cachix.org
 - [x] Obtain public signing key
 - [x] Update flake.nix with real public key
-- [x] Add CACHIX_AUTH_TOKEN to GitHub secrets
+- [x] Add CACHIX_AUTH to GitHub secrets
 - [x] Update all workflows to use cachix-action@v15
 - [x] Remove cache-nix-action references
 - [x] Test cache in CI

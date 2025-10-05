@@ -22,9 +22,6 @@ A highly opinionated local coding assistant (WIP).
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
 
-# Optional: Configure Cachix for faster builds
-nix run .#setup-cache
-
 # Enter development environment
 nix develop
 
@@ -34,10 +31,11 @@ nix build
 
 ### Using Cachix (Optional but Recommended)
 
-Cachix provides unlimited binary cache storage for faster builds. See [CACHIX_SETUP.md](CACHIX_SETUP.md) for setup instructions.
+Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
 
-**Benefits:**
-- ✅ Unlimited storage (vs GitHub's 10GB limit)
-- ✅ Persistent cache across all CI runs
-- ✅ Shared cache between CI and local development
-- ✅ Dramatically faster builds (download vs rebuild)
+```bash
+# Configure Cachix for faster builds (read-only access)
+nix run .#setup-cache
+```
+
+See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
