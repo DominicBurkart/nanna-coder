@@ -251,13 +251,14 @@ let
       echo "🧪 Running containerized tests..."
 
       echo "🐳 Starting test containers..."
-      nix build .#qwen3-container --no-link
+      nix build .#ollamaImage --no-link
 
-      # Load and start test container
+      # Load and start test container using nix2container's copyToDockerDaemon
       echo "📦 Loading test container..."
       if command -v podman &> /dev/null; then
-        podman load -i $(nix build .#qwen3-container --print-out-paths --no-link)/image.tar
-        podman run -d --name nanna-test-ollama -p 11434:11434 nanna-coder-ollama-qwen3:latest
+        # Use nix2container's built-in copyToDockerDaemon method
+        nix run .#ollamaImage.copyToDockerDaemon
+        podman run -d --name nanna-test-ollama -p 11434:11434 nanna-coder-ollama:latest
       else
         echo "⚠️  Podman not available, skipping container tests"
         exit 1
@@ -322,9 +323,6 @@ let
       echo "🐳 Building container images..."
       nix build .#harnessImage --no-link --print-build-logs &
       nix build .#ollamaImage --no-link --print-build-logs &
-
-      echo "🧪 Building test dependencies..."
-      nix build .#qwen3-model --no-link --print-build-logs &
 
       echo "⏳ Waiting for background builds..."
       wait
