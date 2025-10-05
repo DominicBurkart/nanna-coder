@@ -2,6 +2,12 @@
 
 A highly opinionated local coding assistant (WIP).
 
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
+- [AGENTS.md](AGENTS.md) - Agent control loop and implementation details
+- [TESTING.md](TESTING.md) - Testing strategy and guidelines
+
 ## Technologies
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
