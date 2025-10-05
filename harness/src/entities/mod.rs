@@ -313,8 +313,7 @@ impl EntityStore for InMemoryEntityStore {
 
         for (id, entity) in &self.entities {
             // Filter by entity type
-            if !query.entity_types.is_empty()
-                && !query.entity_types.contains(&entity.entity_type())
+            if !query.entity_types.is_empty() && !query.entity_types.contains(&entity.entity_type())
             {
                 continue;
             }

@@ -34,7 +34,6 @@ pub use agent::{
 
 // Export entity types
 pub use entities::{
-    Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship,
-    EntityResult, EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType,
-    TimeRange,
+    Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship, EntityResult,
+    EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType, TimeRange,
 };
