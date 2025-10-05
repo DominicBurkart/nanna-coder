@@ -112,9 +112,9 @@ jobs:
         echo "🔄 Building test containers for caching..."
         nix build .#ollamaImage --print-build-logs
 
-        echo "📦 Loading test containers into podman (nix2container format)..."
-        # nix2container creates JSON manifests, not tar archives - use custom loader
-        nix run .#load-ollama-image
+        echo "📦 Loading test containers using nix2container copyToDockerDaemon..."
+        # Use nix2container's built-in copyToDockerDaemon for proper loading
+        nix run .#ollamaImage.copyToDockerDaemon
 
         echo "✅ Test containers ready for integration tests"
 
