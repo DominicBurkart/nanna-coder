@@ -53,39 +53,31 @@ jobs:
       if: runner.os != 'Windows'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
+    - name: Configure Cachix
       if: runner.os != 'Windows'
-      id: nix-cache
-      uses: nix-community/cache-nix-action@v5
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ runner.os }}-
-        gc-max-store-size-linux: 1073741824
-        gc-max-store-size-macos: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
-    - name: GitHub Actions Cache Status
+    - name: Cachix Status
       if: runner.os != 'Windows'
       run: |
-        echo "📊 === GitHub Actions Cache Status ==="
-        echo "🔑 Cache Key: nix-v2-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}"
-        echo "📦 Cache Action: nix-community/cache-nix-action@v5"
+        echo "📊 === Cachix Binary Cache Status ==="
+        echo "🔑 Cache: nanna-coder.cachix.org"
+        echo "📦 Cache Action: cachix/cachix-action@v15"
+        echo "🔒 Authentication: ${{ secrets.CACHIX_AUTH != '' && 'Configured' || 'Missing' }}"
 
-        if [ "${{ steps.nix-cache.outputs.cache-hit }}" = "true" ]; then
-          echo "✅ CACHE HIT: Dependencies restored from GitHub Actions cache"
-          echo "🚀 Build performance: OPTIMIZED"
-        elif [ "${{ steps.nix-cache.outputs.cache-hit }}" = "false" ]; then
-          echo "⚠️ CACHE MISS: Building dependencies from scratch"
-          echo "🐌 Build performance: Initial run (next run will be faster)"
+        if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+          echo "🔐 Fork PR: Read-only cache access"
         else
-          echo "🔍 Cache status: Unknown (action may not support cache-hit output)"
+          echo "✅ Push enabled: Artifacts will be cached"
         fi
 
-    - name: Note cache strategy
-      if: runner.os != 'Windows'
-      run: |
-        echo "📦 Using cache-nix-action for free GitHub-native Nix caching"
-        echo "🔄 Cache storage: GitHub Actions cache (10GB limit per repo)"
-        echo "⚡ Migrated from deprecated Magic Nix Cache and Cachix"
+        echo "💾 Cache storage: Unlimited (Cachix)"
+        echo "⚡ Migration: Using Cachix exclusively for binary caching"
 
     - name: Setup Rust toolchain (Windows)
       if: runner.os == 'Windows'
@@ -195,12 +187,12 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Run benchmarks
       run: |
@@ -247,13 +239,13 @@ jobs:
       if: runner.os == 'Linux'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Setup Nix cache (Linux)
+    - name: Configure Cachix (Linux)
       if: runner.os == 'Linux'
-      uses: nix-community/cache-nix-action@v5
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-build-${{ matrix.target }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-build-${{ matrix.target }}-
-        gc-max-store-size-linux: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Setup Rust toolchain (macOS)
       if: runner.os == 'macOS'
@@ -341,12 +333,13 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
     - name: Log in to Container Registry
       if: github.event_name != 'pull_request'
@@ -479,18 +472,18 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Note cache strategy
       run: |
-        echo "📦 Using cache-nix-action for all binary caching"
-        echo "🔄 Cache managed automatically by GitHub Actions"
-        echo "✅ No external binary cache services required"
+        echo "📦 Using Cachix for binary caching"
+        echo "🔄 Cache: nanna-coder.cachix.org"
+        echo "✅ Unlimited storage with Cachix"
 
     - name: Cache analytics and reporting
       run: |
@@ -525,12 +518,12 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-v2-${{ github.job }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-v2-${{ github.job }}-
-        gc-max-store-size-linux: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Build release artifacts
       run: |

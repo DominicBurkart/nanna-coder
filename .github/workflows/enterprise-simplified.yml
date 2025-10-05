@@ -39,15 +39,14 @@ jobs:
       if: runner.os != 'Windows'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store (Free GitHub-native caching)
+    - name: Configure Cachix
       if: runner.os != 'Windows'
-      uses: nix-community/cache-nix-action@v5
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: nix-${{ matrix.os }}-${{ matrix.test-type }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ matrix.os }}-${{ matrix.test-type }}-
-        gc-before-save: true
-        gc-max-store-size-linux: 1073741824
-        gc-max-store-size-macos: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
     - name: Setup Rust toolchain (Windows/macOS)
       if: runner.os != 'Linux'
@@ -112,11 +111,11 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix (Linux)
-      if: runner.os == 'Linux' && secrets.CACHIX_AUTH_TOKEN != ''
+      if: runner.os == 'Linux' && secrets.CACHIX_AUTH != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        authToken: ${{ secrets.CACHIX_AUTH }}
         pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Setup Rust toolchain (macOS)
@@ -152,11 +151,11 @@ jobs:
       uses: DeterminateSystems/magic-nix-cache-action@main
 
     - name: Configure Cachix
-      if: secrets.CACHIX_AUTH_TOKEN != ''
+      if: secrets.CACHIX_AUTH != ''
       uses: cachix/cachix-action@v12
       with:
         name: nanna-coder
-        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        authToken: ${{ secrets.CACHIX_AUTH }}
         pushFilter: "(-source$|nixpkgs.tar.gz$)"
 
     - name: Build harness container

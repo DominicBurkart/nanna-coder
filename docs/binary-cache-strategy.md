@@ -76,7 +76,7 @@ Each CI job includes:
   uses: cachix/cachix-action@v12
   with:
     name: nanna-coder
-    authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    authToken: ${{ secrets.CACHIX_AUTH }}
     pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
 
 - name: Optimize CI cache settings
@@ -133,7 +133,7 @@ nix build .#nanna-coder --refresh
 
 #### Manual Cache Upload
 ```bash
-# Build and push to cache (requires CACHIX_AUTH_TOKEN)
+# Build and push to cache (requires CACHIX_AUTH)
 nix run .#push-cache
 ```
 
@@ -170,7 +170,7 @@ The cache-analytics utility provides:
 ## Security Considerations
 
 ### Access Control
-- CACHIX_AUTH_TOKEN stored as GitHub secret
+- CACHIX_AUTH stored as GitHub secret
 - Read-only access for public cache consumption
 - Write access restricted to CI automation
 

@@ -89,7 +89,7 @@ With this:
 
 **Cons:**
 - ❌ Requires paid subscription
-- ❌ Needs `CACHIX_AUTH_TOKEN` secret configuration
+- ❌ Needs `CACHIX_AUTH` secret configuration
 
 ## Migration Strategy
 
@@ -150,10 +150,10 @@ steps:
 
 # Fallback cache: Cachix (only when token available)
 - uses: cachix/cachix-action@v12
-  if: secrets.CACHIX_AUTH_TOKEN != ''
+  if: secrets.CACHIX_AUTH != ''
   with:
     name: nanna-coder
-    authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    authToken: ${{ secrets.CACHIX_AUTH }}
 ```
 
 ## Performance Expectations
