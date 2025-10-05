@@ -1,4 +1,4 @@
-name: Cache Migration Test (Free Alternative)
+name: Cachix Integration Test
 
 on:
   push:
@@ -11,9 +11,9 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Test cache-nix-action as free alternative to Magic Nix Cache
-  test-cache-nix-action:
-    name: Test cache-nix-action (${{ matrix.os }})
+  # Test Cachix integration
+  test-cachix:
+    name: Test Cachix (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,25 +27,20 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    # Use cache-nix-action instead of magic-nix-cache
-    - name: Cache Nix store (Free GitHub Alternative)
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        # Cache key includes OS and lock file hash
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
-        # Garbage collection before caching to optimize storage
-        gc-before-save: true
-        # Cache for 7 days to balance freshness vs space
-        gc-max-store-size-linux: 1073741824
-        gc-max-store-size-macos: 1073741824
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 
     - name: Note cache strategy
       run: |
-        echo "📦 Using cache-nix-action for free GitHub-native Nix caching"
-        echo "🔄 Cache storage: GitHub Actions cache (10GB limit per repo)"
-        echo "🎯 Benefits: No secrets required, works with forks/PRs"
-        echo "⚡ Alternative to Magic Nix Cache (deprecated Feb 2025)"
+        echo "📦 Using Cachix for binary caching"
+        echo "🔄 Cache: nanna-coder.cachix.org"
+        echo "🎯 Benefits: Unlimited storage, persistent cache"
+        echo "⚡ Full migration to Cachix-only (no deprecated actions)"
 
     - name: Test basic Nix build
       run: |

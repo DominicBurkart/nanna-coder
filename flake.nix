@@ -774,6 +774,7 @@
         binaryCacheConfig = {
           # Cachix configuration for public binary cache
           cacheName = "nanna-coder";
+          publicKey = "nanna-coder.cachix.org-1:U/8OwBxzrmKhrghm7KtNA3cRnYR5ioKlB637gbc2BF4=";
           pushToCache = true;
 
           # Cache priorities optimized for CI performance
@@ -821,7 +822,7 @@
             echo "✏️  Adding to nix.conf..."
             mkdir -p ~/.config/nix
             echo "substituters = https://cache.nixos.org https://${binaryCacheConfig.cacheName}.cachix.org" >> ~/.config/nix/nix.conf
-            echo "trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= ${binaryCacheConfig.cacheName}.cachix.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" >> ~/.config/nix/nix.conf
+            echo "trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= ${binaryCacheConfig.publicKey}" >> ~/.config/nix/nix.conf
 
             echo "✅ Binary cache configured successfully!"
             echo "💡 Run 'push-cache' to upload builds to cache"

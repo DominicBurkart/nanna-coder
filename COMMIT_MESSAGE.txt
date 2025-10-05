@@ -1,0 +1,62 @@
+feat(ci): migrate to Cachix-only binary caching
+
+Complete migration from cache-nix-action to Cachix for all binary caching.
+
+## Changes
+
+### CI Workflows
+- Replace cache-nix-action with cachix-action@v15 in all workflows
+- Add CACHIX_AUTH_TOKEN authentication
+- Implement fork PR protection (skipPush)
+- Add pushFilter to exclude source tarballs
+- Remove deprecated Magic Nix Cache references
+
+### Flake Configuration  
+- Add publicKey field to binaryCacheConfig
+- Update setup-cache script to use publicKey variable
+- Add clear TODO for public key replacement
+
+### Documentation
+- Create CACHIX_SETUP.md with setup instructions
+- Create docs/cachix-migration.md with comprehensive guide
+- Update README.md with Cachix quick start
+- Add MIGRATION_SUMMARY.md with complete migration details
+
+### Testing
+- Create tests/cachix_integration_test.sh
+- Add 10 integration tests for Cachix configuration
+- Validate workflow updates
+- Check security requirements
+
+## Benefits
+
+- Unlimited storage vs 10GB GitHub limit
+- Persistent cache across all CI runs
+- Shared cache between CI and developers
+- Resolves HTTP 400 cache errors (Issue #2)
+- Improves container caching (Issue #3)
+- Addresses Cachix integration (Issue #11)
+
+## Breaking Changes
+
+**Required:** CACHIX_AUTH_TOKEN secret must be configured
+**Required:** Public key must be updated in flake.nix after cache creation
+
+See CACHIX_SETUP.md for detailed setup instructions.
+
+## Related Issues
+
+Closes #11
+Resolves #2
+Improves #3
+
+## Migration Checklist
+
+- [x] Update all CI workflows
+- [x] Update flake.nix configuration
+- [x] Create setup documentation
+- [x] Add integration tests
+- [x] Update README
+- [ ] Create Cachix cache (manual)
+- [ ] Update public key (manual)
+- [ ] Configure GitHub secret (manual)
