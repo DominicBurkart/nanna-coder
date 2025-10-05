@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the caching strategy implemented to optimize CI/CD build times. The strategy focuses on maximizing cache reuse across jobs while staying within GitHub Actions' 10GB cache limit.
+This document describes the caching strategy implemented to optimize CI/CD build times. The strategy uses Cachix binary cache for unlimited storage and maximizes cache reuse across jobs.
 
 ## Cache Architecture
 
@@ -14,7 +14,8 @@ This document describes the caching strategy implemented to optimize CI/CD build
 │ - Rust toolchain (1.84.0)                              │
 │ - Cargo dependencies (all crates)                      │
 │ - Development tools (nextest, clippy, etc.)            │
-│ Cache Key: nix-v3-deps-{flake.lock}-{Cargo.lock}      │
+│ Cache Key: cachix-v1-deps-{flake.lock}-{Cargo.lock}   │
+│ Storage: Cachix Binary Cache (Unlimited)               │
 └─────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -23,6 +24,7 @@ This document describes the caching strategy implemented to optimize CI/CD build
 │ - Test artifacts per matrix job                        │
 │ - Platform-specific builds                             │
 │ Cache Key: {deps-key}-{OS}-{rust}-{test-type}         │
+│ Storage: Cachix Binary Cache (Unlimited)               │
 └─────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -31,8 +33,11 @@ This document describes the caching strategy implemented to optimize CI/CD build
 │ - Harness container                                    │
 │ - Ollama container                                     │
 │ Cache Key: {deps-key}-container-{image}-{arch}        │
+│ Storage: Cachix Binary Cache (Unlimited)               │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Note:** Cachix provides unlimited binary cache storage, eliminating the constraints of GitHub Actions' 10GB cache limit.
 
 ## Workflows
 
@@ -41,28 +46,23 @@ This document describes the caching strategy implemented to optimize CI/CD build
 **Job: `prebuild-deps`**
 - Runs first, before all matrix jobs
 - Builds Rust toolchain and cargo dependencies once
-- Caches result with key: `nix-v3-deps-{flake.lock}-{Cargo.lock}`
+- Pushes to Cachix binary cache with key: `cachix-v1-deps-{flake.lock}-{Cargo.lock}`
+- Uses `cachix/cachix-action@v15` for authentication and push
 - Output: `cache-key` used by downstream jobs
 
 **Job: `test-matrix`**
 - Depends on `prebuild-deps`
-- Restores shared dependency cache
-- Adds job-specific artifacts to cache
-- Cache key hierarchy:
-  1. Exact: `{deps-key}-{OS}-{rust}-{test-type}` (this job's cache)
-  2. Fallback: `{deps-key}-{OS}-` (same OS, any test type)
-  3. Fallback: `{deps-key}-` (shared deps from prebuild)
-  4. Fallback: `nix-v3-deps-` (any version of shared deps)
+- Pulls shared dependency cache from Cachix
+- Adds job-specific artifacts to Cachix cache
+- Uses `cachix/cachix-action@v15` for authentication and push
+- Cache restoration is automatic via Cachix
 
 **Job: `build-containers`**
 - Depends on `prebuild-deps` and `test-matrix`
-- Leverages shared dependency cache
+- Leverages shared dependency cache from Cachix
 - Optimized for container layer reuse
-- Cache key hierarchy:
-  1. Exact: `{deps-key}-container-{image}-{arch}`
-  2. Fallback: `{deps-key}-container-{image}-` (same image, any arch)
-  3. Fallback: `{deps-key}-container-` (any container)
-  4. Fallback: `{deps-key}-` (shared deps)
+- Pushes container artifacts to Cachix
+- Uses `cachix/cachix-action@v15` for authentication and push
 
 ### 2. Cache Warming (`.github/workflows/cache-warming.yml`)
 
@@ -88,31 +88,49 @@ This document describes the caching strategy implemented to optimize CI/CD build
 ### Key Components
 
 ```
-nix-v3-deps-{flake-hash}-{cargo-hash}
-│       │    │            │
-│       │    │            └─ First 16 chars of Cargo.lock SHA256
-│       │    └─ First 16 chars of flake.lock SHA256
-│       └─ Cache strategy version (increment to invalidate all)
-└─ Nix-specific prefix
+cachix-v1-deps-{flake-hash}-{cargo-hash}
+│         │     │            │
+│         │     │            └─ First 16 chars of Cargo.lock SHA256
+│         │     └─ First 16 chars of flake.lock SHA256
+│         └─ Cache strategy version (increment to invalidate all)
+└─ Cachix-specific prefix
 ```
 
-### Cache Key Hierarchy Benefits
+### Cachix Authentication
 
-1. **Exact Match**: Fastest, uses exact cache for this job
-2. **Partial Match**: Reuses most artifacts, rebuilds only changed parts
-3. **Shared Deps**: Reuses expensive dependencies, rebuilds project
-4. **Fallback**: Better than nothing, still saves some time
+All workflows using Cachix require authentication to push to the binary cache:
+
+- **Secret Required**: `CACHIX_AUTH_TOKEN` must be configured in repository secrets
+- **Cache Name**: `nanna-coder` (configured in workflows)
+- **Action**: `cachix/cachix-action@v15`
+
+Example workflow configuration:
+```yaml
+- uses: cachix/cachix-action@v15
+  with:
+    name: nanna-coder
+    authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+```
+
+### Cachix Dashboard
+
+Monitor cache contents and statistics at:
+- **URL**: https://nanna-coder.cachix.org
+- **Features**:
+  - View all cached store paths
+  - Check cache size and usage statistics
+  - Browse recent pushes and pulls
+  - Monitor cache hit rates
+  - Manage cache retention policies
 
 ## Cache Size Management
 
-### Limits
+### Storage Capacity
 
-- **GitHub Actions Cache Limit**: 10GB total per repository
-- **Per-Job Allocation**:
-  - `prebuild-deps`: 2GB (Rust toolchain + dependencies)
-  - `test-matrix` jobs: 1GB each
-  - `build-containers`: 2GB per container
-  - GC triggers when approaching limits
+- **Cachix Binary Cache**: Unlimited storage
+- **No Size Constraints**: Unlike GitHub Actions cache (10GB limit), Cachix allows unrestricted caching
+- **Automatic Management**: Cachix handles cache retention and cleanup automatically
+- **No Manual GC Required**: No need to manage garbage collection or size limits
 
 ### What Gets Cached
 
@@ -137,18 +155,25 @@ nix-v3-deps-{flake-hash}-{cargo-hash}
 
 | Metric | Target | How Measured |
 |--------|--------|--------------|
-| Cache hit rate | >80% | `steps.nix-cache.outputs.cache-hit` |
+| Cache hit rate | >80% | Cachix dashboard analytics |
 | PR build time reduction | >30% | Baseline vs optimized comparison |
-| Dependency restore time | <5min | Time from cache restore start to completion |
-| Storage efficiency | <10GB total | Sum of all active caches |
+| Dependency restore time | <2min | Time from cache pull start to completion |
+| Storage efficiency | Unlimited | Cachix provides unlimited storage |
 
 ### Monitoring
 
+**Cachix Dashboard** (https://nanna-coder.cachix.org):
+- Real-time cache statistics
+- Push/pull activity timeline
+- Storage usage metrics
+- Cache hit/miss rates
+- Recent build artifacts
+
 **CI Job Summary** includes:
-- Cache hit/miss status per job
-- Cache restore timing
+- Cachix push/pull status per job
 - Build duration breakdown
 - Cache key information
+- Link to Cachix dashboard
 
 **Cache Analytics Tool** (`nix run .#cache-analytics`):
 ```bash
@@ -156,7 +181,6 @@ nix-v3-deps-{flake-hash}-{cargo-hash}
 nix run .#cache-analytics
 
 # Shows:
-# - Cache hit/miss analysis
 # - Nix store size and contents
 # - Largest store paths
 # - Build dependency breakdown
@@ -168,49 +192,76 @@ nix run .#cache-analytics
 ### Cache Invalidation
 
 **Automatic Invalidation:**
-- Dependency changes (`flake.lock`, `Cargo.lock`)
-- Cache version bump (`nix-v3` → `nix-v4`)
-- GitHub Actions automatic eviction (unused for 7 days)
+- Dependency changes (`flake.lock`, `Cargo.lock`) result in new cache keys
+- Cache version bump (`cachix-v1` → `cachix-v2`)
+- Cachix retains all cache entries indefinitely (no automatic eviction)
 
 **Manual Invalidation:**
 ```bash
 # Bump cache version in workflows
-sed -i 's/nix-v3/nix-v4/g' .github/workflows/*.yml
+sed -i 's/cachix-v1/cachix-v2/g' .github/workflows/*.yml
 
 # Force rebuild via cache warming
 gh workflow run cache-warming.yml -f force_rebuild=true
+
+# Note: Old cache entries remain in Cachix but won't be used
 ```
 
 ### Troubleshooting
 
-**Problem: Cache Miss on Every Build**
+**Problem: Cachix Authentication Failed**
 ```bash
-# Check if keys are generating consistently
-gh run view --log | grep "Cache Key:"
+# Verify CACHIX_AUTH_TOKEN secret is configured
+gh secret list | grep CACHIX
+
+# Test authentication locally
+cachix authtoken <your-token>
+cachix use nanna-coder
+
+# Check workflow logs for auth errors
+gh run view --log | grep -i "cachix.*auth"
+```
+
+**Problem: Cache Not Being Used**
+```bash
+# Check Cachix dashboard for cache contents
+open https://nanna-coder.cachix.org
+
+# Verify cache keys are generating consistently
+gh run view --log | grep "cache-key"
 
 # Verify flake.lock and Cargo.lock are committed
 git status flake.lock Cargo.lock
+
+# Check if Cachix action is properly configured
+grep -A 5 "cachix-action" .github/workflows/*.yml
 ```
 
-**Problem: Cache Size Limit Exceeded**
-```bash
-# Check current usage
-gh cache list --limit 100
-
-# Manually delete old caches
-gh cache delete <cache-key>
-
-# Or bump version to invalidate all
-# (see Manual Invalidation above)
-```
-
-**Problem: Slow Builds Despite Cache Hits**
+**Problem: Slow Builds Despite Cachix**
 ```bash
 # Run analytics to identify bottlenecks
 nix run .#cache-analytics
 
-# Check if derivations are being rebuilt
+# Check if derivations are being rebuilt unnecessarily
 nix build .#nanna-coder --print-build-logs
+
+# Verify Cachix is being hit in workflow logs
+gh run view --log | grep -i "cachix"
+
+# Check Cachix dashboard for recent pulls
+open https://nanna-coder.cachix.org
+```
+
+**Problem: Unable to Push to Cachix**
+```bash
+# Verify push permissions for CACHIX_AUTH_TOKEN
+# Token must have write access to nanna-coder cache
+
+# Check workflow logs for push errors
+gh run view --log | grep -i "cachix.*push\|cachix.*error"
+
+# Verify cache name matches in workflow
+grep "name: nanna-coder" .github/workflows/*.yml
 ```
 
 ## Best Practices
@@ -224,70 +275,97 @@ nix build .#nanna-coder --print-build-logs
    # Commit lock files together
    ```
 
-2. **Test locally with Nix**
+2. **Test locally with Nix and Cachix**
    ```bash
+   # Configure Cachix locally (read-only, no auth needed)
+   cachix use nanna-coder
+
    # Use Nix develop to match CI environment
    nix develop
    cargo build --workspace
    ```
 
 3. **Monitor cache in PRs**
-   - Check CI summary for cache hit rates
-   - Look for "CACHE HIT" vs "CACHE MISS" messages
-   - Report persistent cache misses as issues
+   - Check CI logs for Cachix push/pull activity
+   - Visit Cachix dashboard to verify artifacts
+   - Report authentication or push failures as issues
 
 ### For Maintainers
 
 1. **Merge dependency updates promptly**
-   - Triggerse cache warming on `main`
+   - Triggers cache warming on `main`
    - Benefits all subsequent PRs
+   - Check Cachix dashboard after merge
 
-2. **Monitor cache usage**
+2. **Monitor cache usage via Cachix Dashboard**
    ```bash
-   gh cache list --limit 50 | head -20
+   # Open dashboard in browser
+   open https://nanna-coder.cachix.org
+
+   # View statistics:
+   # - Total cache size (unlimited)
+   # - Recent push/pull activity
+   # - Cache hit rates
+   # - Popular store paths
    ```
 
-3. **Tune cache sizes if needed**
-   - Adjust `gc-max-store-size-*` in workflows
-   - Balance between cache hit rate and size limits
+3. **Manage Cachix authentication**
+   - Rotate `CACHIX_AUTH_TOKEN` periodically
+   - Verify token has write permissions
+   - Update secret if authentication issues arise:
+     ```bash
+     gh secret set CACHIX_AUTH_TOKEN
+     ```
 
 ## Migration Guide
 
-### From Old Cache Strategy (nix-v2)
+### From GitHub Actions Cache to Cachix
 
-The new strategy (nix-v3) is backward compatible via fallback keys:
+The migration from GitHub Actions cache to Cachix provides:
+- **Unlimited storage** vs 10GB GitHub Actions limit
+- **Faster cache restoration** via CDN distribution
+- **Better reliability** with dedicated binary cache infrastructure
+- **Enhanced monitoring** via Cachix dashboard
 
-```yaml
-restore-prefixes-first-match: |
-  nix-v3-deps-
-  nix-v2-Linux-  # Falls back to old strategy
-```
+Migration steps:
+1. Configure `CACHIX_AUTH_TOKEN` repository secret
+2. Update workflows to use `cachix/cachix-action@v15`
+3. Change cache key prefix from `nix-v3-deps-` to `cachix-v1-deps-`
+4. Remove GitHub Actions cache configuration (e.g., `gc-max-store-size`)
 
-First build after merge:
-- May see CACHE MISS as v3 keys don't exist yet
-- `prebuild-deps` populates new cache structure
-- Subsequent builds use v3 efficiently
+First build after migration:
+- Cachix cache will be empty initially
+- `prebuild-deps` job populates Cachix with dependencies
+- Subsequent builds pull from Cachix automatically
+- Old GitHub Actions cache can be safely ignored/deleted
 
 ### Rollback Procedure
 
-If issues arise:
+If issues arise with Cachix:
 
-1. Revert cache version in workflows:
+1. Revert to GitHub Actions cache:
    ```bash
-   git revert <cache-optimization-commit>
+   git revert <cachix-migration-commit>
    ```
 
-2. Or disable prebuild-deps job:
+2. Or temporarily disable Cachix:
    ```yaml
-   prebuild-deps:
-     if: false  # Disable optimization
+   # Comment out cachix-action steps in workflows
+   # - uses: cachix/cachix-action@v15
+   #   with:
+   #     name: nanna-coder
+   #     authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
    ```
 
-3. Jobs fall back to old `nix-v2` cache strategy
+3. Monitor rollback impact:
+   - Builds will be slower without cache
+   - Consider increasing GitHub Actions cache allocation
+   - Re-enable cache warming workflow
 
 ## References
 
-- [GitHub Actions Cache Documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows)
-- [nix-community/cache-nix-action](https://github.com/nix-community/cache-nix-action)
 - [Cachix Documentation](https://docs.cachix.org/)
+- [Cachix GitHub Action](https://github.com/cachix/cachix-action)
+- [Nanna Coder Cachix Dashboard](https://nanna-coder.cachix.org)
+- [GitHub Actions Cache Documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows)
 - [Issue #18: Cache Strategy Evaluation](https://github.com/DominicBurkart/nanna-coder/issues/18)

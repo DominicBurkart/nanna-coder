@@ -35,27 +35,24 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
     - name: Generate cache keys
       id: cache-keys
       run: |
         FLAKE_HASH=$(sha256sum flake.lock | cut -d' ' -f1 | head -c 16)
         CARGO_HASH=$(sha256sum Cargo.lock | cut -d' ' -f1 | head -c 16)
-        DEPS_KEY="nix-v3-deps-${FLAKE_HASH}-${CARGO_HASH}"
+        DEPS_KEY="cachix-v1-deps-${FLAKE_HASH}-${CARGO_HASH}"
         echo "deps-key=${DEPS_KEY}" >> $GITHUB_OUTPUT
         echo "🔑 Generated cache key: ${DEPS_KEY}"
 
-    - name: Cache Nix dependencies
-      id: deps-cache
-      uses: nix-community/cache-nix-action@v5
-      with:
-        primary-key: ${{ steps.cache-keys.outputs.deps-key }}
-        restore-prefixes-first-match: |
-          nix-v3-deps-
-          nix-v2-Linux-
-        gc-max-store-size-linux: 3221225472  # 3GB for main branch
-
     - name: Build Rust toolchain and core dependencies
-      if: steps.deps-cache.outputs.cache-hit != 'true' || github.event.inputs.force_rebuild == 'true'
+      if: github.event.inputs.force_rebuild == 'true' || github.event_name == 'push'
       run: |
         echo "🔥 Warming cache: Building Rust toolchain and dependencies..."
         START_TIME=$(date +%s)
@@ -86,13 +83,13 @@ jobs:
         echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
         echo "**Branch:** main" >> $GITHUB_STEP_SUMMARY
         echo "**Cache Key:** \`${{ steps.cache-keys.outputs.deps-key }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Cache Backend:** Cachix (nanna-coder.cachix.org)" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        if [ "${{ steps.deps-cache.outputs.cache-hit }}" = "true" ] && [ "${{ github.event.inputs.force_rebuild }}" != "true" ]; then
-          echo "✅ **Status:** Cache already warm (no build needed)" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+          echo "🔨 **Status:** Force rebuild - Cache warmed successfully" >> $GITHUB_STEP_SUMMARY
         else
-          echo "🔨 **Status:** Cache warmed successfully" >> $GITHUB_STEP_SUMMARY
-          echo "⏱️ **Build Duration:** ${{ steps.deps-cache.outputs.cache_duration || 'N/A' }}s" >> $GITHUB_STEP_SUMMARY
+          echo "🔨 **Status:** Dependencies built and pushed to Cachix" >> $GITHUB_STEP_SUMMARY
         fi
 
         echo "" >> $GITHUB_STEP_SUMMARY
@@ -117,15 +114,12 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store
-      uses: nix-community/cache-nix-action@v5
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: ${{ needs.warm-dependencies.outputs.cache-key }}-containers-${{ matrix.image }}
-        restore-prefixes-first-match: |
-          ${{ needs.warm-dependencies.outputs.cache-key }}-containers-
-          ${{ needs.warm-dependencies.outputs.cache-key }}-
-          nix-v3-deps-
-        gc-max-store-size-linux: 2147483648
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Build container image
       run: |
@@ -168,15 +162,13 @@ jobs:
       if: runner.os == 'Linux'
       uses: DeterminateSystems/nix-installer-action@main
 
-    - name: Cache Nix store
+    - name: Configure Cachix (Linux)
       if: runner.os == 'Linux'
-      uses: nix-community/cache-nix-action@v5
+      uses: cachix/cachix-action@v15
       with:
-        primary-key: ${{ needs.warm-dependencies.outputs.cache-key }}-${{ matrix.target }}
-        restore-prefixes-first-match: |
-          ${{ needs.warm-dependencies.outputs.cache-key }}-
-          nix-v3-deps-
-        gc-max-store-size-linux: 2147483648
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 
     - name: Build for target platform
       if: runner.os == 'Linux'
