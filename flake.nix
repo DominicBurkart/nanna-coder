@@ -335,7 +335,7 @@
 
                 # Use skopeo to load the nix2container JSON format
                 echo "Using skopeo to load image..."
-                skopeo copy nix:$IMAGE_PATH containers-storage:nanna-coder-ollama:latest
+                skopeo copy "nix:$IMAGE_PATH" containers-storage:nanna-coder-ollama:latest
                 echo "✅ Image loaded successfully"
               '';
             }) else null;
