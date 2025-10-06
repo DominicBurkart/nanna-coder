@@ -115,6 +115,40 @@ pub enum EntityType {
 }
 
 /// Core entity trait implemented by all entity types
+///
+/// # Design Decisions
+///
+/// ## Why Not Clone?
+///
+/// The `Entity` trait intentionally does **not** require `Clone` for several reasons:
+///
+/// 1. **Large Data Structures**: Some entities (especially AST and telemetry) may contain
+///    large amounts of data that would be expensive to clone.
+///
+/// 2. **Reference Semantics**: Entities are meant to be stored and referenced, not copied.
+///    The entity store manages ownership, and consumers should work with references or IDs.
+///
+/// 3. **Relationship Integrity**: Cloning entities could lead to duplicate IDs or broken
+///    relationships in the entity graph.
+///
+/// ## Alternative Patterns
+///
+/// Instead of cloning, use these patterns:
+///
+/// - **References**: Store `&Entity` or `EntityId` and query when needed
+/// - **Serialization**: Use `to_json()` for persistence or transfer
+/// - **Selective Copying**: Copy only the metadata or specific fields needed
+///
+/// ## Future Considerations
+///
+/// If entity retrieval by value becomes necessary:
+///
+/// - Add `fn to_owned(&self) -> Box<dyn Entity>` for explicit cloning
+/// - Use `Arc<dyn Entity>` for cheap reference counting
+/// - Implement `Clone` on specific entity types that need it
+///
+/// For now, the `EntityStore::exists()` method provides existence checking without
+/// requiring entity retrieval.
 #[async_trait]
 pub trait Entity: Send + Sync {
     /// Get entity metadata
@@ -124,6 +158,9 @@ pub trait Entity: Send + Sync {
     fn metadata_mut(&mut self) -> &mut EntityMetadata;
 
     /// Serialize entity to JSON
+    ///
+    /// This is the primary way to persist or transmit entities. For large entities,
+    /// consider implementing streaming serialization in the concrete type.
     fn to_json(&self) -> EntityResult<String>;
 
     /// Get entity type
@@ -223,12 +260,47 @@ pub struct QueryResult {
 }
 
 /// Entity storage abstraction
+///
+/// # Design Decisions
+///
+/// ## Why No `get()` Method?
+///
+/// This trait intentionally **does not** include a `get(id) -> Box<dyn Entity>` method
+/// because `Box<dyn Entity>` cannot implement `Clone`, which would be required for
+/// returning owned entities.
+///
+/// ### Alternative Approaches
+///
+/// 1. **Query by ID**: Use `query()` with an ID filter to get `QueryResult` metadata
+/// 2. **Check Existence**: Use `exists()` to verify an entity is present
+/// 3. **Type-Specific Stores**: Implement separate stores for each concrete entity type
+///    that can return typed entities (e.g., `GitEntityStore::get() -> GitRepository`)
+/// 4. **Future Enhancement**: Add a visitor pattern or callback-based access method
+///    that allows operating on entities without transferring ownership
+///
+/// ## Query-Centric Design
+///
+/// The interface is designed around **querying** rather than direct retrieval:
+///
+/// - `query()` returns lightweight `QueryResult` with metadata and relevance
+/// - Consumers work with IDs and metadata rather than full entities
+/// - Reduces memory overhead for large entity graphs
+/// - Aligns with RAG (Retrieval-Augmented Generation) patterns
+///
+/// ## Concrete Store Implementations
+///
+/// Specific storage backends (database, file system, etc.) can provide type-safe
+/// retrieval methods for their concrete entity types while implementing this trait
+/// for the generic operations.
 #[async_trait]
 pub trait EntityStore: Send + Sync {
     /// Store an entity
     async fn store(&mut self, entity: Box<dyn Entity>) -> EntityResult<EntityId>;
 
     /// Check if entity exists
+    ///
+    /// This is the primary way to verify entity presence without requiring
+    /// entity retrieval or cloning.
     async fn exists(&self, id: &str) -> bool;
 
     /// Update an existing entity
@@ -238,6 +310,10 @@ pub trait EntityStore: Send + Sync {
     async fn delete(&mut self, id: &str) -> EntityResult<()>;
 
     /// Query entities
+    ///
+    /// Returns lightweight query results with metadata. Use this instead of
+    /// `get()` for working with entities. For full entity data, implement
+    /// type-specific stores or use serialization.
     async fn query(&self, query: &EntityQuery) -> EntityResult<Vec<QueryResult>>;
 
     /// Get relationships for an entity
