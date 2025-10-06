@@ -57,12 +57,8 @@ jobs:
         echo "🔥 Warming cache: Building Rust toolchain and dependencies..."
         START_TIME=$(date +%s)
 
-        # Build Rust toolchain
-        echo "🦀 Building Rust toolchain (1.84.0)..."
-        nix build nixpkgs#rust-bin.stable."1.84.0".default --print-build-logs --no-link
-
-        # Build cargo dependencies (the expensive part)
-        echo "📦 Building Cargo dependencies..."
+        # Build cargo dependencies (this also builds the Rust toolchain)
+        echo "📦 Building Cargo dependencies and toolchain..."
         nix develop --command cargo fetch --locked
         nix develop --command cargo build --workspace --all-features --release
 
