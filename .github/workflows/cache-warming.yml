@@ -1,0 +1,205 @@
+name: Cache Warming
+
+# Run on main branch to pre-populate cache for PR builds
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flake.lock'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - '.github/workflows/cache-warming.yml'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild all caches'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  warm-dependencies:
+    name: Warm Dependency Cache
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-keys.outputs.deps-key }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
+    - name: Generate cache keys
+      id: cache-keys
+      run: |
+        FLAKE_HASH=$(sha256sum flake.lock | cut -d' ' -f1 | head -c 16)
+        CARGO_HASH=$(sha256sum Cargo.lock | cut -d' ' -f1 | head -c 16)
+        DEPS_KEY="cachix-v1-deps-${FLAKE_HASH}-${CARGO_HASH}"
+        echo "deps-key=${DEPS_KEY}" >> $GITHUB_OUTPUT
+        echo "🔑 Generated cache key: ${DEPS_KEY}"
+
+    - name: Build Rust toolchain and core dependencies
+      if: github.event.inputs.force_rebuild == 'true' || github.event_name == 'push'
+      run: |
+        echo "🔥 Warming cache: Building Rust toolchain and dependencies..."
+        START_TIME=$(date +%s)
+
+        # Build Rust toolchain
+        echo "🦀 Building Rust toolchain (1.84.0)..."
+        nix build nixpkgs#rust-bin.stable."1.84.0".default --print-build-logs --no-link
+
+        # Build cargo dependencies (the expensive part)
+        echo "📦 Building Cargo dependencies..."
+        nix develop --command cargo fetch --locked
+        nix develop --command cargo build --workspace --all-features --release
+
+        # Build common development tools
+        echo "🛠️ Building development tools..."
+        nix develop --command cargo nextest --version
+        nix develop --command cargo clippy --version
+
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+        echo "✅ Cache warming completed in ${DURATION}s"
+        echo "cache_duration=${DURATION}" >> $GITHUB_OUTPUT
+
+    - name: Cache warming report
+      run: |
+        echo "## 🔥 Cache Warming Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** main" >> $GITHUB_STEP_SUMMARY
+        echo "**Cache Key:** \`${{ steps.cache-keys.outputs.deps-key }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Cache Backend:** Cachix (nanna-coder.cachix.org)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+          echo "🔨 **Status:** Force rebuild - Cache warmed successfully" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "🔨 **Status:** Dependencies built and pushed to Cachix" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Cache Contents" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        du -sh /nix/store 2>/dev/null || echo "Unable to measure" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  warm-containers:
+    name: Warm Container Cache (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: warm-dependencies
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [harness, ollama]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
+    - name: Build container image
+      run: |
+        echo "🐳 Warming cache: Building ${{ matrix.image }} container..."
+        START_TIME=$(date +%s)
+
+        case "${{ matrix.image }}" in
+          "harness")
+            nix build .#harnessImage --print-build-logs --no-link
+            ;;
+          "ollama")
+            nix build .#ollamaImage --print-build-logs --no-link
+            ;;
+        esac
+
+        END_TIME=$(date +%s)
+        echo "✅ Container ${{ matrix.image }} cached in $((END_TIME - START_TIME))s"
+
+  warm-cross-platform:
+    name: Warm Cross-Platform Cache (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    needs: warm-dependencies
+    if: false  # Disabled for now - enable when cross-compilation is stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux
+            runner: ubuntu-latest
+          - target: x86_64-darwin
+            runner: macos-latest
+          - target: aarch64-darwin
+            runner: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix (Linux)
+      if: runner.os == 'Linux'
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix (Linux)
+      if: runner.os == 'Linux'
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: '${{ secrets.CACHIX_AUTH }}'
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
+    - name: Build for target platform
+      if: runner.os == 'Linux'
+      run: |
+        echo "🔧 Warming cache: Building for ${{ matrix.target }}..."
+        nix build .#packages.${{ matrix.target }}.nanna-coder --print-build-logs --no-link || {
+          echo "⚠️ Cross-compilation not yet configured for ${{ matrix.target }}"
+          exit 0
+        }
+
+  summary:
+    name: Cache Warming Summary
+    runs-on: ubuntu-latest
+    needs: [warm-dependencies, warm-containers]
+    if: always()
+
+    steps:
+    - name: Generate summary
+      run: |
+        echo "## 🎯 Cache Warming Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Completed:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Job Status" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependencies | ${{ needs.warm-dependencies.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Containers | ${{ needs.warm-containers.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎁 Benefits" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ PR builds will use pre-warmed dependency cache" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Reduced build times for all CI matrix jobs" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Container images pre-built and cached" >> $GITHUB_STEP_SUMMARY
+        echo "- 🔑 Cache key: \`${{ needs.warm-dependencies.outputs.cache-key }}\`" >> $GITHUB_STEP_SUMMARY
