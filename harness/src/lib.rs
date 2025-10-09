@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod container;
+pub mod entities;
 pub mod monitoring;
 pub mod observability;
 pub mod telemetry;
@@ -29,4 +30,10 @@ pub use tools::{CalculatorTool, EchoTool, Tool, ToolError, ToolRegistry, ToolRes
 pub use agent::{
     AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
     AgentState,
+};
+
+// Export entity types
+pub use entities::{
+    Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship, EntityResult,
+    EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType, TimeRange,
 };
