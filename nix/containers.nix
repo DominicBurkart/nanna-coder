@@ -85,6 +85,24 @@ let
   };
 
   # Model registry with metadata for all supported models
+  #
+  # IMPORTANT: Hash Behavior
+  # -------------------------
+  # - qwen3: Uses real content hash - fully reproducible builds
+  # - llama3, mistral, gemma: Use placeholder hashes for development mode
+  #
+  # Placeholder hashes (0000...000) indicate development-mode models that:
+  # 1. Create lightweight stubs during nix build (fast, no downloads)
+  # 2. Download on-demand when container first runs (flexible for testing)
+  # 3. Are not cached by content hash (intentional for active development)
+  #
+  # To enable production caching for a model:
+  # 1. Build the model container: nix build .#<model>-container
+  # 2. Extract the actual hash from build logs or use nix hash path
+  # 3. Replace the placeholder with the real hash
+  # 4. Rebuild - model will now be cached and reproducible
+  #
+  # See: nix/containers.nix:119-132 for hash detection logic
   modelRegistry = {
     "qwen3" = {
       name = "qwen3:0.6b";
@@ -95,21 +113,21 @@ let
     };
     "llama3" = {
       name = "llama3:8b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Llama3 8B - High quality general purpose model";
       size = "4.7GB";
       homepage = "https://ollama.com/library/llama3";
     };
     "mistral" = {
       name = "mistral:7b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Mistral 7B - Balanced performance model";
       size = "4.1GB";
       homepage = "https://ollama.com/library/mistral";
     };
     "gemma" = {
       name = "gemma:2b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Gemma 2B - Lightweight model for development";
       size = "1.4GB";
       homepage = "https://ollama.com/library/gemma";
