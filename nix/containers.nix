@@ -8,14 +8,15 @@
 { pkgs
 , lib
 , nix2containerPkgs
+, containerConfig
 , harness
 }:
 
 let
   # Container image for the harness CLI
   harnessImage = nix2containerPkgs.nix2container.buildImage {
-    name = "nanna-coder-harness";
-    tag = "latest";
+    name = containerConfig.images.harness;
+    tag = containerConfig.tags.default;
 
     copyToRoot = pkgs.buildEnv {
       name = "harness-env";
@@ -43,13 +44,13 @@ let
     };
 
     # Reproducible layer strategy
-    maxLayers = 100;
+    maxLayers = containerConfig.runtime.maxLayers;
   };
 
   # Ollama service container using nix2container
   ollamaImage = nix2containerPkgs.nix2container.buildImage {
-    name = "nanna-coder-ollama";
-    tag = "latest";
+    name = containerConfig.images.ollama;
+    tag = containerConfig.tags.default;
 
     copyToRoot = pkgs.buildEnv {
       name = "ollama-env";
@@ -80,7 +81,7 @@ let
     };
 
     # Reproducible layer strategy
-    maxLayers = 100;
+    maxLayers = containerConfig.runtime.maxLayers;
   };
 
   # Model registry with metadata for all supported models
@@ -221,8 +222,8 @@ let
   # Multi-model containers with pre-cached models
   containers = {
     qwen3-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-qwen3";
-      tag = "latest";
+      name = containerConfig.images.models.qwen3;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-qwen3-env";
@@ -236,13 +237,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     llama3-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-llama3";
-      tag = "latest";
+      name = containerConfig.images.models.llama3;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-llama3-env";
@@ -256,13 +257,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     mistral-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-mistral";
-      tag = "latest";
+      name = containerConfig.images.models.mistral;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-mistral-env";
@@ -276,13 +277,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     gemma-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-gemma";
-      tag = "latest";
+      name = containerConfig.images.models.gemma;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-gemma-env";
@@ -296,8 +297,8 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
   };
 

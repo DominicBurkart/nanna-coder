@@ -190,7 +190,19 @@ jobs:
 
         echo "📦 Loading test containers using nix2container copyToDockerDaemon..."
         # Use nix2container's built-in copyToDockerDaemon for proper loading
-        nix run .#ollamaImage.copyToDockerDaemon
+        if ! nix run .#ollamaImage.copyToDockerDaemon; then
+          echo "❌ Failed to load test container"
+          echo "💡 Check Docker daemon status: docker info"
+          exit 1
+        fi
+
+        # Verify container loaded successfully
+        if ! docker image inspect nanna-coder-ollama:latest >/dev/null 2>&1; then
+          echo "❌ Container nanna-coder-ollama:latest not found"
+          echo "Available images:"
+          docker images
+          exit 1
+        fi
 
         echo "✅ Test containers ready for integration tests"
 
@@ -514,12 +526,41 @@ jobs:
         # Use nix2container's built-in copyToDockerDaemon helper
         # This uses skopeo with the nix: transport that understands nix2container JSON format
         echo "Loading image using: nix run .#${NIX_ATTR}.copyToDockerDaemon"
-        nix run .#${NIX_ATTR}.copyToDockerDaemon
+        if ! nix run .#${NIX_ATTR}.copyToDockerDaemon; then
+          echo "❌ Failed to load image via copyToDockerDaemon"
+          echo "💡 Troubleshooting:"
+          echo "  - Check if Docker daemon is running: docker info"
+          echo "  - Verify image was built: nix build .#${NIX_ATTR} --print-out-paths"
+          echo "  - Check available disk space: df -h"
+          exit 1
+        fi
+
+        # Verify image was loaded successfully
+        if ! docker image inspect ${IMAGE_NAME}:latest >/dev/null 2>&1; then
+          echo "❌ Image ${IMAGE_NAME}:latest not found after loading"
+          echo "Available images:"
+          docker images | grep -E "(REPOSITORY|${IMAGE_NAME}|nanna-coder)"
+          exit 1
+        fi
+
+        echo "✅ Image ${IMAGE_NAME}:latest loaded successfully"
 
         # Tag for registry (convert repository name to lowercase for Docker compatibility)
-        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
-        docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
+        # Use GITHUB_REPOSITORY from environment (works in forks)
+        REPO_LOWERCASE=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+        echo "🏷️  Tagging for registry: ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}"
+
+        if ! docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}; then
+          echo "❌ Failed to tag image with commit SHA"
+          exit 1
+        fi
+
+        if ! docker tag ${IMAGE_NAME}:latest ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest; then
+          echo "❌ Failed to tag image with 'latest'"
+          exit 1
+        fi
+
+        echo "✅ Images tagged successfully"
 
     - name: Push container images
       if: github.event_name != 'pull_request'
@@ -543,9 +584,22 @@ jobs:
         esac
 
         # Convert repository name to lowercase for Docker compatibility
-        REPO_LOWERCASE=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}
-        docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest
+        # Use GITHUB_REPOSITORY from environment (works in forks)
+        REPO_LOWERCASE=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
+        echo "📤 Pushing to: ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}"
+
+        if ! docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:${{ github.sha }}; then
+          echo "❌ Failed to push image with commit SHA tag"
+          exit 1
+        fi
+
+        if ! docker push ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}:latest; then
+          echo "❌ Failed to push image with latest tag"
+          exit 1
+        fi
+
+        echo "✅ Successfully pushed both tags"
 
   security-scan:
     name: Security Scan
