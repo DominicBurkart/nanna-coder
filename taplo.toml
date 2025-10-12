@@ -1,0 +1,60 @@
+# Taplo TOML formatter configuration for nanna-coder
+# See https://taplo.tamasfe.dev/configuration/
+
+# Include all TOML files
+include = ["**/*.toml"]
+
+# Exclude build artifacts and dependencies
+exclude = [
+  "target/**",
+  "result/**",
+  ".git/**",
+]
+
+# Formatting options
+[formatting]
+# Align entries vertically in tables and arrays
+align_entries = true
+
+# Align single-line arrays to max 80 characters
+array_auto_collapse = true
+array_auto_expand = true
+
+# Allow trailing comma in arrays
+array_trailing_comma = true
+
+# Compact arrays on a single line when possible
+compact_arrays = true
+
+# Compact inline tables when possible
+compact_inline_tables = false
+
+# Column width target
+column_width = 100
+
+# Indent with 2 spaces
+indent_string = "  "
+
+# Indent tables under their parent tables
+indent_tables = false
+
+# Allow inline tables
+inline_table_expand = true
+
+# Reorder keys alphabetically within tables
+reorder_keys = false
+
+# Add trailing newline at end of file
+trailing_newline = true
+
+# Use CRLF line endings on Windows, LF everywhere else
+crlf = false
+
+# Rule-specific overrides for Cargo.toml files
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "dev-dependencies", "build-dependencies"]
+
+[rule.formatting]
+# Keep dependencies sections readable
+reorder_keys = true

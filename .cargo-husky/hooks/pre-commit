@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -e
+
+echo "🔍 Running comprehensive pre-commit checks..."
+
+# Rust: Format check
+echo "📝 Checking Rust formatting..."
+cargo fmt --all -- --check
+
+# Rust: Clippy linting
+echo "🔍 Running clippy..."
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Rust: Tests (including doctests)
+echo "🧪 Running tests..."
+cargo test --workspace --all-features
+
+# Rust: Security audit
+echo "🔒 Running security audit..."
+cargo audit
+
+# Rust: License and dependency scanning
+echo "📋 Checking licenses and dependencies..."
+cargo deny check
+
+# Rust: Documentation builds
+echo "📚 Building documentation..."
+cargo doc --no-deps --workspace
+
+# Shell: Shellcheck validation
+echo "🐚 Linting shell scripts..."
+if command -v shellcheck >/dev/null 2>&1; then
+  # Find all .sh files and shell scripts with shebang
+  find . -type f \( -name "*.sh" -o -executable -exec sh -c 'head -n1 "$1" | grep -q "^#!.*sh"' _ {} \; \) \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -print0 | xargs -0 shellcheck
+else
+  echo "⚠️  shellcheck not available, skipping shell validation"
+fi
+
+# Shell: Format check
+echo "📝 Checking shell script formatting..."
+if command -v shfmt >/dev/null 2>&1; then
+  find . -type f \( -name "*.sh" -o -executable -exec sh -c 'head -n1 "$1" | grep -q "^#!.*sh"' _ {} \; \) \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -print0 | xargs -0 shfmt -i 2 -ci -d
+else
+  echo "⚠️  shfmt not available, skipping shell format check"
+fi
+
+# Nix: Format check
+echo "❄️  Checking Nix formatting..."
+if command -v nixfmt >/dev/null 2>&1; then
+  find . -type f -name "*.nix" \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -exec nixfmt --check {} +
+else
+  echo "⚠️  nixfmt not available, skipping Nix format check"
+fi
+
+# YAML: Linting
+echo "📄 Linting YAML files..."
+if command -v yamllint >/dev/null 2>&1; then
+  find . -type f \( -name "*.yml" -o -name "*.yaml" \) \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -exec yamllint {} +
+else
+  echo "⚠️  yamllint not available, skipping YAML validation"
+fi
+
+# GitHub Actions: Specific linting
+echo "⚙️  Linting GitHub Actions workflows..."
+if command -v actionlint >/dev/null 2>&1; then
+  find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) 2>/dev/null | xargs -r actionlint || true
+else
+  echo "⚠️  actionlint not available, skipping GitHub Actions validation"
+fi
+
+# Markdown: Linting
+echo "📖 Linting Markdown files..."
+if command -v rumdl >/dev/null 2>&1; then
+  find . -type f -name "*.md" \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -exec rumdl {} +
+else
+  echo "⚠️  rumdl not available, skipping Markdown validation"
+fi
+
+# TOML: Format check
+echo "⚙️  Checking TOML formatting..."
+if command -v taplo >/dev/null 2>&1; then
+  find . -type f -name "*.toml" \
+    -not -path "./.git/*" \
+    -not -path "./target/*" \
+    -not -path "./result/*" \
+    -exec taplo fmt --check {} +
+else
+  echo "⚠️  taplo not available, skipping TOML format check"
+fi
+
+# Security review with Claude (if available)
+echo "🔒 Running security review..."
+if command -v claude >/dev/null 2>&1; then
+  git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? If so, return a list of security/compliance problems to fix before the commit can be completed." | tee /tmp/claude_review
+  # Check for security issues (with word boundaries to avoid false positives)
+  if grep -qiE '\b(problem|secret|token|leak)\b|(\bPII\b)' /tmp/claude_review && ! grep -qi "APPROVED" /tmp/claude_review; then
+    echo "🚨 Security issues found above. Please fix before committing."
+    exit 1
+  fi
+else
+  echo "⚠️  Claude CLI not available, skipping automated security review"
+fi
+
+# Coverage check with comparison to main
+echo "📊 Checking test coverage..."
+if command -v cargo-tarpaulin >/dev/null 2>&1; then
+  NEW=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+
+  # Get main branch coverage (if possible)
+  git stash -q 2>/dev/null || true
+  if git checkout main -q 2>/dev/null; then
+    OLD=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+    git checkout - -q
+    git stash pop -q 2>/dev/null || true
+
+    # Compare coverage using awk
+    if awk "BEGIN { exit !($NEW >= $OLD) }"; then
+      echo "✅ Coverage: $NEW% >= $OLD%"
+    else
+      echo "❌ Coverage dropped: $NEW% < $OLD%"
+      exit 1
+    fi
+  else
+    echo "ℹ️  Could not check coverage against main branch"
+    git stash pop -q 2>/dev/null || true
+  fi
+else
+  echo "⚠️  cargo-tarpaulin not available, skipping coverage check"
+fi
+
+echo "✅ All pre-commit checks passed!"
