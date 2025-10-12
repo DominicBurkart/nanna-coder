@@ -243,13 +243,11 @@ pub fn read_remote_branches(path: impl AsRef<Path>) -> GitOperationResult<Vec<Gi
             if parts.len() == 2 {
                 let remote = parts[0].to_string();
                 let name = parts[1].to_string();
-                let oid = branch
-                    .get()
-                    .target()
-                    .ok_or(GitOperationError::NoHeadCommit)?;
-                let sha = oid.to_string();
-
-                branches.push(GitBranch::new_remote(remote, name, sha));
+                // Skip branches without a valid target (e.g., symbolic refs)
+                if let Some(oid) = branch.get().target() {
+                    let sha = oid.to_string();
+                    branches.push(GitBranch::new_remote(remote, name, sha));
+                }
             }
         }
     }
@@ -303,123 +301,97 @@ pub fn read_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::path::PathBuf;
 
-    // Note: These tests require a valid git repository to run
-    // They will be skipped if not running in a git repo
+    // Helper to get repository root for tests
+    fn get_repo_root() -> PathBuf {
+        // Try CARGO_MANIFEST_DIR which points to harness/, go up one level
+        if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+            PathBuf::from(manifest_dir).parent().unwrap().to_path_buf()
+        } else {
+            PathBuf::from("..")
+        }
+    }
+
+    // Tests using current repository - these will exercise actual git2 code paths
+    // when running in CI/local development environment
 
     #[test]
     fn test_read_repository() {
-        // Try to read the current directory as a git repo
-        match read_repository(".") {
-            Ok(repo) => {
-                // If we're in a git repo, verify basic properties
-                assert!(!repo.remote_url.is_empty());
-                assert!(!repo.default_branch.is_empty());
-            }
-            Err(GitOperationError::Git(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
+        // Test reads current repo and verifies structure
+        let repo = read_repository(get_repo_root()).expect("Should read current git repo");
+        assert!(
+            !repo.default_branch.is_empty(),
+            "Should have default branch"
+        );
     }
 
     #[test]
     fn test_read_current_branch() {
-        match read_current_branch(".") {
-            Ok(branch) => {
-                assert!(!branch.name.is_empty());
-                assert!(!branch.head_sha.is_empty());
-                assert!(!branch.is_remote);
-            }
-            Err(GitOperationError::Git(_)) | Err(GitOperationError::RepositoryNotFound(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
+        let branch = read_current_branch(get_repo_root()).expect("Should read current branch");
+        assert!(!branch.name.is_empty(), "Branch should have name");
+        assert!(!branch.head_sha.is_empty(), "Branch should have SHA");
+        assert!(!branch.is_remote, "Current branch should not be remote");
     }
 
     #[test]
     fn test_read_head_commit() {
-        match read_head_commit(".") {
-            Ok(commit) => {
-                assert!(!commit.sha.is_empty());
-                assert!(!commit.author.is_empty());
-                assert!(!commit.title.is_empty());
-            }
-            Err(GitOperationError::Git(_)) | Err(GitOperationError::RepositoryNotFound(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
+        let commit = read_head_commit(get_repo_root()).expect("Should read HEAD commit");
+        assert!(!commit.sha.is_empty(), "Commit should have SHA");
+        assert!(!commit.author.is_empty(), "Commit should have author");
+        assert!(!commit.title.is_empty(), "Commit should have title");
     }
 
     #[test]
     fn test_read_working_directory() {
-        match read_working_directory(".") {
-            Ok(_wd) => {
-                // Just verify it completes successfully
-            }
-            Err(GitOperationError::Git(_)) | Err(GitOperationError::RepositoryNotFound(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
+        let _wd = read_working_directory(get_repo_root()).expect("Should read working directory");
+        // Working directory state varies, just verify it returns successfully
+        // The function returning Ok is sufficient validation
+    }
+
+    #[test]
+    fn test_read_local_branches() {
+        let branches = read_local_branches(get_repo_root()).expect("Should read local branches");
+        assert!(!branches.is_empty(), "Should have at least one branch");
+        for branch in &branches {
+            assert!(!branch.name.is_empty(), "Branch should have name");
+            assert!(!branch.head_sha.is_empty(), "Branch should have SHA");
+            assert!(!branch.is_remote, "Local branches should not be remote");
+        }
+    }
+
+    #[test]
+    fn test_read_remote_branches() {
+        let branches = read_remote_branches(get_repo_root()).expect("Should read remote branches");
+        // Remote branches may or may not exist, but if they do, verify structure
+        for branch in &branches {
+            assert!(!branch.name.is_empty(), "Branch should have name");
+            assert!(!branch.head_sha.is_empty(), "Branch should have SHA");
+            assert!(
+                branch.is_remote,
+                "Remote branches should be marked as remote"
+            );
+            assert!(
+                branch.remote.is_some(),
+                "Remote branches should have remote name"
+            );
         }
     }
 
     #[test]
     fn test_invalid_repository_path() {
         let result = read_repository("/nonexistent/invalid/path");
-        assert!(result.is_err());
+        assert!(result.is_err(), "Should fail for invalid path");
         match result {
-            Err(GitOperationError::Git(_)) => {
-                // Expected error
-            }
+            Err(GitOperationError::Git(_)) => {}
             _ => panic!("Expected GitOperationError::Git for invalid path"),
         }
     }
 
     #[test]
-    fn test_read_local_branches_in_repo() {
-        match read_local_branches(".") {
-            Ok(branches) => {
-                // If we're in a repo, we should have at least one branch
-                if !branches.is_empty() {
-                    // Verify structure
-                    assert!(!branches[0].name.is_empty());
-                    assert!(!branches[0].head_sha.is_empty());
-                    assert!(!branches[0].is_remote);
-                }
-            }
-            Err(GitOperationError::Git(_)) | Err(GitOperationError::RepositoryNotFound(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    #[test]
-    fn test_read_remote_branches_in_repo() {
-        match read_remote_branches(".") {
-            Ok(branches) => {
-                // Remote branches may or may not exist
-                for branch in &branches {
-                    assert!(!branch.name.is_empty());
-                    assert!(!branch.head_sha.is_empty());
-                    assert!(branch.is_remote);
-                    assert!(branch.remote.is_some());
-                }
-            }
-            Err(GitOperationError::Git(_)) | Err(GitOperationError::RepositoryNotFound(_)) => {
-                // Not in a git repo, test passes
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-        }
-    }
-
-    #[test]
     fn test_invalid_diff_sha() {
-        // Test with invalid SHAs
-        let result = read_diff(".", "invalid_sha_1", "invalid_sha_2");
-        assert!(result.is_err());
+        let result = read_diff(get_repo_root(), "invalid_sha_1", "invalid_sha_2");
+        assert!(result.is_err(), "Should fail for invalid SHAs");
     }
 }
