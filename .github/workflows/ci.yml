@@ -525,6 +525,10 @@ jobs:
 
         # Use nix2container's built-in copyToDockerDaemon helper
         # This uses skopeo with the nix: transport that understands nix2container JSON format
+        #
+        # Documentation: See flake.nix (/** Load Ollama container ... */)
+        # Configuration: See nix/container-config.nix (/** Centralized container configuration ... */)
+        #
         echo "Loading image using: nix run .#${NIX_ATTR}.copyToDockerDaemon"
         if ! nix run .#${NIX_ATTR}.copyToDockerDaemon; then
           echo "❌ Failed to load image via copyToDockerDaemon"
@@ -547,6 +551,11 @@ jobs:
 
         # Tag for registry (convert repository name to lowercase for Docker compatibility)
         # Use GITHUB_REPOSITORY from environment (works in forks)
+        #
+        # Configuration: See nix/container-config.nix registry attribute
+        # Fork compatibility: Automatic via ${{ github.repository }}
+        # Helper functions: See nix/container-config.nix (/** Helper functions ... */)
+        #
         REPO_LOWERCASE=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         echo "🏷️  Tagging for registry: ${{ env.REGISTRY }}/${REPO_LOWERCASE}/${REGISTRY_NAME}"
 

@@ -327,8 +327,51 @@
               maxLayers = 100;
             }) else null;
 
-          # Container loading utility using nix2container's built-in copyToDockerDaemon
-          # This is the recommended approach for loading nix2container images
+          /** Load Ollama container using nix2container's copyToDockerDaemon
+
+          This is the recommended method for loading nix2container images.
+          Uses skopeo internally with the nix: transport.
+
+          # Usage
+
+          ```bash
+          # Load ollama image
+          nix run .#load-ollama-image
+
+          # Verify it loaded
+          docker images | grep nanna-coder-ollama
+
+          # Run the container
+          docker run -d -p 11434:11434 nanna-coder-ollama:latest
+          ```
+
+          # How It Works
+
+          1. nix2container builds JSON description (not tarball)
+          2. copyToDockerDaemon uses skopeo with nix: transport
+          3. Image loaded directly into Docker daemon
+          4. No intermediate files created
+
+          # Troubleshooting
+
+          If loading fails:
+          - Check Docker daemon: `docker info`
+          - Verify image built: `nix build .#ollamaImage --print-out-paths`
+          - Check disk space: `df -h`
+
+          # Benefits
+
+          - Fast (no tar extraction)
+          - Works with both Docker and Podman
+          - Handles all format complexities internally
+          - Official nix2container approach
+
+          # See Also
+
+          - Configuration: nix/container-config.nix
+          - For CI usage: .github/workflows/ci.yml:529-536
+          - nix2container: https://github.com/nlewo/nix2container
+          */
           load-ollama-image = if pkgs.stdenv.isLinux then
             (pkgs.writeShellApplication {
               name = "load-ollama-image";

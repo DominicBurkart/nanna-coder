@@ -84,25 +84,85 @@ let
     maxLayers = containerConfig.runtime.maxLayers;
   };
 
-  # Model registry with metadata for all supported models
-  #
-  # IMPORTANT: Hash Behavior
-  # -------------------------
-  # - qwen3: Uses real content hash - fully reproducible builds
-  # - llama3, mistral, gemma: Use placeholder hashes for development mode
-  #
-  # Placeholder hashes (0000...000) indicate development-mode models that:
-  # 1. Create lightweight stubs during nix build (fast, no downloads)
-  # 2. Download on-demand when container first runs (flexible for testing)
-  # 3. Are not cached by content hash (intentional for active development)
-  #
-  # To enable production caching for a model:
-  # 1. Build the model container: nix build .#<model>-container
-  # 2. Extract the actual hash from build logs or use nix hash path
-  # 3. Replace the placeholder with the real hash
-  # 4. Rebuild - model will now be cached and reproducible
-  #
-  # See: nix/containers.nix:119-132 for hash detection logic
+  /** Model registry with content hashes
+
+  Metadata for all supported AI models with content-addressable caching.
+
+  # Hash Behavior
+
+  - **Real hash** (qwen3): Fully reproducible, cached by Nix store
+  - **Placeholder hash** (llama3, mistral, gemma): Development mode
+
+  # Development Mode (Placeholder Hashes)
+
+  Placeholder hashes (sha256-0000...000) enable fast iteration:
+
+  ```bash
+  # Build is fast (no model download during nix build)
+  nix build .#llama3-container
+
+  # Container downloads model on first run
+  docker run nanna-coder-ollama-llama3:latest
+  # Model is downloaded inside container when needed
+  ```
+
+  Benefits:
+  - Fast builds (no 4GB+ downloads)
+  - Flexible for testing
+  - On-demand model loading
+
+  # Production Mode (Real Hashes)
+
+  Convert to production for reproducible caching:
+
+  ```bash
+  # 1. Build and run container to download model
+  nix build .#llama3-container
+  docker run -it nanna-coder-ollama-llama3:latest
+
+  # 2. Calculate actual content hash
+  nix hash path /path/to/downloaded/model
+
+  # 3. Update hash in modelRegistry (this file)
+  # 4. Rebuild - now cached and reproducible
+  ```
+
+  # Example: Model Registry Entry
+
+  ```nix
+  "qwen3" = {
+    name = "qwen3:0.6b";
+    hash = "sha256-2EaXyBr1C+6wNyLzcWblzB52iV/2G26dSa5MFqpYJLc=";  # Real hash
+    description = "Qwen3 0.6B - Fast and efficient model for testing";
+    size = "560MB";
+    homepage = "https://ollama.com/library/qwen3";
+  };
+
+  "llama3" = {
+    name = "llama3:8b";
+    hash = "sha256-0000000000000000000000000000000000000000000=";  # DEVELOPMENT MODE
+    description = "Llama3 8B - High quality general purpose model";
+    size = "4.7GB";
+    homepage = "https://ollama.com/library/llama3";
+  };
+  ```
+
+  # Usage
+
+  ```nix
+  # Access model metadata
+  modelRegistry.qwen3.name
+  => "qwen3:0.6b"
+
+  modelRegistry.llama3.size
+  => "4.7GB"
+  ```
+
+  # See Also
+
+  - Hash detection logic: createModelDerivation function (below)
+  - Container loading: nix/container-config.nix
+  */
   modelRegistry = {
     "qwen3" = {
       name = "qwen3:0.6b";
