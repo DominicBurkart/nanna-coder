@@ -8,14 +8,15 @@
 { pkgs
 , lib
 , nix2containerPkgs
+, containerConfig
 , harness
 }:
 
 let
   # Container image for the harness CLI
   harnessImage = nix2containerPkgs.nix2container.buildImage {
-    name = "nanna-coder-harness";
-    tag = "latest";
+    name = containerConfig.images.harness;
+    tag = containerConfig.tags.default;
 
     copyToRoot = pkgs.buildEnv {
       name = "harness-env";
@@ -43,13 +44,13 @@ let
     };
 
     # Reproducible layer strategy
-    maxLayers = 100;
+    maxLayers = containerConfig.runtime.maxLayers;
   };
 
   # Ollama service container using nix2container
   ollamaImage = nix2containerPkgs.nix2container.buildImage {
-    name = "nanna-coder-ollama";
-    tag = "latest";
+    name = containerConfig.images.ollama;
+    tag = containerConfig.tags.default;
 
     copyToRoot = pkgs.buildEnv {
       name = "ollama-env";
@@ -80,10 +81,88 @@ let
     };
 
     # Reproducible layer strategy
-    maxLayers = 100;
+    maxLayers = containerConfig.runtime.maxLayers;
   };
 
-  # Model registry with metadata for all supported models
+  /** Model registry with content hashes
+
+  Metadata for all supported AI models with content-addressable caching.
+
+  # Hash Behavior
+
+  - **Real hash** (qwen3): Fully reproducible, cached by Nix store
+  - **Placeholder hash** (llama3, mistral, gemma): Development mode
+
+  # Development Mode (Placeholder Hashes)
+
+  Placeholder hashes (sha256-0000...000) enable fast iteration:
+
+  ```bash
+  # Build is fast (no model download during nix build)
+  nix build .#llama3-container
+
+  # Container downloads model on first run
+  docker run nanna-coder-ollama-llama3:latest
+  # Model is downloaded inside container when needed
+  ```
+
+  Benefits:
+  - Fast builds (no 4GB+ downloads)
+  - Flexible for testing
+  - On-demand model loading
+
+  # Production Mode (Real Hashes)
+
+  Convert to production for reproducible caching:
+
+  ```bash
+  # 1. Build and run container to download model
+  nix build .#llama3-container
+  docker run -it nanna-coder-ollama-llama3:latest
+
+  # 2. Calculate actual content hash
+  nix hash path /path/to/downloaded/model
+
+  # 3. Update hash in modelRegistry (this file)
+  # 4. Rebuild - now cached and reproducible
+  ```
+
+  # Example: Model Registry Entry
+
+  ```nix
+  "qwen3" = {
+    name = "qwen3:0.6b";
+    hash = "sha256-2EaXyBr1C+6wNyLzcWblzB52iV/2G26dSa5MFqpYJLc=";  # Real hash
+    description = "Qwen3 0.6B - Fast and efficient model for testing";
+    size = "560MB";
+    homepage = "https://ollama.com/library/qwen3";
+  };
+
+  "llama3" = {
+    name = "llama3:8b";
+    hash = "sha256-0000000000000000000000000000000000000000000=";  # DEVELOPMENT MODE
+    description = "Llama3 8B - High quality general purpose model";
+    size = "4.7GB";
+    homepage = "https://ollama.com/library/llama3";
+  };
+  ```
+
+  # Usage
+
+  ```nix
+  # Access model metadata
+  modelRegistry.qwen3.name
+  => "qwen3:0.6b"
+
+  modelRegistry.llama3.size
+  => "4.7GB"
+  ```
+
+  # See Also
+
+  - Hash detection logic: createModelDerivation function (below)
+  - Container loading: nix/container-config.nix
+  */
   modelRegistry = {
     "qwen3" = {
       name = "qwen3:0.6b";
@@ -94,21 +173,21 @@ let
     };
     "llama3" = {
       name = "llama3:8b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Llama3 8B - High quality general purpose model";
       size = "4.7GB";
       homepage = "https://ollama.com/library/llama3";
     };
     "mistral" = {
       name = "mistral:7b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Mistral 7B - Balanced performance model";
       size = "4.1GB";
       homepage = "https://ollama.com/library/mistral";
     };
     "gemma" = {
       name = "gemma:2b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-0000000000000000000000000000000000000000000="; # DEVELOPMENT MODE
       description = "Gemma 2B - Lightweight model for development";
       size = "1.4GB";
       homepage = "https://ollama.com/library/gemma";
@@ -221,8 +300,8 @@ let
   # Multi-model containers with pre-cached models
   containers = {
     qwen3-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-qwen3";
-      tag = "latest";
+      name = containerConfig.images.models.qwen3;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-qwen3-env";
@@ -236,13 +315,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     llama3-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-llama3";
-      tag = "latest";
+      name = containerConfig.images.models.llama3;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-llama3-env";
@@ -256,13 +335,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     mistral-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-mistral";
-      tag = "latest";
+      name = containerConfig.images.models.mistral;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-mistral-env";
@@ -276,13 +355,13 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
 
     gemma-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-gemma";
-      tag = "latest";
+      name = containerConfig.images.models.gemma;
+      tag = containerConfig.tags.default;
       fromImage = ollamaImage;
       copyToRoot = pkgs.buildEnv {
         name = "ollama-gemma-env";
@@ -296,8 +375,8 @@ let
         ExposedPorts = { "11434/tcp" = {}; };
         Volumes = { "/root/.ollama" = {}; };
       };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
+      created = containerConfig.runtime.buildTimestamp;
+      maxLayers = containerConfig.runtime.maxLayers;
     };
   };
 
