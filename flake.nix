@@ -196,7 +196,7 @@
             export CARGO_HOME=$(mktemp -d)
 
             # Run coverage and extract percentage
-            COVERAGE=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | \
+            COVERAGE=$(cargo tarpaulin --skip-clean --ignore-tests --out Stdout 2>&1 | \
                       grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
 
             # Minimum coverage threshold (can be adjusted)
@@ -389,10 +389,6 @@
                 echo "🐳 Run: docker run -d -p 11434:11434 nanna-coder-ollama:latest"
               '';
             }) else null;
-
-          # NOTE: Legacy load-container-image removed in favor of unified loading interface
-          # Use: nix run .#<image-name>.copyToDockerDaemon instead
-          # See: nix/container-loader.nix for the new unified interface
         }
       );
     };

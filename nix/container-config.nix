@@ -204,9 +204,7 @@ in rec {
     # Model-specific image names
     models = {
       qwen3 = "nanna-coder-ollama-qwen3";
-      llama3 = "nanna-coder-ollama-llama3";
       mistral = "nanna-coder-ollama-mistral";
-      gemma = "nanna-coder-ollama-gemma";
     };
   };
 
@@ -352,31 +350,14 @@ in rec {
   loading.method
   => "copyToDockerDaemon"
 
-  loading.retries.maxAttempts
-  => 3
-
-  loading.timeoutSeconds
-  => 300
+  loading.verbose
+  => false
   ```
-
-  # Note
-
-  Retry logic and timeout are defined but not yet implemented in CI.
-  Reserved for future use.
   */
   loading = {
     # Method to use for loading images
-    # Options: "copyToDockerDaemon", "copyToPodman", "legacy"
+    # Options: "copyToDockerDaemon", "copyToPodman"
     method = "copyToDockerDaemon";
-
-    # Retry configuration for transient failures (reserved for future use)
-    retries = {
-      maxAttempts = 3;
-      delaySeconds = 5;
-    };
-
-    # Timeout for loading operations in seconds (reserved for future use)
-    timeoutSeconds = 300;
 
     # Enable verbose logging during load
     verbose = getEnv "CONTAINER_LOAD_VERBOSE" "false" == "true";
