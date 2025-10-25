@@ -80,6 +80,16 @@ else
     OVERALL_FAILED=1
 fi
 
+# Run security hook tests
+echo ""
+echo "======================================"
+if bash "$SCRIPT_DIR/security/test-security-hook.sh"; then
+    echo -e "${GREEN}✅ Security hook tests passed${NC}"
+else
+    echo -e "${RED}❌ Security hook tests failed${NC}"
+    OVERALL_FAILED=1
+fi
+
 # Run provenance tests
 echo ""
 echo "======================================"
