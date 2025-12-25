@@ -98,6 +98,8 @@ pub struct AgentLoop {
     iterations: usize,
     /// Entity store for managing development artifacts
     entity_store: InMemoryEntityStore,
+    /// Number of actions performed (not iterations)
+    performed_actions: usize,
 }
 
 impl AgentLoop {
@@ -113,6 +115,7 @@ impl AgentLoop {
             config,
             iterations: 0,
             entity_store,
+            performed_actions: 0,
         }
     }
 
@@ -230,14 +233,10 @@ impl AgentLoop {
     /// Check if the task is complete
     ///
     /// MVP implementation:
-    /// - Completes after at least one entity has been created/modified
-    /// - Checks if we've performed at least one action
+    /// - Completes after at least one action has been performed
+    /// - Phase 2: Will use LLM to validate completion
     async fn check_task_complete(&self, _context: &AgentContext) -> AgentResult<bool> {
-        // We need at least 2 iterations to have gone through:
-        // Iteration 0: Planning -> CheckingCompletion (returns false)
-        // Iteration 1: Deciding -> Performing -> CheckingCompletion (returns true)
-        // So complete when iterations >= 2 (meaning we've done perform at least once)
-        Ok(self.iterations >= 2)
+        Ok(self.performed_actions > 0)
     }
 
     /// Decide whether to query for more context
@@ -272,6 +271,8 @@ impl AgentLoop {
     /// - Stores it in the entity store
     async fn perform(&mut self, context: &AgentContext) -> AgentResult<()> {
         use crate::entities::{git::types::GitRepository, EntityStore};
+
+        self.performed_actions += 1;
 
         if self.config.verbose {
             tracing::info!("Performing action for: {}", context.user_prompt);
