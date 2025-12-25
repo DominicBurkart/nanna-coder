@@ -219,12 +219,20 @@ impl CompletionPrompt {
     /// * `None` - Could not parse response
     pub fn parse_response(response: &str) -> Option<bool> {
         let upper = response.to_uppercase();
-        if upper.contains("COMPLETE") && !upper.contains("INCOMPLETE") {
+        
+        // Check for standalone "COMPLETE" (not part of "INCOMPLETE")
+        let has_complete_only = upper.contains("COMPLETE") && !upper.contains("INCOMPLETE");
+        let has_incomplete = upper.contains("INCOMPLETE");
+        
+        // If both appear (INCOMPLETE contains COMPLETE), it's ambiguous
+        if has_incomplete && upper.matches("COMPLETE").count() > 1 {
+            None // Ambiguous - both keywords present separately
+        } else if has_complete_only {
             Some(true) // Task complete
-        } else if upper.contains("INCOMPLETE") {
-            Some(false) // Task incomplete
+        } else if has_incomplete {
+            Some(false) // Task incomplete (INCOMPLETE contains COMPLETE)
         } else {
-            None // Ambiguous or invalid
+            None // Neither keyword present
         }
     }
 }
@@ -512,6 +520,20 @@ mod tests {
             CompletionPrompt::parse_response(""),
             None,
             "Should return None for empty response"
+        );
+    }
+
+    #[test]
+    fn test_completion_parse_both_keywords() {
+        assert_eq!(
+            CompletionPrompt::parse_response("The task is INCOMPLETE but we're making progress toward COMPLETE"),
+            None,
+            "Should return None when both COMPLETE and INCOMPLETE are present"
+        );
+        assert_eq!(
+            CompletionPrompt::parse_response("COMPLETE INCOMPLETE"),
+            None,
+            "Should return None when both keywords appear"
         );
     }
 

@@ -249,24 +249,25 @@ impl AgentLoop {
         for attempt in 0..judge_config.max_retries {
             match provider.chat(request.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(e) if attempt < judge_config.max_retries - 1 => {
-                    let delay = judge_config.calculate_retry_delay(attempt);
-                    if self.config.verbose {
-                        tracing::warn!(
-                            "LLM {} failed (attempt {}), retrying in {:?}: {}",
-                            operation,
-                            attempt + 1,
-                            delay,
-                            e
-                        );
-                    }
-                    tokio::time::sleep(delay).await;
-                }
                 Err(e) => {
-                    return Err(AgentError::StateError(format!(
-                        "LLM {} failed after {} attempts: {}",
-                        operation, judge_config.max_retries, e
-                    )));
+                    if attempt < judge_config.max_retries - 1 {
+                        let delay = judge_config.calculate_retry_delay(attempt);
+                        if self.config.verbose {
+                            tracing::warn!(
+                                "LLM {} failed (attempt {}), retrying in {:?}: {}",
+                                operation,
+                                attempt + 1,
+                                delay,
+                                e
+                            );
+                        }
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        return Err(AgentError::StateError(format!(
+                            "LLM {} failed after {} attempts: {}",
+                            operation, judge_config.max_retries, e
+                        )));
+                    }
                 }
             }
         }
@@ -351,6 +352,13 @@ impl AgentLoop {
                 .call_llm_with_retry(provider, request, "planning")
                 .await?;
 
+            // Validate response has choices
+            if response.choices.is_empty() {
+                return Err(AgentError::StateError(
+                    "LLM returned empty choices array for planning".to_string(),
+                ));
+            }
+
             self.plan_cache = response.choices[0].message.content.clone();
 
             if self.config.verbose {
@@ -393,6 +401,14 @@ impl AgentLoop {
             
             // Call LLM with retry logic
             let response = self.call_llm_with_retry(provider, request, "completion check").await?;
+            
+            // Validate response has choices
+            if response.choices.is_empty() {
+                if self.config.verbose {
+                    tracing::warn!("LLM returned empty choices, falling back to action count");
+                }
+                return Ok(self.performed_actions > 0);
+            }
             
             let empty = String::new();
             let status_text = response.choices[0].message.content
@@ -458,6 +474,14 @@ impl AgentLoop {
             let response = self
                 .call_llm_with_retry(provider, request, "decision")
                 .await?;
+
+            // Validate response has choices
+            if response.choices.is_empty() {
+                if self.config.verbose {
+                    tracing::warn!("LLM returned empty choices, defaulting to PROCEED");
+                }
+                return Ok(false);
+            }
 
             let empty_string = String::new();
             let decision_text = response.choices[0]
