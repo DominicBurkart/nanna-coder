@@ -441,9 +441,10 @@ mod tests {
             .query(&EntityQuery::default())
             .await
             .unwrap();
-        assert!(
-            final_entities.len() > 1,
-            "Agent should have created at least one new entity. Found {} entities",
+        assert_eq!(
+            final_entities.len(),
+            2,
+            "Agent should create exactly one entity (1 initial + 1 created). Found {}",
             final_entities.len()
         );
 
