@@ -83,33 +83,94 @@ let
     maxLayers = 100;
   };
 
+  # vLLM container wrapper scripts
+  # Since vLLM uses the upstream Docker image, we provide wrapper scripts
+  # instead of building custom Nix containers
+  vllmImage = { model ? "XiaomiMiMo/MiMo-V2-Flash", extraArgs ? [] }:
+    pkgs.writeShellApplication {
+      name = "run-vllm-${builtins.replaceStrings ["/"] ["-"] model}";
+      runtimeInputs = with pkgs; [ docker podman ];
+      text = ''
+        # Default model: ${model}
+        MODEL="''${1:-${model}}"
+        
+        echo "🚀 Starting vLLM server with model: $MODEL"
+        echo "📦 Using vllm/vllm-openai:latest"
+        echo "🌐 API will be available on http://localhost:8000"
+        echo ""
+        
+        # Check if using docker or podman
+        if command -v docker &> /dev/null; then
+          CONTAINER_CMD=docker
+        elif command -v podman &> /dev/null; then
+          CONTAINER_CMD=podman
+        else
+          echo "❌ Error: Neither docker nor podman found"
+          exit 1
+        fi
+        
+        # Run vLLM container
+        $CONTAINER_CMD run -d \
+          --name nanna-coder-vllm \
+          -p 8000:8000 \
+          -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+          vllm/vllm-openai:latest \
+          --model "$MODEL" \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --trust-remote-code \
+          ${lib.concatStringsSep " " extraArgs}
+        
+        echo "✅ vLLM container started"
+        echo "📊 Monitor logs with: $CONTAINER_CMD logs -f nanna-coder-vllm"
+        echo "🔍 Check health: curl http://localhost:8000/health"
+        echo "📚 List models: curl http://localhost:8000/v1/models"
+      '';
+    };
+
   # Model registry with metadata for all supported models
+  # Updated to use HuggingFace models for vLLM
   modelRegistry = {
+    "mimo-v2-flash" = {
+      name = "XiaomiMiMo/MiMo-V2-Flash";
+      description = "MiMo V2 Flash - Fast reasoning model with custom architecture";
+      size = "~2GB";
+      homepage = "https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash";
+      requiresTrustRemoteCode = true;
+    };
+    "qwen3-coder-30b" = {
+      name = "Qwen/Qwen3-Coder-30B-A3B-Instruct";
+      description = "Qwen3 Coder 30B - Advanced coding model with instruction tuning";
+      size = "~30GB";
+      homepage = "https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct";
+      requiresTrustRemoteCode = false;
+    };
+    # Legacy Ollama models (kept for backward compatibility during migration)
     "qwen3" = {
       name = "qwen3:0.6b";
       hash = "sha256-2EaXyBr1C+6wNyLzcWblzB52iV/2G26dSa5MFqpYJLc=";
-      description = "Qwen3 0.6B - Fast and efficient model for testing";
+      description = "Qwen3 0.6B - Fast and efficient model for testing (Ollama)";
       size = "560MB";
       homepage = "https://ollama.com/library/qwen3";
     };
     "llama3" = {
       name = "llama3:8b";
       hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Llama3 8B - High quality general purpose model";
+      description = "Llama3 8B - High quality general purpose model (Ollama)";
       size = "4.7GB";
       homepage = "https://ollama.com/library/llama3";
     };
     "mistral" = {
       name = "mistral:7b";
       hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Mistral 7B - Balanced performance model";
+      description = "Mistral 7B - Balanced performance model (Ollama)";
       size = "4.1GB";
       homepage = "https://ollama.com/library/mistral";
     };
     "gemma" = {
       name = "gemma:2b";
       hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Gemma 2B - Lightweight model for development";
+      description = "Gemma 2B - Lightweight model for development (Ollama)";
       size = "1.4GB";
       homepage = "https://ollama.com/library/gemma";
     };
@@ -303,6 +364,6 @@ let
 
 in
 {
-  inherit harnessImage ollamaImage;
+  inherit harnessImage ollamaImage vllmImage;
   inherit modelRegistry models containers;
 }

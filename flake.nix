@@ -108,6 +108,9 @@
           binaryCacheUtils = cache.binaryCacheUtils;
           devUtils = scripts.devUtils;
           cacheUtils = scripts.cacheUtils;
+          vllmImage = containers.vllmImage { };
+          vllmImageMimo = containers.vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
+          vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
         };
 
       in
@@ -118,11 +121,16 @@
 
           # Container images (production)
           inherit (containers) harnessImage ollamaImage;
+          
+          # vLLM containers with different models
+          vllmImage = containers.vllmImage { };  # Default: MiMo-V2-Flash
+          vllmImageMimo = containers.vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
+          vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
 
-          # Multi-model cache system
+          # Multi-model cache system (Ollama - legacy)
           inherit (containers.models) qwen3-model llama3-model mistral-model gemma-model;
 
-          # Multi-model containers
+          # Multi-model containers (Ollama - legacy)
           inherit (containers.containers) qwen3-container llama3-container mistral-container gemma-container;
 
           # Cache management utilities
@@ -223,6 +231,9 @@
             extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
           };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          
+          # Add nix2container for container builds
+          nix2containerPkgs = nix2container.packages.${system};
 
           commonBuildInputs = with pkgs; [ pkg-config openssl ];
           commonNativeBuildInputs = with pkgs; [ pkg-config ];
@@ -322,6 +333,53 @@
               };
               maxLayers = 100;
             }) else null;
+
+          # vLLM wrapper scripts (cross-platform compatible)
+          # Note: These are wrapper scripts that use the official vllm/vllm-openai Docker image
+          vllmImage = (import ./nix/containers.nix {
+            inherit pkgs nix2containerPkgs;
+            lib = pkgs.lib;
+            harness = (craneLib.buildPackage {
+              inherit src cargoArtifacts;
+              buildInputs = commonBuildInputs;
+              nativeBuildInputs = commonNativeBuildInputs;
+              cargoBuildCommand = "cargo build --release --bin harness";
+              installPhase = ''
+                mkdir -p $out/bin
+                cp target/release/harness $out/bin/
+              '';
+            });
+          }).vllmImage { };
+
+          vllmImageMimo = (import ./nix/containers.nix {
+            inherit pkgs nix2containerPkgs;
+            lib = pkgs.lib;
+            harness = (craneLib.buildPackage {
+              inherit src cargoArtifacts;
+              buildInputs = commonBuildInputs;
+              nativeBuildInputs = commonNativeBuildInputs;
+              cargoBuildCommand = "cargo build --release --bin harness";
+              installPhase = ''
+                mkdir -p $out/bin
+                cp target/release/harness $out/bin/
+              '';
+            });
+          }).vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
+
+          vllmImageQwen = (import ./nix/containers.nix {
+            inherit pkgs nix2containerPkgs;
+            lib = pkgs.lib;
+            harness = (craneLib.buildPackage {
+              inherit src cargoArtifacts;
+              buildInputs = commonBuildInputs;
+              nativeBuildInputs = commonNativeBuildInputs;
+              cargoBuildCommand = "cargo build --release --bin harness";
+              installPhase = ''
+                mkdir -p $out/bin
+                cp target/release/harness $out/bin/
+              '';
+            });
+          }).vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
 
           # Container loading utilities for CI
           load-ollama-image = if pkgs.stdenv.isLinux then
