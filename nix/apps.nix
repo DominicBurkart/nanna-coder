@@ -4,12 +4,16 @@
 # - CI/CD utility apps
 # - Development utility apps
 # - Cache management apps
+# - vLLM container apps
 
 { flake-utils
 , harness
 , binaryCacheUtils
 , devUtils
 , cacheUtils
+, vllmImage
+, vllmImageMimo
+, vllmImageQwen
 }:
 
 {
@@ -52,5 +56,18 @@
   # Cache management
   cache-info = flake-utils.lib.mkApp {
     drv = cacheUtils.cache-info;
+  };
+
+  # vLLM container management
+  vllm-start = flake-utils.lib.mkApp {
+    drv = vllmImage;
+  };
+
+  vllm-start-mimo = flake-utils.lib.mkApp {
+    drv = vllmImageMimo;
+  };
+
+  vllm-start-qwen = flake-utils.lib.mkApp {
+    drv = vllmImageQwen;
   };
 }
