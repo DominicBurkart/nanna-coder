@@ -803,12 +803,12 @@ mod tests {
         
         // Should use fallback (action count) when no LLM provider
         let is_complete = agent.check_task_complete(&context).await.unwrap();
-        assert_eq!(is_complete, true, "Should be complete when performed_actions > 0");
+        assert!(is_complete, "Should be complete when performed_actions > 0");
         
         // With no actions, should be incomplete
         agent.performed_actions = 0;
         let is_complete = agent.check_task_complete(&context).await.unwrap();
-        assert_eq!(is_complete, false, "Should be incomplete when performed_actions == 0");
+        assert!(!is_complete, "Should be incomplete when performed_actions == 0");
     }
 
     #[tokio::test]
@@ -853,9 +853,8 @@ mod tests {
             }
         }
         
-        let is_complete = result.unwrap();
-        // Valid boolean result
-        assert!(is_complete || !is_complete);
+        let _is_complete = result.unwrap();
+        // LLM returned valid completion status (test passes if we get here without panic)
     }
 
     #[tokio::test]
@@ -892,9 +891,8 @@ mod tests {
             return;
         }
         
-        let needs_query = result.unwrap();
-        // Valid boolean result (either true or false)
-        assert!(needs_query || !needs_query);
+        let _needs_query = result.unwrap();
+        // LLM returned valid decision (test passes if we get here without panic)
     }
 
     /// Task 8: Full LLM Agent Control Loop Integration Test

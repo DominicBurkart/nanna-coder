@@ -47,7 +47,7 @@ fn main() {
     let completion = CompletionPrompt::build(
         "Create a new git repository with README",
         2,
-        &vec!["GitRepository".to_string(), "Context".to_string()],
+        &["GitRepository".to_string(), "Context".to_string()],
     );
     println!("{}\n", completion);
 

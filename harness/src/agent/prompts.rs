@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_completion_prompt_contains_user_request() {
-        let prompt = CompletionPrompt::build("Create feature", 1, &vec!["Git".to_string()]);
+        let prompt = CompletionPrompt::build("Create feature", 1, &["Git".to_string()]);
         assert!(
             prompt.contains("Create feature"),
             "Prompt should contain user request"
@@ -445,13 +445,13 @@ mod tests {
 
     #[test]
     fn test_completion_prompt_contains_action_count() {
-        let prompt = CompletionPrompt::build("Test", 3, &vec![]);
+        let prompt = CompletionPrompt::build("Test", 3, &[]);
         assert!(prompt.contains("3"), "Prompt should contain action count");
     }
 
     #[test]
     fn test_completion_prompt_contains_entities() {
-        let prompt = CompletionPrompt::build("Test", 1, &vec!["Git".to_string(), "Ast".to_string()]);
+        let prompt = CompletionPrompt::build("Test", 1, &["Git".to_string(), "Ast".to_string()]);
         assert!(
             prompt.contains("Git"),
             "Prompt should contain entity types"
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_completion_prompt_structure() {
-        let prompt = CompletionPrompt::build("Test", 0, &vec![]);
+        let prompt = CompletionPrompt::build("Test", 0, &[]);
         assert!(prompt.contains("USER REQUEST:"), "Should have USER REQUEST");
         assert!(
             prompt.contains("ACTIONS PERFORMED:"),
@@ -543,7 +543,7 @@ mod tests {
     fn test_all_prompts_are_non_empty() {
         let planning = PlanningPrompt::build("Test", 0, "None");
         let decision = DecisionPrompt::build("Test", "Plan", 0, 0);
-        let completion = CompletionPrompt::build("Test", 0, &vec![]);
+        let completion = CompletionPrompt::build("Test", 0, &[]);
 
         assert!(!planning.is_empty(), "Planning prompt should not be empty");
         assert!(!decision.is_empty(), "Decision prompt should not be empty");
@@ -557,7 +557,7 @@ mod tests {
     fn test_prompts_handle_empty_inputs() {
         let planning = PlanningPrompt::build("", 0, "");
         let decision = DecisionPrompt::build("", "", 0, 0);
-        let completion = CompletionPrompt::build("", 0, &vec![]);
+        let completion = CompletionPrompt::build("", 0, &[]);
 
         // Should not panic with empty inputs
         assert!(planning.contains("USER REQUEST:"));
