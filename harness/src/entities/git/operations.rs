@@ -314,11 +314,23 @@ mod tests {
         }
     }
 
+    // Helper to check if we're in a git repository (for Nix sandbox compatibility)
+    fn has_git_repo() -> bool {
+        let repo_path = get_repo_root();
+        git2::Repository::discover(&repo_path).is_ok()
+    }
+
     // Tests using current repository - these will exercise actual git2 code paths
     // when running in CI/local development environment
 
     #[test]
     fn test_read_repository() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!("Skipping test_read_repository: no git repository found (Nix sandbox)");
+            return;
+        }
+
         // Test reads current repo and verifies structure
         let repo = read_repository(get_repo_root()).expect("Should read current git repo");
         assert!(
@@ -329,6 +341,12 @@ mod tests {
 
     #[test]
     fn test_read_current_branch() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!("Skipping test_read_current_branch: no git repository found (Nix sandbox)");
+            return;
+        }
+
         // In CI, the repo may be in detached HEAD state, so this test may fail
         // We handle this gracefully by checking the error type
         match read_current_branch(get_repo_root()) {
@@ -347,6 +365,12 @@ mod tests {
 
     #[test]
     fn test_read_head_commit() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!("Skipping test_read_head_commit: no git repository found (Nix sandbox)");
+            return;
+        }
+
         let commit = read_head_commit(get_repo_root()).expect("Should read HEAD commit");
         assert!(!commit.sha.is_empty(), "Commit should have SHA");
         assert!(!commit.author.is_empty(), "Commit should have author");
@@ -355,6 +379,14 @@ mod tests {
 
     #[test]
     fn test_read_working_directory() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!(
+                "Skipping test_read_working_directory: no git repository found (Nix sandbox)"
+            );
+            return;
+        }
+
         let _wd = read_working_directory(get_repo_root()).expect("Should read working directory");
         // Working directory state varies, just verify it returns successfully
         // The function returning Ok is sufficient validation
@@ -362,6 +394,12 @@ mod tests {
 
     #[test]
     fn test_read_local_branches() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!("Skipping test_read_local_branches: no git repository found (Nix sandbox)");
+            return;
+        }
+
         let branches = read_local_branches(get_repo_root()).expect("Should read local branches");
         // In CI environments (especially detached HEAD), we may have 0 or limited branches
         // Just verify the structure is correct for any branches that do exist
@@ -374,6 +412,12 @@ mod tests {
 
     #[test]
     fn test_read_remote_branches() {
+        // Skip in Nix sandbox where .git is not available
+        if !has_git_repo() {
+            eprintln!("Skipping test_read_remote_branches: no git repository found (Nix sandbox)");
+            return;
+        }
+
         let branches = read_remote_branches(get_repo_root()).expect("Should read remote branches");
         // Remote branches may or may not exist, but if they do, verify structure
         for branch in &branches {
