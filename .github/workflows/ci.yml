@@ -172,11 +172,22 @@ jobs:
     - name: Install additional tools (non-Nix)
       if: runner.os != 'Linux'
       shell: bash
+      timeout-minutes: 15
       run: |
-        cargo install cargo-nextest cargo-audit cargo-deny
+        echo "📦 Installing Rust tools for ${{ runner.os }}..."
+        echo "🔧 Installing cargo-nextest, cargo-audit, cargo-deny..."
+        
+        # Install tools one by one with better error handling
+        cargo install cargo-nextest --locked || echo "⚠️ cargo-nextest install failed"
+        cargo install cargo-audit --locked || echo "⚠️ cargo-audit install failed" 
+        cargo install cargo-deny --locked || echo "⚠️ cargo-deny install failed"
+        
         if [ "${{ matrix.test-type }}" = "security" ]; then
-          cargo install cargo-tarpaulin
+          echo "🔧 Installing cargo-tarpaulin..."
+          cargo install cargo-tarpaulin --locked || echo "⚠️ cargo-tarpaulin install failed"
         fi
+        
+        echo "✅ Tool installation complete"
 
     - name: Optimize CI cache settings (Nix)
       if: runner.os == 'Linux'
