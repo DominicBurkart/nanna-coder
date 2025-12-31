@@ -248,7 +248,9 @@ jobs:
         if [ "${{ runner.os }}" = "Linux" ]; then
           echo "⚠️ Skipping cargo audit due to CVSS 4.0 incompatibility"
           echo "⚠️ Skipping cargo deny due to CVSS 4.0 incompatibility"
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 600
+          # Increased timeout from 600s to 1800s (30 min) to accommodate E2E containerized tests
+          # which run slower under tarpaulin instrumentation
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
