@@ -123,17 +123,8 @@ pkgs.mkShell {
     echo "📋 Checking licenses and dependencies..."
     cargo deny check
 
-    # Security review with Claude (if available)
-    echo "🔒 Running security review..."
-    if command -v claude >/dev/null 2>&1; then
-      git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? If so, return a list of security/compliance problems to fix before the commit can be completed." | tee /tmp/claude_review
-      if grep -qi "problem\|secret\|token\|pii\|leak" /tmp/claude_review; then
-        echo "🚨 Security issues found above. Please fix before committing."
-        exit 1
-      fi
-    else
-      echo "⚠️  Claude CLI not available, skipping automated security review"
-    fi
+    # Security review with Claude
+    bash scripts/hooks/security-review.sh
 
     # Coverage check with comparison to main
     echo "📊 Checking test coverage..."

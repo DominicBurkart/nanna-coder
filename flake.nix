@@ -228,8 +228,8 @@
           };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-          commonBuildInputs = with pkgs; [ pkg-config openssl ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config ];
+          commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
+          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc ];
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
