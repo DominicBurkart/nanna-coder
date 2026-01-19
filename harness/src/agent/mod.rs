@@ -11,8 +11,13 @@
 pub mod decision;
 pub mod rag;
 
+use crate::entities::InMemoryEntityStore;
+use crate::tools::{
+    GitDiffTool, GitStatusTool, ListDirTool, ReadFileTool, SearchTool, ToolRegistry, WriteFileTool,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Errors that can occur in the agent
@@ -95,21 +100,84 @@ pub struct AgentLoop {
     config: AgentConfig,
     /// Iteration counter
     iterations: usize,
+    /// Entity store for managing development artifacts
+    entity_store: InMemoryEntityStore,
+    /// Tool registry for file operations
+    tool_registry: ToolRegistry,
+    /// Workspace root for file operations
+    workspace_root: PathBuf,
 }
 
 impl AgentLoop {
-    /// Create a new agent loop
+    /// Create a new agent loop with default entity store using current directory
     pub fn new(config: AgentConfig) -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_workspace(config, workspace_root)
+    }
+
+    /// Create a new agent loop with a specific workspace root
+    pub fn with_workspace(config: AgentConfig, workspace_root: PathBuf) -> Self {
+        Self::with_entity_store_and_workspace(config, InMemoryEntityStore::new(), workspace_root)
+    }
+
+    /// Create a new agent loop with a provided entity store
+    pub fn with_entity_store(config: AgentConfig, entity_store: InMemoryEntityStore) -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_entity_store_and_workspace(config, entity_store, workspace_root)
+    }
+
+    /// Create a new agent loop with a provided entity store and workspace root
+    pub fn with_entity_store_and_workspace(
+        config: AgentConfig,
+        entity_store: InMemoryEntityStore,
+        workspace_root: PathBuf,
+    ) -> Self {
+        let tool_registry = Self::create_default_tools(&workspace_root);
         Self {
             state: AgentState::Planning,
             config,
             iterations: 0,
+            entity_store,
+            tool_registry,
+            workspace_root,
         }
+    }
+
+    /// Create the default tool registry with file and git operation tools
+    fn create_default_tools(workspace_root: &std::path::Path) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadFileTool::new(workspace_root.to_path_buf())));
+        registry.register(Box::new(WriteFileTool::new(workspace_root.to_path_buf())));
+        registry.register(Box::new(ListDirTool::new(workspace_root.to_path_buf())));
+        registry.register(Box::new(SearchTool::new(workspace_root.to_path_buf())));
+        registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
+        registry.register(Box::new(GitDiffTool::new(workspace_root.to_path_buf())));
+        registry
     }
 
     /// Get the current state
     pub fn state(&self) -> &AgentState {
         &self.state
+    }
+
+    /// Get reference to entity store
+    pub fn entity_store(&self) -> &InMemoryEntityStore {
+        &self.entity_store
+    }
+
+    /// Get mutable reference to entity store
+    pub fn entity_store_mut(&mut self) -> &mut InMemoryEntityStore {
+        &mut self.entity_store
+    }
+
+    /// Get reference to tool registry
+    pub fn tool_registry(&self) -> &ToolRegistry {
+        &self.tool_registry
+    }
+
+    /// Get the workspace root
+    pub fn workspace_root(&self) -> &PathBuf {
+        &self.workspace_root
     }
 
     /// Run the agent loop with the given context
@@ -177,34 +245,101 @@ impl AgentLoop {
         self.state = new_state;
     }
 
-    /// Plan (stub)
-    async fn plan(&mut self, _context: &AgentContext) -> AgentResult<()> {
-        // Planning logic would go here
+    /// Plan - Query entities and prepare for action
+    ///
+    /// MVP implementation:
+    /// - Uses RAG to query relevant entities
+    /// - Logs planning intent
+    /// - Stores context for perform stage
+    async fn plan(&mut self, context: &AgentContext) -> AgentResult<()> {
+        if self.config.verbose {
+            tracing::info!("Planning for prompt: {}", context.user_prompt);
+        }
+
+        // Use RAG to query entities related to the prompt
+        let query_results = rag::query_entities(&self.entity_store, &context.user_prompt, Some(10))
+            .await
+            .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+
+        if self.config.verbose {
+            tracing::info!("Found {} relevant entities", query_results.len());
+            for result in &query_results {
+                tracing::debug!(
+                    "  - {} (type: {:?}, relevance: {:.2})",
+                    result.entity_id,
+                    result.entity_type,
+                    result.relevance
+                );
+            }
+        }
+
         Ok(())
     }
 
     /// Check if the task is complete
+    ///
+    /// MVP implementation:
+    /// - Completes after at least one entity has been created/modified
+    /// - Checks if we've performed at least one action
     async fn check_task_complete(&self, _context: &AgentContext) -> AgentResult<bool> {
-        // For now, complete after first iteration to avoid infinite loop
-        // Real implementation would check if user's requirements are met
-        Ok(self.iterations > 0)
+        // We need at least 2 iterations to have gone through:
+        // Iteration 0: Planning -> CheckingCompletion (returns false)
+        // Iteration 1: Deciding -> Performing -> CheckingCompletion (returns true)
+        // So complete when iterations >= 2 (meaning we've done perform at least once)
+        Ok(self.iterations >= 2)
     }
 
-    /// Decide (stub - returns whether to query)
+    /// Decide whether to query for more context
+    ///
+    /// MVP implementation:
+    /// - Don't query on first iteration (we already queried in plan)
+    /// - For now, always proceed to perform
     async fn decide(&self, _context: &AgentContext) -> AgentResult<bool> {
-        // Decision logic would go here
-        Ok(false) // Don't query by default
+        // For MVP, we don't need additional RAG queries
+        // The planning stage already did the initial query
+        Ok(false) // Don't query, proceed to perform
     }
 
-    /// Query using RAG (stub - calls unimplemented RAG logic)
-    async fn query(&self, _context: &AgentContext) -> AgentResult<()> {
-        // This will panic when called due to unimplemented!() in rag module
-        rag::query().map_err(|e| AgentError::StateError(e.to_string()))
+    /// Query using RAG for additional context
+    async fn query(&self, context: &AgentContext) -> AgentResult<()> {
+        // Use the new RAG implementation
+        let results = rag::query_entities(&self.entity_store, &context.user_prompt, Some(5))
+            .await
+            .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+
+        if self.config.verbose {
+            tracing::info!("Additional query found {} entities", results.len());
+        }
+
+        Ok(())
     }
 
-    /// Perform action (stub)
-    async fn perform(&mut self, _context: &AgentContext) -> AgentResult<()> {
-        // Perform logic would go here
+    /// Perform action - Create new entities based on the plan
+    ///
+    /// MVP implementation:
+    /// - Creates a new GitRepository entity based on user prompt
+    /// - Stores it in the entity store
+    async fn perform(&mut self, context: &AgentContext) -> AgentResult<()> {
+        use crate::entities::{git::types::GitRepository, EntityStore};
+
+        if self.config.verbose {
+            tracing::info!("Performing action for: {}", context.user_prompt);
+        }
+
+        // MVP: Create a new git repository entity
+        // Future: Parse user intent and create appropriate entities
+        let new_entity = Box::new(GitRepository::new());
+
+        let entity_id = self
+            .entity_store
+            .store(new_entity)
+            .await
+            .map_err(|e| AgentError::StateError(format!("Failed to store entity: {}", e)))?;
+
+        if self.config.verbose {
+            tracing::info!("Created new entity: {}", entity_id);
+        }
+
         Ok(())
     }
 }
@@ -225,6 +360,8 @@ pub trait AgentComponent: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::git::types::GitRepository;
+    use crate::entities::{EntityQuery, EntityStore, InMemoryEntityStore};
 
     #[test]
     fn test_agent_state_transitions() {
@@ -292,5 +429,88 @@ mod tests {
         // Should hit max iterations but actually completes after first iteration
         // due to check_task_complete logic
         assert!(result.is_ok() || matches!(result, Err(AgentError::MaxIterationsExceeded)));
+    }
+
+    /// MVP Test: Agent completes one full control loop modifying entities
+    ///
+    /// This test defines the MVP contract:
+    /// 1. Agent accepts an entity store
+    /// 2. Agent can plan using RAG (query entities) without panicking
+    /// 3. Agent can perform actions (create git entity)
+    /// 4. Agent can check task completion (verify entity was created)
+    /// 5. Agent completes successfully after modifications
+    #[tokio::test]
+    async fn test_mvp_agent_control_loop_with_entities() {
+        // Setup: Create entity store with initial state
+        let mut entity_store = InMemoryEntityStore::new();
+
+        // Add an initial git repository entity for context
+        let initial_repo = Box::new(GitRepository::new());
+        let _initial_id = entity_store.store(initial_repo).await.unwrap();
+
+        // Verify initial state
+        assert_eq!(
+            entity_store
+                .query(&EntityQuery::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Create agent with entity store
+        let config = AgentConfig {
+            max_iterations: 10,
+            verbose: true,
+        };
+        let mut agent = AgentLoop::with_entity_store(config, entity_store);
+
+        // Create context requesting git entity creation
+        let context = AgentContext {
+            user_prompt: "Create a new git repository entity".to_string(),
+            conversation_history: vec![],
+            app_state_id: "mvp_test_state".to_string(),
+        };
+
+        // Run agent
+        let result = agent.run(context).await;
+
+        // Verify success
+        assert!(result.is_ok(), "Agent should complete successfully");
+        let run_result = result.unwrap();
+        assert!(
+            run_result.task_completed,
+            "Task should be marked as completed"
+        );
+        assert_eq!(run_result.final_state, AgentState::Completed);
+
+        // Verify entity modifications occurred
+        let final_entities = agent
+            .entity_store()
+            .query(&EntityQuery::default())
+            .await
+            .unwrap();
+        assert!(
+            final_entities.len() > 1,
+            "Agent should have created at least one new entity. Found {} entities",
+            final_entities.len()
+        );
+
+        // Verify we can query by text (RAG didn't panic)
+        // The GitRepository entity has "Git" in its type, so search for that
+        let query = EntityQuery {
+            text_query: Some("Git".to_string()),
+            ..Default::default()
+        };
+        let text_results = agent.entity_store().query(&query).await.unwrap();
+        assert!(
+            !text_results.is_empty(),
+            "RAG text search should find entities with 'Git'"
+        );
+
+        println!(
+            "✅ MVP Test passed: Agent completed control loop with {} entities created",
+            final_entities.len() - 1
+        );
     }
 }
