@@ -9,6 +9,7 @@ A highly opinionated local coding assistant (WIP).
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
 
 ## Technologies
+
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
@@ -18,6 +19,7 @@ A highly opinionated local coding assistant (WIP).
 ## Quick Start
 
 ### Prerequisites
+
 - Nix with flakes enabled
 - (Optional) Cachix account for faster builds
 
@@ -37,7 +39,8 @@ nix build
 
 ### Using Cachix (Optional but Recommended)
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
+Cachix provides a public binary cache for faster builds.
+No account needed to pull pre-built artifacts.
 
 ```bash
 # Configure Cachix for faster builds (read-only access)

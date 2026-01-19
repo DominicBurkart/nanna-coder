@@ -2,13 +2,15 @@
 
 ## Overview
 
-This document outlines the comprehensive binary cache strategy implemented for the Nanna Coder project to optimize CI/CD performance and reduce build times.
+This document outlines the comprehensive binary cache strategy implemented
+for the Nanna Coder project to optimize CI/CD performance and reduce build
+times.
 
 ## Architecture
 
 ### 1. Multi-Tier Caching System
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    Binary Cache Hierarchy                   │
 ├─────────────────────────────────────────────────────────────┤
@@ -45,9 +47,11 @@ This document outlines the comprehensive binary cache strategy implemented for t
 
 ### 1. Flake Configuration
 
-The binary cache system is configured in `flake.nix` with the following components:
+The binary cache system is configured in `flake.nix` with the following
+components:
 
 #### Cache Configuration
+
 ```nix
 binaryCacheConfig = {
   cacheName = "nanna-coder";
@@ -60,6 +64,7 @@ binaryCacheConfig = {
 ```
 
 #### Cache Management Utilities
+
 - `setup-cache`: Configure local development environment
 - `push-cache`: Upload builds to binary cache
 - `ci-cache-optimize`: Optimize CI cache settings
@@ -86,6 +91,7 @@ Each CI job includes:
 #### Cache Maintenance Job
 
 Dedicated job for cache management:
+
 - Pushes successful builds to cache
 - Generates performance analytics
 - Reports cache health metrics
@@ -93,16 +99,19 @@ Dedicated job for cache management:
 ### 3. Performance Optimizations
 
 #### Build Parallelization
+
 - Max jobs: 4 concurrent builds
 - Core utilization: All available CPU cores
 - Intelligent dependency ordering
 
 #### Cache Warming Strategy
+
 - Pre-populate development dependencies
 - Prioritize frequently accessed artifacts
 - Batch upload of related derivations
 
 #### Artifact Filtering
+
 - Exclude source tarballs from push
 - Filter temporary build artifacts
 - Optimize for reproducible outputs
@@ -112,6 +121,7 @@ Dedicated job for cache management:
 ### For Developers
 
 #### Initial Setup
+
 ```bash
 # Configure local binary cache
 nix run .#setup-cache
@@ -121,6 +131,7 @@ nix run .#cache-analytics
 ```
 
 #### Building with Cache
+
 ```bash
 # Normal builds automatically use cache
 nix build .#nanna-coder
@@ -132,12 +143,14 @@ nix build .#nanna-coder --refresh
 ### For CI/CD
 
 #### Manual Cache Upload
+
 ```bash
 # Build and push to cache (requires CACHIX_AUTH)
 nix run .#push-cache
 ```
 
 #### Cache Analytics
+
 ```bash
 # Generate performance report
 nix run .#cache-analytics
@@ -162,6 +175,7 @@ nix run .#cache-analytics
 ### Dashboard Integration
 
 The cache-analytics utility provides:
+
 - Real-time cache statistics
 - Build dependency analysis
 - Storage optimization recommendations
@@ -170,16 +184,19 @@ The cache-analytics utility provides:
 ## Security Considerations
 
 ### Access Control
+
 - CACHIX_AUTH stored as GitHub secret
 - Read-only access for public cache consumption
 - Write access restricted to CI automation
 
 ### Content Validation
+
 - Cryptographic verification of all cached artifacts
 - Reproducible build validation
 - Source code integrity checks
 
 ### Privacy
+
 - No sensitive data cached
 - Build logs sanitized before upload
 - Model caches use content-addressed storage
@@ -189,17 +206,20 @@ The cache-analytics utility provides:
 ### Common Issues
 
 #### Cache Miss Scenarios
+
 - First build on new branch
 - Dependency version updates
 - Configuration changes
 
 #### Resolution Steps
+
 1. Check cache-analytics output
 2. Verify Cachix configuration
 3. Rebuild with cache-refresh
 4. Contact cache maintainers
 
 #### Performance Issues
+
 - Monitor cache hit rates
 - Analyze build dependency graphs
 - Optimize artifact filtering
@@ -221,6 +241,7 @@ nix build .#nanna-coder --refresh --print-build-logs
 ## Future Enhancements
 
 ### Planned Improvements
+
 1. **Multi-Region Caching**: Geographic distribution for global teams
 2. **Intelligent Warming**: ML-based cache prediction
 3. **Cross-Platform Optimization**: ARM64 and x86_64 unified caching
@@ -228,6 +249,7 @@ nix build .#nanna-coder --refresh --print-build-logs
 5. **Advanced Analytics**: Cost analysis and optimization recommendations
 
 ### Performance Goals
+
 - 95% cache hit rate target
 - <1 minute average build time
 - Multi-arch container support
@@ -235,4 +257,5 @@ nix build .#nanna-coder --refresh --print-build-logs
 
 ---
 
-For questions or issues with the binary cache system, please refer to the cache-analytics output or contact the development team.
+For questions or issues with the binary cache system, please refer to the
+cache-analytics output or contact the development team.

@@ -9,14 +9,17 @@
 ## Contributor Usage
 
 ### Read-Only (Pull from Cache)
+
 ```bash
 nix run .#setup-cache  # Configure cache for faster builds
 ```
 
 ### Push Access (Maintainers)
+
 ```bash
 export CACHIX_AUTH="<your-token>"
 nix run .#push-cache
 ```
 
-For detailed documentation, troubleshooting, and advanced configuration, see the [Cachix documentation](https://docs.cachix.org/).
+For detailed documentation, troubleshooting, and advanced configuration,
+see the [Cachix documentation](https://docs.cachix.org/).

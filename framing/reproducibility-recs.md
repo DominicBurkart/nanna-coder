@@ -1,3 +1,4 @@
+<!-- rumdl-disable MD013 MD033 MD041 MD067 -->
 <img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
 
 # what are your recommendations for creating reproducible rust / multi-language applications using nix?
@@ -40,4 +41,3 @@ If desired, I can provide an example Nix flake configuration illustrating these 
 [^1_9]: https://dennybritz.com/posts/adopting-nix/
 
 [^1_10]: https://github.com/nix-community/awesome-nix
-
