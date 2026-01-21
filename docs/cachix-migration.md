@@ -2,7 +2,9 @@
 
 ## Overview
 
-This project uses **Cachix exclusively** for binary caching, providing unlimited storage and persistent cache across all CI runs and developer machines.
+This project uses **Cachix exclusively** for binary caching, providing
+unlimited storage and persistent cache across all CI runs and developer
+machines.
 
 ## Migration History
 
@@ -27,7 +29,7 @@ This project uses **Cachix exclusively** for binary caching, providing unlimited
 
 ### Cachix Integration Points
 
-```
+```text
 ┌─────────────────────────────────────────┐
 │         GitHub Actions CI               │
 │                                         │
@@ -75,6 +77,7 @@ All workflows now use `cachix/cachix-action@v15`:
 ```
 
 **Key Features:**
+
 - **Public read access**: Anyone can download from cache
 - **Authenticated push**: Only CI with `CACHIX_AUTH` can upload
 - **Fork protection**: Forks read but don't push (security)
@@ -122,15 +125,18 @@ nix run .#cache-analytics
 ### What Gets Cached
 
 **High Priority (Always cached):**
+
 - Rust dependencies (cargo artifacts)
 - Test containers (small, frequently used)
 - Build artifacts (binaries)
 
 **Medium Priority (Cached when space available):**
+
 - Cross-compilation outputs
 - Development tools
 
 **Low Priority (Excluded from Cachix):**
+
 - Source tarballs (filtered out)
 - Large model files (downloaded on-demand)
 - nixpkgs tarballs (already cached upstream)
@@ -142,10 +148,12 @@ pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 ```
 
 **Excludes:**
+
 - `*-source` derivations (save bandwidth)
 - `nixpkgs.tar.gz` files (redundant with upstream cache)
 
 **Includes:**
+
 - Compiled binaries
 - Container images
 - Build dependencies
@@ -171,11 +179,13 @@ pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 ### Authentication
 
 **CI Push Access:**
+
 - Requires `CACHIX_AUTH` secret
 - Only configured in repository settings
 - Not accessible to fork PRs
 
 **Public Read Access:**
+
 - Anyone can download from cache
 - No authentication required
 - Cache is marked as "Public" on Cachix
@@ -183,6 +193,7 @@ pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
 ### Fork PR Protection
 
 Fork PRs:
+
 - ✅ Can read from Cachix (faster builds)
 - ❌ Cannot push to Cachix (security)
 - Configured via `skipPush` parameter
@@ -190,6 +201,7 @@ Fork PRs:
 ### Content Trust
 
 All cached artifacts:
+
 - ✅ Verified by Nix content hash
 - ✅ Signed by Cachix
 - ✅ Public key verified on download
@@ -205,6 +217,7 @@ nix run .#cache-analytics
 ```
 
 **Reports:**
+
 - Cachix cache info
 - Local store statistics
 - Configuration validation
@@ -227,6 +240,7 @@ Every CI run includes cache analytics in the job summary:
 **Symptom:** Builds take full time, no downloads from Cachix
 
 **Diagnosis:**
+
 ```bash
 # Check substituters configuration
 cat ~/.config/nix/nix.conf | grep substituters
@@ -236,6 +250,7 @@ cat ~/.config/nix/nix.conf | grep substituters
 ```
 
 **Solution:**
+
 ```bash
 nix run .#setup-cache
 ```
@@ -245,11 +260,13 @@ nix run .#setup-cache
 **Symptom:** CI builds successfully but cache not updated
 
 **Check:**
+
 1. Is `CACHIX_AUTH` secret configured?
 2. Is job running on main branch (not fork PR)?
 3. Check CI logs for "Pushing to cache" messages
 
 **Debug:**
+
 ```bash
 # In CI workflow, add diagnostic step:
 - name: Debug Cachix
@@ -263,6 +280,7 @@ nix run .#setup-cache
 **Symptom:** Error about untrusted public key
 
 **Solution:**
+
 1. Get correct public key from app.cachix.org
 2. Update `flake.nix` line 779
 3. Update local config: `nix run .#setup-cache`
@@ -272,10 +290,12 @@ nix run .#setup-cache
 ### Cachix Free Tier
 
 **Limits:**
+
 - 5 GB storage
 - 10 GB/month bandwidth
 
 **Recommended for:**
+
 - Small projects
 - Open source projects
 - Personal development
@@ -283,11 +303,13 @@ nix run .#setup-cache
 ### Cachix Pro
 
 **Features:**
+
 - Unlimited storage
 - Unlimited bandwidth
 - Priority support
 
 **Recommended for:**
+
 - Large projects (>5GB artifacts)
 - High traffic projects
 - Enterprise use
@@ -301,6 +323,7 @@ nix run .#setup-cache
 | Cachix Pro | Unlimited | Unlimited | $29/month |
 
 **Optimization Tips:**
+
 - Use `pushFilter` to exclude large artifacts
 - Monitor bandwidth with cache-analytics
 - Consider hybrid approach for very large projects

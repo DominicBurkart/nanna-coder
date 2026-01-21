@@ -1,6 +1,7 @@
 # Testing Guide for Nanna Coder
 
-This document provides comprehensive instructions for running tests locally in the nanna-coder project.
+This document provides comprehensive instructions for running tests locally
+in the nanna-coder project.
 
 ## Table of Contents
 
@@ -15,7 +16,8 @@ This document provides comprehensive instructions for running tests locally in t
 
 ### Required Dependencies
 
-All tests must be run from within the Nix development shell. The following dependencies are required:
+All tests must be run from within the Nix development shell.
+The following dependencies are required:
 
 - **nix** - Nix package manager (required)
 - **jq** - JSON processor (required)
@@ -77,7 +79,7 @@ From the project root directory (inside the Nix shell):
 
 The test suite is organized into modular components:
 
-```
+```text
 tests/
 ├── lib/
 │   └── test-helpers.sh          # Shared test utilities
@@ -104,7 +106,9 @@ The original monolithic test script is still available for compatibility:
 ./test-agentic-security.sh
 ```
 
-**Note**: This script has been enhanced with stricter dependency checks. It will now fail (exit 1) if `podman` or `vulnix` are not available, rather than issuing soft warnings.
+**Note**: This script has been enhanced with stricter dependency checks.
+It will now fail (exit 1) if `podman` or `vulnix` are not available,
+rather than issuing soft warnings.
 
 ### Modular Test Execution
 
@@ -133,13 +137,15 @@ The CI pipeline runs tests automatically on push and pull requests:
 
 ### cargo-deny vs cargo-audit
 
-The project uses **both** `cargo-deny` and `cargo-audit` for comprehensive security coverage:
+The project uses **both** `cargo-deny` and `cargo-audit`
+for comprehensive security coverage:
 
 #### cargo-deny
 
 **Purpose**: Multi-faceted supply chain security and compliance
 
 **Features**:
+
 - ✅ Vulnerability checking (via RustSec Advisory Database)
 - ✅ License compliance validation
 - ✅ Dependency graph analysis
@@ -150,6 +156,7 @@ The project uses **both** `cargo-deny` and `cargo-audit` for comprehensive secur
 **Configuration**: `deny.toml` in project root
 
 **Usage**:
+
 ```bash
 cargo deny check           # Run all checks
 cargo deny check advisories  # Only vulnerability checks
@@ -162,12 +169,14 @@ cargo deny check bans        # Only banned dependencies
 **Purpose**: Focused vulnerability scanning
 
 **Features**:
+
 - ✅ Vulnerability checking (via RustSec Advisory Database)
 - ✅ Lightweight and fast
 - ✅ Detailed vulnerability reports
 - ✅ Integration with `Cargo.lock`
 
 **Usage**:
+
 ```bash
 cargo audit               # Check for vulnerabilities
 cargo audit --json        # JSON output
@@ -177,20 +186,28 @@ cargo audit --json        # JSON output
 
 **Recommendation**: **Keep both tools**
 
-1. **cargo-deny** provides comprehensive supply chain security including license compliance, which is critical for enterprise deployments and open-source compliance
-2. **cargo-audit** is lighter weight and provides detailed vulnerability-specific reporting
+1. **cargo-deny** provides comprehensive supply chain security including
+   license compliance, which is critical for enterprise deployments and
+   open-source compliance
+2. **cargo-audit** is lighter weight and provides detailed
+   vulnerability-specific reporting
 3. They complement each other:
    - Use `cargo-deny` for pre-commit hooks and full compliance checks
-   - Use `cargo-audit` for quick vulnerability scans during development
-   - Both share the same vulnerability database (RustSec) but present information differently
+   - Use `cargo-audit` for quick vulnerability scans during
+     development
+   - Both share the same vulnerability database (RustSec) but present
+     information differently
 
 **Redundancy Analysis**:
+
 - Vulnerability checking: Both use RustSec (redundant but provides validation)
 - License checking: **Only cargo-deny**
 - Ban checking: **Only cargo-deny**
 - Duplicate detection: **Only cargo-deny**
 
-**Conclusion**: While there is some redundancy in vulnerability checking, `cargo-deny` provides essential features that `cargo-audit` does not. Both tools should be retained.
+**Conclusion**: While there is some redundancy in vulnerability checking,
+`cargo-deny` provides essential features that `cargo-audit` does not.
+Both tools should be retained.
 
 ### AI Security Tools
 
@@ -237,7 +254,8 @@ nix develop
 
 The test suite now requires podman for container-based tests.
 
-**Solution**: Ensure you're in the Nix development shell (podman is provided automatically):
+**Solution**: Ensure you're in the Nix development shell.
+Podman is provided automatically:
 
 ```bash
 nix develop
@@ -274,7 +292,8 @@ curl http://localhost:11434/api/tags
 
 Behavioral tests can take 2-3 minutes.
 
-**Solution**: This is expected for the first run. Subsequent runs should be faster due to caching.
+**Solution**: This is expected for the first run.
+Subsequent runs should be faster due to caching.
 
 ### Test Failures
 
@@ -300,13 +319,13 @@ If tests pass locally but fail in CI:
 - [CI/CD Pipeline](.github/workflows/ci.yml) - Full CI configuration
 - [Nix Flake](flake.nix) - Development environment and security tools
 - [cargo-deny Configuration](deny.toml) - Security and compliance rules
-- [AGENTIC-SECURITY.md](AGENTIC-SECURITY.md) - AI-powered security architecture (if available)
 
 ## Contributing
 
 When adding new tests:
 
-1. Create test scripts in the appropriate directory (`tests/security/`, `tests/integration/`, etc.)
+1. Create test scripts in the appropriate directory
+   (`tests/security/`, `tests/integration/`, etc.)
 2. Use the shared test helpers from `tests/lib/test-helpers.sh`
 3. Make scripts executable: `chmod +x tests/path/to/test.sh`
 4. Add your test to `tests/run-all-tests.sh`
@@ -317,12 +336,15 @@ When adding new tests:
 
 This project follows these testing principles:
 
-1. **Fail Fast**: Tests exit immediately on critical failures (dependencies, environment)
+1. **Fail Fast**: Tests exit immediately on critical failures
+   (dependencies, environment)
 2. **Modular**: Tests are split into focused, single-responsibility scripts
 3. **Reproducible**: All tests run in a hermetic Nix environment
-4. **Comprehensive**: Security tests cover traditional tools, AI analysis, and supply chain validation
+4. **Comprehensive**: Security tests cover traditional tools, AI analysis,
+   and supply chain validation
 5. **CI/CD Ready**: All tests are designed to run in GitHub Actions
 
 ---
 
-For questions or issues with testing, please open a GitHub issue or consult the CI/CD logs.
+For questions or issues with testing,
+please open a GitHub issue or consult the CI/CD logs.

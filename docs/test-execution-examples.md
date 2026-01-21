@@ -1,17 +1,19 @@
 # Test Execution Examples
 
-This document shows what test execution looks like in different environments with the new Nix-based container caching.
+This document shows what test execution looks like in different environments
+with the new Nix-based container caching.
 
 ## 🏠 Local Development (Without Dependencies)
 
 When running tests locally without Ollama or container runtime available:
 
 ```bash
-$ cargo test --test integration_tests -- --nocapture
+cargo test --test integration_tests -- --nocapture
 ```
 
 **Output:**
-```
+
+```text
 running 14 tests
 test test_chat_request_building ... ok
 test test_config_validation ... ok
@@ -45,6 +47,7 @@ test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 **Key Points:**
+
 - ✅ **All tests pass** (no failures, no ignored tests)
 - ⚠️ **Graceful degradation** when dependencies unavailable
 - 🔄 **Clear guidance** on how to enable full testing locally
@@ -75,7 +78,8 @@ $ cargo test --test integration_tests -- --nocapture
 ```
 
 **Output:**
-```
+
+```text
 running 14 tests
 # ... basic tests pass as before ...
 
@@ -113,6 +117,7 @@ Time: ~15s (first run), ~5s (subsequent runs with warm containers)
 ```
 
 **Key Points:**
+
 - 🚀 **Full integration testing** with real model
 - ⚡ **Fast subsequent runs** due to cached model
 - 🔒 **Reproducible** - identical across all machines
@@ -143,7 +148,8 @@ In CI, the pre-commit hook configuration builds and caches everything:
 ```
 
 **CI Output (First Run - Downloads Model):**
-```
+
+```text
 🔄 Building test containers for caching...
 building '/nix/store/xyz789.../qwen3-0.6b-model.drv'...
 🔄 Setting up qwen3:0.6b model download (reproducible)...
@@ -172,7 +178,8 @@ Time: ~3m (first run - downloads model)
 ```
 
 **CI Output (Subsequent Runs - Cache Hit):**
-```
+
+```text
 🔄 Building test containers for caching...
 cache hit: qwen3-0.6b-model from binary cache
 cache hit: nanna-coder-test-ollama-qwen3 from binary cache
@@ -187,6 +194,7 @@ Time: ~30s (cached run - no downloads)
 ```
 
 **Key Points:**
+
 - 🚀 **First CI run**: Downloads model once, caches forever
 - ⚡ **Subsequent CI runs**: Instant cache hits, 30s total time
 - 🔒 **Reproducible**: Identical model across all CI runs
@@ -224,4 +232,6 @@ $ nix build .#qwen3-model
 ✅ Model cached with content hash: sha256-b8f2c3d4e5...
 ```
 
-This ensures **true reproducibility** - the model is cached by its actual content hash, making builds bit-for-bit identical across all machines and time periods.
+This ensures **true reproducibility** - the model is cached by its actual
+content hash, making builds bit-for-bit identical across all machines and
+time periods.
