@@ -42,28 +42,84 @@ build_arch() {
         # Cross-compilation attempt
         echo "⚠️  Attempting cross-compilation for $arch..."
 
-        if nix build .#packages."$arch"."$image" 2>/dev/null; then
-            echo "✅ Cross-compiled $image for $arch"
+        # Capture build output for diagnostics
+        local build_log
+        build_log=$(mktemp)
 
-            podman load < result
+        if nix build .#packages."$arch"."$image" --print-build-logs 2>"$build_log"; then
+            echo "✅ Cross-compiled $image for $arch"
+            rm -f "$build_log"
+
+            # Validate result exists before loading
+            if [ ! -e "result" ]; then
+                echo "❌ ERROR: Build succeeded but result symlink not found"
+                ls -la result* 2>/dev/null || echo "No result files found"
+                return 1
+            fi
+
+            # Load into podman with error checking
+            if ! podman load < result; then
+                echo "❌ ERROR: Failed to load $image for $arch into podman"
+                return 1
+            fi
+
             local base_name
             case "$image" in
                 "harnessImage") base_name="nanna-coder-harness" ;;
                 "ollamaImage") base_name="nanna-coder-ollama" ;;
             esac
 
-            podman tag "$base_name:latest" "$base_name:$arch"
+            # Verify image was loaded
+            if ! podman image exists "$base_name:latest"; then
+                echo "❌ ERROR: Image $base_name:latest not found after loading"
+                echo "Available images:"
+                podman images | grep "$base_name" || echo "No matching images found"
+                return 1
+            fi
+
+            # Tag with error checking
+            if ! podman tag "$base_name:latest" "$base_name:$arch"; then
+                echo "❌ ERROR: Failed to tag image as $base_name:$arch"
+                return 1
+            fi
             echo "🏷️  Tagged as $base_name:$arch"
         else
-            echo "⚠️  Cross-compilation failed for $arch, using emulation fallback"
+            # Analyze the build failure
+            local error_msg
+            error_msg=$(cat "$build_log")
+            rm -f "$build_log"
+
+            echo "⚠️  Cross-compilation failed for $arch"
+
+            # Distinguish between different failure types
+            if echo "$error_msg" | grep -qi "unsupported system\|not supported"; then
+                echo "💡 Cross-compilation to $arch is not configured for this flake"
+                echo "   This is expected - cross-compilation setup is optional"
+                return 1
+            elif echo "$error_msg" | grep -qi "toolchain\|linker"; then
+                echo "❌ Cross-compilation toolchain error:"
+                echo "$error_msg" | grep -i "toolchain\|linker" | head -5
+                return 1
+            elif echo "$error_msg" | grep -qi "network\|fetch\|download"; then
+                echo "❌ Network error during cross-compilation:"
+                echo "$error_msg" | grep -i "network\|fetch\|download" | head -5
+                echo "💡 This may be a transient network issue - retry may succeed"
+                return 1
+            else
+                echo "❌ Build error (first 10 lines):"
+                echo "$error_msg" | head -10
+            fi
+
             # Fallback: Build with emulation (slower but works)
+            echo ""
+            echo "🔄 Checking for QEMU emulation fallback..."
             if command -v qemu-user-static >/dev/null 2>&1; then
-                echo "🔄 Using QEMU emulation..."
-                # This would require more complex setup for proper emulation
+                echo "   QEMU available but emulation setup not implemented"
                 echo "⏭️  Skipping $image for $arch (emulation setup required)"
                 return 1
             else
-                echo "❌ No emulation available, skipping $arch"
+                echo "   No QEMU emulation available"
+                echo "⏭️  Skipping $arch build"
                 return 1
             fi
         fi

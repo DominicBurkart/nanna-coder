@@ -388,22 +388,80 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         mkdir -p artifacts
+
+        # Check for Nix build output and copy artifacts
+        ARTIFACT_FOUND=false
+
+        # Case 1: result is a directory with bin/ subdirectory
         if [ -d "result/bin" ]; then
-          cp result/bin/* artifacts/ || true
+          echo "📦 Found Nix build output in result/bin/"
+          for binary in result/bin/*; do
+            if [ -f "$binary" ]; then
+              cp "$binary" artifacts/ || {
+                echo "❌ ERROR: Failed to copy $binary to artifacts/"
+                exit 1
+              }
+              echo "✅ Copied $(basename "$binary") to artifacts/"
+              ARTIFACT_FOUND=true
+            fi
+          done
+        # Case 2: result is a symlink to a single binary
+        elif [ -L "result" ] && [ -f "result" ]; then
+          echo "📦 Found Nix build output as symlink"
+          cp result "artifacts/nanna-coder-${{ matrix.target }}" || {
+            echo "❌ ERROR: Failed to copy result to artifacts/nanna-coder-${{ matrix.target }}"
+            exit 1
+          }
+          echo "✅ Copied nanna-coder-${{ matrix.target }} to artifacts/"
+          ARTIFACT_FOUND=true
         fi
-        if [ -f "result" ]; then
-          cp result artifacts/nanna-coder-${{ matrix.target }} || true
+
+        # Validate that at least one artifact was found
+        if [ "$ARTIFACT_FOUND" = "false" ]; then
+          echo "❌ ERROR: No artifacts found after Nix build"
+          echo "Expected either result/bin/* or result symlink to exist"
+          ls -la result* 2>/dev/null || echo "No result files found"
+          exit 1
         fi
+
+        echo "📋 Final artifacts:"
+        ls -lah artifacts/
 
     - name: Prepare artifacts (Cargo)
       if: runner.os == 'macOS'
       run: |
         mkdir -p artifacts
+
+        # Determine the expected binary path based on cross-compilation
         if [ "${{ matrix.cross }}" = "true" ]; then
-          cp target/aarch64-apple-darwin/release/harness artifacts/harness-${{ matrix.target }} || true
+          BINARY_PATH="target/aarch64-apple-darwin/release/harness"
+          TARGET_NAME="harness-${{ matrix.target }}"
         else
-          cp target/release/harness artifacts/harness-${{ matrix.target }} || true
+          BINARY_PATH="target/release/harness"
+          TARGET_NAME="harness-${{ matrix.target }}"
         fi
+
+        echo "🔍 Looking for binary at: $BINARY_PATH"
+
+        # Validate binary exists before copying
+        if [ ! -f "$BINARY_PATH" ]; then
+          echo "❌ ERROR: Expected binary not found at $BINARY_PATH"
+          echo "Build may have failed or produced output in unexpected location"
+          echo ""
+          echo "📂 Contents of target directory:"
+          find target -name "harness" -type f 2>/dev/null || echo "No harness binary found in target/"
+          exit 1
+        fi
+
+        # Copy the binary to artifacts
+        cp "$BINARY_PATH" "artifacts/$TARGET_NAME" || {
+          echo "❌ ERROR: Failed to copy $BINARY_PATH to artifacts/$TARGET_NAME"
+          exit 1
+        }
+
+        echo "✅ Copied $TARGET_NAME to artifacts/"
+        echo "📋 Final artifacts:"
+        ls -lah artifacts/
 
     - name: Upload binary artifacts
       uses: actions/upload-artifact@v4
