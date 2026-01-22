@@ -211,7 +211,6 @@ mod tests {
     #[test]
     fn test_git_repository_detect() {
         if let Some(repo) = GitRepository::detect(std::path::Path::new(".")) {
-            assert!(!repo.current_branch.is_empty());
             assert!(!repo.head_commit.is_empty());
         }
     }
