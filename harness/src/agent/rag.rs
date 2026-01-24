@@ -74,7 +74,7 @@ mod tests {
         let mut store = InMemoryEntityStore::new();
 
         // Add a git repository entity
-        let repo = Box::new(GitRepository::new());
+        let repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
         store.store(repo).await.unwrap();
 
         // Query should find it via JSON text search

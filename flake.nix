@@ -63,7 +63,12 @@
               
               cargoHash = "sha256-2u1DQtvjRfwbCXnX70M7drrMEvNsrVxsbikgrnNOkUE=";
               
-              # Skip tests that fail in nix sandbox
+              # TODO: Investigate why cargo-deny tests fail in nix sandbox and fix
+              # instead of skipping. Possible causes:
+              # - Network access requirements (fetching advisories)
+              # - Missing dependencies or environment variables
+              # - Sandbox filesystem restrictions
+              # See: https://github.com/DominicBurkart/nanna-coder/pull/37#discussion_r2718758422
               doCheck = false;
               
               buildInputs = with prev; [ pkg-config openssl ]
