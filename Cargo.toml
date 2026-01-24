@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Dominic Burkart"]
 description = "AI-powered coding assistant with tool calling and multi-model support"
 repository = "https://github.com/DominicBurkart/nanna-coder"
