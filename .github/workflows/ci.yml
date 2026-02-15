@@ -169,14 +169,29 @@ jobs:
         toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
 
-    - name: Install additional tools (non-Nix)
+    - name: Install cargo-nextest (non-Nix)
       if: runner.os != 'Linux'
-      shell: bash
-      run: |
-        cargo install cargo-nextest cargo-audit cargo-deny
-        if [ "${{ matrix.test-type }}" = "security" ]; then
-          cargo install cargo-tarpaulin
-        fi
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    - name: Install cargo-audit (non-Nix)
+      if: runner.os != 'Linux'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+
+    - name: Install cargo-deny (non-Nix)
+      if: runner.os != 'Linux'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+
+    - name: Install cargo-tarpaulin (non-Nix)
+      if: runner.os != 'Linux' && matrix.test-type == 'security'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-tarpaulin
 
     - name: Optimize CI cache settings (Nix)
       if: runner.os == 'Linux'
