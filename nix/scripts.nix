@@ -283,33 +283,61 @@ let
 
     # Run containerized tests
     container-test = pkgs.writeShellScriptBin "container-test" ''
-      echo "🧪 Running containerized tests..."
+      set -euo pipefail
 
-      echo "🐳 Starting test containers..."
-      nix build .#ollamaImage --no-link
+      CONTAINER_NAME="nanna-test-ollama"
+      CONTAINER_PORT=11434
+      MODEL_NAME="qwen3:0.6b"
 
-      # Load and start test container using nix2container's copyToDockerDaemon
-      echo "📦 Loading test container..."
-      if command -v podman &> /dev/null; then
-        # Use nix2container's built-in copyToDockerDaemon method
-        nix run .#ollamaImage.copyToDockerDaemon
-        podman run -d --name nanna-test-ollama -p 11434:11434 nanna-coder-ollama:latest
+      if command -v docker &> /dev/null; then
+        RUNTIME=docker
+      elif command -v podman &> /dev/null; then
+        RUNTIME=podman
       else
-        echo "⚠️  Podman not available, skipping container tests"
+        echo "No container runtime found (need docker or podman)"
         exit 1
       fi
+      echo "Using container runtime: $RUNTIME"
 
-      echo "⏳ Waiting for container to be ready..."
-      sleep 10
+      cleanup() {
+        echo "Cleaning up container..."
+        $RUNTIME stop "$CONTAINER_NAME" 2>/dev/null || true
+        $RUNTIME rm "$CONTAINER_NAME" 2>/dev/null || true
+      }
+      trap cleanup EXIT
 
-      echo "🧪 Running integration tests..."
-      cargo test --workspace --test '*' -- --test-threads=1
+      cleanup
 
-      echo "🧹 Cleaning up test containers..."
-      podman stop nanna-test-ollama
-      podman rm nanna-test-ollama
+      echo "Building ollama image..."
+      nix build .#ollamaImage --no-link
 
-      echo "✅ Containerized tests complete!"
+      echo "Loading ollama image..."
+      nix run .#ollamaImage.copyToDockerDaemon
+
+      echo "Starting container on port $CONTAINER_PORT..."
+      $RUNTIME run -d --name "$CONTAINER_NAME" -p "$CONTAINER_PORT:11434" nanna-coder-ollama:latest
+
+      echo "Waiting for Ollama API..."
+      for i in $(seq 1 60); do
+        if ${pkgs.curl}/bin/curl -sf "http://localhost:$CONTAINER_PORT/api/tags" > /dev/null 2>&1; then
+          echo "Ollama API is ready"
+          break
+        fi
+        if [ "$i" -eq 60 ]; then
+          echo "Timed out waiting for Ollama API"
+          exit 1
+        fi
+        sleep 2
+      done
+
+      echo "Pulling model $MODEL_NAME..."
+      ${pkgs.curl}/bin/curl -sf "http://localhost:$CONTAINER_PORT/api/pull" \
+        -d "{\"name\": \"$MODEL_NAME\"}" > /dev/null
+
+      echo "Running integration tests..."
+      cargo nextest run -p model -- --ignored
+
+      echo "Integration tests complete!"
     '';
 
     # Stop all development containers
