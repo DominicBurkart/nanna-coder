@@ -335,7 +335,7 @@ let
         -d "{\"name\": \"$MODEL_NAME\"}" > /dev/null
 
       echo "Running integration tests..."
-      cargo nextest run -p model -- --ignored
+      PATH="${rustToolchain}/bin:${pkgs.cargo-nextest}/bin:$PATH" cargo nextest run -p model -- --ignored
 
       echo "Integration tests complete!"
     '';
