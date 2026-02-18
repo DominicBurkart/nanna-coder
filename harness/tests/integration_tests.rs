@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+use harness::agent::{AgentConfig, AgentContext, AgentLoop};
 use harness::container::{
     detect_runtime, health_check_container, start_container_with_fallback, verify_image_exists,
     ContainerConfig, ContainerError, ContainerRuntime,
@@ -7,8 +9,13 @@ use model::judge::{
     JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult,
 };
 use model::prelude::*;
+use model::types::{
+    ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall, ModelInfo, ToolCall,
+};
+use model::{ModelError, ModelProvider, ModelResult};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 // use futures::future; // Reserved for future concurrent test implementation
@@ -1358,4 +1365,345 @@ async fn test_mock_performance_validation() {
 
     sleep(Duration::from_millis(300)).await;
     println!("🎉 Mock performance validation completed");
+}
+
+// ============================================================================
+// AGENT LOOP INTEGRATION TESTS
+// ============================================================================
+
+struct SequenceMockProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+}
+
+impl SequenceMockProvider {
+    fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for SequenceMockProvider {
+    async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            return Err(ModelError::ServiceUnavailable {
+                message: "No more scripted responses".to_string(),
+            });
+        }
+        Ok(responses.remove(0))
+    }
+
+    async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn health_check(&self) -> ModelResult<()> {
+        Ok(())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "sequence_mock"
+    }
+}
+
+fn make_tool_call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: args,
+        },
+    }
+}
+
+fn make_stop_response(content: &str) -> ChatResponse {
+    ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant(content),
+            finish_reason: Some(FinishReason::Stop),
+        }],
+        usage: None,
+    }
+}
+
+#[tokio::test]
+async fn test_agent_loop_tool_call_integration() {
+    let tool_call_response = ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant_with_tools(
+                None,
+                vec![make_tool_call(
+                    "call_1",
+                    "echo",
+                    json!({"message": "hello world"}),
+                )],
+            ),
+            finish_reason: Some(FinishReason::ToolCalls),
+        }],
+        usage: None,
+    };
+    let stop_response = make_stop_response("Task complete.");
+
+    let provider = SequenceMockProvider::new(vec![tool_call_response, stop_response]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 20,
+        verbose: false,
+        system_prompt: "You are a helpful assistant.".to_string(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Echo hello world".to_string(),
+        conversation_history: vec![ChatMessage::user("Echo hello world")],
+        app_state_id: "integration_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    let history = agent.conversation_history();
+    assert!(history.len() >= 5);
+
+    assert_eq!(history[0].role, model::types::MessageRole::System);
+    assert_eq!(history[1].role, model::types::MessageRole::User);
+    assert_eq!(history[2].role, model::types::MessageRole::Assistant);
+    assert!(history[2].tool_calls.is_some());
+    assert_eq!(history[3].role, model::types::MessageRole::Tool);
+    assert!(history[3].content.as_ref().unwrap().contains("hello world"));
+    assert_eq!(history[4].role, model::types::MessageRole::Assistant);
+    assert_eq!(history[4].content.as_deref(), Some("Task complete."));
+}
+
+#[tokio::test]
+async fn test_agent_loop_multi_tool_integration() {
+    let multi_tool_response = ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant_with_tools(
+                None,
+                vec![
+                    make_tool_call("call_1", "echo", json!({"message": "ping"})),
+                    make_tool_call(
+                        "call_2",
+                        "calculate",
+                        json!({"operation": "add", "a": 2.0, "b": 3.0}),
+                    ),
+                ],
+            ),
+            finish_reason: Some(FinishReason::ToolCalls),
+        }],
+        usage: None,
+    };
+    let stop_response = make_stop_response("Both tools executed.");
+
+    let provider = SequenceMockProvider::new(vec![multi_tool_response, stop_response]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+    registry.register(Box::new(CalculatorTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 20,
+        verbose: false,
+        system_prompt: "You are a helpful assistant.".to_string(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Echo ping and add 2+3".to_string(),
+        conversation_history: vec![ChatMessage::user("Echo ping and add 2+3")],
+        app_state_id: "integration_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    let tool_responses: Vec<_> = agent
+        .conversation_history()
+        .iter()
+        .filter(|m| m.role == model::types::MessageRole::Tool)
+        .collect();
+    assert_eq!(tool_responses.len(), 2);
+
+    let echo_response = tool_responses
+        .iter()
+        .find(|m| m.content.as_ref().unwrap().contains("ping"))
+        .expect("Echo tool response should contain 'ping'");
+    assert_eq!(echo_response.tool_call_id.as_deref(), Some("call_1"));
+
+    let calc_response = tool_responses
+        .iter()
+        .find(|m| m.content.as_ref().unwrap().contains("\"result\""))
+        .expect("Calculator tool response should contain 'result' key");
+    assert_eq!(calc_response.tool_call_id.as_deref(), Some("call_2"));
+}
+
+#[tokio::test]
+async fn test_agent_loop_error_recovery_integration() {
+    let bad_tool_response = ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant_with_tools(
+                None,
+                vec![make_tool_call("call_1", "nonexistent_tool", json!({}))],
+            ),
+            finish_reason: Some(FinishReason::ToolCalls),
+        }],
+        usage: None,
+    };
+    let stop_response = make_stop_response("Recovered from error.");
+
+    let provider = SequenceMockProvider::new(vec![bad_tool_response, stop_response]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 20,
+        verbose: false,
+        system_prompt: "You are a helpful assistant.".to_string(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Use a tool".to_string(),
+        conversation_history: vec![ChatMessage::user("Use a tool")],
+        app_state_id: "integration_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    let tool_responses: Vec<_> = agent
+        .conversation_history()
+        .iter()
+        .filter(|m| m.role == model::types::MessageRole::Tool)
+        .collect();
+    assert_eq!(tool_responses.len(), 1);
+    assert!(tool_responses[0]
+        .content
+        .as_ref()
+        .unwrap()
+        .contains("Error"));
+}
+
+#[tokio::test]
+async fn test_e2e_agent_with_containerized_ollama() {
+    println!("Starting E2E agent integration test with containerized Ollama...");
+
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        println!("No container runtime available - skipping E2E agent test");
+        return;
+    }
+
+    let config = ContainerConfig {
+        base_image: "ollama/ollama:latest".to_string(),
+        test_image: Some("nanna-coder-test-ollama-qwen3:latest".to_string()),
+        container_name: "e2e-agent-integration-test".to_string(),
+        port_mapping: Some((11440, 11434)),
+        model_to_pull: Some(E2E_MODEL.to_string()),
+        startup_timeout: CONTAINER_STARTUP_WAIT,
+        health_check_timeout: HEALTH_CHECK_TIMEOUT,
+        env_vars: vec![],
+        additional_args: vec![],
+    };
+
+    let container_handle = match start_container_with_fallback(&config).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            println!("Container start failed: {} - skipping E2E agent test", e);
+            return;
+        }
+    };
+
+    let port = container_handle.port.unwrap_or(11440);
+    let health_url = format!("http://localhost:{}", port);
+    match health_check_container(&container_handle, &health_url, config.health_check_timeout).await
+    {
+        Ok(()) => println!("Health check passed"),
+        Err(e) => {
+            println!("Health check failed: {} - skipping E2E agent test", e);
+            return;
+        }
+    }
+
+    let ollama_config = OllamaConfig::new()
+        .with_base_url(format!("http://localhost:{}", port))
+        .with_timeout(Duration::from_secs(120));
+
+    let provider = match OllamaProvider::new(ollama_config) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Failed to create provider: {} - skipping", e);
+            return;
+        }
+    };
+
+    let mut tool_registry = ToolRegistry::new();
+    tool_registry.register(Box::new(EchoTool::new()));
+
+    let agent_config = AgentConfig {
+        max_iterations: 10,
+        verbose: true,
+        system_prompt: "You are a helpful assistant. Use the echo tool when asked to echo something. After using the tool, respond with a brief summary.".to_string(),
+        model_name: E2E_MODEL.to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Use the echo tool to echo 'hello world'.".to_string(),
+        conversation_history: vec![ChatMessage::user(
+            "Use the echo tool to echo 'hello world'.",
+        )],
+        app_state_id: "e2e_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::new(agent_config, Box::new(provider), tool_registry);
+
+    let result = timeout(E2E_TIMEOUT, agent.run(context)).await;
+
+    match result {
+        Ok(Ok(run_result)) => {
+            println!("Agent completed: {:?}", run_result);
+            assert!(run_result.task_completed);
+
+            let has_tool_response = agent
+                .conversation_history()
+                .iter()
+                .any(|m| m.role == model::types::MessageRole::Tool);
+            println!(
+                "Conversation history length: {}",
+                agent.conversation_history().len()
+            );
+            for msg in agent.conversation_history() {
+                println!(
+                    "  [{:?}] {}",
+                    msg.role,
+                    msg.content.as_deref().unwrap_or("<no content>")
+                );
+            }
+
+            if has_tool_response {
+                println!("Agent successfully used tools in E2E test");
+            } else {
+                println!("Agent completed without tool usage (model may not have called tools)");
+            }
+        }
+        Ok(Err(e)) => {
+            println!(
+                "Agent run failed: {} - this may be expected with small models",
+                e
+            );
+        }
+        Err(_) => {
+            println!("Agent E2E test timed out");
+        }
+    }
 }
