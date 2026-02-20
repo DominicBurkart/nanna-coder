@@ -1251,4 +1251,72 @@ mod tests {
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().provider_name(), "ollama");
     }
+
+    #[test]
+    fn test_build_request_body_no_options() {
+        let request = ChatRequest::new("llama3.1:8b", vec![ChatMessage::user("Hello")]);
+        let body = OllamaProvider::build_request_body(&request);
+        assert!(body.options.is_none());
+    }
+
+    #[test]
+    fn test_message_conversion_system_role() {
+        let msg = ChatMessage::system("Be helpful");
+        let api_msg = OllamaProvider::convert_message_to_api(&msg);
+        assert_eq!(api_msg.role, "system");
+        assert_eq!(api_msg.content, "Be helpful");
+    }
+
+    #[test]
+    fn test_provider_creation_url_normalization() {
+        let config = OllamaConfig::default().with_base_url("http://localhost:11434/v1");
+        let provider = OllamaProvider::new(config).unwrap();
+        assert_eq!(provider.base_url, "http://localhost:11434/");
+
+        let config = OllamaConfig::default().with_base_url("http://localhost:11434");
+        let provider = OllamaProvider::new(config).unwrap();
+        assert_eq!(provider.base_url, "http://localhost:11434/");
+    }
+
+    #[test]
+    fn test_handle_ollama_error_json_error() {
+        let json_err = serde_json::from_str::<i32>("invalid").unwrap_err();
+        let ollama_err = ollama_rs::error::OllamaError::JsonError(json_err);
+        let result = OllamaProvider::handle_ollama_error(ollama_err);
+        assert!(matches!(result, ModelError::Serialization(_)));
+    }
+
+    #[tokio::test]
+    async fn test_chat_returns_error_on_non_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config).unwrap();
+        let request = ChatRequest::new("test-model", vec![ChatMessage::user("hi")]);
+        let result = provider.chat(request).await;
+        assert!(matches!(result, Err(ModelError::Unknown { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_chat_returns_error_on_invalid_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_body("not valid json")
+            .create_async()
+            .await;
+
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config).unwrap();
+        let request = ChatRequest::new("test-model", vec![ChatMessage::user("hi")]);
+        let result = provider.chat(request).await;
+        assert!(matches!(result, Err(ModelError::Network(_))));
+    }
 }
