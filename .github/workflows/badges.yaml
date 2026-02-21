@@ -16,8 +16,8 @@ jobs:
       - name: Compute lines of code
         id: loc
         run: |
-          COUNT=$(git ls-files '*.rs' | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
-          LABEL=$(echo $COUNT | numfmt --to=si)
+          COUNT=$(git ls-files -z '*.rs' | xargs -0 cat 2>/dev/null | wc -l)
+          LABEL=$(echo "${COUNT:-0}" | numfmt --to=si)
           echo "label=$LABEL" >> $GITHUB_OUTPUT
 
       - name: Compute contributors
