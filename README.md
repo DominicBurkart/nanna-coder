@@ -1,7 +1,6 @@
 # Nanna Coder
 
 [![codecov](https://codecov.io/gh/DominicBurkart/nanna-coder/branch/main/graph/badge.svg)](https://codecov.io/gh/DominicBurkart/nanna-coder)
-[![crates.io](https://img.shields.io/crates/v/model.svg)](https://crates.io/crates/model)
 [![lines of code](https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/development_metadata/badges/lines_of_code.svg)](https://github.com/DominicBurkart/nanna-coder)
 [![last commit](https://img.shields.io/github/last-commit/DominicBurkart/nanna-coder)](https://github.com/DominicBurkart/nanna-coder/commits/main)
 [![contributors](https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/development_metadata/badges/contributors.svg)](https://github.com/DominicBurkart/nanna-coder/graphs/contributors)
