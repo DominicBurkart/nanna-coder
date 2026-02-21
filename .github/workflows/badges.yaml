@@ -23,8 +23,8 @@ jobs:
       - name: Compute contributors
         id: contrib
         run: |
-          COUNT=$(git shortlog -sne --all | wc -l)
-          LABEL=$(echo $COUNT | numfmt --to=si)
+          COUNT=$(git log --all --format="%ae" | grep -v "test@example.com" | sort -u | wc -l)
+          LABEL=$(echo "${COUNT:-0}" | numfmt --to=si)
           echo "label=$LABEL" >> $GITHUB_OUTPUT
 
       - name: Generate badge SVGs
