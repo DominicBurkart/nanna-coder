@@ -111,7 +111,11 @@ impl OllamaProvider {
             format!("{}/", host)
         };
 
-        let client = Ollama::new(host, 11434);
+        let port = reqwest::Url::parse(&host)
+            .ok()
+            .and_then(|u| u.port())
+            .unwrap_or(11434);
+        let client = Ollama::new(host, port);
 
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
@@ -1318,5 +1322,297 @@ mod tests {
         let request = ChatRequest::new("test-model", vec![ChatMessage::user("hi")]);
         let result = provider.chat(request).await;
         assert!(matches!(result, Err(ModelError::Network(_))));
+    }
+
+    #[test]
+    fn test_calculate_variance_empty() {
+        assert_eq!(calculate_variance(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_variance_single() {
+        assert_eq!(calculate_variance(&[5.0]), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_variance_known() {
+        let result = calculate_variance(&[2.0, 4.0, 6.0]);
+        assert!((result - 8.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_judge_config_accessor() {
+        let config = OllamaConfig::default();
+        let provider = OllamaProvider::new(config).unwrap();
+        let jc = provider.judge_config();
+        assert_eq!(jc.max_retries, JudgeConfig::default().max_retries);
+        assert_eq!(jc.base_delay_ms, JudgeConfig::default().base_delay_ms);
+    }
+
+    #[tokio::test]
+    async fn test_validate_tool_calling_empty_tools() {
+        let config = OllamaConfig::default();
+        let provider = OllamaProvider::new(config).unwrap();
+        let result = provider.validate_tool_calling(&[]).await.unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_tool_calling_nonempty_tools() {
+        use crate::types::JsonSchema;
+        let config = OllamaConfig::default();
+        let provider = OllamaProvider::new(config).unwrap();
+        let tool = ToolDefinition {
+            function: FunctionDefinition {
+                name: "test_fn".to_string(),
+                description: "A test function".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        };
+        let result = provider.validate_tool_calling(&[tool]).await.unwrap();
+        assert!(matches!(result, ValidationResult::Warning { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_consistency_empty_prompts() {
+        let config = OllamaConfig::default();
+        let provider = OllamaProvider::new(config).unwrap();
+        let result = provider.validate_consistency(&[], 3).await.unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_consistency_zero_iterations() {
+        let config = OllamaConfig::default();
+        let provider = OllamaProvider::new(config).unwrap();
+        let result = provider.validate_consistency(&["hi"], 0).await.unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_list_models_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"models":[{"name":"test:latest","modified_at":"2024-01-01T00:00:00Z","size":1000000}]}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config).unwrap();
+        let result = provider.list_models().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "test:latest");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"models":[]}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config).unwrap();
+        assert!(provider.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config).unwrap();
+        assert!(provider.health_check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_responsiveness_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"models":[]}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let result = provider
+            .validate_api_responsiveness(Duration::MAX)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_responsiveness_warning() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"models":[]}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let result = provider
+            .validate_api_responsiveness(Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Warning { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_responsiveness_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(500)
+            .with_body("Service Unavailable")
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let result = provider
+            .validate_api_responsiveness(Duration::MAX)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Failure { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_quality_success() {
+        let mut server = mockito::Server::new_async().await;
+        let body = r#"{"message":{"role":"assistant","content":"Machine learning is a field of artificial intelligence that enables computers to learn from data and improve over time. It uses algorithms and statistical models to make predictions and decisions about various problems.","tool_calls":[]},"done":true,"prompt_eval_count":10,"eval_count":20}"#;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let criteria = ValidationCriteria::default();
+        let result = provider
+            .validate_response_quality("What is machine learning?", &criteria)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_quality_too_short() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":{"role":"assistant","content":"Hi","tool_calls":[]},"done":true,"prompt_eval_count":5,"eval_count":2}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let criteria = ValidationCriteria::default();
+        let result = provider
+            .validate_response_quality("hi", &criteria)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Failure { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_quality_forbidden_keyword() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":{"role":"assistant","content":"I cannot help with that request because it violates the rules.","tool_calls":[]},"done":true,"prompt_eval_count":5,"eval_count":10}"#)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let criteria = ValidationCriteria {
+            min_relevance_score: 0.0,
+            min_coherence_score: 0.0,
+            forbidden_keywords: vec!["I cannot".to_string()],
+            ..ValidationCriteria::default()
+        };
+        let result = provider
+            .validate_response_quality("help me", &criteria)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Warning { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_quality_chat_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let criteria = ValidationCriteria::default();
+        let result = provider
+            .validate_response_quality("test", &criteria)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Failure { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_consistency_single_iteration() {
+        let mut server = mockito::Server::new_async().await;
+        let body = r#"{"message":{"role":"assistant","content":"Four is the answer to two plus two. This is a mathematical fact that has been known since ancient times.","tool_calls":[]},"done":true,"prompt_eval_count":5,"eval_count":20}"#;
+        let _mock = server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let config = OllamaConfig::default().with_base_url(server.url());
+        let provider = OllamaProvider::new(config)
+            .unwrap()
+            .with_judge_config(JudgeConfig::with_retries(0, 0));
+        let result = provider
+            .validate_consistency(&["What is 2+2?"], 1)
+            .await
+            .unwrap();
+        assert!(matches!(result, ValidationResult::Success { .. }));
     }
 }
