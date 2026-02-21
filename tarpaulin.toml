@@ -1,0 +1,4 @@
+[config]
+exclude-files = [
+    "model/tests/*_integration.rs"
+]
