@@ -5,10 +5,6 @@
     # Pin to specific commit for reproducibility
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     crane = {
       url = "github:ipetkov/crane";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -27,15 +23,11 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix2container, cachix }:
+  outputs = { self, nixpkgs, flake-utils, crane, nix2container, cachix }:
     # Support multiple systems for cross-platform CI
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
-        # Reproducible overlays with pinned versions
-        overlays = [
-          (import rust-overlay)
-          # Additional pinned packages can be added here
-        ];
+        overlays = [];
         pkgs = import nixpkgs {
           inherit system overlays;
           config = {
@@ -46,13 +38,12 @@
           };
         };
 
-        # Pin specific Rust version for reproducibility (supports edition 2024)
-        rustToolchain = pkgs.rust-bin.stable."1.93.0".default.override {
-          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
+        rustToolchain = pkgs.symlinkJoin {
+          name = "rust-toolchain";
+          paths = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer ];
         };
 
-        # Crane library for building Rust packages
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        craneLib = crane.mkLib pkgs;
 
         # Filter source files (exclude target, .git, etc.)
         src = pkgs.lib.cleanSourceWith {
@@ -220,13 +211,14 @@
         let
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [ (import rust-overlay) ];
+            overlays = [];
             config.allowUnfree = false;
           };
-          rustToolchain = pkgs.rust-bin.stable."1.93.0".default.override {
-            extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
+          rustToolchain = pkgs.symlinkJoin {
+            name = "rust-toolchain";
+            paths = with pkgs; [ rustc cargo rustfmt clippy rust-analyzer ];
           };
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          craneLib = crane.mkLib pkgs;
 
           commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
           commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc ];
