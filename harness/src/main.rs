@@ -37,6 +37,21 @@ enum Commands {
     Tools,
     /// Health check
     Health,
+    /// Run the autonomous agent with a prompt
+    Agent {
+        /// The prompt for the agent
+        #[arg(short, long)]
+        prompt: String,
+        /// The model to use
+        #[arg(short, long, default_value = "llama3.1:8b")]
+        model: String,
+        /// Maximum agent iterations
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -83,6 +98,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Health => {
             health_check(&provider).await?;
+        }
+        Commands::Agent {
+            prompt,
+            model,
+            max_iterations,
+            verbose,
+        } => {
+            run_agent(&prompt, &model, max_iterations, verbose).await?;
         }
     }
 
@@ -302,6 +325,71 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
             println!("✗ Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_agent(
+    prompt: &str,
+    model: &str,
+    max_iterations: usize,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::agent::{AgentConfig, AgentContext, AgentLoop};
+    use harness::tools::{CalculatorTool as LibCalc, EchoTool as LibEcho, ToolRegistry as LibReg};
+
+    let config = OllamaConfig::default();
+    let provider = OllamaProvider::new(config)?;
+
+    let mut tool_registry = LibReg::new();
+    tool_registry.register(Box::new(LibEcho::new()));
+    tool_registry.register(Box::new(LibCalc::new()));
+
+    let agent_config = AgentConfig {
+        max_iterations,
+        verbose,
+        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
+        model_name: model.to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: prompt.to_string(),
+        conversation_history: vec![ChatMessage::user(prompt)],
+        app_state_id: "cli".to_string(),
+    };
+
+    if verbose {
+        println!("Starting agent with model: {}", model);
+        println!("Prompt: {}", prompt);
+        println!("Max iterations: {}", max_iterations);
+    }
+
+    let mut agent = AgentLoop::new(agent_config, Box::new(provider), tool_registry);
+    let result = agent.run(context).await?;
+
+    println!("\n--- Agent Result ---");
+    println!("Completed: {}", result.task_completed);
+    println!("Iterations: {}", result.iterations);
+    println!("Final state: {:?}", result.final_state);
+
+    if verbose {
+        println!("\n--- Conversation History ---");
+        for msg in agent.conversation_history() {
+            println!("[{:?}] {}", msg.role, msg.content.as_deref().unwrap_or(""));
+            if let Some(tool_calls) = &msg.tool_calls {
+                for tc in tool_calls {
+                    println!(
+                        "  Tool call: {} ({:?})",
+                        tc.function.name, tc.function.arguments
+                    );
+                }
+            }
+        }
+    } else if let Some(last) = agent.conversation_history().last() {
+        if let Some(content) = &last.content {
+            println!("\nAgent: {}", content);
         }
     }
 
