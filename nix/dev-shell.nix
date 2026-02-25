@@ -129,12 +129,12 @@ pkgs.mkShell {
     # Coverage check with comparison to main
     echo "📊 Checking test coverage..."
     if command -v cargo-tarpaulin >/dev/null 2>&1; then
-      NEW=$(cargo tarpaulin --skip-clean --ignore-tests --out Stdout 2>&1 | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+      NEW=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
 
       # Get main branch coverage (if possible)
       git stash -q 2>/dev/null || true
       if git checkout main -q 2>/dev/null; then
-        OLD=$(cargo tarpaulin --skip-clean --ignore-tests --out Stdout 2>&1 | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
+        OLD=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
         git checkout - -q
         git stash pop -q 2>/dev/null || true
 

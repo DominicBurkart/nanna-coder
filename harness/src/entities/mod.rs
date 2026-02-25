@@ -219,7 +219,7 @@ pub enum RelationshipType {
 }
 
 /// Query interface for entity retrieval
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EntityQuery {
     /// Entity types to query
     pub entity_types: Vec<EntityType>,

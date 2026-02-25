@@ -1,66 +1,59 @@
 #!/usr/bin/env bash
 set -e
 
-echo "Running comprehensive pre-commit checks..."
+echo "🔍 Running comprehensive pre-commit checks..."
 
 # Rust: Format check
-echo "Checking Rust formatting..."
+echo "📝 Checking Rust formatting..."
 cargo fmt --all -- --check
 
 # Rust: Clippy linting
-echo "Running clippy..."
+echo "🔍 Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Rust: Tests (including doctests)
-echo "Running tests..."
+echo "🧪 Running tests..."
 cargo test --workspace --all-features
 
 # Rust: Security audit
-echo "Running security audit..."
-if command -v cargo-audit >/dev/null 2>&1; then
-  cargo audit || echo "Warning: cargo audit found issues or failed"
-else
-  echo "cargo-audit not available, skipping security audit"
-fi
+echo "🔒 Running security audit..."
+cargo audit
 
 # Rust: License and dependency scanning
-echo "Checking licenses and dependencies..."
-if command -v cargo-deny >/dev/null 2>&1; then
-  cargo deny check || echo "Warning: cargo deny found issues or failed"
-else
-  echo "cargo-deny not available, skipping license check"
-fi
+echo "📋 Checking licenses and dependencies..."
+cargo deny check
 
 # Rust: Documentation builds
-echo "Building documentation..."
+echo "📚 Building documentation..."
 cargo doc --no-deps --workspace
 
 # Shell: Shellcheck validation
-echo "Linting shell scripts..."
+echo "🐚 Linting shell scripts..."
 if command -v shellcheck >/dev/null 2>&1; then
+  # Find all .sh files and shell scripts with shebang
   find . -type f \( -name "*.sh" -o -executable -exec sh -c 'head -n1 "$1" | grep -q "^#!.*sh"' _ {} \; \) \
     -not -path "./.git/*" \
     -not -path "./target/*" \
     -not -path "./result/*" \
-    -print0 | xargs -0 -r shellcheck
+    -print0 | xargs -0 shellcheck
 else
-  echo "shellcheck not available, skipping shell validation"
+  echo "⚠️  shellcheck not available, skipping shell validation"
 fi
 
 # Shell: Format check
-echo "Checking shell script formatting..."
+echo "📝 Checking shell script formatting..."
 if command -v shfmt >/dev/null 2>&1; then
   find . -type f \( -name "*.sh" -o -executable -exec sh -c 'head -n1 "$1" | grep -q "^#!.*sh"' _ {} \; \) \
     -not -path "./.git/*" \
     -not -path "./target/*" \
     -not -path "./result/*" \
-    -print0 | xargs -0 -r shfmt -i 2 -ci -d
+    -print0 | xargs -0 shfmt -i 2 -ci -d
 else
-  echo "shfmt not available, skipping shell format check"
+  echo "⚠️  shfmt not available, skipping shell format check"
 fi
 
 # Nix: Format check
-echo "Checking Nix formatting..."
+echo "❄️  Checking Nix formatting..."
 if command -v nixfmt >/dev/null 2>&1; then
   find . -type f -name "*.nix" \
     -not -path "./.git/*" \
@@ -68,11 +61,11 @@ if command -v nixfmt >/dev/null 2>&1; then
     -not -path "./result/*" \
     -exec nixfmt --check {} +
 else
-  echo "nixfmt not available, skipping Nix format check"
+  echo "⚠️  nixfmt not available, skipping Nix format check"
 fi
 
 # YAML: Linting
-echo "Linting YAML files..."
+echo "📄 Linting YAML files..."
 if command -v yamllint >/dev/null 2>&1; then
   find . -type f \( -name "*.yml" -o -name "*.yaml" \) \
     -not -path "./.git/*" \
@@ -80,82 +73,69 @@ if command -v yamllint >/dev/null 2>&1; then
     -not -path "./result/*" \
     -exec yamllint {} +
 else
-  echo "yamllint not available, skipping YAML validation"
+  echo "⚠️  yamllint not available, skipping YAML validation"
 fi
 
 # GitHub Actions: Specific linting
-echo "Linting GitHub Actions workflows..."
+echo "⚙️  Linting GitHub Actions workflows..."
 if command -v actionlint >/dev/null 2>&1; then
   find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) 2>/dev/null | xargs -r actionlint || true
 else
-  echo "actionlint not available, skipping GitHub Actions validation"
+  echo "⚠️  actionlint not available, skipping GitHub Actions validation"
 fi
 
-# Markdown: Linting (warn only - existing docs have issues)
-echo "Linting Markdown files..."
+# Markdown: Linting
+echo "📖 Linting Markdown files..."
 if command -v rumdl >/dev/null 2>&1; then
   find . -type f -name "*.md" \
     -not -path "./.git/*" \
     -not -path "./target/*" \
     -not -path "./result/*" \
-    -exec rumdl check {} + || echo "Warning: rumdl found markdown issues"
+    -exec rumdl {} +
 else
-  echo "rumdl not available, skipping Markdown validation"
+  echo "⚠️  rumdl not available, skipping Markdown validation"
 fi
 
-# TOML: Format check (warn only - existing files have issues)
-echo "Checking TOML formatting..."
+# TOML: Format check
+echo "⚙️  Checking TOML formatting..."
 if command -v taplo >/dev/null 2>&1; then
   find . -type f -name "*.toml" \
     -not -path "./.git/*" \
     -not -path "./target/*" \
     -not -path "./result/*" \
-    -exec taplo fmt --check {} + || echo "Warning: taplo found TOML formatting issues"
+    -exec taplo fmt --check {} +
 else
-  echo "taplo not available, skipping TOML format check"
+  echo "⚠️  taplo not available, skipping TOML format check"
 fi
 
-# Security review with Claude (if available)
-echo "Running security review..."
-if command -v claude >/dev/null 2>&1; then
-  git diff --cached | claude "You are a security engineer. Review the code being committed to determine if it can be committed/pushed. Does this commit leak any secrets, tokens, sensitive internals, or PII? If so, return a list of security/compliance problems to fix before the commit can be completed. End your response with exactly one word on its own line: APPROVED if safe to commit, or REJECTED if there are security issues." | tee /tmp/claude_review
-  VERDICT=$(tail -1 /tmp/claude_review | tr -d '[:space:]')
-  if [ "$VERDICT" = "APPROVED" ]; then
-    echo "Security review passed"
-  elif [ "$VERDICT" = "REJECTED" ]; then
-    echo "Security issues found above. Please fix before committing."
-    exit 1
-  else
-    echo "Security review did not return a clear verdict (got: $VERDICT)"
-    exit 1
-  fi
-else
-  echo "Claude CLI not available, skipping automated security review"
-fi
+# Security review with Claude
+bash scripts/hooks/security-review.sh
 
 # Coverage check with comparison to main
-echo "Checking test coverage..."
+echo "📊 Checking test coverage..."
 if command -v cargo-tarpaulin >/dev/null 2>&1; then
   NEW=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
 
+  # Get main branch coverage (if possible)
   git stash -q 2>/dev/null || true
   if git checkout main -q 2>/dev/null; then
     OLD=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
     git checkout - -q
     git stash pop -q 2>/dev/null || true
 
+    # Compare coverage using awk
     if awk "BEGIN { exit !($NEW >= $OLD) }"; then
-      echo "Coverage: $NEW% >= $OLD%"
+      echo "✅ Coverage: $NEW% >= $OLD%"
     else
-      echo "Coverage dropped: $NEW% < $OLD%"
+      echo "❌ Coverage dropped: $NEW% < $OLD%"
       exit 1
     fi
   else
-    echo "Could not check coverage against main branch"
+    echo "ℹ️  Could not check coverage against main branch"
     git stash pop -q 2>/dev/null || true
   fi
 else
-  echo "cargo-tarpaulin not available, skipping coverage check"
+  echo "⚠️  cargo-tarpaulin not available, skipping coverage check"
 fi
 
-echo "All pre-commit checks passed!"
+echo "✅ All pre-commit checks passed!"

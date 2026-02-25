@@ -40,44 +40,9 @@ let
 
     stop-pod = pkgs.writeShellScriptBin "stop-pod" ''
       echo "🛑 Stopping nanna-coder pod..."
-
-      # Check if podman is available
-      if ! command -v podman &> /dev/null; then
-        echo "❌ ERROR: podman command not found"
-        echo "💡 Please install podman to manage pods"
-        exit 1
-      fi
-
-      # Check if pod exists
-      if ! podman pod exists nanna-coder-pod 2>/dev/null; then
-        echo "ℹ️  Pod 'nanna-coder-pod' does not exist (already removed)"
-        exit 0
-      fi
-
-      # Get pod status
-      local status
-      status=$(podman pod inspect nanna-coder-pod --format '{{.State}}' 2>/dev/null || echo "unknown")
-
-      # Stop pod if running
-      if [[ "$status" == "Running" ]] || [[ "$status" == "Degraded" ]]; then
-        echo "Stopping pod 'nanna-coder-pod'..."
-        if ! podman pod stop nanna-coder-pod 2>&1; then
-          echo "❌ ERROR: Failed to stop pod 'nanna-coder-pod'"
-          exit 1
-        fi
-        echo "✅ Pod stopped"
-      else
-        echo "ℹ️  Pod already stopped (status: $status)"
-      fi
-
-      # Remove pod
-      echo "Removing pod 'nanna-coder-pod'..."
-      if ! podman pod rm nanna-coder-pod 2>&1; then
-        echo "❌ ERROR: Failed to remove pod 'nanna-coder-pod'"
-        exit 1
-      fi
-
-      echo "✅ Pod stopped and removed successfully!"
+      podman pod stop nanna-coder-pod || true
+      podman pod rm nanna-coder-pod || true
+      echo "✅ Pod stopped successfully!"
     '';
   };
 
@@ -283,131 +248,51 @@ let
 
     # Run containerized tests
     container-test = pkgs.writeShellScriptBin "container-test" ''
-      set -euo pipefail
+      echo "🧪 Running containerized tests..."
 
-      CONTAINER_NAME="nanna-test-ollama"
-      CONTAINER_PORT=11434
-      MODEL_NAME="qwen3:0.6b"
-
-      if command -v docker &> /dev/null; then
-        RUNTIME=docker
-      elif command -v podman &> /dev/null; then
-        RUNTIME=podman
-      else
-        echo "No container runtime found (need docker or podman)"
-        exit 1
-      fi
-      echo "Using container runtime: $RUNTIME"
-
-      cleanup() {
-        echo "Cleaning up container..."
-        $RUNTIME stop "$CONTAINER_NAME" 2>/dev/null || true
-        $RUNTIME rm "$CONTAINER_NAME" 2>/dev/null || true
-      }
-      trap cleanup EXIT
-
-      cleanup
-
-      echo "Building ollama image..."
+      echo "🐳 Starting test containers..."
       nix build .#ollamaImage --no-link
 
-      echo "Loading ollama image..."
-      nix run .#ollamaImage.copyToDockerDaemon
+      # Load and start test container using nix2container's copyToDockerDaemon
+      echo "📦 Loading test container..."
+      if command -v podman &> /dev/null; then
+        # Use nix2container's built-in copyToDockerDaemon method
+        nix run .#ollamaImage.copyToDockerDaemon
+        podman run -d --name nanna-test-ollama -p 11434:11434 nanna-coder-ollama:latest
+      else
+        echo "⚠️  Podman not available, skipping container tests"
+        exit 1
+      fi
 
-      echo "Starting container on port $CONTAINER_PORT..."
-      $RUNTIME run -d --name "$CONTAINER_NAME" -p "$CONTAINER_PORT:11434" nanna-coder-ollama:latest
+      echo "⏳ Waiting for container to be ready..."
+      sleep 10
 
-      echo "Waiting for Ollama API..."
-      for i in $(seq 1 60); do
-        if ${pkgs.curl}/bin/curl -sf "http://localhost:$CONTAINER_PORT/api/tags" > /dev/null 2>&1; then
-          echo "Ollama API is ready"
-          break
-        fi
-        if [ "$i" -eq 60 ]; then
-          echo "Timed out waiting for Ollama API"
-          exit 1
-        fi
-        sleep 2
-      done
+      echo "🧪 Running integration tests..."
+      cargo test --workspace --test '*' -- --test-threads=1
 
-      echo "Pulling model $MODEL_NAME..."
-      ${pkgs.curl}/bin/curl -sf "http://localhost:$CONTAINER_PORT/api/pull" \
-        -d "{\"name\": \"$MODEL_NAME\"}" > /dev/null
+      echo "🧹 Cleaning up test containers..."
+      podman stop nanna-test-ollama
+      podman rm nanna-test-ollama
 
-      echo "Running integration tests..."
-      PATH="${rustToolchain}/bin:${pkgs.cargo-nextest}/bin:$PATH" cargo nextest run -p model -- --ignored
-
-      echo "Integration tests complete!"
+      echo "✅ Containerized tests complete!"
     '';
 
     # Stop all development containers
     container-stop = pkgs.writeShellScriptBin "container-stop" ''
       echo "🛑 Stopping development containers..."
 
-      local stop_errors=0
-
       if command -v podman &> /dev/null; then
-        echo "🐳 Checking podman containers..."
-
-        # Get list of running containers
-        local running_containers
-        running_containers=$(podman ps -q 2>/dev/null)
-
-        if [ -n "$running_containers" ]; then
-          echo "Stopping $(echo "$running_containers" | wc -l) running container(s)..."
-          if ! echo "$running_containers" | xargs -r podman stop 2>&1; then
-            echo "⚠️  Some containers failed to stop"
-            ((stop_errors++))
-          else
-            echo "✅ Stopped podman containers"
-          fi
-        else
-          echo "ℹ️  No running podman containers"
-        fi
-
-        # Try to stop pod
-        echo "Checking for nanna-coder pod..."
-        if podman pod exists nanna-coder-pod 2>/dev/null; then
-          if ! nix run .#stop-pod; then
-            echo "⚠️  Failed to stop nanna-coder pod"
-            ((stop_errors++))
-          fi
-        else
-          echo "ℹ️  No nanna-coder pod running"
-        fi
-      else
-        echo "ℹ️  Podman not available"
+        echo "🐳 Stopping podman containers..."
+        podman stop $(podman ps -q) 2>/dev/null || echo "No running containers"
+        nix run .#stop-pod 2>/dev/null || echo "Pod not running"
       fi
 
       if command -v docker &> /dev/null; then
-        echo "🐳 Checking docker containers..."
-
-        # Get list of running containers
-        local running_containers
-        running_containers=$(docker ps -q 2>/dev/null)
-
-        if [ -n "$running_containers" ]; then
-          echo "Stopping $(echo "$running_containers" | wc -l) running container(s)..."
-          if ! echo "$running_containers" | xargs -r docker stop 2>&1; then
-            echo "⚠️  Some containers failed to stop"
-            ((stop_errors++))
-          else
-            echo "✅ Stopped docker containers"
-          fi
-        else
-          echo "ℹ️  No running docker containers"
-        fi
-      else
-        echo "ℹ️  Docker not available"
+        echo "🐳 Stopping docker containers..."
+        docker stop $(docker ps -q) 2>/dev/null || echo "No running containers"
       fi
 
-      if [ $stop_errors -eq 0 ]; then
-        echo "✅ All containers stopped successfully!"
-        exit 0
-      else
-        echo "⚠️  Completed with $stop_errors error(s)"
-        exit 1
-      fi
+      echo "✅ All containers stopped!"
     '';
 
     # View container logs

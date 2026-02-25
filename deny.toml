@@ -6,6 +6,12 @@ all-features = true
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+# Temporarily ignored advisories - tracked in GitHub issues
+ignore = [
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained
+    # TODO: https://github.com/DominicBurkart/nanna-coder/issues/40
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 # List of explicitly allowed licenses
@@ -16,19 +22,17 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
-    "CC0-1.0",
-    "Unlicense",
-    "Unicode-3.0",
+    "Unicode-3.0",  # ICU libraries for internationalization
 ]
 
 # Some crates don't have machine readable licensing information,
 # so we clarify here
 [[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
+name = "ollama-rs"
+version = "0.2.6"
+expression = "MIT"
 license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
+    { path = "LICENSE.md", hash = 0x5a019257 },
 ]
 
 [bans]
