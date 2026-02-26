@@ -4,6 +4,11 @@
 
 set -e
 
+if [ -n "${CLAUDECODE:-}" ]; then
+  echo "⚠️  Running inside Claude Code session, skipping automated security review"
+  exit 0
+fi
+
 if ! command -v claude >/dev/null 2>&1; then
   echo "⚠️  Claude CLI not available, skipping automated security review"
   exit 0

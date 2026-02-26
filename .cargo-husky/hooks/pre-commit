@@ -7,6 +7,9 @@ echo "🔍 Running comprehensive pre-commit checks..."
 echo "📝 Checking Rust formatting..."
 cargo fmt --all -- --check
 
+# Rust: Clippy auto-fix (non-blocking)
+cargo clippy --fix --allow-dirty --allow-staged 2>/dev/null || true
+
 # Rust: Clippy linting
 echo "🔍 Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
