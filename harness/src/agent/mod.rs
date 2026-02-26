@@ -21,6 +21,14 @@ use thiserror::Error;
 use model::provider::ModelProvider;
 use model::types::{ChatRequest, ChatResponse};
 
+const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
+const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
+const DEFAULT_QUERY_RAG_LIMIT: usize = 5;
+const PLANNING_TEMPERATURE: f32 = 0.7;
+const COMPLETION_TEMPERATURE: f32 = 0.2;
+const DECISION_TEMPERATURE: f32 = 0.3;
+const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
+
 /// Errors that can occur in the agent
 #[derive(Error, Debug)]
 pub enum AgentError {
@@ -60,6 +68,8 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     /// Enable verbose logging
     pub verbose: bool,
+    /// Default model for LLM calls
+    pub default_model: String,
 }
 
 impl Default for AgentConfig {
@@ -67,6 +77,7 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 100,
             verbose: false,
+            default_model: DEFAULT_MODEL.to_string(),
         }
     }
 }
@@ -168,6 +179,14 @@ impl AgentLoop {
     /// Get mutable reference to entity store
     pub fn entity_store_mut(&mut self) -> &mut InMemoryEntityStore {
         &mut self.entity_store
+    }
+
+    fn extract_response_content(response: &ChatResponse) -> &str {
+        response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("")
     }
 
     /// Run the agent loop with the given context
@@ -277,7 +296,7 @@ impl AgentLoop {
     /// Validate LLM response meets basic criteria
     fn validate_llm_response(&self, response: &str, expected_keywords: &[&str]) -> bool {
         // Basic length check
-        if response.trim().is_empty() || response.len() > 2000 {
+        if response.trim().is_empty() || response.len() > MAX_LLM_RESPONSE_LENGTH {
             return false;
         }
 
@@ -308,9 +327,13 @@ impl AgentLoop {
         }
 
         // Use RAG to query entities related to the prompt
-        let query_results = rag::query_entities(&self.entity_store, &context.user_prompt, Some(10))
-            .await
-            .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+        let query_results = rag::query_entities(
+            &self.entity_store,
+            &context.user_prompt,
+            Some(DEFAULT_PLANNING_RAG_LIMIT),
+        )
+        .await
+        .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Found {} relevant entities", query_results.len());
@@ -343,10 +366,10 @@ impl AgentLoop {
             );
 
             let request = ChatRequest::new(
-                "qwen2.5:0.5b",
+                &self.config.default_model,
                 vec![ChatMessage::user(&prompt_text)],
             )
-            .with_temperature(0.7);
+            .with_temperature(PLANNING_TEMPERATURE);
 
             let response = self
                 .call_llm_with_retry(provider, request, "planning")
@@ -376,32 +399,42 @@ impl AgentLoop {
     /// - Falls back to action count when LLM unavailable or response invalid
     async fn check_task_complete(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use model::types::ChatMessage;
             use crate::entities::{EntityQuery, EntityStore};
-            
+            use model::types::ChatMessage;
+
             // Query current entities
-            let entities = self.entity_store.query(&EntityQuery::default()).await
-                .map_err(|e| AgentError::TaskCheckFailed(format!("Failed to query entities: {}", e)))?;
-            
-            let entity_summary: Vec<String> = entities.iter()
+            let entities = self
+                .entity_store
+                .query(&EntityQuery::default())
+                .await
+                .map_err(|e| {
+                    AgentError::TaskCheckFailed(format!("Failed to query entities: {}", e))
+                })?;
+
+            let entity_summary: Vec<String> = entities
+                .iter()
                 .map(|e| format!("{:?}", e.entity_type))
                 .collect();
-            
+
             // Build prompt
             let prompt_text = prompts::CompletionPrompt::build(
                 &context.user_prompt,
                 self.performed_actions,
-                &entity_summary
+                &entity_summary,
             );
-            
+
             // Create request
-            let request = ChatRequest::new("qwen2.5:0.5b", vec![
-                ChatMessage::user(&prompt_text)
-            ]).with_temperature(0.2);
-            
+            let request = ChatRequest::new(
+                &self.config.default_model,
+                vec![ChatMessage::user(&prompt_text)],
+            )
+            .with_temperature(COMPLETION_TEMPERATURE);
+
             // Call LLM with retry logic
-            let response = self.call_llm_with_retry(provider, request, "completion check").await?;
-            
+            let response = self
+                .call_llm_with_retry(provider, request, "completion check")
+                .await?;
+
             // Validate response has choices
             if response.choices.is_empty() {
                 if self.config.verbose {
@@ -409,12 +442,9 @@ impl AgentLoop {
                 }
                 return Ok(self.performed_actions > 0);
             }
-            
-            let empty = String::new();
-            let status_text = response.choices[0].message.content
-                .as_ref()
-                .unwrap_or(&empty);
-            
+
+            let status_text = Self::extract_response_content(&response);
+
             // Validate response
             if !self.validate_llm_response(status_text, &["COMPLETE", "INCOMPLETE"]) {
                 if self.config.verbose {
@@ -422,7 +452,7 @@ impl AgentLoop {
                 }
                 return Ok(self.performed_actions > 0);
             }
-            
+
             // Parse completion status
             match prompts::CompletionPrompt::parse_response(status_text) {
                 Some(true) => Ok(true),   // COMPLETE
@@ -466,10 +496,10 @@ impl AgentLoop {
             );
 
             let request = ChatRequest::new(
-                "qwen2.5:0.5b",
+                &self.config.default_model,
                 vec![ChatMessage::user(&prompt_text)],
             )
-            .with_temperature(0.3);
+            .with_temperature(DECISION_TEMPERATURE);
 
             let response = self
                 .call_llm_with_retry(provider, request, "decision")
@@ -483,12 +513,7 @@ impl AgentLoop {
                 return Ok(false);
             }
 
-            let empty_string = String::new();
-            let decision_text = response.choices[0]
-                .message
-                .content
-                .as_ref()
-                .unwrap_or(&empty_string);
+            let decision_text = Self::extract_response_content(&response);
 
             // Validate response
             if !self.validate_llm_response(decision_text, &["QUERY", "PROCEED"]) {
@@ -500,7 +525,7 @@ impl AgentLoop {
 
             // Parse decision
             match prompts::DecisionPrompt::parse_response(decision_text) {
-                Some(true) => Ok(true),  // QUERY
+                Some(true) => Ok(true),   // QUERY
                 Some(false) => Ok(false), // PROCEED
                 None => {
                     if self.config.verbose {
@@ -519,9 +544,13 @@ impl AgentLoop {
     /// Query using RAG for additional context
     async fn query(&self, context: &AgentContext) -> AgentResult<()> {
         // Use the new RAG implementation
-        let results = rag::query_entities(&self.entity_store, &context.user_prompt, Some(5))
-            .await
-            .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+        let results = rag::query_entities(
+            &self.entity_store,
+            &context.user_prompt,
+            Some(DEFAULT_QUERY_RAG_LIMIT),
+        )
+        .await
+        .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Additional query found {} entities", results.len());
@@ -546,7 +575,7 @@ impl AgentLoop {
 
         // MVP: Create a new git repository entity
         // Future: Parse user intent and create appropriate entities
-        let new_entity = Box::new(GitRepository::new());
+        let new_entity = Box::new(GitRepository::new(String::new(), "main".to_string()));
 
         let entity_id = self
             .entity_store
@@ -605,13 +634,14 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 100);
         assert!(!config.verbose);
+        assert_eq!(config.default_model, DEFAULT_MODEL);
     }
 
     #[tokio::test]
     async fn test_agent_run_completes() {
         let config = AgentConfig {
             max_iterations: 10,
-            verbose: false,
+            ..Default::default()
         };
         let mut agent = AgentLoop::new(config);
         let context = AgentContext {
@@ -630,7 +660,7 @@ mod tests {
     async fn test_agent_max_iterations() {
         let config = AgentConfig {
             max_iterations: 2,
-            verbose: false,
+            ..Default::default()
         };
         let mut agent = AgentLoop::new(config);
 
@@ -663,7 +693,7 @@ mod tests {
         let mut entity_store = InMemoryEntityStore::new();
 
         // Add an initial git repository entity for context
-        let initial_repo = Box::new(GitRepository::new());
+        let initial_repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
         let _initial_id = entity_store.store(initial_repo).await.unwrap();
 
         // Verify initial state
@@ -680,6 +710,7 @@ mod tests {
         let config = AgentConfig {
             max_iterations: 10,
             verbose: true,
+            ..Default::default()
         };
         let mut agent = AgentLoop::with_entity_store(config, entity_store);
 
@@ -768,7 +799,7 @@ mod tests {
         };
 
         let result = agent.plan(&context).await;
-        
+
         // Skip test if LLM/model not available (e.g., qwen2.5:0.5b not pulled)
         if let Err(ref e) = result {
             let err_msg = e.to_string();
@@ -777,12 +808,9 @@ mod tests {
                 return;
             }
         }
-        
+
         assert!(result.is_ok(), "Planning should succeed: {:?}", result);
-        assert!(
-            agent.plan_cache.is_some(),
-            "LLM should create a plan"
-        );
+        assert!(agent.plan_cache.is_some(), "LLM should create a plan");
 
         let plan = agent.plan_cache.as_ref().unwrap();
         assert!(plan.len() > 10, "Plan should be non-trivial, got: {}", plan);
@@ -791,32 +819,35 @@ mod tests {
     #[tokio::test]
     async fn test_completion_check_fallback_no_llm() {
         let mut agent = AgentLoop::new(AgentConfig::default());
-        
+
         // Simulate having done work
         agent.performed_actions = 1;
-        
+
         let context = AgentContext {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
         };
-        
+
         // Should use fallback (action count) when no LLM provider
         let is_complete = agent.check_task_complete(&context).await.unwrap();
         assert!(is_complete, "Should be complete when performed_actions > 0");
-        
+
         // With no actions, should be incomplete
         agent.performed_actions = 0;
         let is_complete = agent.check_task_complete(&context).await.unwrap();
-        assert!(!is_complete, "Should be incomplete when performed_actions == 0");
+        assert!(
+            !is_complete,
+            "Should be incomplete when performed_actions == 0"
+        );
     }
 
     #[tokio::test]
     async fn test_llm_completion_check() {
-        use model::OllamaProvider;
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
-        
+        use model::OllamaProvider;
+
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
@@ -824,26 +855,23 @@ mod tests {
                 return;
             }
         };
-        
-        let mut agent = AgentLoop::with_llm(
-            AgentConfig::default(),
-            InMemoryEntityStore::new(),
-            provider
-        );
-        
+
+        let mut agent =
+            AgentLoop::with_llm(AgentConfig::default(), InMemoryEntityStore::new(), provider);
+
         // Simulate having done work
         agent.performed_actions = 1;
-        let repo = Box::new(GitRepository::new());
+        let repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
         agent.entity_store_mut().store(repo).await.unwrap();
-        
+
         let context = AgentContext {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
         };
-        
+
         let result = agent.check_task_complete(&context).await;
-        
+
         // Skip test if LLM/model not available
         if let Err(ref e) = result {
             let err_msg = e.to_string();
@@ -852,7 +880,7 @@ mod tests {
                 return;
             }
         }
-        
+
         let _is_complete = result.unwrap();
         // LLM returned valid completion status (test passes if we get here without panic)
     }
@@ -869,11 +897,8 @@ mod tests {
             }
         };
 
-        let mut agent = AgentLoop::with_llm(
-            AgentConfig::default(),
-            InMemoryEntityStore::new(),
-            provider,
-        );
+        let mut agent =
+            AgentLoop::with_llm(AgentConfig::default(), InMemoryEntityStore::new(), provider);
 
         agent.plan_cache = Some("Create authentication entity".to_string());
 
@@ -884,13 +909,13 @@ mod tests {
         };
 
         let result = agent.decide(&context).await;
-        
+
         // If LLM call fails (e.g., model not available), skip the test
         if result.is_err() {
             eprintln!("Skipping LLM decision test: LLM call failed");
             return;
         }
-        
+
         let _needs_query = result.unwrap();
         // LLM returned valid decision (test passes if we get here without panic)
     }
@@ -898,10 +923,10 @@ mod tests {
     /// Task 8: Full LLM Agent Control Loop Integration Test
     #[tokio::test]
     async fn test_full_llm_agent_control_loop() {
-        use model::OllamaProvider;
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
-        
+        use model::OllamaProvider;
+
         // Skip if Ollama not available
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
@@ -910,40 +935,41 @@ mod tests {
                 return;
             }
         };
-        
+
         let config = AgentConfig {
             max_iterations: 20,
             verbose: true,
+            ..Default::default()
         };
-        
+
         let mut entity_store = InMemoryEntityStore::new();
-        let initial = Box::new(GitRepository::new());
+        let initial = Box::new(GitRepository::new(String::new(), "main".to_string()));
         entity_store.store(initial).await.unwrap();
-        
+
         let mut agent = AgentLoop::with_llm(config, entity_store, provider);
-        
+
         let context = AgentContext {
             user_prompt: "Create a new git repository for authentication service".to_string(),
             conversation_history: vec![],
             app_state_id: "llm_test".to_string(),
         };
-        
+
         let result = agent.run(context).await;
-        
+
         // If LLM fails, skip gracefully
         if result.is_err() {
             eprintln!("Skipping full LLM test: Agent run failed (likely LLM unavailable)");
             return;
         }
-        
+
         assert!(result.is_ok(), "LLM agent should complete successfully");
         let run_result = result.unwrap();
         assert!(run_result.task_completed);
         assert_eq!(run_result.final_state, AgentState::Completed);
-        
+
         // Verify LLM was actually used
         assert!(agent.plan_cache.is_some(), "LLM should have created a plan");
-        
+
         println!(
             "✅ LLM Agent Test passed with plan: {:?}",
             agent.plan_cache.as_ref().unwrap()
@@ -955,38 +981,45 @@ mod tests {
     async fn test_mvp_mode_still_works_without_llm() {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
-        
+
         // Create agent WITHOUT LLM provider (MVP mode)
         let config = AgentConfig {
             max_iterations: 10,
             verbose: true,
+            ..Default::default()
         };
-        
+
         let mut entity_store = InMemoryEntityStore::new();
-        let initial = Box::new(GitRepository::new());
+        let initial = Box::new(GitRepository::new(String::new(), "main".to_string()));
         entity_store.store(initial).await.unwrap();
-        
+
         let mut agent = AgentLoop::with_entity_store(config, entity_store);
-        
+
         // Verify no LLM provider
-        assert!(agent.llm_provider.is_none(), "MVP mode should have no LLM provider");
-        
+        assert!(
+            agent.llm_provider.is_none(),
+            "MVP mode should have no LLM provider"
+        );
+
         let context = AgentContext {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp".to_string(),
         };
-        
+
         let result = agent.run(context).await;
         assert!(result.is_ok(), "MVP mode should still work without LLM");
-        
+
         let run_result = result.unwrap();
         assert!(run_result.task_completed);
         assert_eq!(run_result.final_state, AgentState::Completed);
-        
+
         // Verify plan_cache not populated (MVP mode)
-        assert!(agent.plan_cache.is_none(), "MVP mode should not populate plan_cache");
-        
+        assert!(
+            agent.plan_cache.is_none(),
+            "MVP mode should not populate plan_cache"
+        );
+
         println!("✅ MVP mode backward compatibility verified");
     }
 }

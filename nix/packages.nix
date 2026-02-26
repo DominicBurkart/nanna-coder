@@ -15,10 +15,13 @@ let
   commonBuildInputs = with pkgs; [
     pkg-config
     openssl
+    libssh2
+    zlib
   ];
 
   commonNativeBuildInputs = with pkgs; [
     pkg-config
+    stdenv.cc
   ];
 
   # Build dependencies first for better caching

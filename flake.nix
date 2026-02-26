@@ -34,7 +34,48 @@
         # Reproducible overlays with pinned versions
         overlays = [
           (import rust-overlay)
-          # Additional pinned packages can be added here
+          # Pin security tools to versions with CVSS 4.0 support
+          (final: prev: {
+            cargo-audit = prev.rustPlatform.buildRustPackage rec {
+              pname = "cargo-audit";
+              version = "0.22.0";
+              
+              src = prev.fetchCrate {
+                inherit pname version;
+                hash = "sha256-Ha2yVyu9331NaqiW91NEwCTIeW+3XPiqZzmatN5KOws=";
+              };
+              
+              cargoHash = "sha256-f8nrW1l7UA8sixwqXBD1jCJi9qyKC5tNl/dWwCt41Lk=";
+              
+              buildInputs = with prev; [ pkg-config openssl ] 
+                ++ prev.lib.optionals prev.stdenv.isDarwin [ prev.darwin.apple_sdk.frameworks.Security ];
+              nativeBuildInputs = with prev; [ pkg-config ];
+            };
+            
+            cargo-deny = prev.rustPlatform.buildRustPackage rec {
+              pname = "cargo-deny";
+              version = "0.18.9";
+              
+              src = prev.fetchCrate {
+                inherit pname version;
+                hash = "sha256-WnIkb4OXutgufNWpFooKQiJ5TNhamtTsFJu8bWyWeR4=";
+              };
+              
+              cargoHash = "sha256-2u1DQtvjRfwbCXnX70M7drrMEvNsrVxsbikgrnNOkUE=";
+              
+              # TODO: Investigate why cargo-deny tests fail in nix sandbox and fix
+              # instead of skipping. Possible causes:
+              # - Network access requirements (fetching advisories)
+              # - Missing dependencies or environment variables
+              # - Sandbox filesystem restrictions
+              # See: https://github.com/DominicBurkart/nanna-coder/pull/37#discussion_r2718758422
+              doCheck = false;
+              
+              buildInputs = with prev; [ pkg-config openssl ]
+                ++ prev.lib.optionals prev.stdenv.isDarwin [ prev.darwin.apple_sdk.frameworks.Security prev.darwin.apple_sdk.frameworks.SystemConfiguration ];
+              nativeBuildInputs = with prev; [ pkg-config ];
+            };
+          })
         ];
         pkgs = import nixpkgs {
           inherit system overlays;
@@ -235,8 +276,8 @@
           # Add nix2container for container builds
           nix2containerPkgs = nix2container.packages.${system};
 
-          commonBuildInputs = with pkgs; [ pkg-config openssl ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config ];
+          commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
+          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc ];
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
