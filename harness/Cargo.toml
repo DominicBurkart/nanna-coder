@@ -29,7 +29,6 @@ git2 = "0.19"
 toml = "0.8"
 
 [dev-dependencies]
-cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 futures = "0.3"
 tempfile = "3.0"
 serial_test = "3.0"

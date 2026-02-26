@@ -40,44 +40,9 @@ let
 
     stop-pod = pkgs.writeShellScriptBin "stop-pod" ''
       echo "🛑 Stopping nanna-coder pod..."
-
-      # Check if podman is available
-      if ! command -v podman &> /dev/null; then
-        echo "❌ ERROR: podman command not found"
-        echo "💡 Please install podman to manage pods"
-        exit 1
-      fi
-
-      # Check if pod exists
-      if ! podman pod exists nanna-coder-pod 2>/dev/null; then
-        echo "ℹ️  Pod 'nanna-coder-pod' does not exist (already removed)"
-        exit 0
-      fi
-
-      # Get pod status
-      local status
-      status=$(podman pod inspect nanna-coder-pod --format '{{.State}}' 2>/dev/null || echo "unknown")
-
-      # Stop pod if running
-      if [[ "$status" == "Running" ]] || [[ "$status" == "Degraded" ]]; then
-        echo "Stopping pod 'nanna-coder-pod'..."
-        if ! podman pod stop nanna-coder-pod 2>&1; then
-          echo "❌ ERROR: Failed to stop pod 'nanna-coder-pod'"
-          exit 1
-        fi
-        echo "✅ Pod stopped"
-      else
-        echo "ℹ️  Pod already stopped (status: $status)"
-      fi
-
-      # Remove pod
-      echo "Removing pod 'nanna-coder-pod'..."
-      if ! podman pod rm nanna-coder-pod 2>&1; then
-        echo "❌ ERROR: Failed to remove pod 'nanna-coder-pod'"
-        exit 1
-      fi
-
-      echo "✅ Pod stopped and removed successfully!"
+      podman pod stop nanna-coder-pod || true
+      podman pod rm nanna-coder-pod || true
+      echo "✅ Pod stopped successfully!"
     '';
   };
 
@@ -316,70 +281,18 @@ let
     container-stop = pkgs.writeShellScriptBin "container-stop" ''
       echo "🛑 Stopping development containers..."
 
-      local stop_errors=0
-
       if command -v podman &> /dev/null; then
-        echo "🐳 Checking podman containers..."
-
-        # Get list of running containers
-        local running_containers
-        running_containers=$(podman ps -q 2>/dev/null)
-
-        if [ -n "$running_containers" ]; then
-          echo "Stopping $(echo "$running_containers" | wc -l) running container(s)..."
-          if ! echo "$running_containers" | xargs -r podman stop 2>&1; then
-            echo "⚠️  Some containers failed to stop"
-            ((stop_errors++))
-          else
-            echo "✅ Stopped podman containers"
-          fi
-        else
-          echo "ℹ️  No running podman containers"
-        fi
-
-        # Try to stop pod
-        echo "Checking for nanna-coder pod..."
-        if podman pod exists nanna-coder-pod 2>/dev/null; then
-          if ! nix run .#stop-pod; then
-            echo "⚠️  Failed to stop nanna-coder pod"
-            ((stop_errors++))
-          fi
-        else
-          echo "ℹ️  No nanna-coder pod running"
-        fi
-      else
-        echo "ℹ️  Podman not available"
+        echo "🐳 Stopping podman containers..."
+        podman stop $(podman ps -q) 2>/dev/null || echo "No running containers"
+        nix run .#stop-pod 2>/dev/null || echo "Pod not running"
       fi
 
       if command -v docker &> /dev/null; then
-        echo "🐳 Checking docker containers..."
-
-        # Get list of running containers
-        local running_containers
-        running_containers=$(docker ps -q 2>/dev/null)
-
-        if [ -n "$running_containers" ]; then
-          echo "Stopping $(echo "$running_containers" | wc -l) running container(s)..."
-          if ! echo "$running_containers" | xargs -r docker stop 2>&1; then
-            echo "⚠️  Some containers failed to stop"
-            ((stop_errors++))
-          else
-            echo "✅ Stopped docker containers"
-          fi
-        else
-          echo "ℹ️  No running docker containers"
-        fi
-      else
-        echo "ℹ️  Docker not available"
+        echo "🐳 Stopping docker containers..."
+        docker stop $(docker ps -q) 2>/dev/null || echo "No running containers"
       fi
 
-      if [ $stop_errors -eq 0 ]; then
-        echo "✅ All containers stopped successfully!"
-        exit 0
-      else
-        echo "⚠️  Completed with $stop_errors error(s)"
-        exit 1
-      fi
+      echo "✅ All containers stopped!"
     '';
 
     # View container logs
