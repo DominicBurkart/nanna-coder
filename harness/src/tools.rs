@@ -344,7 +344,9 @@ impl Tool for ReadFileTool {
         ToolDefinition {
             function: FunctionDefinition {
                 name: "read_file".to_string(),
-                description: "Read the contents of a file. Returns the file content with line numbers.".to_string(),
+                description:
+                    "Read the contents of a file. Returns the file content with line numbers."
+                        .to_string(),
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -353,7 +355,9 @@ impl Tool for ReadFileTool {
                             "path".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Path to the file (relative to workspace root)".to_string()),
+                                description: Some(
+                                    "Path to the file (relative to workspace root)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -361,7 +365,9 @@ impl Tool for ReadFileTool {
                             "start_line".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::Integer,
-                                description: Some("Starting line number (1-indexed, optional)".to_string()),
+                                description: Some(
+                                    "Starting line number (1-indexed, optional)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -369,7 +375,9 @@ impl Tool for ReadFileTool {
                             "end_line".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::Integer,
-                                description: Some("Ending line number (inclusive, optional)".to_string()),
+                                description: Some(
+                                    "Ending line number (inclusive, optional)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -576,7 +584,10 @@ impl Tool for ListDirTool {
                             "path".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Path to list (relative to workspace root, defaults to '.')".to_string()),
+                                description: Some(
+                                    "Path to list (relative to workspace root, defaults to '.')"
+                                        .to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -584,7 +595,9 @@ impl Tool for ListDirTool {
                             "recursive".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::Boolean,
-                                description: Some("Whether to list recursively (default: false)".to_string()),
+                                description: Some(
+                                    "Whether to list recursively (default: false)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -592,7 +605,9 @@ impl Tool for ListDirTool {
                             "pattern".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Glob pattern to filter files (e.g., '*.rs')".to_string()),
+                                description: Some(
+                                    "Glob pattern to filter files (e.g., '*.rs')".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -737,7 +752,8 @@ impl Tool for SearchTool {
         ToolDefinition {
             function: FunctionDefinition {
                 name: "search".to_string(),
-                description: "Search for a pattern in files. Returns matching lines with context.".to_string(),
+                description: "Search for a pattern in files. Returns matching lines with context."
+                    .to_string(),
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -754,7 +770,9 @@ impl Tool for SearchTool {
                             "path".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Path to search in (defaults to workspace root)".to_string()),
+                                description: Some(
+                                    "Path to search in (defaults to workspace root)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -762,7 +780,9 @@ impl Tool for SearchTool {
                             "file_pattern".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Glob pattern to filter files (e.g., '*.rs')".to_string()),
+                                description: Some(
+                                    "Glob pattern to filter files (e.g., '*.rs')".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -770,7 +790,9 @@ impl Tool for SearchTool {
                             "max_results".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::Integer,
-                                description: Some("Maximum number of results to return (default: 50)".to_string()),
+                                description: Some(
+                                    "Maximum number of results to return (default: 50)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -886,7 +908,8 @@ impl Tool for GitDiffTool {
         ToolDefinition {
             function: FunctionDefinition {
                 name: "git_diff".to_string(),
-                description: "Show git diff for files. Can show staged or unstaged changes.".to_string(),
+                description: "Show git diff for files. Can show staged or unstaged changes."
+                    .to_string(),
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -895,7 +918,9 @@ impl Tool for GitDiffTool {
                             "path".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::String,
-                                description: Some("Path to diff (optional, defaults to all files)".to_string()),
+                                description: Some(
+                                    "Path to diff (optional, defaults to all files)".to_string(),
+                                ),
                                 items: None,
                             },
                         );
@@ -903,7 +928,10 @@ impl Tool for GitDiffTool {
                             "staged".to_string(),
                             PropertySchema {
                                 schema_type: SchemaType::Boolean,
-                                description: Some("Show staged changes instead of unstaged (default: false)".to_string()),
+                                description: Some(
+                                    "Show staged changes instead of unstaged (default: false)"
+                                        .to_string(),
+                                ),
                                 items: None,
                             },
                         );
