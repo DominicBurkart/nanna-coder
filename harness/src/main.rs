@@ -1,9 +1,7 @@
-mod tools;
-
 use clap::{Parser, Subcommand};
+use harness::tools::{CalculatorTool, EchoTool, ToolRegistry};
 use model::prelude::*;
 use std::io::{self, Write};
-use tools::{CalculatorTool, EchoTool, ToolRegistry};
 use tracing::{error, info};
 
 #[derive(Parser)]
