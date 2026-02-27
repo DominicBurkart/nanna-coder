@@ -1463,7 +1463,7 @@ async fn test_agent_loop_tool_call_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1520,7 +1520,7 @@ async fn test_agent_loop_multi_tool_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1576,7 +1576,7 @@ async fn test_agent_loop_error_recovery_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::new(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1665,7 +1665,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         app_state_id: "e2e_test".to_string(),
     };
 
-    let mut agent = AgentLoop::new(agent_config, Box::new(provider), tool_registry);
+    let mut agent = AgentLoop::with_tools(agent_config, Box::new(provider), tool_registry);
 
     let result = timeout(E2E_TIMEOUT, agent.run(context)).await;
 

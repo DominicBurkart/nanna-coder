@@ -19,7 +19,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatRequest, ChatResponse};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -64,12 +64,10 @@ pub enum AgentState {
 /// Configuration for the agent
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Maximum number of iterations before stopping
     pub max_iterations: usize,
-    /// Enable verbose logging
     pub verbose: bool,
-    /// Default model for LLM calls
-    pub default_model: String,
+    pub system_prompt: String,
+    pub model_name: String,
 }
 
 impl Default for AgentConfig {
@@ -77,7 +75,8 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 100,
             verbose: false,
-            default_model: DEFAULT_MODEL.to_string(),
+            system_prompt: String::new(),
+            model_name: DEFAULT_MODEL.to_string(),
         }
     }
 }
@@ -85,11 +84,8 @@ impl Default for AgentConfig {
 /// Context for the agent's execution
 #[derive(Debug, Clone)]
 pub struct AgentContext {
-    /// User's prompt/request
     pub user_prompt: String,
-    /// Conversation history
-    pub conversation_history: Vec<String>,
-    /// Application state identifier
+    pub conversation_history: Vec<ChatMessage>,
     pub app_state_id: String,
 }
 
@@ -104,22 +100,17 @@ pub struct AgentRunResult {
     pub task_completed: bool,
 }
 
-/// Main agent loop implementation
 pub struct AgentLoop {
-    /// Current state
     state: AgentState,
-    /// Configuration
     config: AgentConfig,
-    /// Iteration counter
     iterations: usize,
-    /// Entity store for managing development artifacts
     entity_store: InMemoryEntityStore,
-    /// Number of actions performed (not iterations)
     performed_actions: usize,
-    /// Optional LLM provider for intelligent decision making
     llm_provider: Option<Arc<dyn ModelProvider>>,
-    /// Optional plan cache to store LLM-generated plans
     plan_cache: Option<String>,
+    conversation_history: Vec<ChatMessage>,
+    tool_calling_provider: Option<Box<dyn ModelProvider>>,
+    tool_registry: Option<crate::tools::ToolRegistry>,
 }
 
 impl AgentLoop {
@@ -133,6 +124,9 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: None,
             plan_cache: None,
+            conversation_history: Vec::new(),
+            tool_calling_provider: None,
+            tool_registry: None,
         }
     }
 
@@ -146,6 +140,9 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: None,
             plan_cache: None,
+            conversation_history: Vec::new(),
+            tool_calling_provider: None,
+            tool_registry: None,
         }
     }
 
@@ -163,7 +160,33 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: Some(llm_provider),
             plan_cache: None,
+            conversation_history: Vec::new(),
+            tool_calling_provider: None,
+            tool_registry: None,
         }
+    }
+
+    pub fn with_tools(
+        config: AgentConfig,
+        provider: Box<dyn ModelProvider>,
+        tool_registry: crate::tools::ToolRegistry,
+    ) -> Self {
+        Self {
+            state: AgentState::Planning,
+            config,
+            iterations: 0,
+            entity_store: InMemoryEntityStore::new(),
+            performed_actions: 0,
+            llm_provider: None,
+            plan_cache: None,
+            conversation_history: Vec::new(),
+            tool_calling_provider: Some(provider),
+            tool_registry: Some(tool_registry),
+        }
+    }
+
+    pub fn conversation_history(&self) -> &[ChatMessage] {
+        &self.conversation_history
     }
 
     /// Get the current state
@@ -191,6 +214,10 @@ impl AgentLoop {
 
     /// Run the agent loop with the given context
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
+        if self.tool_calling_provider.is_some() {
+            return self.run_tool_loop(context).await;
+        }
+
         self.iterations = 0;
 
         loop {
@@ -366,7 +393,7 @@ impl AgentLoop {
             );
 
             let request = ChatRequest::new(
-                &self.config.default_model,
+                &self.config.model_name,
                 vec![ChatMessage::user(&prompt_text)],
             )
             .with_temperature(PLANNING_TEMPERATURE);
@@ -425,7 +452,7 @@ impl AgentLoop {
 
             // Create request
             let request = ChatRequest::new(
-                &self.config.default_model,
+                &self.config.model_name,
                 vec![ChatMessage::user(&prompt_text)],
             )
             .with_temperature(COMPLETION_TEMPERATURE);
@@ -496,7 +523,7 @@ impl AgentLoop {
             );
 
             let request = ChatRequest::new(
-                &self.config.default_model,
+                &self.config.model_name,
                 vec![ChatMessage::user(&prompt_text)],
             )
             .with_temperature(DECISION_TEMPERATURE);
@@ -589,6 +616,100 @@ impl AgentLoop {
 
         Ok(())
     }
+
+    async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
+        self.conversation_history.clear();
+
+        if !self.config.system_prompt.is_empty() {
+            let sp = self.config.system_prompt.clone();
+            self.conversation_history.push(ChatMessage::system(&sp));
+        }
+
+        for msg in context.conversation_history {
+            self.conversation_history.push(msg);
+        }
+
+        let tool_defs = self
+            .tool_registry
+            .as_ref()
+            .map(|r| r.get_definitions())
+            .unwrap_or_default();
+
+        self.iterations = 0;
+
+        loop {
+            if self.iterations >= self.config.max_iterations {
+                return Err(AgentError::MaxIterationsExceeded);
+            }
+
+            let model_name = self.config.model_name.clone();
+            let messages = self.conversation_history.clone();
+            let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
+
+            let provider = self
+                .tool_calling_provider
+                .take()
+                .ok_or_else(|| AgentError::StateError("No provider configured".to_string()))?;
+            let response_result = provider
+                .chat(request)
+                .await
+                .map_err(|e| AgentError::StateError(format!("LLM call failed: {}", e)));
+            self.tool_calling_provider = Some(provider);
+            let response = response_result?;
+
+            if response.choices.is_empty() {
+                return Err(AgentError::StateError(
+                    "Empty response from model".to_string(),
+                ));
+            }
+
+            let choice = response.choices.into_iter().next().unwrap();
+            let finish_reason = choice.finish_reason;
+            let tool_calls = choice.message.tool_calls.clone();
+            self.conversation_history.push(choice.message);
+
+            match finish_reason {
+                Some(FinishReason::Stop) | None => {
+                    self.transition_to(AgentState::Completed);
+                    return Ok(AgentRunResult {
+                        final_state: AgentState::Completed,
+                        iterations: self.iterations,
+                        task_completed: true,
+                    });
+                }
+                Some(FinishReason::ToolCalls) => {
+                    if let Some(calls) = tool_calls {
+                        for tool_call in &calls {
+                            let name = tool_call.function.name.clone();
+                            let args = tool_call.function.arguments.clone();
+                            let call_id = tool_call.id.clone();
+
+                            let registry = self.tool_registry.take().ok_or_else(|| {
+                                AgentError::StateError("No tool registry".to_string())
+                            })?;
+                            let tool_result = registry.execute(&name, args).await;
+                            self.tool_registry = Some(registry);
+
+                            let response_content = match tool_result {
+                                Ok(v) => v.to_string(),
+                                Err(e) => format!("Error: {}", e),
+                            };
+
+                            self.conversation_history
+                                .push(ChatMessage::tool_response(call_id, response_content));
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(AgentError::StateError(
+                        "Unexpected finish reason".to_string(),
+                    ));
+                }
+            }
+
+            self.iterations += 1;
+        }
+    }
 }
 
 /// Trait for components that can interact with the agent
@@ -634,7 +755,7 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 100);
         assert!(!config.verbose);
-        assert_eq!(config.default_model, DEFAULT_MODEL);
+        assert_eq!(config.model_name, DEFAULT_MODEL);
     }
 
     #[tokio::test]

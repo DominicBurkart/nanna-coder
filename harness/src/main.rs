@@ -366,7 +366,7 @@ async fn run_agent(
         println!("Max iterations: {}", max_iterations);
     }
 
-    let mut agent = AgentLoop::new(agent_config, Box::new(provider), tool_registry);
+    let mut agent = AgentLoop::with_tools(agent_config, Box::new(provider), tool_registry);
     let result = agent.run(context).await?;
 
     println!("\n--- Agent Result ---");
