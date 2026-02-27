@@ -7,6 +7,8 @@ use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Git repository entity
 ///
@@ -42,6 +44,27 @@ pub struct GitRepository {
 
     /// Submodules (path -> URL)
     pub submodules: HashMap<String, String>,
+
+    /// Root path of the repository (populated by detect())
+    pub root_path: Option<PathBuf>,
+
+    /// Current branch name (populated by detect())
+    pub current_branch: Option<String>,
+
+    /// Short HEAD commit SHA (populated by detect())
+    pub head_commit: Option<String>,
+
+    /// Whether the working directory has uncommitted changes (populated by detect())
+    pub is_dirty: bool,
+
+    /// Staged files (populated by detect())
+    pub staged_files: Vec<String>,
+
+    /// Modified but unstaged files (populated by detect())
+    pub modified_files: Vec<String>,
+
+    /// Untracked files (populated by detect())
+    pub untracked_files: Vec<String>,
 }
 
 impl GitRepository {
@@ -57,6 +80,13 @@ impl GitRepository {
             remotes,
             config: HashMap::new(),
             submodules: HashMap::new(),
+            root_path: None,
+            current_branch: None,
+            head_commit: None,
+            is_dirty: false,
+            staged_files: Vec::new(),
+            modified_files: Vec::new(),
+            untracked_files: Vec::new(),
         }
     }
 
@@ -68,6 +98,194 @@ impl GitRepository {
     /// Add a submodule
     pub fn add_submodule(&mut self, path: String, url: String) {
         self.submodules.insert(path, url);
+    }
+
+    /// Detect a git repository at or above the given path using git CLI
+    pub fn detect(path: &std::path::Path) -> Option<Self> {
+        let root = Self::find_git_root(path)?;
+
+        let remote_url = Self::get_remote_url(&root).unwrap_or_default();
+        let default_branch = Self::get_default_branch(&root).unwrap_or_else(|| "main".to_string());
+        let current_branch = Self::get_current_branch(&root);
+        let head_commit = Self::get_head_commit(&root);
+        let (staged, modified, untracked) = Self::get_status(&root).unwrap_or_default();
+        let is_dirty = !staged.is_empty() || !modified.is_empty();
+
+        let mut remotes = HashMap::new();
+        if !remote_url.is_empty() {
+            remotes.insert("origin".to_string(), remote_url.clone());
+        }
+
+        Some(Self {
+            metadata: EntityMetadata::new(EntityType::Git),
+            remote_url,
+            default_branch,
+            remotes,
+            config: HashMap::new(),
+            submodules: HashMap::new(),
+            root_path: Some(root),
+            current_branch,
+            head_commit,
+            is_dirty,
+            staged_files: staged,
+            modified_files: modified,
+            untracked_files: untracked,
+        })
+    }
+
+    /// Check if the working directory has uncommitted changes
+    pub fn has_uncommitted_changes(&self) -> bool {
+        self.is_dirty
+    }
+
+    /// Get a human-readable summary of repository state
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(ref branch) = self.current_branch {
+            parts.push(format!("branch: {}", branch));
+        }
+        if let Some(ref commit) = self.head_commit {
+            parts.push(format!("commit: {}", commit));
+        }
+
+        if self.is_dirty {
+            let mut changes = Vec::new();
+            if !self.staged_files.is_empty() {
+                changes.push(format!("{} staged", self.staged_files.len()));
+            }
+            if !self.modified_files.is_empty() {
+                changes.push(format!("{} modified", self.modified_files.len()));
+            }
+            if !self.untracked_files.is_empty() {
+                changes.push(format!("{} untracked", self.untracked_files.len()));
+            }
+            parts.push(format!("changes: {}", changes.join(", ")));
+        } else {
+            parts.push("clean".to_string());
+        }
+
+        parts.join(" | ")
+    }
+
+    fn find_git_root(path: &std::path::Path) -> Option<PathBuf> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(path)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Some(PathBuf::from(root))
+        } else {
+            None
+        }
+    }
+
+    fn get_remote_url(root: &std::path::Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    fn get_default_branch(root: &std::path::Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Some(full.trim_start_matches("refs/remotes/origin/").to_string())
+        } else {
+            None
+        }
+    }
+
+    fn get_current_branch(root: &std::path::Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if branch.is_empty() {
+                None
+            } else {
+                Some(branch)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn get_head_commit(root: &std::path::Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    fn get_status(root: &std::path::Path) -> Option<(Vec<String>, Vec<String>, Vec<String>)> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let mut staged = Vec::new();
+        let mut modified = Vec::new();
+        let mut untracked = Vec::new();
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.len() < 3 {
+                continue;
+            }
+
+            let index_status = line.chars().next().unwrap_or(' ');
+            let worktree_status = line.chars().nth(1).unwrap_or(' ');
+            let file = line[3..].to_string();
+
+            match index_status {
+                'A' | 'M' | 'D' | 'R' | 'C' => staged.push(file.clone()),
+                _ => {}
+            }
+
+            match worktree_status {
+                'M' | 'D' => {
+                    if !staged.contains(&file) {
+                        modified.push(file.clone());
+                    }
+                }
+                '?' => untracked.push(file),
+                _ => {}
+            }
+        }
+
+        Some((staged, modified, untracked))
     }
 }
 
@@ -702,5 +920,59 @@ mod tests {
 
         assert_eq!(repo.remote_url, deserialized.remote_url);
         assert_eq!(repo.default_branch, deserialized.default_branch);
+    }
+
+    #[test]
+    fn test_git_repository_new_has_empty_optional_fields() {
+        let repo = GitRepository::new("url".to_string(), "main".to_string());
+        assert!(repo.root_path.is_none());
+        assert!(repo.current_branch.is_none());
+        assert!(repo.head_commit.is_none());
+        assert!(!repo.is_dirty);
+        assert!(repo.staged_files.is_empty());
+        assert!(repo.modified_files.is_empty());
+        assert!(repo.untracked_files.is_empty());
+    }
+
+    #[test]
+    fn test_git_repository_detect() {
+        if let Some(repo) = GitRepository::detect(std::path::Path::new(".")) {
+            assert!(repo.root_path.is_some());
+            assert!(!repo.head_commit.as_deref().unwrap_or("").is_empty());
+        }
+    }
+
+    #[test]
+    fn test_git_repository_summary_clean() {
+        let mut repo = GitRepository::new("url".to_string(), "main".to_string());
+        repo.current_branch = Some("main".to_string());
+        repo.head_commit = Some("abc123".to_string());
+
+        let summary = repo.summary();
+        assert!(summary.contains("main"));
+        assert!(summary.contains("abc123"));
+        assert!(summary.contains("clean"));
+    }
+
+    #[test]
+    fn test_git_repository_summary_dirty() {
+        let mut repo = GitRepository::new("url".to_string(), "main".to_string());
+        repo.current_branch = Some("feat/foo".to_string());
+        repo.head_commit = Some("def456".to_string());
+        repo.is_dirty = true;
+        repo.staged_files = vec!["a.rs".to_string()];
+        repo.modified_files = vec!["b.rs".to_string(), "c.rs".to_string()];
+
+        let summary = repo.summary();
+        assert!(summary.contains("1 staged"));
+        assert!(summary.contains("2 modified"));
+    }
+
+    #[test]
+    fn test_has_uncommitted_changes() {
+        let mut repo = GitRepository::new("url".to_string(), "main".to_string());
+        assert!(!repo.has_uncommitted_changes());
+        repo.is_dirty = true;
+        assert!(repo.has_uncommitted_changes());
     }
 }
