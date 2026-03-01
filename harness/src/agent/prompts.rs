@@ -13,6 +13,16 @@
 //! - Favor keywords over JSON for MVP simplicity
 //! - Provide sufficient context without overwhelming the LLM
 //! - Format outputs for easy parsing (uppercase keywords)
+//!
+//! # Security Considerations
+//!
+//! **Prompt Injection Risk**: User input is interpolated directly into prompts.
+//! This is a known limitation of the MVP implementation. For production use:
+//! - Consider input sanitization or validation
+//! - Monitor agent outputs for unexpected behavior
+//! - Implement output validation before acting on LLM decisions
+//!
+//! See: <https://owasp.org/www-project-top-10-for-large-language-model-applications/>
 
 use crate::entities::QueryResult;
 
@@ -121,7 +131,12 @@ impl DecisionPrompt {
     ///
     /// # Returns
     /// Formatted prompt string for LLM
-    pub fn build(user_prompt: &str, current_plan: &str, entity_count: usize, performed_actions: usize) -> String {
+    pub fn build(
+        user_prompt: &str,
+        current_plan: &str,
+        entity_count: usize,
+        performed_actions: usize,
+    ) -> String {
         format!(
             "You are a code assistant deciding the next step.\n\
              USER REQUEST: {}\n\
@@ -196,7 +211,7 @@ impl CompletionPrompt {
         } else {
             entity_summary.join(", ")
         };
-        
+
         format!(
             "You are a code assistant checking task completion.\n\
              USER REQUEST: {}\n\
@@ -219,11 +234,11 @@ impl CompletionPrompt {
     /// * `None` - Could not parse response
     pub fn parse_response(response: &str) -> Option<bool> {
         let upper = response.to_uppercase();
-        
+
         // Check for standalone "COMPLETE" (not part of "INCOMPLETE")
         let has_complete_only = upper.contains("COMPLETE") && !upper.contains("INCOMPLETE");
         let has_incomplete = upper.contains("INCOMPLETE");
-        
+
         // If both appear (INCOMPLETE contains COMPLETE), it's ambiguous
         if has_incomplete && upper.matches("COMPLETE").count() > 1 {
             None // Ambiguous - both keywords present separately
@@ -452,14 +467,8 @@ mod tests {
     #[test]
     fn test_completion_prompt_contains_entities() {
         let prompt = CompletionPrompt::build("Test", 1, &["Git".to_string(), "Ast".to_string()]);
-        assert!(
-            prompt.contains("Git"),
-            "Prompt should contain entity types"
-        );
-        assert!(
-            prompt.contains("Ast"),
-            "Prompt should contain entity types"
-        );
+        assert!(prompt.contains("Git"), "Prompt should contain entity types");
+        assert!(prompt.contains("Ast"), "Prompt should contain entity types");
     }
 
     #[test]
@@ -470,7 +479,10 @@ mod tests {
             prompt.contains("ACTIONS PERFORMED:"),
             "Should have ACTIONS PERFORMED"
         );
-        assert!(prompt.contains("CURRENT ENTITIES:"), "Should have CURRENT ENTITIES");
+        assert!(
+            prompt.contains("CURRENT ENTITIES:"),
+            "Should have CURRENT ENTITIES"
+        );
         assert!(
             prompt.contains("COMPLETE or INCOMPLETE"),
             "Should request COMPLETE or INCOMPLETE"
@@ -526,7 +538,9 @@ mod tests {
     #[test]
     fn test_completion_parse_both_keywords() {
         assert_eq!(
-            CompletionPrompt::parse_response("The task is INCOMPLETE but we're making progress toward COMPLETE"),
+            CompletionPrompt::parse_response(
+                "The task is INCOMPLETE but we're making progress toward COMPLETE"
+            ),
             None,
             "Should return None when both COMPLETE and INCOMPLETE are present"
         );
@@ -570,7 +584,7 @@ mod tests {
         let special = "Test with \"quotes\" and \n newlines";
         let planning = PlanningPrompt::build(special, 0, special);
         let decision = DecisionPrompt::build(special, special, 0, 0);
-        let completion = CompletionPrompt::build(special, 0, &vec![special.to_string()]);
+        let completion = CompletionPrompt::build(special, 0, &[special.to_string()]);
 
         assert!(planning.contains("quotes"));
         assert!(decision.contains("quotes"));

@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Telemetry system errors
