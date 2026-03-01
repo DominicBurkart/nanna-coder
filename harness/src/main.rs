@@ -1,9 +1,13 @@
-mod tools;
-
 use clap::{Parser, Subcommand};
+use harness::entities::ast::WorkspaceScanner;
+use harness::entities::git::GitRepository;
+use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::tools::{
+    CalculatorTool, EchoTool, GitDiffTool, GitStatusTool, ListDirTool, ReadFileTool, SearchTool,
+    ToolRegistry, WriteFileTool,
+};
 use model::prelude::*;
 use std::io::{self, Write};
-use tools::{CalculatorTool, EchoTool, ToolRegistry};
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -65,9 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = OllamaConfig::default();
     let provider = OllamaProvider::new(config)?;
 
-    let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(EchoTool::new()));
-    tool_registry.register(Box::new(CalculatorTool::new()));
+    let workspace_root = std::env::current_dir()?;
+    let tool_registry = create_tool_registry(&workspace_root);
 
     match cli.command {
         Commands::Chat {
@@ -76,6 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             temperature,
         } => {
+            let entity_store = initialize_workspace(&workspace_root).await;
+
             if let Some(initial_prompt) = prompt {
                 single_chat(
                     &provider,
@@ -87,7 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             } else {
-                interactive_chat(&provider, &tool_registry, &model, tools, temperature).await?;
+                interactive_chat(
+                    &provider,
+                    &tool_registry,
+                    &model,
+                    tools,
+                    temperature,
+                    entity_store,
+                )
+                .await?;
             }
         }
         Commands::Models => {
@@ -110,6 +123,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+    registry.register(Box::new(CalculatorTool::new()));
+    registry.register(Box::new(ReadFileTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(WriteFileTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(ListDirTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(SearchTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(GitDiffTool::new(workspace_root.to_path_buf())));
+    registry
+}
+
+async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
+    let mut store = InMemoryEntityStore::new();
+
+    if let Some(git_repo) = GitRepository::detect(workspace_root) {
+        info!(
+            "Detected git repository: {} ({})",
+            git_repo.current_branch.as_deref().unwrap_or("unknown"),
+            git_repo.head_commit.as_deref().unwrap_or("unknown")
+        );
+        if let Err(e) = store.store(Box::new(git_repo)).await {
+            error!("Failed to store git repository entity: {}", e);
+        }
+    }
+
+    let scanner = WorkspaceScanner::new();
+    match scanner.scan_workspace(workspace_root, &mut store).await {
+        Ok(count) => {
+            info!("Scanned {} files in workspace", count);
+        }
+        Err(e) => {
+            error!("Failed to scan workspace: {}", e);
+        }
+    }
+
+    store
 }
 
 async fn single_chat(
@@ -186,10 +239,15 @@ async fn interactive_chat(
     model: &str,
     enable_tools: bool,
     temperature: f32,
+    entity_store: InMemoryEntityStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let entity_count = entity_store
+        .query(&harness::entities::EntityQuery::default())
+        .await?
+        .len();
     println!(
-        "Starting interactive chat with {} (tools: {})",
-        model, enable_tools
+        "Starting interactive chat with {} (tools: {}, entities: {})",
+        model, enable_tools, entity_count
     );
     println!("Type 'quit' or 'exit' to end the conversation.\n");
 
