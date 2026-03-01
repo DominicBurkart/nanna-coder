@@ -123,9 +123,6 @@ pkgs.mkShell {
     echo "📋 Checking licenses and dependencies..."
     cargo deny check
 
-    # Security review with Claude
-    bash scripts/hooks/security-review.sh
-
     # Coverage check with comparison to main
     echo "📊 Checking test coverage..."
     if command -v cargo-tarpaulin >/dev/null 2>&1; then

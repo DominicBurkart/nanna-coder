@@ -219,10 +219,9 @@
             inherit src;
           };
 
-          # TODO: Re-enable audit once advisory-db is properly configured
-          # workspace-audit = craneLib.cargoAudit {
-          #   inherit src;
-          # };
+          workspace-audit = craneLib.cargoAudit {
+            inherit src;
+          };
 
           workspace-deny = pkgs.runCommand "cargo-deny-check" {
             buildInputs = [ pkgs.cargo-deny rustToolchain ];
