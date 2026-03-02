@@ -4,23 +4,23 @@ use crate::judge::{
 };
 use crate::provider::{ModelError, ModelProvider, ModelResult};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole, ModelInfo,
-    ToolDefinition, Usage,
+    ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall, MessageRole,
+    ModelInfo, ToolCall, ToolDefinition, Usage,
 };
 use async_trait::async_trait;
-use ollama_rs::{
-    generation::chat::{ChatMessage as OllamaChatMessage, MessageRole as OllamaRole},
-    Ollama,
-};
+use ollama_rs::Ollama;
+use serde::Deserialize;
+use serde_json::Value;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 pub struct OllamaProvider {
     client: Ollama,
-    #[allow(dead_code)]
     config: OllamaConfig,
     judge_config: JudgeConfig,
+    http_client: reqwest::Client,
+    base_url: String,
 }
 
 impl OllamaProvider {
@@ -29,18 +29,33 @@ impl OllamaProvider {
             .validate()
             .map_err(|msg| ModelError::InvalidConfig { message: msg })?;
 
-        let host = if config.base_url.ends_with("/v1") {
+        let base_url = if config.base_url.ends_with("/v1") {
             config.base_url[..config.base_url.len() - 3].to_string()
         } else {
             config.base_url.clone()
         };
 
-        let client = Ollama::new(host, 11434);
+        let ollama_host = if base_url.ends_with(':') {
+            base_url.trim_end_matches(':').to_string()
+        } else {
+            base_url.clone()
+        };
+
+        let client = Ollama::new(ollama_host, 11434);
+
+        let http_client = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|e| ModelError::Unknown {
+                message: format!("Failed to build HTTP client: {}", e),
+            })?;
 
         Ok(Self {
             client,
             config,
             judge_config: JudgeConfig::default(),
+            http_client,
+            base_url,
         })
     }
 
@@ -53,41 +68,117 @@ impl OllamaProvider {
         self
     }
 
-    fn convert_message_role(role: &MessageRole) -> OllamaRole {
-        match role {
-            MessageRole::System => OllamaRole::System,
-            MessageRole::User => OllamaRole::User,
-            MessageRole::Assistant => OllamaRole::Assistant,
-            MessageRole::Tool => OllamaRole::Tool,
-        }
+    fn messages_to_json(messages: &[ChatMessage]) -> Vec<Value> {
+        messages
+            .iter()
+            .map(|msg| {
+                let role = match &msg.role {
+                    MessageRole::System => "system",
+                    MessageRole::User => "user",
+                    MessageRole::Assistant => "assistant",
+                    MessageRole::Tool => "tool",
+                };
+
+                let mut obj = serde_json::json!({
+                    "role": role,
+                    "content": msg.content.as_deref().unwrap_or(""),
+                });
+
+                if let Some(tool_calls) = &msg.tool_calls {
+                    if !tool_calls.is_empty() {
+                        let tc_json: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                })
+                            })
+                            .collect();
+                        obj["tool_calls"] = Value::Array(tc_json);
+                    }
+                }
+
+                if let Some(tool_call_id) = &msg.tool_call_id {
+                    obj["tool_call_id"] = Value::String(tool_call_id.clone());
+                }
+
+                obj
+            })
+            .collect()
     }
 
-    #[allow(dead_code)]
-    fn convert_message_from_ollama(msg: &OllamaChatMessage) -> ChatMessage {
-        let role = match msg.role {
-            OllamaRole::System => MessageRole::System,
-            OllamaRole::User => MessageRole::User,
-            OllamaRole::Assistant => MessageRole::Assistant,
-            OllamaRole::Tool => MessageRole::Tool,
+    fn tools_to_json(tools: &[ToolDefinition]) -> Vec<Value> {
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": tool.function
+                })
+            })
+            .collect()
+    }
+
+    fn parse_raw_response(raw: OllamaChatRawResponse) -> ModelResult<ChatResponse> {
+        let has_tool_calls = raw
+            .message
+            .tool_calls
+            .as_ref()
+            .map(|tc| !tc.is_empty())
+            .unwrap_or(false);
+
+        let (finish_reason, tool_calls) = if has_tool_calls {
+            let calls: Vec<ToolCall> = raw
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(idx, tc)| ToolCall {
+                    id: format!("call_{}", idx),
+                    function: FunctionCall {
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    },
+                })
+                .collect();
+            (FinishReason::ToolCalls, Some(calls))
+        } else {
+            (FinishReason::Stop, None)
         };
 
-        ChatMessage {
-            role,
-            content: Some(msg.content.clone()),
-            tool_calls: None, // Tool calls will be handled separately for now
+        let content = if raw.message.content.is_empty() {
+            None
+        } else {
+            Some(raw.message.content)
+        };
+
+        let message = ChatMessage {
+            role: MessageRole::Assistant,
+            content,
+            tool_calls,
             tool_call_id: None,
-        }
-    }
+        };
 
-    fn convert_message_to_ollama(msg: &ChatMessage) -> OllamaChatMessage {
-        let role = Self::convert_message_role(&msg.role);
+        let usage = match (raw.prompt_eval_count, raw.eval_count) {
+            (Some(p), Some(e)) => Some(Usage {
+                prompt_tokens: p as u32,
+                completion_tokens: e as u32,
+                total_tokens: (p + e) as u32,
+            }),
+            _ => None,
+        };
 
-        OllamaChatMessage {
-            role,
-            content: msg.content.clone().unwrap_or_default(),
-            images: None,
-            tool_calls: vec![], // Empty for now
-        }
+        Ok(ChatResponse {
+            choices: vec![Choice {
+                message,
+                finish_reason: Some(finish_reason),
+            }],
+            usage,
+        })
     }
 
     fn handle_ollama_error(err: ollama_rs::error::OllamaError) -> ModelError {
@@ -102,7 +193,6 @@ impl OllamaProvider {
                         message: "Cannot connect to Ollama service".to_string(),
                     }
                 } else {
-                    // Convert to the right reqwest error type
                     ModelError::Unknown {
                         message: format!("Network error: {}", e),
                     }
@@ -114,6 +204,50 @@ impl OllamaProvider {
             },
         }
     }
+
+    fn handle_reqwest_error(e: reqwest::Error) -> ModelError {
+        if e.is_timeout() {
+            ModelError::ServiceUnavailable {
+                message: "Request timeout".to_string(),
+            }
+        } else if e.is_connect() {
+            ModelError::ServiceUnavailable {
+                message: "Cannot connect to Ollama service".to_string(),
+            }
+        } else {
+            ModelError::Unknown {
+                message: format!("Network error: {}", e),
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OllamaChatRawResponse {
+    message: OllamaRawMessage,
+    #[allow(dead_code)]
+    done: bool,
+    prompt_eval_count: Option<i64>,
+    eval_count: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct OllamaRawMessage {
+    #[allow(dead_code)]
+    role: String,
+    content: String,
+    tool_calls: Option<Vec<OllamaRawToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OllamaRawToolCall {
+    function: OllamaRawFunction,
+}
+
+#[derive(Deserialize)]
+struct OllamaRawFunction {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 #[async_trait]
@@ -121,50 +255,53 @@ impl ModelProvider for OllamaProvider {
     async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
         debug!("Starting chat request with model: {}", request.model);
 
-        let ollama_messages: Vec<OllamaChatMessage> = request
-            .messages
-            .iter()
-            .map(Self::convert_message_to_ollama)
-            .collect();
+        let messages = Self::messages_to_json(&request.messages);
 
-        // For now, use the completion API since it's simpler
-        let prompt = ollama_messages
-            .iter()
-            .map(|msg| msg.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let temperature = request
+            .temperature
+            .unwrap_or(self.config.default_temperature);
 
-        let generation_request = ollama_rs::generation::completion::request::GenerationRequest::new(
-            request.model.clone(),
-            prompt,
-        );
+        let mut payload = serde_json::json!({
+            "model": request.model,
+            "messages": messages,
+            "stream": false,
+            "options": {
+                "temperature": temperature
+            }
+        });
+
+        if let Some(tools) = &request.tools {
+            if !tools.is_empty() {
+                payload["tools"] = Value::Array(Self::tools_to_json(tools));
+            }
+        }
+
+        let url = format!("{}/api/chat", self.base_url);
 
         let response = self
-            .client
-            .generate(generation_request)
+            .http_client
+            .post(&url)
+            .json(&payload)
+            .send()
             .await
-            .map_err(Self::handle_ollama_error)?;
+            .map_err(Self::handle_reqwest_error)?;
 
-        let message = ChatMessage::assistant(response.response);
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelError::Unknown {
+                message: format!("Ollama API error {}: {}", status, body),
+            });
+        }
 
-        let choice = Choice {
-            message,
-            finish_reason: Some(FinishReason::Stop),
-        };
-
-        let usage = Some(Usage {
-            prompt_tokens: response.prompt_eval_count.unwrap_or(0) as u32,
-            completion_tokens: response.eval_count.unwrap_or(0) as u32,
-            total_tokens: (response.prompt_eval_count.unwrap_or(0)
-                + response.eval_count.unwrap_or(0)) as u32,
-        });
+        let raw: OllamaChatRawResponse =
+            response.json().await.map_err(|e| ModelError::Unknown {
+                message: format!("Failed to parse response: {}", e),
+            })?;
 
         info!("Chat request completed successfully");
 
-        Ok(ChatResponse {
-            choices: vec![choice],
-            usage,
-        })
+        Self::parse_raw_response(raw)
     }
 
     async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
@@ -181,7 +318,7 @@ impl ModelProvider for OllamaProvider {
             .map(|model| ModelInfo {
                 name: model.name,
                 size: Some(model.size),
-                digest: None, // Not available in this API
+                digest: None,
                 modified_at: Some(model.modified_at),
             })
             .collect();
@@ -337,7 +474,6 @@ impl ModelJudge for OllamaProvider {
 
                     if let Some(choice) = response.choices.first() {
                         if let Some(content) = &choice.message.content {
-                            // Calculate quality metrics
                             let response_length = content.len();
                             let coherence_score = crate::judge::calculate_coherence_score(content);
                             let relevance_score = crate::judge::calculate_relevance_score(
@@ -356,7 +492,6 @@ impl ModelJudge for OllamaProvider {
                                 custom_metrics: std::collections::HashMap::new(),
                             };
 
-                            // Check length criteria
                             if response_length < expected_criteria.min_response_length {
                                 return Ok(ValidationResult::Failure {
                                     message: format!(
@@ -389,7 +524,6 @@ impl ModelJudge for OllamaProvider {
                                 });
                             }
 
-                            // Check coherence score
                             if coherence_score < expected_criteria.min_coherence_score {
                                 return Ok(ValidationResult::Warning {
                                     message: format!(
@@ -406,7 +540,6 @@ impl ModelJudge for OllamaProvider {
                                 });
                             }
 
-                            // Check relevance score
                             if relevance_score < expected_criteria.min_relevance_score {
                                 return Ok(ValidationResult::Warning {
                                     message: format!(
@@ -422,7 +555,6 @@ impl ModelJudge for OllamaProvider {
                                 });
                             }
 
-                            // Check for forbidden keywords
                             let forbidden_found: Vec<&String> = expected_criteria
                                 .forbidden_keywords
                                 .iter()
@@ -447,7 +579,6 @@ impl ModelJudge for OllamaProvider {
                                 });
                             }
 
-                            // Check for required keywords
                             if !expected_criteria.required_keywords.is_empty() {
                                 let missing_keywords: Vec<&String> = expected_criteria
                                     .required_keywords
@@ -475,7 +606,6 @@ impl ModelJudge for OllamaProvider {
                                 }
                             }
 
-                            // Add token usage to custom metrics if available
                             if let Some(usage) = &response.usage {
                                 metrics.add_custom_metric(
                                     "prompt_tokens".to_string(),
@@ -582,19 +712,50 @@ impl ModelJudge for OllamaProvider {
             });
         }
 
-        // For now, Ollama provider doesn't support tool calling in our implementation
-        // This is a placeholder that acknowledges the limitation
-        warn!("Tool calling validation requested but not yet implemented for Ollama provider");
+        let request = ChatRequest::new(
+            "qwen2.5:0.5b",
+            vec![ChatMessage::user(
+                "What is the weather in Paris? Use the available tool.",
+            )],
+        )
+        .with_tools(tools.to_vec());
 
-        Ok(ValidationResult::Warning {
-            message: "Tool calling validation not implemented for Ollama provider".to_string(),
-            suggestions: vec![
-                "Implement tool calling support in OllamaProvider".to_string(),
-                "Use a different provider that supports tool calling".to_string(),
-                "Skip tool calling validation for now".to_string(),
-            ],
-            metrics: ValidationMetrics::with_duration(start_time.elapsed()),
-        })
+        match self.chat(request).await {
+            Ok(response) => {
+                let duration = start_time.elapsed();
+                if let Some(choice) = response.choices.first() {
+                    if choice
+                        .message
+                        .tool_calls
+                        .as_ref()
+                        .map(|tc| !tc.is_empty())
+                        .unwrap_or(false)
+                    {
+                        return Ok(ValidationResult::Success {
+                            message: format!("Tool calling validated in {:?}", duration),
+                            metrics: ValidationMetrics::with_duration(duration),
+                        });
+                    }
+                }
+                Ok(ValidationResult::Warning {
+                    message: "Model did not use tools in test request".to_string(),
+                    suggestions: vec![
+                        "Model may not support tool calling".to_string(),
+                        "Try a tool-calling capable model".to_string(),
+                    ],
+                    metrics: ValidationMetrics::with_duration(start_time.elapsed()),
+                })
+            }
+            Err(e) => Ok(ValidationResult::Failure {
+                message: "Tool calling test request failed".to_string(),
+                error_details: e.to_string(),
+                suggestions: vec![
+                    "Check model availability".to_string(),
+                    "Verify tool definitions are correct".to_string(),
+                ],
+                metrics: Some(ValidationMetrics::with_duration(start_time.elapsed())),
+            }),
+        }
     }
 
     async fn validate_consistency(
@@ -667,7 +828,6 @@ impl ModelJudge for OllamaProvider {
                     }
                 }
 
-                // Small delay between requests to avoid overwhelming the server
                 if iteration < iterations - 1 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -695,7 +855,6 @@ impl ModelJudge for OllamaProvider {
             custom_metrics: std::collections::HashMap::new(),
         };
 
-        // Calculate consistency metrics
         if response_lengths.len() > 1 {
             let length_variance = calculate_variance(
                 &response_lengths
@@ -786,7 +945,6 @@ impl ModelJudge for OllamaProvider {
     }
 }
 
-/// Helper function to calculate variance
 fn calculate_variance(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
@@ -801,15 +959,177 @@ fn calculate_variance(values: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType};
+    use std::collections::HashMap;
 
     #[test]
-    fn test_message_conversion() {
-        let our_message = ChatMessage::user("Hello world");
-        let ollama_message = OllamaProvider::convert_message_to_ollama(&our_message);
-        let converted_back = OllamaProvider::convert_message_from_ollama(&ollama_message);
+    fn test_tool_definition_to_json() {
+        let mut props = HashMap::new();
+        props.insert(
+            "location".to_string(),
+            PropertySchema {
+                schema_type: SchemaType::String,
+                description: Some("The city name".to_string()),
+                items: None,
+            },
+        );
+        let tool = ToolDefinition {
+            function: FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: "Get the weather for a location".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some(props),
+                    required: Some(vec!["location".to_string()]),
+                },
+            },
+        };
 
-        assert_eq!(our_message.role, converted_back.role);
-        assert_eq!(our_message.content, converted_back.content);
+        let json = OllamaProvider::tools_to_json(&[tool]);
+
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["type"], "function");
+        assert_eq!(json[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            json[0]["function"]["description"],
+            "Get the weather for a location"
+        );
+        assert_eq!(json[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn test_messages_to_json_preserves_roles() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
+        ];
+
+        let json = OllamaProvider::messages_to_json(&messages);
+
+        assert_eq!(json.len(), 3);
+        assert_eq!(json[0]["role"], "system");
+        assert_eq!(json[0]["content"], "You are helpful");
+        assert_eq!(json[1]["role"], "user");
+        assert_eq!(json[1]["content"], "Hello");
+        assert_eq!(json[2]["role"], "assistant");
+        assert_eq!(json[2]["content"], "Hi there");
+    }
+
+    #[test]
+    fn test_tool_response_message_to_json() {
+        let msg = ChatMessage::tool_response("call_123", "The weather is sunny");
+        let json = OllamaProvider::messages_to_json(&[msg]);
+
+        assert_eq!(json.len(), 1);
+        assert_eq!(json[0]["role"], "tool");
+        assert_eq!(json[0]["content"], "The weather is sunny");
+        assert_eq!(json[0]["tool_call_id"], "call_123");
+    }
+
+    #[test]
+    fn test_parse_tool_call_response() {
+        let raw = OllamaChatRawResponse {
+            message: OllamaRawMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Some(vec![OllamaRawToolCall {
+                    function: OllamaRawFunction {
+                        name: "get_weather".to_string(),
+                        arguments: serde_json::json!({"location": "Paris"}),
+                    },
+                }]),
+            },
+            done: true,
+            prompt_eval_count: Some(10),
+            eval_count: Some(20),
+        };
+
+        let response = OllamaProvider::parse_raw_response(raw).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+
+        let tool_calls = response.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].function.arguments["location"], "Paris");
+
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
+    }
+
+    #[test]
+    fn test_parse_plain_response() {
+        let raw = OllamaChatRawResponse {
+            message: OllamaRawMessage {
+                role: "assistant".to_string(),
+                content: "Hello, how can I help you?".to_string(),
+                tool_calls: None,
+            },
+            done: true,
+            prompt_eval_count: Some(5),
+            eval_count: Some(15),
+        };
+
+        let response = OllamaProvider::parse_raw_response(raw).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            response.choices[0].message.content,
+            Some("Hello, how can I help you?".to_string())
+        );
+        assert!(response.choices[0].message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_with_empty_tool_calls() {
+        let raw = OllamaChatRawResponse {
+            message: OllamaRawMessage {
+                role: "assistant".to_string(),
+                content: "No tools needed".to_string(),
+                tool_calls: Some(vec![]),
+            },
+            done: true,
+            prompt_eval_count: None,
+            eval_count: None,
+        };
+
+        let response = OllamaProvider::parse_raw_response(raw).unwrap();
+
+        assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn test_assistant_message_with_tool_calls_to_json() {
+        let msg = ChatMessage::assistant_with_tools(
+            Some("I will check the weather".to_string()),
+            vec![ToolCall {
+                id: "call_0".to_string(),
+                function: FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"location": "London"}),
+                },
+            }],
+        );
+
+        let json = OllamaProvider::messages_to_json(&[msg]);
+
+        assert_eq!(json[0]["role"], "assistant");
+        assert_eq!(json[0]["content"], "I will check the weather");
+        assert_eq!(json[0]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            json[0]["tool_calls"][0]["function"]["arguments"]["location"],
+            "London"
+        );
     }
 
     #[tokio::test]
@@ -818,5 +1138,12 @@ mod tests {
         let provider = OllamaProvider::new(config);
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().provider_name(), "ollama");
+    }
+
+    #[tokio::test]
+    async fn test_provider_creation_strips_v1() {
+        let config = OllamaConfig::default().with_base_url("http://localhost:11434/v1");
+        let provider = OllamaProvider::new(config).unwrap();
+        assert_eq!(provider.base_url, "http://localhost:11434");
     }
 }
