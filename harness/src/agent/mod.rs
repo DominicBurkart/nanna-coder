@@ -706,12 +706,10 @@ impl AgentLoop {
         ];
 
         for _ in 0..MAX_TOOL_ITERATIONS {
-            let request = ChatRequest::new(
-                &self.config.model_name,
-                self.conversation_history.clone(),
-            )
-            .with_tools(tool_defs.clone())
-            .with_temperature(COMPLETION_TEMPERATURE);
+            let request =
+                ChatRequest::new(&self.config.model_name, self.conversation_history.clone())
+                    .with_tools(tool_defs.clone())
+                    .with_temperature(COMPLETION_TEMPERATURE);
 
             let response = self
                 .call_llm_with_retry(provider, request, "perform")
