@@ -203,3 +203,125 @@ async fn test_invalid_model_returns_error() {
 
     assert!(result.is_err(), "expected error for nonexistent model");
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_ollama_chat_preserves_roles() {
+    let provider = make_provider();
+
+    let messages = vec![
+        ChatMessage::system("You are a helpful assistant. Be concise."),
+        ChatMessage::user("My name is Alice."),
+        ChatMessage::assistant("Hello Alice, nice to meet you!"),
+        ChatMessage::user("What is my name?"),
+    ];
+    let request = ChatRequest::new(MODEL, messages);
+
+    let response = tokio::time::timeout(TIMEOUT, provider.chat(request))
+        .await
+        .expect("chat timed out")
+        .expect("chat failed");
+
+    assert_valid_response(&response);
+
+    let content = response.choices[0]
+        .message
+        .content
+        .as_ref()
+        .expect("content must exist");
+
+    assert!(
+        content.to_lowercase().contains("alice"),
+        "model should recall the name Alice from conversation history, got: {}",
+        content
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_ollama_tool_calling_roundtrip() {
+    let provider = make_provider();
+
+    let mut properties = HashMap::new();
+    properties.insert(
+        "city".to_string(),
+        PropertySchema {
+            schema_type: SchemaType::String,
+            description: Some("The city to get weather for".to_string()),
+            items: None,
+        },
+    );
+
+    let tool = ToolDefinition {
+        function: FunctionDefinition {
+            name: "get_weather".to_string(),
+            description: "Get current weather for a city".to_string(),
+            parameters: JsonSchema {
+                schema_type: SchemaType::Object,
+                properties: Some(properties),
+                required: Some(vec!["city".to_string()]),
+            },
+        },
+    };
+
+    let request = ChatRequest::new(
+        MODEL,
+        vec![ChatMessage::user("What is the weather in London?")],
+    )
+    .with_tools(vec![tool.clone()]);
+
+    let first_response = tokio::time::timeout(TIMEOUT, provider.chat(request))
+        .await
+        .expect("first chat timed out")
+        .expect("first chat failed");
+
+    assert_valid_response(&first_response);
+    let first_choice = &first_response.choices[0];
+
+    let tool_calls = match &first_choice.finish_reason {
+        Some(FinishReason::ToolCalls) => first_choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls must be present"),
+        Some(FinishReason::Stop) => {
+            eprintln!("Model answered directly without tool call — skipping roundtrip assertion");
+            return;
+        }
+        other => panic!("unexpected finish_reason: {:?}", other),
+    };
+
+    assert!(!tool_calls.is_empty(), "must have at least one tool call");
+    assert_eq!(tool_calls[0].function.name, "get_weather");
+
+    let mut messages = vec![ChatMessage::user("What is the weather in London?")];
+    messages.push(first_choice.message.clone());
+    messages.push(ChatMessage::tool_response(
+        tool_calls[0].id.clone(),
+        r#"{"temperature": "15°C", "condition": "Cloudy"}"#,
+    ));
+
+    let second_request = ChatRequest::new(MODEL, messages).with_tools(vec![tool]);
+
+    let second_response = tokio::time::timeout(TIMEOUT, provider.chat(second_request))
+        .await
+        .expect("second chat timed out")
+        .expect("second chat failed");
+
+    assert_valid_response(&second_response);
+    assert_eq!(
+        second_response.choices[0].finish_reason,
+        Some(FinishReason::Stop),
+        "final response should be Stop after tool result"
+    );
+
+    let final_content = second_response.choices[0]
+        .message
+        .content
+        .as_ref()
+        .expect("final content must exist");
+    assert!(
+        !final_content.is_empty(),
+        "final response must contain content"
+    );
+}
