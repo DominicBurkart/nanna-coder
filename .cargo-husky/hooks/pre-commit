@@ -142,7 +142,7 @@ if command -v cargo-tarpaulin >/dev/null 2>&1; then
   if git checkout main -q 2>/dev/null; then
     OLD=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
     git checkout - -q
-    git stash pop -q 2>/dev/null || true
+    git stash pop --index -q 2>/dev/null || true
 
     if awk "BEGIN { exit !($NEW >= $OLD) }"; then
       echo "Coverage: $NEW% >= $OLD%"
@@ -152,7 +152,7 @@ if command -v cargo-tarpaulin >/dev/null 2>&1; then
     fi
   else
     echo "Could not check coverage against main branch"
-    git stash pop -q 2>/dev/null || true
+    git stash pop --index -q 2>/dev/null || true
   fi
 else
   echo "cargo-tarpaulin not available, skipping coverage check"
