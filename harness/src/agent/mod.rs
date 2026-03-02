@@ -13,6 +13,7 @@ pub mod prompts;
 pub mod rag;
 
 use crate::entities::InMemoryEntityStore;
+use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ const PLANNING_TEMPERATURE: f32 = 0.7;
 const COMPLETION_TEMPERATURE: f32 = 0.2;
 const DECISION_TEMPERATURE: f32 = 0.3;
 const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
+const MAX_TOOL_ITERATIONS: usize = 10;
 
 /// Errors that can occur in the agent
 #[derive(Error, Debug)]
@@ -108,9 +110,8 @@ pub struct AgentLoop {
     performed_actions: usize,
     llm_provider: Option<Arc<dyn ModelProvider>>,
     plan_cache: Option<String>,
+    tool_registry: Option<ToolRegistry>,
     conversation_history: Vec<ChatMessage>,
-    tool_calling_provider: Option<Box<dyn ModelProvider>>,
-    tool_registry: Option<crate::tools::ToolRegistry>,
 }
 
 impl AgentLoop {
@@ -124,9 +125,8 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: None,
             plan_cache: None,
-            conversation_history: Vec::new(),
-            tool_calling_provider: None,
             tool_registry: None,
+            conversation_history: Vec::new(),
         }
     }
 
@@ -140,9 +140,8 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: None,
             plan_cache: None,
-            conversation_history: Vec::new(),
-            tool_calling_provider: None,
             tool_registry: None,
+            conversation_history: Vec::new(),
         }
     }
 
@@ -160,28 +159,28 @@ impl AgentLoop {
             performed_actions: 0,
             llm_provider: Some(llm_provider),
             plan_cache: None,
-            conversation_history: Vec::new(),
-            tool_calling_provider: None,
             tool_registry: None,
+            conversation_history: Vec::new(),
         }
     }
 
+    /// Create a new agent loop with entity store, LLM provider, and tool registry
     pub fn with_tools(
         config: AgentConfig,
-        provider: Box<dyn ModelProvider>,
-        tool_registry: crate::tools::ToolRegistry,
+        entity_store: InMemoryEntityStore,
+        llm_provider: Arc<dyn ModelProvider>,
+        tool_registry: ToolRegistry,
     ) -> Self {
         Self {
             state: AgentState::Planning,
             config,
             iterations: 0,
-            entity_store: InMemoryEntityStore::new(),
+            entity_store,
             performed_actions: 0,
-            llm_provider: None,
+            llm_provider: Some(llm_provider),
             plan_cache: None,
-            conversation_history: Vec::new(),
-            tool_calling_provider: Some(provider),
             tool_registry: Some(tool_registry),
+            conversation_history: Vec::new(),
         }
     }
 
@@ -204,6 +203,11 @@ impl AgentLoop {
         &mut self.entity_store
     }
 
+    /// Get reference to tool registry if present
+    pub fn tool_registry(&self) -> Option<&ToolRegistry> {
+        self.tool_registry.as_ref()
+    }
+
     fn extract_response_content(response: &ChatResponse) -> &str {
         response
             .choices
@@ -214,7 +218,7 @@ impl AgentLoop {
 
     /// Run the agent loop with the given context
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
-        if self.tool_calling_provider.is_some() {
+        if self.tool_registry.is_some() && self.llm_provider.is_some() {
             return self.run_tool_loop(context).await;
         }
 
@@ -322,12 +326,10 @@ impl AgentLoop {
 
     /// Validate LLM response meets basic criteria
     fn validate_llm_response(&self, response: &str, expected_keywords: &[&str]) -> bool {
-        // Basic length check
         if response.trim().is_empty() || response.len() > MAX_LLM_RESPONSE_LENGTH {
             return false;
         }
 
-        // Keyword validation if provided
         if !expected_keywords.is_empty() {
             let response_upper = response.to_uppercase();
             expected_keywords
@@ -339,21 +341,11 @@ impl AgentLoop {
     }
 
     /// Plan - Query entities and prepare for action
-    ///
-    /// MVP implementation:
-    /// - Uses RAG to query relevant entities
-    /// - Logs planning intent
-    /// - Stores context for perform stage
-    ///
-    /// Phase 2 enhancement:
-    /// - If LLM provider available, uses it for intelligent planning
-    /// - Caches LLM-generated plan for later use
     async fn plan(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.config.verbose {
             tracing::info!("Planning for prompt: {}", context.user_prompt);
         }
 
-        // Use RAG to query entities related to the prompt
         let query_results = rag::query_entities(
             &self.entity_store,
             &context.user_prompt,
@@ -374,10 +366,8 @@ impl AgentLoop {
             }
         }
 
-        // If LLM available, use it for planning
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
-            use model::types::ChatMessage;
 
             let entity_count = self
                 .entity_store
@@ -402,7 +392,6 @@ impl AgentLoop {
                 .call_llm_with_retry(provider, request, "planning")
                 .await?;
 
-            // Validate response has choices
             if response.choices.is_empty() {
                 return Err(AgentError::StateError(
                     "LLM returned empty choices array for planning".to_string(),
@@ -420,16 +409,10 @@ impl AgentLoop {
     }
 
     /// Check if the task is complete
-    ///
-    /// Phase 2 implementation:
-    /// - Uses LLM when available to intelligently determine completion
-    /// - Falls back to action count when LLM unavailable or response invalid
     async fn check_task_complete(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
-            use model::types::ChatMessage;
 
-            // Query current entities
             let entities = self
                 .entity_store
                 .query(&EntityQuery::default())
@@ -443,26 +426,22 @@ impl AgentLoop {
                 .map(|e| format!("{:?}", e.entity_type))
                 .collect();
 
-            // Build prompt
             let prompt_text = prompts::CompletionPrompt::build(
                 &context.user_prompt,
                 self.performed_actions,
                 &entity_summary,
             );
 
-            // Create request
             let request = ChatRequest::new(
                 &self.config.model_name,
                 vec![ChatMessage::user(&prompt_text)],
             )
             .with_temperature(COMPLETION_TEMPERATURE);
 
-            // Call LLM with retry logic
             let response = self
                 .call_llm_with_retry(provider, request, "completion check")
                 .await?;
 
-            // Validate response has choices
             if response.choices.is_empty() {
                 if self.config.verbose {
                     tracing::warn!("LLM returned empty choices, falling back to action count");
@@ -472,7 +451,6 @@ impl AgentLoop {
 
             let status_text = Self::extract_response_content(&response);
 
-            // Validate response
             if !self.validate_llm_response(status_text, &["COMPLETE", "INCOMPLETE"]) {
                 if self.config.verbose {
                     tracing::warn!("Invalid completion response, falling back to action count");
@@ -480,10 +458,9 @@ impl AgentLoop {
                 return Ok(self.performed_actions > 0);
             }
 
-            // Parse completion status
             match prompts::CompletionPrompt::parse_response(status_text) {
-                Some(true) => Ok(true),   // COMPLETE
-                Some(false) => Ok(false), // INCOMPLETE
+                Some(true) => Ok(true),
+                Some(false) => Ok(false),
                 None => {
                     if self.config.verbose {
                         tracing::warn!("Ambiguous completion status, falling back");
@@ -492,20 +469,14 @@ impl AgentLoop {
                 }
             }
         } else {
-            // MVP fallback when no LLM provider
             Ok(self.performed_actions > 0)
         }
     }
 
     /// Decide whether to query for more context
-    ///
-    /// Phase 2 implementation:
-    /// - Use LLM to decide whether to QUERY (need more context) or PROCEED (ready to act)
-    /// - Falls back to MVP behavior if no LLM provider available
     async fn decide(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
-            use model::types::ChatMessage;
 
             let plan = self.plan_cache.as_deref().unwrap_or("No plan yet");
             let entity_count = self
@@ -532,7 +503,6 @@ impl AgentLoop {
                 .call_llm_with_retry(provider, request, "decision")
                 .await?;
 
-            // Validate response has choices
             if response.choices.is_empty() {
                 if self.config.verbose {
                     tracing::warn!("LLM returned empty choices, defaulting to PROCEED");
@@ -542,7 +512,6 @@ impl AgentLoop {
 
             let decision_text = Self::extract_response_content(&response);
 
-            // Validate response
             if !self.validate_llm_response(decision_text, &["QUERY", "PROCEED"]) {
                 if self.config.verbose {
                     tracing::warn!("Invalid decision response, defaulting to PROCEED");
@@ -550,10 +519,9 @@ impl AgentLoop {
                 return Ok(false);
             }
 
-            // Parse decision
             match prompts::DecisionPrompt::parse_response(decision_text) {
-                Some(true) => Ok(true),   // QUERY
-                Some(false) => Ok(false), // PROCEED
+                Some(true) => Ok(true),
+                Some(false) => Ok(false),
                 None => {
                     if self.config.verbose {
                         tracing::warn!("Ambiguous decision, defaulting to PROCEED");
@@ -562,15 +530,12 @@ impl AgentLoop {
                 }
             }
         } else {
-            // MVP fallback: don't need additional RAG queries
-            // The planning stage already did the initial query
             Ok(false)
         }
     }
 
     /// Query using RAG for additional context
     async fn query(&self, context: &AgentContext) -> AgentResult<()> {
-        // Use the new RAG implementation
         let results = rag::query_entities(
             &self.entity_store,
             &context.user_prompt,
@@ -586,12 +551,18 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Perform action - Create new entities based on the plan
-    ///
-    /// MVP implementation:
-    /// - Creates a new GitRepository entity based on user prompt
-    /// - Stores it in the entity store
+    /// Perform action — dispatches to perform_with_tools or perform_mvp
     async fn perform(&mut self, context: &AgentContext) -> AgentResult<()> {
+        if self.llm_provider.is_some() && self.tool_registry.is_some() {
+            let provider = self.llm_provider.as_ref().unwrap().clone();
+            self.perform_with_tools(context, &provider).await
+        } else {
+            self.perform_mvp(context).await
+        }
+    }
+
+    /// MVP perform: create a GitRepository entity
+    async fn perform_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
         use crate::entities::{git::types::GitRepository, EntityStore};
 
         self.performed_actions += 1;
@@ -600,8 +571,6 @@ impl AgentLoop {
             tracing::info!("Performing action for: {}", context.user_prompt);
         }
 
-        // MVP: Create a new git repository entity
-        // Future: Parse user intent and create appropriate entities
         let new_entity = Box::new(GitRepository::new(String::new(), "main".to_string()));
 
         let entity_id = self
@@ -617,6 +586,10 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Full tool-calling run loop — used when tool_registry is set.
+    ///
+    /// Bypasses the state machine and drives a direct LLM ↔ tool conversation
+    /// until the model stops with a non-tool finish reason.
     async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
 
@@ -647,15 +620,15 @@ impl AgentLoop {
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
             let provider = self
-                .tool_calling_provider
-                .take()
-                .ok_or_else(|| AgentError::StateError("No provider configured".to_string()))?;
-            let response_result = provider
+                .llm_provider
+                .as_ref()
+                .ok_or_else(|| AgentError::StateError("No provider configured".to_string()))?
+                .clone();
+
+            let response = provider
                 .chat(request)
                 .await
-                .map_err(|e| AgentError::StateError(format!("LLM call failed: {}", e)));
-            self.tool_calling_provider = Some(provider);
-            let response = response_result?;
+                .map_err(|e| AgentError::StateError(format!("LLM call failed: {}", e)))?;
 
             if response.choices.is_empty() {
                 return Err(AgentError::StateError(
@@ -664,7 +637,7 @@ impl AgentLoop {
             }
 
             let choice = response.choices.into_iter().next().unwrap();
-            let finish_reason = choice.finish_reason;
+            let finish_reason = choice.finish_reason.clone();
             let tool_calls = choice.message.tool_calls.clone();
             self.conversation_history.push(choice.message);
 
@@ -684,13 +657,16 @@ impl AgentLoop {
                             let args = tool_call.function.arguments.clone();
                             let call_id = tool_call.id.clone();
 
-                            let registry = self.tool_registry.take().ok_or_else(|| {
-                                AgentError::StateError("No tool registry".to_string())
-                            })?;
-                            let tool_result = registry.execute(&name, args).await;
-                            self.tool_registry = Some(registry);
+                            let result = self
+                                .tool_registry
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AgentError::StateError("No tool registry".to_string())
+                                })?
+                                .execute(&name, args)
+                                .await;
 
-                            let response_content = match tool_result {
+                            let response_content = match result {
                                 Ok(v) => v.to_string(),
                                 Err(e) => format!("Error: {}", e),
                             };
@@ -709,6 +685,79 @@ impl AgentLoop {
 
             self.iterations += 1;
         }
+    }
+
+    /// Tool-calling perform helper: inner loop for the state-machine `perform` step.
+    async fn perform_with_tools(
+        &mut self,
+        context: &AgentContext,
+        provider: &Arc<dyn ModelProvider>,
+    ) -> AgentResult<()> {
+        let tool_defs = self.tool_registry.as_ref().unwrap().get_definitions();
+
+        let system_prompt = format!(
+            "You are an assistant with access to tools. Use them to complete the task: {}",
+            context.user_prompt
+        );
+
+        self.conversation_history = vec![
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(&context.user_prompt),
+        ];
+
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            let request = ChatRequest::new(
+                &self.config.model_name,
+                self.conversation_history.clone(),
+            )
+            .with_tools(tool_defs.clone())
+            .with_temperature(COMPLETION_TEMPERATURE);
+
+            let response = self
+                .call_llm_with_retry(provider, request, "perform")
+                .await?;
+
+            if response.choices.is_empty() {
+                break;
+            }
+
+            let choice = response.choices.into_iter().next().unwrap();
+
+            let has_tool_calls = choice
+                .message
+                .tool_calls
+                .as_ref()
+                .map(|tc| !tc.is_empty())
+                .unwrap_or(false);
+
+            if has_tool_calls {
+                let tool_calls = choice.message.tool_calls.clone().unwrap();
+                self.conversation_history.push(choice.message.clone());
+
+                for tc in &tool_calls {
+                    let result = self
+                        .tool_registry
+                        .as_ref()
+                        .unwrap()
+                        .execute(&tc.function.name, tc.function.arguments.clone())
+                        .await;
+
+                    let content = match result {
+                        Ok(val) => val.to_string(),
+                        Err(e) => format!("Error: {}", e),
+                    };
+
+                    self.conversation_history
+                        .push(ChatMessage::tool_response(tc.id.clone(), content));
+                }
+            } else {
+                self.conversation_history.push(choice.message);
+                break;
+            }
+        }
+
+        self.performed_actions += 1;
+        Ok(())
     }
 }
 
@@ -730,6 +779,254 @@ mod tests {
     use super::*;
     use crate::entities::git::types::GitRepository;
     use crate::entities::{EntityQuery, EntityStore, InMemoryEntityStore};
+    use crate::tools::{EchoTool, ToolRegistry};
+    use model::provider::{ModelError, ModelResult};
+    use model::types::{
+        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall,
+    };
+    use std::sync::Mutex;
+
+    struct MockProvider {
+        responses: Mutex<Vec<ChatResponse>>,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MockProvider {
+        async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                return Err(ModelError::Unknown {
+                    message: "No more responses".to_string(),
+                });
+            }
+            Ok(responses.remove(0))
+        }
+
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn plain_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: None,
+        }
+    }
+
+    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function: FunctionCall {
+                            name: tool_name.to_string(),
+                            arguments: args,
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_loop_with_tools_creation() {
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let provider = MockProvider::new(vec![]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        assert!(agent.tool_registry().is_some());
+        assert!(agent.llm_provider.is_some());
+        assert_eq!(agent.state(), &AgentState::Planning);
+    }
+
+    #[test]
+    fn test_agent_loop_backward_compat() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.tool_registry().is_none());
+        assert!(agent.llm_provider.is_none());
+
+        let store = InMemoryEntityStore::new();
+        let agent = AgentLoop::with_entity_store(AgentConfig::default(), store);
+        assert!(agent.tool_registry().is_none());
+        assert!(agent.llm_provider.is_none());
+
+        let store = InMemoryEntityStore::new();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let agent = AgentLoop::with_llm(AgentConfig::default(), store, provider);
+        assert!(agent.tool_registry().is_none());
+        assert!(agent.llm_provider.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_perform_with_tools_executes_calls() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hello"})),
+            plain_response("Done! I echoed the message."),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "Echo hello".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent
+            .perform_with_tools(&context, &agent.llm_provider.as_ref().unwrap().clone())
+            .await;
+        assert!(
+            result.is_ok(),
+            "perform_with_tools should succeed: {:?}",
+            result
+        );
+        assert_eq!(agent.performed_actions, 1);
+
+        let history = &agent.conversation_history;
+        assert!(
+            history.len() >= 4,
+            "History should have system, user, assistant(tool_call), tool_response, assistant(final)"
+        );
+
+        let has_tool_response = history.iter().any(|m| m.role == MessageRole::Tool);
+        assert!(has_tool_response, "History should contain tool response");
+    }
+
+    #[tokio::test]
+    async fn test_perform_with_tools_handles_errors() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("nonexistent_tool", serde_json::json!({})),
+            plain_response("I couldn't find that tool."),
+        ]);
+
+        let registry = ToolRegistry::new();
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "Do something".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
+        let result = agent.perform_with_tools(&context, &provider_clone).await;
+        assert!(result.is_ok(), "Should handle tool errors gracefully");
+
+        let has_error_response = agent.conversation_history.iter().any(|m| {
+            m.role == MessageRole::Tool
+                && m.content
+                    .as_ref()
+                    .map(|c| c.starts_with("Error:"))
+                    .unwrap_or(false)
+        });
+        assert!(has_error_response, "Should have an error tool response");
+    }
+
+    #[tokio::test]
+    async fn test_perform_without_tools_mvp_fallback() {
+        let config = AgentConfig {
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_entity_store(config, store);
+
+        assert!(agent.tool_registry().is_none());
+
+        let context = AgentContext {
+            user_prompt: "Create entity".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.perform_mvp(&context).await;
+        assert!(result.is_ok());
+        assert_eq!(agent.performed_actions, 1);
+
+        let entities = agent
+            .entity_store()
+            .query(&EntityQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            entities.len(),
+            1,
+            "MVP should create a GitRepository entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_perform_with_tools_max_iterations() {
+        let responses: Vec<ChatResponse> = (0..MAX_TOOL_ITERATIONS + 5)
+            .map(|_| tool_call_response("echo", serde_json::json!({"message": "loop"})))
+            .collect();
+
+        let provider = MockProvider::new(responses);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "Keep looping".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
+        let result = agent.perform_with_tools(&context, &provider_clone).await;
+        assert!(
+            result.is_ok(),
+            "Should stop after max iterations without error"
+        );
+        assert_eq!(agent.performed_actions, 1, "Should count as one action");
+    }
 
     #[test]
     fn test_agent_state_transitions() {
@@ -785,7 +1082,6 @@ mod tests {
         };
         let mut agent = AgentLoop::new(config);
 
-        // Set up so it never completes
         agent.state = AgentState::Planning;
 
         let context = AgentContext {
@@ -795,29 +1091,17 @@ mod tests {
         };
 
         let result = agent.run(context).await;
-        // Should hit max iterations but actually completes after first iteration
-        // due to check_task_complete logic
         assert!(result.is_ok() || matches!(result, Err(AgentError::MaxIterationsExceeded)));
     }
 
     /// MVP Test: Agent completes one full control loop modifying entities
-    ///
-    /// This test defines the MVP contract:
-    /// 1. Agent accepts an entity store
-    /// 2. Agent can plan using RAG (query entities) without panicking
-    /// 3. Agent can perform actions (create git entity)
-    /// 4. Agent can check task completion (verify entity was created)
-    /// 5. Agent completes successfully after modifications
     #[tokio::test]
     async fn test_mvp_agent_control_loop_with_entities() {
-        // Setup: Create entity store with initial state
         let mut entity_store = InMemoryEntityStore::new();
 
-        // Add an initial git repository entity for context
         let initial_repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
         let _initial_id = entity_store.store(initial_repo).await.unwrap();
 
-        // Verify initial state
         assert_eq!(
             entity_store
                 .query(&EntityQuery::default())
@@ -827,7 +1111,6 @@ mod tests {
             1
         );
 
-        // Create agent with entity store
         let config = AgentConfig {
             max_iterations: 10,
             verbose: true,
@@ -835,17 +1118,14 @@ mod tests {
         };
         let mut agent = AgentLoop::with_entity_store(config, entity_store);
 
-        // Create context requesting git entity creation
         let context = AgentContext {
             user_prompt: "Create a new git repository entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp_test_state".to_string(),
         };
 
-        // Run agent
         let result = agent.run(context).await;
 
-        // Verify success
         assert!(result.is_ok(), "Agent should complete successfully");
         let run_result = result.unwrap();
         assert!(
@@ -854,7 +1134,6 @@ mod tests {
         );
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        // Verify entity modifications occurred
         let final_entities = agent
             .entity_store()
             .query(&EntityQuery::default())
@@ -867,8 +1146,6 @@ mod tests {
             final_entities.len()
         );
 
-        // Verify we can query by text (RAG didn't panic)
-        // The GitRepository entity has "Git" in its type, so search for that
         let query = EntityQuery {
             text_query: Some("Git".to_string()),
             ..Default::default()
@@ -921,7 +1198,6 @@ mod tests {
 
         let result = agent.plan(&context).await;
 
-        // Skip test if LLM/model not available (e.g., qwen2.5:0.5b not pulled)
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             if err_msg.contains("Ollama") || err_msg.contains("model") || err_msg.contains("LLM") {
@@ -941,7 +1217,6 @@ mod tests {
     async fn test_completion_check_fallback_no_llm() {
         let mut agent = AgentLoop::new(AgentConfig::default());
 
-        // Simulate having done work
         agent.performed_actions = 1;
 
         let context = AgentContext {
@@ -950,11 +1225,9 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        // Should use fallback (action count) when no LLM provider
         let is_complete = agent.check_task_complete(&context).await.unwrap();
         assert!(is_complete, "Should be complete when performed_actions > 0");
 
-        // With no actions, should be incomplete
         agent.performed_actions = 0;
         let is_complete = agent.check_task_complete(&context).await.unwrap();
         assert!(
@@ -980,7 +1253,6 @@ mod tests {
         let mut agent =
             AgentLoop::with_llm(AgentConfig::default(), InMemoryEntityStore::new(), provider);
 
-        // Simulate having done work
         agent.performed_actions = 1;
         let repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
         agent.entity_store_mut().store(repo).await.unwrap();
@@ -993,7 +1265,6 @@ mod tests {
 
         let result = agent.check_task_complete(&context).await;
 
-        // Skip test if LLM/model not available
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             if err_msg.contains("Ollama") || err_msg.contains("model") || err_msg.contains("LLM") {
@@ -1003,7 +1274,6 @@ mod tests {
         }
 
         let _is_complete = result.unwrap();
-        // LLM returned valid completion status (test passes if we get here without panic)
     }
 
     #[tokio::test]
@@ -1031,14 +1301,12 @@ mod tests {
 
         let result = agent.decide(&context).await;
 
-        // If LLM call fails (e.g., model not available), skip the test
         if result.is_err() {
             eprintln!("Skipping LLM decision test: LLM call failed");
             return;
         }
 
         let _needs_query = result.unwrap();
-        // LLM returned valid decision (test passes if we get here without panic)
     }
 
     /// Task 8: Full LLM Agent Control Loop Integration Test
@@ -1048,7 +1316,6 @@ mod tests {
         use crate::entities::EntityStore;
         use model::OllamaProvider;
 
-        // Skip if Ollama not available
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
@@ -1077,7 +1344,6 @@ mod tests {
 
         let result = agent.run(context).await;
 
-        // If LLM fails, skip gracefully
         if result.is_err() {
             eprintln!("Skipping full LLM test: Agent run failed (likely LLM unavailable)");
             return;
@@ -1088,7 +1354,6 @@ mod tests {
         assert!(run_result.task_completed);
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        // Verify LLM was actually used
         assert!(agent.plan_cache.is_some(), "LLM should have created a plan");
 
         println!(
@@ -1103,7 +1368,6 @@ mod tests {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
 
-        // Create agent WITHOUT LLM provider (MVP mode)
         let config = AgentConfig {
             max_iterations: 10,
             verbose: true,
@@ -1116,7 +1380,6 @@ mod tests {
 
         let mut agent = AgentLoop::with_entity_store(config, entity_store);
 
-        // Verify no LLM provider
         assert!(
             agent.llm_provider.is_none(),
             "MVP mode should have no LLM provider"
@@ -1135,12 +1398,60 @@ mod tests {
         assert!(run_result.task_completed);
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        // Verify plan_cache not populated (MVP mode)
         assert!(
             agent.plan_cache.is_none(),
             "MVP mode should not populate plan_cache"
         );
 
         println!("✅ MVP mode backward compatibility verified");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_agent_loop_with_ollama_and_tools() {
+        use crate::tools::{CalculatorTool, EchoTool};
+        use model::OllamaProvider;
+
+        let provider = match OllamaProvider::with_default_config() {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("Skipping: Ollama not available: {}", e);
+                return;
+            }
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        registry.register(Box::new(CalculatorTool::new()));
+
+        let config = AgentConfig {
+            max_iterations: 20,
+            verbose: true,
+            model_name: "qwen3:0.6b".to_string(),
+            ..Default::default()
+        };
+
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "Use the calculate tool to add 5 and 3, then tell me the result."
+                .to_string(),
+            conversation_history: vec![],
+            app_state_id: "integration_test".to_string(),
+        };
+
+        let result = agent.run(context).await;
+        assert!(result.is_ok(), "Agent run should succeed: {:?}", result);
+
+        let run_result = result.unwrap();
+        assert!(run_result.task_completed, "Task should complete");
+        assert_eq!(run_result.final_state, AgentState::Completed);
+
+        println!("✅ Agent loop with Ollama and tools completed successfully");
+        println!(
+            "   Conversation history: {} messages",
+            agent.conversation_history.len()
+        );
     }
 }

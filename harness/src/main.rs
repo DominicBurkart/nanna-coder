@@ -396,14 +396,18 @@ async fn run_agent(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
+    use harness::entities::InMemoryEntityStore;
     use harness::tools::{CalculatorTool as LibCalc, EchoTool as LibEcho, ToolRegistry as LibReg};
+    use std::sync::Arc;
 
     let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
+    let provider = Arc::new(OllamaProvider::new(config)?);
 
     let mut tool_registry = LibReg::new();
     tool_registry.register(Box::new(LibEcho::new()));
     tool_registry.register(Box::new(LibCalc::new()));
+
+    let entity_store = InMemoryEntityStore::new();
 
     let agent_config = AgentConfig {
         max_iterations,
@@ -424,7 +428,7 @@ async fn run_agent(
         println!("Max iterations: {}", max_iterations);
     }
 
-    let mut agent = AgentLoop::with_tools(agent_config, Box::new(provider), tool_registry);
+    let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
     let result = agent.run(context).await?;
 
     println!("\n--- Agent Result ---");
