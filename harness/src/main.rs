@@ -47,7 +47,7 @@ enum Commands {
         #[arg(short, long)]
         prompt: String,
         /// The model to use
-        #[arg(short, long, default_value = "llama3.1:8b")]
+        #[arg(short, long, default_value = "qwen3:0.6b")]
         model: String,
         /// Maximum agent iterations
         #[arg(long, default_value = "100")]
@@ -55,6 +55,9 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Enable tool calling
+        #[arg(short, long)]
+        tools: bool,
     },
 }
 
@@ -117,8 +120,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
             verbose,
+            tools,
         } => {
-            run_agent(&prompt, &model, max_iterations, verbose).await?;
+            run_agent(
+                &prompt,
+                &model,
+                max_iterations,
+                verbose,
+                tools,
+                &workspace_root,
+            )
+            .await?;
         }
     }
 
@@ -394,16 +406,15 @@ async fn run_agent(
     model: &str,
     max_iterations: usize,
     verbose: bool,
+    tools: bool,
+    workspace_root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
-    use harness::tools::{CalculatorTool as LibCalc, EchoTool as LibEcho, ToolRegistry as LibReg};
+    use std::sync::Arc;
 
     let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
-    let mut tool_registry = LibReg::new();
-    tool_registry.register(Box::new(LibEcho::new()));
-    tool_registry.register(Box::new(LibCalc::new()));
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
         max_iterations,
@@ -422,9 +433,16 @@ async fn run_agent(
         println!("Starting agent with model: {}", model);
         println!("Prompt: {}", prompt);
         println!("Max iterations: {}", max_iterations);
+        println!("Tools enabled: {}", tools);
     }
 
-    let mut agent = AgentLoop::with_tools(agent_config, Box::new(provider), tool_registry);
+    let mut agent = if tools {
+        let tool_registry = create_tool_registry(workspace_root);
+        AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
+    } else {
+        AgentLoop::with_llm(agent_config, entity_store, provider)
+    };
+
     let result = agent.run(context).await?;
 
     println!("\n--- Agent Result ---");

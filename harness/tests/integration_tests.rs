@@ -4,6 +4,7 @@ use harness::container::{
     detect_runtime, health_check_container, start_container_with_fallback, verify_image_exists,
     ContainerConfig, ContainerError, ContainerRuntime,
 };
+use harness::entities::InMemoryEntityStore;
 use harness::tools::{CalculatorTool, EchoTool, Tool, ToolRegistry};
 use model::judge::{
     JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult,
@@ -15,7 +16,7 @@ use model::types::{
 use model::{ModelError, ModelProvider, ModelResult};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 // use futures::future; // Reserved for future concurrent test implementation
@@ -1446,7 +1447,10 @@ async fn test_agent_loop_tool_call_integration() {
     };
     let stop_response = make_stop_response("Task complete.");
 
-    let provider = SequenceMockProvider::new(vec![tool_call_response, stop_response]);
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        tool_call_response,
+        stop_response,
+    ]));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
 
@@ -1463,7 +1467,7 @@ async fn test_agent_loop_tool_call_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1502,7 +1506,10 @@ async fn test_agent_loop_multi_tool_integration() {
     };
     let stop_response = make_stop_response("Both tools executed.");
 
-    let provider = SequenceMockProvider::new(vec![multi_tool_response, stop_response]);
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        multi_tool_response,
+        stop_response,
+    ]));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
     registry.register(Box::new(CalculatorTool::new()));
@@ -1520,7 +1527,7 @@ async fn test_agent_loop_multi_tool_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1559,7 +1566,10 @@ async fn test_agent_loop_error_recovery_integration() {
     };
     let stop_response = make_stop_response("Recovered from error.");
 
-    let provider = SequenceMockProvider::new(vec![bad_tool_response, stop_response]);
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        bad_tool_response,
+        stop_response,
+    ]));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
 
@@ -1576,7 +1586,7 @@ async fn test_agent_loop_error_recovery_integration() {
         app_state_id: "integration_test".to_string(),
     };
 
-    let mut agent = AgentLoop::with_tools(config, Box::new(provider), registry);
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
     let result = agent.run(context).await.unwrap();
 
     assert!(result.task_completed);
@@ -1640,7 +1650,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         .with_timeout(Duration::from_secs(120));
 
     let provider = match OllamaProvider::new(ollama_config) {
-        Ok(p) => p,
+        Ok(p) => Arc::new(p),
         Err(e) => {
             println!("Failed to create provider: {} - skipping", e);
             return;
@@ -1665,7 +1675,12 @@ async fn test_e2e_agent_with_containerized_ollama() {
         app_state_id: "e2e_test".to_string(),
     };
 
-    let mut agent = AgentLoop::with_tools(agent_config, Box::new(provider), tool_registry);
+    let mut agent = AgentLoop::with_tools(
+        agent_config,
+        InMemoryEntityStore::new(),
+        provider,
+        tool_registry,
+    );
 
     let result = timeout(E2E_TIMEOUT, agent.run(context)).await;
 

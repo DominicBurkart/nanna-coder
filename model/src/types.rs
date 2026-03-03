@@ -177,7 +177,7 @@ pub struct Choice {
     pub finish_reason: Option<FinishReason>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
