@@ -173,9 +173,9 @@ jobs:
       if: runner.os != 'Linux'
       shell: bash
       run: |
-        cargo install cargo-nextest cargo-audit cargo-deny
+        cargo install --locked cargo-nextest cargo-audit cargo-deny
         if [ "${{ matrix.test-type }}" = "security" ]; then
-          cargo install cargo-tarpaulin
+          cargo install --locked cargo-tarpaulin
         fi
 
     - name: Optimize CI cache settings (Nix)
