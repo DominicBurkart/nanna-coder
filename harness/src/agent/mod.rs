@@ -12,7 +12,8 @@ pub mod decision;
 pub mod prompts;
 pub mod rag;
 
-use crate::entities::InMemoryEntityStore;
+use crate::entities::context::types::{ContextEntity, ToolCallRecord};
+use crate::entities::{EntityStore, InMemoryEntityStore};
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -100,6 +101,54 @@ pub struct AgentRunResult {
     pub iterations: usize,
     /// Whether the task was completed successfully
     pub task_completed: bool,
+}
+
+fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
+    use std::collections::HashMap;
+
+    let mut call_args: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+    let mut call_results: HashMap<String, String> = HashMap::new();
+
+    for msg in history {
+        if msg.role == MessageRole::Assistant {
+            if let Some(tool_calls) = &msg.tool_calls {
+                for tc in tool_calls {
+                    call_args.insert(
+                        tc.id.clone(),
+                        (tc.function.name.clone(), tc.function.arguments.clone()),
+                    );
+                }
+            }
+        }
+        if msg.role == MessageRole::Tool {
+            if let (Some(call_id), Some(content)) = (&msg.tool_call_id, &msg.content) {
+                call_results.insert(call_id.clone(), content.clone());
+            }
+        }
+    }
+
+    call_args
+        .into_iter()
+        .map(|(call_id, (tool_name, arguments))| {
+            let result = call_results.get(&call_id).cloned().unwrap_or_default();
+            ToolCallRecord {
+                tool_name,
+                arguments,
+                call_id,
+                result,
+            }
+        })
+        .collect()
+}
+
+fn extract_result_summary(history: &[ChatMessage]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::Assistant && m.tool_calls.is_none())
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("")
+        .to_string()
 }
 
 pub struct AgentLoop {
@@ -233,6 +282,33 @@ impl AgentLoop {
                 tracing::info!("Agent iteration {}: {:?}", self.iterations, self.state);
             }
 
+            if self.state == AgentState::Completed {
+                let task_description = context.user_prompt.clone();
+                let conversation = self.conversation_history.clone();
+                let tool_calls_made = extract_tool_calls_from_history(&conversation);
+                let result_summary = extract_result_summary(&conversation);
+                let model_used = self.config.model_name.clone();
+                let entity = ContextEntity::new(
+                    task_description,
+                    conversation,
+                    tool_calls_made,
+                    result_summary,
+                    model_used,
+                );
+                if let Err(e) = self.entity_store.store(Box::new(entity)).await {
+                    tracing::warn!("Failed to store context entity: {}", e);
+                }
+                return Ok(AgentRunResult {
+                    final_state: self.state.clone(),
+                    iterations: self.iterations,
+                    task_completed: true,
+                });
+            }
+
+            if let AgentState::Error(msg) = &self.state {
+                return Err(AgentError::StateError(msg.clone()));
+            }
+
             match &self.state {
                 AgentState::Planning => {
                     self.plan(&context).await?;
@@ -261,16 +337,7 @@ impl AgentLoop {
                     self.perform(&context).await?;
                     self.transition_to(AgentState::CheckingCompletion);
                 }
-                AgentState::Completed => {
-                    return Ok(AgentRunResult {
-                        final_state: self.state.clone(),
-                        iterations: self.iterations,
-                        task_completed: true,
-                    });
-                }
-                AgentState::Error(msg) => {
-                    return Err(AgentError::StateError(msg.clone()));
-                }
+                AgentState::Completed | AgentState::Error(_) => unreachable!(),
             }
 
             self.iterations += 1;
@@ -644,6 +711,21 @@ impl AgentLoop {
             match finish_reason {
                 Some(FinishReason::Stop) | None => {
                     self.transition_to(AgentState::Completed);
+                    let task_description = context.user_prompt.clone();
+                    let conversation = self.conversation_history.clone();
+                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
+                    let result_summary = extract_result_summary(&conversation);
+                    let model_used = self.config.model_name.clone();
+                    let entity = ContextEntity::new(
+                        task_description,
+                        conversation,
+                        tool_calls_made,
+                        result_summary,
+                        model_used,
+                    );
+                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
+                        tracing::warn!("Failed to store context entity: {}", e);
+                    }
                     return Ok(AgentRunResult {
                         final_state: AgentState::Completed,
                         iterations: self.iterations,
@@ -1132,17 +1214,30 @@ mod tests {
         );
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        let final_entities = agent
+        let git_entities = agent
             .entity_store()
-            .query(&EntityQuery::default())
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Git],
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(
-            final_entities.len(),
+            git_entities.len(),
             2,
-            "Agent should create exactly one entity (1 initial + 1 created). Found {}",
-            final_entities.len()
+            "Agent should create exactly one git entity (1 initial + 1 created). Found {}",
+            git_entities.len()
         );
+
+        let context_entities = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(context_entities.len(), 1, "Should store one ContextEntity");
 
         let query = EntityQuery {
             text_query: Some("Git".to_string()),
@@ -1155,8 +1250,8 @@ mod tests {
         );
 
         println!(
-            "✅ MVP Test passed: Agent completed control loop with {} entities created",
-            final_entities.len() - 1
+            "✅ MVP Test passed: Agent completed control loop with {} git entities",
+            git_entities.len()
         );
     }
 
@@ -1450,6 +1545,193 @@ mod tests {
         println!(
             "   Conversation history: {} messages",
             agent.conversation_history.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_run_stores_context_entity() {
+        let config = AgentConfig {
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_entity_store(config, store);
+
+        let context = AgentContext {
+            user_prompt: "store entity test".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run(context).await;
+        assert!(result.is_ok());
+
+        let all_context = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            all_context.len(),
+            1,
+            "Should store exactly one ContextEntity"
+        );
+        assert_eq!(
+            all_context[0].entity_type,
+            crate::entities::EntityType::Context
+        );
+
+        let by_prompt = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some("store entity test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_prompt.len(), 1, "Entity should contain task_description");
+
+        let by_model = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some(DEFAULT_MODEL.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_model.len(), 1, "Entity should contain model_used");
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_run_stores_context_entity() {
+        let provider = MockProvider::new(vec![plain_response("Task complete!")]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig {
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "do something".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run(context).await;
+        assert!(result.is_ok(), "Agent run should succeed: {:?}", result);
+
+        let all_context = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            all_context.len(),
+            1,
+            "Should store exactly one ContextEntity"
+        );
+
+        let by_prompt = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some("do something".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !by_prompt.is_empty(),
+            "Entity should contain task_description"
+        );
+
+        let by_model = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some(DEFAULT_MODEL.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!by_model.is_empty(), "Entity should contain model_used");
+
+        let by_summary = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some("Task complete!".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !by_summary.is_empty(),
+            "Entity should contain result_summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_stores_tool_calls_made() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "ping"})),
+            plain_response("All done."),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "echo ping".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        agent.run(context).await.unwrap();
+
+        let by_tool_name = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some("echo".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !by_tool_name.is_empty(),
+            "Entity should contain tool call name"
+        );
+
+        let by_summary = agent
+            .entity_store()
+            .query(&EntityQuery {
+                entity_types: vec![crate::entities::EntityType::Context],
+                text_query: Some("All done.".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !by_summary.is_empty(),
+            "Entity should contain result_summary"
         );
     }
 }
