@@ -5,6 +5,7 @@ use harness::container::{
     ContainerConfig, ContainerError, ContainerRuntime,
 };
 use harness::entities::InMemoryEntityStore;
+use harness::entities::{EntityQuery, EntityStore, EntityType};
 use harness::tools::{CalculatorTool, EchoTool, Tool, ToolRegistry};
 use model::judge::{
     JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult,
@@ -1602,6 +1603,120 @@ async fn test_agent_loop_error_recovery_integration() {
         .as_ref()
         .unwrap()
         .contains("Error"));
+}
+
+#[tokio::test]
+async fn test_context_entity_stored_after_agent_run() {
+    let tool_call_response = ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant_with_tools(
+                None,
+                vec![make_tool_call(
+                    "call_ctx",
+                    "echo",
+                    json!({"message": "context test"}),
+                )],
+            ),
+            finish_reason: Some(FinishReason::ToolCalls),
+        }],
+        usage: None,
+    };
+    let stop_response = make_stop_response("Context entity stored.");
+
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        tool_call_response,
+        stop_response,
+    ]));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 20,
+        verbose: false,
+        system_prompt: "You are a helpful assistant.".to_string(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Echo context test message".to_string(),
+        conversation_history: vec![ChatMessage::user("Echo context test message")],
+        app_state_id: "context_entity_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
+    let result = agent.run(context).await.unwrap();
+    assert!(result.task_completed);
+
+    let context_results = agent
+        .entity_store()
+        .query(&EntityQuery {
+            entity_types: vec![EntityType::Context],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        context_results.len(),
+        1,
+        "Should store exactly one ContextEntity after run"
+    );
+    assert_eq!(context_results[0].entity_type, EntityType::Context);
+
+    let by_prompt = agent
+        .entity_store()
+        .query(&EntityQuery {
+            entity_types: vec![EntityType::Context],
+            text_query: Some("Echo context test message".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !by_prompt.is_empty(),
+        "ContextEntity should contain task_description"
+    );
+
+    let by_model = agent
+        .entity_store()
+        .query(&EntityQuery {
+            entity_types: vec![EntityType::Context],
+            text_query: Some("test-model".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !by_model.is_empty(),
+        "ContextEntity should contain model_used"
+    );
+
+    let by_tool = agent
+        .entity_store()
+        .query(&EntityQuery {
+            entity_types: vec![EntityType::Context],
+            text_query: Some("echo".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !by_tool.is_empty(),
+        "ContextEntity should contain tool call record"
+    );
+
+    let by_summary = agent
+        .entity_store()
+        .query(&EntityQuery {
+            entity_types: vec![EntityType::Context],
+            text_query: Some("Context entity stored.".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !by_summary.is_empty(),
+        "ContextEntity should contain result_summary"
+    );
 }
 
 #[tokio::test]
