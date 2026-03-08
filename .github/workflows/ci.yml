@@ -30,6 +30,10 @@ jobs:
             test-type: unit
           - os: windows-latest
             test-type: unit
+          - os: ubuntu-latest
+            test-type: integration
+          - os: ubuntu-latest
+            test-type: integration-container
 
     steps:
     - name: Checkout code
@@ -91,7 +95,7 @@ jobs:
       run: nix run .#ci-cache-optimize
 
     - name: Pre-build test containers (Integration tests only)
-      if: matrix.test-type == 'integration' && runner.os == 'Linux'
+      if: matrix.test-type == 'integration-container' && runner.os == 'Linux'
       run: |
         echo "🔄 Building test containers for caching..."
         nix build .#ollamaImage --print-build-logs
@@ -123,6 +127,19 @@ jobs:
         else
           cargo nextest run --workspace --lib --all-features
         fi
+
+    - name: Run integration tests
+      if: matrix.test-type == 'integration'
+      shell: bash
+      run: |
+        nix develop --command cargo nextest run --workspace --test '*' --all-features
+
+    - name: Run integration tests (container)
+      if: matrix.test-type == 'integration-container'
+      shell: bash
+      run: |
+        nix develop --command cargo nextest run --workspace --test '*' --all-features -- --test-threads=1
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only -- --test-threads=1
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
