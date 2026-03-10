@@ -135,27 +135,11 @@ else
   echo "Claude CLI not available, skipping automated security review"
 fi
 
-# Coverage check with comparison to main
+# Coverage check (report only, no branch comparison to avoid corrupting staged changes)
 echo "Checking test coverage..."
 if command -v cargo-tarpaulin >/dev/null 2>&1; then
-  NEW=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
-
-  git stash push --keep-index -q 2>/dev/null || true
-  if git checkout main -q 2>/dev/null; then
-    OLD=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "0.0")
-    git checkout - -q
-    git stash pop --index -q 2>/dev/null || true
-
-    if awk "BEGIN { exit !($NEW >= $OLD) }"; then
-      echo "Coverage: $NEW% >= $OLD%"
-    else
-      echo "Coverage dropped: $NEW% < $OLD%"
-      exit 1
-    fi
-  else
-    echo "Could not check coverage against main branch"
-    git stash pop --index -q 2>/dev/null || true
-  fi
+  COVERAGE=$(cargo tarpaulin --skip-clean --ignore-tests --output-format text 2>/dev/null | grep -oP '\d+\.\d+(?=% coverage)' || echo "unknown")
+  echo "Coverage: ${COVERAGE}%"
 else
   echo "cargo-tarpaulin not available, skipping coverage check"
 fi

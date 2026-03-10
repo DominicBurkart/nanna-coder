@@ -138,8 +138,8 @@ jobs:
       if: matrix.test-type == 'integration-container'
       shell: bash
       run: |
-        nix develop --command cargo nextest run --workspace --test '*' --all-features -- --test-threads=1
-        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only -- --test-threads=1
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --test-threads=1
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
