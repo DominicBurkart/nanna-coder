@@ -988,6 +988,19 @@ impl Tool for GitDiffTool {
     }
 }
 
+pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+    registry.register(Box::new(CalculatorTool::new()));
+    registry.register(Box::new(ReadFileTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(WriteFileTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(ListDirTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(SearchTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(GitDiffTool::new(workspace_root.to_path_buf())));
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,15 +1,18 @@
 pub mod agent;
 pub mod container;
 pub mod entities;
+pub mod mcp;
 pub mod monitoring;
 pub mod observability;
+pub mod task;
 pub mod telemetry;
 pub mod tools;
+pub mod workspace;
 
 pub use container::{
     cleanup_container, detect_runtime, health_check_container, load_image_from_path,
     start_container_with_fallback, verify_image_exists, ContainerConfig, ContainerError,
-    ContainerHandle, ContainerRuntime,
+    ContainerHandle, ContainerRuntime, SharedModelPool,
 };
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
@@ -24,7 +27,9 @@ pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
-pub use tools::{CalculatorTool, EchoTool, Tool, ToolError, ToolRegistry, ToolResult};
+pub use tools::{
+    create_tool_registry, CalculatorTool, EchoTool, Tool, ToolError, ToolRegistry, ToolResult,
+};
 
 // Export agent types
 pub use agent::{
