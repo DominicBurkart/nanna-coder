@@ -122,7 +122,7 @@ jobs:
       if: matrix.test-type == 'integration-container'
       run: |
         echo "Building example dev container image..."
-        nix build path:tests/integration/repo#devContainerImage --no-link
+        nix build path:tests/integration/repo#devContainerImage --no-link --impure
         echo "Dev container image built successfully"
 
     - name: Run unit tests

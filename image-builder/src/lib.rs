@@ -85,6 +85,7 @@ pub fn build_dev_container(source: &Path) -> ImageBuilderResult<PathBuf> {
             &format!("path:{}#devContainerImage", source_str),
             "--print-out-paths",
             "--no-link",
+            "--impure",
         ])
         .output()
         .map_err(ImageBuilderError::Io)?;
