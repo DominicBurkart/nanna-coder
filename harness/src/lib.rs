@@ -7,9 +7,9 @@ pub mod telemetry;
 pub mod tools;
 
 pub use container::{
-    cleanup_container, detect_runtime, health_check_container, load_image_from_path,
-    start_container_with_fallback, verify_image_exists, ContainerConfig, ContainerError,
-    ContainerHandle, ContainerRuntime,
+    cleanup_container, detect_runtime, exec_in_container, health_check_container,
+    load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
+    ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime,
 };
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
@@ -24,7 +24,10 @@ pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
-pub use tools::{CalculatorTool, EchoTool, Tool, ToolError, ToolRegistry, ToolResult};
+pub use tools::{
+    CalculatorTool, EchoTool, GitDiffTool, GitStatusTool, ListDirTool, ReadFileTool,
+    RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool,
+};
 
 // Export agent types
 pub use agent::{
