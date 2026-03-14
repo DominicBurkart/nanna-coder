@@ -12,15 +12,9 @@
       url = "github:nlewo/nix2container";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    nanna-coder = {
-      url = "path:../../..";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rust-overlay.follows = "rust-overlay";
-      inputs.nix2container.follows = "nix2container";
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, nix2container, nanna-coder }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, nix2container }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
