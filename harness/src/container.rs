@@ -4,6 +4,12 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{sleep, timeout};
 
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
 /// Container runtime types supported
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainerRuntime {
@@ -189,7 +195,7 @@ pub fn verify_image_exists(
 pub fn load_image_from_path(
     runtime: &ContainerRuntime,
     image_path: &Path,
-) -> Result<(), ContainerError> {
+) -> Result<String, ContainerError> {
     if !runtime.is_available() {
         return Err(ContainerError::NoRuntimeAvailable);
     }
@@ -201,23 +207,94 @@ pub fn load_image_from_path(
         });
     }
 
-    let output = Command::new(runtime.command())
-        .args(["load", "-i"])
-        .arg(image_path)
-        .output()
-        .map_err(|e| ContainerError::ImageLoadFailed {
-            path: image_path.display().to_string(),
-            reason: e.to_string(),
-        })?;
+    let real_path = if image_path.is_symlink() {
+        std::fs::read_link(image_path).unwrap_or_else(|_| image_path.to_path_buf())
+    } else {
+        image_path.to_path_buf()
+    };
 
-    if !output.status.success() {
-        return Err(ContainerError::ImageLoadFailed {
-            path: image_path.display().to_string(),
-            reason: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
+    let is_nix2container = if real_path.is_file() {
+        let mut buf = [0u8; 1];
+        std::fs::File::open(&real_path)
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read_exact(&mut buf).map(|_| buf[0] == b'{')
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if is_nix2container {
+        let content =
+            std::fs::read_to_string(&real_path).map_err(|e| ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: format!("Invalid nix2container JSON: {}", e),
+            })?;
+
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let tag = json.get("tag").and_then(|v| v.as_str()).unwrap_or("latest");
+        let image_ref = format!("{}:{}", name, tag);
+
+        let dest = match runtime {
+            ContainerRuntime::Podman => format!("containers-storage:{}", image_ref),
+            ContainerRuntime::Docker => format!("docker-daemon:{}", image_ref),
+            ContainerRuntime::None => return Err(ContainerError::NoRuntimeAvailable),
+        };
+
+        let output = Command::new("skopeo")
+            .args(["copy", &format!("nix:{}", real_path.display()), &dest])
+            .output()
+            .map_err(|e| ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: format!("skopeo not available: {}", e),
+            })?;
+
+        if !output.status.success() {
+            return Err(ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        Ok(image_ref)
+    } else {
+        let output = Command::new(runtime.command())
+            .args(["load", "-i"])
+            .arg(image_path)
+            .output()
+            .map_err(|e| ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(ContainerError::ImageLoadFailed {
+                path: image_path.display().to_string(),
+                reason: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let image_ref = stdout
+            .lines()
+            .find(|l| l.contains("Loaded image"))
+            .and_then(|l| l.split(": ").last())
+            .unwrap_or("unknown:latest")
+            .trim()
+            .to_string();
+
+        Ok(image_ref)
     }
-
-    Ok(())
 }
 
 /// Start container with intelligent fallback logic
@@ -464,6 +541,41 @@ pub fn cleanup_container(handle: &ContainerHandle) -> Result<(), ContainerError>
     Ok(())
 }
 
+pub fn exec_in_container(
+    handle: &ContainerHandle,
+    command: &[&str],
+    working_dir: Option<&str>,
+) -> Result<CommandOutput, ContainerError> {
+    if !handle.runtime.is_available() {
+        return Err(ContainerError::NoRuntimeAvailable);
+    }
+
+    let mut cmd = Command::new(handle.runtime.command());
+    cmd.arg("exec");
+
+    if let Some(dir) = working_dir {
+        cmd.args(["-w", dir]);
+    }
+
+    cmd.arg(&handle.name);
+    cmd.args(command);
+
+    let output = cmd.output().map_err(|_e| ContainerError::CommandFailed {
+        command: format!(
+            "{} exec {} {:?}",
+            handle.runtime.command(),
+            handle.name,
+            command
+        ),
+    })?;
+
+    Ok(CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.status.success(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +641,17 @@ mod tests {
             result,
             Err(ContainerError::ImageLoadFailed { .. })
         ));
+    }
+
+    #[test]
+    fn test_exec_in_container_no_runtime() {
+        let handle = ContainerHandle {
+            name: "test".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        };
+        let result = exec_in_container(&handle, &["echo", "hello"], None);
+        assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
     }
 }

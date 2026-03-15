@@ -4,6 +4,7 @@
 //! for different environments (dev, sandbox, release).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use thiserror::Error;
 
 /// Errors related to image building
@@ -56,38 +57,49 @@ impl Default for ImageBuildConfig {
     }
 }
 
-/// Build a container image using Nix
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
-/// The actual implementation should:
-/// - Invoke Nix build commands
-/// - Handle nix-in-container builds
-/// - Manage build caching
-/// - Validate the resulting image
-pub fn build_image(_config: &ImageBuildConfig) -> ImageBuilderResult<PathBuf> {
-    unimplemented!(
-        "Image building with Nix requires further problem definition. \
-         This should integrate with the nix-in-container system to build dev, \
-         sandbox, and release images."
-    )
+pub fn build_image(config: &ImageBuildConfig) -> ImageBuilderResult<PathBuf> {
+    match config.image_type {
+        ImageType::Dev => build_dev_container(&config.source_path),
+        _ => Err(ImageBuilderError::InvalidConfig(
+            "only Dev image type is currently supported".to_string(),
+        )),
+    }
 }
 
-/// Build the dev container from harness modifications
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
-pub fn build_dev_container(_source: &Path) -> ImageBuilderResult<PathBuf> {
-    unimplemented!(
-        "Dev container building requires further problem definition. \
-         This should compile the modified harness code into a dev container image."
-    )
+pub fn build_dev_container(source: &Path) -> ImageBuilderResult<PathBuf> {
+    if !source.join("flake.nix").exists() {
+        return Err(ImageBuilderError::InvalidConfig(
+            "source directory has no flake.nix; automatic flake generation is not yet supported (see issue #72)".to_string(),
+        ));
+    }
+
+    let source_str = source
+        .canonicalize()
+        .map_err(ImageBuilderError::Io)?
+        .to_string_lossy()
+        .into_owned();
+
+    let output = Command::new("nix")
+        .args([
+            "build",
+            &format!("path:{}#devContainerImage", source_str),
+            "--print-out-paths",
+            "--no-link",
+        ])
+        .output()
+        .map_err(ImageBuilderError::Io)?;
+
+    if !output.status.success() {
+        return Err(ImageBuilderError::NixError(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next().unwrap_or("").trim();
+    Ok(PathBuf::from(first_line))
 }
 
-/// Build the sandbox container for isolated execution
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
 pub fn build_sandbox_container(_source: &Path) -> ImageBuilderResult<PathBuf> {
     unimplemented!(
         "Sandbox container building requires further problem definition. \
@@ -95,10 +107,6 @@ pub fn build_sandbox_container(_source: &Path) -> ImageBuilderResult<PathBuf> {
     )
 }
 
-/// Promote a dev container to a release container
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
 pub fn promote_to_release(_dev_image: &Path) -> ImageBuilderResult<PathBuf> {
     unimplemented!(
         "Container promotion requires further problem definition. \
@@ -106,20 +114,31 @@ pub fn promote_to_release(_dev_image: &Path) -> ImageBuilderResult<PathBuf> {
     )
 }
 
-/// Validate a built container image
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
-pub fn validate_image(_image_path: &Path) -> ImageBuilderResult<bool> {
-    unimplemented!(
-        "Image validation requires further problem definition. \
-         This should verify the container image is well-formed and functional."
-    )
+pub fn validate_image(image_path: &Path) -> ImageBuilderResult<bool> {
+    if !image_path.exists() {
+        return Ok(false);
+    }
+
+    if image_path.is_file() {
+        let mut buf = [0u8; 1];
+        use std::io::Read;
+        let mut f = std::fs::File::open(image_path).map_err(ImageBuilderError::Io)?;
+        let n = f.read(&mut buf).map_err(ImageBuilderError::Io)?;
+        return Ok(n > 0 && buf[0] == b'{');
+    }
+
+    if image_path.is_dir() {
+        let mut entries = std::fs::read_dir(image_path).map_err(ImageBuilderError::Io)?;
+        return Ok(entries.next().is_some());
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_image_types() {
@@ -149,17 +168,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Image building with Nix requires further problem definition")]
-    fn test_build_image_unimplemented() {
-        let config = ImageBuildConfig::default();
-        let _ = build_image(&config);
+    fn test_build_image_non_dev_type() {
+        let config = ImageBuildConfig {
+            image_type: ImageType::Sandbox,
+            ..ImageBuildConfig::default()
+        };
+        let result = build_image(&config);
+        assert!(matches!(result, Err(ImageBuilderError::InvalidConfig(_))));
     }
 
     #[test]
-    #[should_panic(expected = "Dev container building requires further problem definition")]
-    fn test_build_dev_container_unimplemented() {
-        let source = PathBuf::from(".");
-        let _ = build_dev_container(&source);
+    fn test_build_dev_container_missing_flake() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = build_dev_container(dir.path());
+        assert!(matches!(result, Err(ImageBuilderError::InvalidConfig(_))));
     }
 
     #[test]
@@ -177,9 +199,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Image validation requires further problem definition")]
-    fn test_validate_image_unimplemented() {
-        let image_path = PathBuf::from("./image");
-        let _ = validate_image(&image_path);
+    fn test_validate_image_nonexistent() {
+        let result = validate_image(Path::new("/nonexistent/path"));
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_validate_image_json() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"{}").unwrap();
+        let result = validate_image(f.path());
+        assert!(result.unwrap());
     }
 }
