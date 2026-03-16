@@ -1,5 +1,10 @@
+use model::provider::ModelProvider;
+use model::OllamaConfig;
+use model::OllamaProvider;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{sleep, timeout};
@@ -574,6 +579,77 @@ pub fn exec_in_container(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         success: output.status.success(),
     })
+}
+
+/// Shared pool that manages a single model container instance.
+///
+/// Tracks active users with a reference count; starts the container on first
+/// `get_or_start` and stops it when the last user drops their handle.
+pub struct SharedModelPool {
+    container: Mutex<Option<ContainerHandle>>,
+    ref_count: AtomicUsize,
+    config: ContainerConfig,
+}
+
+impl SharedModelPool {
+    pub fn new(config: ContainerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            container: Mutex::new(None),
+            ref_count: AtomicUsize::new(0),
+            config,
+        })
+    }
+
+    /// Return a shared `OllamaProvider`, starting the container if necessary.
+    pub async fn get_or_start(
+        self: &Arc<Self>,
+        ollama_config: OllamaConfig,
+    ) -> Result<Arc<dyn ModelProvider>, ContainerError> {
+        {
+            let guard = self.container.lock().unwrap();
+            if guard.is_some() {
+                self.ref_count.fetch_add(1, Ordering::SeqCst);
+                let provider = OllamaProvider::new(ollama_config).map_err(|e| {
+                    ContainerError::CommandFailed {
+                        command: format!("OllamaProvider::new: {}", e),
+                    }
+                })?;
+                return Ok(Arc::new(provider));
+            }
+        }
+
+        let handle = start_container_with_fallback(&self.config).await?;
+        {
+            let mut guard = self.container.lock().unwrap();
+            *guard = Some(handle);
+        }
+        self.ref_count.fetch_add(1, Ordering::SeqCst);
+
+        let provider =
+            OllamaProvider::new(ollama_config).map_err(|e| ContainerError::CommandFailed {
+                command: format!("OllamaProvider::new: {}", e),
+            })?;
+        Ok(Arc::new(provider))
+    }
+
+    /// Release a reference. When the count reaches zero, the container is stopped.
+    pub fn release(self: &Arc<Self>) -> Result<(), ContainerError> {
+        let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            let handle = {
+                let mut guard = self.container.lock().unwrap();
+                guard.take()
+            };
+            if let Some(h) = handle {
+                cleanup_container(&h)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ref_count(&self) -> usize {
+        self.ref_count.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]

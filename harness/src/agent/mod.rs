@@ -39,8 +39,8 @@ pub enum AgentError {
     StateError(String),
     #[error("Task completion check failed: {0}")]
     TaskCheckFailed(String),
-    #[error("Maximum iterations exceeded")]
-    MaxIterationsExceeded,
+    #[error("Maximum iterations exceeded after {iterations} iterations")]
+    MaxIterationsExceeded { iterations: usize },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -101,6 +101,12 @@ pub struct AgentRunResult {
     pub iterations: usize,
     /// Whether the task was completed successfully
     pub task_completed: bool,
+    /// Summary of the result from the last assistant message
+    pub result_summary: String,
+    /// All tool calls made during this run
+    pub tool_calls_made: Vec<ToolCallRecord>,
+    /// Snapshot of the full conversation
+    pub conversation_snapshot: Vec<ChatMessage>,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -275,7 +281,9 @@ impl AgentLoop {
 
         loop {
             if self.iterations >= self.config.max_iterations {
-                return Err(AgentError::MaxIterationsExceeded);
+                return Err(AgentError::MaxIterationsExceeded {
+                    iterations: self.iterations,
+                });
             }
 
             if self.config.verbose {
@@ -290,9 +298,9 @@ impl AgentLoop {
                 let model_used = self.config.model_name.clone();
                 let entity = ContextEntity::new(
                     task_description,
-                    conversation,
-                    tool_calls_made,
-                    result_summary,
+                    conversation.clone(),
+                    tool_calls_made.clone(),
+                    result_summary.clone(),
                     model_used,
                 );
                 if let Err(e) = self.entity_store.store(Box::new(entity)).await {
@@ -302,6 +310,9 @@ impl AgentLoop {
                     final_state: self.state.clone(),
                     iterations: self.iterations,
                     task_completed: true,
+                    result_summary,
+                    tool_calls_made,
+                    conversation_snapshot: conversation,
                 });
             }
 
@@ -679,7 +690,9 @@ impl AgentLoop {
 
         loop {
             if self.iterations >= self.config.max_iterations {
-                return Err(AgentError::MaxIterationsExceeded);
+                return Err(AgentError::MaxIterationsExceeded {
+                    iterations: self.iterations,
+                });
             }
 
             let model_name = self.config.model_name.clone();
@@ -718,9 +731,9 @@ impl AgentLoop {
                     let model_used = self.config.model_name.clone();
                     let entity = ContextEntity::new(
                         task_description,
-                        conversation,
-                        tool_calls_made,
-                        result_summary,
+                        conversation.clone(),
+                        tool_calls_made.clone(),
+                        result_summary.clone(),
                         model_used,
                     );
                     if let Err(e) = self.entity_store.store(Box::new(entity)).await {
@@ -730,6 +743,9 @@ impl AgentLoop {
                         final_state: AgentState::Completed,
                         iterations: self.iterations,
                         task_completed: true,
+                        result_summary,
+                        tool_calls_made,
+                        conversation_snapshot: conversation,
                     });
                 }
                 Some(FinishReason::ToolCalls) => {
@@ -1171,7 +1187,7 @@ mod tests {
         };
 
         let result = agent.run(context).await;
-        assert!(result.is_ok() || matches!(result, Err(AgentError::MaxIterationsExceeded)));
+        assert!(result.is_ok() || matches!(result, Err(AgentError::MaxIterationsExceeded { .. })));
     }
 
     /// MVP Test: Agent completes one full control loop modifying entities

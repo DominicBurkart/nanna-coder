@@ -2,10 +2,7 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
-use harness::tools::{
-    CalculatorTool, EchoTool, GitDiffTool, GitStatusTool, ListDirTool, ReadFileTool, SearchTool,
-    ToolRegistry, WriteFileTool,
-};
+use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
 use tracing::{error, info};
@@ -58,6 +55,15 @@ enum Commands {
         /// Enable tool calling
         #[arg(short, long)]
         tools: bool,
+    },
+    /// Run as an MCP server over stdio
+    McpServe {
+        /// The model to use for agent tasks
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations per task
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
     },
 }
 
@@ -132,22 +138,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::McpServe {
+            model,
+            max_iterations,
+        } => {
+            run_mcp_server(&model, max_iterations).await?;
+        }
     }
 
     Ok(())
 }
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(EchoTool::new()));
-    registry.register(Box::new(CalculatorTool::new()));
-    registry.register(Box::new(ReadFileTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(WriteFileTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(ListDirTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(SearchTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(GitDiffTool::new(workspace_root.to_path_buf())));
-    registry
+    harness::tools::create_tool_registry(workspace_root)
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
@@ -469,5 +472,28 @@ async fn run_agent(
         }
     }
 
+    Ok(())
+}
+
+async fn run_mcp_server(
+    model: &str,
+    max_iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::mcp::NannaMcpServer;
+    use harness::task::TaskManager;
+    use std::sync::Arc;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let task_manager = Arc::new(TaskManager::new());
+
+    info!(
+        "Starting Nanna MCP server (model: {}, max_iterations: {})",
+        model, max_iterations
+    );
+
+    let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
+
+    server.run_stdio().await?;
     Ok(())
 }
