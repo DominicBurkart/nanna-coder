@@ -28,9 +28,9 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_tool_registry, CalculatorTool, EchoTool, GitDiffTool, GitStatusTool, ListDirTool,
-    ReadFileTool, RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult,
-    WriteFileTool,
+    create_container_tool_registry, create_tool_registry, CalculatorTool, EchoTool, GitDiffTool,
+    GitStatusTool, ListDirTool, ReadFileTool, RunCommandTool, SearchTool, Tool, ToolError,
+    ToolRegistry, ToolResult, WriteFileTool,
 };
 
 // Export agent types

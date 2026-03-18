@@ -1076,6 +1076,19 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
+pub fn create_container_tool_registry(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+) -> ToolRegistry {
+    let mut registry = create_tool_registry(workspace_root);
+    registry.register(Box::new(RunCommandTool::new(
+        container_handle,
+        Some(container_working_dir.to_string()),
+    )));
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,5 +1288,30 @@ mod tests {
             assert!(diff.get("diff").is_some());
             assert!(diff.get("has_changes").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_container_tool_registry_includes_run_command() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join("nanna_test_container_registry");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+
+        let registry = create_container_tool_registry(&temp_dir, handle, "/workspace");
+        assert!(registry.get_tool("run_command").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("list_directory").is_some());
+        assert!(registry.get_tool("search").is_some());
+        assert!(registry.get_tool("git_status").is_some());
+        assert!(registry.get_tool("git_diff").is_some());
+
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 }
