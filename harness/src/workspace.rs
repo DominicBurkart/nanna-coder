@@ -11,6 +11,8 @@ pub enum WorkspaceError {
     GitWorktreeRemoveFailed(String),
     #[error("Failed to extract changes: {0}")]
     ExtractChangesFailed(String),
+    #[error("Failed to produce format-patch: {0}")]
+    FormatPatchFailed(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -88,14 +90,69 @@ impl TaskWorkspace {
     }
 
     pub fn extract_changes(&self) -> Result<String, WorkspaceError> {
+        let add_output = git_cmd(&self.workspace_path)
+            .args(["add", "--all"])
+            .output()?;
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+            return Err(WorkspaceError::ExtractChangesFailed(stderr));
+        }
         let output = git_cmd(&self.workspace_path)
-            .args(["diff", "HEAD"])
+            .args(["diff", "--cached", "HEAD"])
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::ExtractChangesFailed(stderr));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    pub fn format_patch(&self) -> Result<Option<String>, WorkspaceError> {
+        let add_output = git_cmd(&self.workspace_path)
+            .args(["add", "--all"])
+            .output()?;
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+            return Err(WorkspaceError::FormatPatchFailed(stderr));
+        }
+
+        let check_output = git_cmd(&self.workspace_path)
+            .args(["diff", "--cached", "--quiet"])
+            .output()?;
+        if check_output.status.success() {
+            return Ok(None);
+        }
+
+        let commit_output = git_cmd(&self.workspace_path)
+            .args([
+                "-c",
+                "user.email=nanna@local",
+                "-c",
+                "user.name=nanna",
+                "commit",
+                "-m",
+                "agent changes",
+            ])
+            .output()?;
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr).to_string();
+            return Err(WorkspaceError::FormatPatchFailed(stderr));
+        }
+
+        let patch_output = git_cmd(&self.workspace_path)
+            .args(["format-patch", "-1", "--stdout"])
+            .output()?;
+        if !patch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&patch_output.stderr).to_string();
+            return Err(WorkspaceError::FormatPatchFailed(stderr));
+        }
+
+        let patch = String::from_utf8_lossy(&patch_output.stdout).to_string();
+        if patch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(patch))
+        }
     }
 }
 
@@ -170,6 +227,60 @@ mod tests {
 
         let diff = ws.extract_changes().unwrap();
         assert!(diff.contains("new_file.txt") || diff.is_empty());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_captures_untracked_files() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-untracked"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join("untracked.txt"), "untracked content").unwrap();
+
+        let diff = ws.extract_changes().unwrap();
+        assert!(
+            diff.contains("untracked.txt"),
+            "Diff should include untracked file, got: {}",
+            diff
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_format_patch_produces_apply_ready_output() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-patch"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join("new_file.txt"), "new content").unwrap();
+
+        let patch = ws.format_patch().unwrap();
+        assert!(patch.is_some(), "Should produce a patch for new file");
+        let patch = patch.unwrap();
+        assert!(
+            patch.contains("diff --git"),
+            "Patch should be in git format, got: {}",
+            patch
+        );
+        assert!(
+            patch.contains("new_file.txt"),
+            "Patch should reference the new file"
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_format_patch_returns_none_when_no_changes() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-no-changes"), "HEAD").unwrap();
+
+        let patch = ws.format_patch().unwrap();
+        assert!(patch.is_none(), "Should return None when no changes");
         ws.cleanup().unwrap();
     }
 
