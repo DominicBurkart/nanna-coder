@@ -4,6 +4,47 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub async fn handle_list_tasks(task_manager: &Arc<TaskManager>) -> Result<Value, String> {
+    let tasks = task_manager.list().await;
+    let summaries: Vec<Value> = tasks
+        .into_iter()
+        .map(|t| {
+            let status_str = match &t.status {
+                TaskStatus::Pending => "Pending",
+                TaskStatus::Running { .. } => "Running",
+                TaskStatus::Completed { .. } => "Completed",
+                TaskStatus::Failed { .. } => "Failed",
+            };
+            serde_json::json!({
+                "id": t.id.0,
+                "status": status_str,
+                "description": t.description,
+                "created_at": t.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!(summaries))
+}
+
+pub async fn handle_cancel_task(
+    params: &Value,
+    task_manager: &Arc<TaskManager>,
+) -> Result<Value, String> {
+    let task_id_str = params
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing required field: task_id".to_string())?;
+
+    let task_id = TaskId(task_id_str.to_string());
+    task_manager.cancel(&task_id).await?;
+
+    Ok(serde_json::json!({
+        "task_id": task_id_str,
+        "status": "Cancelled",
+        "message": "Task has been cancelled"
+    }))
+}
+
 pub async fn handle_assign_task(
     params: &Value,
     task_manager: &Arc<TaskManager>,
@@ -209,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_assign_task_missing_description() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let params = serde_json::json!({"repo_path": "/tmp"});
         let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
@@ -219,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_assign_task_missing_repo_path() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let params = serde_json::json!({"description": "Do something"});
         let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
@@ -229,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_assign_task_returns_task_id() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
         let params = serde_json::json!({
             "description": "Test task",
@@ -244,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_poll_task_invalid_id() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let params = serde_json::json!({"task_id": "nonexistent-id"});
         let result = handle_poll_task(&params, &manager).await;
         assert!(result.is_err());
@@ -252,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_get_result_invalid_id() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let params = serde_json::json!({"task_id": "nonexistent-id"});
         let result = handle_get_result(&params, &manager).await;
         assert!(result.is_err());
@@ -260,10 +301,53 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_poll_task_missing_task_id() {
-        let manager = Arc::new(TaskManager::new());
+        let manager = Arc::new(TaskManager::new(8));
         let params = serde_json::json!({});
         let result = handle_poll_task(&params, &manager).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("task_id"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_tasks_empty() {
+        let manager = Arc::new(TaskManager::new(8));
+        let result = handle_list_tasks(&manager).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_tasks_after_submit() {
+        let manager = Arc::new(TaskManager::new(8));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "Test task",
+            "repo_path": "/tmp"
+        });
+        handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100)
+            .await
+            .unwrap();
+
+        let result = handle_list_tasks(&manager).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["description"], "Test task");
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_task_missing_task_id() {
+        let manager = Arc::new(TaskManager::new(8));
+        let params = serde_json::json!({});
+        let result = handle_cancel_task(&params, &manager).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("task_id"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_task_nonexistent() {
+        let manager = Arc::new(TaskManager::new(8));
+        let params = serde_json::json!({"task_id": "nonexistent"});
+        let result = handle_cancel_task(&params, &manager).await;
+        assert!(result.is_err());
     }
 }

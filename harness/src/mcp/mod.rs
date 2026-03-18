@@ -220,6 +220,28 @@ impl NannaMcpServer {
                     },
                     "required": ["task_id"]
                 }
+            },
+            {
+                "name": "list_tasks",
+                "description": "List all submitted tasks with their current status",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "cancel_task",
+                "description": "Cancel a pending or running task",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID returned by assign_task"
+                        }
+                    },
+                    "required": ["task_id"]
+                }
             }
         ])
     }
@@ -250,6 +272,8 @@ impl NannaMcpServer {
             }
             "poll_task" => handlers::handle_poll_task(&tool_params, &self.task_manager).await,
             "get_result" => handlers::handle_get_result(&tool_params, &self.task_manager).await,
+            "list_tasks" => handlers::handle_list_tasks(&self.task_manager).await,
+            "cancel_task" => handlers::handle_cancel_task(&tool_params, &self.task_manager).await,
             other => Err(format!("Unknown tool: {}", other)),
         };
 
@@ -296,7 +320,7 @@ mod tests {
 
     fn make_server() -> NannaMcpServer {
         NannaMcpServer::new(
-            Arc::new(TaskManager::new()),
+            Arc::new(TaskManager::new(8)),
             Arc::new(NoopProvider),
             "qwen3:0.6b".to_string(),
             100,
@@ -320,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_returns_three_tools() {
+    async fn test_tools_list_returns_five_tools() {
         let server = make_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -331,7 +355,7 @@ mod tests {
         let resp = server.handle_request(req).await;
         assert!(resp.error.is_none());
         let tools = &resp.result.unwrap()["tools"];
-        assert_eq!(tools.as_array().unwrap().len(), 3);
+        assert_eq!(tools.as_array().unwrap().len(), 5);
         let names: Vec<&str> = tools
             .as_array()
             .unwrap()
@@ -341,6 +365,8 @@ mod tests {
         assert!(names.contains(&"assign_task"));
         assert!(names.contains(&"poll_task"));
         assert!(names.contains(&"get_result"));
+        assert!(names.contains(&"list_tasks"));
+        assert!(names.contains(&"cancel_task"));
     }
 
     #[tokio::test]
