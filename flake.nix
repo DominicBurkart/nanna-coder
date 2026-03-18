@@ -119,7 +119,7 @@
         };
 
         containers = import ./nix/containers.nix {
-          inherit pkgs nix2containerPkgs;
+          inherit pkgs nix2containerPkgs rustToolchain;
           lib = pkgs.lib;
           harness = packages.harness;
         };
@@ -161,7 +161,7 @@
           inherit (packages) nanna-coder harness;
 
           # Container images (production)
-          inherit (containers) harnessImage ollamaImage;
+          inherit (containers) harnessImage ollamaImage devContainerImage;
           
           # vLLM containers with different models
           vllmImage = containers.vllmImage { };  # Default: MiMo-V2-Flash
