@@ -8,8 +8,9 @@ use model::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
@@ -109,12 +110,18 @@ pub struct Task {
 
 pub struct TaskManager {
     tasks: Arc<RwLock<HashMap<TaskId, Task>>>,
+    handles: Arc<RwLock<HashMap<TaskId, tokio::task::AbortHandle>>>,
+    max_concurrent: Arc<Semaphore>,
+    progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
 }
 
 impl TaskManager {
-    pub fn new() -> Self {
+    pub fn new(max_concurrent_tasks: usize) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            max_concurrent: Arc::new(Semaphore::new(max_concurrent_tasks)),
+            progress: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -142,9 +149,21 @@ impl TaskManager {
             tasks.insert(task_id.clone(), task);
         }
 
+        let progress_counter = Arc::new(AtomicUsize::new(0));
+        {
+            let mut progress = self.progress.write().await;
+            progress.insert(task_id.clone(), Arc::clone(&progress_counter));
+        }
+
         let tasks_ref = Arc::clone(&self.tasks);
+        let handles_ref = Arc::clone(&self.handles);
+        let progress_ref = Arc::clone(&self.progress);
+        let semaphore = Arc::clone(&self.max_concurrent);
         let task_id_clone = task_id.clone();
-        tokio::spawn(async move {
+
+        let join_handle = tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("Semaphore closed");
+
             {
                 let mut tasks = tasks_ref.write().await;
                 if let Some(task) = tasks.get_mut(&task_id_clone) {
@@ -158,6 +177,14 @@ impl TaskManager {
             let workspace_result = TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch);
             match workspace_result {
                 Err(e) => {
+                    {
+                        let mut handles = handles_ref.write().await;
+                        handles.remove(&task_id_clone);
+                    }
+                    {
+                        let mut progress = progress_ref.write().await;
+                        progress.remove(&task_id_clone);
+                    }
                     let mut tasks = tasks_ref.write().await;
                     if let Some(task) = tasks.get_mut(&task_id_clone) {
                         task.status = TaskStatus::Failed {
@@ -189,6 +216,7 @@ impl TaskManager {
 
                     let mut agent =
                         AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
+                    agent.set_progress_counter(Arc::clone(&progress_counter));
                     let run_result = agent.run(context).await;
 
                     let changes_patch = workspace.extract_changes().ok().and_then(|patch| {
@@ -202,6 +230,15 @@ impl TaskManager {
                     });
 
                     let _ = workspace.cleanup();
+
+                    {
+                        let mut handles = handles_ref.write().await;
+                        handles.remove(&task_id_clone);
+                    }
+                    {
+                        let mut progress = progress_ref.write().await;
+                        progress.remove(&task_id_clone);
+                    }
 
                     match run_result {
                         Ok(result) => {
@@ -253,12 +290,31 @@ impl TaskManager {
             }
         });
 
+        {
+            let mut handles = self.handles.write().await;
+            handles.insert(task_id.clone(), join_handle.abort_handle());
+        }
+
         task_id
     }
 
     pub async fn poll(&self, task_id: &TaskId) -> Option<Task> {
         let tasks = self.tasks.read().await;
-        tasks.get(task_id).cloned()
+        let mut task = tasks.get(task_id)?.clone();
+        drop(tasks);
+
+        if let TaskStatus::Running { started_at, .. } = task.status {
+            let progress = self.progress.read().await;
+            if let Some(counter) = progress.get(task_id) {
+                let current_iterations = counter.load(Ordering::Relaxed);
+                task.status = TaskStatus::Running {
+                    started_at,
+                    iterations: current_iterations,
+                };
+            }
+        }
+
+        Some(task)
     }
 
     pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
@@ -276,11 +332,62 @@ impl TaskManager {
         let tasks = self.tasks.read().await;
         tasks.values().cloned().collect()
     }
+
+    pub async fn cancel(&self, task_id: &TaskId) -> Result<Task, String> {
+        let had_handle = {
+            let mut handles = self.handles.write().await;
+            if let Some(handle) = handles.remove(task_id) {
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+
+        let iterations_completed = {
+            let mut progress = self.progress.write().await;
+            let count = progress
+                .get(task_id)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            progress.remove(task_id);
+            count
+        };
+
+        let mut tasks = self.tasks.write().await;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("Task not found: {}", task_id))?;
+
+        match &task.status {
+            TaskStatus::Completed { .. } | TaskStatus::Failed { .. } => {
+                let _ = had_handle;
+                return Err(format!(
+                    "Task {} cannot be cancelled: already finished",
+                    task_id
+                ));
+            }
+            _ => {}
+        }
+
+        task.status = TaskStatus::Failed {
+            finished_at: Utc::now(),
+            error: "Task cancelled".to_string(),
+            diagnostics: FailureDiagnostics {
+                error_type: "Cancelled".to_string(),
+                iterations_completed,
+                last_tool_call: None,
+                partial_changes: None,
+            },
+        };
+
+        Ok(task.clone())
+    }
 }
 
 impl Default for TaskManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(8)
     }
 }
 
@@ -412,16 +519,70 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_manager_poll_returns_none_for_invalid_id() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new(8);
         let result = manager.poll(&TaskId("nonexistent".to_string())).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_task_manager_list_empty() {
-        let manager = TaskManager::new();
+        let manager = TaskManager::new(8);
         let tasks = manager.list().await;
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_nonexistent_task() {
+        let manager = TaskManager::new(8);
+        let result = manager.cancel(&TaskId("nonexistent".to_string())).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pending_task() {
+        let manager = TaskManager::new(0);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "test".to_string(),
+                PathBuf::from("/tmp"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                provider,
+            )
+            .await;
+
+        tokio::task::yield_now().await;
+
+        let result = manager.cancel(&id).await;
+        assert!(result.is_ok());
+        let task = result.unwrap();
+        assert!(
+            matches!(&task.status, TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limit_keeps_tasks_pending() {
+        let manager = TaskManager::new(0);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "test".to_string(),
+                PathBuf::from("/tmp"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                provider,
+            )
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let task = manager.poll(&id).await.unwrap();
+        assert!(matches!(task.status, TaskStatus::Pending));
     }
 
     #[tokio::test]
@@ -468,5 +629,28 @@ mod tests {
             result,
             Err(AgentError::MaxIterationsExceeded { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_progress_counter_accessible_after_run() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+        let config = AgentConfig {
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        agent.set_progress_counter(Arc::clone(&counter));
+        let context = AgentContext {
+            user_prompt: "Test task".to_string(),
+            conversation_history: vec![ChatMessage::user("Test task")],
+            app_state_id: "test".to_string(),
+        };
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), result.iterations);
     }
 }
