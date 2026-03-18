@@ -56,6 +56,7 @@ pub struct NannaMcpServer {
     provider: Arc<dyn ModelProvider>,
     default_model: String,
     default_max_iterations: usize,
+    _model_guard: Option<crate::container::ModelGuard>,
 }
 
 impl NannaMcpServer {
@@ -64,12 +65,14 @@ impl NannaMcpServer {
         provider: Arc<dyn ModelProvider>,
         default_model: String,
         default_max_iterations: usize,
+        model_guard: Option<crate::container::ModelGuard>,
     ) -> Self {
         Self {
             task_manager,
             provider,
             default_model,
             default_max_iterations,
+            _model_guard: model_guard,
         }
     }
 
@@ -300,6 +303,7 @@ mod tests {
             Arc::new(NoopProvider),
             "qwen3:0.6b".to_string(),
             100,
+            None,
         )
     }
 
