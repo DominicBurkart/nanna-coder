@@ -36,15 +36,103 @@ const MAX_TOOL_ITERATIONS: usize = 10;
 /// Errors that can occur in the agent
 #[derive(Error, Debug)]
 pub enum AgentError {
-    #[error("Agent state error: {0}")]
-    StateError(String),
-    #[error("Task completion check failed: {0}")]
-    TaskCheckFailed(String),
-    #[error("Maximum iterations exceeded after {iterations} iterations")]
-    MaxIterationsExceeded { iterations: usize },
+    #[error("Agent state error: {message}")]
+    StateError {
+        message: String,
+        iterations_completed: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+        conversation_snapshot: Vec<ChatMessage>,
+        last_agent_state: AgentState,
+    },
+    #[error("Task completion check failed: {message}")]
+    TaskCheckFailed {
+        message: String,
+        iterations_completed: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+        conversation_snapshot: Vec<ChatMessage>,
+        last_agent_state: AgentState,
+    },
+    #[error("Maximum iterations exceeded after {iterations_completed} iterations")]
+    MaxIterationsExceeded {
+        iterations_completed: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+        conversation_snapshot: Vec<ChatMessage>,
+        last_agent_state: AgentState,
+    },
+}
+
+impl AgentError {
+    pub fn diagnostics(&self) -> (&[ToolCallRecord], &[ChatMessage], usize, &AgentState) {
+        match self {
+            AgentError::StateError {
+                tool_calls_made,
+                conversation_snapshot,
+                iterations_completed,
+                last_agent_state,
+                ..
+            } => (
+                tool_calls_made,
+                conversation_snapshot,
+                *iterations_completed,
+                last_agent_state,
+            ),
+            AgentError::TaskCheckFailed {
+                tool_calls_made,
+                conversation_snapshot,
+                iterations_completed,
+                last_agent_state,
+                ..
+            } => (
+                tool_calls_made,
+                conversation_snapshot,
+                *iterations_completed,
+                last_agent_state,
+            ),
+            AgentError::MaxIterationsExceeded {
+                tool_calls_made,
+                conversation_snapshot,
+                iterations_completed,
+                last_agent_state,
+            } => (
+                tool_calls_made,
+                conversation_snapshot,
+                *iterations_completed,
+                last_agent_state,
+            ),
+        }
+    }
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
+
+fn bare_state_error(message: impl Into<String>) -> AgentError {
+    AgentError::StateError {
+        message: message.into(),
+        iterations_completed: 0,
+        tool_calls_made: vec![],
+        conversation_snapshot: vec![],
+        last_agent_state: AgentState::Planning,
+    }
+}
+
+fn bare_task_check_failed(message: impl Into<String>) -> AgentError {
+    AgentError::TaskCheckFailed {
+        message: message.into(),
+        iterations_completed: 0,
+        tool_calls_made: vec![],
+        conversation_snapshot: vec![],
+        last_agent_state: AgentState::Planning,
+    }
+}
+
+fn bare_max_iterations(iterations_completed: usize) -> AgentError {
+    AgentError::MaxIterationsExceeded {
+        iterations_completed,
+        tool_calls_made: vec![],
+        conversation_snapshot: vec![],
+        last_agent_state: AgentState::Planning,
+    }
+}
 
 /// State of the agent in the control loop
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +361,38 @@ impl AgentLoop {
         self.tool_registry.as_ref()
     }
 
+    fn enrich_error(&self, error: AgentError) -> AgentError {
+        let tool_calls = extract_tool_calls_from_history(&self.conversation_history);
+        let conversation = self.conversation_history.clone();
+        let state = self.state.clone();
+        let iterations = self.iterations;
+        match error {
+            AgentError::StateError { message, .. } => AgentError::StateError {
+                message,
+                iterations_completed: iterations,
+                tool_calls_made: tool_calls,
+                conversation_snapshot: conversation,
+                last_agent_state: state,
+            },
+            AgentError::TaskCheckFailed { message, .. } => AgentError::TaskCheckFailed {
+                message,
+                iterations_completed: iterations,
+                tool_calls_made: tool_calls,
+                conversation_snapshot: conversation,
+                last_agent_state: state,
+            },
+            AgentError::MaxIterationsExceeded {
+                iterations_completed,
+                ..
+            } => AgentError::MaxIterationsExceeded {
+                iterations_completed,
+                tool_calls_made: tool_calls,
+                conversation_snapshot: conversation,
+                last_agent_state: state,
+            },
+        }
+    }
+
     fn extract_response_content(response: &ChatResponse) -> &str {
         response
             .choices
@@ -291,9 +411,7 @@ impl AgentLoop {
 
         loop {
             if self.iterations >= self.config.max_iterations {
-                return Err(AgentError::MaxIterationsExceeded {
-                    iterations: self.iterations,
-                });
+                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
             }
 
             if self.config.verbose {
@@ -326,36 +444,39 @@ impl AgentLoop {
                 });
             }
 
-            if let AgentState::Error(msg) = &self.state {
-                return Err(AgentError::StateError(msg.clone()));
+            if let AgentState::Error(_) = &self.state {
+                if let AgentState::Error(msg) = self.state.clone() {
+                    return Err(self.enrich_error(bare_state_error(msg)));
+                }
             }
 
-            match &self.state {
+            match &self.state.clone() {
                 AgentState::Planning => {
-                    self.plan(&context).await?;
+                    if let Err(e) = self.plan(&context).await {
+                        return Err(self.enrich_error(e));
+                    }
                     self.transition_to(AgentState::CheckingCompletion);
                 }
-                AgentState::CheckingCompletion => {
-                    if self.check_task_complete(&context).await? {
-                        self.transition_to(AgentState::Completed);
-                    } else {
-                        self.transition_to(AgentState::Deciding);
-                    }
-                }
-                AgentState::Deciding => {
-                    let needs_query = self.decide(&context).await?;
-                    if needs_query {
-                        self.transition_to(AgentState::Querying);
-                    } else {
-                        self.transition_to(AgentState::Performing);
-                    }
-                }
+                AgentState::CheckingCompletion => match self.check_task_complete(&context).await {
+                    Ok(true) => self.transition_to(AgentState::Completed),
+                    Ok(false) => self.transition_to(AgentState::Deciding),
+                    Err(e) => return Err(self.enrich_error(e)),
+                },
+                AgentState::Deciding => match self.decide(&context).await {
+                    Ok(true) => self.transition_to(AgentState::Querying),
+                    Ok(false) => self.transition_to(AgentState::Performing),
+                    Err(e) => return Err(self.enrich_error(e)),
+                },
                 AgentState::Querying => {
-                    self.query(&context).await?;
+                    if let Err(e) = self.query(&context).await {
+                        return Err(self.enrich_error(e));
+                    }
                     self.transition_to(AgentState::Planning);
                 }
                 AgentState::Performing => {
-                    self.perform(&context).await?;
+                    if let Err(e) = self.perform(&context).await {
+                        return Err(self.enrich_error(e));
+                    }
                     self.transition_to(AgentState::CheckingCompletion);
                 }
                 AgentState::Completed | AgentState::Error(_) => unreachable!(),
@@ -404,7 +525,7 @@ impl AgentLoop {
                         }
                         tokio::time::sleep(delay).await;
                     } else {
-                        return Err(AgentError::StateError(format!(
+                        return Err(bare_state_error(format!(
                             "LLM {} failed after {} attempts: {}",
                             operation, judge_config.max_retries, e
                         )));
@@ -443,7 +564,7 @@ impl AgentLoop {
             Some(DEFAULT_PLANNING_RAG_LIMIT),
         )
         .await
-        .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+        .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Found {} relevant entities", query_results.len());
@@ -464,7 +585,7 @@ impl AgentLoop {
                 .entity_store
                 .query(&EntityQuery::default())
                 .await
-                .map_err(|e| AgentError::StateError(format!("Failed to query entities: {}", e)))?
+                .map_err(|e| bare_state_error(format!("Failed to query entities: {}", e)))?
                 .len();
 
             let prompt_text = prompts::PlanningPrompt::build_from_results(
@@ -484,8 +605,8 @@ impl AgentLoop {
                 .await?;
 
             if response.choices.is_empty() {
-                return Err(AgentError::StateError(
-                    "LLM returned empty choices array for planning".to_string(),
+                return Err(bare_state_error(
+                    "LLM returned empty choices array for planning",
                 ));
             }
 
@@ -508,9 +629,7 @@ impl AgentLoop {
                 .entity_store
                 .query(&EntityQuery::default())
                 .await
-                .map_err(|e| {
-                    AgentError::TaskCheckFailed(format!("Failed to query entities: {}", e))
-                })?;
+                .map_err(|e| bare_task_check_failed(format!("Failed to query entities: {}", e)))?;
 
             let entity_summary: Vec<String> = entities
                 .iter()
@@ -574,7 +693,7 @@ impl AgentLoop {
                 .entity_store
                 .query(&EntityQuery::default())
                 .await
-                .map_err(|e| AgentError::StateError(format!("Failed to query entities: {}", e)))?
+                .map_err(|e| bare_state_error(format!("Failed to query entities: {}", e)))?
                 .len();
 
             let prompt_text = prompts::DecisionPrompt::build(
@@ -633,7 +752,7 @@ impl AgentLoop {
             Some(DEFAULT_QUERY_RAG_LIMIT),
         )
         .await
-        .map_err(|e| AgentError::StateError(format!("RAG query failed: {}", e)))?;
+        .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Additional query found {} entities", results.len());
@@ -668,7 +787,7 @@ impl AgentLoop {
             .entity_store
             .store(new_entity)
             .await
-            .map_err(|e| AgentError::StateError(format!("Failed to store entity: {}", e)))?;
+            .map_err(|e| bare_state_error(format!("Failed to store entity: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Created new entity: {}", entity_id);
@@ -703,30 +822,26 @@ impl AgentLoop {
 
         loop {
             if self.iterations >= self.config.max_iterations {
-                return Err(AgentError::MaxIterationsExceeded {
-                    iterations: self.iterations,
-                });
+                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
             }
 
             let model_name = self.config.model_name.clone();
             let messages = self.conversation_history.clone();
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
-            let provider = self
-                .llm_provider
-                .as_ref()
-                .ok_or_else(|| AgentError::StateError("No provider configured".to_string()))?
-                .clone();
+            let provider = match self.llm_provider.clone() {
+                Some(p) => p,
+                None => {
+                    return Err(self.enrich_error(bare_state_error("No provider configured")));
+                }
+            };
 
-            let response = provider
-                .chat(request)
-                .await
-                .map_err(|e| AgentError::StateError(format!("LLM call failed: {}", e)))?;
+            let response = provider.chat(request).await.map_err(|e| {
+                self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
+            })?;
 
             if response.choices.is_empty() {
-                return Err(AgentError::StateError(
-                    "Empty response from model".to_string(),
-                ));
+                return Err(self.enrich_error(bare_state_error("Empty response from model")));
             }
 
             let choice = response.choices.into_iter().next().unwrap();
@@ -768,18 +883,22 @@ impl AgentLoop {
                             let args = tool_call.function.arguments.clone();
                             let call_id = tool_call.id.clone();
 
-                            let result = self
-                                .tool_registry
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    AgentError::StateError("No tool registry".to_string())
-                                })?
-                                .execute(&name, args)
-                                .await;
-
-                            let response_content = match result {
-                                Ok(v) => v.to_string(),
-                                Err(e) => format!("Error: {}", e),
+                            let response_content = {
+                                let registry = self.tool_registry.as_ref();
+                                match registry {
+                                    None => {
+                                        return Err(
+                                            self.enrich_error(bare_state_error("No tool registry"))
+                                        );
+                                    }
+                                    Some(r) => {
+                                        let result = r.execute(&name, args).await;
+                                        match result {
+                                            Ok(v) => v.to_string(),
+                                            Err(e) => format!("Error: {}", e),
+                                        }
+                                    }
+                                }
                             };
 
                             self.conversation_history
@@ -788,9 +907,7 @@ impl AgentLoop {
                     }
                 }
                 Some(_) => {
-                    return Err(AgentError::StateError(
-                        "Unexpected finish reason".to_string(),
-                    ));
+                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
                 }
             }
 
@@ -1204,6 +1321,40 @@ mod tests {
 
         let result = agent.run(context).await;
         assert!(result.is_ok() || matches!(result, Err(AgentError::MaxIterationsExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_enriched_error_carries_diagnostics() {
+        let responses: Vec<ChatResponse> = (0..5).map(|_| plain_response("not done yet")).collect();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(responses);
+        let config = AgentConfig {
+            max_iterations: 0,
+            ..Default::default()
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "Test task".to_string(),
+            conversation_history: vec![ChatMessage::user("Test task")],
+            app_state_id: "test".to_string(),
+        };
+        let result = agent.run(context).await;
+        assert!(matches!(
+            result,
+            Err(AgentError::MaxIterationsExceeded { .. })
+        ));
+        if let Err(e) = result {
+            let (tool_calls, conversation, iters, state) = e.diagnostics();
+            assert_eq!(iters, 0);
+            assert!(matches!(
+                state,
+                AgentState::Planning | AgentState::Completed
+            ));
+            let _ = tool_calls;
+            let _ = conversation;
+        }
     }
 
     /// MVP Test: Agent completes one full control loop modifying entities
