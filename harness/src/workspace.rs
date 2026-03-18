@@ -1,6 +1,11 @@
-use crate::tools::{create_tool_registry, ToolRegistry};
+use crate::container::{
+    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerRuntime,
+};
+use crate::tools::{create_container_tool_registry, create_tool_registry, ToolRegistry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -11,6 +16,10 @@ pub enum WorkspaceError {
     GitWorktreeRemoveFailed(String),
     #[error("Failed to extract changes: {0}")]
     ExtractChangesFailed(String),
+    #[error("Container setup failed: {0}")]
+    ContainerSetupFailed(String),
+    #[error("No container runtime available")]
+    NoContainerRuntime,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -35,6 +44,7 @@ pub struct TaskWorkspace {
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
     pub task_id: String,
+    container_handle: Option<Arc<crate::container::ContainerHandle>>,
     cleaned_up: bool,
 }
 
@@ -57,6 +67,63 @@ impl TaskWorkspace {
             workspace_path,
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
+            container_handle: None,
+            cleaned_up: false,
+        })
+    }
+
+    pub async fn create_with_container(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+    ) -> Result<Self, WorkspaceError> {
+        let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
+        let output = git_cmd(source_repo)
+            .args([
+                "worktree",
+                "add",
+                workspace_path.to_str().expect("non-UTF8 path"),
+                branch,
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
+        }
+
+        let runtime = detect_runtime();
+        if !runtime.is_available() {
+            return Err(WorkspaceError::NoContainerRuntime);
+        }
+
+        let container_name = format!("nanna-task-{}", task_id);
+        let mut additional_args = vec![format!("-v={}:/workspace", workspace_path.display())];
+        if runtime == ContainerRuntime::Podman {
+            additional_args.push("--userns=keep-id".to_string());
+        }
+
+        let config = ContainerConfig {
+            base_image: image_ref.to_string(),
+            test_image: None,
+            container_name,
+            port_mapping: None,
+            model_to_pull: None,
+            startup_timeout: Duration::from_secs(30),
+            health_check_timeout: Duration::from_secs(10),
+            env_vars: vec![],
+            additional_args,
+        };
+
+        let handle = start_container_with_fallback(&config)
+            .await
+            .map_err(|e| WorkspaceError::ContainerSetupFailed(e.to_string()))?;
+
+        Ok(Self {
+            workspace_path,
+            source_repo: source_repo.to_path_buf(),
+            task_id: task_id.to_string(),
+            container_handle: Some(Arc::new(handle)),
             cleaned_up: false,
         })
     }
@@ -65,6 +132,7 @@ impl TaskWorkspace {
         if self.cleaned_up {
             return Ok(());
         }
+        drop(self.container_handle.take());
         let output = git_cmd(&self.source_repo)
             .args([
                 "worktree",
@@ -83,6 +151,14 @@ impl TaskWorkspace {
 
     pub fn create_tool_registry(&self) -> ToolRegistry {
         create_tool_registry(&self.workspace_path)
+    }
+
+    pub fn create_container_tool_registry(&self) -> ToolRegistry {
+        if let Some(handle) = &self.container_handle {
+            create_container_tool_registry(&self.workspace_path, Arc::clone(handle), "/workspace")
+        } else {
+            create_tool_registry(&self.workspace_path)
+        }
     }
 
     pub fn extract_changes(&self) -> Result<String, WorkspaceError> {
@@ -186,5 +262,26 @@ mod tests {
 
         ws1.cleanup().unwrap();
         ws2.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_no_runtime() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let runtime = detect_runtime();
+        if runtime.is_available() {
+            return;
+        }
+
+        let result = TaskWorkspace::create_with_container(
+            source.path(),
+            &unique_id("ws-no-runtime"),
+            "HEAD",
+            "nonexistent:image",
+        )
+        .await;
+
+        assert!(matches!(result, Err(WorkspaceError::NoContainerRuntime)));
     }
 }
