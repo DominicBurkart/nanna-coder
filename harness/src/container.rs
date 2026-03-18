@@ -3,8 +3,7 @@ use model::OllamaConfig;
 use model::OllamaProvider;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{sleep, timeout};
@@ -123,6 +122,15 @@ impl Default for ContainerConfig {
             health_check_timeout: Duration::from_secs(10),
             env_vars: Vec::new(),
             additional_args: Vec::new(),
+        }
+    }
+}
+
+impl ContainerConfig {
+    pub fn ollama_host_url(&self) -> String {
+        match self.port_mapping {
+            Some((host_port, _)) => format!("http://localhost:{}", host_port),
+            None => "http://localhost:11434".to_string(),
         }
     }
 }
@@ -409,7 +417,11 @@ pub async fn start_container_with_fallback(
 
     // Wait for container to be ready
     println!("⏳ Waiting for container to be ready...");
-    sleep(config.startup_timeout).await;
+    if let Some((host_port, _)) = config.port_mapping {
+        health_check_host(host_port, config.startup_timeout).await?;
+    } else {
+        sleep(config.startup_timeout).await;
+    }
 
     // Pull model if needed
     if needs_model_pull {
@@ -476,6 +488,35 @@ pub async fn start_container_with_fallback(
         port: host_port,
         needs_cleanup: true,
     })
+}
+
+/// Poll Ollama's HTTP API on the host until it responds or the timeout expires.
+pub async fn health_check_host(port: u16, timeout: Duration) -> Result<(), ContainerError> {
+    let url = format!("http://localhost:{}/api/tags", port);
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                println!("✅ Ollama health check passed on port {}", port);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(ContainerError::HealthCheckFailed {
+                reason: format!(
+                    "Ollama at port {} did not respond within {}s",
+                    port,
+                    timeout.as_secs()
+                ),
+            });
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// Perform health check on a running container service
@@ -581,74 +622,94 @@ pub fn exec_in_container(
     })
 }
 
+struct PoolInner {
+    container: Option<ContainerHandle>,
+    provider: Option<Arc<dyn ModelProvider>>,
+    ref_count: usize,
+}
+
 /// Shared pool that manages a single model container instance.
 ///
 /// Tracks active users with a reference count; starts the container on first
-/// `get_or_start` and stops it when the last user drops their handle.
+/// `get_or_start` and stops it when the last user drops their guard.
 pub struct SharedModelPool {
-    container: Mutex<Option<ContainerHandle>>,
-    ref_count: AtomicUsize,
-    config: ContainerConfig,
+    inner: tokio::sync::Mutex<PoolInner>,
+    container_config: ContainerConfig,
+}
+
+/// RAII guard holding a reference to the shared model pool.
+///
+/// Dropping this guard decrements the pool's reference count and stops the
+/// container when no more guards exist.
+pub struct ModelGuard {
+    pool: Arc<SharedModelPool>,
+    provider: Arc<dyn ModelProvider>,
+}
+
+impl ModelGuard {
+    pub fn provider(&self) -> &Arc<dyn ModelProvider> {
+        &self.provider
+    }
+}
+
+impl Drop for ModelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.pool.inner.try_lock() {
+            inner.ref_count = inner.ref_count.saturating_sub(1);
+            if inner.ref_count == 0 {
+                inner.container.take();
+                inner.provider.take();
+            }
+        }
+    }
 }
 
 impl SharedModelPool {
-    pub fn new(config: ContainerConfig) -> Arc<Self> {
+    pub fn new(container_config: ContainerConfig) -> Arc<Self> {
         Arc::new(Self {
-            container: Mutex::new(None),
-            ref_count: AtomicUsize::new(0),
-            config,
+            inner: tokio::sync::Mutex::new(PoolInner {
+                container: None,
+                provider: None,
+                ref_count: 0,
+            }),
+            container_config,
         })
     }
 
-    /// Return a shared `OllamaProvider`, starting the container if necessary.
-    pub async fn get_or_start(
-        self: &Arc<Self>,
-        ollama_config: OllamaConfig,
-    ) -> Result<Arc<dyn ModelProvider>, ContainerError> {
-        {
-            let guard = self.container.lock().unwrap();
-            if guard.is_some() {
-                self.ref_count.fetch_add(1, Ordering::SeqCst);
-                let provider = OllamaProvider::new(ollama_config).map_err(|e| {
-                    ContainerError::CommandFailed {
-                        command: format!("OllamaProvider::new: {}", e),
-                    }
-                })?;
-                return Ok(Arc::new(provider));
-            }
+    /// Return a `ModelGuard` with a shared provider, starting the container if necessary.
+    pub async fn get_or_start(self: &Arc<Self>) -> Result<ModelGuard, ContainerError> {
+        let mut inner = self.inner.lock().await;
+
+        if let Some(provider) = inner.provider.as_ref().cloned() {
+            inner.ref_count += 1;
+            return Ok(ModelGuard {
+                pool: self.clone(),
+                provider,
+            });
         }
 
-        let handle = start_container_with_fallback(&self.config).await?;
-        {
-            let mut guard = self.container.lock().unwrap();
-            *guard = Some(handle);
-        }
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
+        let handle = start_container_with_fallback(&self.container_config).await?;
+        let url = self.container_config.ollama_host_url();
+        let ollama_config = OllamaConfig::default().with_base_url(url);
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(OllamaProvider::new(ollama_config).map_err(|e| {
+                ContainerError::CommandFailed {
+                    command: format!("OllamaProvider::new: {}", e),
+                }
+            })?);
 
-        let provider =
-            OllamaProvider::new(ollama_config).map_err(|e| ContainerError::CommandFailed {
-                command: format!("OllamaProvider::new: {}", e),
-            })?;
-        Ok(Arc::new(provider))
-    }
+        inner.container = Some(handle);
+        inner.provider = Some(provider.clone());
+        inner.ref_count = 1;
 
-    /// Release a reference. When the count reaches zero, the container is stopped.
-    pub fn release(self: &Arc<Self>) -> Result<(), ContainerError> {
-        let prev = self.ref_count.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            let handle = {
-                let mut guard = self.container.lock().unwrap();
-                guard.take()
-            };
-            if let Some(h) = handle {
-                cleanup_container(&h)?;
-            }
-        }
-        Ok(())
+        Ok(ModelGuard {
+            pool: self.clone(),
+            provider,
+        })
     }
 
     pub fn ref_count(&self) -> usize {
-        self.ref_count.load(Ordering::SeqCst)
+        self.inner.try_lock().map(|g| g.ref_count).unwrap_or(0)
     }
 }
 
@@ -729,5 +790,44 @@ mod tests {
         };
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
+    }
+
+    #[test]
+    fn test_ollama_host_url_default() {
+        let config = ContainerConfig::default();
+        assert_eq!(config.ollama_host_url(), "http://localhost:11435");
+    }
+
+    #[test]
+    fn test_ollama_host_url_custom_port() {
+        let config = ContainerConfig {
+            port_mapping: Some((9999, 11434)),
+            ..ContainerConfig::default()
+        };
+        assert_eq!(config.ollama_host_url(), "http://localhost:9999");
+    }
+
+    #[test]
+    fn test_ollama_host_url_no_mapping() {
+        let config = ContainerConfig {
+            port_mapping: None,
+            ..ContainerConfig::default()
+        };
+        assert_eq!(config.ollama_host_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn test_shared_model_pool_new_ref_count_zero() {
+        let pool = SharedModelPool::new(ContainerConfig::default());
+        assert_eq!(pool.ref_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_host_fails_fast_when_nothing_listening() {
+        let result = health_check_host(19999, Duration::from_secs(3)).await;
+        assert!(matches!(
+            result,
+            Err(ContainerError::HealthCheckFailed { .. })
+        ));
     }
 }
