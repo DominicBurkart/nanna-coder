@@ -4,11 +4,13 @@ use harness::container::{
     ContainerConfig, ContainerRuntime,
 };
 use harness::entities::InMemoryEntityStore;
+use harness::task::{TaskManager, TaskStatus};
 use harness::tools::{
     ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
 };
 use image_builder::build_dev_container;
 use model::prelude::*;
+use model::provider::ModelProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,6 +182,65 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
     }
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_task_manager_submit_with_dev_container() {
+    let repo_path = example_repo_path();
+    assert!(
+        repo_path.exists(),
+        "Example repo not found at {:?}",
+        repo_path
+    );
+
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+
+    let manager = TaskManager::new();
+
+    let ollama_config = model::OllamaConfig::default();
+    let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
+    let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+
+    let task_id = manager
+        .submit(
+            "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
+                .to_string(),
+            repo_path,
+            "HEAD".to_string(),
+            E2E_MODEL.to_string(),
+            MAX_TURNS,
+            provider,
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(700);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("Task did not complete within timeout");
+        }
+
+        let task = manager.poll(&task_id).await.expect("task not found");
+        match &task.status {
+            TaskStatus::Completed { result, .. } => {
+                assert!(
+                    result.changes_patch.is_some(),
+                    "expected non-empty changes_patch"
+                );
+                return;
+            }
+            TaskStatus::Failed { error, .. } => {
+                panic!("Task failed: {}", error);
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
