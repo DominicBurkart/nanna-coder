@@ -205,6 +205,21 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         ));
     }
 
+    let french_indicators = [
+        "outil",
+        "modèle",
+        "interaction",
+        "langage",
+        "commande",
+        "aide",
+    ];
+    if !french_indicators.iter().any(|w| help_output.contains(w)) {
+        return Err(format!(
+            "harness --help does not contain any French indicator words {:?}.\nOutput: {}",
+            french_indicators, help_output
+        ));
+    }
+
     Ok(())
 }
 

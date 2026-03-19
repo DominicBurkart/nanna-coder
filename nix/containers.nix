@@ -67,6 +67,9 @@ let
         pkgs.cacert
         pkgs.pkg-config
         pkgs.openssl
+        pkgs.stdenv.cc
+        pkgs.libssh2
+        pkgs.zlib
       ];
       pathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
     };
@@ -76,6 +79,9 @@ let
       Env = [
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "PATH=/bin"
+        "CARGO_HOME=/tmp/cargo"
+        "PKG_CONFIG_PATH=/lib/pkgconfig"
+        "RUST_LOG=info"
       ];
       WorkingDir = "/workspace";
     };
