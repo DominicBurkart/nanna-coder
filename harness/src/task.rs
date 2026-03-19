@@ -269,7 +269,11 @@ impl TaskManager {
                     }
                 }
                 Ok(mut workspace) => {
-                    let tool_registry = workspace.create_container_tool_registry();
+                    let tool_registry = if use_container {
+                        workspace.create_container_tool_registry()
+                    } else {
+                        workspace.create_tool_registry()
+                    };
                     let entity_store = InMemoryEntityStore::new();
                     let agent_config = AgentConfig {
                         max_iterations,
@@ -771,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_records_container_setup_failure() {
+    async fn test_submit_records_workspace_creation_failure() {
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let provider: Arc<dyn ModelProvider> =
             MockProvider::new(vec![stop_response("Task complete!")]);
@@ -788,15 +792,65 @@ mod tests {
             )
             .await;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        let task = manager.poll(&task_id).await.unwrap();
-        assert!(matches!(task.status, TaskStatus::Failed { .. }));
-        if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+                }
+                break;
+            }
             assert!(
-                diagnostics.error_type == "ContainerSetupFailed"
-                    || diagnostics.error_type == "WorkspaceCreationFailed"
+                std::time::Instant::now() < deadline,
+                "task did not complete"
             );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_container_setup_failure() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "ContainerSetupFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 }

@@ -314,10 +314,14 @@ mod tests {
         }
     }
 
-    // Helper to check if we're in a git repository (for Nix sandbox compatibility)
+    // Helper to check if we're in a git repository with full access (for Nix sandbox and
+    // worktree-isolation compatibility where .gitmodules may be a device file)
     fn has_git_repo() -> bool {
         let repo_path = get_repo_root();
-        git2::Repository::discover(&repo_path).is_ok()
+        match git2::Repository::discover(&repo_path) {
+            Ok(repo) => repo.submodules().is_ok(),
+            Err(_) => false,
+        }
     }
 
     // Tests using current repository - these will exercise actual git2 code paths

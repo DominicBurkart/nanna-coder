@@ -92,8 +92,20 @@ impl TaskWorkspace {
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
 
+        let cleanup_worktree = || {
+            let _ = git_cmd(source_repo)
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    workspace_path.to_str().unwrap(),
+                ])
+                .output();
+        };
+
         let runtime = detect_runtime();
         if !runtime.is_available() {
+            cleanup_worktree();
             return Err(WorkspaceError::NoContainerRuntime);
         }
 
@@ -115,9 +127,13 @@ impl TaskWorkspace {
             additional_args,
         };
 
-        let handle = start_container_with_fallback(&config)
-            .await
-            .map_err(|e| WorkspaceError::ContainerSetupFailed(e.to_string()))?;
+        let handle = match start_container_with_fallback(&config).await {
+            Ok(h) => h,
+            Err(e) => {
+                cleanup_worktree();
+                return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
+            }
+        };
 
         Ok(Self {
             workspace_path,
@@ -190,15 +206,21 @@ mod tests {
             vec!["init"],
             vec!["config", "user.email", "test@test.com"],
             vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             git_cmd(dir).args(args).output().unwrap();
         }
         std::fs::write(dir.join("README.md"), "# Test").unwrap();
         git_cmd(dir).args(["add", "."]).output().unwrap();
-        git_cmd(dir)
+        let out = git_cmd(dir)
             .args(["commit", "-m", "init"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "init commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn unique_id(prefix: &str) -> String {
