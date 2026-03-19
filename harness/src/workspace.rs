@@ -9,6 +9,8 @@ pub enum WorkspaceError {
     GitWorktreeCreateFailed(String),
     #[error("Git worktree removal failed: {0}")]
     GitWorktreeRemoveFailed(String),
+    #[error("Failed to stage changes: {0}")]
+    StageAllFailed(String),
     #[error("Failed to extract changes: {0}")]
     ExtractChangesFailed(String),
     #[error("Failed to produce format-patch: {0}")]
@@ -89,14 +91,19 @@ impl TaskWorkspace {
         create_tool_registry(&self.workspace_path)
     }
 
-    pub fn extract_changes(&self) -> Result<String, WorkspaceError> {
+    fn stage_all(&self) -> Result<(), WorkspaceError> {
         let add_output = git_cmd(&self.workspace_path)
             .args(["add", "--all"])
             .output()?;
         if !add_output.status.success() {
             let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
-            return Err(WorkspaceError::ExtractChangesFailed(stderr));
+            return Err(WorkspaceError::StageAllFailed(stderr));
         }
+        Ok(())
+    }
+
+    pub fn extract_changes(&self) -> Result<String, WorkspaceError> {
+        self.stage_all()?;
         let output = git_cmd(&self.workspace_path)
             .args(["diff", "--cached", "HEAD"])
             .output()?;
@@ -108,13 +115,7 @@ impl TaskWorkspace {
     }
 
     pub fn format_patch(&self) -> Result<Option<String>, WorkspaceError> {
-        let add_output = git_cmd(&self.workspace_path)
-            .args(["add", "--all"])
-            .output()?;
-        if !add_output.status.success() {
-            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
-            return Err(WorkspaceError::FormatPatchFailed(stderr));
-        }
+        self.stage_all()?;
 
         let check_output = git_cmd(&self.workspace_path)
             .args(["diff", "--cached", "--quiet"])
@@ -129,6 +130,8 @@ impl TaskWorkspace {
                 "user.email=nanna@local",
                 "-c",
                 "user.name=nanna",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-m",
                 "agent changes",

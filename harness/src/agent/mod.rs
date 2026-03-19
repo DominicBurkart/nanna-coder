@@ -444,13 +444,11 @@ impl AgentLoop {
                 });
             }
 
-            if let AgentState::Error(_) = &self.state {
-                if let AgentState::Error(msg) = self.state.clone() {
-                    return Err(self.enrich_error(bare_state_error(msg)));
-                }
+            if let AgentState::Error(msg) = self.state.clone() {
+                return Err(self.enrich_error(bare_state_error(msg)));
             }
 
-            match &self.state.clone() {
+            match self.state.clone() {
                 AgentState::Planning => {
                     if let Err(e) = self.plan(&context).await {
                         return Err(self.enrich_error(e));
