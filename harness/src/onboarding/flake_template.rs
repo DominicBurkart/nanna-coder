@@ -1,5 +1,5 @@
 use super::OnboardingError;
-use crate::onboarding::profile::{BuildSystem, ProjectProfile};
+use crate::onboarding::profile::{BuildSystem, ProjectProfile, DEFAULT_RUST_VERSION};
 
 const CARGO_FLAKE_TEMPLATE: &str = r#"{
   description = "__PROJECT_NAME__ dev container";
@@ -77,7 +77,10 @@ pub fn generate_flake(profile: &ProjectProfile) -> Result<String, OnboardingErro
 }
 
 fn generate_cargo_flake(profile: &ProjectProfile) -> Result<String, OnboardingError> {
-    let rust_version = profile.rust_version.as_deref().unwrap_or("1.84.0");
+    let rust_version = profile
+        .rust_version
+        .as_deref()
+        .unwrap_or(DEFAULT_RUST_VERSION);
 
     let packages_str = profile.nix_packages.join("\n          ");
 
@@ -92,7 +95,9 @@ fn generate_cargo_flake(profile: &ProjectProfile) -> Result<String, OnboardingEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::onboarding::profile::{BuildSystem, ProjectProfile, ToolCategory, ToolSpec};
+    use crate::onboarding::profile::{
+        BuildSystem, ProjectProfile, ToolCategory, ToolSpec, DEFAULT_RUST_VERSION,
+    };
 
     fn minimal_cargo_profile(name: &str) -> ProjectProfile {
         ProjectProfile {
@@ -109,7 +114,7 @@ mod tests {
                 "pkgs.git".to_string(),
                 "pkgs.cacert".to_string(),
             ],
-            rust_version: Some("1.84.0".to_string()),
+            rust_version: Some(DEFAULT_RUST_VERSION.to_string()),
             extra_env_vars: vec![],
         }
     }

@@ -194,6 +194,9 @@ pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
         .ok_or_else(|| "Missing required field: repo_path".to_string())?;
 
     let source = Path::new(repo_path);
+    if !source.is_absolute() {
+        return Err("repo_path must be an absolute path".to_string());
+    }
     let onboarder = DeterministicOnboarder;
     let result = onboarder.onboard(source).await.map_err(|e| e.to_string())?;
 
@@ -382,5 +385,13 @@ mod tests {
         let params = serde_json::json!({"task_id": "nonexistent"});
         let result = handle_cancel_task(&params, &manager).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_rejects_relative_path() {
+        let params = serde_json::json!({"repo_path": "relative/path"});
+        let result = handle_onboard_repo(&params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute"));
     }
 }

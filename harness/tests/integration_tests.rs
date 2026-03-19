@@ -1872,10 +1872,11 @@ fn init_test_git_repo(dir: &Path) {
     }
     std::fs::write(dir.join("README.md"), "# Test").unwrap();
     git_cmd_clean(dir).args(["add", "."]).output().unwrap();
-    git_cmd_clean(dir)
-        .args(["commit", "-m", "init"])
+    let status = git_cmd_clean(dir)
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
         .output()
         .unwrap();
+    assert!(status.status.success(), "git commit failed in test setup");
 }
 
 #[tokio::test]

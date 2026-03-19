@@ -119,10 +119,11 @@ mod tests {
         }
         std::fs::write(dir.join("README.md"), "# Test").unwrap();
         git_cmd(dir).args(["add", "."]).output().unwrap();
-        git_cmd(dir)
-            .args(["commit", "-m", "init"])
+        let status = git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
             .output()
             .unwrap();
+        assert!(status.status.success(), "git commit failed in test setup");
     }
 
     fn unique_id(prefix: &str) -> String {

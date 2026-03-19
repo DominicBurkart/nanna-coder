@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+pub const DEFAULT_RUST_VERSION: &str = "1.84.0";
+
 const COMMAND_BLOCKLIST: &[&str] = &[
     "publish", "deploy", "push", "rm -rf", "drop", "delete", "destroy",
 ];
@@ -34,8 +36,15 @@ impl ToolSpec {
         category: ToolCategory,
     ) -> Result<Self, ProfileError> {
         let command = command.into();
+        let command_tokens: Vec<&str> = command.split_whitespace().collect();
         for blocked in COMMAND_BLOCKLIST {
-            if command.contains(blocked) {
+            let blocked_tokens: Vec<&str> = blocked.split_whitespace().collect();
+            let window_size = blocked_tokens.len();
+            if window_size > 0
+                && command_tokens
+                    .windows(window_size)
+                    .any(|w| w == blocked_tokens.as_slice())
+            {
                 return Err(ProfileError::BlocklistedCommand(command));
             }
         }
@@ -79,7 +88,7 @@ mod tests {
         .is_err());
         assert!(ToolSpec::new(
             "deploy",
-            "./deploy.sh",
+            "run deploy production",
             "Deploy to production",
             ToolCategory::Build
         )
@@ -122,6 +131,17 @@ mod tests {
             "cargo fmt --check",
             "Check formatting",
             ToolCategory::Format
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn tool_spec_allows_blocklist_substring_within_word() {
+        assert!(ToolSpec::new(
+            "run-publisher",
+            "cargo run --bin publisher",
+            "Run the publisher binary",
+            ToolCategory::Build
         )
         .is_ok());
     }

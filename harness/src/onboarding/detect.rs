@@ -1,5 +1,7 @@
 use super::OnboardingError;
-use crate::onboarding::profile::{BuildSystem, ProjectProfile, ToolCategory, ToolSpec};
+use crate::onboarding::profile::{
+    BuildSystem, ProjectProfile, ToolCategory, ToolSpec, DEFAULT_RUST_VERSION,
+};
 use std::path::Path;
 
 pub struct CargoManifest {
@@ -36,7 +38,7 @@ pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
     let has_flake_nix = top_level_entries.iter().any(|name| name == "flake.nix");
 
     let cargo_toml = if top_level_entries.iter().any(|n| n == "Cargo.toml") {
-        Some(parse_cargo_toml(&source.join("Cargo.toml"))?)
+        Some(parse_cargo_toml(&source.join("Cargo.toml"), source)?)
     } else {
         None
     };
@@ -50,7 +52,7 @@ pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
     })
 }
 
-fn parse_cargo_toml(path: &Path) -> Result<CargoManifest, OnboardingError> {
+fn parse_cargo_toml(path: &Path, repo_root: &Path) -> Result<CargoManifest, OnboardingError> {
     let content = std::fs::read_to_string(path).map_err(OnboardingError::Io)?;
     let doc: toml::Value = content
         .parse()
@@ -58,12 +60,17 @@ fn parse_cargo_toml(path: &Path) -> Result<CargoManifest, OnboardingError> {
 
     let is_workspace = doc.get("workspace").is_some();
 
+    let dir_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
     let name = if is_workspace {
         doc.get("workspace")
             .and_then(|w| w.get("package"))
             .and_then(|p| p.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("workspace")
+            .unwrap_or(dir_name)
             .to_string()
     } else {
         doc.get("package")
@@ -108,17 +115,34 @@ fn parse_cargo_toml(path: &Path) -> Result<CargoManifest, OnboardingError> {
         doc.get("dependencies")
     };
 
-    let dependencies = deps_table
+    let mut dependencies: std::collections::HashSet<String> = deps_table
         .and_then(|d| d.as_table())
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
+
+    if is_workspace {
+        for member in &members {
+            let member_cargo = repo_root.join(member).join("Cargo.toml");
+            if let Ok(member_content) = std::fs::read_to_string(&member_cargo) {
+                if let Ok(member_doc) = member_content.parse::<toml::Value>() {
+                    if let Some(member_deps) =
+                        member_doc.get("dependencies").and_then(|d| d.as_table())
+                    {
+                        for key in member_deps.keys() {
+                            dependencies.insert(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(CargoManifest {
         name,
         edition,
         is_workspace,
         members,
-        dependencies,
+        dependencies: dependencies.into_iter().collect(),
     })
 }
 
@@ -174,7 +198,7 @@ impl ProjectSignals {
             build_system: BuildSystem::Cargo,
             tools,
             nix_packages,
-            rust_version: Some("1.84.0".to_string()),
+            rust_version: Some(DEFAULT_RUST_VERSION.to_string()),
             extra_env_vars: vec![],
         })
     }
@@ -302,7 +326,7 @@ edition = "2021"
         let profile = signals.to_cargo_profile().unwrap();
         assert_eq!(profile.project_name, "myapp");
         assert_eq!(profile.build_system, BuildSystem::Cargo);
-        assert_eq!(profile.rust_version, Some("1.84.0".to_string()));
+        assert_eq!(profile.rust_version, Some(DEFAULT_RUST_VERSION.to_string()));
         assert!(profile.nix_packages.contains(&"rustToolchain".to_string()));
         assert!(profile
             .nix_packages
@@ -346,5 +370,89 @@ openssl = "0.10"
             signals.to_cargo_profile(),
             Err(OnboardingError::NotCargoProject)
         ));
+    }
+
+    #[test]
+    fn workspace_member_openssl_dep_is_collected() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member-a"]
+"#,
+        );
+        fs::create_dir(dir.path().join("member-a")).unwrap();
+        fs::write(
+            dir.path().join("member-a").join("Cargo.toml"),
+            r#"
+[package]
+name = "member-a"
+version = "0.1.0"
+
+[dependencies]
+openssl = "0.10"
+"#,
+        )
+        .unwrap();
+        let signals = scan_project(dir.path()).unwrap();
+        let manifest = signals.cargo_toml.unwrap();
+        assert!(manifest.dependencies.contains(&"openssl".to_string()));
+    }
+
+    #[test]
+    fn workspace_member_openssl_dep_adds_nix_packages() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["member-a"]
+"#,
+        );
+        fs::create_dir(dir.path().join("member-a")).unwrap();
+        fs::write(
+            dir.path().join("member-a").join("Cargo.toml"),
+            r#"
+[package]
+name = "member-a"
+version = "0.1.0"
+
+[dependencies]
+openssl = "0.10"
+"#,
+        )
+        .unwrap();
+        let signals = scan_project(dir.path()).unwrap();
+        let profile = signals.to_cargo_profile().unwrap();
+        assert!(profile.nix_packages.contains(&"pkgs.openssl".to_string()));
+        assert!(profile
+            .nix_packages
+            .contains(&"pkgs.pkg-config".to_string()));
+    }
+
+    #[test]
+    fn workspace_without_package_name_uses_dir_name() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[workspace]
+members = ["crate-a"]
+"#,
+        );
+        let dir_name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let signals = scan_project(dir.path()).unwrap();
+        let manifest = signals.cargo_toml.unwrap();
+        assert_eq!(manifest.name, dir_name);
     }
 }
