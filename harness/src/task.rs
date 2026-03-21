@@ -540,6 +540,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_running_task() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Running {
+                started_at: Utc::now(),
+                iterations: 0,
+            },
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        let dummy = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = dummy.abort_handle();
+        {
+            let mut handles = manager.handles.write().await;
+            handles.insert(task_id.clone(), abort_handle);
+        }
+        let result = manager.cancel(&task_id).await;
+        assert!(result.is_ok());
+        let task = result.unwrap();
+        assert!(
+            matches!(&task.status, TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled")
+        );
+        dummy.abort();
+    }
+
+    #[tokio::test]
+    async fn test_queued_task_starts_after_completion() {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let sem2 = Arc::clone(&sem);
+        let handle = tokio::spawn(async move {
+            let _p = sem2.acquire_owned().await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished());
+        drop(permit);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_cancel_pending_task() {
         let manager = TaskManager::new(0);
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
@@ -579,7 +628,7 @@ mod tests {
             )
             .await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
 
         let task = manager.poll(&id).await.unwrap();
         assert!(matches!(task.status, TaskStatus::Pending));
