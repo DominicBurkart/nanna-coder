@@ -162,6 +162,7 @@ impl TaskManager {
         let semaphore = Arc::clone(&self.max_concurrent);
         let task_id_clone = task_id.clone();
 
+        let mut handles_guard = self.handles.write().await;
         let join_handle = tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("Semaphore closed");
 
@@ -291,10 +292,8 @@ impl TaskManager {
             }
         });
 
-        {
-            let mut handles = self.handles.write().await;
-            handles.insert(task_id.clone(), join_handle.abort_handle());
-        }
+        handles_guard.insert(task_id.clone(), join_handle.abort_handle());
+        drop(handles_guard);
 
         task_id
     }
