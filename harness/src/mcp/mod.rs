@@ -77,10 +77,22 @@ impl NannaMcpServer {
     }
 
     pub async fn run_stdio(self) -> Result<(), Box<dyn std::error::Error>> {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
-        let mut writer = stdout;
+        self.run_on(tokio::io::stdin(), tokio::io::stdout())
+            .await
+            .map_err(|e| e as Box<dyn std::error::Error>)
+    }
+
+    pub async fn run_on<R, W>(
+        self,
+        reader: R,
+        writer: W,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut writer = writer;
 
         loop {
             let mut header_buf = String::new();
@@ -375,5 +387,99 @@ mod tests {
         };
         let resp = server.handle_request(req).await;
         assert!(resp.error.is_some());
+    }
+
+    async fn send_framed(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        msg: serde_json::Value,
+    ) {
+        let body = serde_json::to_vec(&msg).unwrap();
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        tokio::io::AsyncWriteExt::write_all(writer, header.as_bytes())
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(writer, &body)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(writer).await.unwrap();
+    }
+
+    async fn recv_framed(
+        reader: &mut tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>,
+    ) -> serde_json::Value {
+        let mut content_length: Option<usize> = None;
+        let mut header_buf = String::new();
+        loop {
+            header_buf.clear();
+            reader.read_line(&mut header_buf).await.unwrap();
+            let line = header_buf.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            if let Some(rest) = line.strip_prefix("Content-Length: ") {
+                content_length = rest.trim().parse().ok();
+            }
+        }
+        let n = content_length.expect("no Content-Length header");
+        let mut body = vec![0u8; n];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stdio_initialize_round_trip() {
+        let (client, server_io) = tokio::io::duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(make_server().run_on(server_read, server_write));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_reader = tokio::io::BufReader::new(client_read);
+
+        send_framed(
+            &mut client_write,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        )
+        .await;
+
+        let resp = recv_framed(&mut client_reader).await;
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+        assert!(resp["result"]["capabilities"]["tools"].is_object());
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_tools_list_round_trip() {
+        let (client, server_io) = tokio::io::duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(make_server().run_on(server_read, server_write));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_reader = tokio::io::BufReader::new(client_read);
+
+        send_framed(
+            &mut client_write,
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+
+        let resp = recv_framed(&mut client_reader).await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"assign_task"));
+        assert!(names.contains(&"poll_task"));
+        assert!(names.contains(&"get_result"));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_eof_clean_shutdown() {
+        let (client, server_io) = tokio::io::duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let server_task = tokio::spawn(make_server().run_on(server_read, server_write));
+        drop(client);
+        server_task.await.unwrap().unwrap();
     }
 }
