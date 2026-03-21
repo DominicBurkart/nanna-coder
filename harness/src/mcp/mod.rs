@@ -320,7 +320,7 @@ mod tests {
 
     fn make_server() -> NannaMcpServer {
         NannaMcpServer::new(
-            Arc::new(TaskManager::new(8)),
+            Arc::new(TaskManager::default()),
             Arc::new(NoopProvider),
             "qwen3:0.6b".to_string(),
             100,

@@ -14,6 +14,7 @@ use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
+pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
@@ -387,7 +388,7 @@ impl TaskManager {
 
 impl Default for TaskManager {
     fn default() -> Self {
-        Self::new(8)
+        Self::new(DEFAULT_MAX_CONCURRENT_TASKS)
     }
 }
 
@@ -519,21 +520,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_manager_poll_returns_none_for_invalid_id() {
-        let manager = TaskManager::new(8);
+        let manager = TaskManager::default();
         let result = manager.poll(&TaskId("nonexistent".to_string())).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_task_manager_list_empty() {
-        let manager = TaskManager::new(8);
+        let manager = TaskManager::default();
         let tasks = manager.list().await;
         assert!(tasks.is_empty());
     }
 
     #[tokio::test]
     async fn test_cancel_nonexistent_task() {
-        let manager = TaskManager::new(8);
+        let manager = TaskManager::default();
         let result = manager.cancel(&TaskId("nonexistent".to_string())).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));

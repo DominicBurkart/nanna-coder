@@ -1883,7 +1883,7 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
-    let manager = Arc::new(TaskManager::new(8));
+    let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> =
         Arc::new(SequenceMockProvider::new(vec![make_stop_response(
             "Task completed successfully",
@@ -1937,7 +1937,7 @@ async fn test_e2e_mcp_assign_poll_get_result_failure() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
-    let manager = Arc::new(TaskManager::new(8));
+    let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(vec![]));
 
     let assign_params = json!({
@@ -1980,7 +1980,7 @@ async fn test_e2e_mcp_get_result_while_pending_returns_error() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
-    let manager = Arc::new(TaskManager::new(8));
+    let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> =
         Arc::new(SequenceMockProvider::new(vec![make_stop_response("done")]));
 
@@ -2018,7 +2018,7 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
-    let manager = Arc::new(TaskManager::new(8));
+    let manager = Arc::new(TaskManager::default());
     let provider_a: Arc<dyn ModelProvider> =
         Arc::new(SequenceMockProvider::new(vec![make_stop_response(
             "Result for task A",
