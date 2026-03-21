@@ -676,6 +676,21 @@ impl SharedModelPool {
         })
     }
 
+    #[cfg(test)]
+    pub fn new_with_provider(
+        container_config: ContainerConfig,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: tokio::sync::Mutex::new(PoolInner {
+                container: None,
+                provider: Some(provider),
+                ref_count: 0,
+            }),
+            container_config,
+        })
+    }
+
     /// Return a `ModelGuard` with a shared provider, starting the container if necessary.
     pub async fn get_or_start(self: &Arc<Self>) -> Result<ModelGuard, ContainerError> {
         let mut inner = self.inner.lock().await;
@@ -716,6 +731,27 @@ impl SharedModelPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use model::provider::ModelResult;
+    use model::types::{ChatRequest, ChatResponse, ModelInfo};
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl ModelProvider for MockProvider {
+        async fn chat(&self, _: ChatRequest) -> ModelResult<ChatResponse> {
+            unimplemented!()
+        }
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+    }
 
     #[test]
     fn test_container_runtime_command() {
@@ -829,5 +865,66 @@ mod tests {
             result,
             Err(ContainerError::HealthCheckFailed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_start_returns_guard_and_increments_ref_count() {
+        let pool =
+            SharedModelPool::new_with_provider(ContainerConfig::default(), Arc::new(MockProvider));
+        let _guard = pool.get_or_start().await.unwrap();
+        assert_eq!(pool.ref_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_start_twice_shares_provider() {
+        let pool =
+            SharedModelPool::new_with_provider(ContainerConfig::default(), Arc::new(MockProvider));
+        let guard1 = pool.get_or_start().await.unwrap();
+        let guard2 = pool.get_or_start().await.unwrap();
+        assert_eq!(pool.ref_count(), 2);
+        assert!(Arc::ptr_eq(guard1.provider(), guard2.provider()));
+    }
+
+    #[tokio::test]
+    async fn test_drop_guard_decrements_ref_count() {
+        let pool =
+            SharedModelPool::new_with_provider(ContainerConfig::default(), Arc::new(MockProvider));
+        let guard1 = pool.get_or_start().await.unwrap();
+        let guard2 = pool.get_or_start().await.unwrap();
+        assert_eq!(pool.ref_count(), 2);
+        drop(guard1);
+        assert_eq!(pool.ref_count(), 1);
+        drop(guard2);
+        assert_eq!(pool.ref_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_drop_last_guard_clears_provider() {
+        let pool =
+            SharedModelPool::new_with_provider(ContainerConfig::default(), Arc::new(MockProvider));
+        let guard = pool.get_or_start().await.unwrap();
+        assert_eq!(pool.ref_count(), 1);
+        drop(guard);
+        assert_eq!(pool.ref_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_get_or_start() {
+        let pool =
+            SharedModelPool::new_with_provider(ContainerConfig::default(), Arc::new(MockProvider));
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.get_or_start().await.unwrap() })
+            })
+            .collect();
+        let guards: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(pool.ref_count(), 5);
+        drop(guards);
+        assert_eq!(pool.ref_count(), 0);
     }
 }
