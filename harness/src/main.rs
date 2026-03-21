@@ -485,7 +485,7 @@ async fn run_mcp_server(
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::new());
+    let task_manager = Arc::new(TaskManager::default());
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {})",
