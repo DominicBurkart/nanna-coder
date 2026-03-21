@@ -118,6 +118,20 @@ jobs:
 
         echo "✅ Test containers ready for integration tests"
 
+    - name: Start Ollama container for integration tests
+      if: matrix.test-type == 'integration-container'
+      run: |
+        docker run -d --name ollama-ci -p 11434:11434 nanna-coder-ollama:latest
+        for i in $(seq 1 30); do
+          if curl -s --max-time 5 http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "Ollama is ready"
+            break
+          fi
+          echo "Waiting for Ollama... ($i/30)"
+          sleep 2
+        done
+        curl -sf http://localhost:11434/api/tags || (echo "Ollama failed to start"; docker logs ollama-ci; exit 1)
+
     - name: Pre-build dev container image
       if: matrix.test-type == 'integration-container'
       run: |
@@ -146,11 +160,11 @@ jobs:
       shell: bash
       run: |
         nix develop --command cargo nextest run --workspace --test '*' --all-features --test-threads=1
-        if curl -s --max-time 5 http://localhost:11434/api/tags > /dev/null 2>&1; then
-          nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
-        else
-          echo "Ollama not reachable on port 11434, skipping model integration tests"
-        fi
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
+
+    - name: Cleanup Ollama container
+      if: always() && matrix.test-type == 'integration-container'
+      run: docker rm -f ollama-ci || true
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
