@@ -122,7 +122,7 @@ mod tests {
         std::fs::write(dir.join("README.md"), "# Test").unwrap();
         git_cmd(dir).args(["add", "."]).output().unwrap();
         let status = git_cmd(dir)
-            .args(["commit", "-m", "init"])
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
             .output()
             .unwrap();
         assert!(status.status.success(), "git commit failed in test setup");
