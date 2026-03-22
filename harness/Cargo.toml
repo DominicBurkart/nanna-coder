@@ -28,9 +28,9 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 git2 = "0.20"
 glob = "0.3"
 regex = "1.0"
+tempfile = "3.0"
 toml = "0.8"
 
 [dev-dependencies]
 futures = "0.3"
-tempfile = "3.0"
 serial_test = "3.0"
