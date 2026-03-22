@@ -404,6 +404,9 @@ impl TaskManager {
                 iterations_completed,
                 last_tool_call: None,
                 partial_changes: None,
+                tool_call_history: vec![],
+                last_agent_state: None,
+                conversation_snapshot: None,
             },
         };
 
