@@ -1168,9 +1168,8 @@ impl PrStatusData {
         }
 
         // Diff stats
-        match (self.additions, self.deletions) {
-            (Some(a), Some(d)) => parts.push(format!("+{}/-{}", a, d)),
-            _ => {}
+        if let (Some(a), Some(d)) = (self.additions, self.deletions) {
+            parts.push(format!("+{}/-{}", a, d));
         }
 
         // CI status
@@ -1605,10 +1604,7 @@ impl Tool for GitHubPrStatusTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let level = args
-            .get("level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("l0");
+        let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("l0");
 
         let data = collect_pr_status(&self.workspace_root)?;
 
@@ -1621,16 +1617,15 @@ impl Tool for GitHubPrStatusTool {
                 }))
             }
             "l1" => {
-                let field = args
-                    .get("field")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::InvalidArguments {
+                let field = args.get("field").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::InvalidArguments {
                         message: "Missing 'field' parameter for l1 query".to_string(),
-                    })?;
-
-                let detail = data.to_l1(field).map_err(|e| ToolError::InvalidArguments {
-                    message: e,
+                    }
                 })?;
+
+                let detail = data
+                    .to_l1(field)
+                    .map_err(|e| ToolError::InvalidArguments { message: e })?;
 
                 Ok(json!({
                     "level": "l1",
@@ -2090,10 +2085,7 @@ mod tests {
         let data = PrStatusData {
             additions: Some(50),
             deletions: Some(20),
-            changed_files: vec![
-                "src/main.rs".to_string(),
-                "Cargo.toml".to_string(),
-            ],
+            changed_files: vec!["src/main.rs".to_string(), "Cargo.toml".to_string()],
             ..Default::default()
         };
 

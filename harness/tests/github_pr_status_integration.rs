@@ -4,9 +4,7 @@
 //! execution at both L0 and L1 levels, and error handling.
 //! Tests gracefully handle environments where git or gh CLI may be unavailable.
 
-use harness::tools::{
-    create_tool_registry, GitHubPrStatusTool, PrStatusData, Tool, ToolError,
-};
+use harness::tools::{create_tool_registry, GitHubPrStatusTool, PrStatusData, Tool, ToolError};
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -264,7 +262,11 @@ async fn test_l1_diff_field() {
         .unwrap();
 
     let detail = result["detail"].as_str().unwrap();
-    assert!(detail.contains("Diff"), "Should contain diff info: '{}'", detail);
+    assert!(
+        detail.contains("Diff"),
+        "Should contain diff info: '{}'",
+        detail
+    );
 }
 
 #[tokio::test]
@@ -374,7 +376,11 @@ async fn test_l1_missing_field_returns_error() {
 
     match result {
         Err(ToolError::InvalidArguments { message }) => {
-            assert!(message.contains("field"), "Error should mention 'field': {}", message);
+            assert!(
+                message.contains("field"),
+                "Error should mention 'field': {}",
+                message
+            );
         }
         other => panic!("Expected InvalidArguments, got: {:?}", other),
     }
@@ -568,9 +574,7 @@ async fn test_execute_via_registry() {
     let registry = create_tool_registry(repo.path());
 
     // Execute L0 through the registry interface
-    let result = registry
-        .execute("github_pr_status", json!({}))
-        .await;
+    let result = registry.execute("github_pr_status", json!({})).await;
     assert!(result.is_ok(), "Should execute via registry");
 
     let val = result.unwrap();
@@ -588,13 +592,19 @@ async fn test_execute_l1_via_registry() {
     let registry = create_tool_registry(repo.path());
 
     let result = registry
-        .execute("github_pr_status", json!({ "level": "l1", "field": "conflicts" }))
+        .execute(
+            "github_pr_status",
+            json!({ "level": "l1", "field": "conflicts" }),
+        )
         .await;
     assert!(result.is_ok(), "L1 should execute via registry");
 
     let val = result.unwrap();
     assert_eq!(val["level"], "l1");
-    assert!(val["detail"].as_str().unwrap().contains("No merge conflicts"));
+    assert!(val["detail"]
+        .as_str()
+        .unwrap()
+        .contains("No merge conflicts"));
 }
 
 // ── L1 detail accuracy tests ────────────────────────────────────────────────
@@ -627,7 +637,11 @@ fn test_l1_all_valid_fields() {
     ] {
         let result = data.to_l1(field);
         assert!(result.is_ok(), "Field '{}' should be valid", field);
-        assert!(!result.unwrap().is_empty(), "Field '{}' should return content", field);
+        assert!(
+            !result.unwrap().is_empty(),
+            "Field '{}' should return content",
+            field
+        );
     }
 }
 
