@@ -1063,7 +1063,19 @@ impl Tool for RunCommandTool {
     }
 }
 
-/// GitHub PR status data collected from git and gh CLI
+/// GitHub API connection status for transparent degradation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum GitHubStatus {
+    /// Successfully connected to GitHub API.
+    Connected,
+    /// No GITHUB_TOKEN environment variable configured.
+    #[default]
+    NoToken,
+    /// API call failed with an error message.
+    ApiError(String),
+}
+
+/// GitHub PR status data collected from git and GitHub REST API.
 #[derive(Debug, Clone, Default)]
 pub struct PrStatusData {
     /// PR number (e.g., "#42")
@@ -1102,6 +1114,8 @@ pub struct PrStatusData {
     pub has_upstream: bool,
     /// Changed file paths (for diff detail)
     pub changed_files: Vec<String>,
+    /// GitHub API connection status
+    pub github_status: GitHubStatus,
 }
 
 impl PrStatusData {
@@ -1194,6 +1208,13 @@ impl PrStatusData {
             }
         }
 
+        // GitHub connection status (visible degradation)
+        match &self.github_status {
+            GitHubStatus::Connected => {}
+            GitHubStatus::NoToken => parts.push("[github:unconfigured]".to_string()),
+            GitHubStatus::ApiError(_) => parts.push("[github:error]".to_string()),
+        }
+
         parts.join(" ")
     }
 
@@ -1279,15 +1300,26 @@ impl PrStatusData {
                 Some(days) => Ok(format!("Last updated {} days ago", days)),
                 None => Ok("Staleness data not available.".to_string()),
             },
+            "github" => match &self.github_status {
+                GitHubStatus::Connected => {
+                    Ok("GitHub API: connected (token configured)".to_string())
+                }
+                GitHubStatus::NoToken => Ok(
+                    "GitHub API: not configured. Set GITHUB_TOKEN env var with repo:status and read:org scopes to enable PR data, CI status, and review information.".to_string(),
+                ),
+                GitHubStatus::ApiError(msg) => {
+                    Ok(format!("GitHub API: error — {}", msg))
+                }
+            },
             _ => Err(format!(
-                "Unknown field '{}'. Valid fields: conflicts, ci, diff, sync, review, automerge, staleness",
+                "Unknown field '{}'. Valid fields: conflicts, ci, diff, sync, review, automerge, staleness, github",
                 field
             )),
         }
     }
 }
 
-/// Collect PR status data from git and (optionally) gh CLI.
+/// Collect PR status data from git and (optionally) the GitHub REST API.
 fn collect_pr_status(workspace_root: &Path) -> ToolResult<PrStatusData> {
     let mut data = PrStatusData::default();
 
@@ -1428,130 +1460,287 @@ fn collect_pr_status(workspace_root: &Path) -> ToolResult<PrStatusData> {
         }
     }
 
-    // -- gh CLI data (graceful degradation) --
-    if let Ok(gh_output) = std::process::Command::new("gh")
-        .args([
-            "pr", "view", "--json",
-            "number,state,isDraft,reviewDecision,mergeStateStatus,autoMergeRequest,statusCheckRollup,updatedAt,closingIssuesReferences",
-        ])
+    // -- GitHub REST API data (explicit degradation) --
+    let token = std::env::var("GITHUB_TOKEN").ok();
+
+    if let Some(ref token) = token {
+        match fetch_github_pr_data(workspace_root, &data, token) {
+            Ok(gh_data) => {
+                data.pr_number = gh_data.pr_number.or(data.pr_number);
+                data.issue_number = gh_data.issue_number.or(data.issue_number);
+                data.pr_status = gh_data.pr_status.or(data.pr_status);
+                data.review_state = gh_data.review_state.or(data.review_state);
+                data.ci_status = gh_data.ci_status.or(data.ci_status);
+                data.ci_failing_checks = if gh_data.ci_failing_checks.is_empty() {
+                    data.ci_failing_checks
+                } else {
+                    gh_data.ci_failing_checks
+                };
+                data.automerge = gh_data.automerge;
+                data.staleness_days = gh_data.staleness_days.or(data.staleness_days);
+                if let Some(count) = gh_data.conflict_count {
+                    if data.conflict_count.is_none() {
+                        data.conflict_count = Some(count);
+                    }
+                }
+                data.github_status = GitHubStatus::Connected;
+            }
+            Err(e) => {
+                data.github_status = GitHubStatus::ApiError(e);
+            }
+        }
+    }
+    // else: data.github_status remains NoToken (the default)
+
+    Ok(data)
+}
+
+/// Parse a GitHub remote URL into (owner, repo).
+fn parse_github_remote(url: &str) -> Option<(String, String)> {
+    // Handle SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let path = rest.trim_end_matches(".git");
+        let (owner, repo) = path.split_once('/')?;
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    }
+    // Handle HTTPS: https://github.com/owner/repo.git
+    if url.contains("github.com") {
+        let path = url
+            .split("github.com")
+            .nth(1)?
+            .trim_start_matches('/')
+            .trim_start_matches(':')
+            .trim_end_matches(".git");
+        let (owner, repo) = path.split_once('/')?;
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    }
+    None
+}
+
+/// Fetch PR data from the GitHub REST API. Returns partial data on success,
+/// or an error message string on failure.
+fn fetch_github_pr_data(
+    workspace_root: &Path,
+    local_data: &PrStatusData,
+    token: &str,
+) -> Result<PrStatusData, String> {
+    let mut gh_data = PrStatusData::default();
+
+    // Get remote URL
+    let remote_output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
         .current_dir(workspace_root)
         .output()
+        .map_err(|e| format!("failed to get git remote: {}", e))?;
+
+    if !remote_output.status.success() {
+        return Err("no 'origin' remote configured".to_string());
+    }
+
+    let remote_url = String::from_utf8_lossy(&remote_output.stdout)
+        .trim()
+        .to_string();
+    let (owner, repo) =
+        parse_github_remote(&remote_url).ok_or_else(|| "not a GitHub remote".to_string())?;
+
+    let branch = local_data
+        .branch
+        .as_deref()
+        .ok_or_else(|| "no branch detected".to_string())?;
+
+    let client = reqwest::blocking::Client::new();
+    let api_base = "https://api.github.com";
+
+    // Find PR for current branch
+    let pr_url = format!(
+        "{}/repos/{}/{}/pulls?head={}:{}&state=open",
+        api_base, owner, repo, owner, branch
+    );
+    let pr_resp = client
+        .get(&pr_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nanna-coder-harness")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("GitHub API request failed: {}", e))?;
+
+    if !pr_resp.status().is_success() {
+        let status = pr_resp.status();
+        return Err(format!("GitHub API returned {}", status));
+    }
+
+    let prs: Vec<Value> = pr_resp
+        .json()
+        .map_err(|e| format!("failed to parse PR response: {}", e))?;
+
+    let pr_json = match prs.first() {
+        Some(pr) => pr,
+        None => return Ok(gh_data), // No open PR for this branch — not an error
+    };
+
+    // PR number
+    gh_data.pr_number = pr_json.get("number").and_then(|v| v.as_u64());
+
+    // PR status (draft/ready/merged/closed)
+    let is_draft = pr_json
+        .get("draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let state = pr_json.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    gh_data.pr_status = Some(match (state, is_draft) {
+        (_, true) => "draft".to_string(),
+        ("closed", _) => "closed".to_string(),
+        _ => "ready".to_string(),
+    });
+
+    // Merge conflicts from mergeable_state
+    if let Some(mergeable_state) = pr_json.get("mergeable_state").and_then(|v| v.as_str()) {
+        if mergeable_state == "dirty" {
+            gh_data.conflict_count = Some(1);
+        }
+    }
+
+    // Automerge
+    gh_data.automerge = pr_json
+        .get("auto_merge")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
+    // Staleness
+    if let Some(updated_at) = pr_json.get("updated_at").and_then(|v| v.as_str()) {
+        if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+            let now = chrono::Utc::now();
+            let duration = now.signed_duration_since(updated);
+            gh_data.staleness_days = Some(duration.num_days() as u64);
+        }
+    }
+
+    // Linked issues from body (look for "Closes #N" / "Fixes #N" patterns)
+    if let Some(body) = pr_json.get("body").and_then(|v| v.as_str()) {
+        let issue_re =
+            regex::Regex::new(r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)").ok();
+        if let Some(re) = issue_re {
+            if let Some(caps) = re.captures(body) {
+                if let Some(num) = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok()) {
+                    gh_data.issue_number = Some(num);
+                }
+            }
+        }
+    }
+
+    let pr_number = match gh_data.pr_number {
+        Some(n) => n,
+        None => return Ok(gh_data),
+    };
+
+    // Fetch reviews for review decision
+    let reviews_url = format!(
+        "{}/repos/{}/{}/pulls/{}/reviews",
+        api_base, owner, repo, pr_number
+    );
+    if let Ok(reviews_resp) = client
+        .get(&reviews_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nanna-coder-harness")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
     {
-        if gh_output.status.success() {
-            if let Ok(pr_json) = serde_json::from_slice::<Value>(&gh_output.stdout) {
-                // PR number
-                data.pr_number = pr_json.get("number").and_then(|v| v.as_u64());
-
-                // PR status
-                let is_draft = pr_json
-                    .get("isDraft")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let state = pr_json
-                    .get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                data.pr_status = Some(match (state, is_draft) {
-                    (_, true) => "draft".to_string(),
-                    ("MERGED", _) => "merged".to_string(),
-                    ("CLOSED", _) => "closed".to_string(),
-                    _ => "ready".to_string(),
-                });
-
-                // Review decision
-                if let Some(review) = pr_json.get("reviewDecision").and_then(|v| v.as_str()) {
-                    data.review_state = Some(match review {
-                        "APPROVED" => "approved".to_string(),
-                        "CHANGES_REQUESTED" => "changes-requested".to_string(),
-                        "REVIEW_REQUIRED" => "review-required".to_string(),
-                        other => other.to_lowercase(),
-                    });
-                }
-
-                // Merge conflicts from mergeStateStatus
-                if let Some(merge_state) =
-                    pr_json.get("mergeStateStatus").and_then(|v| v.as_str())
-                {
-                    if merge_state == "DIRTY" && data.conflict_count.is_none() {
-                        // GitHub says there are conflicts but we couldn't detect locally
-                        data.conflict_count = Some(1); // at least 1
+        if reviews_resp.status().is_success() {
+            if let Ok(reviews) = reviews_resp.json::<Vec<Value>>() {
+                // Use the last substantive review state per reviewer
+                let mut latest_states: HashMap<String, String> = HashMap::new();
+                for review in &reviews {
+                    let user = review
+                        .get("user")
+                        .and_then(|u| u.get("login"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    if state == "APPROVED" || state == "CHANGES_REQUESTED" || state == "DISMISSED" {
+                        latest_states.insert(user.to_string(), state.to_string());
                     }
                 }
-
-                // Automerge
-                data.automerge = pr_json
-                    .get("autoMergeRequest")
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-
-                // CI status
-                if let Some(checks) = pr_json.get("statusCheckRollup").and_then(|v| v.as_array())
-                {
-                    let mut has_fail = false;
-                    let mut has_pending = false;
-                    let mut failing_names = Vec::new();
-
-                    for check in checks {
-                        let conclusion =
-                            check.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-                        let state_val =
-                            check.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                        let name = check
-                            .get("name")
-                            .or_else(|| check.get("context"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-
-                        if conclusion == "FAILURE" || conclusion == "ERROR"
-                            || state_val == "FAILURE" || state_val == "ERROR"
-                        {
-                            has_fail = true;
-                            failing_names.push(name.to_string());
-                        } else if conclusion.is_empty()
-                            && (state_val == "PENDING" || state_val == "EXPECTED")
-                        {
-                            has_pending = true;
-                        }
-                    }
-
-                    data.ci_status = Some(if has_fail {
-                        "fail".to_string()
-                    } else if has_pending {
-                        "pending".to_string()
-                    } else {
-                        "pass".to_string()
-                    });
-                    data.ci_failing_checks = failing_names;
+                if latest_states.values().any(|s| s == "CHANGES_REQUESTED") {
+                    gh_data.review_state = Some("changes-requested".to_string());
+                } else if latest_states.values().any(|s| s == "APPROVED") {
+                    gh_data.review_state = Some("approved".to_string());
+                } else if !latest_states.is_empty() {
+                    gh_data.review_state = Some("review-required".to_string());
                 }
+            }
+        }
+    }
 
-                // Linked issue
-                if let Some(issues) = pr_json
-                    .get("closingIssuesReferences")
-                    .and_then(|v| v.as_array())
-                {
-                    if let Some(first_issue) = issues.first() {
-                        data.issue_number =
-                            first_issue.get("number").and_then(|v| v.as_u64());
-                    }
-                }
-
-                // Staleness
-                if let Some(updated_at) =
-                    pr_json.get("updatedAt").and_then(|v| v.as_str())
-                {
-                    if let Ok(updated) =
-                        chrono::DateTime::parse_from_rfc3339(updated_at)
+    // Fetch CI status via check-runs
+    let head_sha = pr_json
+        .get("head")
+        .and_then(|h| h.get("sha"))
+        .and_then(|v| v.as_str());
+    if let Some(sha) = head_sha {
+        let checks_url = format!(
+            "{}/repos/{}/{}/commits/{}/check-runs",
+            api_base, owner, repo, sha
+        );
+        if let Ok(checks_resp) = client
+            .get(&checks_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "nanna-coder-harness")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+        {
+            if checks_resp.status().is_success() {
+                if let Ok(checks_json) = checks_resp.json::<Value>() {
+                    if let Some(check_runs) =
+                        checks_json.get("check_runs").and_then(|v| v.as_array())
                     {
-                        let now = chrono::Utc::now();
-                        let duration = now.signed_duration_since(updated);
-                        data.staleness_days = Some(duration.num_days() as u64);
+                        let mut has_fail = false;
+                        let mut has_pending = false;
+                        let mut failing_names = Vec::new();
+
+                        for check in check_runs {
+                            let conclusion = check
+                                .get("conclusion")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = check
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+
+                            if conclusion == "failure" || conclusion == "timed_out" {
+                                has_fail = true;
+                                failing_names.push(name.to_string());
+                            } else if status == "queued"
+                                || status == "in_progress"
+                                || status == "waiting"
+                            {
+                                has_pending = true;
+                            }
+                        }
+
+                        gh_data.ci_status = Some(if has_fail {
+                            "fail".to_string()
+                        } else if has_pending {
+                            "pending".to_string()
+                        } else {
+                            "pass".to_string()
+                        });
+                        gh_data.ci_failing_checks = failing_names;
                     }
                 }
             }
         }
     }
 
-    Ok(data)
+    Ok(gh_data)
 }
 
 pub struct GitHubPrStatusTool {
@@ -1590,7 +1779,7 @@ impl Tool for GitHubPrStatusTool {
                             PropertySchema {
                                 schema_type: SchemaType::String,
                                 description: Some(
-                                    "Field to expand (required for l1). Options: conflicts, ci, diff, sync, review, automerge, staleness".to_string(),
+                                    "Field to expand (required for l1). Options: conflicts, ci, diff, sync, review, automerge, staleness, github".to_string(),
                                 ),
                                 items: None,
                             },
@@ -1607,13 +1796,15 @@ impl Tool for GitHubPrStatusTool {
         let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("l0");
 
         let data = collect_pr_status(&self.workspace_root)?;
+        let github_connected = data.github_status == GitHubStatus::Connected;
 
         match level {
             "l0" => {
                 let status_line = data.to_l0();
                 Ok(json!({
                     "level": "l0",
-                    "status": status_line
+                    "status": status_line,
+                    "github_connected": github_connected
                 }))
             }
             "l1" => {
@@ -1630,7 +1821,8 @@ impl Tool for GitHubPrStatusTool {
                 Ok(json!({
                     "level": "l1",
                     "field": field,
-                    "detail": detail
+                    "detail": detail,
+                    "github_connected": github_connected
                 }))
             }
             _ => Err(ToolError::InvalidArguments {
@@ -1888,6 +2080,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             has_upstream: true,
             changed_files: vec![],
+            github_status: GitHubStatus::Connected,
         };
 
         let l0 = data.to_l0();
@@ -1915,6 +2108,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             has_upstream: true,
             changed_files: vec![],
+            github_status: GitHubStatus::Connected,
         };
 
         let l0 = data.to_l0();
@@ -1942,6 +2136,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             has_upstream: false,
             changed_files: vec![],
+            github_status: GitHubStatus::Connected,
         };
 
         let l0 = data.to_l0();
@@ -1969,6 +2164,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             has_upstream: true,
             changed_files: vec![],
+            github_status: GitHubStatus::Connected,
         };
 
         let l0 = data.to_l0();
@@ -1996,6 +2192,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             has_upstream: true,
             changed_files: vec![],
+            github_status: GitHubStatus::Connected,
         };
 
         let l0 = data.to_l0();
@@ -2014,6 +2211,7 @@ mod tests {
             deletions: Some(0),
             has_upstream: true,
             ci_status: Some("pass".to_string()),
+            github_status: GitHubStatus::Connected,
             ..Default::default()
         };
 
@@ -2027,6 +2225,7 @@ mod tests {
         let data = PrStatusData {
             head_sha: Some("def456".to_string()),
             has_upstream: false,
+            github_status: GitHubStatus::Connected,
             ..Default::default()
         };
 
