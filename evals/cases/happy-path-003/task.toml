@@ -1,0 +1,17 @@
+[case]
+id = "happy-path-003"
+name = "Add a new module"
+description = "Add a new utils module to an existing library crate"
+
+[task]
+prompt = "Create a new module named `utils` in a separate file `src/utils.rs` with a public function `add(a: i32, b: i32) -> i32` that returns the sum. Declare the module in `src/lib.rs`."
+
+[expected]
+files_changed = ["src/lib.rs", "src/utils.rs"]
+build_must_pass = true
+required_symbols = ["utils", "add"]
+
+[metadata]
+difficulty = "easy"
+tags = ["module", "addition"]
+timeout_secs = 120

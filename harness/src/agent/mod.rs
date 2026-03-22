@@ -10,6 +10,7 @@
 
 pub mod decision;
 pub mod eval;
+pub mod eval_case;
 pub mod prompts;
 pub mod rag;
 
