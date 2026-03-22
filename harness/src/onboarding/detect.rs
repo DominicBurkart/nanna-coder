@@ -7,6 +7,7 @@ use std::path::Path;
 pub struct CargoManifest {
     pub name: String,
     pub edition: Option<String>,
+    pub rust_version: Option<String>,
     pub is_workspace: bool,
     pub members: Vec<String>,
     pub dependencies: Vec<String>,
@@ -95,6 +96,19 @@ fn parse_cargo_toml(path: &Path, repo_root: &Path) -> Result<CargoManifest, Onbo
             .map(String::from)
     };
 
+    let rust_version = if is_workspace {
+        doc.get("workspace")
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.get("rust-version"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        doc.get("package")
+            .and_then(|p| p.get("rust-version"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+
     let members = if is_workspace {
         doc.get("workspace")
             .and_then(|w| w.get("members"))
@@ -140,6 +154,7 @@ fn parse_cargo_toml(path: &Path, repo_root: &Path) -> Result<CargoManifest, Onbo
     Ok(CargoManifest {
         name,
         edition,
+        rust_version,
         is_workspace,
         members,
         dependencies: dependencies.into_iter().collect(),
@@ -193,12 +208,17 @@ impl ProjectSignals {
             .map_err(|e| OnboardingError::ProfileError(e.to_string()))?,
         ];
 
+        let rust_version = manifest
+            .rust_version
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RUST_VERSION.to_string());
+
         Ok(ProjectProfile {
             project_name: manifest.name.clone(),
             build_system: BuildSystem::Cargo,
             tools,
             nix_packages,
-            rust_version: Some(DEFAULT_RUST_VERSION.to_string()),
+            rust_version: Some(rust_version),
             extra_env_vars: vec![],
         })
     }
@@ -431,6 +451,43 @@ openssl = "0.10"
         assert!(profile
             .nix_packages
             .contains(&"pkgs.pkg-config".to_string()));
+    }
+
+    #[test]
+    fn to_cargo_profile_reads_rust_version_from_cargo_toml() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[package]
+name = "myapp"
+version = "0.1.0"
+rust-version = "1.80.0"
+"#,
+        );
+        let signals = scan_project(dir.path()).unwrap();
+        let profile = signals.to_cargo_profile().unwrap();
+        assert_eq!(profile.rust_version, Some("1.80.0".to_string()));
+    }
+
+    #[test]
+    fn to_cargo_profile_reads_rust_version_from_workspace_cargo_toml() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[workspace]
+members = []
+
+[workspace.package]
+rust-version = "1.78.0"
+"#,
+        );
+        let signals = scan_project(dir.path()).unwrap();
+        let profile = signals.to_cargo_profile().unwrap();
+        assert_eq!(profile.rust_version, Some("1.78.0".to_string()));
     }
 
     #[test]

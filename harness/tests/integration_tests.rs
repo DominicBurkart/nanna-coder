@@ -1849,6 +1849,8 @@ async fn test_e2e_agent_with_containerized_ollama() {
 fn git_cmd_clean(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     for var in &[
         "GIT_DIR",
         "GIT_INDEX_FILE",
@@ -1873,7 +1875,7 @@ fn init_test_git_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# Test").unwrap();
     git_cmd_clean(dir).args(["add", "."]).output().unwrap();
     let status = git_cmd_clean(dir)
-        .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
+        .args(["commit", "-m", "init"])
         .output()
         .unwrap();
     assert!(status.status.success(), "git commit failed in test setup");
