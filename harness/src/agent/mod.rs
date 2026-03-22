@@ -9,6 +9,7 @@
 //! 6. If Yes → Application State 2 (completed)
 
 pub mod decision;
+pub mod eval_case;
 pub mod prompts;
 pub mod rag;
 
