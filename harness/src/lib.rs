@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod container;
 pub mod entities;
+pub mod eval;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
@@ -39,6 +40,9 @@ pub use agent::{
     AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
     AgentState,
 };
+
+// Export eval report types
+pub use eval::report::EvalReport;
 
 // Export entity types
 pub use entities::{
