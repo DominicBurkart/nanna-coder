@@ -2,9 +2,11 @@
 //!
 //! These tests exercise the full tool lifecycle: registration, definition,
 //! execution at both L0 and L1 levels, and error handling.
-//! Tests gracefully handle environments where git or gh CLI may be unavailable.
+//! Tests gracefully handle environments where git or GITHUB_TOKEN may be unavailable.
 
-use harness::tools::{create_tool_registry, GitHubPrStatusTool, PrStatusData, Tool, ToolError};
+use harness::tools::{
+    create_tool_registry, GitHubPrStatusTool, GitHubStatus, PrStatusData, Tool, ToolError,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -469,6 +471,7 @@ fn test_l0_format_draft_with_conflicts() {
         deletions: Some(233),
         ci_status: Some("fail".to_string()),
         has_upstream: true,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -488,6 +491,7 @@ fn test_l0_format_ready_approved_automerge() {
         automerge: true,
         staleness_days: Some(2),
         has_upstream: true,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -505,6 +509,7 @@ fn test_l0_format_behind_no_pr() {
         additions: Some(66),
         deletions: Some(233),
         has_upstream: true,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -518,6 +523,7 @@ fn test_l0_format_commit_no_upstream() {
         additions: Some(5),
         deletions: Some(2),
         has_upstream: false,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -537,6 +543,7 @@ fn test_l0_format_changes_requested() {
         deletions: Some(50),
         ci_status: Some("pending".to_string()),
         has_upstream: true,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -555,6 +562,7 @@ fn test_l0_format_clean_pr() {
         deletions: Some(0),
         ci_status: Some("pass".to_string()),
         has_upstream: true,
+        github_status: GitHubStatus::Connected,
         ..Default::default()
     };
 
@@ -634,6 +642,7 @@ fn test_l1_all_valid_fields() {
         "review",
         "automerge",
         "staleness",
+        "github",
     ] {
         let result = data.to_l1(field);
         assert!(result.is_ok(), "Field '{}' should be valid", field);
@@ -684,4 +693,152 @@ fn test_l1_ci_with_multiple_failures() {
     assert!(detail.contains("lint"));
     assert!(detail.contains("test-unit"));
     assert!(detail.contains("test-integration"));
+}
+
+// ── GitHub status degradation tests ─────────────────────────────────────────
+
+#[test]
+fn test_l0_shows_unconfigured_when_no_token() {
+    let data = PrStatusData {
+        head_sha: Some("abc123".to_string()),
+        has_upstream: false,
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:unconfigured]"),
+        "L0 should show unconfigured hint: '{}'",
+        l0
+    );
+}
+
+#[test]
+fn test_l0_shows_error_when_api_fails() {
+    let data = PrStatusData {
+        head_sha: Some("abc123".to_string()),
+        has_upstream: false,
+        github_status: GitHubStatus::ApiError("401 Unauthorized".to_string()),
+        ..Default::default()
+    };
+
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:error]"),
+        "L0 should show error hint: '{}'",
+        l0
+    );
+}
+
+#[test]
+fn test_l0_no_hint_when_connected() {
+    let data = PrStatusData {
+        pr_number: Some(42),
+        has_upstream: true,
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+
+    let l0 = data.to_l0();
+    assert!(
+        !l0.contains("[github:"),
+        "L0 should not show github hint when connected: '{}'",
+        l0
+    );
+}
+
+#[test]
+fn test_l1_github_field_no_token() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("not configured"),
+        "Should explain how to configure: '{}'",
+        detail
+    );
+    assert!(
+        detail.contains("GITHUB_TOKEN"),
+        "Should mention GITHUB_TOKEN: '{}'",
+        detail
+    );
+}
+
+#[test]
+fn test_l1_github_field_connected() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("connected"),
+        "Should show connected status: '{}'",
+        detail
+    );
+}
+
+#[test]
+fn test_l1_github_field_api_error() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::ApiError("403 Forbidden".to_string()),
+        ..Default::default()
+    };
+
+    let detail = data.to_l1("github").unwrap();
+    assert!(detail.contains("error"), "Should show error: '{}'", detail);
+    assert!(
+        detail.contains("403 Forbidden"),
+        "Should include error message: '{}'",
+        detail
+    );
+}
+
+#[tokio::test]
+async fn test_execute_returns_github_connected_field() {
+    if !has_git() {
+        eprintln!("Skipping: git not available");
+        return;
+    }
+
+    let repo = create_temp_git_repo();
+    let tool = GitHubPrStatusTool::new(repo.path().to_path_buf());
+
+    let result = tool.execute(json!({})).await.unwrap();
+    // github_connected should be present in response
+    assert!(
+        result.get("github_connected").is_some(),
+        "Response should include github_connected field"
+    );
+}
+
+#[tokio::test]
+async fn test_l1_github_field_via_tool() {
+    if !has_git() {
+        eprintln!("Skipping: git not available");
+        return;
+    }
+
+    let repo = create_temp_git_repo();
+    let tool = GitHubPrStatusTool::new(repo.path().to_path_buf());
+
+    let result = tool
+        .execute(json!({ "level": "l1", "field": "github" }))
+        .await
+        .unwrap();
+
+    assert_eq!(result["level"], "l1");
+    assert_eq!(result["field"], "github");
+    let detail = result["detail"].as_str().unwrap();
+    // Without GITHUB_TOKEN set, should show unconfigured message
+    assert!(
+        detail.contains("not configured") || detail.contains("connected"),
+        "Should report GitHub status: '{}'",
+        detail
+    );
 }
