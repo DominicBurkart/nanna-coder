@@ -2,20 +2,20 @@
 
 use harness::agent::eval_case::EvalCase;
 use harness::eval::runner::{run_eval, EvalRunnerConfig, EvalRunnerError};
-use std::path::Path;
+use std::path::PathBuf;
 
 /// Locate the evals/cases directory relative to the workspace root.
-fn cases_dir() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn cases_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .join("evals/cases")
-        .leak()
 }
 
 #[tokio::test]
 async fn test_run_eval_returns_result() {
-    let task_toml = cases_dir().join("happy-path-001/task.toml");
+    let cases_dir = cases_dir();
+    let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
     let case_dir = task_toml.parent().unwrap();
 
@@ -58,7 +58,8 @@ timeout_secs = 1
 
 #[tokio::test]
 async fn test_run_eval_isolation() {
-    let task_toml = cases_dir().join("happy-path-001/task.toml");
+    let cases_dir = cases_dir();
+    let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
     let case_dir = task_toml.parent().unwrap();
     let config = EvalRunnerConfig::default().with_max_iterations(5);
@@ -75,7 +76,8 @@ async fn test_run_eval_isolation() {
 
 #[tokio::test]
 async fn test_discover_and_run_all_cases() {
-    let cases = EvalCase::discover(cases_dir()).unwrap();
+    let cases_dir = cases_dir();
+    let cases = EvalCase::discover(&cases_dir).unwrap();
     assert!(
         cases.len() >= 3,
         "Expected at least 3 eval cases, found {}",
