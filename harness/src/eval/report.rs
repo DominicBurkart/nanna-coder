@@ -343,6 +343,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    #[allow(clippy::too_many_arguments)]
     fn make_result(
         id: &str,
         success: bool,
