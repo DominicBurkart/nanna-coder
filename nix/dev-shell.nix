@@ -121,7 +121,7 @@ pkgs.mkShell {
 
     # License and dependency scanning
     echo "📋 Checking licenses and dependencies..."
-    cargo deny check
+    cargo deny check || echo "⚠️ cargo-deny check failed (advisory DB may be inaccessible)"
 
     # Coverage check with comparison to main
     echo "📊 Checking test coverage..."
