@@ -17,6 +17,7 @@ use crate::entities::{EntityStore, InMemoryEntityStore};
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -167,6 +168,7 @@ pub struct AgentLoop {
     plan_cache: Option<String>,
     tool_registry: Option<ToolRegistry>,
     conversation_history: Vec<ChatMessage>,
+    progress_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl AgentLoop {
@@ -182,6 +184,7 @@ impl AgentLoop {
             plan_cache: None,
             tool_registry: None,
             conversation_history: Vec::new(),
+            progress_counter: None,
         }
     }
 
@@ -197,6 +200,7 @@ impl AgentLoop {
             plan_cache: None,
             tool_registry: None,
             conversation_history: Vec::new(),
+            progress_counter: None,
         }
     }
 
@@ -216,6 +220,7 @@ impl AgentLoop {
             plan_cache: None,
             tool_registry: None,
             conversation_history: Vec::new(),
+            progress_counter: None,
         }
     }
 
@@ -236,7 +241,12 @@ impl AgentLoop {
             plan_cache: None,
             tool_registry: Some(tool_registry),
             conversation_history: Vec::new(),
+            progress_counter: None,
         }
+    }
+
+    pub fn set_progress_counter(&mut self, counter: Arc<AtomicUsize>) {
+        self.progress_counter = Some(counter);
     }
 
     pub fn conversation_history(&self) -> &[ChatMessage] {
@@ -352,6 +362,9 @@ impl AgentLoop {
             }
 
             self.iterations += 1;
+            if let Some(ref counter) = self.progress_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -782,6 +795,9 @@ impl AgentLoop {
             }
 
             self.iterations += 1;
+            if let Some(ref counter) = self.progress_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

@@ -495,7 +495,7 @@ async fn run_mcp_server(
     use model::provider::ModelProvider;
     use std::sync::Arc;
 
-    let task_manager = Arc::new(TaskManager::new());
+    let task_manager = Arc::new(TaskManager::default());
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {})",
