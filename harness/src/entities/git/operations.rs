@@ -65,11 +65,12 @@ pub fn read_repository(path: impl AsRef<Path>) -> GitOperationResult<GitReposito
         }
     }
 
-    // Get submodules
-    for submodule in repo.submodules()?.iter() {
-        if let Some(path) = submodule.path().to_str() {
-            if let Some(url) = submodule.url() {
-                git_repo.add_submodule(path.to_string(), url.to_string());
+    if let Ok(submodules) = repo.submodules() {
+        for submodule in submodules.iter() {
+            if let Some(path) = submodule.path().to_str() {
+                if let Some(url) = submodule.url() {
+                    git_repo.add_submodule(path.to_string(), url.to_string());
+                }
             }
         }
     }
