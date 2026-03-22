@@ -69,7 +69,8 @@ pub fn build_image(config: &ImageBuildConfig) -> ImageBuilderResult<PathBuf> {
 pub fn build_dev_container(source: &Path) -> ImageBuilderResult<PathBuf> {
     if !source.join("flake.nix").exists() {
         return Err(ImageBuilderError::InvalidConfig(
-            "source directory has no flake.nix; automatic flake generation is not yet supported (see issue #72)".to_string(),
+            "source directory has no flake.nix; use the onboard_repo tool to generate one"
+                .to_string(),
         ));
     }
 
