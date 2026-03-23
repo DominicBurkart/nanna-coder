@@ -47,6 +47,24 @@ ollama pull qwen3:0.6b
 ollama serve
 ```
 
+### Running Eval Tests
+
+With Ollama running and `qwen3:0.6b` pulled:
+
+```bash
+cargo test --test eval_runner_tests -- --ignored
+```
+
+Or using the Nix container (no local Ollama install needed):
+
+```bash
+nix run .#qwen3-container.copyToDockerDaemon
+docker run -d --name ollama-qwen3 -p 11434:11434 nanna-coder-ollama-qwen3:latest
+until curl -sf http://localhost:11434/api/tags | grep -q qwen3; do sleep 2; done
+cargo test --test eval_runner_tests -- --ignored
+docker rm -f ollama-qwen3
+```
+
 ### Using Cachix (Optional but Recommended)
 
 Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
