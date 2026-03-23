@@ -82,6 +82,22 @@ async fn test_run_eval_isolation() {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
+async fn test_run_eval_with_llm() {
+    let cases_dir = cases_dir();
+    let task_toml = cases_dir.join("happy-path-001/task.toml");
+    let case = EvalCase::from_toml_file(&task_toml).unwrap();
+    let case_dir = task_toml.parent().unwrap();
+
+    let config = EvalRunnerConfig::default().with_max_iterations(20);
+    let result = run_eval(&case, case_dir, &config).await.unwrap();
+
+    assert_eq!(result.case_id, "happy-path-001");
+    assert!(result.iterations > 0, "LLM-powered agent should iterate");
+    assert!(result.agent_result.is_some());
+}
+
+#[tokio::test]
+#[ignore] // requires Ollama instance
 async fn test_discover_and_run_all_cases() {
     let cases_dir = cases_dir();
     let cases = EvalCase::discover(&cases_dir).unwrap();
