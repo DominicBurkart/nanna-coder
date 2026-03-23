@@ -1483,6 +1483,7 @@ async fn test_agent_loop_tool_call_integration() {
         user_prompt: "Echo hello world".to_string(),
         conversation_history: vec![ChatMessage::user("Echo hello world")],
         app_state_id: "integration_test".to_string(),
+        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
@@ -1551,6 +1552,7 @@ async fn test_agent_loop_multi_tool_integration() {
         user_prompt: "Echo ping and add 2+3".to_string(),
         conversation_history: vec![ChatMessage::user("Echo ping and add 2+3")],
         app_state_id: "integration_test".to_string(),
+        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
@@ -1609,6 +1611,7 @@ async fn test_agent_loop_error_recovery_integration() {
         user_prompt: "Use a tool".to_string(),
         conversation_history: vec![ChatMessage::user("Use a tool")],
         app_state_id: "integration_test".to_string(),
+        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
@@ -1664,6 +1667,7 @@ async fn test_context_entity_stored_after_agent_run() {
         user_prompt: "Echo context test message".to_string(),
         conversation_history: vec![ChatMessage::user("Echo context test message")],
         app_state_id: "context_entity_test".to_string(),
+        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
@@ -1811,6 +1815,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
             "Use the echo tool to echo 'hello world'.",
         )],
         app_state_id: "e2e_test".to_string(),
+        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(

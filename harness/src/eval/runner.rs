@@ -25,7 +25,8 @@
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
-use std::path::Path;
+use crate::tools::create_tool_registry;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -176,12 +177,16 @@ pub async fn run_eval(
         model_name: config.model_name.clone(),
     };
 
-    let mut agent = AgentLoop::new(agent_config);
+    let tool_registry = create_tool_registry(work_dir);
+    let entity_store = crate::entities::InMemoryEntityStore::new();
+    let mut agent = AgentLoop::with_entity_store(agent_config, entity_store);
+    agent.set_tool_registry(tool_registry);
 
     let context = AgentContext {
         user_prompt: eval_case.task.prompt.clone(),
         conversation_history: vec![],
         app_state_id: format!("eval_{}", eval_case.case.id),
+        work_dir: Some(PathBuf::from(work_dir)),
     };
 
     let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
@@ -196,7 +201,8 @@ pub async fn run_eval(
         Ok(Err(e)) => {
             let mut f = vec![format!("Agent error: {e}")];
             // Still run verification even on agent error
-            let verification = run_verification(work_dir, &eval_case.expected).await;
+            let verification =
+                run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
             let execution_time = start.elapsed();
             let success = false;
             if !verification.all_passed() {
@@ -219,7 +225,8 @@ pub async fn run_eval(
     };
 
     // --- 3. Verification ---
-    let verification = run_verification(work_dir, &eval_case.expected).await;
+    let verification =
+        run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
 
     // --- 4. Collect metrics ---
     let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
@@ -254,6 +261,7 @@ pub async fn run_eval(
 async fn run_verification(
     work_dir: &Path,
     expected: &crate::agent::eval_case::ExpectedResult,
+    language: &str,
 ) -> VerificationResult {
     let build_passed = if expected.build_must_pass {
         Some(verify_build(work_dir).await)
@@ -268,7 +276,8 @@ async fn run_verification(
     };
 
     let (files_found, missing_files) = verify_files(work_dir, &expected.files_changed);
-    let (symbols_found, missing_symbols) = verify_symbols(work_dir, &expected.required_symbols);
+    let (symbols_found, missing_symbols) =
+        verify_symbols(work_dir, &expected.required_symbols, language);
 
     VerificationResult {
         build_passed,
@@ -281,27 +290,49 @@ async fn run_verification(
 }
 
 async fn verify_build(work_dir: &Path) -> bool {
-    tokio::process::Command::new("cargo")
+    let output = tokio::process::Command::new("cargo")
         .arg("build")
         .current_dir(work_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(o) => {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!("Build verification failed:\n{stderr}");
+            }
+            o.status.success()
+        }
+        Err(e) => {
+            tracing::warn!("Build verification could not run: {e}");
+            false
+        }
+    }
 }
 
 async fn verify_tests(work_dir: &Path) -> bool {
-    tokio::process::Command::new("cargo")
+    let output = tokio::process::Command::new("cargo")
         .arg("test")
         .current_dir(work_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(o) => {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!("Test verification failed:\n{stderr}");
+            }
+            o.status.success()
+        }
+        Err(e) => {
+            tracing::warn!("Test verification could not run: {e}");
+            false
+        }
+    }
 }
 
 fn verify_files(work_dir: &Path, expected_files: &[String]) -> (Vec<String>, Vec<String>) {
@@ -317,7 +348,11 @@ fn verify_files(work_dir: &Path, expected_files: &[String]) -> (Vec<String>, Vec
     (found, missing)
 }
 
-fn verify_symbols(work_dir: &Path, required_symbols: &[String]) -> (Vec<String>, Vec<String>) {
+fn verify_symbols(
+    work_dir: &Path,
+    required_symbols: &[String],
+    language: &str,
+) -> (Vec<String>, Vec<String>) {
     let mut found = Vec::new();
     let mut missing = Vec::new();
 
@@ -325,8 +360,8 @@ fn verify_symbols(work_dir: &Path, required_symbols: &[String]) -> (Vec<String>,
         return (found, missing);
     }
 
-    // Collect all source file contents
-    let source_content = collect_source_content(work_dir);
+    let extensions = extensions_for_language(language);
+    let source_content = collect_source_content(work_dir, &extensions);
 
     for symbol in required_symbols {
         if source_content.contains(symbol.as_str()) {
@@ -338,18 +373,37 @@ fn verify_symbols(work_dir: &Path, required_symbols: &[String]) -> (Vec<String>,
     (found, missing)
 }
 
-/// Recursively read all `.rs` source files under `dir` and concatenate their contents.
-fn collect_source_content(dir: &Path) -> String {
+/// Map a language name to its common file extensions.
+fn extensions_for_language(language: &str) -> Vec<&'static str> {
+    match language.to_lowercase().as_str() {
+        "rust" => vec!["rs"],
+        "python" => vec!["py"],
+        "javascript" | "js" => vec!["js", "jsx", "mjs"],
+        "typescript" | "ts" => vec!["ts", "tsx"],
+        "go" | "golang" => vec!["go"],
+        "java" => vec!["java"],
+        "c" => vec!["c", "h"],
+        "cpp" | "c++" => vec!["cpp", "cc", "cxx", "hpp", "h"],
+        "ruby" => vec!["rb"],
+        _ => vec!["rs"], // default to Rust for backwards compatibility
+    }
+}
+
+/// Recursively read source files under `dir` matching the given extensions
+/// and concatenate their contents.
+fn collect_source_content(dir: &Path, extensions: &[&str]) -> String {
     let mut content = String::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                content.push_str(&collect_source_content(&path));
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    content.push_str(&text);
-                    content.push('\n');
+                content.push_str(&collect_source_content(&path, extensions));
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if extensions.iter().any(|&e| e == ext) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        content.push_str(&text);
+                        content.push('\n');
+                    }
                 }
             }
         }
@@ -539,6 +593,7 @@ mod tests {
                 "hello".to_string(),
                 "missing_fn".to_string(),
             ],
+            "rust",
         );
 
         assert_eq!(found, vec!["greet", "hello"]);
