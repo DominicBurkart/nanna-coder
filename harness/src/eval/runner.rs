@@ -24,9 +24,12 @@
 //! ```
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
-use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
+use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
 use crate::tools::create_tool_registry;
+use model::config::OllamaConfig;
+use model::ollama::OllamaProvider;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -36,9 +39,11 @@ pub enum EvalRunnerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Agent error: {0}")]
-    Agent(#[from] AgentError),
+    Agent(#[from] crate::agent::AgentError),
     #[error("Eval case error: {0}")]
     EvalCase(#[from] EvalCaseError),
+    #[error("Model provider error: {0}")]
+    ModelProvider(String),
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
 }
@@ -136,9 +141,6 @@ pub struct EvalRunResult {
     /// Number of agent loop iterations.
     pub iterations: usize,
     /// Token usage aggregated across all LLM calls.
-    // TODO: Token tracking requires upstream changes to `AgentLoop` / `AgentRunResult`
-    // to aggregate `ChatResponse.usage` across iterations. The plumbing is in place
-    // so token data flows through once the agent tracks it.
     pub token_usage: TokenUsage,
     /// Post-completion verification results.
     pub verification: VerificationResult,
@@ -179,8 +181,19 @@ pub async fn run_eval(
 
     let tool_registry = create_tool_registry(work_dir);
     let entity_store = crate::entities::InMemoryEntityStore::new();
-    let mut agent = AgentLoop::with_entity_store(agent_config, entity_store);
-    agent.set_tool_registry(tool_registry);
+
+    // Create LLM provider so the agent uses the tool-calling loop
+    // (without a provider, the agent falls back to the entity-based loop
+    // which never touches the filesystem — see issue #98).
+    let mut ollama_config = OllamaConfig::new().with_timeout(Duration::from_secs(120));
+    if let Some(url) = &config.model_base_url {
+        ollama_config = ollama_config.with_base_url(url.clone());
+    }
+    let provider = OllamaProvider::new(ollama_config)
+        .map_err(|e| EvalRunnerError::ModelProvider(e.to_string()))?;
+    let provider = Arc::new(provider);
+
+    let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
 
     let context = AgentContext {
         user_prompt: eval_case.task.prompt.clone(),
@@ -242,12 +255,22 @@ pub async fn run_eval(
     let success = failures.is_empty();
     let execution_time = start.elapsed();
 
+    let token_usage = agent_result
+        .as_ref()
+        .and_then(|r| r.token_usage.as_ref())
+        .map(|u| TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        })
+        .unwrap_or_default();
+
     Ok(EvalRunResult {
         case_id: eval_case.case.id.clone(),
         success,
         execution_time,
         iterations,
-        token_usage: TokenUsage::default(),
+        token_usage,
         verification,
         failures,
         agent_result,
@@ -399,7 +422,7 @@ fn collect_source_content(dir: &Path, extensions: &[&str]) -> String {
             if path.is_dir() {
                 content.push_str(&collect_source_content(&path, extensions));
             } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|&e| e == ext) {
+                if extensions.contains(&ext) {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         content.push_str(&text);
                         content.push('\n');

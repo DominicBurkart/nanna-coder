@@ -201,6 +201,8 @@ pub struct AgentRunResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Snapshot of the full conversation
     pub conversation_snapshot: Vec<ChatMessage>,
+    /// Aggregated token usage across all LLM calls (`None` when no LLM was used).
+    pub token_usage: Option<model::types::Usage>,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -451,6 +453,7 @@ impl AgentLoop {
                     result_summary,
                     tool_calls_made,
                     conversation_snapshot: conversation,
+                    token_usage: None,
                 });
             }
 
@@ -810,6 +813,11 @@ impl AgentLoop {
     /// until the model stops with a non-tool finish reason.
     async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
+        let mut total_usage = model::types::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
 
         if !self.config.system_prompt.is_empty() {
             let sp = self.config.system_prompt.clone();
@@ -848,6 +856,12 @@ impl AgentLoop {
                 self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
             })?;
 
+            if let Some(usage) = &response.usage {
+                total_usage.prompt_tokens += usage.prompt_tokens;
+                total_usage.completion_tokens += usage.completion_tokens;
+                total_usage.total_tokens += usage.total_tokens;
+            }
+
             if response.choices.is_empty() {
                 return Err(self.enrich_error(bare_state_error("Empty response from model")));
             }
@@ -882,6 +896,7 @@ impl AgentLoop {
                         result_summary,
                         tool_calls_made,
                         conversation_snapshot: conversation,
+                        token_usage: Some(total_usage),
                     });
                 }
                 Some(FinishReason::ToolCalls) => {
