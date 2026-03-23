@@ -25,8 +25,13 @@
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
+use crate::entities::InMemoryEntityStore;
 use crate::tools::create_tool_registry;
+use model::config::OllamaConfig;
+use model::ollama::OllamaProvider;
+use model::provider::ModelProvider;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -170,17 +175,33 @@ pub async fn run_eval(
     let work_dir = tmp_dir.path();
 
     // --- 2. Build and run agent ---
+    let ollama_config = match &config.model_base_url {
+        Some(url) => OllamaConfig::default().with_base_url(url),
+        None => OllamaConfig::default(),
+    };
+
+    let provider: Option<Arc<dyn ModelProvider>> = match OllamaProvider::new(ollama_config) {
+        Ok(p) => match p.health_check().await {
+            Ok(()) => Some(Arc::new(p)),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
     let agent_config = AgentConfig {
         max_iterations: config.max_iterations,
         verbose: config.verbose,
-        system_prompt: String::new(),
+        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
         model_name: config.model_name.clone(),
     };
 
-    let tool_registry = create_tool_registry(work_dir);
-    let entity_store = crate::entities::InMemoryEntityStore::new();
-    let mut agent = AgentLoop::with_entity_store(agent_config, entity_store);
-    agent.set_tool_registry(tool_registry);
+    let mut agent = if let Some(provider) = provider {
+        let tool_registry = create_tool_registry(work_dir);
+        let entity_store = InMemoryEntityStore::new();
+        AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
+    } else {
+        AgentLoop::new(agent_config)
+    };
 
     let context = AgentContext {
         user_prompt: eval_case.task.prompt.clone(),
