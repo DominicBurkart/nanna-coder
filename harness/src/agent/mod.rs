@@ -1,12 +1,16 @@
 //! Agent architecture implementation
 //!
-//! This module implements the main agent control loop following the architecture:
-//! 1. Application State → User Prompt
-//! 2. Plan
-//! 3. Task Complete? decision
-//! 4. If No → Decision → Query (RAG) or Plan
-//! 5. Plan → Perform → back to check
+//! This module implements the main agent control loop following ARCHITECTURE.md:
+//!
+//! 1. Application State 1 → **Entity Enrichment**
+//! 2. Entity Enrichment → **Plan Entity Modification** ← User Prompt
+//! 3. Plan Entity Modification → **Perform Entity Modification**
+//! 4. Perform Entity Modification → **Update Entities**
+//! 5. Update Entities → **Task Complete?**
 //! 6. If Yes → Application State 2 (completed)
+//! 7. If No → **Entity Modification Decision**
+//! 8. Decision → **Query Entities (RAG)** → back to Decision
+//! 9. Decision → **Plan Entity Modification** (loop)
 
 pub mod decision;
 pub mod eval;
@@ -113,7 +117,7 @@ fn bare_state_error(message: impl Into<String>) -> AgentError {
         iterations_completed: 0,
         tool_calls_made: vec![],
         conversation_snapshot: vec![],
-        last_agent_state: AgentState::Planning,
+        last_agent_state: AgentState::PlanningEntityModification,
     }
 }
 
@@ -123,7 +127,7 @@ fn bare_task_check_failed(message: impl Into<String>) -> AgentError {
         iterations_completed: 0,
         tool_calls_made: vec![],
         conversation_snapshot: vec![],
-        last_agent_state: AgentState::Planning,
+        last_agent_state: AgentState::PlanningEntityModification,
     }
 }
 
@@ -132,24 +136,41 @@ fn bare_max_iterations(iterations_completed: usize) -> AgentError {
         iterations_completed,
         tool_calls_made: vec![],
         conversation_snapshot: vec![],
-        last_agent_state: AgentState::Planning,
+        last_agent_state: AgentState::PlanningEntityModification,
     }
 }
 
 /// State of the agent in the control loop
+///
+/// States and transitions mirror the Harness Control Flow in ARCHITECTURE.md:
+///
+/// ```text
+/// App State 1 → EnrichingEntities → PlanningEntityModification
+///                                     → PerformingEntityModification
+///                                       → UpdatingEntities
+///                                         → CheckingTaskCompletion
+///                                           ├─ Yes → Completed
+///                                           └─ No  → EntityModificationDecision
+///                                                     ├─ Query → QueryingEntities → EntityModificationDecision
+///                                                     └─ Plan  → PlanningEntityModification
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentState {
-    /// Planning
-    Planning,
-    /// Querying using RAG
-    Querying,
-    /// Deciding what to do
-    Deciding,
-    /// Performing action
-    Performing,
-    /// Checking if task is complete
-    CheckingCompletion,
-    /// Task completed successfully
+    /// Entity Enrichment: scan/enrich entities from application state (ARCHITECTURE.md)
+    EnrichingEntities,
+    /// Plan Entity Modification: analyse user request and create execution plan (ARCHITECTURE.md)
+    PlanningEntityModification,
+    /// Perform Entity Modification: execute the planned modification (ARCHITECTURE.md)
+    PerformingEntityModification,
+    /// Update Entities: commit entity changes to the store (ARCHITECTURE.md)
+    UpdatingEntities,
+    /// Task Complete? decision point (ARCHITECTURE.md)
+    CheckingTaskCompletion,
+    /// Entity Modification Decision: decide whether to query or plan (ARCHITECTURE.md)
+    EntityModificationDecision,
+    /// Query Entities (RAG): retrieve additional context (ARCHITECTURE.md)
+    QueryingEntities,
+    /// Task completed successfully → Application State 2 (ARCHITECTURE.md)
     Completed,
     /// Error state
     Error(String),
@@ -266,7 +287,7 @@ impl AgentLoop {
     /// Create a new agent loop with default entity store
     pub fn new(config: AgentConfig) -> Self {
         Self {
-            state: AgentState::Planning,
+            state: AgentState::EnrichingEntities,
             config,
             iterations: 0,
             entity_store: InMemoryEntityStore::new(),
@@ -283,7 +304,7 @@ impl AgentLoop {
     /// Create a new agent loop with a provided entity store
     pub fn with_entity_store(config: AgentConfig, entity_store: InMemoryEntityStore) -> Self {
         Self {
-            state: AgentState::Planning,
+            state: AgentState::EnrichingEntities,
             config,
             iterations: 0,
             entity_store,
@@ -304,7 +325,7 @@ impl AgentLoop {
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
-            state: AgentState::Planning,
+            state: AgentState::EnrichingEntities,
             config,
             iterations: 0,
             entity_store,
@@ -326,7 +347,7 @@ impl AgentLoop {
         tool_registry: ToolRegistry,
     ) -> Self {
         Self {
-            state: AgentState::Planning,
+            state: AgentState::EnrichingEntities,
             config,
             iterations: 0,
             entity_store,
@@ -471,33 +492,49 @@ impl AgentLoop {
             }
 
             match self.state.clone() {
-                AgentState::Planning => {
-                    if let Err(e) = self.plan(&context).await {
+                AgentState::EnrichingEntities => {
+                    if let Err(e) = self.enrich_entities(&context).await {
                         return Err(self.enrich_error(e));
                     }
-                    self.transition_to(AgentState::CheckingCompletion);
+                    self.transition_to(AgentState::PlanningEntityModification);
                 }
-                AgentState::CheckingCompletion => match self.check_task_complete(&context).await {
-                    Ok(true) => self.transition_to(AgentState::Completed),
-                    Ok(false) => self.transition_to(AgentState::Deciding),
-                    Err(e) => return Err(self.enrich_error(e)),
-                },
-                AgentState::Deciding => match self.decide(&context).await {
-                    Ok(true) => self.transition_to(AgentState::Querying),
-                    Ok(false) => self.transition_to(AgentState::Performing),
-                    Err(e) => return Err(self.enrich_error(e)),
-                },
-                AgentState::Querying => {
-                    if let Err(e) = self.query(&context).await {
+                AgentState::PlanningEntityModification => {
+                    if let Err(e) = self.plan_entity_modification(&context).await {
                         return Err(self.enrich_error(e));
                     }
-                    self.transition_to(AgentState::Planning);
+                    self.transition_to(AgentState::PerformingEntityModification);
                 }
-                AgentState::Performing => {
-                    if let Err(e) = self.perform(&context).await {
+                AgentState::PerformingEntityModification => {
+                    if let Err(e) = self.perform_entity_modification(&context).await {
                         return Err(self.enrich_error(e));
                     }
-                    self.transition_to(AgentState::CheckingCompletion);
+                    self.transition_to(AgentState::UpdatingEntities);
+                }
+                AgentState::UpdatingEntities => {
+                    if let Err(e) = self.update_entities(&context).await {
+                        return Err(self.enrich_error(e));
+                    }
+                    self.transition_to(AgentState::CheckingTaskCompletion);
+                }
+                AgentState::CheckingTaskCompletion => {
+                    match self.check_task_completion(&context).await {
+                        Ok(true) => self.transition_to(AgentState::Completed),
+                        Ok(false) => self.transition_to(AgentState::EntityModificationDecision),
+                        Err(e) => return Err(self.enrich_error(e)),
+                    }
+                }
+                AgentState::EntityModificationDecision => {
+                    match self.entity_modification_decision(&context).await {
+                        Ok(true) => self.transition_to(AgentState::QueryingEntities),
+                        Ok(false) => self.transition_to(AgentState::PlanningEntityModification),
+                        Err(e) => return Err(self.enrich_error(e)),
+                    }
+                }
+                AgentState::QueryingEntities => {
+                    if let Err(e) = self.query_entities(&context).await {
+                        return Err(self.enrich_error(e));
+                    }
+                    self.transition_to(AgentState::EntityModificationDecision);
                 }
                 AgentState::Completed | AgentState::Error(_) => unreachable!(),
             }
@@ -573,10 +610,11 @@ impl AgentLoop {
         }
     }
 
-    /// Plan - Query entities and prepare for action
-    async fn plan(&mut self, context: &AgentContext) -> AgentResult<()> {
+    /// Entity Enrichment (ARCHITECTURE.md) — scan and enrich entities from
+    /// the current application state via RAG before planning.
+    async fn enrich_entities(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.config.verbose {
-            tracing::info!("Planning for prompt: {}", context.user_prompt);
+            tracing::info!("Enriching entities for prompt: {}", context.user_prompt);
         }
 
         let query_results = rag::query_entities(
@@ -599,6 +637,34 @@ impl AgentLoop {
             }
         }
 
+        // Store enrichment results for use by the planning step
+        if !query_results.is_empty() {
+            let summary = format!(
+                "Found {} relevant entities: {}",
+                query_results.len(),
+                query_results
+                    .iter()
+                    .take(3)
+                    .map(|r| format!("{:?}", r.entity_type))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            self.plan_cache = Some(summary);
+        }
+
+        Ok(())
+    }
+
+    /// Plan Entity Modification (ARCHITECTURE.md) — analyse user request and
+    /// create an execution plan using the LLM and enriched entity context.
+    async fn plan_entity_modification(&mut self, context: &AgentContext) -> AgentResult<()> {
+        if self.config.verbose {
+            tracing::info!(
+                "Planning entity modification for prompt: {}",
+                context.user_prompt
+            );
+        }
+
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
 
@@ -609,10 +675,12 @@ impl AgentLoop {
                 .map_err(|e| bare_state_error(format!("Failed to query entities: {}", e)))?
                 .len();
 
-            let prompt_text = prompts::PlanningPrompt::build_from_results(
+            let enrichment_summary = self.plan_cache.as_deref().unwrap_or("No enrichment data");
+
+            let prompt_text = prompts::PlanningPrompt::build(
                 &context.user_prompt,
                 entity_count,
-                &query_results,
+                enrichment_summary,
             );
 
             let request = ChatRequest::new(
@@ -641,8 +709,9 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Check if the task is complete
-    async fn check_task_complete(&self, context: &AgentContext) -> AgentResult<bool> {
+    /// Task Complete? (ARCHITECTURE.md) — determine whether the user's
+    /// request has been fully satisfied.
+    async fn check_task_completion(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
 
@@ -704,8 +773,9 @@ impl AgentLoop {
         }
     }
 
-    /// Decide whether to query for more context
-    async fn decide(&self, context: &AgentContext) -> AgentResult<bool> {
+    /// Entity Modification Decision (ARCHITECTURE.md) — decide whether to
+    /// query for more context (true) or proceed to plan (false).
+    async fn entity_modification_decision(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
             use crate::entities::{EntityQuery, EntityStore};
 
@@ -765,8 +835,9 @@ impl AgentLoop {
         }
     }
 
-    /// Query using RAG for additional context
-    async fn query(&self, context: &AgentContext) -> AgentResult<()> {
+    /// Query Entities / RAG (ARCHITECTURE.md) — retrieve additional entity
+    /// context to inform the next modification decision.
+    async fn query_entities(&self, context: &AgentContext) -> AgentResult<()> {
         let results = rag::query_entities(
             &self.entity_store,
             &context.user_prompt,
@@ -782,15 +853,35 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Perform action — dispatches to perform_with_tools or perform_mvp
+    /// Perform Entity Modification (ARCHITECTURE.md) — execute the planned
+    /// modification, dispatching to tool-based or MVP implementation.
     #[allow(deprecated)]
-    async fn perform(&mut self, context: &AgentContext) -> AgentResult<()> {
+    async fn perform_entity_modification(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.llm_provider.is_some() && self.tool_registry.is_some() {
             let provider = self.llm_provider.as_ref().unwrap().clone();
-            self.perform_with_tools(context, &provider).await
+            self.perform_entity_modification_with_tools(context, &provider)
+                .await
         } else {
-            self.perform_mvp(context).await
+            self.perform_entity_modification_mvp(context).await
         }
+    }
+
+    /// Update Entities (ARCHITECTURE.md) — commit entity changes to the store
+    /// after a modification has been performed. Currently a lightweight
+    /// confirmation step; future versions may add validation or journaling.
+    async fn update_entities(&mut self, _context: &AgentContext) -> AgentResult<()> {
+        if self.config.verbose {
+            tracing::info!(
+                "Updating entities (performed_actions: {})",
+                self.performed_actions
+            );
+        }
+
+        // Entity mutations are currently applied inline during
+        // perform_entity_modification. This step exists to match the
+        // ARCHITECTURE.md flow and provide a hook for future validation,
+        // journaling, or batched writes.
+        Ok(())
     }
 
     /// MVP perform: create a GitRepository entity.
@@ -798,7 +889,7 @@ impl AgentLoop {
     /// Deprecated: Use `with_tools` constructor to get LLM-driven tool calling in
     /// the Performing state instead.
     #[deprecated(note = "Use with_tools constructor for LLM-driven performing")]
-    async fn perform_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
+    async fn perform_entity_modification_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
         use crate::entities::{git::types::GitRepository, EntityStore};
 
         self.performed_actions += 1;
@@ -825,7 +916,7 @@ impl AgentLoop {
     /// Full tool-calling run loop — formerly used when tool_registry is set.
     ///
     /// Deprecated: The state machine `run()` method now handles tools via
-    /// `perform_with_tools()` in the Performing state, following the architecture.
+    /// `perform_entity_modification_with_tools()` in the Performing state, following the architecture.
     #[deprecated(note = "run() now handles tools via the state machine")]
     #[allow(dead_code)]
     async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
@@ -946,11 +1037,12 @@ impl AgentLoop {
         }
     }
 
-    /// Tool-calling perform helper: inner loop for the state-machine `perform` step.
+    /// Tool-calling perform helper: inner loop for the state-machine
+    /// Perform Entity Modification step.
     ///
     /// Appends to the existing conversation history (set up by `run()`) rather than
     /// replacing it, so that the full architectural context is preserved.
-    async fn perform_with_tools(
+    async fn perform_entity_modification_with_tools(
         &mut self,
         context: &AgentContext,
         provider: &Arc<dyn ModelProvider>,
@@ -1121,15 +1213,16 @@ mod tests {
     }
 
     /// Wrap tool-loop responses with the state machine responses needed for
-    /// Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion flow.
+    /// EnrichingEntities → PlanningEntityModification → PerformingEntityModification →
+    /// UpdatingEntities → CheckingTaskCompletion flow.
     fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+        // EnrichingEntities: no LLM call
         let mut responses = vec![
-            plain_response("Plan: execute the task"),
-            plain_response("INCOMPLETE - task not started yet"),
-            plain_response("PROCEED - ready to act"),
+            plain_response("Plan: execute the task"), // PlanningEntityModification
         ];
-        responses.extend(tool_responses);
-        responses.push(plain_response("COMPLETE - task done"));
+        responses.extend(tool_responses); // PerformingEntityModification
+                                          // UpdatingEntities: no LLM call
+        responses.push(plain_response("COMPLETE - task done")); // CheckingTaskCompletion
         responses
     }
 
@@ -1145,7 +1238,7 @@ mod tests {
 
         assert!(agent.tool_registry().is_some());
         assert!(agent.llm_provider.is_some());
-        assert_eq!(agent.state(), &AgentState::Planning);
+        assert_eq!(agent.state(), &AgentState::EnrichingEntities);
     }
 
     #[test]
@@ -1167,7 +1260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_perform_with_tools_executes_calls() {
+    async fn test_perform_entity_modification_with_tools_executes_calls() {
         let provider = MockProvider::new(vec![
             tool_call_response("echo", serde_json::json!({"message": "hello"})),
             plain_response("Done! I echoed the message."),
@@ -1192,11 +1285,14 @@ mod tests {
             .push(ChatMessage::user("Echo hello"));
 
         let result = agent
-            .perform_with_tools(&context, &agent.llm_provider.as_ref().unwrap().clone())
+            .perform_entity_modification_with_tools(
+                &context,
+                &agent.llm_provider.as_ref().unwrap().clone(),
+            )
             .await;
         assert!(
             result.is_ok(),
-            "perform_with_tools should succeed: {:?}",
+            "perform_entity_modification_with_tools should succeed: {:?}",
             result
         );
         assert_eq!(agent.performed_actions, 1);
@@ -1209,7 +1305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_perform_with_tools_handles_errors() {
+    async fn test_perform_entity_modification_with_tools_handles_errors() {
         let provider = MockProvider::new(vec![
             tool_call_response("nonexistent_tool", serde_json::json!({})),
             plain_response("I couldn't find that tool."),
@@ -1233,7 +1329,9 @@ mod tests {
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
-        let result = agent.perform_with_tools(&context, &provider_clone).await;
+        let result = agent
+            .perform_entity_modification_with_tools(&context, &provider_clone)
+            .await;
         assert!(result.is_ok(), "Should handle tool errors gracefully");
 
         let has_error_response = agent.conversation_history.iter().any(|m| {
@@ -1248,7 +1346,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(deprecated)]
-    async fn test_perform_without_tools_mvp_fallback() {
+    async fn test_perform_entity_modification_without_tools_mvp_fallback() {
         let config = AgentConfig {
             max_iterations: 10,
             ..Default::default()
@@ -1264,7 +1362,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.perform_mvp(&context).await;
+        let result = agent.perform_entity_modification_mvp(&context).await;
         assert!(result.is_ok());
         assert_eq!(agent.performed_actions, 1);
 
@@ -1281,7 +1379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_perform_with_tools_max_iterations() {
+    async fn test_perform_entity_modification_with_tools_max_iterations() {
         let responses: Vec<ChatResponse> = (0..MAX_TOOL_ITERATIONS + 5)
             .map(|_| tool_call_response("echo", serde_json::json!({"message": "loop"})))
             .collect();
@@ -1307,7 +1405,9 @@ mod tests {
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
-        let result = agent.perform_with_tools(&context, &provider_clone).await;
+        let result = agent
+            .perform_entity_modification_with_tools(&context, &provider_clone)
+            .await;
         assert!(
             result.is_ok(),
             "Should stop after max iterations without error"
@@ -1317,11 +1417,11 @@ mod tests {
 
     #[test]
     fn test_agent_state_transitions() {
-        let state = AgentState::Planning;
-        assert_eq!(state, AgentState::Planning);
+        let state = AgentState::EnrichingEntities;
+        assert_eq!(state, AgentState::EnrichingEntities);
 
-        let state = AgentState::Querying;
-        assert_eq!(state, AgentState::Querying);
+        let state = AgentState::QueryingEntities;
+        assert_eq!(state, AgentState::QueryingEntities);
 
         let state = AgentState::Completed;
         assert_eq!(state, AgentState::Completed);
@@ -1331,7 +1431,7 @@ mod tests {
     fn test_agent_loop_creation() {
         let config = AgentConfig::default();
         let agent = AgentLoop::new(config);
-        assert_eq!(agent.state(), &AgentState::Planning);
+        assert_eq!(agent.state(), &AgentState::EnrichingEntities);
     }
 
     #[test]
@@ -1369,7 +1469,7 @@ mod tests {
         };
         let mut agent = AgentLoop::new(config);
 
-        agent.state = AgentState::Planning;
+        agent.state = AgentState::EnrichingEntities;
 
         let context = AgentContext {
             user_prompt: "test prompt".to_string(),
@@ -1408,7 +1508,7 @@ mod tests {
             assert_eq!(iters, 0);
             assert!(matches!(
                 state,
-                AgentState::Planning | AgentState::Completed
+                AgentState::EnrichingEntities | AgentState::Completed
             ));
             let _ = tool_calls;
             let _ = conversation;
@@ -1530,7 +1630,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.plan(&context).await;
+        let result = agent.plan_entity_modification(&context).await;
 
         if let Err(ref e) = result {
             let err_msg = e.to_string();
@@ -1559,11 +1659,11 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let is_complete = agent.check_task_complete(&context).await.unwrap();
+        let is_complete = agent.check_task_completion(&context).await.unwrap();
         assert!(is_complete, "Should be complete when performed_actions > 0");
 
         agent.performed_actions = 0;
-        let is_complete = agent.check_task_complete(&context).await.unwrap();
+        let is_complete = agent.check_task_completion(&context).await.unwrap();
         assert!(
             !is_complete,
             "Should be incomplete when performed_actions == 0"
@@ -1597,7 +1697,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.check_task_complete(&context).await;
+        let result = agent.check_task_completion(&context).await;
 
         if let Err(ref e) = result {
             let err_msg = e.to_string();
@@ -1633,7 +1733,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.decide(&context).await;
+        let result = agent.entity_modification_decision(&context).await;
 
         if result.is_err() {
             eprintln!("Skipping LLM decision test: LLM call failed");

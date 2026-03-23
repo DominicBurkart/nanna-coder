@@ -1435,15 +1435,16 @@ fn make_stop_response(content: &str) -> ChatResponse {
 }
 
 /// Wrap tool-loop responses with the state machine responses needed for
-/// Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion flow.
+/// EnrichingEntities → PlanningEntityModification → PerformingEntityModification →
+/// UpdatingEntities → CheckingTaskCompletion flow.
 fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+    // EnrichingEntities: no LLM call
     let mut responses = vec![
-        make_stop_response("Plan: execute the task"),
-        make_stop_response("INCOMPLETE - task not started yet"),
-        make_stop_response("PROCEED - ready to act"),
+        make_stop_response("Plan: execute the task"), // PlanningEntityModification
     ];
-    responses.extend(tool_responses);
-    responses.push(make_stop_response("COMPLETE - task done"));
+    responses.extend(tool_responses); // PerformingEntityModification
+                                      // UpdatingEntities: no LLM call
+    responses.push(make_stop_response("COMPLETE - task done")); // CheckingTaskCompletion
     responses
 }
 
@@ -2179,8 +2180,9 @@ async fn test_state_machine_follows_architecture_with_tools() {
 
     assert!(result.task_completed);
 
-    // Verify the agent followed the architectural state machine:
-    // Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion → Completed
+    // Verify the agent followed the architectural state machine (ARCHITECTURE.md):
+    // EnrichingEntities → PlanningEntityModification → PerformingEntityModification →
+    // UpdatingEntities → CheckingTaskCompletion → Completed
     let history = agent.state_history();
     assert!(
         history.len() >= 5,
@@ -2189,46 +2191,47 @@ async fn test_state_machine_follows_architecture_with_tools() {
     );
     assert_eq!(
         history[0],
-        AgentState::CheckingCompletion,
-        "After Planning, should transition to CheckingCompletion"
+        AgentState::PlanningEntityModification,
+        "After EnrichingEntities, should transition to PlanningEntityModification"
     );
     assert_eq!(
         history[1],
-        AgentState::Deciding,
-        "After first CheckingCompletion (INCOMPLETE), should transition to Deciding"
+        AgentState::PerformingEntityModification,
+        "After Planning, should transition to PerformingEntityModification"
     );
     assert_eq!(
         history[2],
-        AgentState::Performing,
-        "After Deciding (PROCEED), should transition to Performing"
+        AgentState::UpdatingEntities,
+        "After Performing, should transition to UpdatingEntities"
     );
     assert_eq!(
         history[3],
-        AgentState::CheckingCompletion,
-        "After Performing, should transition to CheckingCompletion"
+        AgentState::CheckingTaskCompletion,
+        "After UpdatingEntities, should transition to CheckingTaskCompletion"
     );
     assert_eq!(
         history[4],
         AgentState::Completed,
-        "After final CheckingCompletion (COMPLETE), should transition to Completed"
+        "After CheckingTaskCompletion (COMPLETE), should transition to Completed"
     );
 }
 
 #[tokio::test]
 async fn test_state_machine_query_loop() {
-    // Decision returns QUERY first, then PROCEED
+    // Decision returns QUERY first, then PROCEED to re-plan
     let provider = Arc::new(SequenceMockProvider::new(vec![
-        make_stop_response("Plan: do the task"),         // planning
-        make_stop_response("INCOMPLETE"),                // first completion check
-        make_stop_response("QUERY - need more context"), // decision: QUERY
-        // After query, loops back to Planning:
-        make_stop_response("Revised plan after query"), // second planning
-        make_stop_response("INCOMPLETE"),               // second completion check
-        make_stop_response("PROCEED - ready to act"),   // decision: PROCEED
-        // Performing: perform_with_tools sub-loop
-        make_stop_response("Performed the action."),
-        // Back to completion check:
-        make_stop_response("COMPLETE - task done"),
+        // Enrich: no LLM
+        make_stop_response("Plan: do the task"), // PlanningEntityModification
+        make_stop_response("First action done."), // PerformingEntityModification
+        // Update: no LLM
+        make_stop_response("INCOMPLETE"), // CheckingTaskCompletion
+        make_stop_response("QUERY - need more context"), // EntityModificationDecision: QUERY
+        // QueryingEntities: no LLM, loops back to EntityModificationDecision
+        make_stop_response("PROCEED - ready to re-plan"), // EntityModificationDecision: PROCEED
+        make_stop_response("Revised plan after query"),   // PlanningEntityModification (2nd)
+        make_stop_response("Performed the action."),      // PerformingEntityModification (2nd)
+        // Update: no LLM
+        make_stop_response("COMPLETE - task done"), // CheckingTaskCompletion
     ]));
 
     let mut registry = ToolRegistry::new();
@@ -2252,22 +2255,20 @@ async fn test_state_machine_query_loop() {
 
     assert!(result.task_completed);
 
-    // Verify: Planning → CheckingCompletion → Deciding(QUERY) → Querying → Planning →
-    //         CheckingCompletion → Deciding(PROCEED) → Performing → CheckingCompletion → Completed
     let history = agent.state_history();
     assert!(
-        history.contains(&AgentState::Querying),
-        "Agent should have gone through Querying state, got: {:?}",
+        history.contains(&AgentState::QueryingEntities),
+        "Agent should have gone through QueryingEntities state, got: {:?}",
         history
     );
 
-    // Verify Planning appears at least twice (once initial, once after query)
+    // Verify PlanningEntityModification appears at least twice (once initial, once after query)
     let planning_count = history
         .iter()
-        .filter(|s| **s == AgentState::Planning)
+        .filter(|s| **s == AgentState::PlanningEntityModification)
         .count();
     assert!(
-        planning_count >= 1,
+        planning_count >= 2,
         "Agent should re-plan after querying, planning transitions: {}",
         planning_count
     );
@@ -2277,14 +2278,16 @@ async fn test_state_machine_query_loop() {
 async fn test_state_machine_multi_perform_iterations() {
     // Completion check returns INCOMPLETE after first perform, then COMPLETE after second
     let provider = Arc::new(SequenceMockProvider::new(vec![
-        make_stop_response("Plan: multi-step task"),  // planning
-        make_stop_response("INCOMPLETE"),             // first completion check
-        make_stop_response("PROCEED"),                // first decision
-        make_stop_response("First action done."),     // first perform
-        make_stop_response("INCOMPLETE - more work"), // second completion check
-        make_stop_response("PROCEED"),                // second decision
-        make_stop_response("Second action done."),    // second perform
-        make_stop_response("COMPLETE"),               // final completion check
+        // Enrich: no LLM
+        make_stop_response("Plan: multi-step task"), // PlanningEntityModification
+        make_stop_response("First action done."),    // PerformingEntityModification
+        // Update: no LLM
+        make_stop_response("INCOMPLETE - more work"), // CheckingTaskCompletion
+        make_stop_response("PROCEED"),                // EntityModificationDecision
+        make_stop_response("Plan: second step"),      // PlanningEntityModification (2nd)
+        make_stop_response("Second action done."),    // PerformingEntityModification (2nd)
+        // Update: no LLM
+        make_stop_response("COMPLETE"), // CheckingTaskCompletion
     ]));
 
     let mut registry = ToolRegistry::new();
@@ -2308,11 +2311,11 @@ async fn test_state_machine_multi_perform_iterations() {
 
     assert!(result.task_completed);
 
-    // Verify Performing appears at least twice
+    // Verify PerformingEntityModification appears at least twice
     let performing_count = agent
         .state_history()
         .iter()
-        .filter(|s| **s == AgentState::Performing)
+        .filter(|s| **s == AgentState::PerformingEntityModification)
         .count();
     assert_eq!(
         performing_count, 2,

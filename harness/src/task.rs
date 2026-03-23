@@ -495,15 +495,15 @@ mod tests {
         }
     }
 
-    /// Wrap tool-loop responses with state machine responses for plan/check/decide.
+    /// Wrap tool-loop responses with state machine responses for plan/perform/check.
     fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+        // EnrichingEntities: no LLM call
         let mut responses = vec![
-            stop_response("Plan: execute the task"),
-            stop_response("INCOMPLETE - task not started yet"),
-            stop_response("PROCEED - ready to act"),
+            stop_response("Plan: execute the task"), // PlanningEntityModification
         ];
-        responses.extend(tool_responses);
-        responses.push(stop_response("COMPLETE - task done"));
+        responses.extend(tool_responses); // PerformingEntityModification
+                                          // UpdatingEntities: no LLM call
+        responses.push(stop_response("COMPLETE - task done")); // CheckingTaskCompletion
         responses
     }
 
