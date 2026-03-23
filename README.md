@@ -63,6 +63,14 @@ cargo run --bin harness -- agent --prompt "Your task description" --tools
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
 ```
 
+### Running Eval Tests
+
+With Ollama running and `qwen3:0.6b` pulled:
+
+```bash
+cargo test --test eval_runner_tests -- --ignored
+```
+
 ### Using Cachix (Optional but Recommended)
 
 Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.

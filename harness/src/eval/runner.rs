@@ -420,7 +420,7 @@ fn collect_source_content(dir: &Path, extensions: &[&str]) -> String {
             if path.is_dir() {
                 content.push_str(&collect_source_content(&path, extensions));
             } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|&e| e == ext) {
+                if extensions.contains(&ext) {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         content.push_str(&text);
                         content.push('\n');
