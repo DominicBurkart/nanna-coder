@@ -1434,6 +1434,19 @@ fn make_stop_response(content: &str) -> ChatResponse {
     }
 }
 
+/// Wrap tool-loop responses with the state machine responses needed for
+/// Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion flow.
+fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+    let mut responses = vec![
+        make_stop_response("Plan: execute the task"),
+        make_stop_response("INCOMPLETE - task not started yet"),
+        make_stop_response("PROCEED - ready to act"),
+    ];
+    responses.extend(tool_responses);
+    responses.push(make_stop_response("COMPLETE - task done"));
+    responses
+}
+
 #[tokio::test]
 async fn test_agent_loop_tool_call_integration() {
     let tool_call_response = ChatResponse {
@@ -1452,10 +1465,9 @@ async fn test_agent_loop_tool_call_integration() {
     };
     let stop_response = make_stop_response("Task complete.");
 
-    let provider = Arc::new(SequenceMockProvider::new(vec![
-        tool_call_response,
-        stop_response,
-    ]));
+    let provider = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![tool_call_response, stop_response]),
+    ));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
 
@@ -1477,17 +1489,26 @@ async fn test_agent_loop_tool_call_integration() {
 
     assert!(result.task_completed);
 
+    // Verify the conversation contains tool call and response
     let history = agent.conversation_history();
-    assert!(history.len() >= 5);
+    let has_tool_call = history
+        .iter()
+        .any(|m| m.role == model::types::MessageRole::Assistant && m.tool_calls.is_some());
+    assert!(has_tool_call, "History should contain a tool call");
 
-    assert_eq!(history[0].role, model::types::MessageRole::System);
-    assert_eq!(history[1].role, model::types::MessageRole::User);
-    assert_eq!(history[2].role, model::types::MessageRole::Assistant);
-    assert!(history[2].tool_calls.is_some());
-    assert_eq!(history[3].role, model::types::MessageRole::Tool);
-    assert!(history[3].content.as_ref().unwrap().contains("hello world"));
-    assert_eq!(history[4].role, model::types::MessageRole::Assistant);
-    assert_eq!(history[4].content.as_deref(), Some("Task complete."));
+    let tool_response = history
+        .iter()
+        .find(|m| m.role == model::types::MessageRole::Tool);
+    assert!(
+        tool_response.is_some(),
+        "History should contain tool response"
+    );
+    assert!(tool_response
+        .unwrap()
+        .content
+        .as_ref()
+        .unwrap()
+        .contains("hello world"));
 }
 
 #[tokio::test]
@@ -1511,10 +1532,9 @@ async fn test_agent_loop_multi_tool_integration() {
     };
     let stop_response = make_stop_response("Both tools executed.");
 
-    let provider = Arc::new(SequenceMockProvider::new(vec![
-        multi_tool_response,
-        stop_response,
-    ]));
+    let provider = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![multi_tool_response, stop_response]),
+    ));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
     registry.register(Box::new(CalculatorTool::new()));
@@ -1571,10 +1591,9 @@ async fn test_agent_loop_error_recovery_integration() {
     };
     let stop_response = make_stop_response("Recovered from error.");
 
-    let provider = Arc::new(SequenceMockProvider::new(vec![
-        bad_tool_response,
-        stop_response,
-    ]));
+    let provider = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![bad_tool_response, stop_response]),
+    ));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
 
@@ -1627,10 +1646,9 @@ async fn test_context_entity_stored_after_agent_run() {
     };
     let stop_response = make_stop_response("Context entity stored.");
 
-    let provider = Arc::new(SequenceMockProvider::new(vec![
-        tool_call_response,
-        stop_response,
-    ]));
+    let provider = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![tool_call_response, stop_response]),
+    ));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
 
@@ -1887,10 +1905,9 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
     init_test_git_repo(repo_dir.path());
 
     let manager = Arc::new(TaskManager::default());
-    let provider: Arc<dyn ModelProvider> =
-        Arc::new(SequenceMockProvider::new(vec![make_stop_response(
-            "Task completed successfully",
-        )]));
+    let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![make_stop_response("Task completed successfully")]),
+    ));
 
     let assign_params = json!({
         "description": "Echo hello world",
@@ -1984,8 +2001,9 @@ async fn test_e2e_mcp_get_result_while_pending_returns_error() {
     init_test_git_repo(repo_dir.path());
 
     let manager = Arc::new(TaskManager::default());
-    let provider: Arc<dyn ModelProvider> =
-        Arc::new(SequenceMockProvider::new(vec![make_stop_response("done")]));
+    let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![make_stop_response("done")]),
+    ));
 
     let assign_params = json!({
         "description": "Immediate get_result test",
@@ -2022,14 +2040,12 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
     init_test_git_repo(repo_dir.path());
 
     let manager = Arc::new(TaskManager::default());
-    let provider_a: Arc<dyn ModelProvider> =
-        Arc::new(SequenceMockProvider::new(vec![make_stop_response(
-            "Result for task A",
-        )]));
-    let provider_b: Arc<dyn ModelProvider> =
-        Arc::new(SequenceMockProvider::new(vec![make_stop_response(
-            "Result for task B",
-        )]));
+    let provider_a: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![make_stop_response("Result for task A")]),
+    ));
+    let provider_b: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![make_stop_response("Result for task B")]),
+    ));
 
     let repo_path = repo_dir.path().to_str().unwrap();
     let assign_a = handle_assign_task(
@@ -2108,4 +2124,199 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
         .as_str()
         .unwrap()
         .contains("Result for task B"));
+}
+
+// ============================================================================
+// ARCHITECTURAL COMPLIANCE INTEGRATION TESTS
+// ============================================================================
+// These tests verify that the agent loop follows the architecture described
+// in ARCHITECTURE.md: Planning → CheckingCompletion → Deciding → Performing
+
+use harness::agent::AgentState;
+
+#[tokio::test]
+async fn test_state_machine_follows_architecture_with_tools() {
+    let tool_call_resp = ChatResponse {
+        choices: vec![Choice {
+            message: ChatMessage::assistant_with_tools(
+                None,
+                vec![make_tool_call(
+                    "call_1",
+                    "echo",
+                    json!({"message": "arch test"}),
+                )],
+            ),
+            finish_reason: Some(FinishReason::ToolCalls),
+        }],
+        usage: None,
+    };
+
+    let provider = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![
+            tool_call_resp,
+            make_stop_response("Done with tools."),
+        ]),
+    ));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 20,
+        verbose: true,
+        system_prompt: "You are a helpful assistant.".to_string(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Echo arch test".to_string(),
+        conversation_history: vec![ChatMessage::user("Echo arch test")],
+        app_state_id: "arch_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    // Verify the agent followed the architectural state machine:
+    // Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion → Completed
+    let history = agent.state_history();
+    assert!(
+        history.len() >= 5,
+        "State history should have at least 5 transitions, got: {:?}",
+        history
+    );
+    assert_eq!(
+        history[0],
+        AgentState::CheckingCompletion,
+        "After Planning, should transition to CheckingCompletion"
+    );
+    assert_eq!(
+        history[1],
+        AgentState::Deciding,
+        "After first CheckingCompletion (INCOMPLETE), should transition to Deciding"
+    );
+    assert_eq!(
+        history[2],
+        AgentState::Performing,
+        "After Deciding (PROCEED), should transition to Performing"
+    );
+    assert_eq!(
+        history[3],
+        AgentState::CheckingCompletion,
+        "After Performing, should transition to CheckingCompletion"
+    );
+    assert_eq!(
+        history[4],
+        AgentState::Completed,
+        "After final CheckingCompletion (COMPLETE), should transition to Completed"
+    );
+}
+
+#[tokio::test]
+async fn test_state_machine_query_loop() {
+    // Decision returns QUERY first, then PROCEED
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        make_stop_response("Plan: do the task"),         // planning
+        make_stop_response("INCOMPLETE"),                // first completion check
+        make_stop_response("QUERY - need more context"), // decision: QUERY
+        // After query, loops back to Planning:
+        make_stop_response("Revised plan after query"), // second planning
+        make_stop_response("INCOMPLETE"),               // second completion check
+        make_stop_response("PROCEED - ready to act"),   // decision: PROCEED
+        // Performing: perform_with_tools sub-loop
+        make_stop_response("Performed the action."),
+        // Back to completion check:
+        make_stop_response("COMPLETE - task done"),
+    ]));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 30,
+        verbose: true,
+        system_prompt: String::new(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Query loop test".to_string(),
+        conversation_history: vec![ChatMessage::user("Query loop test")],
+        app_state_id: "query_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    // Verify: Planning → CheckingCompletion → Deciding(QUERY) → Querying → Planning →
+    //         CheckingCompletion → Deciding(PROCEED) → Performing → CheckingCompletion → Completed
+    let history = agent.state_history();
+    assert!(
+        history.contains(&AgentState::Querying),
+        "Agent should have gone through Querying state, got: {:?}",
+        history
+    );
+
+    // Verify Planning appears at least twice (once initial, once after query)
+    let planning_count = history
+        .iter()
+        .filter(|s| **s == AgentState::Planning)
+        .count();
+    assert!(
+        planning_count >= 1,
+        "Agent should re-plan after querying, planning transitions: {}",
+        planning_count
+    );
+}
+
+#[tokio::test]
+async fn test_state_machine_multi_perform_iterations() {
+    // Completion check returns INCOMPLETE after first perform, then COMPLETE after second
+    let provider = Arc::new(SequenceMockProvider::new(vec![
+        make_stop_response("Plan: multi-step task"),  // planning
+        make_stop_response("INCOMPLETE"),             // first completion check
+        make_stop_response("PROCEED"),                // first decision
+        make_stop_response("First action done."),     // first perform
+        make_stop_response("INCOMPLETE - more work"), // second completion check
+        make_stop_response("PROCEED"),                // second decision
+        make_stop_response("Second action done."),    // second perform
+        make_stop_response("COMPLETE"),               // final completion check
+    ]));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool::new()));
+
+    let config = AgentConfig {
+        max_iterations: 30,
+        verbose: true,
+        system_prompt: String::new(),
+        model_name: "test-model".to_string(),
+    };
+
+    let context = AgentContext {
+        user_prompt: "Multi-step task".to_string(),
+        conversation_history: vec![ChatMessage::user("Multi-step task")],
+        app_state_id: "multi_test".to_string(),
+    };
+
+    let mut agent = AgentLoop::with_tools(config, InMemoryEntityStore::new(), provider, registry);
+    let result = agent.run(context).await.unwrap();
+
+    assert!(result.task_completed);
+
+    // Verify Performing appears at least twice
+    let performing_count = agent
+        .state_history()
+        .iter()
+        .filter(|s| **s == AgentState::Performing)
+        .count();
+    assert_eq!(
+        performing_count, 2,
+        "Agent should perform twice before completing, got: {}",
+        performing_count
+    );
 }

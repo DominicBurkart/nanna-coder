@@ -259,6 +259,7 @@ pub struct AgentLoop {
     tool_registry: Option<ToolRegistry>,
     conversation_history: Vec<ChatMessage>,
     progress_counter: Option<Arc<AtomicUsize>>,
+    state_history: Vec<AgentState>,
 }
 
 impl AgentLoop {
@@ -275,6 +276,7 @@ impl AgentLoop {
             tool_registry: None,
             conversation_history: Vec::new(),
             progress_counter: None,
+            state_history: Vec::new(),
         }
     }
 
@@ -291,6 +293,7 @@ impl AgentLoop {
             tool_registry: None,
             conversation_history: Vec::new(),
             progress_counter: None,
+            state_history: Vec::new(),
         }
     }
 
@@ -311,6 +314,7 @@ impl AgentLoop {
             tool_registry: None,
             conversation_history: Vec::new(),
             progress_counter: None,
+            state_history: Vec::new(),
         }
     }
 
@@ -332,6 +336,7 @@ impl AgentLoop {
             tool_registry: Some(tool_registry),
             conversation_history: Vec::new(),
             progress_counter: None,
+            state_history: Vec::new(),
         }
     }
 
@@ -361,6 +366,11 @@ impl AgentLoop {
     /// Get reference to tool registry if present
     pub fn tool_registry(&self) -> Option<&ToolRegistry> {
         self.tool_registry.as_ref()
+    }
+
+    /// Get the history of state transitions
+    pub fn state_history(&self) -> &[AgentState] {
+        &self.state_history
     }
 
     fn enrich_error(&self, error: AgentError) -> AgentError {
@@ -403,13 +413,23 @@ impl AgentLoop {
             .unwrap_or("")
     }
 
-    /// Run the agent loop with the given context
+    /// Run the agent loop with the given context.
+    ///
+    /// All agents flow through the architectural state machine:
+    /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
-        if self.tool_registry.is_some() && self.llm_provider.is_some() {
-            return self.run_tool_loop(context).await;
-        }
-
         self.iterations = 0;
+        self.state_history.clear();
+
+        // Initialize conversation history from context
+        self.conversation_history.clear();
+        if !self.config.system_prompt.is_empty() {
+            let sp = self.config.system_prompt.clone();
+            self.conversation_history.push(ChatMessage::system(&sp));
+        }
+        for msg in &context.conversation_history {
+            self.conversation_history.push(msg.clone());
+        }
 
         loop {
             if self.iterations >= self.config.max_iterations {
@@ -494,6 +514,7 @@ impl AgentLoop {
         if self.config.verbose {
             tracing::debug!("State transition: {:?} → {:?}", self.state, new_state);
         }
+        self.state_history.push(new_state.clone());
         self.state = new_state;
     }
 
@@ -762,6 +783,7 @@ impl AgentLoop {
     }
 
     /// Perform action — dispatches to perform_with_tools or perform_mvp
+    #[allow(deprecated)]
     async fn perform(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.llm_provider.is_some() && self.tool_registry.is_some() {
             let provider = self.llm_provider.as_ref().unwrap().clone();
@@ -771,7 +793,11 @@ impl AgentLoop {
         }
     }
 
-    /// MVP perform: create a GitRepository entity
+    /// MVP perform: create a GitRepository entity.
+    ///
+    /// Deprecated: Use `with_tools` constructor to get LLM-driven tool calling in
+    /// the Performing state instead.
+    #[deprecated(note = "Use with_tools constructor for LLM-driven performing")]
     async fn perform_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
         use crate::entities::{git::types::GitRepository, EntityStore};
 
@@ -796,10 +822,12 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Full tool-calling run loop — used when tool_registry is set.
+    /// Full tool-calling run loop — formerly used when tool_registry is set.
     ///
-    /// Bypasses the state machine and drives a direct LLM ↔ tool conversation
-    /// until the model stops with a non-tool finish reason.
+    /// Deprecated: The state machine `run()` method now handles tools via
+    /// `perform_with_tools()` in the Performing state, following the architecture.
+    #[deprecated(note = "run() now handles tools via the state machine")]
+    #[allow(dead_code)]
     async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
 
@@ -919,6 +947,9 @@ impl AgentLoop {
     }
 
     /// Tool-calling perform helper: inner loop for the state-machine `perform` step.
+    ///
+    /// Appends to the existing conversation history (set up by `run()`) rather than
+    /// replacing it, so that the full architectural context is preserved.
     async fn perform_with_tools(
         &mut self,
         context: &AgentContext,
@@ -926,15 +957,16 @@ impl AgentLoop {
     ) -> AgentResult<()> {
         let tool_defs = self.tool_registry.as_ref().unwrap().get_definitions();
 
-        let system_prompt = format!(
-            "You are an assistant with access to tools. Use them to complete the task: {}",
-            context.user_prompt
-        );
-
-        self.conversation_history = vec![
-            ChatMessage::system(system_prompt),
-            ChatMessage::user(&context.user_prompt),
-        ];
+        // Add plan context if available, rather than resetting the conversation
+        if let Some(plan) = &self.plan_cache {
+            self.conversation_history.push(ChatMessage::user(format!(
+                "Execute the following plan using the available tools: {}",
+                plan
+            )));
+        } else {
+            self.conversation_history
+                .push(ChatMessage::user(&context.user_prompt));
+        }
 
         for _ in 0..MAX_TOOL_ITERATIONS {
             let request =
@@ -1088,6 +1120,19 @@ mod tests {
         }
     }
 
+    /// Wrap tool-loop responses with the state machine responses needed for
+    /// Planning → CheckingCompletion → Deciding → Performing → CheckingCompletion flow.
+    fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+        let mut responses = vec![
+            plain_response("Plan: execute the task"),
+            plain_response("INCOMPLETE - task not started yet"),
+            plain_response("PROCEED - ready to act"),
+        ];
+        responses.extend(tool_responses);
+        responses.push(plain_response("COMPLETE - task done"));
+        responses
+    }
+
     #[test]
     fn test_agent_loop_with_tools_creation() {
         let config = AgentConfig::default();
@@ -1141,6 +1186,11 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
+        // Pre-populate conversation history (normally done by run())
+        agent
+            .conversation_history
+            .push(ChatMessage::user("Echo hello"));
+
         let result = agent
             .perform_with_tools(&context, &agent.llm_provider.as_ref().unwrap().clone())
             .await;
@@ -1151,13 +1201,10 @@ mod tests {
         );
         assert_eq!(agent.performed_actions, 1);
 
-        let history = &agent.conversation_history;
-        assert!(
-            history.len() >= 4,
-            "History should have system, user, assistant(tool_call), tool_response, assistant(final)"
-        );
-
-        let has_tool_response = history.iter().any(|m| m.role == MessageRole::Tool);
+        let has_tool_response = agent
+            .conversation_history
+            .iter()
+            .any(|m| m.role == MessageRole::Tool);
         assert!(has_tool_response, "History should contain tool response");
     }
 
@@ -1173,6 +1220,11 @@ mod tests {
         let config = AgentConfig::default();
         let store = InMemoryEntityStore::new();
         let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        // Pre-populate conversation history (normally done by run())
+        agent
+            .conversation_history
+            .push(ChatMessage::user("Do something"));
 
         let context = AgentContext {
             user_prompt: "Do something".to_string(),
@@ -1195,6 +1247,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_perform_without_tools_mvp_fallback() {
         let config = AgentConfig {
             max_iterations: 10,
@@ -1241,6 +1294,11 @@ mod tests {
         let config = AgentConfig::default();
         let store = InMemoryEntityStore::new();
         let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        // Pre-populate conversation history (normally done by run())
+        agent
+            .conversation_history
+            .push(ChatMessage::user("Keep looping"));
 
         let context = AgentContext {
             user_prompt: "Keep looping".to_string(),
@@ -1792,13 +1850,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_loop_run_stores_context_entity() {
-        let provider = MockProvider::new(vec![plain_response("Task complete!")]);
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![plain_response(
+            "Task complete!",
+        )]));
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool::new()));
 
         let config = AgentConfig {
-            max_iterations: 10,
+            max_iterations: 20,
             ..Default::default()
         };
         let store = InMemoryEntityStore::new();
@@ -1869,15 +1929,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_loop_stores_tool_calls_made() {
-        let provider = MockProvider::new(vec![
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![
             tool_call_response("echo", serde_json::json!({"message": "ping"})),
             plain_response("All done."),
-        ]);
+        ]));
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool::new()));
 
-        let config = AgentConfig::default();
+        let config = AgentConfig {
+            max_iterations: 20,
+            ..Default::default()
+        };
         let store = InMemoryEntityStore::new();
         let mut agent = AgentLoop::with_tools(config, store, provider, registry);
 
