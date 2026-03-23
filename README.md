@@ -35,6 +35,18 @@ nix develop
 nix build
 ```
 
+### Ollama Setup
+
+Nanna Coder requires [Ollama](https://ollama.ai/download) for local LLM inference. After installing Ollama:
+
+```bash
+# Pull the default eval model
+ollama pull qwen3:0.6b
+
+# Start the Ollama server (must be running for agent commands and evals)
+ollama serve
+```
+
 ### Using Cachix (Optional but Recommended)
 
 Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
