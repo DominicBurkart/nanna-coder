@@ -499,18 +499,14 @@ impl AgentLoop {
                 AgentState::CheckingTaskCompletion => {
                     match self.check_task_completion(&context).await {
                         Ok(true) => self.transition_to(AgentState::Completed),
-                        Ok(false) => {
-                            self.transition_to(AgentState::EntityModificationDecision)
-                        }
+                        Ok(false) => self.transition_to(AgentState::EntityModificationDecision),
                         Err(e) => return Err(self.enrich_error(e)),
                     }
                 }
                 AgentState::EntityModificationDecision => {
                     match self.entity_modification_decision(&context).await {
                         Ok(true) => self.transition_to(AgentState::QueryingEntities),
-                        Ok(false) => {
-                            self.transition_to(AgentState::PlanningEntityModification)
-                        }
+                        Ok(false) => self.transition_to(AgentState::PlanningEntityModification),
                         Err(e) => return Err(self.enrich_error(e)),
                     }
                 }
@@ -642,7 +638,10 @@ impl AgentLoop {
     /// create an execution plan using the LLM and enriched entity context.
     async fn plan_entity_modification(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.config.verbose {
-            tracing::info!("Planning entity modification for prompt: {}", context.user_prompt);
+            tracing::info!(
+                "Planning entity modification for prompt: {}",
+                context.user_prompt
+            );
         }
 
         if let Some(provider) = &self.llm_provider {
@@ -1235,7 +1234,10 @@ mod tests {
         };
 
         let result = agent
-            .perform_entity_modification_with_tools(&context, &agent.llm_provider.as_ref().unwrap().clone())
+            .perform_entity_modification_with_tools(
+                &context,
+                &agent.llm_provider.as_ref().unwrap().clone(),
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -1274,7 +1276,9 @@ mod tests {
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
-        let result = agent.perform_entity_modification_with_tools(&context, &provider_clone).await;
+        let result = agent
+            .perform_entity_modification_with_tools(&context, &provider_clone)
+            .await;
         assert!(result.is_ok(), "Should handle tool errors gracefully");
 
         let has_error_response = agent.conversation_history.iter().any(|m| {
@@ -1342,7 +1346,9 @@ mod tests {
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
-        let result = agent.perform_entity_modification_with_tools(&context, &provider_clone).await;
+        let result = agent
+            .perform_entity_modification_with_tools(&context, &provider_clone)
+            .await;
         assert!(
             result.is_ok(),
             "Should stop after max iterations without error"

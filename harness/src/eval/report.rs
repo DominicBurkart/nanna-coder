@@ -251,11 +251,11 @@ impl EvalReport {
         let _ = writeln!(out, "stateDiagram-v2");
         for (from, to) in &transitions {
             let _ = writeln!(
-            out,
-            "    {} --> {}",
-            from.replace(' ', "_"),
-            to.replace(' ', "_")
-        );
+                out,
+                "    {} --> {}",
+                from.replace(' ', "_"),
+                to.replace(' ', "_")
+            );
         }
         let _ = writeln!(out, "```\n");
     }
@@ -663,10 +663,7 @@ mod tests {
             state_name(&AgentState::PerformingEntityModification),
             "Perform Entity Modification"
         );
-        assert_eq!(
-            state_name(&AgentState::UpdatingEntities),
-            "Update Entities"
-        );
+        assert_eq!(state_name(&AgentState::UpdatingEntities), "Update Entities");
         assert_eq!(
             state_name(&AgentState::CheckingTaskCompletion),
             "Task Complete?"
@@ -730,8 +727,9 @@ mod tests {
         let md = report.render_markdown();
 
         // Each unique transition should appear exactly once
-        let enrichment_to_perform =
-            md.matches("Entity_Enrichment --> Perform_Entity_Modification").count();
+        let enrichment_to_perform = md
+            .matches("Entity_Enrichment --> Perform_Entity_Modification")
+            .count();
         assert_eq!(
             enrichment_to_perform, 1,
             "Duplicate transitions in state diagram"
