@@ -1,4 +1,7 @@
 //! Integration tests for the eval runner.
+//!
+//! These tests require an Ollama instance to run the agent end-to-end.
+//! Run with: `cargo test --test eval_runner_tests -- --ignored`
 
 use harness::agent::eval_case::EvalCase;
 use harness::eval::runner::{run_eval, EvalRunnerConfig, EvalRunnerError};
@@ -13,6 +16,7 @@ fn cases_dir() -> PathBuf {
 }
 
 #[tokio::test]
+#[ignore] // requires Ollama instance
 async fn test_run_eval_returns_result() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
@@ -28,6 +32,7 @@ async fn test_run_eval_returns_result() {
 }
 
 #[tokio::test]
+#[ignore] // requires Ollama instance
 async fn test_run_eval_timeout() {
     let toml_str = r#"
 [case]
@@ -57,6 +62,7 @@ timeout_secs = 1
 }
 
 #[tokio::test]
+#[ignore] // requires Ollama instance
 async fn test_run_eval_isolation() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
@@ -75,6 +81,7 @@ async fn test_run_eval_isolation() {
 }
 
 #[tokio::test]
+#[ignore] // requires Ollama instance
 async fn test_discover_and_run_all_cases() {
     let cases_dir = cases_dir();
     let cases = EvalCase::discover(&cases_dir).unwrap();

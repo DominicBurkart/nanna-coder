@@ -510,6 +510,7 @@ impl AgentEvaluator {
             user_prompt: scenario.user_prompt.clone(),
             conversation_history: vec![],
             app_state_id: format!("eval_{}", scenario.id),
+            work_dir: None,
         };
 
         // Track state transitions
