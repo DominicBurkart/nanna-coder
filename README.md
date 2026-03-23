@@ -46,8 +46,8 @@ curl -fsSL https://ollama.ai/install.sh | sh
 # Pull the default model
 ollama pull qwen3:0.6b
 
-# Verify Ollama is running
-nix develop --command cargo run --bin harness -- health
+# Start the Ollama server (must be running for agent commands and evals)
+ollama serve
 ```
 
 ### Running the Agent
