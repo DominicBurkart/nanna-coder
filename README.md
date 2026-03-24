@@ -13,7 +13,7 @@ A highly opinionated local coding assistant (WIP).
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
 - [Rust](https://rustlang.org)
-- [Cachix](https://cachix.org/) - Binary cache for fast builds
+- [Cachix](https://cachix.org/)
 
 ## Quick Start
 
