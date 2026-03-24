@@ -1,6 +1,7 @@
-//! RAG (Retrieval-Augmented Generation) for querying
+//! Query Entities / RAG (ARCHITECTURE.md)
 //!
-//! This module provides functionality for querying entities using RAG techniques.
+//! This module implements the "Query Entities (RAG)" node from the Harness
+//! Control Flow, providing entity retrieval using RAG techniques.
 //!
 //! # MVP Implementation
 //! The current implementation uses simple keyword-based text search.
