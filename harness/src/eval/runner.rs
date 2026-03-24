@@ -141,9 +141,6 @@ pub struct EvalRunResult {
     /// Number of agent loop iterations.
     pub iterations: usize,
     /// Token usage aggregated across all LLM calls.
-    // TODO: Token tracking requires upstream changes to `AgentLoop` / `AgentRunResult`
-    // to aggregate `ChatResponse.usage` across iterations. The plumbing is in place
-    // so token data flows through once the agent tracks it.
     pub token_usage: TokenUsage,
     /// Post-completion verification results.
     pub verification: VerificationResult,
@@ -252,6 +249,13 @@ pub async fn run_eval(
     // --- 4. Collect metrics ---
     let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
     let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
+    let token_usage = agent_result
+        .as_ref()
+        .map_or(TokenUsage::default(), |r| TokenUsage {
+            prompt_tokens: r.token_usage.prompt_tokens,
+            completion_tokens: r.token_usage.completion_tokens,
+            total_tokens: r.token_usage.total_tokens,
+        });
 
     if !task_completed {
         failures.push("Agent did not complete the task".to_string());
@@ -268,7 +272,7 @@ pub async fn run_eval(
         success,
         execution_time,
         iterations,
-        token_usage: TokenUsage::default(),
+        token_usage,
         verification,
         failures,
         agent_result,
