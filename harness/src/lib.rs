@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod container;
 pub mod entities;
+pub mod eval;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
@@ -29,9 +30,9 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_tool_registry, CalculatorTool, EchoTool, GitDiffTool, GitStatusTool, ListDirTool,
-    ReadFileTool, RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult,
-    WriteFileTool,
+    create_tool_registry, CalculatorTool, EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus,
+    GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
+    ToolError, ToolRegistry, ToolResult, WriteFileTool,
 };
 
 // Export agent types
@@ -39,6 +40,9 @@ pub use agent::{
     AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
     AgentState,
 };
+
+// Export eval report types
+pub use eval::report::EvalReport;
 
 // Export entity types
 pub use entities::{

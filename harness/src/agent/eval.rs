@@ -471,6 +471,8 @@ impl AgentEvaluator {
         let agent_config = AgentConfig {
             max_iterations: scenario.max_iterations,
             verbose: self.config.verbose,
+            system_prompt: String::new(),
+            model_name: self.config.model.clone(),
         };
 
         let mut agent = AgentLoop::with_entity_store(agent_config, entity_store);
@@ -595,12 +597,29 @@ impl AgentEvaluator {
         // Create initial entities based on scenario
         for entity_type in &scenario.initial_entities {
             let entity: Box<dyn crate::entities::Entity> = match entity_type {
-                EntityType::Git => Box::new(crate::entities::git::types::GitRepository::new()),
+                EntityType::Git => Box::new(crate::entities::git::types::GitRepository::new(
+                    "https://example.com/repo.git".to_string(),
+                    "main".to_string(),
+                )),
                 EntityType::Context => {
-                    Box::new(crate::entities::context::types::ContextEntity::new())
+                    Box::new(crate::entities::context::types::ContextEntity::new(
+                        "eval task".to_string(),
+                        vec![],
+                        vec![],
+                        String::new(),
+                        "eval".to_string(),
+                    ))
                 }
                 EntityType::Test => Box::new(crate::entities::test::types::TestEntity::new()),
-                EntityType::Ast => Box::new(crate::entities::ast::types::AstEntity::new()),
+                EntityType::Ast => Box::new(crate::entities::ast::types::FileEntity {
+                    metadata: crate::entities::EntityMetadata::new(EntityType::Ast),
+                    path: std::path::PathBuf::from("/tmp/eval_placeholder.rs"),
+                    relative_path: "eval_placeholder.rs".to_string(),
+                    file_type: crate::entities::ast::types::FileType::Rust,
+                    size_bytes: 0,
+                    content_preview: String::new(),
+                    line_count: 0,
+                }),
                 EntityType::Env => Box::new(crate::entities::env::types::EnvEntity::new()),
                 EntityType::Telemetry => {
                     Box::new(crate::entities::telemetry::types::TelemetryEntity::new())

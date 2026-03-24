@@ -1,0 +1,16 @@
+[case]
+id = "happy-path-002"
+name = "Fix a compile error"
+description = "Fix a type mismatch compile error in main.rs"
+
+[task]
+prompt = "Fix the compile error in src/main.rs. The variable `x` is declared as `i32` but assigned a string literal."
+
+[expected]
+files_changed = ["src/main.rs"]
+build_must_pass = true
+
+[metadata]
+difficulty = "easy"
+tags = ["bugfix", "type-error"]
+timeout_secs = 120
