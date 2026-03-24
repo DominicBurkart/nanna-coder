@@ -484,6 +484,8 @@ impl EntityStore for InMemoryEntityStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::ast::types::{FileEntity, FileType};
+    use crate::entities::git::types::GitRepository;
 
     #[test]
     fn test_entity_metadata_creation() {
@@ -491,6 +493,19 @@ mod tests {
         assert_eq!(metadata.entity_type, EntityType::Git);
         assert_eq!(metadata.version, 1);
         assert!(metadata.tags.is_empty());
+    }
+
+    #[test]
+    fn test_entity_metadata_has_unique_ids() {
+        let a = EntityMetadata::new(EntityType::Git);
+        let b = EntityMetadata::new(EntityType::Git);
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn test_entity_metadata_timestamps_are_equal_at_creation() {
+        let m = EntityMetadata::new(EntityType::Ast);
+        assert_eq!(m.created_at, m.updated_at);
     }
 
     #[test]
@@ -504,10 +519,351 @@ mod tests {
         assert_eq!(rel.relationship_type, RelationshipType::Calls);
     }
 
+    #[test]
+    fn test_custom_relationship_type() {
+        let custom = RelationshipType::Custom("depends-on".to_string());
+        assert_eq!(custom, RelationshipType::Custom("depends-on".to_string()));
+        assert_ne!(custom, RelationshipType::Custom("other".to_string()));
+    }
+
+    /// Helper: create a GitRepository entity with optional tags.
+    fn make_git_entity(tags: Vec<String>) -> Box<dyn Entity> {
+        let mut entity = GitRepository::new("/tmp/repo".to_string(), "HEAD".to_string());
+        entity.metadata.tags = tags;
+        Box::new(entity)
+    }
+
+    fn make_file_entity() -> Box<dyn Entity> {
+        let entity = FileEntity {
+            metadata: EntityMetadata::new(EntityType::Ast),
+            path: std::path::PathBuf::from("/tmp/file.rs"),
+            relative_path: "file.rs".to_string(),
+            file_type: FileType::Rust,
+            size_bytes: 100,
+            content_preview: "fn main() {}".to_string(),
+            line_count: 1,
+        };
+        Box::new(entity)
+    }
+
+    // ── EntityStore: store / exists / delete lifecycle ──
+
     #[tokio::test]
-    async fn test_in_memory_store_basic_operations() {
-        // Note: Full tests will be added when concrete entity types are implemented
-        let store = InMemoryEntityStore::new();
+    async fn test_store_and_exists() {
+        let mut store = InMemoryEntityStore::new();
+        let entity = make_git_entity(vec![]);
+        let id = entity.id().to_string();
+
+        let stored_id = store.store(entity).await.unwrap();
+        assert_eq!(stored_id, id);
+        assert!(store.exists(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_duplicate_id() {
+        let mut store = InMemoryEntityStore::new();
+        let entity = make_git_entity(vec![]);
+        let id = entity.id().to_string();
+        store.store(entity).await.unwrap();
+
+        // Build another entity and forcibly assign the same ID.
+        let mut dup = GitRepository::new("/dup".to_string(), "HEAD".to_string());
+        dup.metadata.id = id.clone();
+        let result = store.store(Box::new(dup)).await;
+
+        assert!(matches!(result, Err(EntityError::AlreadyExists(ref eid)) if eid == &id));
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_entity() {
+        let mut store = InMemoryEntityStore::new();
+        let entity = make_git_entity(vec![]);
+        let id = store.store(entity).await.unwrap();
+
+        store.delete(&id).await.unwrap();
+        assert!(!store.exists(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_returns_not_found() {
+        let mut store = InMemoryEntityStore::new();
+        let result = store.delete("does-not-exist").await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    // ── EntityStore: update ──
+
+    #[tokio::test]
+    async fn test_update_existing_entity() {
+        let mut store = InMemoryEntityStore::new();
+        let entity = make_git_entity(vec![]);
+        let id = entity.id().to_string();
+        store.store(entity).await.unwrap();
+
+        // Build a replacement with the same ID.
+        let mut replacement = GitRepository::new("/updated".to_string(), "main".to_string());
+        replacement.metadata.id = id.clone();
+        store.update(Box::new(replacement)).await.unwrap();
+
+        assert!(store.exists(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_update_nonexistent_returns_not_found() {
+        let mut store = InMemoryEntityStore::new();
+        let entity = make_git_entity(vec![]);
+        // Don't store it first — update should fail.
+        let result = store.update(entity).await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    // ── EntityStore: query filtering ──
+
+    #[tokio::test]
+    async fn test_query_filter_by_entity_type() {
+        let mut store = InMemoryEntityStore::new();
+        store.store(make_git_entity(vec![])).await.unwrap();
+        store.store(make_file_entity()).await.unwrap();
+
+        let git_only = EntityQuery {
+            entity_types: vec![EntityType::Git],
+            ..Default::default()
+        };
+        let results = store.query(&git_only).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity_type, EntityType::Git);
+
+        let ast_only = EntityQuery {
+            entity_types: vec![EntityType::Ast],
+            ..Default::default()
+        };
+        let results = store.query(&ast_only).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity_type, EntityType::Ast);
+    }
+
+    #[tokio::test]
+    async fn test_query_empty_type_filter_returns_all() {
+        let mut store = InMemoryEntityStore::new();
+        store.store(make_git_entity(vec![])).await.unwrap();
+        store.store(make_file_entity()).await.unwrap();
+
+        let all = EntityQuery::default();
+        let results = store.query(&all).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_query_filter_by_tags() {
+        let mut store = InMemoryEntityStore::new();
+        store
+            .store(make_git_entity(vec!["important".to_string()]))
+            .await
+            .unwrap();
+        store.store(make_git_entity(vec![])).await.unwrap();
+
+        let tagged = EntityQuery {
+            tags: vec!["important".to_string()],
+            ..Default::default()
+        };
+        let results = store.query(&tagged).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_filter_by_time_range() {
+        let mut store = InMemoryEntityStore::new();
+        store.store(make_git_entity(vec![])).await.unwrap();
+
+        // A time range in the distant past should match nothing.
+        let ancient = EntityQuery {
+            time_range: Some(TimeRange {
+                start: chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                end: chrono::DateTime::parse_from_rfc3339("2000-01-02T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }),
+            ..Default::default()
+        };
+        let results = store.query(&ancient).await.unwrap();
+        assert!(results.is_empty());
+
+        // A range including now should match.
+        let now_range = EntityQuery {
+            time_range: Some(TimeRange {
+                start: chrono::Utc::now() - chrono::Duration::hours(1),
+                end: chrono::Utc::now() + chrono::Duration::hours(1),
+            }),
+            ..Default::default()
+        };
+        let results = store.query(&now_range).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_text_search_case_insensitive() {
+        let mut store = InMemoryEntityStore::new();
+        // GitRepository serialises the repo_path field.
+        store.store(make_git_entity(vec![])).await.unwrap();
+
+        let search = EntityQuery {
+            text_query: Some("/tmp/repo".to_string()),
+            ..Default::default()
+        };
+        let results = store.query(&search).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!((results[0].relevance - 0.8).abs() < f64::EPSILON);
+
+        let no_match = EntityQuery {
+            text_query: Some("zzz_nonexistent_zzz".to_string()),
+            ..Default::default()
+        };
+        let results = store.query(&no_match).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_limit() {
+        let mut store = InMemoryEntityStore::new();
+        for _ in 0..5 {
+            store.store(make_git_entity(vec![])).await.unwrap();
+        }
+
+        let limited = EntityQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let results = store.query(&limited).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_query_no_text_gives_full_relevance() {
+        let mut store = InMemoryEntityStore::new();
+        store.store(make_git_entity(vec![])).await.unwrap();
+
+        let all = EntityQuery::default();
+        let results = store.query(&all).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!((results[0].relevance - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── EntityStore: relationships ──
+
+    #[tokio::test]
+    async fn test_create_and_get_relationship() {
+        let mut store = InMemoryEntityStore::new();
+        let id_a = store.store(make_git_entity(vec![])).await.unwrap();
+        let id_b = store.store(make_file_entity()).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id_a.clone(),
+            to: id_b.clone(),
+            relationship_type: RelationshipType::Contains,
+            metadata: HashMap::new(),
+        };
+        store.create_relationship(rel).await.unwrap();
+
+        // Queried from either side.
+        let from_a = store.get_relationships(&id_a).await.unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0].to, id_b);
+
+        let from_b = store.get_relationships(&id_b).await.unwrap();
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_b[0].from, id_a);
+    }
+
+    #[tokio::test]
+    async fn test_create_relationship_rejects_missing_entity() {
+        let mut store = InMemoryEntityStore::new();
+        let id_a = store.store(make_git_entity(vec![])).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id_a,
+            to: "nonexistent".to_string(),
+            relationship_type: RelationshipType::References,
+            metadata: HashMap::new(),
+        };
+        let result = store.create_relationship(rel).await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_delete_relationship() {
+        let mut store = InMemoryEntityStore::new();
+        let id_a = store.store(make_git_entity(vec![])).await.unwrap();
+        let id_b = store.store(make_file_entity()).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id_a.clone(),
+            to: id_b.clone(),
+            relationship_type: RelationshipType::Modifies,
+            metadata: HashMap::new(),
+        };
+        store.create_relationship(rel).await.unwrap();
+        assert_eq!(store.get_relationships(&id_a).await.unwrap().len(), 1);
+
+        store
+            .delete_relationship(&id_a, &id_b, RelationshipType::Modifies)
+            .await
+            .unwrap();
+        assert!(store.get_relationships(&id_a).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_relationship_only_removes_matching_type() {
+        let mut store = InMemoryEntityStore::new();
+        let id_a = store.store(make_git_entity(vec![])).await.unwrap();
+        let id_b = store.store(make_file_entity()).await.unwrap();
+
+        for rtype in [RelationshipType::Contains, RelationshipType::Modifies] {
+            store
+                .create_relationship(EntityRelationship {
+                    from: id_a.clone(),
+                    to: id_b.clone(),
+                    relationship_type: rtype,
+                    metadata: HashMap::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.get_relationships(&id_a).await.unwrap().len(), 2);
+
+        store
+            .delete_relationship(&id_a, &id_b, RelationshipType::Contains)
+            .await
+            .unwrap();
+        let remaining = store.get_relationships(&id_a).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].relationship_type, RelationshipType::Modifies);
+    }
+
+    // ── Entity trait default methods ──
+
+    #[test]
+    fn test_entity_trait_id_and_type() {
+        let entity = GitRepository::new("/r".to_string(), "main".to_string());
+        assert_eq!(entity.entity_type(), EntityType::Git);
+        assert!(!entity.id().is_empty());
+    }
+
+    #[test]
+    fn test_entity_to_json_roundtrip() {
+        let entity = GitRepository::new("/tmp/repo".to_string(), "main".to_string());
+        let json = entity.to_json().unwrap();
+        assert!(json.contains("/tmp/repo"));
+        assert!(json.contains("main"));
+    }
+
+    // ── InMemoryEntityStore default trait ──
+
+    #[tokio::test]
+    async fn test_in_memory_store_default() {
+        let store = InMemoryEntityStore::default();
         assert_eq!(store.entities.len(), 0);
+        assert!(store.relationships.is_empty());
     }
 }
