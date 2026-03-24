@@ -16,6 +16,7 @@ jobs:
   test-matrix:
     name: ${{ matrix.test-type }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    environment: codecov
     strategy:
       fail-fast: false
       matrix:
