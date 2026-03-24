@@ -28,7 +28,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, Usage};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -202,6 +202,9 @@ pub struct AgentContext {
     pub user_prompt: String,
     pub conversation_history: Vec<ChatMessage>,
     pub app_state_id: String,
+    /// Working directory for filesystem operations.  `None` means the agent
+    /// uses whatever workspace root was configured on its tools at construction.
+    pub work_dir: Option<std::path::PathBuf>,
 }
 
 /// Result of running the agent
@@ -219,6 +222,8 @@ pub struct AgentRunResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Snapshot of the full conversation
     pub conversation_snapshot: Vec<ChatMessage>,
+    /// Aggregated token usage across all LLM calls
+    pub token_usage: Usage,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -360,6 +365,11 @@ impl AgentLoop {
         self.progress_counter = Some(counter);
     }
 
+    /// Attach a tool registry to the agent loop.
+    pub fn set_tool_registry(&mut self, registry: ToolRegistry) {
+        self.tool_registry = Some(registry);
+    }
+
     pub fn conversation_history(&self) -> &[ChatMessage] {
         &self.conversation_history
     }
@@ -464,6 +474,11 @@ impl AgentLoop {
                     result_summary,
                     tool_calls_made,
                     conversation_snapshot: conversation,
+                    token_usage: Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    },
                 });
             }
 
@@ -910,6 +925,11 @@ impl AgentLoop {
             .unwrap_or_default();
 
         self.iterations = 0;
+        let mut total_usage = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
 
         loop {
             if self.iterations >= self.config.max_iterations {
@@ -935,10 +955,21 @@ impl AgentLoop {
                 return Err(self.enrich_error(bare_state_error("Empty response from model")));
             }
 
+            if let Some(ref u) = response.usage {
+                total_usage.prompt_tokens += u.prompt_tokens;
+                total_usage.completion_tokens += u.completion_tokens;
+                total_usage.total_tokens += u.total_tokens;
+            }
+
             let choice = response.choices.into_iter().next().unwrap();
             let finish_reason = choice.finish_reason.clone();
             let tool_calls = choice.message.tool_calls.clone();
             self.conversation_history.push(choice.message);
+
+            self.iterations += 1;
+            if let Some(ref counter) = self.progress_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
 
             match finish_reason {
                 Some(FinishReason::Stop) | None => {
@@ -965,6 +996,7 @@ impl AgentLoop {
                         result_summary,
                         tool_calls_made,
                         conversation_snapshot: conversation,
+                        token_usage: total_usage,
                     });
                 }
                 Some(FinishReason::ToolCalls) => {
@@ -1000,11 +1032,6 @@ impl AgentLoop {
                 Some(_) => {
                     return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
                 }
-            }
-
-            self.iterations += 1;
-            if let Some(ref counter) = self.progress_counter {
-                counter.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1103,7 +1130,7 @@ mod tests {
     use crate::tools::{EchoTool, ToolRegistry};
     use model::provider::{ModelError, ModelResult};
     use model::types::{
-        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall,
+        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall, Usage,
     };
     use std::sync::Mutex;
 
@@ -1231,6 +1258,7 @@ mod tests {
             user_prompt: "Echo hello".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent
@@ -1273,6 +1301,7 @@ mod tests {
             user_prompt: "Do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1306,6 +1335,7 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.perform_entity_modification_mvp(&context).await;
@@ -1343,6 +1373,7 @@ mod tests {
             user_prompt: "Keep looping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1394,6 +1425,7 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1416,6 +1448,7 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1438,6 +1471,7 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
         let result = agent.run(context).await;
         assert!(matches!(
@@ -1484,6 +1518,7 @@ mod tests {
             user_prompt: "Create a new git repository entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp_test_state".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1569,6 +1604,7 @@ mod tests {
             user_prompt: "Create a user authentication module".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.plan_entity_modification(&context).await;
@@ -1598,6 +1634,7 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let is_complete = agent.check_task_completion(&context).await.unwrap();
@@ -1636,6 +1673,7 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.check_task_completion(&context).await;
@@ -1672,6 +1710,7 @@ mod tests {
             user_prompt: "Add user authentication".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.entity_modification_decision(&context).await;
@@ -1715,6 +1754,7 @@ mod tests {
             user_prompt: "Create a new git repository for authentication service".to_string(),
             conversation_history: vec![],
             app_state_id: "llm_test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1764,6 +1804,7 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1814,6 +1855,7 @@ mod tests {
                 .to_string(),
             conversation_history: vec![],
             app_state_id: "integration_test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1843,6 +1885,7 @@ mod tests {
             user_prompt: "store entity test".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1907,6 +1950,7 @@ mod tests {
             user_prompt: "do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1984,6 +2028,7 @@ mod tests {
             user_prompt: "echo ping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
+            work_dir: None,
         };
 
         agent.run(context).await.unwrap();
@@ -2015,5 +2060,99 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_single_stop_counts_one_iteration() {
+        let provider = MockProvider::new(vec![plain_response("Done")]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+            work_dir: None,
+        };
+
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 1,
+            "Stop on first call should count as 1 iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_tool_call_then_stop_counts_two_iterations() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hello"})),
+            plain_response("All done."),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "echo hello".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+            work_dir: None,
+        };
+
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 2,
+            "One tool call then stop should count as 2 iterations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_accumulates_token_usage() {
+        let provider = MockProvider::new(vec![
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                }),
+                ..tool_call_response("echo", serde_json::json!({"message": "hi"}))
+            },
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 200,
+                    completion_tokens: 80,
+                    total_tokens: 280,
+                }),
+                ..plain_response("Done")
+            },
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test usage".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+            work_dir: None,
+        };
+
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(result.token_usage.prompt_tokens, 300);
+        assert_eq!(result.token_usage.completion_tokens, 130);
+        assert_eq!(result.token_usage.total_tokens, 430);
     }
 }

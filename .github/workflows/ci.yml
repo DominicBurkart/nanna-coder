@@ -97,26 +97,27 @@ jobs:
     - name: Pre-build test containers (Integration tests only)
       if: matrix.test-type == 'integration-container' && runner.os == 'Linux'
       run: |
-        echo "🔄 Building test containers for caching..."
-        nix build .#ollamaImage --print-build-logs
-
-        echo "📦 Loading test containers using nix2container copyToDockerDaemon..."
-        # Use nix2container's built-in copyToDockerDaemon for proper loading
-        if ! nix run .#ollamaImage.copyToDockerDaemon; then
-          echo "❌ Failed to load test container"
-          echo "💡 Check Docker daemon status: docker info"
+        nix build .#qwen3-container --print-build-logs
+        if ! nix run .#qwen3-container.copyToDockerDaemon; then
+          echo "Failed to load qwen3 container"
           exit 1
         fi
+        docker image inspect nanna-coder-ollama-qwen3:latest >/dev/null
 
-        # Verify container loaded successfully
-        if ! docker image inspect nanna-coder-ollama:latest >/dev/null 2>&1; then
-          echo "❌ Container nanna-coder-ollama:latest not found"
-          echo "Available images:"
-          docker images
-          exit 1
-        fi
-
-        echo "✅ Test containers ready for integration tests"
+    - name: Start Ollama with qwen3 model
+      if: matrix.test-type == 'integration-container' && runner.os == 'Linux'
+      run: |
+        docker run -d --name ollama-qwen3 -p 11434:11434 nanna-coder-ollama-qwen3:latest
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:11434/api/tags 2>/dev/null | grep -q "qwen3"; then
+            echo "Ollama ready with qwen3 model"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Ollama failed to start within 60 seconds"
+        docker logs ollama-qwen3
+        exit 1
 
     - name: Pre-build dev container image
       if: matrix.test-type == 'integration-container'
@@ -146,11 +147,11 @@ jobs:
       shell: bash
       run: |
         nix develop --command cargo nextest run --workspace --test '*' --all-features --test-threads=1
-        if curl -s --max-time 5 http://localhost:11434/api/tags > /dev/null 2>&1; then
-          nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
-        else
-          echo "Ollama not reachable on port 11434, skipping model integration tests"
-        fi
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
+
+    - name: Stop Ollama container
+      if: matrix.test-type == 'integration-container' && always()
+      run: docker rm -f ollama-qwen3 2>/dev/null || true
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
