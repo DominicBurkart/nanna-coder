@@ -30,7 +30,7 @@ use crate::tools::create_tool_registry;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
 use model::provider::ModelProvider;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -46,6 +46,8 @@ pub enum EvalRunnerError {
     EvalCase(#[from] EvalCaseError),
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
+    #[error("LLM provider unavailable: {0}")]
+    ProviderUnavailable(String),
 }
 
 /// Configuration for the eval runner.
@@ -177,12 +179,20 @@ pub async fn run_eval(
         None => OllamaConfig::default(),
     };
 
-    let provider: Option<Arc<dyn ModelProvider>> = match OllamaProvider::new(ollama_config) {
+    let provider: Arc<dyn ModelProvider> = match OllamaProvider::new(ollama_config) {
         Ok(p) => match p.health_check().await {
-            Ok(()) => Some(Arc::new(p)),
-            Err(_) => None,
+            Ok(()) => Arc::new(p),
+            Err(e) => {
+                return Err(EvalRunnerError::ProviderUnavailable(format!(
+                    "Ollama health check failed: {e}"
+                )));
+            }
         },
-        Err(_) => None,
+        Err(e) => {
+            return Err(EvalRunnerError::ProviderUnavailable(format!(
+                "Failed to create Ollama provider: {e}"
+            )));
+        }
     };
 
     let agent_config = AgentConfig {
@@ -192,19 +202,14 @@ pub async fn run_eval(
         model_name: config.model_name.clone(),
     };
 
-    let mut agent = if let Some(provider) = provider {
-        let tool_registry = create_tool_registry(work_dir);
-        let entity_store = InMemoryEntityStore::new();
-        AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
-    } else {
-        AgentLoop::new(agent_config)
-    };
+    let tool_registry = create_tool_registry(work_dir);
+    let entity_store = InMemoryEntityStore::new();
+    let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
 
     let context = AgentContext {
         user_prompt: eval_case.task.prompt.clone(),
         conversation_history: vec![],
         app_state_id: format!("eval_{}", eval_case.case.id),
-        work_dir: Some(PathBuf::from(work_dir)),
     };
 
     let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);

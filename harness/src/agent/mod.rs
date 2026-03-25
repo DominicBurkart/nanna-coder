@@ -202,9 +202,6 @@ pub struct AgentContext {
     pub user_prompt: String,
     pub conversation_history: Vec<ChatMessage>,
     pub app_state_id: String,
-    /// Working directory for filesystem operations.  `None` means the agent
-    /// uses whatever workspace root was configured on its tools at construction.
-    pub work_dir: Option<std::path::PathBuf>,
 }
 
 /// Result of running the agent
@@ -363,11 +360,6 @@ impl AgentLoop {
 
     pub fn set_progress_counter(&mut self, counter: Arc<AtomicUsize>) {
         self.progress_counter = Some(counter);
-    }
-
-    /// Attach a tool registry to the agent loop.
-    pub fn set_tool_registry(&mut self, registry: ToolRegistry) {
-        self.tool_registry = Some(registry);
     }
 
     pub fn conversation_history(&self) -> &[ChatMessage] {
@@ -1258,7 +1250,6 @@ mod tests {
             user_prompt: "Echo hello".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent
@@ -1301,7 +1292,6 @@ mod tests {
             user_prompt: "Do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1335,7 +1325,6 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.perform_entity_modification_mvp(&context).await;
@@ -1373,7 +1362,6 @@ mod tests {
             user_prompt: "Keep looping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1425,7 +1413,6 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1448,7 +1435,6 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1471,7 +1457,6 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
         let result = agent.run(context).await;
         assert!(matches!(
@@ -1518,7 +1503,6 @@ mod tests {
             user_prompt: "Create a new git repository entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp_test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1604,7 +1588,6 @@ mod tests {
             user_prompt: "Create a user authentication module".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.plan_entity_modification(&context).await;
@@ -1634,7 +1617,6 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let is_complete = agent.check_task_completion(&context).await.unwrap();
@@ -1673,7 +1655,6 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.check_task_completion(&context).await;
@@ -1710,7 +1691,6 @@ mod tests {
             user_prompt: "Add user authentication".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.entity_modification_decision(&context).await;
@@ -1754,7 +1734,6 @@ mod tests {
             user_prompt: "Create a new git repository for authentication service".to_string(),
             conversation_history: vec![],
             app_state_id: "llm_test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1804,7 +1783,6 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1855,7 +1833,6 @@ mod tests {
                 .to_string(),
             conversation_history: vec![],
             app_state_id: "integration_test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1885,7 +1862,6 @@ mod tests {
             user_prompt: "store entity test".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1950,7 +1926,6 @@ mod tests {
             user_prompt: "do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -2028,7 +2003,6 @@ mod tests {
             user_prompt: "echo ping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         agent.run(context).await.unwrap();
@@ -2077,7 +2051,6 @@ mod tests {
             user_prompt: "test".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
@@ -2105,7 +2078,6 @@ mod tests {
             user_prompt: "echo hello".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
@@ -2147,7 +2119,6 @@ mod tests {
             user_prompt: "test usage".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
