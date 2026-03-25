@@ -1,7 +1,9 @@
+use crate::onboarding::DeterministicOnboarder;
+use crate::onboarding::Onboarder;
 use crate::task::{TaskId, TaskManager, TaskStatus};
 use model::provider::ModelProvider;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub async fn handle_list_tasks(task_manager: &Arc<TaskManager>) -> Result<Value, String> {
@@ -185,6 +187,40 @@ pub async fn handle_get_result(
     }
 }
 
+pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
+    let repo_path = params
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing required field: repo_path".to_string())?;
+
+    let source = Path::new(repo_path);
+    if !source.is_absolute() {
+        return Err("repo_path must be an absolute path".to_string());
+    }
+    let onboarder = DeterministicOnboarder;
+    let result = onboarder.onboard(source).await.map_err(|e| e.to_string())?;
+
+    let tools: Vec<Value> = result
+        .profile
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "command": t.command,
+                "description": t.description,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "project_name": result.profile.project_name,
+        "flake_path": result.flake_path.to_string_lossy(),
+        "nix_packages": result.profile.nix_packages,
+        "tools": tools,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +385,13 @@ mod tests {
         let params = serde_json::json!({"task_id": "nonexistent"});
         let result = handle_cancel_task(&params, &manager).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_rejects_relative_path() {
+        let params = serde_json::json!({"repo_path": "relative/path"});
+        let result = handle_onboard_repo(&params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute"));
     }
 }

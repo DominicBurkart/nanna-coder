@@ -4,13 +4,11 @@ use harness::container::{
     ContainerConfig, ContainerRuntime,
 };
 use harness::entities::InMemoryEntityStore;
-use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
 use harness::tools::{
     ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
 };
 use image_builder::build_dev_container;
 use model::prelude::*;
-use model::provider::ModelProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,25 +18,26 @@ const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 const E2E_MODEL: &str = "qwen3:0.6b";
+const ORIGINAL_HELP_STRING: &str = "A CLI tool for interacting with language models";
 
-fn example_repo_path() -> PathBuf {
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("tests/integration/repo")
+        .to_path_buf()
 }
 
 #[tokio::test]
 #[ignore]
-async fn test_dev_container_fibonacci_to_primes() {
-    let repo_path = example_repo_path();
+async fn test_nanna_self_dev_translate_help_to_french() {
+    let root = workspace_root();
     assert!(
-        repo_path.exists(),
-        "Example repo not found at {:?}",
-        repo_path
+        root.join("flake.nix").exists(),
+        "workspace root not found at {:?}",
+        root
     );
 
-    let image_path = build_dev_container(&repo_path).expect("failed to build dev container image");
+    let image_path = build_dev_container(&root).expect("failed to build nanna dev container image");
 
     let runtime = detect_runtime();
     if !runtime.is_available() {
@@ -83,10 +82,10 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
     let tempdir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let workspace = tempdir.path().to_path_buf();
 
-    let repo_path = example_repo_path();
-    copy_dir_all(&repo_path, &workspace).map_err(|e| format!("copy failed: {}", e))?;
+    let root = workspace_root();
+    copy_workspace(&root, &workspace).map_err(|e| format!("workspace copy failed: {}", e))?;
 
-    let container_name = format!("nanna-dev-container-test-{}", uuid::Uuid::new_v4());
+    let container_name = format!("nanna-self-dev-test-{}", uuid::Uuid::new_v4());
 
     let mut additional_args = vec![format!("-v={}:/workspace", workspace.display())];
     if *runtime == ContainerRuntime::Podman {
@@ -129,12 +128,22 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
     let agent_config = AgentConfig {
         max_iterations: MAX_TURNS,
         verbose: true,
-        system_prompt: "You are a coding assistant. Modify this Rust project to compute the first 10 prime numbers instead of Fibonacci numbers. Update src/lib.rs to implement a `primes(n: usize) -> Vec<u64>` function that returns the first n prime numbers. Update src/main.rs to call `primes(10)` and print the result. Update tests/fib_test.rs to test that primes(10) returns [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]. Use run_command to run `cargo test` and `cargo run` to verify your changes work.".to_string(),
+        system_prompt: format!(
+            "You are a coding assistant working inside a Rust project at /workspace. \
+             Your task is to translate the CLI help text in harness/src/main.rs from English to French. \
+             Specifically, find the `about` string \"{ORIGINAL_HELP_STRING}\" in the #[command(about = ...)] \
+             attribute on the Cli struct in harness/src/main.rs and translate it to French. \
+             Also translate any other English user-facing strings in the #[command] and #[arg] \
+             doc comments in that file. \
+             After making changes, use run_command to verify with `cargo build --workspace` and \
+             `cargo test --workspace` inside the container."
+        ),
         model_name: E2E_MODEL.to_string(),
     };
 
     let context = AgentContext {
-        user_prompt: "Modify the fibonacci project to compute prime numbers instead.".to_string(),
+        user_prompt: "Translate the CLI help text in harness/src/main.rs from English to French."
+            .to_string(),
         conversation_history: vec![],
         app_state_id: uuid::Uuid::new_v4().to_string(),
     };
@@ -153,8 +162,26 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         ));
     }
 
-    let test_result = exec_in_container(&handle, &["cargo", "test"], Some("/workspace"))
-        .map_err(|e| format!("exec cargo test failed: {}", e))?;
+    let build_result = exec_in_container(
+        &handle,
+        &["cargo", "build", "--workspace"],
+        Some("/workspace"),
+    )
+    .map_err(|e| format!("exec cargo build failed: {}", e))?;
+
+    if !build_result.success {
+        return Err(format!(
+            "cargo build failed:\nstdout: {}\nstderr: {}",
+            build_result.stdout, build_result.stderr
+        ));
+    }
+
+    let test_result = exec_in_container(
+        &handle,
+        &["cargo", "test", "--workspace"],
+        Some("/workspace"),
+    )
+    .map_err(|e| format!("exec cargo test failed: {}", e))?;
 
     if !test_result.success {
         return Err(format!(
@@ -163,95 +190,54 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         ));
     }
 
-    let run_result = exec_in_container(&handle, &["cargo", "run"], Some("/workspace"))
-        .map_err(|e| format!("exec cargo run failed: {}", e))?;
+    let help_result = exec_in_container(
+        &handle,
+        &["cargo", "run", "--bin", "harness", "--", "--help"],
+        Some("/workspace"),
+    )
+    .map_err(|e| format!("exec harness --help failed: {}", e))?;
 
-    if !run_result.success {
+    let help_output = format!("{}{}", help_result.stdout, help_result.stderr);
+    if help_output.contains(ORIGINAL_HELP_STRING) {
         return Err(format!(
-            "cargo run failed:\nstdout: {}\nstderr: {}",
-            run_result.stdout, run_result.stderr
+            "harness --help still contains original English string {:?}.\nOutput: {}",
+            ORIGINAL_HELP_STRING, help_output
         ));
     }
 
-    let expected_primes = "[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]";
-    if !run_result.stdout.contains(expected_primes) {
+    let french_indicators = [
+        "outil",
+        "modèle",
+        "interaction",
+        "langage",
+        "commande",
+        "aide",
+    ];
+    if !french_indicators.iter().any(|w| help_output.contains(w)) {
         return Err(format!(
-            "cargo run output does not contain expected primes {}.\nActual stdout: {}",
-            expected_primes, run_result.stdout
+            "harness --help does not contain any French indicator words {:?}.\nOutput: {}",
+            french_indicators, help_output
         ));
     }
 
     Ok(())
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_task_manager_submit_with_dev_container() {
-    let repo_path = example_repo_path();
-    assert!(
-        repo_path.exists(),
-        "Example repo not found at {:?}",
-        repo_path
-    );
-
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
-
-    let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
-
-    let ollama_config = model::OllamaConfig::default();
-    let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
-    let provider: Arc<dyn ModelProvider> = Arc::new(provider);
-
-    let task_id = manager
-        .submit(
-            "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
-                .to_string(),
-            repo_path,
-            "HEAD".to_string(),
-            E2E_MODEL.to_string(),
-            MAX_TURNS,
-            provider,
-        )
-        .await;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(700);
-    loop {
-        if std::time::Instant::now() > deadline {
-            panic!("Task did not complete within timeout");
-        }
-
-        let task = manager.poll(&task_id).await.expect("task not found");
-        match &task.status {
-            TaskStatus::Completed { result, .. } => {
-                assert!(
-                    result.changes_patch.is_some(),
-                    "expected non-empty changes_patch"
-                );
-                return;
-            }
-            TaskStatus::Failed { error, .. } => {
-                panic!("Task failed: {}", error);
-            }
-            _ => {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+fn copy_workspace(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let skip = ["target", ".git", "result"];
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if skip.iter().any(|s| *s == name_str.as_ref()) {
+            continue;
+        }
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_workspace(&entry.path(), &dst.join(&name))?;
         } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            std::fs::copy(entry.path(), dst.join(&name))?;
         }
     }
     Ok(())

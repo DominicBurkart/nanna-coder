@@ -41,6 +41,7 @@ impl std::fmt::Display for TaskId {
 pub struct TaskResult {
     pub result_summary: String,
     pub changes_patch: Option<String>,
+    pub format_patch: Option<String>,
     pub files_modified: Vec<String>,
     pub tool_calls_made: Vec<ToolCallRecord>,
     pub iterations: usize,
@@ -52,6 +53,7 @@ impl TaskResult {
         serde_json::json!({
             "result_summary": self.result_summary,
             "changes_patch": self.changes_patch,
+            "format_patch": self.format_patch,
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
             "iterations": self.iterations,
@@ -66,6 +68,9 @@ pub struct FailureDiagnostics {
     pub iterations_completed: usize,
     pub last_tool_call: Option<ToolCallRecord>,
     pub partial_changes: Option<String>,
+    pub tool_call_history: Vec<ToolCallRecord>,
+    pub last_agent_state: Option<String>,
+    pub conversation_snapshot: Option<Vec<ChatMessage>>,
 }
 
 impl FailureDiagnostics {
@@ -75,6 +80,9 @@ impl FailureDiagnostics {
             "iterations_completed": self.iterations_completed,
             "last_tool_call": self.last_tool_call,
             "partial_changes": self.partial_changes,
+            "tool_call_history": self.tool_call_history,
+            "last_agent_state": self.last_agent_state,
+            "conversation_snapshot": self.conversation_snapshot,
         })
     }
 }
@@ -225,6 +233,9 @@ impl TaskManager {
                                     iterations_completed: 0,
                                     last_tool_call: None,
                                     partial_changes: None,
+                                    tool_call_history: vec![],
+                                    last_agent_state: None,
+                                    conversation_snapshot: None,
                                 },
                             };
                         }
@@ -264,6 +275,9 @@ impl TaskManager {
                                 iterations_completed: 0,
                                 last_tool_call: None,
                                 partial_changes: None,
+                                tool_call_history: vec![],
+                                last_agent_state: None,
+                                conversation_snapshot: None,
                             },
                         };
                     }
@@ -302,6 +316,8 @@ impl TaskManager {
                         }
                     });
 
+                    let format_patch = workspace.format_patch().ok().flatten();
+
                     let _ = workspace.cleanup();
 
                     {
@@ -319,6 +335,7 @@ impl TaskManager {
                             let task_result = TaskResult {
                                 result_summary: result.result_summary,
                                 changes_patch,
+                                format_patch,
                                 files_modified,
                                 tool_calls_made: result.tool_calls_made,
                                 iterations: result.iterations,
@@ -334,20 +351,32 @@ impl TaskManager {
                         }
                         Err(e) => {
                             let partial_changes = changes_patch;
+                            let (tool_calls_slice, conv_slice, diag_iters, diag_state) =
+                                e.diagnostics();
+                            let tool_call_history: Vec<ToolCallRecord> = tool_calls_slice.to_vec();
+                            let conversation_snapshot: Vec<ChatMessage> = conv_slice.to_vec();
+                            let last_agent_state = Some(format!("{:?}", diag_state));
+                            let last_tool_call = tool_call_history.last().cloned();
                             let (error_type, iterations_completed) = match &e {
-                                AgentError::MaxIterationsExceeded { iterations } => {
-                                    ("MaxIterationsExceeded".to_string(), *iterations)
+                                AgentError::MaxIterationsExceeded {
+                                    iterations_completed,
+                                    ..
+                                } => ("MaxIterationsExceeded".to_string(), *iterations_completed),
+                                AgentError::StateError { .. } => {
+                                    ("StateError".to_string(), diag_iters)
                                 }
-                                AgentError::StateError(_) => ("StateError".to_string(), 0),
-                                AgentError::TaskCheckFailed(_) => {
-                                    ("TaskCheckFailed".to_string(), 0)
+                                AgentError::TaskCheckFailed { .. } => {
+                                    ("TaskCheckFailed".to_string(), diag_iters)
                                 }
                             };
                             let diagnostics = FailureDiagnostics {
                                 error_type,
                                 iterations_completed,
-                                last_tool_call: None,
+                                last_tool_call,
                                 partial_changes,
+                                tool_call_history,
+                                last_agent_state,
+                                conversation_snapshot: Some(conversation_snapshot),
                             };
                             let mut tasks = tasks_ref.write().await;
                             if let Some(task) = tasks.get_mut(&task_id_clone) {
@@ -449,6 +478,9 @@ impl TaskManager {
                 iterations_completed,
                 last_tool_call: None,
                 partial_changes: None,
+                tool_call_history: vec![],
+                last_agent_state: None,
+                conversation_snapshot: None,
             },
         };
 
@@ -549,6 +581,7 @@ mod tests {
         let result = TaskResult {
             result_summary: "Done".to_string(),
             changes_patch: Some("diff --git a/foo".to_string()),
+            format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
             files_modified: vec!["foo.rs".to_string()],
             tool_calls_made: vec![],
             iterations: 3,
@@ -558,6 +591,7 @@ mod tests {
         assert_eq!(json["result_summary"], "Done");
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
+        assert!(json["format_patch"].is_string());
     }
 
     #[test]
@@ -567,10 +601,41 @@ mod tests {
             iterations_completed: 100,
             last_tool_call: None,
             partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "MaxIterationsExceeded");
         assert_eq!(json["iterations_completed"], 100);
+    }
+
+    #[test]
+    fn test_failure_diagnostics_with_full_context() {
+        use crate::entities::context::types::ToolCallRecord;
+
+        let tool_call = ToolCallRecord {
+            tool_name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+            call_id: "call_1".to_string(),
+            result: "fn main() {}".to_string(),
+        };
+        let diag = FailureDiagnostics {
+            error_type: "StateError".to_string(),
+            iterations_completed: 5,
+            last_tool_call: Some(tool_call.clone()),
+            partial_changes: Some("diff --git a/foo".to_string()),
+            tool_call_history: vec![tool_call],
+            last_agent_state: Some("Performing".to_string()),
+            conversation_snapshot: Some(vec![ChatMessage::user("do something")]),
+        };
+        let json = diag.to_json();
+        assert_eq!(json["error_type"], "StateError");
+        assert_eq!(json["iterations_completed"], 5);
+        assert!(json["last_tool_call"].is_object());
+        assert_eq!(json["tool_call_history"].as_array().unwrap().len(), 1);
+        assert_eq!(json["last_agent_state"], "Performing");
+        assert!(json["conversation_snapshot"].is_array());
     }
 
     #[test]

@@ -1849,6 +1849,8 @@ async fn test_e2e_agent_with_containerized_ollama() {
 fn git_cmd_clean(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     for var in &[
         "GIT_DIR",
         "GIT_INDEX_FILE",

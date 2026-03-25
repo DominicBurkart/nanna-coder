@@ -1,0 +1,17 @@
+[case]
+id = "happy-path-001"
+name = "Add a function"
+description = "Add a public greeting function to an empty library crate"
+
+[task]
+prompt = "Add a public function named `greet` that takes a `name: &str` parameter and returns a `String` with the greeting `Hello, {name}!`."
+
+[expected]
+files_changed = ["src/lib.rs"]
+build_must_pass = true
+required_symbols = ["greet"]
+
+[metadata]
+difficulty = "easy"
+tags = ["function", "addition"]
+timeout_secs = 120

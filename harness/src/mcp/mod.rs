@@ -242,6 +242,20 @@ impl NannaMcpServer {
                     },
                     "required": ["task_id"]
                 }
+            },
+            {
+                "name": "onboard_repo",
+                "description": "Generate a flake.nix for a pure Cargo Rust project that has none",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Absolute path to the repository to onboard"
+                        }
+                    },
+                    "required": ["repo_path"]
+                }
             }
         ])
     }
@@ -274,6 +288,7 @@ impl NannaMcpServer {
             "get_result" => handlers::handle_get_result(&tool_params, &self.task_manager).await,
             "list_tasks" => handlers::handle_list_tasks(&self.task_manager).await,
             "cancel_task" => handlers::handle_cancel_task(&tool_params, &self.task_manager).await,
+            "onboard_repo" => handlers::handle_onboard_repo(&tool_params).await,
             other => Err(format!("Unknown tool: {}", other)),
         };
 
@@ -344,7 +359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_returns_five_tools() {
+    async fn test_tools_list_returns_six_tools() {
         let server = make_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -355,7 +370,7 @@ mod tests {
         let resp = server.handle_request(req).await;
         assert!(resp.error.is_none());
         let tools = &resp.result.unwrap()["tools"];
-        assert_eq!(tools.as_array().unwrap().len(), 5);
+        assert_eq!(tools.as_array().unwrap().len(), 6);
         let names: Vec<&str> = tools
             .as_array()
             .unwrap()
@@ -367,6 +382,7 @@ mod tests {
         assert!(names.contains(&"get_result"));
         assert!(names.contains(&"list_tasks"));
         assert!(names.contains(&"cancel_task"));
+        assert!(names.contains(&"onboard_repo"));
     }
 
     #[tokio::test]
