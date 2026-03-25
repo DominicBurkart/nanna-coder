@@ -3,6 +3,7 @@ use model::OllamaConfig;
 use model::OllamaProvider;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -515,7 +516,9 @@ pub async fn health_check_host(port: u16, timeout: Duration) -> Result<(), Conta
             });
         }
 
-        sleep(Duration::from_secs(2)).await;
+        // Cap the sleep so we don't overshoot the deadline.
+        let remaining = timeout.saturating_sub(start.elapsed());
+        sleep(remaining.min(Duration::from_secs(2))).await;
     }
 }
 
@@ -625,7 +628,6 @@ pub fn exec_in_container(
 struct PoolInner {
     container: Option<ContainerHandle>,
     provider: Option<Arc<dyn ModelProvider>>,
-    ref_count: usize,
 }
 
 /// Shared pool that manages a single model container instance.
@@ -634,6 +636,7 @@ struct PoolInner {
 /// `get_or_start` and stops it when the last user drops their guard.
 pub struct SharedModelPool {
     inner: tokio::sync::Mutex<PoolInner>,
+    ref_count: AtomicUsize,
     container_config: ContainerConfig,
 }
 
@@ -654,9 +657,11 @@ impl ModelGuard {
 
 impl Drop for ModelGuard {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.pool.inner.try_lock() {
-            inner.ref_count = inner.ref_count.saturating_sub(1);
-            if inner.ref_count == 0 {
+        let prev = self.pool.ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            // Last guard dropped — best-effort cleanup.  ContainerHandle's own
+            // Drop will remove the container even if try_lock fails here.
+            if let Ok(mut inner) = self.pool.inner.try_lock() {
                 inner.container.take();
                 inner.provider.take();
             }
@@ -670,8 +675,8 @@ impl SharedModelPool {
             inner: tokio::sync::Mutex::new(PoolInner {
                 container: None,
                 provider: None,
-                ref_count: 0,
             }),
+            ref_count: AtomicUsize::new(0),
             container_config,
         })
     }
@@ -685,8 +690,8 @@ impl SharedModelPool {
             inner: tokio::sync::Mutex::new(PoolInner {
                 container: None,
                 provider: Some(provider),
-                ref_count: 0,
             }),
+            ref_count: AtomicUsize::new(0),
             container_config,
         })
     }
@@ -696,7 +701,7 @@ impl SharedModelPool {
         let mut inner = self.inner.lock().await;
 
         if let Some(provider) = inner.provider.as_ref().cloned() {
-            inner.ref_count += 1;
+            self.ref_count.fetch_add(1, Ordering::AcqRel);
             return Ok(ModelGuard {
                 pool: self.clone(),
                 provider,
@@ -715,7 +720,7 @@ impl SharedModelPool {
 
         inner.container = Some(handle);
         inner.provider = Some(provider.clone());
-        inner.ref_count = 1;
+        self.ref_count.store(1, Ordering::Release);
 
         Ok(ModelGuard {
             pool: self.clone(),
@@ -724,7 +729,7 @@ impl SharedModelPool {
     }
 
     pub fn ref_count(&self) -> usize {
-        self.inner.try_lock().map(|g| g.ref_count).unwrap_or(0)
+        self.ref_count.load(Ordering::Acquire)
     }
 }
 
