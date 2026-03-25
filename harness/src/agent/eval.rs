@@ -95,9 +95,6 @@ pub struct EvaluationConfig {
     /// Model to use for LLM-powered agent
     pub model: String,
 
-    /// Model base URL (for containerized models)
-    pub model_base_url: Option<String>,
-
     /// Maximum evaluation time
     pub timeout: Duration,
 
@@ -118,7 +115,6 @@ impl Default for EvaluationConfig {
     fn default() -> Self {
         Self {
             model: "qwen3:0.6b".to_string(),
-            model_base_url: None,
             timeout: Duration::from_secs(300),
             verbose: false,
             max_retries: 2,
@@ -140,11 +136,6 @@ impl Default for EvaluationConfig {
 impl EvaluationConfig {
     pub fn with_model(mut self, model: &str) -> Self {
         self.model = model.to_string();
-        self
-    }
-
-    pub fn with_base_url(mut self, url: &str) -> Self {
-        self.model_base_url = Some(url.to_string());
         self
     }
 
@@ -435,11 +426,6 @@ pub struct AgentEvaluator {
     /// Configuration
     config: EvaluationConfig,
 
-    /// Model provider (optional, for LLM-powered evaluations)
-    /// Reserved for future use when evaluating LLM-powered agents
-    #[allow(dead_code)]
-    model_provider: Option<Box<dyn ModelProvider>>,
-
     /// Observability system (optional)
     observability: Option<ObservabilitySystem>,
 }
@@ -447,19 +433,6 @@ pub struct AgentEvaluator {
 impl AgentEvaluator {
     /// Create a new agent evaluator
     pub async fn new(config: EvaluationConfig) -> EvaluationResult<Self> {
-        let model_provider = if let Some(base_url) = &config.model_base_url {
-            let ollama_config = OllamaConfig::new()
-                .with_base_url(base_url.clone())
-                .with_timeout(Duration::from_secs(120));
-
-            let provider = OllamaProvider::new(ollama_config)
-                .map_err(|e| EvaluationError::SetupFailed(e.to_string()))?;
-
-            Some(Box::new(provider) as Box<dyn ModelProvider>)
-        } else {
-            None
-        };
-
         let observability = if config.collect_observability {
             let mut obs = ObservabilitySystem::new()
                 .with_service_name("agent-evaluator")
@@ -475,7 +448,6 @@ impl AgentEvaluator {
 
         Ok(Self {
             config,
-            model_provider,
             observability,
         })
     }
@@ -510,7 +482,6 @@ impl AgentEvaluator {
             user_prompt: scenario.user_prompt.clone(),
             conversation_history: vec![],
             app_state_id: format!("eval_{}", scenario.id),
-            work_dir: None,
         };
 
         // Track state transitions
@@ -881,7 +852,6 @@ mod tests {
     #[tokio::test]
     async fn test_evaluator_creation_without_model() {
         let config = EvaluationConfig {
-            model_base_url: None,
             collect_observability: false,
             ..Default::default()
         };
@@ -893,7 +863,6 @@ mod tests {
     #[tokio::test]
     async fn test_simple_entity_creation_scenario() {
         let config = EvaluationConfig {
-            model_base_url: None,
             collect_observability: false,
             timeout: Duration::from_secs(10),
             verbose: true,
@@ -912,12 +881,21 @@ mod tests {
         );
         assert!(result.metrics.entities_created >= 1);
         assert_eq!(result.final_state, AgentState::Completed);
+        assert!(
+            result.metrics.decision_quality > 0.0,
+            "Decision quality should be positive, got {}",
+            result.metrics.decision_quality
+        );
+        assert!(
+            result.metrics.entity_accuracy > 0.0,
+            "Entity accuracy should be positive, got {}",
+            result.metrics.entity_accuracy
+        );
     }
 
     #[tokio::test]
     async fn test_rag_retrieval_scenario() {
         let config = EvaluationConfig {
-            model_base_url: None,
             collect_observability: false,
             timeout: Duration::from_secs(10),
             ..Default::default()
@@ -928,21 +906,23 @@ mod tests {
 
         let result = evaluator.evaluate(scenario).await.unwrap();
 
-        // RAG scenario should complete
-        // The entity creation happens successfully even if RAG doesn't match perfectly
         assert!(
-            result.success || result.metrics.entities_created > 0,
-            "Scenario should either pass or create entities"
+            result.success,
+            "RAG scenario should pass: {:?}",
+            result.failures
         );
-
-        // Check that RAG was at least attempted (score is computed)
-        assert!(result.metrics.rag_relevance >= 0.0);
+        assert_eq!(result.final_state, AgentState::Completed);
+        assert!(
+            result.metrics.rag_relevance > 0.0,
+            "RAG relevance should be positive, got {}",
+            result.metrics.rag_relevance
+        );
+        assert!(result.metrics.entities_created >= 1);
     }
 
     #[tokio::test]
     async fn test_batch_evaluation() {
         let config = EvaluationConfig {
-            model_base_url: None,
             collect_observability: false,
             timeout: Duration::from_secs(30),
             ..Default::default()
@@ -958,6 +938,23 @@ mod tests {
         let batch_result = evaluator.evaluate_batch(scenarios).await.unwrap();
 
         assert_eq!(batch_result.total_scenarios, 2);
-        assert!(batch_result.passed > 0);
+        assert_eq!(
+            batch_result.passed, 2,
+            "Both scenarios should pass, but only {} passed",
+            batch_result.passed
+        );
+        assert_eq!(batch_result.failed, 0);
+        assert_eq!(batch_result.results.len(), 2);
+        assert!(
+            batch_result.total_time > Duration::ZERO,
+            "Total time should be positive"
+        );
+        for result in &batch_result.results {
+            assert!(
+                result.success,
+                "Individual scenario failed: {:?}",
+                result.failures
+            );
+        }
     }
 }

@@ -430,7 +430,6 @@ async fn run_agent(
         user_prompt: prompt.to_string(),
         conversation_history: vec![ChatMessage::user(prompt)],
         app_state_id: "cli".to_string(),
-        work_dir: None,
     };
 
     if verbose {
