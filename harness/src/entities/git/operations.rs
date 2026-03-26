@@ -65,7 +65,6 @@ pub fn read_repository(path: impl AsRef<Path>) -> GitOperationResult<GitReposito
         }
     }
 
-    // Get submodules
     for submodule in repo.submodules()?.iter() {
         if let Some(path) = submodule.path().to_str() {
             if let Some(url) = submodule.url() {
@@ -314,10 +313,10 @@ mod tests {
         }
     }
 
-    // Helper to check if we're in a git repository (for Nix sandbox compatibility)
+    // Helper to check if we're in a usable git repository (for sandbox compatibility)
     fn has_git_repo() -> bool {
         let repo_path = get_repo_root();
-        git2::Repository::discover(&repo_path).is_ok()
+        read_repository(repo_path).is_ok()
     }
 
     // Tests using current repository - these will exercise actual git2 code paths

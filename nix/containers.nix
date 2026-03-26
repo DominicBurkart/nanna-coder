@@ -9,6 +9,7 @@
 , lib
 , nix2containerPkgs
 , harness
+, rustToolchain
 }:
 
 let
@@ -43,6 +44,48 @@ let
     };
 
     # Reproducible layer strategy
+    maxLayers = 100;
+  };
+
+  # Development container image for nanna self-development
+  devContainerImage = nix2containerPkgs.nix2container.buildImage {
+    name = "nanna-coder-dev";
+    tag = "latest";
+
+    copyToRoot = pkgs.buildEnv {
+      name = "dev-env";
+      paths = [
+        harness
+        rustToolchain
+        pkgs.cargo-nextest
+        pkgs.cargo-audit
+        pkgs.cargo-deny
+        pkgs.cargo-tarpaulin
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.git
+        pkgs.cacert
+        pkgs.pkg-config
+        pkgs.openssl
+        pkgs.stdenv.cc
+        pkgs.libssh2
+        pkgs.zlib
+      ];
+      pathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
+    };
+
+    config = {
+      Cmd = [ "${pkgs.bash}/bin/sleep" "infinity" ];
+      Env = [
+        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "PATH=/bin"
+        "CARGO_HOME=/tmp/cargo"
+        "PKG_CONFIG_PATH=/lib/pkgconfig"
+        "RUST_LOG=info"
+      ];
+      WorkingDir = "/workspace";
+    };
+
     maxLayers = 100;
   };
 
@@ -364,6 +407,6 @@ let
 
 in
 {
-  inherit harnessImage ollamaImage vllmImage;
+  inherit harnessImage ollamaImage vllmImage devContainerImage;
   inherit modelRegistry models containers;
 }
