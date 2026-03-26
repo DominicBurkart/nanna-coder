@@ -16,6 +16,12 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+/// Parse an Ollama base URL into a `(host_url, port)` pair.
+///
+/// Strips a trailing `/v1` suffix (used by OpenAI-compatible endpoints) and
+/// extracts scheme + host. **Note:** any path components other than `/v1` are
+/// intentionally dropped — reverse-proxy paths (e.g. `http://proxy:8080/ollama`)
+/// are not supported. If no port is specified, defaults to 11434.
 pub fn parse_ollama_url(base_url: &str) -> Result<(String, u16), String> {
     let url_str = base_url.strip_suffix("/v1").unwrap_or(base_url);
     let url = Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;

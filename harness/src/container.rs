@@ -505,7 +505,8 @@ pub async fn health_check_host(port: u16, timeout: Duration) -> Result<(), Conta
             _ => {}
         }
 
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             return Err(ContainerError::HealthCheckFailed {
                 reason: format!(
                     "Ollama at port {} did not respond within {}s",
@@ -515,7 +516,9 @@ pub async fn health_check_host(port: u16, timeout: Duration) -> Result<(), Conta
             });
         }
 
-        sleep(Duration::from_secs(2)).await;
+        // Sleep for at most 2s, but don't exceed the remaining timeout.
+        let remaining = timeout - elapsed;
+        sleep(remaining.min(Duration::from_secs(2))).await;
     }
 }
 
@@ -633,7 +636,9 @@ struct PoolInner {
 /// Tracks active users with a reference count; starts the container on first
 /// `get_or_start` and stops it when the last user drops their guard.
 pub struct SharedModelPool {
-    inner: tokio::sync::Mutex<PoolInner>,
+    inner: std::sync::Mutex<PoolInner>,
+    /// Serializes async container startup so only one task starts the container.
+    start_lock: tokio::sync::Mutex<()>,
     container_config: ContainerConfig,
 }
 
@@ -654,12 +659,11 @@ impl ModelGuard {
 
 impl Drop for ModelGuard {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.pool.inner.try_lock() {
-            inner.ref_count = inner.ref_count.saturating_sub(1);
-            if inner.ref_count == 0 {
-                inner.container.take();
-                inner.provider.take();
-            }
+        let mut inner = self.pool.inner.lock().unwrap();
+        inner.ref_count = inner.ref_count.saturating_sub(1);
+        if inner.ref_count == 0 {
+            inner.container.take();
+            inner.provider.take();
         }
     }
 }
@@ -667,11 +671,12 @@ impl Drop for ModelGuard {
 impl SharedModelPool {
     pub fn new(container_config: ContainerConfig) -> Arc<Self> {
         Arc::new(Self {
-            inner: tokio::sync::Mutex::new(PoolInner {
+            inner: std::sync::Mutex::new(PoolInner {
                 container: None,
                 provider: None,
                 ref_count: 0,
             }),
+            start_lock: tokio::sync::Mutex::new(()),
             container_config,
         })
     }
@@ -682,25 +687,30 @@ impl SharedModelPool {
         provider: Arc<dyn ModelProvider>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: tokio::sync::Mutex::new(PoolInner {
+            inner: std::sync::Mutex::new(PoolInner {
                 container: None,
                 provider: Some(provider),
                 ref_count: 0,
             }),
+            start_lock: tokio::sync::Mutex::new(()),
             container_config,
         })
     }
 
     /// Return a `ModelGuard` with a shared provider, starting the container if necessary.
     pub async fn get_or_start(self: &Arc<Self>) -> Result<ModelGuard, ContainerError> {
-        let mut inner = self.inner.lock().await;
+        // Serialize startup attempts so only one task starts the container.
+        let _start_guard = self.start_lock.lock().await;
 
-        if let Some(provider) = inner.provider.as_ref().cloned() {
-            inner.ref_count += 1;
-            return Ok(ModelGuard {
-                pool: self.clone(),
-                provider,
-            });
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(provider) = inner.provider.as_ref().cloned() {
+                inner.ref_count += 1;
+                return Ok(ModelGuard {
+                    pool: self.clone(),
+                    provider,
+                });
+            }
         }
 
         let handle = start_container_with_fallback(&self.container_config).await?;
@@ -713,9 +723,12 @@ impl SharedModelPool {
                 }
             })?);
 
-        inner.container = Some(handle);
-        inner.provider = Some(provider.clone());
-        inner.ref_count = 1;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.container = Some(handle);
+            inner.provider = Some(provider.clone());
+            inner.ref_count = 1;
+        }
 
         Ok(ModelGuard {
             pool: self.clone(),
@@ -724,7 +737,7 @@ impl SharedModelPool {
     }
 
     pub fn ref_count(&self) -> usize {
-        self.inner.try_lock().map(|g| g.ref_count).unwrap_or(0)
+        self.inner.lock().unwrap().ref_count
     }
 }
 
