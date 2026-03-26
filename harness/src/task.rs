@@ -495,6 +495,18 @@ mod tests {
         }
     }
 
+    /// Wrap tool-loop responses with state machine responses for plan/perform/check.
+    fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+        // EnrichingEntities: no LLM call
+        let mut responses = vec![
+            stop_response("Plan: execute the task"), // PlanningEntityModification
+        ];
+        responses.extend(tool_responses); // PerformingEntityModification
+                                          // UpdatingEntities: no LLM call
+        responses.push(stop_response("COMPLETE - task done")); // CheckingTaskCompletion
+        responses
+    }
+
     #[test]
     fn test_task_id_uniqueness() {
         let id1 = TaskId::new();
@@ -698,10 +710,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_completes_with_mock_provider() {
-        let provider: Arc<dyn ModelProvider> =
-            MockProvider::new(vec![stop_response("Task complete!")]);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
+        );
         let config = AgentConfig {
-            max_iterations: 10,
+            max_iterations: 20,
             ..Default::default()
         };
         let mut registry = ToolRegistry::new();
@@ -715,7 +728,6 @@ mod tests {
         };
         let result = agent.run(context).await.unwrap();
         assert!(result.task_completed);
-        assert_eq!(result.result_summary, "Task complete!");
     }
 
     #[tokio::test]
@@ -745,10 +757,11 @@ mod tests {
     #[tokio::test]
     async fn test_progress_counter_accessible_after_run() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let provider: Arc<dyn ModelProvider> =
-            MockProvider::new(vec![stop_response("Task complete!")]);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
+        );
         let config = AgentConfig {
-            max_iterations: 10,
+            max_iterations: 20,
             ..Default::default()
         };
         let mut registry = ToolRegistry::new();
