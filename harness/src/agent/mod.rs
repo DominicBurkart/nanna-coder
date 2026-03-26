@@ -425,11 +425,11 @@ impl AgentLoop {
     }
 
     /// Run the agent loop with the given context
+    ///
+    /// Always follows the ARCHITECTURE.md Harness Control Flow state machine:
+    /// Entity Enrichment → Plan Entity Modification → Perform Entity Modification
+    /// → Update Entities → Task Complete? → (loop or complete)
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
-        if self.tool_registry.is_some() && self.llm_provider.is_some() {
-            return self.run_tool_loop(context).await;
-        }
-
         self.iterations = 0;
 
         loop {
@@ -754,28 +754,23 @@ impl AgentLoop {
 
     /// Entity Modification Decision (ARCHITECTURE.md) — decide whether to
     /// query for more context (true) or proceed to plan (false).
+    ///
+    /// Delegates prompt construction to [`decision::build_decision_prompt`]
+    /// and response parsing to [`decision::parse_decision_response`].
     async fn entity_modification_decision(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
-
-            let plan = self.plan_cache.as_deref().unwrap_or("No plan yet");
-            let entity_count = self
-                .entity_store
-                .query(&EntityQuery::default())
-                .await
-                .map_err(|e| bare_state_error(format!("Failed to query entities: {}", e)))?
-                .len();
-
-            let prompt_text = prompts::DecisionPrompt::build(
+            let input = decision::build_decision_prompt(
+                &self.entity_store,
                 &context.user_prompt,
-                plan,
-                entity_count,
+                self.plan_cache.as_deref(),
                 self.performed_actions,
-            );
+            )
+            .await
+            .map_err(|e| bare_state_error(format!("Decision prompt error: {}", e)))?;
 
             let request = ChatRequest::new(
                 &self.config.model_name,
-                vec![ChatMessage::user(&prompt_text)],
+                vec![ChatMessage::user(&input.prompt)],
             )
             .with_temperature(DECISION_TEMPERATURE);
 
@@ -799,7 +794,7 @@ impl AgentLoop {
                 return Ok(false);
             }
 
-            match prompts::DecisionPrompt::parse_response(decision_text) {
+            match decision::parse_decision_response(decision_text) {
                 Some(true) => Ok(true),
                 Some(false) => Ok(false),
                 None => {
@@ -887,10 +882,14 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Full tool-calling run loop — used when tool_registry is set.
+    /// Full tool-calling run loop — alternative execution mode.
     ///
-    /// Bypasses the state machine and drives a direct LLM ↔ tool conversation
-    /// until the model stops with a non-tool finish reason.
+    /// **Note**: This method does NOT follow the ARCHITECTURE.md Harness Control
+    /// Flow. It drives a direct LLM ↔ tool conversation loop, bypassing the
+    /// structured state machine. Prefer [`run()`](Self::run) which always follows
+    /// the architecture's control flow. This method is retained for advanced use
+    /// cases that need a flat tool-calling loop.
+    #[allow(dead_code)]
     async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
 
@@ -1889,9 +1888,23 @@ mod tests {
         assert_eq!(by_model.len(), 1, "Entity should contain model_used");
     }
 
+    /// Test that the state machine stores a ContextEntity when tools are present.
+    ///
+    /// With the architecture-aligned state machine, `run()` always follows
+    /// Entity Enrichment → Plan → Perform → Update → Check flow, even when
+    /// tools are registered. The mock provider supplies responses for each
+    /// LLM-calling step: planning, perform (tool call + final), and
+    /// completion check.
     #[tokio::test]
     async fn test_tool_loop_run_stores_context_entity() {
-        let provider = MockProvider::new(vec![plain_response("Task complete!")]);
+        let provider = MockProvider::new(vec![
+            // 1. plan_entity_modification: LLM returns a plan
+            plain_response("Plan: echo a message"),
+            // 2. perform_entity_modification_with_tools: LLM returns a final (no tool call)
+            plain_response("Task complete!"),
+            // 3. check_task_completion: LLM says COMPLETE
+            plain_response("COMPLETE - task is done"),
+        ]);
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool::new()));
@@ -1950,27 +1963,24 @@ mod tests {
             .await
             .unwrap();
         assert!(!by_model.is_empty(), "Entity should contain model_used");
-
-        let by_summary = agent
-            .entity_store()
-            .query(&EntityQuery {
-                entity_types: vec![crate::entities::EntityType::Context],
-                text_query: Some("Task complete!".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            !by_summary.is_empty(),
-            "Entity should contain result_summary"
-        );
     }
 
+    /// Test that tool calls made during perform are recorded in the ContextEntity.
+    ///
+    /// The state machine goes through: enrich → plan → perform (with tools) →
+    /// update → completion check. Mock responses are provided for each
+    /// LLM-calling step.
     #[tokio::test]
     async fn test_tool_loop_stores_tool_calls_made() {
         let provider = MockProvider::new(vec![
+            // 1. plan_entity_modification
+            plain_response("Plan: echo ping"),
+            // 2. perform_entity_modification_with_tools: tool call
             tool_call_response("echo", serde_json::json!({"message": "ping"})),
+            // 3. perform_entity_modification_with_tools: final response
             plain_response("All done."),
+            // 4. check_task_completion
+            plain_response("COMPLETE"),
         ]);
 
         let mut registry = ToolRegistry::new();

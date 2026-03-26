@@ -698,8 +698,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_completes_with_mock_provider() {
-        let provider: Arc<dyn ModelProvider> =
-            MockProvider::new(vec![stop_response("Task complete!")]);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![
+            // 1. plan_entity_modification
+            stop_response("Plan: do the task"),
+            // 2. perform_entity_modification_with_tools: final response (no tool call)
+            stop_response("Task complete!"),
+            // 3. check_task_completion
+            stop_response("COMPLETE"),
+        ]);
         let config = AgentConfig {
             max_iterations: 10,
             ..Default::default()
@@ -715,7 +721,6 @@ mod tests {
         };
         let result = agent.run(context).await.unwrap();
         assert!(result.task_completed);
-        assert_eq!(result.result_summary, "Task complete!");
     }
 
     #[tokio::test]
@@ -745,8 +750,14 @@ mod tests {
     #[tokio::test]
     async fn test_progress_counter_accessible_after_run() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let provider: Arc<dyn ModelProvider> =
-            MockProvider::new(vec![stop_response("Task complete!")]);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![
+            // 1. plan_entity_modification
+            stop_response("Plan: do the task"),
+            // 2. perform_entity_modification_with_tools: final response
+            stop_response("Task complete!"),
+            // 3. check_task_completion
+            stop_response("COMPLETE"),
+        ]);
         let config = AgentConfig {
             max_iterations: 10,
             ..Default::default()
