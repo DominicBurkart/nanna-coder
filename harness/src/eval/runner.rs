@@ -28,7 +28,7 @@ use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
 use crate::tools::create_tool_registry;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -94,12 +94,15 @@ impl EvalRunnerConfig {
     }
 }
 
-/// Aggregated token usage for an eval run.
-#[derive(Debug, Clone, Default)]
-pub struct TokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+/// Aggregated token usage for an eval run (re-export of [`model::types::Usage`]).
+pub type TokenUsage = model::types::Usage;
+
+fn default_token_usage() -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    }
 }
 
 /// Results of post-completion verification checks.
@@ -199,7 +202,6 @@ pub async fn run_eval(
         user_prompt: eval_case.task.prompt.clone(),
         conversation_history: vec![],
         app_state_id: format!("eval_{}", eval_case.case.id),
-        work_dir: Some(PathBuf::from(work_dir)),
     };
 
     let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
@@ -226,7 +228,7 @@ pub async fn run_eval(
                 success,
                 execution_time,
                 iterations: 0,
-                token_usage: TokenUsage::default(),
+                token_usage: default_token_usage(),
                 verification,
                 failures: f,
                 agent_result: None,
@@ -257,13 +259,8 @@ pub async fn run_eval(
 
     let token_usage = agent_result
         .as_ref()
-        .and_then(|r| r.token_usage.as_ref())
-        .map(|u| TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        })
-        .unwrap_or_default();
+        .and_then(|r| r.token_usage.clone())
+        .unwrap_or_else(default_token_usage);
 
     Ok(EvalRunResult {
         case_id: eval_case.case.id.clone(),
@@ -505,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_token_usage_default() {
-        let usage = TokenUsage::default();
+        let usage = default_token_usage();
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 0);

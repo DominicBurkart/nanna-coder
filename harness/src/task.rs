@@ -225,7 +225,6 @@ impl TaskManager {
                         user_prompt: description.clone(),
                         conversation_history: vec![ChatMessage::user(&description)],
                         app_state_id: task_id_clone.0.clone(),
-                        work_dir: None,
                     };
 
                     let mut agent =
@@ -713,7 +712,6 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
         let result = agent.run(context).await.unwrap();
         assert!(result.task_completed);
@@ -736,7 +734,6 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
         let result = agent.run(context).await;
         assert!(matches!(
@@ -763,7 +760,6 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
         let result = agent.run(context).await.unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), result.iterations);
