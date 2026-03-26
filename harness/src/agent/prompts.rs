@@ -1,11 +1,11 @@
 //! LLM prompt templates for agent decision making
 //!
-//! This module provides structured prompts for the three key decision points
-//! in the agent control loop:
+//! This module provides structured prompts for the key decision points
+//! in the ARCHITECTURE.md Harness Control Flow:
 //!
-//! 1. **Planning**: Analyze user request and create execution plan
-//! 2. **Decision**: Decide whether to QUERY (need RAG) or PROCEED (ready to act)
-//! 3. **Completion**: Determine if task is COMPLETE or INCOMPLETE
+//! 1. **Plan Entity Modification**: Analyze user request and create execution plan
+//! 2. **Entity Modification Decision**: Decide whether to QUERY entities (RAG) or PROCEED to plan
+//! 3. **Task Complete?**: Determine if task is COMPLETE or INCOMPLETE
 //!
 //! # Design Philosophy
 //!

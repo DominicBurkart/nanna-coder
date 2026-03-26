@@ -250,7 +250,12 @@ impl EvalReport {
         let _ = writeln!(out, "```mermaid");
         let _ = writeln!(out, "stateDiagram-v2");
         for (from, to) in &transitions {
-            let _ = writeln!(out, "    {} --> {}", from, to);
+            let _ = writeln!(
+                out,
+                "    {} --> {}",
+                from.replace(' ', "_"),
+                to.replace(' ', "_")
+            );
         }
         let _ = writeln!(out, "```\n");
     }
@@ -285,13 +290,17 @@ impl EvalReport {
 }
 
 /// Map an `AgentState` to a clean label for Mermaid diagrams.
+///
+/// Labels match the node names in the ARCHITECTURE.md Harness Control Flow.
 fn state_name(state: &AgentState) -> &str {
     match state {
-        AgentState::Planning => "Planning",
-        AgentState::Querying => "Querying",
-        AgentState::Deciding => "Deciding",
-        AgentState::Performing => "Performing",
-        AgentState::CheckingCompletion => "CheckingCompletion",
+        AgentState::EnrichingEntities => "Entity Enrichment",
+        AgentState::PlanningEntityModification => "Plan Entity Modification",
+        AgentState::PerformingEntityModification => "Perform Entity Modification",
+        AgentState::UpdatingEntities => "Update Entities",
+        AgentState::CheckingTaskCompletion => "Task Complete?",
+        AgentState::EntityModificationDecision => "Entity Modification Decision",
+        AgentState::QueryingEntities => "Query Entities (RAG)",
         AgentState::Completed => "Completed",
         AgentState::Error(_) => "Error",
     }
@@ -405,8 +414,8 @@ mod tests {
                 0.85,
                 1.0,
                 vec![
-                    AgentState::Planning,
-                    AgentState::Performing,
+                    AgentState::EnrichingEntities,
+                    AgentState::PerformingEntityModification,
                     AgentState::Completed,
                 ],
                 vec![],
@@ -419,8 +428,8 @@ mod tests {
                 0.92,
                 0.8,
                 vec![
-                    AgentState::Planning,
-                    AgentState::Querying,
+                    AgentState::EnrichingEntities,
+                    AgentState::QueryingEntities,
                     AgentState::Completed,
                 ],
                 vec![],
@@ -433,8 +442,8 @@ mod tests {
                 0.6,
                 0.5,
                 vec![
-                    AgentState::Planning,
-                    AgentState::Deciding,
+                    AgentState::EnrichingEntities,
+                    AgentState::EntityModificationDecision,
                     AgentState::Error("timeout".to_string()),
                 ],
                 vec!["Decision quality too low".to_string()],
@@ -467,7 +476,7 @@ mod tests {
             0.95,
             0.9,
             1.0,
-            vec![AgentState::Planning, AgentState::Completed],
+            vec![AgentState::EnrichingEntities, AgentState::Completed],
             vec![],
         )]);
 
@@ -489,7 +498,7 @@ mod tests {
                 0.2,
                 0.3,
                 0.1,
-                vec![AgentState::Planning],
+                vec![AgentState::EnrichingEntities],
                 vec!["Error A".to_string()],
             ),
             make_result(
@@ -499,7 +508,7 @@ mod tests {
                 0.1,
                 0.2,
                 0.0,
-                vec![AgentState::Planning],
+                vec![AgentState::EnrichingEntities],
                 vec!["Error B".to_string()],
             ),
         ]);
@@ -574,7 +583,7 @@ mod tests {
             1.0,
             1.0,
             1.0,
-            vec![AgentState::Planning, AgentState::Completed],
+            vec![AgentState::EnrichingEntities, AgentState::Completed],
             vec![],
         )]);
 
@@ -595,7 +604,7 @@ mod tests {
             0.8,
             0.9,
             1.0,
-            vec![AgentState::Planning, AgentState::Completed],
+            vec![AgentState::EnrichingEntities, AgentState::Completed],
             vec![],
         )]);
 
@@ -642,13 +651,30 @@ mod tests {
 
     #[test]
     fn test_state_name_mapping() {
-        assert_eq!(state_name(&AgentState::Planning), "Planning");
-        assert_eq!(state_name(&AgentState::Querying), "Querying");
-        assert_eq!(state_name(&AgentState::Deciding), "Deciding");
-        assert_eq!(state_name(&AgentState::Performing), "Performing");
         assert_eq!(
-            state_name(&AgentState::CheckingCompletion),
-            "CheckingCompletion"
+            state_name(&AgentState::EnrichingEntities),
+            "Entity Enrichment"
+        );
+        assert_eq!(
+            state_name(&AgentState::PlanningEntityModification),
+            "Plan Entity Modification"
+        );
+        assert_eq!(
+            state_name(&AgentState::PerformingEntityModification),
+            "Perform Entity Modification"
+        );
+        assert_eq!(state_name(&AgentState::UpdatingEntities), "Update Entities");
+        assert_eq!(
+            state_name(&AgentState::CheckingTaskCompletion),
+            "Task Complete?"
+        );
+        assert_eq!(
+            state_name(&AgentState::EntityModificationDecision),
+            "Entity Modification Decision"
+        );
+        assert_eq!(
+            state_name(&AgentState::QueryingEntities),
+            "Query Entities (RAG)"
         );
         assert_eq!(state_name(&AgentState::Completed), "Completed");
         assert_eq!(state_name(&AgentState::Error("oops".to_string())), "Error");
@@ -674,8 +700,8 @@ mod tests {
                 0.9,
                 1.0,
                 vec![
-                    AgentState::Planning,
-                    AgentState::Performing,
+                    AgentState::EnrichingEntities,
+                    AgentState::PerformingEntityModification,
                     AgentState::Completed,
                 ],
                 vec![],
@@ -689,8 +715,8 @@ mod tests {
                 1.0,
                 // Same transitions as "a"
                 vec![
-                    AgentState::Planning,
-                    AgentState::Performing,
+                    AgentState::EnrichingEntities,
+                    AgentState::PerformingEntityModification,
                     AgentState::Completed,
                 ],
                 vec![],
@@ -701,9 +727,11 @@ mod tests {
         let md = report.render_markdown();
 
         // Each unique transition should appear exactly once
-        let planning_to_performing = md.matches("Planning --> Performing").count();
+        let enrichment_to_perform = md
+            .matches("Entity_Enrichment --> Perform_Entity_Modification")
+            .count();
         assert_eq!(
-            planning_to_performing, 1,
+            enrichment_to_perform, 1,
             "Duplicate transitions in state diagram"
         );
     }
