@@ -637,4 +637,303 @@ mod tests {
         assert!(failures[2].contains("a.rs"));
         assert!(failures[3].contains("foo"));
     }
+
+    #[test]
+    fn test_verification_failures_empty_when_all_pass() {
+        let v = VerificationResult {
+            build_passed: Some(true),
+            tests_passed: Some(true),
+            files_found: vec!["lib.rs".to_string()],
+            missing_files: vec![],
+            symbols_found: vec!["greet".to_string()],
+            missing_symbols: vec![],
+        };
+        let failures = verification_failures(&v);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn test_verification_failures_none_checks() {
+        let v = VerificationResult {
+            build_passed: None,
+            tests_passed: None,
+            files_found: vec![],
+            missing_files: vec![],
+            symbols_found: vec![],
+            missing_symbols: vec![],
+        };
+        let failures = verification_failures(&v);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn test_verification_missing_symbols() {
+        let v = VerificationResult {
+            build_passed: None,
+            tests_passed: None,
+            files_found: vec![],
+            missing_files: vec![],
+            symbols_found: vec![],
+            missing_symbols: vec!["bar".to_string(), "baz".to_string()],
+        };
+        assert!(!v.all_passed());
+    }
+
+    #[test]
+    fn test_verification_tests_failed() {
+        let v = VerificationResult {
+            build_passed: Some(true),
+            tests_passed: Some(false),
+            files_found: vec![],
+            missing_files: vec![],
+            symbols_found: vec![],
+            missing_symbols: vec![],
+        };
+        assert!(!v.all_passed());
+    }
+
+    #[test]
+    fn test_extensions_for_language_rust() {
+        assert_eq!(extensions_for_language("rust"), vec!["rs"]);
+        assert_eq!(extensions_for_language("Rust"), vec!["rs"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_python() {
+        assert_eq!(extensions_for_language("python"), vec!["py"]);
+        assert_eq!(extensions_for_language("Python"), vec!["py"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_javascript() {
+        assert_eq!(
+            extensions_for_language("javascript"),
+            vec!["js", "jsx", "mjs"]
+        );
+        assert_eq!(extensions_for_language("js"), vec!["js", "jsx", "mjs"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_typescript() {
+        assert_eq!(extensions_for_language("typescript"), vec!["ts", "tsx"]);
+        assert_eq!(extensions_for_language("ts"), vec!["ts", "tsx"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_go() {
+        assert_eq!(extensions_for_language("go"), vec!["go"]);
+        assert_eq!(extensions_for_language("golang"), vec!["go"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_java() {
+        assert_eq!(extensions_for_language("java"), vec!["java"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_c() {
+        assert_eq!(extensions_for_language("c"), vec!["c", "h"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_cpp() {
+        assert_eq!(
+            extensions_for_language("cpp"),
+            vec!["cpp", "cc", "cxx", "hpp", "h"]
+        );
+        assert_eq!(
+            extensions_for_language("c++"),
+            vec!["cpp", "cc", "cxx", "hpp", "h"]
+        );
+    }
+
+    #[test]
+    fn test_extensions_for_language_ruby() {
+        assert_eq!(extensions_for_language("ruby"), vec!["rb"]);
+    }
+
+    #[test]
+    fn test_extensions_for_language_unknown_defaults_to_rust() {
+        assert_eq!(extensions_for_language("haskell"), vec!["rs"]);
+        assert_eq!(extensions_for_language(""), vec!["rs"]);
+    }
+
+    #[test]
+    fn test_collect_source_content_basic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
+
+        let content = collect_source_content(dir.path(), &["rs"]);
+        assert!(content.contains("fn main()"));
+        assert!(!content.contains("# Hello"));
+    }
+
+    #[test]
+    fn test_collect_source_content_recursive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("lib.rs"), "pub fn hello() {}").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let content = collect_source_content(dir.path(), &["rs"]);
+        assert!(content.contains("pub fn hello()"));
+        assert!(content.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_collect_source_content_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let content = collect_source_content(dir.path(), &["rs"]);
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn test_collect_source_content_nonexistent_dir() {
+        let content = collect_source_content(Path::new("/nonexistent/path"), &["rs"]);
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn test_collect_source_content_multiple_extensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("app.js"), "const x = 1;").unwrap();
+        std::fs::write(dir.path().join("comp.jsx"), "export default () => {};").unwrap();
+        std::fs::write(dir.path().join("style.css"), ".foo {}").unwrap();
+
+        let content = collect_source_content(dir.path(), &["js", "jsx"]);
+        assert!(content.contains("const x = 1;"));
+        assert!(content.contains("export default"));
+        assert!(!content.contains(".foo"));
+    }
+
+    #[test]
+    fn test_verify_files_empty_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (found, missing) = verify_files(dir.path(), &[]);
+        assert!(found.is_empty());
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_verify_symbols_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (found, missing) = verify_symbols(dir.path(), &[], "rust");
+        assert!(found.is_empty());
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_to_nonexistent_dst() {
+        let src = tempfile::TempDir::new().unwrap();
+        let dst_base = tempfile::TempDir::new().unwrap();
+        let dst = dst_base.path().join("new_dir");
+
+        std::fs::write(src.path().join("file.txt"), "content").unwrap();
+        copy_dir_recursive(src.path(), &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("file.txt")).unwrap(),
+            "content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_verification_no_requirements() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let expected = crate::agent::eval_case::ExpectedResult {
+            files_changed: vec![],
+            build_must_pass: false,
+            tests_must_pass: false,
+            required_symbols: vec![],
+        };
+        let result = run_verification(dir.path(), &expected, "rust").await;
+        assert!(result.all_passed());
+        assert!(result.build_passed.is_none());
+        assert!(result.tests_passed.is_none());
+        assert!(result.files_found.is_empty());
+        assert!(result.missing_files.is_empty());
+        assert!(result.symbols_found.is_empty());
+        assert!(result.missing_symbols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_verification_files_and_symbols() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn greet() {}").unwrap();
+
+        let expected = crate::agent::eval_case::ExpectedResult {
+            files_changed: vec!["src/lib.rs".to_string(), "src/missing.rs".to_string()],
+            build_must_pass: false,
+            tests_must_pass: false,
+            required_symbols: vec!["greet".to_string(), "absent".to_string()],
+        };
+        let result = run_verification(dir.path(), &expected, "rust").await;
+        assert!(!result.all_passed());
+        assert_eq!(result.files_found, vec!["src/lib.rs"]);
+        assert_eq!(result.missing_files, vec!["src/missing.rs"]);
+        assert_eq!(result.symbols_found, vec!["greet"]);
+        assert_eq!(result.missing_symbols, vec!["absent"]);
+    }
+
+    #[tokio::test]
+    async fn test_verify_build_nonexistent_dir() {
+        // verify_build on a dir with no Cargo.toml should fail
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = verify_build(dir.path()).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_tests_nonexistent_dir() {
+        // verify_tests on a dir with no Cargo.toml should fail
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = verify_tests(dir.path()).await;
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_eval_runner_error_display() {
+        let io_err = EvalRunnerError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
+        assert!(io_err.to_string().contains("IO error"));
+
+        let model_err = EvalRunnerError::ModelProvider("connection refused".to_string());
+        assert!(model_err.to_string().contains("Model provider error"));
+
+        let timeout_err = EvalRunnerError::Timeout(Duration::from_secs(30));
+        assert!(timeout_err.to_string().contains("Timeout"));
+    }
+
+    #[test]
+    fn test_eval_run_result_fields() {
+        let result = EvalRunResult {
+            case_id: "test-001".to_string(),
+            success: true,
+            execution_time: Duration::from_millis(500),
+            iterations: 3,
+            token_usage: default_token_usage(),
+            verification: VerificationResult {
+                build_passed: None,
+                tests_passed: None,
+                files_found: vec![],
+                missing_files: vec![],
+                symbols_found: vec![],
+                missing_symbols: vec![],
+            },
+            failures: vec![],
+            agent_result: None,
+        };
+        assert_eq!(result.case_id, "test-001");
+        assert!(result.success);
+        assert_eq!(result.iterations, 3);
+        assert_eq!(result.token_usage.total_tokens, 0);
+        assert!(result.failures.is_empty());
+        assert!(result.agent_result.is_none());
+    }
 }
