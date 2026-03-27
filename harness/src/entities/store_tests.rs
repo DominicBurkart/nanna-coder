@@ -8,13 +8,13 @@
 #[cfg(test)]
 mod tests {
     use crate::entities::{
-        context::ContextEntity, test::TestEntity, Entity, EntityError, EntityMetadata,
-        EntityQuery, EntityRelationship, EntityResult, EntityStore, EntityType,
-        InMemoryEntityStore, RelationshipType, TimeRange,
+        context::ContextEntity, test::TestEntity, Entity, EntityError, EntityQuery,
+        EntityRelationship, EntityStore, EntityType, InMemoryEntityStore, RelationshipType,
+        TimeRange,
     };
     use std::collections::HashMap;
 
-    // ── helpers ──────────────────────────────────────────────────────────
+    // -- helpers --
 
     fn context_entity(task: &str) -> ContextEntity {
         ContextEntity::new(
@@ -32,7 +32,7 @@ mod tests {
         e
     }
 
-    // ── store / exists / delete ──────────────────────────────────────────
+    // -- store / exists / delete --
 
     #[tokio::test]
     async fn store_and_exists() {
@@ -52,7 +52,6 @@ mod tests {
         let entity = context_entity("dup");
         let id = entity.id().to_string();
 
-        // Store a second entity with the same id by cloning metadata
         let mut dup = context_entity("dup2");
         dup.metadata.id = id.clone();
 
@@ -79,7 +78,7 @@ mod tests {
         assert!(matches!(err, EntityError::NotFound(_)));
     }
 
-    // ── update ───────────────────────────────────────────────────────────
+    // -- update --
 
     #[tokio::test]
     async fn update_existing_entity() {
@@ -92,7 +91,6 @@ mod tests {
         updated.metadata.id = id.clone();
         store.update(Box::new(updated)).await.unwrap();
 
-        // Verify the entity was replaced (query should still find it)
         assert!(store.exists(&id).await);
     }
 
@@ -104,7 +102,7 @@ mod tests {
         assert!(matches!(err, EntityError::NotFound(_)));
     }
 
-    // ── query: entity type filter ────────────────────────────────────────
+    // -- query: entity type filter --
 
     #[tokio::test]
     async fn query_filters_by_entity_type() {
@@ -134,7 +132,7 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    // ── query: tag filter ────────────────────────────────────────────────
+    // -- query: tag filter --
 
     #[tokio::test]
     async fn query_filters_by_tags() {
@@ -159,7 +157,7 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
-    // ── query: time range filter ─────────────────────────────────────────
+    // -- query: time range filter --
 
     #[tokio::test]
     async fn query_filters_by_time_range() {
@@ -168,7 +166,6 @@ mod tests {
         let created = entity.metadata().created_at;
         store.store(Box::new(entity)).await.unwrap();
 
-        // Range that includes the entity
         let inclusive_range = TimeRange {
             start: created - chrono::Duration::seconds(1),
             end: created + chrono::Duration::seconds(1),
@@ -182,7 +179,6 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
 
-        // Range that excludes the entity (far in the past)
         let exclusive_range = TimeRange {
             start: created - chrono::Duration::hours(2),
             end: created - chrono::Duration::hours(1),
@@ -197,7 +193,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ── query: text search ───────────────────────────────────────────────
+    // -- query: text search --
 
     #[tokio::test]
     async fn query_text_search_matches_json_content() {
@@ -264,7 +260,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ── query: limit ─────────────────────────────────────────────────────
+    // -- query: limit --
 
     #[tokio::test]
     async fn query_respects_limit() {
@@ -287,23 +283,20 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    // ── query: combined filters ──────────────────────────────────────────
+    // -- query: combined filters --
 
     #[tokio::test]
     async fn query_combines_type_and_tag_filters() {
         let mut store = InMemoryEntityStore::new();
 
-        // Context entity with matching tag
         store
             .store(Box::new(tagged_context("ctx-match", vec!["urgent"])))
             .await
             .unwrap();
-        // Context entity without matching tag
         store
             .store(Box::new(tagged_context("ctx-nomatch", vec!["low"])))
             .await
             .unwrap();
-        // Test entity with matching tag
         let mut test_ent = TestEntity::new();
         test_ent.metadata.tags = vec!["urgent".to_string()];
         store.store(Box::new(test_ent)).await.unwrap();
@@ -321,7 +314,7 @@ mod tests {
         assert_eq!(results[0].entity_type, EntityType::Context);
     }
 
-    // ── relationships ────────────────────────────────────────────────────
+    // -- relationships --
 
     #[tokio::test]
     async fn create_and_get_relationship() {
@@ -342,12 +335,10 @@ mod tests {
         };
         store.create_relationship(rel).await.unwrap();
 
-        // Accessible from source side
         let rels = store.get_relationships(&id1).await.unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].to, id2);
 
-        // Also accessible from target side
         let rels = store.get_relationships(&id2).await.unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].from, id1);
@@ -411,7 +402,6 @@ mod tests {
         store.store(Box::new(e1)).await.unwrap();
         store.store(Box::new(e2)).await.unwrap();
 
-        // Create two relationships with different types
         store
             .create_relationship(EntityRelationship {
                 from: id1.clone(),
@@ -431,7 +421,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete only the Calls relationship
         store
             .delete_relationship(&id1, &id2, RelationshipType::Calls)
             .await
@@ -453,7 +442,7 @@ mod tests {
         assert!(rels.is_empty());
     }
 
-    // ── query: results sorted by relevance ────────────────────────────────
+    // -- query: relevance --
 
     #[tokio::test]
     async fn query_results_have_full_relevance_without_text_query() {
@@ -468,7 +457,7 @@ mod tests {
         );
     }
 
-    // ── entity metadata ──────────────────────────────────────────────────
+    // -- entity metadata --
 
     #[tokio::test]
     async fn entity_metadata_ids_are_unique() {
