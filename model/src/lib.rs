@@ -3,6 +3,8 @@ pub mod judge;
 pub mod ollama;
 pub mod provider;
 pub mod types;
+#[cfg(test)]
+mod types_extended_tests;
 
 pub use config::{ModelDefaults, OllamaConfig};
 pub use judge::{JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult};
