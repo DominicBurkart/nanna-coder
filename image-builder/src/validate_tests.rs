@@ -9,7 +9,6 @@
 mod tests {
     use crate::validate_image;
     use std::io::Write;
-    use std::path::Path;
 
     #[test]
     fn validate_image_nonempty_directory() {
