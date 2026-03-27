@@ -137,6 +137,9 @@ pub fn validate_image(image_path: &Path) -> ImageBuilderResult<bool> {
 }
 
 #[cfg(test)]
+mod validate_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
