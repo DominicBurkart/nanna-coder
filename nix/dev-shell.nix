@@ -18,6 +18,7 @@ pkgs.mkShell {
     rustToolchain
 
     # Development tools (specific versions for reproducibility)
+    # Keep in sync with scripts/setup-dev.sh (non-Nix install path)
     cargo-watch
     cargo-audit
     cargo-deny
