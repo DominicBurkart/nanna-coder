@@ -16,6 +16,8 @@ pub mod ast;
 pub mod context;
 pub mod env;
 pub mod git;
+#[cfg(test)]
+mod store_tests;
 pub mod telemetry;
 pub mod test;
 
