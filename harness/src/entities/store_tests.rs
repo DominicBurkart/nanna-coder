@@ -167,8 +167,8 @@ mod tests {
         store.store(Box::new(entity)).await.unwrap();
 
         let inclusive_range = TimeRange {
-            start: created - chrono::Duration::seconds(1),
-            end: created + chrono::Duration::seconds(1),
+            start: created - chrono::TimeDelta::seconds(1),
+            end: created + chrono::TimeDelta::seconds(1),
         };
         let results = store
             .query(&EntityQuery {
@@ -180,8 +180,8 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let exclusive_range = TimeRange {
-            start: created - chrono::Duration::hours(2),
-            end: created - chrono::Duration::hours(1),
+            start: created - chrono::TimeDelta::hours(2),
+            end: created - chrono::TimeDelta::hours(1),
         };
         let results = store
             .query(&EntityQuery {
