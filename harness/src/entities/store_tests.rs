@@ -7,13 +7,14 @@
 #[cfg(test)]
 mod tests {
     use crate::entities::{
-        context::ContextEntity, Entity, EntityError, EntityMetadata, EntityQuery, EntityRelationship,
-        EntityResult, EntityStore, EntityType, InMemoryEntityStore, RelationshipType, TimeRange,
+        context::ContextEntity, Entity, EntityError, EntityMetadata, EntityQuery,
+        EntityRelationship, EntityStore, EntityType, InMemoryEntityStore, RelationshipType,
+        TimeRange,
     };
-    use chrono::{Duration, Utc};
+    use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
 
-    // ── helpers ──────────────────────────────────────────────────────────
+    // -- helpers ----------------------------------------------------------
 
     /// Create a minimal ContextEntity with the given task description.
     fn make_entity(task: &str) -> ContextEntity {
@@ -33,7 +34,7 @@ mod tests {
         e
     }
 
-    // ── store ────────────────────────────────────────────────────────────
+    // -- store ------------------------------------------------------------
 
     #[tokio::test]
     async fn store_returns_entity_id() {
@@ -64,7 +65,7 @@ mod tests {
         }
     }
 
-    // ── exists ───────────────────────────────────────────────────────────
+    // -- exists -----------------------------------------------------------
 
     #[tokio::test]
     async fn exists_returns_true_after_store() {
@@ -80,7 +81,7 @@ mod tests {
         assert!(!store.exists("nonexistent").await);
     }
 
-    // ── update ───────────────────────────────────────────────────────────
+    // -- update -----------------------------------------------------------
 
     #[tokio::test]
     async fn update_replaces_entity() {
@@ -114,7 +115,7 @@ mod tests {
         assert!(matches!(err, EntityError::NotFound(_)));
     }
 
-    // ── delete ───────────────────────────────────────────────────────────
+    // -- delete -----------------------------------------------------------
 
     #[tokio::test]
     async fn delete_removes_entity() {
@@ -133,7 +134,7 @@ mod tests {
         assert!(matches!(err, EntityError::NotFound(_)));
     }
 
-    // ── query: entity type filter ────────────────────────────────────────
+    // -- query: entity type filter ----------------------------------------
 
     #[tokio::test]
     async fn query_filters_by_entity_type() {
@@ -162,7 +163,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ── query: tag filter ────────────────────────────────────────────────
+    // -- query: tag filter ------------------------------------------------
 
     #[tokio::test]
     async fn query_filters_by_tags() {
@@ -186,7 +187,7 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
-    // ── query: text search ───────────────────────────────────────────────
+    // -- query: text search -----------------------------------------------
 
     #[tokio::test]
     async fn query_text_search_matches_serialized_content() {
@@ -247,7 +248,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ── query: time range filter ─────────────────────────────────────────
+    // -- query: time range filter -----------------------------------------
 
     #[tokio::test]
     async fn query_filters_by_time_range() {
@@ -259,8 +260,8 @@ mod tests {
         let results = store
             .query(&EntityQuery {
                 time_range: Some(TimeRange {
-                    start: Utc::now() - Duration::hours(1),
-                    end: Utc::now() + Duration::hours(1),
+                    start: Utc::now() - TimeDelta::hours(1),
+                    end: Utc::now() + TimeDelta::hours(1),
                 }),
                 ..Default::default()
             })
@@ -272,8 +273,8 @@ mod tests {
         let results = store
             .query(&EntityQuery {
                 time_range: Some(TimeRange {
-                    start: Utc::now() - Duration::hours(48),
-                    end: Utc::now() - Duration::hours(24),
+                    start: Utc::now() - TimeDelta::hours(48),
+                    end: Utc::now() - TimeDelta::hours(24),
                 }),
                 ..Default::default()
             })
@@ -282,7 +283,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // ── query: limit ─────────────────────────────────────────────────────
+    // -- query: limit -----------------------------------------------------
 
     #[tokio::test]
     async fn query_respects_limit() {
@@ -304,7 +305,7 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    // ── query: no filters returns all ────────────────────────────────────
+    // -- query: no filters returns all ------------------------------------
 
     #[tokio::test]
     async fn query_empty_filter_returns_all() {
@@ -322,7 +323,7 @@ mod tests {
         assert!(results.iter().all(|r| r.relevance == 1.0));
     }
 
-    // ── query: combined filters ──────────────────────────────────────────
+    // -- query: combined filters ------------------------------------------
 
     #[tokio::test]
     async fn query_combines_type_and_tag_filters() {
@@ -347,7 +348,7 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
-    // ── relationships ────────────────────────────────────────────────────
+    // -- relationships ----------------------------------------------------
 
     #[tokio::test]
     async fn create_and_get_relationship() {
@@ -473,13 +474,11 @@ mod tests {
         assert!(rels.is_empty());
     }
 
-    // ── query result ordering ────────────────────────────────────────────
+    // -- query result ordering --------------------------------------------
 
     #[tokio::test]
     async fn query_results_sorted_by_relevance_descending() {
         let mut store = InMemoryEntityStore::new();
-        // One entity matches text search (relevance 0.8), others don't match
-        // but we can verify ordering with a non-text query where all have 1.0
         store.store(Box::new(make_entity("aaa"))).await.unwrap();
         store.store(Box::new(make_entity("bbb"))).await.unwrap();
 
@@ -491,7 +490,7 @@ mod tests {
         }
     }
 
-    // ── metadata ─────────────────────────────────────────────────────────
+    // -- metadata ---------------------------------------------------------
 
     #[tokio::test]
     async fn entity_metadata_id_is_stable() {
@@ -544,7 +543,7 @@ mod tests {
         }
     }
 
-    // ── default impls ────────────────────────────────────────────────────
+    // -- default impls ----------------------------------------------------
 
     #[test]
     fn in_memory_entity_store_default_is_empty() {
