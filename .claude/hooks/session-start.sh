@@ -6,6 +6,16 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
-# Install Rust dev dependencies via cargo-binstall.
-# Tool list is kept in sync with nix/dev-shell.nix and .github/workflows/ci.yml.
-exec "$CLAUDE_PROJECT_DIR/scripts/setup-dev.sh"
+# Install Nix if not present
+if ! command -v nix &>/dev/null; then
+  curl --proto '=https' --tlsv1.2 -sSf -L \
+    https://install.determinate.systems/nix | sh -s -- install --no-confirm
+  # shellcheck source=/dev/null
+  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+fi
+
+# Warm the devShell so nix develop is fast on first use
+nix develop --command true
+
+# Make nix available for the rest of the session
+echo '. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> "$CLAUDE_ENV_FILE"
