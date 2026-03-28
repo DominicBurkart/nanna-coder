@@ -42,7 +42,7 @@ fn coherence_very_long_text_penalized() {
 #[test]
 fn coherence_multiline_gets_paragraph_bonus() {
     let single = "This is a single paragraph with no newlines at all.";
-    let multi = "This is paragraph one.\n\nThis is paragraph two.";
+    let multi = "This is paragraph one with some extra words added.\n\nThis is paragraph two.";
     let single_score = calculate_coherence_score(single);
     let multi_score = calculate_coherence_score(multi);
     assert!(
@@ -89,7 +89,11 @@ fn relevance_all_required_keywords_present() {
         "explain rust async",
         &criteria,
     );
-    assert!(score > 0.5, "all keywords present should give high score: {}", score);
+    assert!(
+        score > 0.5,
+        "all keywords present should give high score: {}",
+        score
+    );
 }
 
 #[test]
@@ -123,7 +127,7 @@ fn relevance_too_short_response_penalized() {
 fn relevance_empty_prompt_does_not_panic() {
     let criteria = ValidationCriteria::default();
     let score = calculate_relevance_score("some response text", "", &criteria);
-    assert!(score >= 0.0 && score <= 1.0);
+    assert!((0.0..=1.0).contains(&score));
 }
 
 #[test]

@@ -9,7 +9,6 @@ use model::types::{
     JsonSchema, MessageRole, PropertySchema, SchemaType, ToolCall, ToolChoice, ToolDefinition,
     Usage,
 };
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // MessageRole serde
@@ -26,7 +25,12 @@ fn message_role_serializes_lowercase() {
 
 #[test]
 fn message_role_round_trip_all_variants() {
-    for role in [MessageRole::System, MessageRole::User, MessageRole::Assistant, MessageRole::Tool] {
+    for role in [
+        MessageRole::System,
+        MessageRole::User,
+        MessageRole::Assistant,
+        MessageRole::Tool,
+    ] {
         let json = serde_json::to_string(&role).unwrap();
         let back: MessageRole = serde_json::from_str(&json).unwrap();
         assert_eq!(role, back);

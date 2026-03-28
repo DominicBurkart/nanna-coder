@@ -4,12 +4,12 @@
 //! These tests verify the full lifecycle: store, exists, update, delete,
 //! query filtering, and relationship integrity.
 
+use harness::entities::context::types::ContextEntity;
+use harness::entities::git::types::GitRepository;
 use harness::entities::{
-    Entity, EntityError, EntityMetadata, EntityQuery, EntityRelationship, EntityStore, EntityType,
+    Entity, EntityError, EntityQuery, EntityRelationship, EntityStore, EntityType,
     InMemoryEntityStore, RelationshipType, TimeRange,
 };
-use harness::entities::git::types::GitRepository;
-use harness::entities::context::types::ContextEntity;
 
 // ---------------------------------------------------------------------------
 // CRUD basics
@@ -31,7 +31,7 @@ async fn store_and_exists() {
 async fn store_duplicate_returns_error() {
     let mut store = InMemoryEntityStore::new();
     let repo = GitRepository::new("url".into(), "main".into());
-    let id = repo.id().to_string();
+    let _id = repo.id().to_string();
 
     // Clone-via-serde so we can store twice with the same id
     let json = repo.to_json().unwrap();
