@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn all_relationship_types_are_distinct() {
-        let types = vec![
+        let types = [
             RelationshipType::Contains,
             RelationshipType::Calls,
             RelationshipType::Imports,
