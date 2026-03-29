@@ -2,6 +2,65 @@
 
 A highly opinionated local coding assistant (WIP).
 
+## Project Status
+
+```mermaid
+gantt
+    title Nanna Coder Development
+    dateFormat YYYY-MM-DD
+    axisFormat %b %d
+
+    section Foundation
+    Initial implementation           :done, 2025-09-20, 1d
+    Nix flake & containers           :done, 2025-09-20, 2d
+    CI pipeline                      :done, 2025-09-21, 3d
+    Dependency auditing (cargo deny)  :done, 2025-10-04, 1d
+
+    section Infrastructure
+    Agent architecture               :done, 2025-10-04, 2d
+    Cachix binary cache              :done, 2025-10-05, 2d
+    Security hardening               :done, 2025-10-05, 1d
+    Entity management system         :done, 2025-10-09, 1d
+    CI formatting hooks              :done, 2025-10-25, 1d
+
+    section Core Agent
+    Git entities                     :done, 2025-12-31, 1d
+    Container redesign (nix2container):done, 2026-01-01, 1d
+    Error handling overhaul          :done, 2026-01-21, 1d
+    Ollama chat API                  :done, 2026-02-18, 1d
+    Agent MVP control loop           :done, 2026-02-25, 1d
+    MVP tools & entities             :done, 2026-02-28, 1d
+    LLM intelligence (phase 2)       :done, 2026-02-28, 1d
+    E2E agent integration            :done, 2026-03-01, 1d
+
+    section MCP & Evals
+    MCP server infrastructure        :done, 2026-03-03, 1d
+    Context entities                 :done, 2026-03-08, 8d
+    Dev containers                   :done, 2026-03-15, 1d
+    Shared model pool                :done, 2026-03-21, 1d
+    Task lifecycle & dispatch        :done, 2026-03-21, 1d
+    Repo onboarding                  :done, 2026-03-22, 1d
+    Dev container implementation     :done, 2026-03-22, 1d
+    GitHub PR tool                   :done, 2026-03-22, 1d
+    Eval runner                      :done, 2026-03-22, 1d
+    LLMs wired into agent loop       :done, 2026-03-24, 2d
+    100% patch coverage CI           :done, 2026-03-25, 1d
+    Code cleanup & test coverage     :done, 2026-03-28, 1d
+
+    section Planned
+    Expose Nanna via MCP             :active, mcp, after 2026-03-28, 1d
+    Agentic eval suite               :eval, after mcp, 1d
+    SWE-bench adapter                :after eval, 1d
+    Workspace isolation              :after mcp, 1d
+    AST & filesystem entities        :1d
+    Testing & analysis entities      :1d
+    Environment entities             :1d
+    Sandbox telemetry entities       :1d
+    Migrate to vLLM                  :1d
+    Observability consolidation      :1d
+    CI workflow consolidation        :1d
+```
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
