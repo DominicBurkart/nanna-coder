@@ -1,0 +1,95 @@
+name: Eval Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to post results comment (optional)'
+        required: false
+        default: ''
+      model:
+        description: 'Model to use for evaluation'
+        required: false
+        default: 'qwen3:0.6b'
+        type: choice
+        options:
+          - qwen3:0.6b
+          - llama3.1:8b
+
+jobs:
+  eval:
+    name: Run Eval Suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
+    - name: Run eval suite
+      id: eval
+      run: |
+        echo "## Eval Results" > eval-results.md
+        echo "" >> eval-results.md
+        echo "**Model:** \`${{ inputs.model }}\`" >> eval-results.md
+        echo "**Commit:** \`${{ github.sha }}\`" >> eval-results.md
+        echo "**Triggered by:** @${{ github.actor }}" >> eval-results.md
+        echo "" >> eval-results.md
+
+        echo "### Unit-level eval tests" >> eval-results.md
+        echo '```' >> eval-results.md
+        # Run eval-related tests and capture output
+        nix develop --command cargo nextest run \
+          --workspace --all-features \
+          -E 'test(eval)' \
+          --no-fail-fast 2>&1 | tee eval-output.txt || true
+        cat eval-output.txt >> eval-results.md
+        echo '```' >> eval-results.md
+
+        # Determine pass/fail from nextest exit code
+        if nix develop --command cargo nextest run \
+          --workspace --all-features \
+          -E 'test(eval)' \
+          --no-fail-fast > /dev/null 2>&1; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+          echo "" >> eval-results.md
+          echo "**Status: PASSED**" >> eval-results.md
+        else
+          echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          echo "" >> eval-results.md
+          echo "**Status: FAILED** (see logs above)" >> eval-results.md
+        fi
+
+    - name: Write eval summary
+      if: always()
+      run: cat eval-results.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post results as PR comment
+      if: inputs.pr_number != ''
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh pr comment "${{ inputs.pr_number }}" \
+          --body "$(cat eval-results.md)"
+
+    - name: Upload eval results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: eval-results
+        path: |
+          eval-results.md
+          eval-output.txt
+        if-no-files-found: warn
