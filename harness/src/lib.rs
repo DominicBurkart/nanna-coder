@@ -4,7 +4,6 @@ pub mod entities;
 pub mod eval;
 pub mod mcp;
 pub mod monitoring;
-pub mod observability;
 pub mod onboarding;
 pub mod task;
 pub mod telemetry;
@@ -17,13 +16,10 @@ pub use container::{
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
 pub use monitoring::{
-    AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
-    DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
-    MonitoringError, MonitoringSystem, SystemStatus,
-};
-pub use observability::{
-    AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
-    ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
+    AlertCategory, AlertInfo, AlertManager, AlertPolicy, AlertSeverity, AlertThresholds,
+    ComprehensiveStatus, DefaultAlertManager, DefaultHealthMonitor, DefaultMetricsCollector,
+    HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat, MonitoringError,
+    MonitoringSystem, PerformanceTrends, SystemStatus, TrendDirection,
 };
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,

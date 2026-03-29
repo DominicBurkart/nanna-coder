@@ -55,8 +55,8 @@
 
 use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentState};
 use crate::entities::{EntityQuery, EntityStore, EntityType, InMemoryEntityStore};
+use crate::monitoring::MonitoringSystem;
 use crate::monitoring::SystemMetrics;
-use crate::observability::ObservabilitySystem;
 use model::judge::{ValidationCriteria, ValidationResult};
 use model::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -427,19 +427,20 @@ pub struct AgentEvaluator {
     config: EvaluationConfig,
 
     /// Observability system (optional)
-    observability: Option<ObservabilitySystem>,
+    observability: Option<MonitoringSystem>,
 }
 
 impl AgentEvaluator {
     /// Create a new agent evaluator
     pub async fn new(config: EvaluationConfig) -> EvaluationResult<Self> {
         let observability = if config.collect_observability {
-            let mut obs = ObservabilitySystem::new()
+            let telemetry = crate::telemetry::TelemetrySystem::new();
+            let mut obs = MonitoringSystem::new_with_observability(telemetry)
                 .with_service_name("agent-evaluator")
                 .with_health_check_interval(Duration::from_secs(60));
 
             // Initialize, but don't fail if it errors (might be tracing already set up)
-            let _ = obs.initialize().await;
+            let _ = obs.initialize_observability().await;
 
             Some(obs)
         } else {

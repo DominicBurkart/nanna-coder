@@ -466,61 +466,9 @@ impl TelemetryExporter for PrometheusExporter {
     }
 
     async fn export_system_metrics(&self, metrics: SystemMetrics) -> Result<(), TelemetryError> {
-        // Convert system metrics to Prometheus format
-        let timestamp = metrics.timestamp;
-
-        // Cache metrics
-        let cache_metric = MetricPoint {
-            name: "cache_hit_rate".to_string(),
-            metric_type: MetricType::Gauge,
-            value: metrics.cache_metrics.hit_rate,
-            timestamp,
-            labels: HashMap::new(),
-            unit: Some("ratio".to_string()),
-            description: Some("Cache hit rate".to_string()),
-        };
-        self.add_metric(cache_metric);
-
-        // Request latencies
-        for (service, latency) in metrics.request_latencies {
-            let mut labels = HashMap::new();
-            labels.insert("service".to_string(), service);
-
-            let latency_metric = MetricPoint {
-                name: "request_duration_seconds".to_string(),
-                metric_type: MetricType::Histogram,
-                value: latency.avg_latency_ms / 1000.0,
-                timestamp,
-                labels: labels.clone(),
-                unit: Some("seconds".to_string()),
-                description: Some("Request duration".to_string()),
-            };
-            self.add_metric(latency_metric);
-
-            let rps_metric = MetricPoint {
-                name: "requests_per_second".to_string(),
-                metric_type: MetricType::Gauge,
-                value: latency.requests_per_second,
-                timestamp,
-                labels,
-                unit: Some("rps".to_string()),
-                description: Some("Requests per second".to_string()),
-            };
-            self.add_metric(rps_metric);
+        for point in metrics.to_metric_points() {
+            self.add_metric(point);
         }
-
-        // Error metrics
-        let error_rate_metric = MetricPoint {
-            name: "error_rate".to_string(),
-            metric_type: MetricType::Gauge,
-            value: metrics.error_metrics.error_rate,
-            timestamp,
-            labels: HashMap::new(),
-            unit: Some("ratio".to_string()),
-            description: Some("Error rate".to_string()),
-        };
-        self.add_metric(error_rate_metric);
-
         Ok(())
     }
 
@@ -542,6 +490,8 @@ pub struct TelemetrySystem {
     events_buffer: Arc<Mutex<Vec<CustomEvent>>>,
     /// Exporters
     exporters: Vec<Box<dyn TelemetryExporter>>,
+    /// Prometheus exporter (typed reference for direct access)
+    prometheus_exporter: Option<PrometheusExporter>,
     /// Is initialized
     initialized: bool,
     /// Start time for uptime tracking
@@ -551,12 +501,14 @@ pub struct TelemetrySystem {
 impl TelemetrySystem {
     /// Create a new telemetry system
     pub fn new() -> Self {
+        let prometheus_exporter = PrometheusExporter::new(None);
         Self {
             config: TelemetryConfig::default(),
             active_traces: Arc::new(Mutex::new(Vec::new())),
             metrics_buffer: Arc::new(Mutex::new(Vec::new())),
             events_buffer: Arc::new(Mutex::new(Vec::new())),
             exporters: Vec::new(),
+            prometheus_exporter: Some(prometheus_exporter),
             initialized: false,
             start_time: Instant::now(),
         }
@@ -804,8 +756,7 @@ impl TelemetrySystem {
 
     /// Get a reference to the Prometheus exporter
     pub fn get_prometheus_exporter(&self) -> Option<&PrometheusExporter> {
-        // In a real implementation, we'd maintain typed references to specific exporters
-        None
+        self.prometheus_exporter.as_ref()
     }
 
     /// Export all buffered telemetry data
@@ -1042,6 +993,16 @@ mod tests {
         assert_eq!(
             trace.attributes.get("error"),
             Some(&"Something went wrong".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_exporter_returns_some() {
+        let telemetry = TelemetrySystem::new();
+        let exporter = telemetry.get_prometheus_exporter();
+        assert!(
+            exporter.is_some(),
+            "get_prometheus_exporter should return Some"
         );
     }
 }
