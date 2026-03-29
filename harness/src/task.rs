@@ -122,6 +122,7 @@ pub struct TaskManager {
     handles: Arc<RwLock<HashMap<TaskId, tokio::task::AbortHandle>>>,
     max_concurrent: Arc<Semaphore>,
     progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
+    image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
 }
 
 impl TaskManager {
@@ -131,7 +132,37 @@ impl TaskManager {
             handles: Arc::new(RwLock::new(HashMap::new())),
             max_concurrent: Arc::new(Semaphore::new(max_concurrent_tasks)),
             progress: Arc::new(RwLock::new(HashMap::new())),
+            image_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn get_or_build_image(
+        cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
+        repo_path: &std::path::Path,
+    ) -> Result<String, String> {
+        let canonical = repo_path.canonicalize().map_err(|e| e.to_string())?;
+        {
+            let cache_read = cache.read().await;
+            if let Some(image_ref) = cache_read.get(&canonical) {
+                return Ok(image_ref.clone());
+            }
+        }
+        let source = canonical.clone();
+        let image_path =
+            tokio::task::spawn_blocking(move || image_builder::build_dev_container(&source))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+
+        let runtime = crate::container::detect_runtime();
+        let image_ref = crate::container::load_image_from_path(&runtime, &image_path)
+            .map_err(|e| e.to_string())?;
+
+        {
+            let mut cache_write = cache.write().await;
+            cache_write.insert(canonical, image_ref.clone());
+        }
+        Ok(image_ref)
     }
 
     pub async fn submit(
@@ -168,6 +199,7 @@ impl TaskManager {
         let handles_ref = Arc::clone(&self.handles);
         let progress_ref = Arc::clone(&self.progress);
         let semaphore = Arc::clone(&self.max_concurrent);
+        let image_cache_ref = Arc::clone(&self.image_cache);
         let task_id_clone = task_id.clone();
 
         let mut handles_guard = self.handles.write().await;
@@ -184,9 +216,47 @@ impl TaskManager {
                 }
             }
 
-            let workspace_result = TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch);
+            let use_container = repo_path.join("flake.nix").exists();
+
+            let workspace_result = if use_container {
+                let image_result = Self::get_or_build_image(&image_cache_ref, &repo_path).await;
+                let image_ref = match image_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let mut tasks = tasks_ref.write().await;
+                        if let Some(task) = tasks.get_mut(&task_id_clone) {
+                            task.status = TaskStatus::Failed {
+                                finished_at: Utc::now(),
+                                error: e.clone(),
+                                diagnostics: FailureDiagnostics {
+                                    error_type: "ContainerSetupFailed".to_string(),
+                                    iterations_completed: 0,
+                                    last_tool_call: None,
+                                    partial_changes: None,
+                                    tool_call_history: vec![],
+                                    last_agent_state: None,
+                                    conversation_snapshot: None,
+                                },
+                            };
+                        }
+                        return;
+                    }
+                };
+                TaskWorkspace::create_with_container(
+                    &repo_path,
+                    &task_id_clone.0,
+                    &branch,
+                    &image_ref,
+                )
+                .await
+                .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
+            } else {
+                TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch)
+                    .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
+            };
+
             match workspace_result {
-                Err(e) => {
+                Err((e, error_type)) => {
                     {
                         let mut handles = handles_ref.write().await;
                         handles.remove(&task_id_clone);
@@ -199,9 +269,9 @@ impl TaskManager {
                     if let Some(task) = tasks.get_mut(&task_id_clone) {
                         task.status = TaskStatus::Failed {
                             finished_at: Utc::now(),
-                            error: e.to_string(),
+                            error: e,
                             diagnostics: FailureDiagnostics {
-                                error_type: "WorkspaceCreationFailed".to_string(),
+                                error_type: error_type.to_string(),
                                 iterations_completed: 0,
                                 last_tool_call: None,
                                 partial_changes: None,
@@ -213,7 +283,11 @@ impl TaskManager {
                     }
                 }
                 Ok(mut workspace) => {
-                    let tool_registry = workspace.create_tool_registry();
+                    let tool_registry = if use_container {
+                        workspace.create_container_tool_registry()
+                    } else {
+                        workspace.create_tool_registry()
+                    };
                     let entity_store = InMemoryEntityStore::new();
                     let agent_config = AgentConfig {
                         max_iterations,
@@ -776,5 +850,85 @@ mod tests {
         };
         let result = agent.run(context).await.unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), result.iterations);
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_workspace_creation_failure() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let nonexistent_repo = PathBuf::from("/nonexistent/repo/path/that/does/not/exist");
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                nonexistent_repo,
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_container_setup_failure() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "ContainerSetupFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
     }
 }
