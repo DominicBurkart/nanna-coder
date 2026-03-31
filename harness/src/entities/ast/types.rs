@@ -3,8 +3,8 @@
 //! Represents files in the workspace for RAG-based code understanding.
 //! Full AST parsing tracked in issue #23.
 
-use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
-use async_trait::async_trait;
+use crate::entities::{EntityMetadata, EntityType};
+use crate::impl_entity;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -74,21 +74,7 @@ pub struct FileEntity {
     pub line_count: usize,
 }
 
-#[async_trait]
-impl Entity for FileEntity {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(FileEntity);
 
 impl FileEntity {
     const PREVIEW_LINES: usize = 50;

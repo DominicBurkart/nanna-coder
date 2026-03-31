@@ -174,6 +174,32 @@ pub trait Entity: Send + Sync {
     }
 }
 
+/// Implement the [`Entity`] trait for a `Serialize` type whose `EntityMetadata`
+/// lives in a field called `metadata`.
+#[macro_export]
+macro_rules! impl_entity {
+    ($ty:ty) => {
+        #[async_trait::async_trait]
+        impl $crate::entities::Entity for $ty {
+            fn metadata(&self) -> &$crate::entities::EntityMetadata {
+                &self.metadata
+            }
+
+            fn metadata_mut(&mut self) -> &mut $crate::entities::EntityMetadata {
+                &mut self.metadata
+            }
+
+            fn to_json(&self) -> $crate::entities::EntityResult<String> {
+                serde_json::to_string(self).map_err(|e| {
+                    $crate::entities::EntityError::SerializationError(e.to_string())
+                })
+            }
+        }
+    };
+}
+
+pub use impl_entity;
+
 /// Relationship between entities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityRelationship {
