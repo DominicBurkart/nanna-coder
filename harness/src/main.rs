@@ -65,6 +65,18 @@ enum Commands {
         #[arg(long, default_value = "100")]
         max_iterations: usize,
     },
+    /// Generate a SWE-bench report from JSON results
+    SweBenchReport {
+        /// Path to the JSON results file
+        #[arg(short, long)]
+        input: std::path::PathBuf,
+        /// Output directory (default: results/<sha>/<bench>/<scenario>/)
+        #[arg(short, long)]
+        output_dir: Option<std::path::PathBuf>,
+        /// Optional second JSON file for comparison report
+        #[arg(long)]
+        compare: Option<std::path::PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -143,6 +155,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
         } => {
             run_mcp_server(&model, max_iterations).await?;
+        }
+        Commands::SweBenchReport {
+            input,
+            output_dir,
+            compare,
+        } => {
+            generate_swebench_report(&input, output_dir.as_deref(), compare.as_deref())?;
         }
     }
 
@@ -470,6 +489,36 @@ async fn run_agent(
         if let Some(content) = &last.content {
             println!("\nAgent: {}", content);
         }
+    }
+
+    Ok(())
+}
+
+fn generate_swebench_report(
+    input: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+    compare: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::eval::swebench::SweBenchRunResult;
+    use harness::eval::swebench_report::SweBenchReport;
+
+    let json = std::fs::read_to_string(input)?;
+    let run_result: SweBenchRunResult = serde_json::from_str(&json)?;
+
+    let base_dir = output_dir.unwrap_or_else(|| std::path::Path::new("results"));
+
+    let report = SweBenchReport::new("SWE-bench Report", run_result);
+    let report_path = report.write_to_directory(base_dir)?;
+    println!("Report written to: {}", report_path.display());
+
+    if let Some(compare_path) = compare {
+        let compare_json = std::fs::read_to_string(compare_path)?;
+        let compare_result: SweBenchRunResult = serde_json::from_str(&compare_json)?;
+        let comparison_path = report.write_comparison_to_directory(&compare_result, base_dir)?;
+        println!(
+            "Comparison report written to: {}",
+            comparison_path.display()
+        );
     }
 
     Ok(())
