@@ -190,9 +190,8 @@ macro_rules! impl_entity {
             }
 
             fn to_json(&self) -> $crate::entities::EntityResult<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    $crate::entities::EntityError::SerializationError(e.to_string())
-                })
+                serde_json::to_string(self)
+                    .map_err(|e| $crate::entities::EntityError::SerializationError(e.to_string()))
             }
         }
     };
