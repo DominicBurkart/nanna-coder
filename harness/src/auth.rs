@@ -1,5 +1,7 @@
 use rand::RngCore;
-use std::path::Path;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -11,6 +13,10 @@ pub enum AuthError {
     ExpiredToken,
     #[error("missing authorization header")]
     MissingToken,
+    #[error("insecure bind address: non-loopback addresses require TLS (not yet supported)")]
+    InsecureBindAddress,
+    #[error("rate limited")]
+    RateLimited,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -56,6 +62,14 @@ impl TokenStore {
         }
     }
 
+    pub fn with_token(token: AuthToken, lifetime: Duration) -> Self {
+        Self {
+            token,
+            created_at: Instant::now(),
+            lifetime,
+        }
+    }
+
     pub fn validate(&self, candidate: &str) -> Result<(), AuthError> {
         if self.is_expired() {
             return Err(AuthError::ExpiredToken);
@@ -87,18 +101,62 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Write token to file with restrictive permissions (0600 on Unix).
-pub fn write_token_file(token: &AuthToken, path: &Path) -> Result<(), AuthError> {
-    use std::fs;
-    use std::io::Write;
-    let mut file = fs::File::create(path)?;
-    file.write_all(token.as_str().as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+/// Validate that a bind address is safe. Non-loopback addresses are rejected
+/// because TLS is not yet supported and binding to a public interface would
+/// expose the auth token in cleartext.
+pub fn validate_bind_address(addr: &SocketAddr) -> Result<(), AuthError> {
+    if !addr.ip().is_loopback() {
+        return Err(AuthError::InsecureBindAddress);
     }
     Ok(())
+}
+
+/// Rate limiter that tracks failed authentication attempts per IP address.
+/// After `max_failures` within `window`, subsequent requests from that IP
+/// are rejected until the window expires or a successful auth resets the counter.
+pub struct RateLimiter {
+    state: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    max_failures: u32,
+    window: Duration,
+}
+
+impl RateLimiter {
+    pub fn new(max_failures: u32, window: Duration) -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            max_failures,
+            window,
+        }
+    }
+
+    /// Check whether the given IP is currently rate-limited.
+    pub fn check_rate_limit(&self, ip: &IpAddr) -> Result<(), AuthError> {
+        let state = self.state.lock().expect("rate limiter lock poisoned");
+        if let Some((failures, first_failure)) = state.get(ip) {
+            if first_failure.elapsed() < self.window && *failures >= self.max_failures {
+                return Err(AuthError::RateLimited);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed authentication attempt for the given IP.
+    pub fn record_failure(&self, ip: &IpAddr) {
+        let mut state = self.state.lock().expect("rate limiter lock poisoned");
+        let entry = state.entry(*ip).or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= self.window {
+            // Window expired — reset.
+            *entry = (1, Instant::now());
+        } else {
+            entry.0 += 1;
+        }
+    }
+
+    /// Record a successful authentication — resets the failure counter for the IP.
+    pub fn record_success(&self, ip: &IpAddr) {
+        let mut state = self.state.lock().expect("rate limiter lock poisoned");
+        state.remove(ip);
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +226,8 @@ mod tests {
             AuthError::InvalidToken,
             AuthError::ExpiredToken,
             AuthError::MissingToken,
+            AuthError::InsecureBindAddress,
+            AuthError::RateLimited,
         ];
 
         for err in &errors {
@@ -190,27 +250,59 @@ mod tests {
     }
 
     #[test]
-    fn test_write_token_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        let token = AuthToken::generate();
-        write_token_file(&token, &path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, token.as_str());
+    fn test_validate_bind_address_loopback_ok() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        assert!(validate_bind_address(&addr).is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_token_file_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        let token = AuthToken::generate();
-        write_token_file(&token, &path).unwrap();
+    fn test_validate_bind_address_ipv6_loopback_ok() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "[::1]:3000".parse().unwrap();
+        assert!(validate_bind_address(&addr).is_ok());
+    }
 
-        let metadata = std::fs::metadata(&path).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+    #[test]
+    fn test_validate_bind_address_rejects_wildcard() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+        let result = validate_bind_address(&addr);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AuthError::InsecureBindAddress => {}
+            other => panic!("Expected InsecureBindAddress, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_allows_under_threshold() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        limiter.record_failure(&ip);
+        limiter.record_failure(&ip);
+        assert!(limiter.check_rate_limit(&ip).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_at_threshold() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        limiter.record_failure(&ip);
+        limiter.record_failure(&ip);
+        limiter.record_failure(&ip);
+        assert!(limiter.check_rate_limit(&ip).is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_resets_on_success() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        limiter.record_failure(&ip);
+        limiter.record_failure(&ip);
+        limiter.record_failure(&ip);
+        assert!(limiter.check_rate_limit(&ip).is_err());
+        limiter.record_success(&ip);
+        assert!(limiter.check_rate_limit(&ip).is_ok());
     }
 }

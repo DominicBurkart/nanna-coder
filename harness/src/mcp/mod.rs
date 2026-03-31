@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod http;
 
 use crate::task::TaskManager;
 use model::provider::ModelProvider;
@@ -8,27 +9,27 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
+pub(crate) struct JsonRpcRequest {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: Option<Value>,
+    pub(crate) method: String,
+    pub(crate) params: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Option<Value>,
+pub(crate) struct JsonRpcResponse {
+    pub(crate) jsonrpc: String,
+    pub(crate) id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
+    pub(crate) result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
+    pub(crate) error: Option<JsonRpcError>,
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+pub(crate) struct JsonRpcError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 
 impl JsonRpcResponse {
@@ -123,7 +124,7 @@ impl NannaMcpServer {
         }
     }
 
-    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    pub(crate) async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         if req.jsonrpc != "2.0" {
             return JsonRpcResponse::error(req.id, -32600, "Invalid JSON-RPC version".to_string());
         }

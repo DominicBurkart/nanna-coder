@@ -527,6 +527,7 @@ dependencies = [
  "futures",
  "git2",
  "glob",
+ "hyper 0.14.32",
  "image-builder",
  "model",
  "rand",

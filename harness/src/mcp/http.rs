@@ -1,4 +1,4 @@
-use crate::auth::{AuthError, TokenStore};
+use crate::auth::{AuthError, RateLimiter, TokenStore};
 use crate::mcp::NannaMcpServer;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Extract bearer token from the Authorization header.
-fn extract_bearer_token(req: &Request<Body>) -> Result<&str, AuthError> {
+pub(crate) fn extract_bearer_token(req: &Request<Body>) -> Result<&str, AuthError> {
     let header = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -16,9 +16,7 @@ fn extract_bearer_token(req: &Request<Body>) -> Result<&str, AuthError> {
 
     let value = header.to_str().map_err(|_| AuthError::InvalidToken)?;
 
-    value
-        .strip_prefix("Bearer ")
-        .ok_or(AuthError::InvalidToken)
+    value.strip_prefix("Bearer ").ok_or(AuthError::InvalidToken)
 }
 
 /// JSON-RPC error response body.
@@ -43,7 +41,17 @@ async fn handle_http_request(
     req: Request<Body>,
     server: Arc<NannaMcpServer>,
     token_store: Arc<TokenStore>,
+    rate_limiter: Arc<RateLimiter>,
+    remote_addr: SocketAddr,
 ) -> Result<Response<Body>, Infallible> {
+    let client_ip = remote_addr.ip();
+
+    // Check rate limit before doing any work
+    if let Err(_e) = rate_limiter.check_rate_limit(&client_ip) {
+        let body = json_rpc_error(-32000, "rate limited");
+        return Ok(json_response(StatusCode::TOO_MANY_REQUESTS, &body));
+    }
+
     // Only accept POST
     if req.method() != Method::POST {
         let body = json_rpc_error(-32600, "Only POST is accepted");
@@ -54,6 +62,7 @@ async fn handle_http_request(
     match extract_bearer_token(&req) {
         Ok(token) => {
             if let Err(e) = token_store.validate(token) {
+                rate_limiter.record_failure(&client_ip);
                 let (status, msg) = match e {
                     AuthError::ExpiredToken => (StatusCode::UNAUTHORIZED, "expired token"),
                     AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid token"),
@@ -64,10 +73,14 @@ async fn handle_http_request(
             }
         }
         Err(_) => {
+            rate_limiter.record_failure(&client_ip);
             let body = json_rpc_error(-32000, "missing authorization header");
             return Ok(json_response(StatusCode::UNAUTHORIZED, &body));
         }
     }
+
+    // Auth succeeded — clear any rate-limit state for this IP
+    rate_limiter.record_success(&client_ip);
 
     // Read body
     let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
@@ -89,24 +102,33 @@ async fn handle_http_request(
 
     // Delegate to existing handler
     let response = server.handle_request(rpc_request).await;
-    let response_body =
-        serde_json::to_value(&response).unwrap_or_else(|_| json_rpc_error(-32603, "internal error"));
+    let response_body = serde_json::to_value(&response)
+        .unwrap_or_else(|_| json_rpc_error(-32603, "internal error"));
 
     Ok(json_response(StatusCode::OK, &response_body))
 }
 
-/// Start the HTTP JSON-RPC server with bearer-token authentication.
+/// Start the HTTP JSON-RPC server with bearer-token authentication and rate limiting.
 pub async fn run_http(
     server: Arc<NannaMcpServer>,
     token_store: Arc<TokenStore>,
+    rate_limiter: Arc<RateLimiter>,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let make_svc = make_service_fn(move |_conn| {
+    let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let server = Arc::clone(&server);
         let token_store = Arc::clone(&token_store);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let remote_addr = conn.remote_addr();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
-                handle_http_request(req, Arc::clone(&server), Arc::clone(&token_store))
+                handle_http_request(
+                    req,
+                    Arc::clone(&server),
+                    Arc::clone(&token_store),
+                    Arc::clone(&rate_limiter),
+                    remote_addr,
+                )
             }))
         }
     });
