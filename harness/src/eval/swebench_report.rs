@@ -95,18 +95,10 @@ impl SweBenchReport {
         let _ = writeln!(out, "|--------|-------|");
         let _ = writeln!(out, "| Total instances | {} |", r.total_count());
         let _ = writeln!(out, "| Resolved | {} |", r.resolved_count());
-        let _ = writeln!(
-            out,
-            "| Resolve rate | {:.1}% |",
-            r.resolve_rate() * 100.0
-        );
+        let _ = writeln!(out, "| Resolve rate | {:.1}% |", r.resolve_rate() * 100.0);
         let _ = writeln!(out, "| Total Claude tokens | {} |", r.total_claude_tokens());
         let _ = writeln!(out, "| Avg wall time | {:.1}s |", r.avg_wall_time());
-        let _ = writeln!(
-            out,
-            "| Tokens per resolved | {} |",
-            r.tokens_per_resolved()
-        );
+        let _ = writeln!(out, "| Tokens per resolved | {} |", r.tokens_per_resolved());
         let _ = writeln!(out);
     }
 
@@ -138,7 +130,10 @@ impl SweBenchReport {
         let _ = writeln!(out, "xychart-beta");
         let _ = writeln!(out, "    title \"Wall Time by Instance\"");
 
-        let labels: Vec<String> = instances.iter().map(|i| truncate_id(&i.instance_id)).collect();
+        let labels: Vec<String> = instances
+            .iter()
+            .map(|i| truncate_id(&i.instance_id))
+            .collect();
         let _ = writeln!(out, "    x-axis [{}]", labels.join(", "));
 
         let max_time = instances
@@ -168,7 +163,10 @@ impl SweBenchReport {
         let _ = writeln!(out, "xychart-beta");
         let _ = writeln!(out, "    title \"Claude Token Usage by Instance\"");
 
-        let labels: Vec<String> = instances.iter().map(|i| truncate_id(&i.instance_id)).collect();
+        let labels: Vec<String> = instances
+            .iter()
+            .map(|i| truncate_id(&i.instance_id))
+            .collect();
         let _ = writeln!(out, "    x-axis [{}]", labels.join(", "));
 
         let max_tokens = instances
@@ -210,18 +208,18 @@ impl SweBenchReport {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {:.1}s | {} |",
-                i.instance_id,
-                status,
-                i.claude_token_usage.total_tokens,
-                i.wall_time_secs,
-                error,
+                i.instance_id, status, i.claude_token_usage.total_tokens, i.wall_time_secs, error,
             );
         }
         let _ = writeln!(out);
     }
 
     fn render_comparison_header(&self, out: &mut String, other: &SweBenchRunResult) {
-        let _ = writeln!(out, "# Comparison: {} vs {}\n", self.run_result.config.scenario, other.config.scenario);
+        let _ = writeln!(
+            out,
+            "# Comparison: {} vs {}\n",
+            self.run_result.config.scenario, other.config.scenario
+        );
         let _ = writeln!(
             out,
             "**Generated:** {}\n",
@@ -303,7 +301,11 @@ impl SweBenchReport {
         );
 
         let max_rate = f64::max(a.resolve_rate(), b.resolve_rate()) * 100.0;
-        let y_max = if max_rate < 0.01 { 100.0 } else { (max_rate * 1.2).min(100.0) };
+        let y_max = if max_rate < 0.01 {
+            100.0
+        } else {
+            (max_rate * 1.2).min(100.0)
+        };
         let _ = writeln!(out, "    y-axis \"Resolve Rate (%)\" 0 --> {:.0}", y_max);
 
         let _ = writeln!(
@@ -374,7 +376,7 @@ fn truncate_id(id: &str) -> String {
     } else {
         id.to_string()
     };
-    format!("\"{}\"", label)
+    format!("\"{}\"" , label)
 }
 
 /// Truncate a scenario label for chart axes.
@@ -415,10 +417,7 @@ mod tests {
         }
     }
 
-    fn make_run(
-        scenario: &str,
-        instances: Vec<SweBenchInstanceResult>,
-    ) -> SweBenchRunResult {
+    fn make_run(scenario: &str, instances: Vec<SweBenchInstanceResult>) -> SweBenchRunResult {
         SweBenchRunResult {
             config: SweBenchRunConfig {
                 commit_sha: "abc123".to_string(),
