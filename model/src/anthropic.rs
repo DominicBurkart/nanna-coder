@@ -5,7 +5,7 @@ use crate::types::{
     ModelInfo, ToolCall, ToolChoice, ToolDefinition, Usage,
 };
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
@@ -338,7 +338,10 @@ struct AnthropicUsage {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
-        debug!("Starting Anthropic chat request with model: {}", request.model);
+        debug!(
+            "Starting Anthropic chat request with model: {}",
+            request.model
+        );
 
         let system = Self::extract_system(&request.messages);
         let messages = Self::messages_to_anthropic(&request.messages);
@@ -520,7 +523,10 @@ mod tests {
 
     #[test]
     fn test_messages_to_anthropic_tool_results() {
-        let messages = vec![ChatMessage::tool_response("toolu_123", "The weather is sunny")];
+        let messages = vec![ChatMessage::tool_response(
+            "toolu_123",
+            "The weather is sunny",
+        )];
 
         let result = AnthropicProvider::messages_to_anthropic(&messages);
 
