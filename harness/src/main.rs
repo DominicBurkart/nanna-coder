@@ -5,6 +5,7 @@ use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -31,13 +32,24 @@ enum Commands {
         /// Temperature setting (0.0 to 2.0)
         #[arg(long, default_value = "0.7")]
         temperature: f32,
+        /// Provider to use (ollama or anthropic)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
     },
     /// List available models
-    Models,
+    Models {
+        /// Provider to use (ollama or anthropic)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
+    },
     /// List available tools
     Tools,
     /// Health check
-    Health,
+    Health {
+        /// Provider to use (ollama or anthropic)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
+    },
     /// Run the autonomous agent with a prompt
     Agent {
         /// The prompt for the agent
@@ -55,6 +67,9 @@ enum Commands {
         /// Enable tool calling
         #[arg(short, long)]
         tools: bool,
+        /// Provider to use (ollama or anthropic)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
     },
     /// Run as an MCP server over stdio
     McpServe {
@@ -64,7 +79,31 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
+        /// Provider to use (ollama or anthropic)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
     },
+}
+
+fn create_provider(
+    provider_name: &str,
+) -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
+    match provider_name {
+        "ollama" => {
+            let config = OllamaConfig::default();
+            Ok(Arc::new(OllamaProvider::new(config)?))
+        }
+        #[cfg(feature = "anthropic")]
+        "anthropic" => {
+            let config = model::AnthropicConfig::default();
+            Ok(Arc::new(model::AnthropicProvider::new(config)?))
+        }
+        #[cfg(not(feature = "anthropic"))]
+        "anthropic" => {
+            Err("Anthropic provider is not enabled. Rebuild with --features anthropic".into())
+        }
+        other => Err(format!("Unknown provider: {}. Supported: ollama, anthropic", other).into()),
+    }
 }
 
 #[tokio::main]
@@ -75,9 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
     let workspace_root = std::env::current_dir()?;
     let tool_registry = create_tool_registry(&workspace_root);
 
@@ -87,12 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             tools,
             temperature,
+            provider: provider_name,
         } => {
+            let provider = create_provider(&provider_name)?;
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
                 single_chat(
-                    &provider,
+                    provider.as_ref(),
                     &tool_registry,
                     &model,
                     &initial_prompt,
@@ -102,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             } else {
                 interactive_chat(
-                    &provider,
+                    provider.as_ref(),
                     &tool_registry,
                     &model,
                     tools,
@@ -112,14 +150,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
         }
-        Commands::Models => {
-            list_models(&provider).await?;
+        Commands::Models {
+            provider: provider_name,
+        } => {
+            let provider = create_provider(&provider_name)?;
+            list_models(provider.as_ref()).await?;
         }
         Commands::Tools => {
             list_tools(&tool_registry);
         }
-        Commands::Health => {
-            health_check(&provider).await?;
+        Commands::Health {
+            provider: provider_name,
+        } => {
+            let provider = create_provider(&provider_name)?;
+            health_check(provider.as_ref()).await?;
         }
         Commands::Agent {
             prompt,
@@ -127,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             verbose,
             tools,
+            provider: provider_name,
         } => {
             run_agent(
                 &prompt,
@@ -135,14 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                &provider_name,
             )
             .await?;
         }
         Commands::McpServe {
             model,
             max_iterations,
+            provider: provider_name,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            run_mcp_server(&model, max_iterations, &provider_name).await?;
         }
     }
 
@@ -181,7 +228,7 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
 }
 
 async fn single_chat(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     prompt: &str,
@@ -249,7 +296,7 @@ async fn single_chat(
 }
 
 async fn interactive_chat(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
@@ -348,7 +395,7 @@ async fn interactive_chat(
     Ok(())
 }
 
-async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_models(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
     println!("Available models:");
     let models = provider.list_models().await?;
 
@@ -386,12 +433,15 @@ fn list_tools(tool_registry: &ToolRegistry) {
     }
 }
 
-async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn health_check(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
     println!("Performing health check...");
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!(
+                "✓ Health check passed. {} is running and accessible.",
+                provider.provider_name()
+            );
             info!("Health check successful");
         }
         Err(e) => {
@@ -411,12 +461,11 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    provider_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = create_provider(provider_name)?;
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -478,13 +527,12 @@ async fn run_agent(
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
+    provider_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = create_provider(provider_name)?;
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
