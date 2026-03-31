@@ -28,6 +28,40 @@ pub enum ToolError {
 
 pub type ToolResult<T> = Result<T, ToolError>;
 
+/// Extract a required string parameter from JSON args.
+fn require_str<'a>(args: &'a Value, name: &str) -> ToolResult<&'a str> {
+    args.get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("Missing or invalid '{}' parameter", name),
+        })
+}
+
+/// Extract a required f64 parameter from JSON args.
+fn require_f64(args: &Value, name: &str) -> ToolResult<f64> {
+    args.get(name)
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("Missing or invalid '{}' parameter", name),
+        })
+}
+
+/// Extract an optional string parameter with a default value.
+fn opt_str<'a>(args: &'a Value, name: &str, default: &'a str) -> &'a str {
+    args.get(name).and_then(|v| v.as_str()).unwrap_or(default)
+}
+
+/// Extract an optional bool parameter with a default value.
+fn opt_bool(args: &Value, name: &str, default: bool) -> bool {
+    args.get(name).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+/// Extract an optional u64 parameter.
+fn opt_u64(args: &Value, name: &str) -> Option<u64> {
+    args.get(name).and_then(|v| v.as_u64())
+}
+
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
@@ -121,12 +155,7 @@ impl Tool for EchoTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let message = args
-            .get("message")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'message' parameter".to_string(),
-            })?;
+        let message = require_str(&args, "message")?;
 
         Ok(json!({
             "echoed": message,
@@ -203,26 +232,11 @@ impl Tool for CalculatorTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let operation = args
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'operation' parameter".to_string(),
-            })?;
+        let operation = require_str(&args, "operation")?;
 
-        let a =
-            args.get("a")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| ToolError::InvalidArguments {
-                    message: "Missing or invalid 'a' parameter".to_string(),
-                })?;
+        let a = require_f64(&args, "a")?;
 
-        let b =
-            args.get("b")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| ToolError::InvalidArguments {
-                    message: "Missing or invalid 'b' parameter".to_string(),
-                })?;
+        let b = require_f64(&args, "b")?;
 
         let result = match operation {
             "add" => a + b,
@@ -390,11 +404,7 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolError::InvalidArguments {
-                message: "Missing or invalid 'path' parameter".to_string(),
-            }
-        })?;
+        let path_str = require_str(&args, "path")?;
 
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
@@ -402,15 +412,11 @@ impl Tool for ReadFileTool {
         let content = std::fs::read_to_string(&safe_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
-        let start = args
-            .get("start_line")
-            .and_then(|v| v.as_u64())
+        let start = opt_u64(&args, "start_line")
             .map(|n| (n as usize).saturating_sub(1))
             .unwrap_or(0);
 
-        let end = args
-            .get("end_line")
-            .and_then(|v| v.as_u64())
+        let end = opt_u64(&args, "end_line")
             .map(|n| n as usize)
             .unwrap_or(lines.len());
 
@@ -481,18 +487,9 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolError::InvalidArguments {
-                message: "Missing or invalid 'path' parameter".to_string(),
-            }
-        })?;
+        let path_str = require_str(&args, "path")?;
 
-        let content = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'content' parameter".to_string(),
-            })?;
+        let content = require_str(&args, "content")?;
 
         let path = Path::new(path_str);
         let safe_path = validate_path_for_write(path, &self.workspace_root)?;
@@ -620,15 +617,12 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path_str = opt_str(&args, "path", ".");
 
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
 
-        let recursive = args
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let recursive = opt_bool(&args, "recursive", false);
 
         let pattern = args.get("pattern").and_then(|v| v.as_str());
 
@@ -805,26 +799,18 @@ impl Tool for SearchTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let pattern_str = args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'pattern' parameter".to_string(),
-            })?;
+        let pattern_str = require_str(&args, "pattern")?;
 
         let regex = regex::Regex::new(pattern_str).map_err(|e| ToolError::InvalidArguments {
             message: format!("Invalid regex pattern: {}", e),
         })?;
 
-        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path_str = opt_str(&args, "path", ".");
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
 
         let file_pattern = args.get("file_pattern").and_then(|v| v.as_str());
-        let max_results = args
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50) as usize;
+        let max_results = opt_u64(&args, "max_results").unwrap_or(50) as usize;
 
         let mut results = Vec::new();
         self.search_recursive(&safe_path, &regex, file_pattern, max_results, &mut results)?;
@@ -945,10 +931,7 @@ impl Tool for GitDiffTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let path = args.get("path").and_then(|v| v.as_str());
-        let staged = args
-            .get("staged")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let staged = opt_bool(&args, "staged", false);
 
         let mut cmd = std::process::Command::new("git");
         cmd.current_dir(&self.workspace_root);
@@ -1035,12 +1018,7 @@ impl Tool for RunCommandTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'command' parameter".to_string(),
-            })?;
+        let command = require_str(&args, "command")?;
 
         let result = crate::container::exec_in_container(
             &self.container_handle,
@@ -1793,7 +1771,7 @@ impl Tool for GitHubPrStatusTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("l0");
+        let level = opt_str(&args, "level", "l0");
 
         let data = collect_pr_status(&self.workspace_root)?;
         let github_connected = data.github_status == GitHubStatus::Connected;
@@ -1808,11 +1786,7 @@ impl Tool for GitHubPrStatusTool {
                 }))
             }
             "l1" => {
-                let field = args.get("field").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ToolError::InvalidArguments {
-                        message: "Missing 'field' parameter for l1 query".to_string(),
-                    }
-                })?;
+                let field = require_str(&args, "field")?;
 
                 let detail = data
                     .to_l1(field)

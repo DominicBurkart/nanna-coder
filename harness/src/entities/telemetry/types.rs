@@ -19,8 +19,8 @@
 //! representation that records telemetry samples as first-class entities
 //! in the entity store.
 
-use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
-use async_trait::async_trait;
+use crate::entities::{EntityMetadata, EntityType};
+use crate::impl_entity;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,21 +77,7 @@ pub struct TelemetryEntity {
     pub attributes: HashMap<String, String>,
 }
 
-#[async_trait]
-impl Entity for TelemetryEntity {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(TelemetryEntity);
 
 impl TelemetryEntity {
     /// Create a new placeholder telemetry entity.

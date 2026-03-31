@@ -3,8 +3,8 @@
 //! This module defines all git version control entities for tracking repository state,
 //! branches, commits, and file changes as specified in issue #22.
 
-use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
-use async_trait::async_trait;
+use crate::entities::{EntityMetadata, EntityType};
+use crate::impl_entity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -289,21 +289,7 @@ impl GitRepository {
     }
 }
 
-#[async_trait]
-impl Entity for GitRepository {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(GitRepository);
 
 /// Git branch entity
 ///
@@ -382,21 +368,7 @@ impl GitBranch {
     }
 }
 
-#[async_trait]
-impl Entity for GitBranch {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(GitBranch);
 
 /// Git commit entity
 ///
@@ -480,21 +452,7 @@ impl GitCommit {
     }
 }
 
-#[async_trait]
-impl Entity for GitCommit {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(GitCommit);
 
 /// Git file status
 ///
@@ -587,21 +545,7 @@ impl Default for GitWorkingDirectory {
     }
 }
 
-#[async_trait]
-impl Entity for GitWorkingDirectory {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(GitWorkingDirectory);
 
 /// Diff between two commits
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,25 +588,12 @@ impl GitDiff {
     }
 }
 
-#[async_trait]
-impl Entity for GitDiff {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(GitDiff);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::Entity;
 
     #[test]
     fn test_git_repository_creation() {
