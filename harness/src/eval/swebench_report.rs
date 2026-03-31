@@ -18,6 +18,7 @@
 
 use super::swebench::SweBenchRunResult;
 use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
 /// A report built from SWE-bench run results, renderable as markdown.
 #[derive(Debug, Clone)]
@@ -50,6 +51,39 @@ impl SweBenchReport {
         self.render_token_bar_chart(&mut out);
         self.render_instance_detail_table(&mut out);
         out
+    }
+
+    /// Write the single-scenario report to a directory structure:
+    /// `<base_dir>/<commit_sha>/<bench_name>/<scenario>/report.md`
+    pub fn write_to_directory(&self, base_dir: &Path) -> std::io::Result<PathBuf> {
+        let c = &self.run_result.config;
+        let dir = base_dir
+            .join(&c.commit_sha)
+            .join(&c.bench_name)
+            .join(&c.scenario);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("report.md");
+        std::fs::write(&path, self.render_markdown())?;
+        Ok(path)
+    }
+
+    /// Write a comparison report to a directory structure:
+    /// `<base_dir>/<commit_sha>/<bench_name>/<scenarioA>_vs_<scenarioB>/comparison.md`
+    pub fn write_comparison_to_directory(
+        &self,
+        other: &SweBenchRunResult,
+        base_dir: &Path,
+    ) -> std::io::Result<PathBuf> {
+        let c = &self.run_result.config;
+        let dir_name = format!("{}_vs_{}", c.scenario, other.config.scenario);
+        let dir = base_dir
+            .join(&c.commit_sha)
+            .join(&c.bench_name)
+            .join(dir_name);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("comparison.md");
+        std::fs::write(&path, self.render_comparison(other))?;
+        Ok(path)
     }
 
     /// Render a comparison report between this run and another.
@@ -376,7 +410,7 @@ fn truncate_id(id: &str) -> String {
     } else {
         id.to_string()
     };
-    format!("\"{}\"" , label)
+    format!("\"{}\"", label)
 }
 
 /// Truncate a scenario label for chart axes.
@@ -620,5 +654,59 @@ mod tests {
             truncate_id("very_long_instance_identifier"),
             "\"very_long_ins...\""
         );
+    }
+
+    #[test]
+    fn test_write_to_directory() {
+        let run = make_run(
+            "claude_code__x86",
+            vec![
+                make_instance("django__django-16379", true, 5000, 45.2),
+                make_instance("sympy__sympy-23824", false, 8000, 120.5),
+            ],
+        );
+        let report = SweBenchReport::new("Write Test", run);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let path = report.write_to_directory(tmp.path()).unwrap();
+
+        assert!(path.exists());
+        assert!(path.ends_with("abc123/swebench_verified/claude_code__x86/report.md"));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# Write Test"));
+        assert!(content.contains("django__django-16379"));
+    }
+
+    #[test]
+    fn test_write_comparison_to_directory() {
+        let run_a = make_run(
+            "scenario_a",
+            vec![
+                make_instance("django__django-16379", true, 5000, 45.2),
+                make_instance("sympy__sympy-23824", false, 8000, 120.5),
+            ],
+        );
+        let run_b = make_run(
+            "scenario_b",
+            vec![
+                make_instance("django__django-16379", false, 6000, 50.0),
+                make_instance("sympy__sympy-23824", true, 7000, 100.0),
+            ],
+        );
+
+        let report = SweBenchReport::new("Comparison Write Test", run_a);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let path = report
+            .write_comparison_to_directory(&run_b, tmp.path())
+            .unwrap();
+
+        assert!(path.exists());
+        assert!(path.ends_with("abc123/swebench_verified/scenario_a_vs_scenario_b/comparison.md"));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Comparison: scenario_a vs scenario_b"));
+        assert!(content.contains("django__django-16379"));
     }
 }
