@@ -544,7 +544,7 @@ mod tests {
     fn test_entity_type_debug_variants() {
         // EntityType does not implement Display, so verify Debug output
         // covers all variants and each produces a distinct string.
-        let variants = vec![
+        let variants = [
             EntityType::Git,
             EntityType::Ast,
             EntityType::Test,
