@@ -12,6 +12,7 @@ repository.workspace = true
 [features]
 default = ["ollama"]
 ollama = ["dep:ollama-rs"]
+anthropic = []
 
 [dependencies]
 async-trait = "0.1"

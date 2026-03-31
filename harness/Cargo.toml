@@ -11,6 +11,9 @@ repository.workspace = true
 name = "harness"
 path = "src/main.rs"
 
+[features]
+anthropic = ["model/anthropic"]
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.0", features = ["derive"] }
