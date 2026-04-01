@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
@@ -123,6 +123,8 @@ pub struct TaskManager {
     max_concurrent: Arc<Semaphore>,
     progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
     image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
+    /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
+    build_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
 impl TaskManager {
@@ -133,20 +135,42 @@ impl TaskManager {
             max_concurrent: Arc::new(Semaphore::new(max_concurrent_tasks)),
             progress: Arc::new(RwLock::new(HashMap::new())),
             image_cache: Arc::new(RwLock::new(HashMap::new())),
+            build_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn get_or_build_image(
         cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
+        build_locks: &Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
         repo_path: &std::path::Path,
     ) -> Result<String, String> {
         let canonical = repo_path.canonicalize().map_err(|e| e.to_string())?;
+
+        // Fast path: return cached image if already built.
         {
             let cache_read = cache.read().await;
             if let Some(image_ref) = cache_read.get(&canonical) {
                 return Ok(image_ref.clone());
             }
         }
+
+        // Obtain (or create) a per-path build lock so only one task builds
+        // the image for a given repo at a time.
+        let path_lock = {
+            let mut locks = build_locks.lock().await;
+            Arc::clone(locks.entry(canonical.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _build_guard = path_lock.lock().await;
+
+        // Re-check cache now that we hold the per-path lock — another task
+        // may have completed the build while we were waiting.
+        {
+            let cache_read = cache.read().await;
+            if let Some(image_ref) = cache_read.get(&canonical) {
+                return Ok(image_ref.clone());
+            }
+        }
+
         let source = canonical.clone();
         let image_path =
             tokio::task::spawn_blocking(move || image_builder::build_dev_container(&source))
@@ -200,6 +224,7 @@ impl TaskManager {
         let progress_ref = Arc::clone(&self.progress);
         let semaphore = Arc::clone(&self.max_concurrent);
         let image_cache_ref = Arc::clone(&self.image_cache);
+        let build_locks_ref = Arc::clone(&self.build_locks);
         let task_id_clone = task_id.clone();
 
         let mut handles_guard = self.handles.write().await;
@@ -216,10 +241,15 @@ impl TaskManager {
                 }
             }
 
-            let use_container = repo_path.join("flake.nix").exists();
+            // Require both flake.nix AND .devcontainer/ to opt in to the
+            // container path, so that repos that merely happen to have a
+            // flake.nix are not affected.
+            let use_container = repo_path.join("flake.nix").exists()
+                && repo_path.join(".devcontainer").exists();
 
             let workspace_result = if use_container {
-                let image_result = Self::get_or_build_image(&image_cache_ref, &repo_path).await;
+                let image_result =
+                    Self::get_or_build_image(&image_cache_ref, &build_locks_ref, &repo_path).await;
                 let image_ref = match image_result {
                     Ok(r) => r,
                     Err(e) => {
@@ -899,6 +929,8 @@ mod tests {
 
         let repo_dir = tempfile::tempdir().unwrap();
         std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        // Both flake.nix and .devcontainer/ must exist to trigger the container path.
+        std::fs::create_dir(repo_dir.path().join(".devcontainer")).unwrap();
 
         let task_id = manager
             .submit(
