@@ -60,9 +60,9 @@ The existing `harness/src/agent/eval.rs` already defines `AgentEvaluationResult`
 
 ### Existing Code References
 
-- `harness/src/agent/eval.rs:350-403` — `EvaluationMetrics` struct
-- `harness/src/agent/eval.rs:406-431` — `AgentEvaluationResult` struct
-- `harness/src/agent/eval.rs:829-836` — `BatchEvaluationResult` struct
+- `harness/src/agent/eval.rs` — `EvaluationMetrics` struct
+- `harness/src/agent/eval.rs` — `AgentEvaluationResult` struct
+- `harness/src/agent/eval.rs` — `BatchEvaluationResult` struct
 
 ---
 
@@ -137,13 +137,20 @@ The agent control loop (see `ARCHITECTURE.md`) follows: Entity Enrichment → Pl
 ### Architecture References
 
 - `ARCHITECTURE.md` — Entity Enrichment → Plan Entity Modification flow
-- `harness/src/agent/eval.rs:162-219` — `EvaluationScenario` and `EvaluationCategory`
+- `harness/src/agent/eval.rs` — `EvaluationScenario` and `EvaluationCategory`
 
 ---
 
 ## Sub-issue 3: Eval Runner — Execute Nanna Against a Single Eval Case
 
 **Labels:** `eval`, `integration`, `core`
+
+> **Implementation Status (as of 2026-03-29):** Partially addressed by open PRs:
+> - **#96** — introduces `run_eval()`, `EvalRunnerConfig`, `EvalRunResult`/`VerificationResult`/`TokenUsage`, temp-dir isolation, timeout via `tokio::time::timeout`, unit and integration tests
+> - **#103** — wires the Ollama LLM provider in `run_eval()` and adds token-usage tracking via `AgentRunResult.token_usage`
+> - **#109** — removes dead code (`work_dir` field, `set_tool_registry`), adds `EvalRunnerError::ProviderUnavailable` when Ollama is unreachable
+>
+> The acceptance criteria below remain the definition of done for this sub-issue.
 
 ### Summary
 
@@ -189,8 +196,8 @@ This is the integration point between the eval infrastructure and nanna's existi
 ### Code References
 
 - `harness/src/agent/mod.rs` — `AgentLoop`, `AgentConfig`, `AgentContext`, `AgentRunResult`
-- `harness/src/agent/eval.rs:484-614` — existing `AgentEvaluator::evaluate()` pattern to follow
-- `harness/src/agent/eval.rs:499-511` — agent config and context setup pattern
+- `harness/src/agent/eval.rs` — `AgentEvaluator::evaluate()` pattern to follow
+- `harness/src/agent/eval.rs` — agent config and context setup pattern
 
 ---
 
@@ -306,7 +313,7 @@ Extend the eval runner to capture computational resource metrics: CPU time, peak
 
 ### Context
 
-The existing `EvaluationMetrics` in `harness/src/agent/eval.rs:350-403` tracks execution time, iterations, and quality scores but does not capture resource utilization. The `SystemMetrics` type (from `harness/src/monitoring.rs`) may already capture some of this.
+The existing `EvaluationMetrics` in `harness/src/agent/eval.rs` tracks execution time, iterations, and quality scores but does not capture resource utilization. The `SystemMetrics` type (from `harness/src/monitoring.rs`) may already capture some of this.
 
 ### Scope
 
@@ -350,8 +357,8 @@ The existing `EvaluationMetrics` in `harness/src/agent/eval.rs:350-403` tracks e
 
 ### Code References
 
-- `harness/src/monitoring.rs` — existing `SystemMetrics`
-- `harness/src/agent/eval.rs:350-403` — existing `EvaluationMetrics`
+- `harness/src/monitoring.rs` — `SystemMetrics` struct
+- `harness/src/agent/eval.rs` — `EvaluationMetrics` struct
 - `model/src/ollama.rs` — Ollama provider (extend for token tracking)
 - `model/src/types.rs` — `ChatResponse` (may already include usage info)
 
