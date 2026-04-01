@@ -510,4 +510,74 @@ mod tests {
         let store = InMemoryEntityStore::new();
         assert_eq!(store.entities.len(), 0);
     }
+
+    #[test]
+    fn test_entity_metadata_new() {
+        let before = chrono::Utc::now();
+        let metadata = EntityMetadata::new(EntityType::Ast);
+        let after = chrono::Utc::now();
+
+        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.entity_type, EntityType::Ast);
+        assert!(metadata.created_at >= before && metadata.created_at <= after);
+        assert!(metadata.tags.is_empty());
+        // ID must be a valid UUID v4 ("random") — rejects v1, v3, v5, and nil UUIDs.
+        let parsed = uuid::Uuid::parse_str(&metadata.id).expect("should be valid UUID");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random)); // v4
+    }
+
+    #[test]
+    fn test_entity_metadata_json_roundtrip() {
+        let original = EntityMetadata::new(EntityType::Context);
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: EntityMetadata = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original.id, restored.id);
+        assert_eq!(original.entity_type, restored.entity_type);
+        assert_eq!(original.version, restored.version);
+        assert_eq!(original.created_at, restored.created_at);
+        assert_eq!(original.updated_at, restored.updated_at);
+        assert_eq!(original.tags, restored.tags);
+    }
+
+    /// Returns one instance of every `EntityType` variant.
+    ///
+    /// The closure `_exhaustive_check` performs a compiler-enforced exhaustive
+    /// `match` so that adding a new variant to `EntityType` without updating
+    /// this helper produces a **compile error** rather than a silent test gap.
+    fn all_entity_type_variants() -> Vec<EntityType> {
+        // Compiler error here if a variant is missing — no runtime surprise.
+        let _exhaustive_check = |v: &EntityType| match v {
+            EntityType::Git
+            | EntityType::Ast
+            | EntityType::Test
+            | EntityType::Env
+            | EntityType::Context
+            | EntityType::Telemetry => {}
+        };
+        vec![
+            EntityType::Git,
+            EntityType::Ast,
+            EntityType::Test,
+            EntityType::Env,
+            EntityType::Context,
+            EntityType::Telemetry,
+        ]
+    }
+
+    #[test]
+    fn test_entity_type_debug_variants() {
+        // EntityType does not implement Display, so verify Debug output
+        // covers all variants and each produces a distinct string.
+        let variants = all_entity_type_variants();
+
+        let debug_strings: Vec<String> = variants.iter().map(|v| format!("{:?}", v)).collect();
+        // All debug strings should be unique
+        let unique: std::collections::HashSet<&String> = debug_strings.iter().collect();
+        assert_eq!(unique.len(), variants.len());
+
+        // Spot-check a few
+        assert_eq!(format!("{:?}", EntityType::Git), "Git");
+        assert_eq!(format!("{:?}", EntityType::Telemetry), "Telemetry");
+    }
 }
