@@ -190,4 +190,157 @@ mod tests {
             other => panic!("Expected InvalidToken, got: {:?}", other),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // HTTP roundtrip integration tests
+    // Each test spins up a real hyper server on 127.0.0.1:0 and talks to it
+    // via reqwest, verifying end-to-end auth, routing, and response shape.
+    // -------------------------------------------------------------------------
+
+    fn make_noop_server() -> Arc<NannaMcpServer> {
+        use async_trait::async_trait;
+        use harness::task::TaskManager;
+        use model::provider::ModelResult;
+        use model::types::{ChatRequest, ChatResponse, ModelInfo};
+
+        struct NoopProvider;
+
+        #[async_trait]
+        impl model::provider::ModelProvider for NoopProvider {
+            async fn chat(&self, _: ChatRequest) -> ModelResult<ChatResponse> {
+                unimplemented!()
+            }
+            async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+                Ok(vec![])
+            }
+            async fn health_check(&self) -> ModelResult<()> {
+                Ok(())
+            }
+            fn provider_name(&self) -> &'static str {
+                "noop"
+            }
+        }
+
+        Arc::new(NannaMcpServer::new(
+            Arc::new(TaskManager::default()),
+            Arc::new(NoopProvider),
+            "test-model".to_string(),
+            10,
+        ))
+    }
+
+    /// Bind to an ephemeral port, spawn the server, return (addr, token_value).
+    async fn spawn_test_server() -> (SocketAddr, String) {
+        // Port 0 lets the OS assign a free port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // Briefly release so hyper can rebind.
+
+        let token_store = Arc::new(TokenStore::new(Duration::from_secs(3600)));
+        let token_value = token_store.token().as_str().to_string();
+        let rate_limiter = Arc::new(RateLimiter::new(10, Duration::from_secs(300)));
+        let mcp_server = make_noop_server();
+
+        tokio::spawn(run_http(mcp_server, token_store, rate_limiter, addr));
+
+        // Give the server a moment to start accepting connections.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        (addr, token_value)
+    }
+
+    /// Full roundtrip: valid token + initialize => 200 with protocolVersion and
+    /// capabilities.tools, token value absent from response body.
+    #[tokio::test]
+    async fn test_http_roundtrip_initialize() {
+        let (addr, token_value) = spawn_test_server().await;
+
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+
+        let response = client
+            .post(format!("http://{}", addr))
+            .header("Authorization", format!("Bearer {}", token_value))
+            .json(&payload)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let resp_text = response.text().await.unwrap();
+
+        assert!(
+            !resp_text.contains(&token_value),
+            "Token must not appear in HTTP response body. Got: {}",
+            resp_text
+        );
+
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&resp_text).expect("response should be valid JSON");
+
+        let result = resp_json.get("result").expect("missing 'result' field");
+        assert!(
+            result.get("protocolVersion").is_some(),
+            "Expected protocolVersion in initialize result. Got: {}",
+            resp_json
+        );
+        assert!(
+            result["capabilities"]["tools"].is_object(),
+            "Expected capabilities.tools to be an object. Got: {}",
+            resp_json
+        );
+    }
+
+    /// Missing Authorization header => 401.
+    #[tokio::test]
+    async fn test_http_401_on_missing_auth() {
+        let (addr, _) = spawn_test_server().await;
+
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+
+        let response = client
+            .post(format!("http://{}", addr))
+            .json(&payload)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Wrong token => 401.
+    #[tokio::test]
+    async fn test_http_401_on_wrong_token() {
+        let (addr, _) = spawn_test_server().await;
+
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+
+        let response = client
+            .post(format!("http://{}", addr))
+            .header("Authorization", "Bearer this-is-definitely-wrong")
+            .json(&payload)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
 }

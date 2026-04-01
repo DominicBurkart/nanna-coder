@@ -84,3 +84,75 @@ fn test_bearer_token_extraction() {
     // Empty string is rejected
     assert!(store.validate("").is_err());
 }
+
+/// Verify that the auth token does not appear in tracing log output.
+///
+/// Uses tracing-subscriber's MakeWriter to capture all bytes written by the
+/// tracing formatter during a validation call and asserts the raw token value
+/// is absent. The redacted marker ([REDACTED]) must appear instead when an
+/// AuthToken is logged via its Debug impl.
+#[test]
+fn test_token_not_leaked_in_tracing_output() {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
+
+    let log_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let writer = MakeWriterFactory(Arc::clone(&log_buffer));
+
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+        let store = TokenStore::new(Duration::from_secs(3600));
+        let token_str = store.token().as_str().to_string();
+
+        // These calls exercise validation paths; ensure no token escapes.
+        let _ = store.validate(&token_str);
+        let _ = store.validate("wrong_token");
+
+        // Emit a tracing event that includes the AuthToken via its Debug impl.
+        // It must show [REDACTED], not the raw value.
+        tracing::debug!(token = ?store.token(), "checking token in tracing field");
+
+        let captured = log_buffer.lock().unwrap();
+        let log_output = String::from_utf8_lossy(&captured);
+
+        assert!(
+            !log_output.contains(&token_str),
+            "Auth token must not appear in tracing output. Got:\n{}",
+            log_output
+        );
+        assert!(
+            log_output.contains("REDACTED"),
+            "Expected [REDACTED] in tracing output when logging an AuthToken. Got:\n{}",
+            log_output
+        );
+    });
+}
+
+// --- helpers ----------------------------------------------------------------
+
+struct WriterWrapper(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for WriterWrapper {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct MakeWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeWriterFactory {
+    type Writer = WriterWrapper;
+    fn make_writer(&'a self) -> Self::Writer {
+        WriterWrapper(Arc::clone(&self.0))
+    }
+}
