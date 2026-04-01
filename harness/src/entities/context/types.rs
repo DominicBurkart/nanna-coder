@@ -3,8 +3,8 @@
 //! Defines context entity type for storing agent run history, conversation,
 //! and tool call records. Implementation tracked in issue #26.
 
-use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
-use async_trait::async_trait;
+use crate::entities::{EntityMetadata, EntityType};
+use crate::impl_entity;
 use model::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 
@@ -29,21 +29,7 @@ pub struct ContextEntity {
     pub model_used: String,
 }
 
-#[async_trait]
-impl Entity for ContextEntity {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(ContextEntity);
 
 impl ContextEntity {
     pub fn new(
@@ -80,6 +66,7 @@ impl Default for ContextEntity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::Entity;
     use model::types::{ChatMessage, MessageRole};
 
     #[test]
