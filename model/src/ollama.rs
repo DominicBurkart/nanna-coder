@@ -14,6 +14,22 @@ use serde_json::Value;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
+use url::Url;
+
+/// Parse an Ollama base URL into a `(host_url, port)` pair.
+///
+/// Strips a trailing `/v1` suffix (used by OpenAI-compatible endpoints) and
+/// extracts scheme + host. **Note:** any path components other than `/v1` are
+/// intentionally dropped — reverse-proxy paths (e.g. `http://proxy:8080/ollama`)
+/// are not supported. If no port is specified, defaults to 11434.
+pub fn parse_ollama_url(base_url: &str) -> Result<(String, u16), String> {
+    let url_str = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    let url = Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
+    let host = url.host_str().ok_or_else(|| "No host in URL".to_string())?;
+    let host_url = format!("{}://{}", url.scheme(), host);
+    let port = url.port().unwrap_or(11434);
+    Ok((host_url, port))
+}
 
 pub struct OllamaProvider {
     client: Ollama,
@@ -35,13 +51,10 @@ impl OllamaProvider {
             config.base_url.clone()
         };
 
-        let ollama_host = if base_url.ends_with(':') {
-            base_url.trim_end_matches(':').to_string()
-        } else {
-            base_url.clone()
-        };
+        let (ollama_host, ollama_port) = parse_ollama_url(&config.base_url)
+            .map_err(|msg| ModelError::InvalidConfig { message: msg })?;
 
-        let client = Ollama::new(ollama_host, 11434);
+        let client = Ollama::new(ollama_host, ollama_port);
 
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
@@ -1145,5 +1158,39 @@ mod tests {
         let config = OllamaConfig::default().with_base_url("http://localhost:11434/v1");
         let provider = OllamaProvider::new(config).unwrap();
         assert_eq!(provider.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn test_parse_ollama_url_default_port() {
+        let (host, port) = parse_ollama_url("http://localhost:11434").unwrap();
+        assert_eq!(host, "http://localhost");
+        assert_eq!(port, 11434);
+    }
+
+    #[test]
+    fn test_parse_ollama_url_custom_port() {
+        let (host, port) = parse_ollama_url("http://localhost:11435").unwrap();
+        assert_eq!(host, "http://localhost");
+        assert_eq!(port, 11435);
+    }
+
+    #[test]
+    fn test_parse_ollama_url_strips_v1() {
+        let (host, port) = parse_ollama_url("http://myhost:8080/v1").unwrap();
+        assert_eq!(host, "http://myhost");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_ollama_url_default_ollama_port() {
+        let (host, port) = parse_ollama_url("http://myhost").unwrap();
+        assert_eq!(host, "http://myhost");
+        assert_eq!(port, 11434);
+    }
+
+    #[test]
+    fn test_parse_ollama_url_invalid() {
+        let result = parse_ollama_url("not-a-url");
+        assert!(result.is_err());
     }
 }

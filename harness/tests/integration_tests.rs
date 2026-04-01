@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use harness::agent::{AgentConfig, AgentContext, AgentLoop};
 use harness::container::{
     detect_runtime, health_check_container, start_container_with_fallback, verify_image_exists,
-    ContainerConfig, ContainerError, ContainerRuntime,
+    ContainerConfig, ContainerError, ContainerRuntime, SharedModelPool,
 };
 use harness::entities::InMemoryEntityStore;
 use harness::entities::{EntityQuery, EntityStore, EntityType};
@@ -2125,6 +2125,49 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
         .as_str()
         .unwrap()
         .contains("Result for task B"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_shared_model_pool_lifecycle_real_container() {
+    let config = ContainerConfig {
+        base_image: "nanna-coder-ollama:latest".to_string(),
+        test_image: Some("nanna-coder-ollama:latest".to_string()),
+        container_name: "nanna-pool-lifecycle-test".to_string(),
+        port_mapping: Some((11436, 11434)),
+        model_to_pull: None,
+        startup_timeout: Duration::from_secs(60),
+        health_check_timeout: Duration::from_secs(30),
+        env_vars: vec![],
+        additional_args: vec![],
+    };
+
+    let pool = SharedModelPool::new(config);
+    assert_eq!(pool.ref_count(), 0);
+
+    let guard1 = pool
+        .get_or_start()
+        .await
+        .expect("failed to start container");
+    assert_eq!(pool.ref_count(), 1);
+
+    guard1
+        .provider()
+        .health_check()
+        .await
+        .expect("health check failed");
+
+    let guard2 = pool
+        .get_or_start()
+        .await
+        .expect("failed to get second guard");
+    assert_eq!(pool.ref_count(), 2);
+    assert!(Arc::ptr_eq(guard1.provider(), guard2.provider()));
+
+    drop(guard1);
+    assert_eq!(pool.ref_count(), 1);
+    drop(guard2);
+    assert_eq!(pool.ref_count(), 0);
 }
 
 // ============================================================================

@@ -64,6 +64,12 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
+        /// Host port for the Ollama container mapping
+        #[arg(long, default_value = "11435")]
+        host_port: u16,
+        /// Explicit Ollama URL; skips container management entirely
+        #[arg(long)]
+        ollama_url: Option<String>,
     },
 }
 
@@ -141,8 +147,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::McpServe {
             model,
             max_iterations,
+            host_port,
+            ollama_url,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            run_mcp_server(&model, max_iterations, host_port, ollama_url.as_deref()).await?;
         }
     }
 
@@ -478,13 +486,15 @@ async fn run_agent(
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
+    host_port: u16,
+    ollama_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::container::{ContainerConfig, SharedModelPool};
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
+    use model::provider::ModelProvider;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
@@ -492,8 +502,75 @@ async fn run_mcp_server(
         model, max_iterations
     );
 
-    let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
+    let (provider, model_guard) = if let Some(url) = ollama_url {
+        let config = OllamaConfig::default().with_base_url(url);
+        let provider: Arc<dyn ModelProvider> = Arc::new(OllamaProvider::new(config)?);
+        (provider, None)
+    } else {
+        let container_config = ContainerConfig {
+            model_to_pull: Some(model.to_string()),
+            port_mapping: Some((host_port, 11434)),
+            ..ContainerConfig::default()
+        };
+        let pool = SharedModelPool::new(container_config);
+        let guard = pool.get_or_start().await?;
+        let provider = guard.provider().clone();
+        (provider, Some(guard))
+    };
+
+    let server = NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+        model_guard,
+    );
 
     server.run_stdio().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_mcp_serve_default_host_port() {
+        let cli = Cli::try_parse_from(["harness", "mcp-serve"]).unwrap();
+        let Commands::McpServe {
+            host_port,
+            ollama_url,
+            ..
+        } = cli.command
+        else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(host_port, 11435);
+        assert!(ollama_url.is_none());
+    }
+
+    #[test]
+    fn test_mcp_serve_custom_host_port() {
+        let cli = Cli::try_parse_from(["harness", "mcp-serve", "--host-port", "9999"]).unwrap();
+        let Commands::McpServe { host_port, .. } = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(host_port, 9999);
+    }
+
+    #[test]
+    fn test_mcp_serve_ollama_url_bypasses_pool() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "mcp-serve",
+            "--ollama-url",
+            "http://remote:11434",
+        ])
+        .unwrap();
+        let Commands::McpServe { ollama_url, .. } = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(ollama_url.as_deref(), Some("http://remote:11434"));
+    }
 }
