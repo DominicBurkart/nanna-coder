@@ -88,7 +88,7 @@
         };
 
         # Pin specific Rust version for reproducibility (supports edition 2024)
-        rustToolchain = pkgs.rust-bin.stable."1.84.0".default.override {
+        rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
           extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
         };
 
@@ -267,7 +267,7 @@
             overlays = [ (import rust-overlay) ];
             config.allowUnfree = false;
           };
-          rustToolchain = pkgs.rust-bin.stable."1.84.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
             extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
           };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
