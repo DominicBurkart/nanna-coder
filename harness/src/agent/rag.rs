@@ -108,8 +108,12 @@ mod tests {
     async fn test_query_entities_limit() {
         let mut store = InMemoryEntityStore::new();
 
-        // Insert multiple entities that will all match the query "Git"
-        for _ in 0..5 {
+        // Insert 15 entities that will all match the query "Git".
+        // The query string "Git" matches because serde's default derive serializes
+        // EntityType::Git as the string "Git" in JSON, which the text-search path
+        // finds via substring match.  15 entities means Some(10) is capped while
+        // None returns all 15, making the two arms observationally distinct.
+        for _ in 0..15 {
             let repo = Box::new(GitRepository::new(String::new(), "main".to_string()));
             store.store(repo).await.unwrap();
         }
@@ -118,12 +122,12 @@ mod tests {
         let results = query_entities(&store, "Git", Some(2)).await.unwrap();
         assert_eq!(results.len(), 2);
 
-        // Query with limit=10 should return all 5
+        // Query with limit=10 should return exactly 10 (pool is 15)
         let results = query_entities(&store, "Git", Some(10)).await.unwrap();
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 10);
 
-        // Query with no limit should return all 5
+        // Query with no limit should return all 15
         let results = query_entities(&store, "Git", None).await.unwrap();
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 15);
     }
 }

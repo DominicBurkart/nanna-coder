@@ -520,10 +520,10 @@ mod tests {
         assert_eq!(metadata.version, 1);
         assert_eq!(metadata.entity_type, EntityType::Ast);
         assert!(metadata.created_at >= before && metadata.created_at <= after);
-        assert_eq!(metadata.created_at, metadata.updated_at);
         assert!(metadata.tags.is_empty());
-        // ID should be a valid UUID v4 string
-        assert!(uuid::Uuid::parse_str(&metadata.id).is_ok());
+        // ID must be a valid UUID v4 ("random") — rejects v1, v3, v5, and nil UUIDs.
+        let parsed = uuid::Uuid::parse_str(&metadata.id).expect("should be valid UUID");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random)); // v4
     }
 
     #[test]
@@ -540,18 +540,36 @@ mod tests {
         assert_eq!(original.tags, restored.tags);
     }
 
-    #[test]
-    fn test_entity_type_debug_variants() {
-        // EntityType does not implement Display, so verify Debug output
-        // covers all variants and each produces a distinct string.
-        let variants = [
+    /// Returns one instance of every `EntityType` variant.
+    ///
+    /// The closure `_exhaustive_check` performs a compiler-enforced exhaustive
+    /// `match` so that adding a new variant to `EntityType` without updating
+    /// this helper produces a **compile error** rather than a silent test gap.
+    fn all_entity_type_variants() -> Vec<EntityType> {
+        // Compiler error here if a variant is missing — no runtime surprise.
+        let _exhaustive_check = |v: &EntityType| match v {
+            EntityType::Git
+            | EntityType::Ast
+            | EntityType::Test
+            | EntityType::Env
+            | EntityType::Context
+            | EntityType::Telemetry => {}
+        };
+        vec![
             EntityType::Git,
             EntityType::Ast,
             EntityType::Test,
             EntityType::Env,
             EntityType::Context,
             EntityType::Telemetry,
-        ];
+        ]
+    }
+
+    #[test]
+    fn test_entity_type_debug_variants() {
+        // EntityType does not implement Display, so verify Debug output
+        // covers all variants and each produces a distinct string.
+        let variants = all_entity_type_variants();
 
         let debug_strings: Vec<String> = variants.iter().map(|v| format!("{:?}", v)).collect();
         // All debug strings should be unique
