@@ -15,7 +15,7 @@ path = "src/main.rs"
 async-trait = "0.1"
 clap = { version = "4.0", features = ["derive"] }
 image-builder = { path = "../image-builder" }
-model = { path = "../model" }
+model = { path = "../model", features = ["openai-compat"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
