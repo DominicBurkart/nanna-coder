@@ -6,6 +6,27 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct AssignTaskParams {
+    pub description: String,
+    pub repo_path: std::path::PathBuf,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+    pub max_iterations: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskIdParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OnboardRepoParams {
+    pub repo_path: std::path::PathBuf,
+}
+
 pub async fn handle_list_tasks(task_manager: &Arc<TaskManager>) -> Result<Value, String> {
     let tasks = task_manager.list().await;
     let summaries: Vec<Value> = tasks
