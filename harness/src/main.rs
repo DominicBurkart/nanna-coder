@@ -14,7 +14,7 @@ use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "nanna")]
-#[command(about = "Nanna CLI \u2014 manage coding tasks, onboard repos, and interact with models")]
+#[command(about = "Nanna CLI -- manage coding tasks, onboard repos, and interact with models")]
 struct Cli {
     /// Output as JSON envelope (version-tagged, machine-readable)
     #[arg(long, global = true)]
