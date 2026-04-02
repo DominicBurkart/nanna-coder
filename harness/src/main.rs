@@ -71,8 +71,11 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:3000")]
         bind: String,
         /// Environment variable containing the auth token (requires --http)
-        #[arg(long, default_value = "NANNA_AUTH_TOKEN")]
+        #[arg(long, default_value = "NANNA_TOKEN")]
         token_env: String,
+        /// Path to a file containing the auth token (must have 0600 permissions)
+        #[arg(long)]
+        token_file: Option<String>,
     },
 }
 
@@ -153,9 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             http,
             bind,
             token_env,
+            token_file,
         } => {
             if http {
-                run_mcp_http_server(&model, max_iterations, &bind, &token_env).await?;
+                run_mcp_http_server(&model, max_iterations, &bind, &token_env, token_file.as_deref())
+                    .await?;
             } else {
                 run_mcp_server(&model, max_iterations).await?;
             }
@@ -519,8 +524,9 @@ async fn run_mcp_http_server(
     max_iterations: usize,
     bind: &str,
     token_env: &str,
+    token_file: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::auth::{validate_bind_address, AuthToken, RateLimiter, TokenStore};
+    use harness::auth::{read_token_file, validate_bind_address, AuthToken, RateLimiter, TokenStore};
     use harness::mcp::http::run_http;
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
@@ -537,8 +543,11 @@ async fn run_mcp_http_server(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
 
-    // Resolve token: from env var if set, otherwise generate one
-    let token_store = if let Ok(env_token) = std::env::var(token_env) {
+    // Resolve token: --token-file takes priority, then --token-env, then generate
+    let token_store = if let Some(path) = token_file {
+        let token = read_token_file(std::path::Path::new(path))?;
+        TokenStore::with_token(token, Duration::from_secs(86400))
+    } else if let Ok(env_token) = std::env::var(token_env) {
         if env_token.is_empty() {
             return Err(format!("environment variable {} is set but empty", token_env).into());
         }
@@ -566,6 +575,8 @@ async fn run_mcp_http_server(
     );
     eprintln!("Listening on http://{}", addr);
 
-    run_http(server, token_store, rate_limiter, addr).await?;
+    run_http(server, token_store, rate_limiter, addr)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     Ok(())
 }

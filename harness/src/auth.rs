@@ -1,6 +1,7 @@
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -17,6 +18,10 @@ pub enum AuthError {
     InsecureBindAddress,
     #[error("rate limited")]
     RateLimited,
+    #[error("token file has insecure permissions (must be 0600)")]
+    InsecureFilePermissions,
+    #[error("token file is empty")]
+    EmptyTokenFile,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -109,6 +114,28 @@ pub fn validate_bind_address(addr: &SocketAddr) -> Result<(), AuthError> {
         return Err(AuthError::InsecureBindAddress);
     }
     Ok(())
+}
+
+/// Read a bearer token from a file, validating that the file has restrictive
+/// permissions (0600 on Unix) to prevent other users from reading the token.
+pub fn read_token_file(path: &Path) -> Result<AuthToken, AuthError> {
+    // On Unix, verify file permissions before reading.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(AuthError::InsecureFilePermissions);
+        }
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    let token = contents.trim().to_string();
+    if token.is_empty() {
+        return Err(AuthError::EmptyTokenFile);
+    }
+    Ok(AuthToken::from_string(token))
 }
 
 /// Rate limiter that tracks failed authentication attempts per IP address.
@@ -304,5 +331,113 @@ mod tests {
         assert!(limiter.check_rate_limit(&ip).is_err());
         limiter.record_success(&ip);
         assert!(limiter.check_rate_limit(&ip).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // Token-file tests
+    // ---------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_token_file_success() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"super-secret-token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let token = read_token_file(&path).unwrap();
+        assert_eq!(token.as_str(), "super-secret-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_token_file_rejects_insecure_permissions() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = read_token_file(&path).unwrap_err();
+        assert!(
+            matches!(err, AuthError::InsecureFilePermissions),
+            "Expected InsecureFilePermissions, got: {:?}",
+            err
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_token_file_rejects_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = read_token_file(&path).unwrap_err();
+        assert!(
+            matches!(err, AuthError::EmptyTokenFile),
+            "Expected EmptyTokenFile, got: {:?}",
+            err
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Security invariant: tokens must never leak
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_debug_does_not_leak_token_value() {
+        let secret = "a]very[secret}token{with!special@chars";
+        let token = AuthToken::from_string(secret.to_string());
+        let debug = format!("{:?}", token);
+        assert!(
+            !debug.contains(secret),
+            "Debug output must not contain the raw token"
+        );
+        assert!(
+            debug.contains("REDACTED"),
+            "Debug output should say REDACTED"
+        );
+    }
+
+    #[test]
+    fn test_auth_errors_never_contain_token_value() {
+        // Generate a unique token string and verify it doesn't appear in any
+        // error variant's Display or Debug output.
+        let secret = "unique-canary-string-1234567890abcdef";
+        let _token = AuthToken::from_string(secret.to_string());
+
+        let errors: Vec<AuthError> = vec![
+            AuthError::InvalidToken,
+            AuthError::ExpiredToken,
+            AuthError::MissingToken,
+            AuthError::InsecureBindAddress,
+            AuthError::RateLimited,
+            AuthError::InsecureFilePermissions,
+            AuthError::EmptyTokenFile,
+            AuthError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file")),
+        ];
+
+        for err in &errors {
+            let display = format!("{}", err);
+            let debug = format!("{:?}", err);
+            assert!(
+                !display.contains(secret),
+                "Error Display leaked token: {}",
+                display
+            );
+            assert!(
+                !debug.contains(secret),
+                "Error Debug leaked token: {}",
+                debug
+            );
+        }
     }
 }

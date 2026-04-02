@@ -114,7 +114,7 @@ pub async fn run_http(
     token_store: Arc<TokenStore>,
     rate_limiter: Arc<RateLimiter>,
     addr: SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let server = Arc::clone(&server);
         let token_store = Arc::clone(&token_store);
@@ -297,10 +297,10 @@ mod tests {
         );
     }
 
-    /// Missing Authorization header => 401.
+    /// Missing Authorization header => 401, body must not contain the real token.
     #[tokio::test]
     async fn test_http_401_on_missing_auth() {
-        let (addr, _) = spawn_test_server().await;
+        let (addr, token_value) = spawn_test_server().await;
 
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
@@ -318,12 +318,19 @@ mod tests {
             .expect("HTTP request failed");
 
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains(&token_value),
+            "401 response body must not contain the server token"
+        );
     }
 
-    /// Wrong token => 401.
+    /// Wrong token => 401, body must not contain either the real or submitted token.
     #[tokio::test]
     async fn test_http_401_on_wrong_token() {
-        let (addr, _) = spawn_test_server().await;
+        let (addr, token_value) = spawn_test_server().await;
+        let wrong_token = "this-is-definitely-wrong";
 
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
@@ -335,12 +342,36 @@ mod tests {
 
         let response = client
             .post(format!("http://{}", addr))
-            .header("Authorization", "Bearer this-is-definitely-wrong")
+            .header("Authorization", format!("Bearer {}", wrong_token))
             .json(&payload)
             .send()
             .await
             .expect("HTTP request failed");
 
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains(&token_value),
+            "401 response body must not contain the real server token"
+        );
+        assert!(
+            !body.contains(wrong_token),
+            "401 response body must not contain the submitted wrong token"
+        );
+    }
+
+    /// AuthToken Debug representation must never reveal the actual value.
+    #[test]
+    fn test_auth_token_debug_redacted() {
+        use crate::auth::AuthToken;
+        let secret = "super-secret-value-that-must-not-leak";
+        let token = AuthToken::from_string(secret.to_string());
+        let debug = format!("{:?}", token);
+        assert!(
+            !debug.contains(secret),
+            "AuthToken Debug must not contain the raw token"
+        );
+        assert!(debug.contains("REDACTED"));
     }
 }

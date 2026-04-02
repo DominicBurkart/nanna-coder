@@ -1,4 +1,5 @@
 use harness::auth::{validate_bind_address, AuthToken, RateLimiter, TokenStore};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[test]
@@ -93,7 +94,6 @@ fn test_bearer_token_extraction() {
 /// AuthToken is logged via its Debug impl.
 #[test]
 fn test_token_not_leaked_in_tracing_output() {
-    use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
 
