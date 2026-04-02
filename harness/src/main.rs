@@ -2,21 +2,80 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::mcp::handlers;
+use harness::output::{ExitCode, JsonEnvelope, OutputFormat};
+use harness::task::TaskManager;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "harness")]
-#[command(about = "A CLI tool for interacting with language models")]
+#[command(name = "nanna")]
+#[command(about = "Nanna CLI — manage coding tasks, onboard repos, and interact with models")]
 struct Cli {
+    /// Output as JSON envelope (version-tagged, machine-readable)
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    // ── Task management (the 6 MVP subcommands) ──────────────────────
+    /// Submit a coding task to be executed
+    AssignTask {
+        /// Description of the task
+        #[arg(short, long)]
+        description: String,
+        /// Absolute path to the git repository
+        #[arg(short, long)]
+        repo_path: PathBuf,
+        /// Branch or ref to base on (default: HEAD)
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+        /// Model to use
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+    },
+    /// Check current status of a task
+    PollTask {
+        /// Task ID returned by assign-task
+        #[arg(short, long)]
+        task_id: String,
+        /// Block until the task finishes (with optional timeout in seconds)
+        #[arg(short, long)]
+        wait: Option<Option<u64>>,
+    },
+    /// Retrieve the final result of a completed/failed task
+    GetResult {
+        /// Task ID returned by assign-task
+        #[arg(short, long)]
+        task_id: String,
+    },
+    /// List all submitted tasks
+    ListTasks,
+    /// Cancel a pending or running task
+    CancelTask {
+        /// Task ID returned by assign-task
+        #[arg(short, long)]
+        task_id: String,
+    },
+    /// Generate a flake.nix for a pure-Cargo project
+    OnboardRepo {
+        /// Absolute path to the repository
+        #[arg(short, long)]
+        repo_path: PathBuf,
+    },
+
+    // ── Legacy / interactive commands ────────────────────────────────
     /// Have a conversation with the model
     Chat {
         /// The model to use
@@ -57,7 +116,16 @@ enum Commands {
         tools: bool,
     },
     /// Run as an MCP server over stdio
-    McpServe {
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Start the MCP JSON-RPC server on stdio
+    Serve {
         /// The model to use for agent tasks
         #[arg(short, long, default_value = "qwen3:0.6b")]
         model: String,
@@ -67,60 +135,349 @@ enum Commands {
     },
 }
 
+/// Returns true when we should use the mock provider (CI-friendly, no Ollama required).
+fn use_mock_provider() -> bool {
+    std::env::var("NANNA_TEST_MOCK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A trivial mock provider that always returns a canned response.
+/// Used for integration tests in CI where Ollama is unavailable.
+struct MockCliProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for MockCliProvider {
+    async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+        Ok(ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("Mock response".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: None,
+        })
+    }
+
+    async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+        Ok(vec![ModelInfo {
+            name: "mock".to_string(),
+            size: Some(0),
+            digest: None,
+            modified_at: None,
+        }])
+    }
+
+    async fn health_check(&self) -> ModelResult<()> {
+        Ok(())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// Create an `Arc<dyn ModelProvider>` — mock when `NANNA_TEST_MOCK=1`, else Ollama.
+fn create_provider() -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
+    if use_mock_provider() {
+        Ok(Arc::new(MockCliProvider))
+    } else {
+        let config = OllamaConfig::default();
+        Ok(Arc::new(OllamaProvider::new(config)?))
+    }
+}
+
+fn emit(format: OutputFormat, code: ExitCode, data: serde_json::Value) -> std::process::ExitCode {
+    match format {
+        OutputFormat::Json => {
+            let envelope = if code == ExitCode::Success {
+                JsonEnvelope::success(data)
+            } else {
+                let msg = data
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| data.to_string());
+                let error_code = match code {
+                    ExitCode::StateError => "STATE_ERROR",
+                    ExitCode::InfraError => "INFRA_ERROR",
+                    ExitCode::UserError => "USER_ERROR",
+                    ExitCode::Interrupted => "INTERRUPTED",
+                    ExitCode::Success => unreachable!(),
+                };
+                JsonEnvelope::error(error_code, &msg)
+            };
+            println!("{}", envelope.to_json_string());
+        }
+        OutputFormat::Human => {
+            if code == ExitCode::Success {
+                print!("{}", harness::output::render(&data, OutputFormat::Human));
+            } else {
+                let msg = data
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        harness::output::render(&data, OutputFormat::Human)
+                            .trim()
+                            .to_string()
+                    });
+                eprintln!("Error: {msg}");
+            }
+        }
+    }
+    code.process_exit()
+}
+
+fn format_from(cli: &Cli) -> OutputFormat {
+    if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Install Ctrl+C handler so we can return exit code 130.
+    let fmt_for_ctrlc = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fmt_clone = fmt_for_ctrlc.clone();
+    let _ = ctrlc::set_handler(move || {
+        // If JSON mode was set we can't easily detect from here, so just exit 130.
+        if fmt_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let envelope = JsonEnvelope::error("INTERRUPTED", "Received SIGINT");
+            // Best-effort print
+            let _ = writeln!(io::stdout(), "{}", envelope.to_json_string());
+        } else {
+            let _ = writeln!(io::stderr(), "Interrupted");
+        }
+        std::process::exit(130);
+    });
+
     let cli = Cli::parse();
+    let fmt = format_from(&cli);
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
-    let workspace_root = std::env::current_dir()?;
-    let tool_registry = create_tool_registry(&workspace_root);
+    // Store whether JSON mode is active for the Ctrl+C handler.
+    fmt_for_ctrlc.store(cli.json, std::sync::atomic::Ordering::Relaxed);
 
     match cli.command {
+        // ── 6 MVP subcommands ────────────────────────────────────────
+        Commands::AssignTask {
+            description,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+        } => {
+            let provider = match create_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(
+                        fmt,
+                        ExitCode::InfraError,
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            };
+            let task_manager = Arc::new(TaskManager::default());
+            let params = serde_json::json!({
+                "description": description,
+                "repo_path": repo_path.to_string_lossy(),
+                "branch": branch,
+                "model": model,
+                "max_iterations": max_iterations,
+            });
+            match handlers::handle_assign_task(
+                &params,
+                &task_manager,
+                &provider,
+                &model,
+                max_iterations,
+            )
+            .await
+            {
+                Ok(data) => emit(fmt, ExitCode::Success, data),
+                Err(e) => emit(fmt, ExitCode::UserError, serde_json::json!(e)),
+            }
+        }
+
+        Commands::PollTask { task_id, wait } => {
+            // poll-task does not need a model provider.
+            let task_manager = Arc::new(TaskManager::default());
+            let params = serde_json::json!({ "task_id": task_id });
+
+            if let Some(timeout_secs) = wait {
+                // --wait: block until terminal state or timeout
+                let deadline = timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+                loop {
+                    match handlers::handle_poll_task(&params, &task_manager).await {
+                        Ok(data) => {
+                            let status = data["status"].as_str().unwrap_or("");
+                            if status == "Completed" || status == "Failed" {
+                                return emit(fmt, ExitCode::Success, data);
+                            }
+                            if let Some(dl) = deadline {
+                                if std::time::Instant::now() >= dl {
+                                    return emit(
+                                        fmt,
+                                        ExitCode::StateError,
+                                        serde_json::json!("Timed out waiting for task to finish"),
+                                    );
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        Err(e) => {
+                            return emit(fmt, ExitCode::StateError, serde_json::json!(e));
+                        }
+                    }
+                }
+            } else {
+                match handlers::handle_poll_task(&params, &task_manager).await {
+                    Ok(data) => emit(fmt, ExitCode::Success, data),
+                    Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+                }
+            }
+        }
+
+        Commands::GetResult { task_id } => {
+            let task_manager = Arc::new(TaskManager::default());
+            let params = serde_json::json!({ "task_id": task_id });
+            match handlers::handle_get_result(&params, &task_manager).await {
+                Ok(data) => emit(fmt, ExitCode::Success, data),
+                Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+            }
+        }
+
+        Commands::ListTasks => {
+            let task_manager = Arc::new(TaskManager::default());
+            match handlers::handle_list_tasks(&task_manager).await {
+                Ok(data) => emit(fmt, ExitCode::Success, data),
+                Err(e) => emit(fmt, ExitCode::InfraError, serde_json::json!(e)),
+            }
+        }
+
+        Commands::CancelTask { task_id } => {
+            let task_manager = Arc::new(TaskManager::default());
+            let params = serde_json::json!({ "task_id": task_id });
+            match handlers::handle_cancel_task(&params, &task_manager).await {
+                Ok(data) => emit(fmt, ExitCode::Success, data),
+                Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+            }
+        }
+
+        Commands::OnboardRepo { repo_path } => {
+            let params =
+                serde_json::json!({ "repo_path": repo_path.to_string_lossy().to_string() });
+            match handlers::handle_onboard_repo(&params).await {
+                Ok(data) => emit(fmt, ExitCode::Success, data),
+                Err(e) => emit(fmt, ExitCode::UserError, serde_json::json!(e)),
+            }
+        }
+
+        // ── Legacy interactive commands (require provider) ───────────
         Commands::Chat {
             model,
             prompt,
             tools,
             temperature,
         } => {
-            let entity_store = initialize_workspace(&workspace_root).await;
+            let provider = match create_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(
+                        fmt,
+                        ExitCode::InfraError,
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            };
+            let workspace_root = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(
+                        fmt,
+                        ExitCode::InfraError,
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            };
+            let tool_registry = create_tool_registry(&workspace_root);
 
             if let Some(initial_prompt) = prompt {
-                single_chat(
-                    &provider,
-                    &tool_registry,
-                    &model,
-                    &initial_prompt,
-                    tools,
-                    temperature,
-                )
-                .await?;
+                let entity_store = initialize_workspace(&workspace_root).await;
+                let _ = entity_store; // used for interactive mode only
+                if let Err(e) =
+                    single_chat(&*provider, &tool_registry, &model, &initial_prompt, tools, temperature)
+                        .await
+                {
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+                }
             } else {
-                interactive_chat(
-                    &provider,
+                let entity_store = initialize_workspace(&workspace_root).await;
+                if let Err(e) = interactive_chat(
+                    &*provider,
                     &tool_registry,
                     &model,
                     tools,
                     temperature,
                     entity_store,
                 )
-                .await?;
+                .await
+                {
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+                }
             }
+            ExitCode::Success.process_exit()
         }
+
         Commands::Models => {
-            list_models(&provider).await?;
+            let provider = match create_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(
+                        fmt,
+                        ExitCode::InfraError,
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            };
+            if let Err(e) = list_models(&*provider).await {
+                return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+            }
+            ExitCode::Success.process_exit()
         }
+
         Commands::Tools => {
+            let workspace_root = std::env::current_dir().unwrap_or_default();
+            let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
+            ExitCode::Success.process_exit()
         }
+
         Commands::Health => {
-            health_check(&provider).await?;
+            let provider = match create_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(
+                        fmt,
+                        ExitCode::InfraError,
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            };
+            if let Err(e) = health_check(&*provider).await {
+                return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+            }
+            ExitCode::Success.process_exit()
         }
+
         Commands::Agent {
             prompt,
             model,
@@ -128,25 +485,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             verbose,
             tools,
         } => {
-            run_agent(
-                &prompt,
-                &model,
-                max_iterations,
-                verbose,
-                tools,
-                &workspace_root,
-            )
-            .await?;
+            let workspace_root = std::env::current_dir().unwrap_or_default();
+            if let Err(e) =
+                run_agent(&prompt, &model, max_iterations, verbose, tools, &workspace_root).await
+            {
+                return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+            }
+            ExitCode::Success.process_exit()
         }
-        Commands::McpServe {
-            model,
-            max_iterations,
+
+        Commands::Mcp {
+            command: McpCommands::Serve {
+                model,
+                max_iterations,
+            },
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            if let Err(e) = run_mcp_server(&model, max_iterations).await {
+                return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+            }
+            ExitCode::Success.process_exit()
         }
     }
-
-    Ok(())
 }
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
@@ -181,7 +540,7 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
 }
 
 async fn single_chat(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     prompt: &str,
@@ -249,7 +608,7 @@ async fn single_chat(
 }
 
 async fn interactive_chat(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
@@ -348,7 +707,7 @@ async fn interactive_chat(
     Ok(())
 }
 
-async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_models(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
     println!("Available models:");
     let models = provider.list_models().await?;
 
@@ -386,16 +745,16 @@ fn list_tools(tool_registry: &ToolRegistry) {
     }
 }
 
-async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn health_check(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
     println!("Performing health check...");
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -413,10 +772,8 @@ async fn run_agent(
     workspace_root: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = create_provider()?;
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -480,11 +837,8 @@ async fn run_mcp_server(
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = create_provider()?;
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
