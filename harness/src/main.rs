@@ -14,7 +14,7 @@ use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "nanna")]
-#[command(about = "Nanna CLI — manage coding tasks, onboard repos, and interact with models")]
+#[command(about = "Nanna CLI \u2014 manage coding tasks, onboard repos, and interact with models")]
 struct Cli {
     /// Output as JSON envelope (version-tagged, machine-readable)
     #[arg(long, global = true)]
@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // ── Task management (the 6 MVP subcommands) ──────────────────────
+    // \u2500\u2500 Task management (the 6 MVP subcommands) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     /// Submit a coding task to be executed
     AssignTask {
         /// Description of the task
@@ -75,7 +75,7 @@ enum Commands {
         repo_path: PathBuf,
     },
 
-    // ── Legacy / interactive commands ────────────────────────────────
+    // \u2500\u2500 Legacy / interactive commands \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     /// Have a conversation with the model
     Chat {
         /// The model to use
@@ -181,7 +181,7 @@ impl ModelProvider for MockCliProvider {
     }
 }
 
-/// Create an `Arc<dyn ModelProvider>` — mock when `NANNA_TEST_MOCK=1`, else Ollama.
+/// Create an `Arc<dyn ModelProvider>` \u2014 mock when `NANNA_TEST_MOCK=1`, else Ollama.
 fn create_provider() -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
     if use_mock_provider() {
         Ok(Arc::new(MockCliProvider))
@@ -216,14 +216,11 @@ fn emit(format: OutputFormat, code: ExitCode, data: serde_json::Value) -> std::p
             if code == ExitCode::Success {
                 print!("{}", harness::output::render(&data, OutputFormat::Human));
             } else {
-                let msg = data
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        harness::output::render(&data, OutputFormat::Human)
-                            .trim()
-                            .to_string()
-                    });
+                let msg = data.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                    harness::output::render(&data, OutputFormat::Human)
+                        .trim()
+                        .to_string()
+                });
                 eprintln!("Error: {msg}");
             }
         }
@@ -267,7 +264,7 @@ async fn main() -> std::process::ExitCode {
     fmt_for_ctrlc.store(cli.json, std::sync::atomic::Ordering::Relaxed);
 
     match cli.command {
-        // ── 6 MVP subcommands ────────────────────────────────────────
+        // \u2500\u2500 6 MVP subcommands \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         Commands::AssignTask {
             description,
             repo_path,
@@ -278,11 +275,7 @@ async fn main() -> std::process::ExitCode {
             let provider = match create_provider() {
                 Ok(p) => p,
                 Err(e) => {
-                    return emit(
-                        fmt,
-                        ExitCode::InfraError,
-                        serde_json::json!(e.to_string()),
-                    );
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             };
             let task_manager = Arc::new(TaskManager::default());
@@ -314,7 +307,8 @@ async fn main() -> std::process::ExitCode {
 
             if let Some(timeout_secs) = wait {
                 // --wait: block until terminal state or timeout
-                let deadline = timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+                let deadline = timeout_secs
+                    .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
                 loop {
                     match handlers::handle_poll_task(&params, &task_manager).await {
                         Ok(data) => {
@@ -381,7 +375,7 @@ async fn main() -> std::process::ExitCode {
             }
         }
 
-        // ── Legacy interactive commands (require provider) ───────────
+        // \u2500\u2500 Legacy interactive commands (require provider) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         Commands::Chat {
             model,
             prompt,
@@ -391,21 +385,13 @@ async fn main() -> std::process::ExitCode {
             let provider = match create_provider() {
                 Ok(p) => p,
                 Err(e) => {
-                    return emit(
-                        fmt,
-                        ExitCode::InfraError,
-                        serde_json::json!(e.to_string()),
-                    );
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             };
             let workspace_root = match std::env::current_dir() {
                 Ok(p) => p,
                 Err(e) => {
-                    return emit(
-                        fmt,
-                        ExitCode::InfraError,
-                        serde_json::json!(e.to_string()),
-                    );
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             };
             let tool_registry = create_tool_registry(&workspace_root);
@@ -413,9 +399,15 @@ async fn main() -> std::process::ExitCode {
             if let Some(initial_prompt) = prompt {
                 let entity_store = initialize_workspace(&workspace_root).await;
                 let _ = entity_store; // used for interactive mode only
-                if let Err(e) =
-                    single_chat(&*provider, &tool_registry, &model, &initial_prompt, tools, temperature)
-                        .await
+                if let Err(e) = single_chat(
+                    &*provider,
+                    &tool_registry,
+                    &model,
+                    &initial_prompt,
+                    tools,
+                    temperature,
+                )
+                .await
                 {
                     return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
@@ -441,11 +433,7 @@ async fn main() -> std::process::ExitCode {
             let provider = match create_provider() {
                 Ok(p) => p,
                 Err(e) => {
-                    return emit(
-                        fmt,
-                        ExitCode::InfraError,
-                        serde_json::json!(e.to_string()),
-                    );
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             };
             if let Err(e) = list_models(&*provider).await {
@@ -465,11 +453,7 @@ async fn main() -> std::process::ExitCode {
             let provider = match create_provider() {
                 Ok(p) => p,
                 Err(e) => {
-                    return emit(
-                        fmt,
-                        ExitCode::InfraError,
-                        serde_json::json!(e.to_string()),
-                    );
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             };
             if let Err(e) = health_check(&*provider).await {
@@ -486,8 +470,15 @@ async fn main() -> std::process::ExitCode {
             tools,
         } => {
             let workspace_root = std::env::current_dir().unwrap_or_default();
-            if let Err(e) =
-                run_agent(&prompt, &model, max_iterations, verbose, tools, &workspace_root).await
+            if let Err(e) = run_agent(
+                &prompt,
+                &model,
+                max_iterations,
+                verbose,
+                tools,
+                &workspace_root,
+            )
+            .await
             {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
             }
@@ -495,10 +486,11 @@ async fn main() -> std::process::ExitCode {
         }
 
         Commands::Mcp {
-            command: McpCommands::Serve {
-                model,
-                max_iterations,
-            },
+            command:
+                McpCommands::Serve {
+                    model,
+                    max_iterations,
+                },
         } => {
             if let Err(e) = run_mcp_server(&model, max_iterations).await {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
