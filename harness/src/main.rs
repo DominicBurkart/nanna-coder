@@ -159,8 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token_file,
         } => {
             if http {
-                run_mcp_http_server(&model, max_iterations, &bind, &token_env, token_file.as_deref())
-                    .await?;
+                run_mcp_http_server(
+                    &model,
+                    max_iterations,
+                    &bind,
+                    &token_env,
+                    token_file.as_deref(),
+                )
+                .await?;
             } else {
                 run_mcp_server(&model, max_iterations).await?;
             }
@@ -526,7 +532,9 @@ async fn run_mcp_http_server(
     token_env: &str,
     token_file: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::auth::{read_token_file, validate_bind_address, AuthToken, RateLimiter, TokenStore};
+    use harness::auth::{
+        read_token_file, validate_bind_address, AuthToken, RateLimiter, TokenStore,
+    };
     use harness::mcp::http::run_http;
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;

@@ -100,11 +100,8 @@ fn test_token_not_leaked_in_tracing_output() {
     let log_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let writer = MakeWriterFactory(Arc::clone(&log_buffer));
 
-    let subscriber = tracing_subscriber::registry().with(
-        fmt::layer()
-            .with_writer(writer)
-            .with_ansi(false),
-    );
+    let subscriber =
+        tracing_subscriber::registry().with(fmt::layer().with_writer(writer).with_ansi(false));
 
     tracing::subscriber::with_default(subscriber, || {
         let store = TokenStore::new(Duration::from_secs(3600));

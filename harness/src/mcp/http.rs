@@ -198,8 +198,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_noop_server() -> Arc<NannaMcpServer> {
-        use async_trait::async_trait;
         use crate::task::TaskManager;
+        use async_trait::async_trait;
         use model::provider::ModelResult;
         use model::types::{ChatRequest, ChatResponse, ModelInfo};
 
