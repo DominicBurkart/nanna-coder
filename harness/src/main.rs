@@ -56,7 +56,7 @@ enum Commands {
         #[arg(short, long)]
         tools: bool,
     },
-    /// Run as an MCP server over stdio
+    /// Run as an MCP server over stdio (default) or HTTP
     McpServe {
         /// The model to use for agent tasks
         #[arg(short, long, default_value = "qwen3:0.6b")]
@@ -64,6 +64,18 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
+        /// Use HTTP transport instead of stdio
+        #[arg(long)]
+        http: bool,
+        /// Address to bind the HTTP server to (requires --http)
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+        /// Environment variable containing the auth token (requires --http)
+        #[arg(long, default_value = "NANNA_TOKEN")]
+        token_env: String,
+        /// Path to a file containing the auth token (must have 0600 permissions)
+        #[arg(long)]
+        token_file: Option<String>,
     },
 }
 
@@ -141,8 +153,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::McpServe {
             model,
             max_iterations,
+            http,
+            bind,
+            token_env,
+            token_file,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            if http {
+                run_mcp_http_server(
+                    &model,
+                    max_iterations,
+                    &bind,
+                    &token_env,
+                    token_file.as_deref(),
+                )
+                .await?;
+            } else {
+                run_mcp_server(&model, max_iterations).await?;
+            }
         }
     }
 
@@ -495,5 +522,69 @@ async fn run_mcp_server(
     let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
 
     server.run_stdio().await?;
+    Ok(())
+}
+
+async fn run_mcp_http_server(
+    model: &str,
+    max_iterations: usize,
+    bind: &str,
+    token_env: &str,
+    token_file: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::auth::{
+        read_token_file, validate_bind_address, AuthToken, RateLimiter, TokenStore,
+    };
+    use harness::mcp::http::run_http;
+    use harness::mcp::NannaMcpServer;
+    use harness::task::TaskManager;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| format!("invalid bind address '{}': {}", bind, e))?;
+
+    validate_bind_address(&addr)?;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let task_manager = Arc::new(TaskManager::default());
+
+    // Resolve token: --token-file takes priority, then --token-env, then generate
+    let token_store = if let Some(path) = token_file {
+        let token = read_token_file(std::path::Path::new(path))?;
+        TokenStore::with_token(token, Duration::from_secs(86400))
+    } else if let Ok(env_token) = std::env::var(token_env) {
+        if env_token.is_empty() {
+            return Err(format!("environment variable {} is set but empty", token_env).into());
+        }
+        let token = AuthToken::from_string(env_token);
+        TokenStore::with_token(token, Duration::from_secs(86400))
+    } else {
+        let store = TokenStore::new(Duration::from_secs(86400));
+        eprintln!("Generated auth token: {}", store.token().as_str());
+        store
+    };
+
+    let token_store = Arc::new(token_store);
+    let rate_limiter = Arc::new(RateLimiter::new(10, Duration::from_secs(300)));
+
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
+
+    info!(
+        "Starting Nanna MCP HTTP server on {} (model: {}, max_iterations: {})",
+        addr, model, max_iterations
+    );
+    eprintln!("Listening on http://{}", addr);
+
+    run_http(server, token_store, rate_limiter, addr)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     Ok(())
 }
