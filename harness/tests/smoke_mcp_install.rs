@@ -268,6 +268,135 @@ fn test_mcp_stdio_tools_list() {
     );
 }
 
+/// Smoke test for `tools/call` with `list_tasks`.
+///
+/// Spawns `harness mcp-serve`, performs the full MCP handshake over stdio,
+/// then sends a `tools/call` JSON-RPC request with `name: "list_tasks"` and
+/// `arguments: {}`. Asserts the response contains a `"content"` array whose
+/// first element has parseable JSON text. This validates the full stdio
+/// transport for tool execution without needing Ollama.
+#[test]
+fn test_mcp_stdio_tools_call_list_tasks() {
+    use std::io::Read;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["mcp-serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start harness mcp-serve");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let timeout = Duration::from_secs(30);
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<serde_json::Value, String>>();
+    std::thread::spawn(move || {
+        // 1. initialize
+        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let init_resp = send_and_recv(&mut stdin, &mut stdout, init_msg);
+        if !init_resp.contains("protocolVersion") && !init_resp.contains("serverInfo") {
+            let _ = tx.send(Err(format!(
+                "initialize response missing expected fields: {}",
+                &init_resp[..init_resp.len().min(500)]
+            )));
+            return;
+        }
+
+        // 2. notifications/initialized (no response expected)
+        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+        let notif_header = format!("Content-Length: {}\r\n\r\n", notif.len());
+        stdin.write_all(notif_header.as_bytes()).unwrap();
+        stdin.write_all(notif.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+
+        // 3. tools/call list_tasks
+        let call_msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_tasks","arguments":{}}}"#;
+        let call_resp = send_and_recv(&mut stdin, &mut stdout, call_msg);
+
+        match serde_json::from_str::<serde_json::Value>(&call_resp) {
+            Ok(v) => {
+                let _ = tx.send(Ok(v));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(format!(
+                    "Failed to parse tools/call response: {}\nRaw: {}",
+                    e,
+                    &call_resp[..call_resp.len().min(500)]
+                )));
+            }
+        }
+    });
+
+    let result = match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Timed out ({timeout:?}) waiting for tools/call list_tasks response");
+        }
+    };
+
+    let _ = child.kill();
+    let stderr_output = child.stderr.take().map(|mut se| {
+        let mut buf = String::new();
+        let _ = se.read_to_string(&mut buf);
+        buf
+    });
+    let _ = child.wait();
+
+    if let Some(ref stderr) = stderr_output {
+        if !stderr.is_empty() {
+            eprintln!("[smoke_mcp] stderr from mcp-serve:\n{stderr}");
+        }
+    }
+
+    let resp = result.unwrap_or_else(|e| panic!("tools/call list_tasks failed: {e}"));
+
+    // The MCP tools/call response must contain a "content" array in the result.
+    let content = resp["result"]["content"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "tools/call list_tasks: expected result.content array, got: {}",
+                serde_json::to_string_pretty(&resp).unwrap_or_default()
+            )
+        });
+
+    assert!(
+        !content.is_empty(),
+        "tools/call list_tasks: content array is empty"
+    );
+
+    // The first content element should have a "text" field with parseable JSON.
+    let text = content[0]["text"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "tools/call list_tasks: first content element missing 'text': {:?}",
+                content[0]
+            )
+        });
+
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "tools/call list_tasks: content text is not valid JSON: {}\nRaw: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    });
+
+    // Sanity: the parsed JSON should be an object (the list_tasks handler returns
+    // a JSON object with task information).
+    assert!(
+        parsed.is_object() || parsed.is_array(),
+        "tools/call list_tasks: expected JSON object or array, got: {}",
+        &text[..text.len().min(200)]
+    );
+}
+
 // ── Live-tier test ────────────────────────────────────────────────────────────
 
 /// Live MCP task roundtrip smoke test.
