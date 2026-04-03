@@ -16,6 +16,9 @@ use uuid::Uuid;
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 
+/// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
+type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
@@ -124,7 +127,7 @@ pub struct TaskManager {
     progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
     image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
     /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
-    build_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    build_locks: BuildLocks,
 }
 
 impl TaskManager {
@@ -141,7 +144,7 @@ impl TaskManager {
 
     async fn get_or_build_image(
         cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
-        build_locks: &Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+        build_locks: &BuildLocks,
         repo_path: &std::path::Path,
     ) -> Result<String, String> {
         let canonical = repo_path.canonicalize().map_err(|e| e.to_string())?;
