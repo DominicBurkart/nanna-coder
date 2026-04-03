@@ -573,12 +573,9 @@ impl ObservabilitySystem {
                 reason: e.to_string(),
             })?;
 
-        // Initialize monitoring
-        self.monitoring.start_monitoring().await.map_err(|e| {
-            ObservabilityError::MonitoringFailed {
-                reason: e.to_string(),
-            }
-        })?;
+        // MonitoringSystem::start_monitoring previously spawned a background task
+        // whose loop body only logged a debug message and did no actual work;
+        // that dead stub has been removed.
 
         info!("Observability system initialized successfully");
         Ok(())
