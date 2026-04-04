@@ -28,7 +28,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, MessageRole};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -854,15 +854,37 @@ impl AgentLoop {
     }
 
     /// Perform Entity Modification (ARCHITECTURE.md) — execute the planned
-    /// modification, dispatching to tool-based or MVP implementation.
-    #[allow(deprecated)]
+    /// modification, dispatching to tool-based or fallback implementation.
     async fn perform_entity_modification(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.llm_provider.is_some() && self.tool_registry.is_some() {
             let provider = self.llm_provider.as_ref().unwrap().clone();
             self.perform_entity_modification_with_tools(context, &provider)
                 .await
         } else {
-            self.perform_entity_modification_mvp(context).await
+            // Fallback: no tool registry configured. Create a placeholder
+            // GitRepository entity so the state machine can continue. Use
+            // `with_tools` constructor to enable LLM-driven tool calling.
+            use crate::entities::{git::types::GitRepository, EntityStore};
+
+            self.performed_actions += 1;
+
+            if self.config.verbose {
+                tracing::info!("Performing action for: {}", context.user_prompt);
+            }
+
+            let new_entity = Box::new(GitRepository::new(String::new(), "main".to_string()));
+
+            let entity_id = self
+                .entity_store
+                .store(new_entity)
+                .await
+                .map_err(|e| bare_state_error(format!("Failed to store entity: {}", e)))?;
+
+            if self.config.verbose {
+                tracing::info!("Created new entity: {}", entity_id);
+            }
+
+            Ok(())
         }
     }
 
@@ -882,159 +904,6 @@ impl AgentLoop {
         // ARCHITECTURE.md flow and provide a hook for future validation,
         // journaling, or batched writes.
         Ok(())
-    }
-
-    /// MVP perform: create a GitRepository entity.
-    ///
-    /// Deprecated: Use `with_tools` constructor to get LLM-driven tool calling in
-    /// the Performing state instead.
-    #[deprecated(note = "Use with_tools constructor for LLM-driven performing")]
-    async fn perform_entity_modification_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
-        use crate::entities::{git::types::GitRepository, EntityStore};
-
-        self.performed_actions += 1;
-
-        if self.config.verbose {
-            tracing::info!("Performing action for: {}", context.user_prompt);
-        }
-
-        let new_entity = Box::new(GitRepository::new(String::new(), "main".to_string()));
-
-        let entity_id = self
-            .entity_store
-            .store(new_entity)
-            .await
-            .map_err(|e| bare_state_error(format!("Failed to store entity: {}", e)))?;
-
-        if self.config.verbose {
-            tracing::info!("Created new entity: {}", entity_id);
-        }
-
-        Ok(())
-    }
-
-    /// Full tool-calling run loop — formerly used when tool_registry is set.
-    ///
-    /// Deprecated: The state machine `run()` method now handles tools via
-    /// `perform_entity_modification_with_tools()` in the Performing state, following the architecture.
-    #[deprecated(note = "run() now handles tools via the state machine")]
-    #[allow(dead_code)]
-    async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
-        self.conversation_history.clear();
-
-        if !self.config.system_prompt.is_empty() {
-            let sp = self.config.system_prompt.clone();
-            self.conversation_history.push(ChatMessage::system(&sp));
-        }
-
-        for msg in context.conversation_history {
-            self.conversation_history.push(msg);
-        }
-
-        let tool_defs = self
-            .tool_registry
-            .as_ref()
-            .map(|r| r.get_definitions())
-            .unwrap_or_default();
-
-        self.iterations = 0;
-
-        loop {
-            if self.iterations >= self.config.max_iterations {
-                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
-            }
-
-            let model_name = self.config.model_name.clone();
-            let messages = self.conversation_history.clone();
-            let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
-
-            let provider = match self.llm_provider.clone() {
-                Some(p) => p,
-                None => {
-                    return Err(self.enrich_error(bare_state_error("No provider configured")));
-                }
-            };
-
-            let response = provider.chat(request).await.map_err(|e| {
-                self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
-            })?;
-
-            if response.choices.is_empty() {
-                return Err(self.enrich_error(bare_state_error("Empty response from model")));
-            }
-
-            let choice = response.choices.into_iter().next().unwrap();
-            let finish_reason = choice.finish_reason.clone();
-            let tool_calls = choice.message.tool_calls.clone();
-            self.conversation_history.push(choice.message);
-
-            match finish_reason {
-                Some(FinishReason::Stop) | None => {
-                    self.transition_to(AgentState::Completed);
-                    let task_description = context.user_prompt.clone();
-                    let conversation = self.conversation_history.clone();
-                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
-                    let result_summary = extract_result_summary(&conversation);
-                    let model_used = self.config.model_name.clone();
-                    let entity = ContextEntity::new(
-                        task_description,
-                        conversation.clone(),
-                        tool_calls_made.clone(),
-                        result_summary.clone(),
-                        model_used,
-                    );
-                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
-                        tracing::warn!("Failed to store context entity: {}", e);
-                    }
-                    return Ok(AgentRunResult {
-                        final_state: AgentState::Completed,
-                        iterations: self.iterations,
-                        task_completed: true,
-                        result_summary,
-                        tool_calls_made,
-                        conversation_snapshot: conversation,
-                    });
-                }
-                Some(FinishReason::ToolCalls) => {
-                    if let Some(calls) = tool_calls {
-                        for tool_call in &calls {
-                            let name = tool_call.function.name.clone();
-                            let args = tool_call.function.arguments.clone();
-                            let call_id = tool_call.id.clone();
-
-                            let response_content = {
-                                let registry = self.tool_registry.as_ref();
-                                match registry {
-                                    None => {
-                                        return Err(
-                                            self.enrich_error(bare_state_error("No tool registry"))
-                                        );
-                                    }
-                                    Some(r) => {
-                                        let result = r.execute(&name, args).await;
-                                        match result {
-                                            Ok(v) => v.to_string(),
-                                            Err(e) => format!("Error: {}", e),
-                                        }
-                                    }
-                                }
-                            };
-
-                            self.conversation_history
-                                .push(ChatMessage::tool_response(call_id, response_content));
-                        }
-                    }
-                }
-                Some(_) => {
-                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
-                }
-            }
-
-            self.iterations += 1;
-            if let Some(ref counter) = self.progress_counter {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// Tool-calling perform helper: inner loop for the state-machine
@@ -1345,8 +1214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_perform_entity_modification_without_tools_mvp_fallback() {
+    async fn test_perform_entity_modification_without_tools_fallback() {
         let config = AgentConfig {
             max_iterations: 10,
             ..Default::default()
@@ -1362,7 +1230,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.perform_entity_modification_mvp(&context).await;
+        let result = agent.perform_entity_modification(&context).await;
         assert!(result.is_ok());
         assert_eq!(agent.performed_actions, 1);
 
@@ -1374,7 +1242,7 @@ mod tests {
         assert_eq!(
             entities.len(),
             1,
-            "MVP should create a GitRepository entity"
+            "Fallback should create a GitRepository entity"
         );
     }
 

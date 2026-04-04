@@ -185,15 +185,19 @@ mod tests {
         assert!(matches!(result, Err(ImageBuilderError::InvalidConfig(_))));
     }
 
+    // These tests only assert that unimplemented stubs panic, which isn't useful coverage.
+    // They are ignored until `build_sandbox_container` and `promote_to_release` are
+    // implemented (see the `unimplemented!` messages in each function for the outstanding
+    // problem-definition work required before these can be written properly).
     #[test]
-    #[should_panic(expected = "Sandbox container building requires further problem definition")]
+    #[ignore = "build_sandbox_container is unimplemented; ignored until the sandbox execution environment is defined"]
     fn test_build_sandbox_container_unimplemented() {
         let source = PathBuf::from(".");
         let _ = build_sandbox_container(&source);
     }
 
     #[test]
-    #[should_panic(expected = "Container promotion requires further problem definition")]
+    #[ignore = "promote_to_release is unimplemented; ignored until the container promotion workflow is defined"]
     fn test_promote_to_release_unimplemented() {
         let dev_image = PathBuf::from("./dev-image");
         let _ = promote_to_release(&dev_image);
