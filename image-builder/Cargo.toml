@@ -12,5 +12,8 @@ repository.workspace = true
 [dependencies]
 thiserror = "1.0"
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 tempfile = "3"

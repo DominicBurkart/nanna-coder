@@ -26,5 +26,8 @@ tracing = "0.1"
 # Additional dependencies for validation framework
 rand = "0.8"
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 tokio-test = "0.4"
