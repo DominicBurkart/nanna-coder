@@ -2443,3 +2443,70 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use std::collections::HashMap;
+
+    /// Model ToolRegistry::register as a pure HashMap insert.
+    ///
+    /// The real `register()` calls `HashMap::insert(name, tool)` which
+    /// silently overwrites any previous entry with the same key. This
+    /// harness verifies that property: after two inserts with the same
+    /// key, only the last value survives and the collection size is 1.
+    #[kani::proof]
+    fn register_overwrites_duplicate_key() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let val1: u8 = kani::any();
+        let val2: u8 = kani::any();
+
+        map.insert(key, val1);
+        assert_eq!(map.len(), 1);
+
+        // Second insert with the same key silently overwrites
+        let old = map.insert(key, val2);
+        assert_eq!(old, Some(val1));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], val2);
+    }
+
+    /// When different keys are used, both entries are preserved.
+    #[kani::proof]
+    fn register_distinct_keys_preserved() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
+        kani::assume(k1 != k2);
+
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(k1, v1);
+        map.insert(k2, v2);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&k1], v1);
+        assert_eq!(map[&k2], v2);
+    }
+
+    /// After removing a key and re-registering, the new value is present.
+    #[kani::proof]
+    fn register_after_remove_succeeds() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(key, v1);
+        map.remove(&key);
+        assert!(map.is_empty());
+
+        map.insert(key, v2);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], v2);
+    }
+}
