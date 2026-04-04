@@ -2442,4 +2442,163 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // ---------------------------------------------------------------------------
+    // ToolRegistry: get with known and unknown names
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_registry_get_known_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let tool = registry.get_tool("echo");
+        assert!(tool.is_some(), "Expected 'echo' tool to be present");
+        assert_eq!(tool.unwrap().name(), "echo");
+    }
+
+    #[test]
+    fn test_tool_registry_get_nonexistent_tool_returns_none() {
+        let registry = ToolRegistry::new();
+
+        let result = registry.get_tool("does_not_exist");
+        assert!(result.is_none(), "Expected None for an unregistered tool name");
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_nonexistent_returns_not_found_error() {
+        let registry = ToolRegistry::new();
+
+        let result = registry.execute("does_not_exist", json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::NotFound { name }) => assert_eq!(name, "does_not_exist"),
+            _ => panic!("Expected ToolError::NotFound"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tool JSON schema: required fields are declared
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_echo_tool_schema_has_required_fields() {
+        let tool = EchoTool::new();
+        let def = tool.definition();
+        let required = def
+            .function
+            .parameters
+            .required
+            .as_ref()
+            .expect("echo schema must declare required fields");
+        assert!(
+            required.contains(&"message".to_string()),
+            "'message' must be a required field in the echo schema"
+        );
+    }
+
+    #[test]
+    fn test_calculator_tool_schema_has_required_fields() {
+        let tool = CalculatorTool::new();
+        let def = tool.definition();
+        let required = def
+            .function
+            .parameters
+            .required
+            .as_ref()
+            .expect("calculator schema must declare required fields");
+        for field in &["operation", "a", "b"] {
+            assert!(
+                required.contains(&field.to_string()),
+                "'{}' must be a required field in the calculator schema",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculator_tool_schema_properties_present() {
+        let tool = CalculatorTool::new();
+        let def = tool.definition();
+        let props = def
+            .function
+            .parameters
+            .properties
+            .as_ref()
+            .expect("calculator schema must have properties");
+        assert!(props.contains_key("operation"));
+        assert!(props.contains_key("a"));
+        assert!(props.contains_key("b"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // EchoTool: input is returned verbatim
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_echo_tool_returns_input_verbatim() {
+        let tool = EchoTool::new();
+        let input = "the quick brown fox";
+        let result = tool
+            .execute(json!({ "message": input }))
+            .await
+            .expect("echo should not fail");
+        assert_eq!(
+            result["echoed"].as_str().unwrap(),
+            input,
+            "echoed field must equal the original input"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_echo_tool_missing_message_returns_error() {
+        let tool = EchoTool::new();
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err(), "echo with no 'message' key should fail");
+    }
+
+    // ---------------------------------------------------------------------------
+    // CalculatorTool: basic arithmetic
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_calculator_tool_subtract() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "subtract", "a": 10.0, "b": 3.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_multiply() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "multiply", "a": 4.0, "b": 5.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_divide() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "divide", "a": 9.0, "b": 3.0 }))
+            .await
+            .unwrap();
+        // Allow floating-point comparison with a small tolerance
+        let val = result["result"].as_f64().unwrap();
+        assert!((val - 3.0).abs() < 1e-10, "9 / 3 should equal 3.0");
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_unknown_operation_returns_error() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "modulo", "a": 10.0, "b": 3.0 }))
+            .await;
+        assert!(result.is_err(), "unknown operation should return an error");
+    }
 }

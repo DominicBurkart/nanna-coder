@@ -1245,4 +1245,106 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    // ---------------------------------------------------------------------------
+    // AlertSeverity: correct ordering (Info < Warning < Error < Critical)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+        // Transitivity
+        assert!(AlertSeverity::Info < AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn test_alert_severity_equality() {
+        assert_eq!(AlertSeverity::Warning, AlertSeverity::Warning);
+        assert_ne!(AlertSeverity::Info, AlertSeverity::Critical);
+    }
+
+    // ---------------------------------------------------------------------------
+    // HealthStatus: helper methods
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        // Unknown does not require attention per the implementation
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    // ---------------------------------------------------------------------------
+    // DefaultMetricsCollector: records metrics correctly
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_collector_records_latencies() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        collector
+            .record_request_latency("api", Duration::from_millis(50))
+            .await;
+        collector
+            .record_request_latency("api", Duration::from_millis(150))
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        let latency = metrics
+            .request_latencies
+            .get("api")
+            .expect("'api' service latency should be present");
+
+        assert_eq!(latency.request_count, 2);
+        assert_eq!(latency.min_latency_ms, 50.0);
+        assert_eq!(latency.max_latency_ms, 150.0);
+        assert_eq!(latency.avg_latency_ms, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_collector_cache_hit_rate() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        collector.record_cache_hit("k1").await;
+        collector.record_cache_hit("k2").await;
+        collector.record_cache_hit("k3").await;
+        collector.record_cache_miss("k4").await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        // 3 hits out of 4 total = 0.75
+        assert!((metrics.cache_metrics.hit_rate - 0.75).abs() < 1e-10);
+        assert_eq!(metrics.cache_metrics.hits, 3);
+        assert_eq!(metrics.cache_metrics.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_reset_clears_data() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        collector
+            .record_request_latency("svc", Duration::from_millis(200))
+            .await;
+        collector.record_cache_hit("key").await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
 }
