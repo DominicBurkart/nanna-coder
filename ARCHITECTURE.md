@@ -10,29 +10,33 @@ config:
   theme: redux-dark
   layout: elk
 ---
-flowchart TD
-    %% Provider side
-    subgraph ProviderHosted["Provider-Hosted"]
-        subgraph ProviderAgent["Primary Agent"]
-            OrchestratorHarness["Orchestrator Harness"]
-            OrchestratorModel["Provider's Frontier Model"]
-            OrchestratorSecondaryModel["Provider's Specialized Secondary Models"]
-            OrchestratorHarness --> OrchestratorModel
-            OrchestratorHarness --> OrchestratorSecondaryModel
-            ProviderDevEnv["Agent Dev Env"]
+flowchart LR
+    subgraph leftCol[" "]
+        %% Provider side
+        subgraph ProviderHosted["Provider-Hosted"]
+            subgraph ProviderAgent["Primary Agent"]
+                OrchestratorHarness["Orchestrator Harness"]
+                OrchestratorModel["Provider's Frontier Model"]
+                OrchestratorSecondaryModel["Provider's Specialized Secondary Models"]
+                OrchestratorHarness --> OrchestratorModel
+                OrchestratorHarness --> OrchestratorSecondaryModel
+                ProviderDevEnv["Agent Dev Env"]
+            end
+            OrchestratorHarness --> ProviderDevEnv
         end
-        OrchestratorHarness --> ProviderDevEnv
     end
 
-    %% Nanna side (Self-hosted or in Provider)
-    subgraph Nanna["Nanna"]
-        subgraph NannaDev["Containers (Self-hosted or in Provider)"]
-            NannaHarness["Nanna Harness"]
-            NannaDevEnv["Agent Dev Container(s)"]
-            NannaHarness --> NannaDevEnv
-        end
-        subgraph GatewayHosted["Local or Secondary Provider"]
-            NannaModel["Nanna Model"]
+    subgraph rightCol[" "]
+        %% Nanna side (Self-hosted or in Provider)
+        subgraph Nanna["Nanna"]
+            subgraph NannaDev["Containers (Self-hosted or in Provider)"]
+                NannaHarness["Nanna Harness"]
+                NannaDevEnv["Agent Dev Container(s)"]
+                NannaHarness --> NannaDevEnv
+            end
+            subgraph GatewayHosted["Local or Secondary Provider"]
+                NannaModel["Nanna Model"]
+            end
         end
     end
 
@@ -48,11 +52,13 @@ flowchart TD
     classDef subagent stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef nanna stroke:#FFB703,fill:#FFE8B6,color:#8B4513
     classDef model stroke:#B5179E,fill:#FFD6F0,color:#7209B7
+    classDef invisible fill:none,stroke:none,color:none
 
     class ProviderHosted,NannaDev,GatewayHosted area
     class ProviderAgent orchestrator
     class Nanna nanna
     class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
+    class leftCol,rightCol invisible
 ```
 
 # Harness Control Flow
