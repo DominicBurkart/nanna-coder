@@ -1,7 +1,3 @@
-# Nanna: A Delegation Tool for Coding Agents
-
-Nanna is a tool for advanced agents to delegate simple coding tasks to smaller models. It is designed to be integrated into orchestrator agent configurations, allowing frontier models to offload well-scoped work to cheaper, faster, local or secondary-provider models.
-
 ## System Architecture
 
 ```mermaid
