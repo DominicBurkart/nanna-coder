@@ -36,11 +36,11 @@ flowchart TD
         end
     end
 
-    %% Optional external model provider for Nanna
-    NannaHarness --> NannaModel
-
     %% Connections between orchestration layers
     OrchestratorHarness --> NannaHarness
+    
+    %% Optional external model provider for Nanna
+    NannaHarness --> NannaModel
 
     %% Classes
     classDef area fill:#202020,stroke:#555,stroke-width:1px,color:#DDD
