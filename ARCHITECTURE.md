@@ -51,21 +51,50 @@ flowchart TD
     class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
 ```
 
-# Delegation Sequence
+# API
+
+The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface: `assign_task` submits work and returns a `task_id`; `poll_task` returns the task's current status; `get_result` retrieves the final output once a task completes; `list_tasks` enumerates known tasks and their states; `cancel_task` requests termination of an in-flight task; and `onboard_repo` registers a repository so subsequent tasks can operate against it.
 
 ```mermaid
 ---
 config:
   theme: redux-dark
-  layout: dagre
+  layout: elk
 ---
+flowchart LR
+    subgraph CLI["CLI (harness)"]
+        chat
+        agent
+        mcpserve["mcp-serve"]
+        models
+        tools
+        health
+    end
+    subgraph MCP["MCP (stdio, via mcp-serve)"]
+        assign_task
+        poll_task
+        get_result
+        list_tasks
+        cancel_task
+        onboard_repo
+    end
+    mcpserve --> MCP
+    classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
+    classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
+    class chat,agent,mcpserve,models,tools,health cli
+    class assign_task,poll_task,get_result,list_tasks,cancel_task,onboard_repo mcp
+```
+
+# Delegation Sequence
+
+```mermaid
 sequenceDiagram
     participant O as Orchestrator
     participant N as Nanna
     O->>N: assign_task(description, repo_path)
     N-->>O: task_id
     Note over O: continues other tasks
-    Note over N: agent loop
+    Note over N: agent loop in worktree
     O->>N: poll_task(task_id)
     N-->>O: running
     O->>N: poll_task(task_id)
