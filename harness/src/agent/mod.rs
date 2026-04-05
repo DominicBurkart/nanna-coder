@@ -2175,7 +2175,9 @@ mod kani_proofs {
 
         // Any state can transition to Error
         // For non-error targets, only LEGAL_EDGES are allowed
-        let expected = LEGAL_EDGES.iter().any(|&(f, t)| f == from_idx && t == to_idx);
+        let expected = LEGAL_EDGES
+            .iter()
+            .any(|&(f, t)| f == from_idx && t == to_idx);
         assert_eq!(result, expected, "Mismatch for ({from_idx} -> {to_idx})");
     }
 
