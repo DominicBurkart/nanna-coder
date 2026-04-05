@@ -1,3 +1,66 @@
+# Primary Use Case
+
+Nanna is a delegation tool for advanced coding agents. It lets a
+provider-hosted orchestrator (e.g. Claude Code, Cursor, Codex) hand off
+well-scoped, simple tasks to smaller, cheaper models running locally or on a
+secondary provider. Agents can invoke nanna through its **CLI** or **MCP**
+interface; both accept a task description and return a result once the
+sub-agent finishes. The diagram below shows how the provider's frontier model
+delegates through its harness into nanna's own harness and model, keeping the
+orchestrator free for higher-level planning.
+
+```mermaid
+---
+config:
+  theme: redux-dark
+  layout: dagre
+---
+flowchart LR
+    %% Provider side
+    subgraph ProviderHosted["Provider-Hosted"]
+        subgraph ProviderAgent["Primary Agent"]
+            OrchestratorHarness["Orchestrator Harness"]
+            OrchestratorModel["Provider's Frontier Model"]
+            OrchestratorSecondaryModel["Provider's Specialized Secondary Models"]
+            OrchestratorHarness --> OrchestratorModel
+            OrchestratorHarness --> OrchestratorSecondaryModel
+            ProviderDevEnv["Agent Dev Env"]
+        end
+        OrchestratorHarness --> ProviderDevEnv
+    end
+
+    %% Nanna side (Self-hosted or in Provider)
+    subgraph Nanna["Nanna"]
+        subgraph NannaDev["Containers (Self-hosted or in Provider)"]
+            NannaHarness["Nanna Harness"]
+            NannaDevEnv["Agent Dev Container(s)"]
+        NannaHarness --> NannaDevEnv
+        end
+        subgraph GatewayHosted["Local or Secondary Provider"]
+            NannaModel["Nanna Model"]
+        end
+    end
+
+    %% Optional external model provider for Nanna
+    NannaHarness --> NannaModel
+
+    %% Connections between orchestration layers
+    OrchestratorHarness --> NannaHarness
+
+    %% Classes
+    classDef area fill:#202020,stroke:#555,stroke-width:1px,color:#DDD
+    classDef orchestrator stroke:#9D4EDD,fill:#E0AAFF,color:#5A189A
+    classDef subagent stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
+    classDef nanna stroke:#FFB703,fill:#FFE8B6,color:#8B4513
+    classDef model stroke:#B5179E,fill:#FFD6F0,color:#7209B7
+
+    class ProviderHosted,NannaDev,GatewayHosted area
+    class ProviderAgent orchestrator
+    class Sub1,Sub2,Sub3,NannaSub1,NannaSub2 subagent
+    class Nanna nanna
+    class NannaModel,OrchestratorModel,GatewayModel model
+```
+
 # Harness Control Flow
 
 ```mermaid
@@ -30,19 +93,4 @@ flowchart TD
      n9:::Aqua
     classDef Rose stroke-width:1px, stroke-dasharray:none, stroke:#FF5978, fill:#FFDFE5, color:#8E2236
     classDef Aqua stroke-width:1px, stroke-dasharray:none, stroke:#46EDC8, fill:#DEFFF8, color:#378E7A
-```
-
-# Container Topology
-
-```mermaid
----
-config:
-  theme: redux-dark
-  layout: elk
----
-flowchart TD
-    B(["Harness Container"]) -- Modifies --> C(["Dev Container"])
-    B -- Queries --> n1(["Model"])
-    C -- Can compile binary for --> n2(["Sandbox"])
-    n2 -- Can be promoted to --> n3(["Release"])
 ```
