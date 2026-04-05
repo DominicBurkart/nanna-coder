@@ -1,4 +1,4 @@
-## System Architecture
+# Primary Use-Case (Background Agents Delegate Tasks to Nanna)
 
 ```mermaid
 ---
