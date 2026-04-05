@@ -161,7 +161,11 @@ impl TaskManager {
         // the image for a given repo at a time.
         let path_lock = {
             let mut locks = build_locks.lock().await;
-            Arc::clone(locks.entry(canonical.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+            Arc::clone(
+                locks
+                    .entry(canonical.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
         };
         let _build_guard = path_lock.lock().await;
 
@@ -247,8 +251,8 @@ impl TaskManager {
             // Require both flake.nix AND .devcontainer/ to opt in to the
             // container path, so that repos that merely happen to have a
             // flake.nix are not affected.
-            let use_container = repo_path.join("flake.nix").exists()
-                && repo_path.join(".devcontainer").exists();
+            let use_container =
+                repo_path.join("flake.nix").exists() && repo_path.join(".devcontainer").exists();
 
             let workspace_result = if use_container {
                 let image_result =
