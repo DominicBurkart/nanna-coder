@@ -44,3 +44,34 @@ impl Default for EnvEntity {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_env_entity_new() {
+        let entity = EnvEntity::new();
+        assert_eq!(entity.metadata().entity_type, crate::entities::EntityType::Env);
+    }
+
+    #[test]
+    fn test_env_entity_default() {
+        let entity = EnvEntity::default();
+        assert_eq!(entity.metadata().entity_type, crate::entities::EntityType::Env);
+    }
+
+    #[test]
+    fn test_env_entity_to_json() {
+        let entity = EnvEntity::new();
+        let json = entity.to_json().unwrap();
+        assert!(json.contains("\"Env\""));
+    }
+
+    #[test]
+    fn test_env_entity_metadata_mut() {
+        let mut entity = EnvEntity::new();
+        entity.metadata_mut().tags.push("test".to_string());
+        assert_eq!(entity.metadata().tags, vec!["test"]);
+    }
+}

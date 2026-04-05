@@ -735,4 +735,29 @@ mod tests {
             "Duplicate transitions in state diagram"
         );
     }
+
+    #[test]
+    fn test_failure_with_warnings_renders_warnings_section() {
+        let mut result = make_result(
+            "failing_with_warnings",
+            false,
+            Duration::from_millis(500),
+            0.5,
+            0.5,
+            0.0,
+            vec![AgentState::Error("failed".to_string())],
+            vec!["something went wrong".to_string()],
+        );
+        result.warnings = vec![
+            "low coherence score".to_string(),
+            "possible hallucination detected".to_string(),
+        ];
+
+        let batch = make_batch(vec![result]);
+        let report = EvalReport::new("Test Report", batch);
+        let md = report.render_markdown();
+        assert!(md.contains("**Warnings:**"));
+        assert!(md.contains("low coherence score"));
+        assert!(md.contains("possible hallucination detected"));
+    }
 }

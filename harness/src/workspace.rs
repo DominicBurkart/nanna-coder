@@ -288,6 +288,17 @@ mod tests {
     }
 
     #[test]
+    fn test_double_cleanup_is_idempotent() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-double-cleanup"), "HEAD").unwrap();
+        ws.cleanup().unwrap();
+        // Second cleanup should not error (already cleaned up)
+        assert!(ws.cleanup().is_ok());
+    }
+
+    #[test]
     fn test_multiple_concurrent_worktrees_dont_interfere() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());

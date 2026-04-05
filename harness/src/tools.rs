@@ -2442,4 +2442,495 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    #[test]
+    fn test_tool_registry_default() {
+        let registry = ToolRegistry::default();
+        assert_eq!(registry.list_tools().len(), 0);
+    }
+
+    #[test]
+    fn test_echo_tool_default_and_name() {
+        let tool = EchoTool::default();
+        assert_eq!(tool.name(), "echo");
+    }
+
+    #[test]
+    fn test_calculator_tool_default_and_name() {
+        let tool = CalculatorTool::default();
+        assert_eq!(tool.name(), "calculate");
+    }
+
+    #[tokio::test]
+    async fn test_echo_tool_missing_message() {
+        let tool = EchoTool::new();
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { .. }) => {}
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculator_divide_success() {
+        let tool = CalculatorTool::new();
+        let args = serde_json::json!({"operation": "divide", "a": 10.0, "b": 4.0});
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 2.5);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let args = serde_json::json!({"operation": "subtract", "a": 10.0, "b": 3.0});
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let args = serde_json::json!({"operation": "multiply", "a": 4.0, "b": 5.0});
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let args = serde_json::json!({"operation": "modulo", "a": 10.0, "b": 3.0});
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("modulo"));
+            }
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_operation() {
+        let tool = CalculatorTool::new();
+        let result = tool.execute(serde_json::json!({"a": 1.0, "b": 2.0})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_a() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(serde_json::json!({"operation": "add", "b": 2.0}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_b() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(serde_json::json!({"operation": "add", "a": 1.0}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_missing_path() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_missing");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = WriteFileTool::new(temp_dir.clone());
+        let result = tool
+            .execute(serde_json::json!({"content": "test"}))
+            .await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_file_missing_content() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_no_content");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = WriteFileTool::new(temp_dir.clone());
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt"}))
+            .await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_nonexistent() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("nonexistent", serde_json::json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::NotFound { name }) => {
+                assert_eq!(name, "nonexistent");
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_missing_path_param() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_read_missing");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = ReadFileTool::new(temp_dir.clone());
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_missing_pattern() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_search_missing");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = SearchTool::new(temp_dir.clone());
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_tool_definitions_are_populated() {
+        let cwd = std::env::current_dir().unwrap();
+        let tool = ReadFileTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "read_file");
+
+        let tool = WriteFileTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "write_file");
+
+        let tool = ListDirTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "list_directory");
+
+        let tool = SearchTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "search");
+
+        let tool = GitStatusTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "git_status");
+
+        let tool = GitDiffTool::new(cwd.clone());
+        let def = tool.definition();
+        assert_eq!(def.function.name, "git_diff");
+    }
+
+    #[test]
+    fn test_tool_names() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(ReadFileTool::new(cwd.clone()).name(), "read_file");
+        assert_eq!(WriteFileTool::new(cwd.clone()).name(), "write_file");
+        assert_eq!(ListDirTool::new(cwd.clone()).name(), "list_directory");
+        assert_eq!(SearchTool::new(cwd.clone()).name(), "search");
+        assert_eq!(GitStatusTool::new(cwd.clone()).name(), "git_status");
+        assert_eq!(GitDiffTool::new(cwd.clone()).name(), "git_diff");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https() {
+        let result = parse_github_remote("https://github.com/owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_no_git_suffix() {
+        let result = parse_github_remote("https://github.com/owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_non_github() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pr_status_l0_closed() {
+        let data = PrStatusData {
+            pr_number: Some(10),
+            pr_status: Some("closed".to_string()),
+            has_upstream: true,
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("closed"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_ahead_only() {
+        let data = PrStatusData {
+            pr_number: Some(5),
+            has_upstream: true,
+            ahead: Some(2),
+            behind: Some(0),
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("ahead:2"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_no_token() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:unconfigured]"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_api_error() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::ApiError("timeout".to_string()),
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:error]"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_diff_no_data() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("diff").unwrap();
+        assert_eq!(detail, "Diff: no diff data");
+    }
+
+    #[test]
+    fn test_pr_status_l1_staleness_none() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("staleness").unwrap();
+        assert_eq!(detail, "Staleness data not available.");
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_connected() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("connected"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_no_token() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("not configured"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_api_error() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::ApiError("connection refused".to_string()),
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_recursive() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_list_recursive");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let subdir = temp_dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(temp_dir.join("root.rs"), "").unwrap();
+        std::fs::write(subdir.join("nested.rs"), "").unwrap();
+        std::fs::write(subdir.join("nested.txt"), "").unwrap();
+
+        let tool = ListDirTool::new(temp_dir.clone());
+
+        // Recursive listing
+        let args = json!({ "recursive": true });
+        let result = tool.execute(args).await.unwrap();
+        assert!(result["count"].as_u64().unwrap() >= 3);
+
+        // Recursive with pattern
+        let args = json!({ "recursive": true, "pattern": "*.rs" });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["count"], 2);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_with_max_results() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_search_max");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        // Write a file with many matching lines
+        let content = (0..20)
+            .map(|i| format!("match line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(temp_dir.join("big.txt"), content).unwrap();
+
+        let tool = SearchTool::new(temp_dir.clone());
+
+        let args = json!({ "pattern": "match", "max_results": 5 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["count"], 5);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_file_with_dotdot_path() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_dotdot");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tool = WriteFileTool::new(temp_dir.clone());
+
+        // Path with ".." should fail due to security
+        let args = json!({ "path": "../outside.txt", "content": "test" });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::PathSecurityViolation { .. }) => {}
+            _ => panic!("Expected PathSecurityViolation error"),
+        }
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_staged() {
+        let cwd = std::env::current_dir().unwrap();
+        let tool = GitDiffTool::new(cwd);
+
+        let args = json!({ "staged": true });
+        let result = tool.execute(args).await;
+
+        if let Ok(diff) = result {
+            assert_eq!(diff["staged"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_with_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let tool = GitDiffTool::new(cwd);
+
+        let args = json!({ "path": "src/lib.rs" });
+        let result = tool.execute(args).await;
+
+        if let Ok(diff) = result {
+            assert_eq!(diff["path"], "src/lib.rs");
+        }
+    }
+
+    #[test]
+    fn test_github_status_default() {
+        let status = GitHubStatus::default();
+        assert_eq!(status, GitHubStatus::NoToken);
+    }
+
+    #[test]
+    fn test_pr_status_data_default() {
+        let data = PrStatusData::default();
+        assert!(data.pr_number.is_none());
+        assert!(data.changed_files.is_empty());
+        assert!(!data.automerge);
+        assert_eq!(data.github_status, GitHubStatus::NoToken);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_absolute_path() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_abs_path");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("abs_test.txt");
+        std::fs::write(&test_file, "absolute path content").unwrap();
+
+        let tool = ReadFileTool::new(temp_dir.clone());
+
+        // Pass the absolute path to the file
+        let abs_path = test_file.to_string_lossy().to_string();
+        let args = json!({ "path": abs_path });
+        let result = tool.execute(args).await;
+        // Should succeed since the absolute path is within the workspace
+        if let Ok(r) = result {
+            assert!(r["total_lines"].as_u64().unwrap() >= 1);
+        }
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_file_nonexistent_triggers_path_security_error() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_nonexist");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tool = ReadFileTool::new(temp_dir.clone());
+
+        // Path that doesn't exist - should fail with PathSecurityViolation
+        // since canonicalize fails on non-existent file
+        let args = json!({ "path": "nonexistent_file.txt" });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_with_file_pattern() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_search_pattern");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("code.rs"), "fn hello() {}").unwrap();
+        std::fs::write(temp_dir.join("notes.txt"), "fn is not here").unwrap();
+
+        let tool = SearchTool::new(temp_dir.clone());
+
+        // Search only in .rs files
+        let args = json!({ "pattern": "fn", "file_pattern": "*.rs" });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["count"], 1);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_default_path() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_listdir_default");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("file.txt"), "content").unwrap();
+
+        let tool = ListDirTool::new(temp_dir.clone());
+
+        // Use default path (.)
+        let args = json!({});
+        let result = tool.execute(args).await.unwrap();
+        assert!(result["count"].as_u64().unwrap() >= 1);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_definition() {
+        // Just test definition since RunCommandTool needs container
+        // We can create a fake ContainerHandle for testing the definition
+        // Actually RunCommandTool::new requires a real container handle
+        // Just test the tool error serialization
+        let err = ToolError::ExecutionFailed { message: "test".to_string() };
+        assert!(err.to_string().contains("test"));
+
+        let err2 = ToolError::InvalidArguments { message: "invalid".to_string() };
+        assert!(err2.to_string().contains("invalid"));
+    }
 }

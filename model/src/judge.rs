@@ -995,4 +995,357 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
     }
+
+    #[test]
+    fn test_retry_delay_no_jitter() {
+        let config = JudgeConfig {
+            jitter_factor: 0.0,
+            base_delay_ms: 100,
+            max_delay_ms: 5000,
+            ..JudgeConfig::default()
+        };
+        let delay = config.calculate_retry_delay(1);
+        // With no jitter, should be exactly 200ms (100 * 2^1)
+        assert_eq!(delay, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_validation_result_warning_display() {
+        let metrics = ValidationMetrics::with_duration(Duration::from_millis(200));
+        let warning = ValidationResult::Warning {
+            message: "Slow response".to_string(),
+            suggestions: vec!["Optimize query".to_string()],
+            metrics,
+        };
+        let display = format!("{}", warning);
+        assert!(display.contains("WARNING"));
+        assert!(display.contains("Slow response"));
+        assert!(display.contains("Optimize query"));
+    }
+
+    #[test]
+    fn test_validation_result_failure_display() {
+        let failure = ValidationResult::Failure {
+            message: "Connection failed".to_string(),
+            error_details: "ECONNREFUSED".to_string(),
+            suggestions: vec!["Check service".to_string()],
+            metrics: None,
+        };
+        let display = format!("{}", failure);
+        assert!(display.contains("FAILURE"));
+        assert!(display.contains("Connection failed"));
+        assert!(display.contains("ECONNREFUSED"));
+        assert!(display.contains("Check service"));
+    }
+
+    #[test]
+    fn test_validation_result_metrics() {
+        let m = ValidationMetrics::with_duration(Duration::from_millis(100));
+        let success = ValidationResult::Success {
+            message: "OK".to_string(),
+            metrics: m.clone(),
+        };
+        assert!(success.metrics().is_some());
+
+        let warning = ValidationResult::Warning {
+            message: "Warn".to_string(),
+            suggestions: vec![],
+            metrics: m.clone(),
+        };
+        assert!(warning.metrics().is_some());
+
+        let failure_with = ValidationResult::Failure {
+            message: "Fail".to_string(),
+            error_details: "err".to_string(),
+            suggestions: vec![],
+            metrics: Some(m),
+        };
+        assert!(failure_with.metrics().is_some());
+
+        let failure_without = ValidationResult::Failure {
+            message: "Fail".to_string(),
+            error_details: "err".to_string(),
+            suggestions: vec![],
+            metrics: None,
+        };
+        assert!(failure_without.metrics().is_none());
+    }
+
+    #[test]
+    fn test_validation_result_suggestions() {
+        let metrics = ValidationMetrics::default();
+
+        let success = ValidationResult::Success {
+            message: "OK".to_string(),
+            metrics: metrics.clone(),
+        };
+        assert!(success.suggestions().is_empty());
+
+        let warning = ValidationResult::Warning {
+            message: "Warn".to_string(),
+            suggestions: vec!["Try this".to_string()],
+            metrics: metrics.clone(),
+        };
+        let sugg = warning.suggestions();
+        assert_eq!(sugg.len(), 1);
+        assert_eq!(sugg[0], "Try this");
+
+        let failure = ValidationResult::Failure {
+            message: "Fail".to_string(),
+            error_details: "err".to_string(),
+            suggestions: vec!["Fix this".to_string(), "Or that".to_string()],
+            metrics: None,
+        };
+        let sugg = failure.suggestions();
+        assert_eq!(sugg.len(), 2);
+    }
+
+    #[test]
+    fn test_relevance_score_too_short() {
+        let criteria = ValidationCriteria {
+            min_response_length: 100,
+            ..ValidationCriteria::default()
+        };
+        // Very short response should get a penalty for being too short
+        let score = calculate_relevance_score("short", "any prompt", &criteria);
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_relevance_score_too_long() {
+        let criteria = ValidationCriteria {
+            max_response_length: 10,
+            ..ValidationCriteria::default()
+        };
+        // Very long response should get a smaller penalty
+        let long_response = "a".repeat(100);
+        let score = calculate_relevance_score(&long_response, "prompt", &criteria);
+        assert!(score >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_validation_with_tools_and_consistency() {
+        use crate::provider::ModelProvider;
+
+        struct MockJudgeProvider2 {
+            config: JudgeConfig,
+        }
+
+        #[async_trait]
+        impl ModelProvider for MockJudgeProvider2 {
+            async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+                Ok(ChatResponse {
+                    choices: vec![crate::types::Choice {
+                        message: ChatMessage::assistant("Mock response"),
+                        finish_reason: Some(crate::types::FinishReason::Stop),
+                    }],
+                    usage: None,
+                })
+            }
+
+            async fn list_models(&self) -> ModelResult<Vec<crate::types::ModelInfo>> {
+                Ok(vec![])
+            }
+
+            async fn health_check(&self) -> ModelResult<()> {
+                Ok(())
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "mock2"
+            }
+        }
+
+        #[async_trait]
+        impl ModelJudge for MockJudgeProvider2 {
+            fn judge_config(&self) -> &JudgeConfig {
+                &self.config
+            }
+
+            async fn validate_api_responsiveness(
+                &self,
+                _latency_threshold: Duration,
+            ) -> ModelResult<ValidationResult> {
+                Ok(ValidationResult::Success {
+                    message: "OK".to_string(),
+                    metrics: ValidationMetrics::with_duration(Duration::from_millis(10)),
+                })
+            }
+
+            async fn validate_response_quality(
+                &self,
+                _prompt: &str,
+                _criteria: &ValidationCriteria,
+            ) -> ModelResult<ValidationResult> {
+                Ok(ValidationResult::Success {
+                    message: "OK".to_string(),
+                    metrics: ValidationMetrics::with_duration(Duration::from_millis(10)),
+                })
+            }
+
+            async fn validate_tool_calling(
+                &self,
+                _tools: &[crate::types::ToolDefinition],
+            ) -> ModelResult<ValidationResult> {
+                Ok(ValidationResult::Success {
+                    message: "Tools OK".to_string(),
+                    metrics: ValidationMetrics::with_duration(Duration::from_millis(10)),
+                })
+            }
+
+            async fn validate_consistency(
+                &self,
+                _prompts: &[&str],
+                _iterations: usize,
+            ) -> ModelResult<ValidationResult> {
+                Ok(ValidationResult::Success {
+                    message: "Consistent".to_string(),
+                    metrics: ValidationMetrics::with_duration(Duration::from_millis(10)),
+                })
+            }
+        }
+
+        use crate::types::{FunctionDefinition, JsonSchema, SchemaType, ToolDefinition};
+        let tool = ToolDefinition {
+            function: FunctionDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        };
+
+        let provider = MockJudgeProvider2 {
+            config: JudgeConfig::default(),
+        };
+        let criteria = ValidationCriteria::default();
+        let results = provider
+            .validate_comprehensive(
+                Duration::from_secs(5),
+                &criteria,
+                &[tool],
+                &["What is 2+2?"],
+                2,
+            )
+            .await
+            .unwrap();
+
+        // Should have 4 results: API, quality, tool calling, consistency
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_validation_error_paths() {
+        use crate::provider::{ModelError, ModelProvider};
+
+        struct ErrorProvider {
+            config: JudgeConfig,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ErrorProvider {
+            async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+                Err(ModelError::Unknown {
+                    message: "test error".to_string(),
+                })
+            }
+
+            async fn list_models(&self) -> ModelResult<Vec<crate::types::ModelInfo>> {
+                Err(ModelError::Unknown {
+                    message: "test error".to_string(),
+                })
+            }
+
+            async fn health_check(&self) -> ModelResult<()> {
+                Err(ModelError::Unknown {
+                    message: "test error".to_string(),
+                })
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "error_provider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelJudge for ErrorProvider {
+            fn judge_config(&self) -> &JudgeConfig {
+                &self.config
+            }
+
+            async fn validate_api_responsiveness(
+                &self,
+                _latency_threshold: Duration,
+            ) -> ModelResult<ValidationResult> {
+                Err(ModelError::Unknown {
+                    message: "API error".to_string(),
+                })
+            }
+
+            async fn validate_response_quality(
+                &self,
+                _prompt: &str,
+                _criteria: &ValidationCriteria,
+            ) -> ModelResult<ValidationResult> {
+                Err(ModelError::Unknown {
+                    message: "Quality error".to_string(),
+                })
+            }
+
+            async fn validate_tool_calling(
+                &self,
+                _tools: &[crate::types::ToolDefinition],
+            ) -> ModelResult<ValidationResult> {
+                Err(ModelError::Unknown {
+                    message: "Tool error".to_string(),
+                })
+            }
+
+            async fn validate_consistency(
+                &self,
+                _prompts: &[&str],
+                _iterations: usize,
+            ) -> ModelResult<ValidationResult> {
+                Err(ModelError::Unknown {
+                    message: "Consistency error".to_string(),
+                })
+            }
+        }
+
+        use crate::types::{FunctionDefinition, JsonSchema, SchemaType, ToolDefinition};
+        let tool = ToolDefinition {
+            function: FunctionDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        };
+
+        let provider = ErrorProvider {
+            config: JudgeConfig::default(),
+        };
+        let criteria = ValidationCriteria::default();
+        let results = provider
+            .validate_comprehensive(
+                Duration::from_secs(5),
+                &criteria,
+                &[tool],
+                &["What is 2+2?"],
+                2,
+            )
+            .await
+            .unwrap();
+
+        // All results should be failures
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|r| r.is_failure()));
+    }
 }

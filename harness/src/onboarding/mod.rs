@@ -158,6 +158,18 @@ edition = "2021"
     }
 
     #[tokio::test]
+    async fn test_onboarding_result_debug() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "Cargo.toml", &minimal_cargo_toml("myapp"));
+        let onboarder = DeterministicOnboarder;
+        let result = onboarder.onboard(dir.path()).await.unwrap();
+        // Test Debug impl
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("OnboardingResult"));
+        assert!(debug_str.contains("myapp"));
+    }
+
+    #[tokio::test]
     async fn ensure_dev_container_skips_onboarding_when_flake_exists() {
         let dir = TempDir::new().unwrap();
         write_file(&dir, "flake.nix", "{}");

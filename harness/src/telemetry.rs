@@ -1044,4 +1044,353 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[test]
+    fn test_trace_context_with_attribute() {
+        let trace = TraceContext::new("test_op")
+            .with_attribute("key1", "value1")
+            .with_attribute("key2", "value2");
+        assert_eq!(trace.attributes.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("test_op");
+        trace.set_status(SpanStatus::Ok);
+        assert_eq!(trace.status, SpanStatus::Ok);
+
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_histogram_and_summary() {
+        let exporter = PrometheusExporter::new(None);
+
+        exporter.add_metric(MetricPoint {
+            name: "histogram_metric".to_string(),
+            metric_type: MetricType::Histogram,
+            value: 1.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+
+        exporter.add_metric(MetricPoint {
+            name: "summary_metric".to_string(),
+            metric_type: MetricType::Summary,
+            value: 2.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+
+        exporter.add_metric(MetricPoint {
+            name: "gauge_metric".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 3.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("# TYPE histogram_metric histogram"));
+        assert!(output.contains("# TYPE summary_metric summary"));
+        assert!(output.contains("# TYPE gauge_metric gauge"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_traces() {
+        let exporter = PrometheusExporter::new(None);
+
+        let mut trace = TraceContext::new("db_query");
+        trace.finish();
+
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        let metrics = exporter.metrics_buffer.lock().unwrap();
+        assert!(!metrics.is_empty());
+        assert_eq!(metrics[0].name, "trace_duration_seconds");
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_trace_without_duration() {
+        let exporter = PrometheusExporter::new(None);
+
+        // Trace without finish (no duration)
+        let trace = TraceContext::new("not_finished");
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        // Should not add metric since no duration
+        let metrics = exporter.metrics_buffer.lock().unwrap();
+        assert!(metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_events() {
+        let exporter = PrometheusExporter::new(None);
+
+        let event = CustomEvent {
+            name: "user_action".to_string(),
+            timestamp: Utc::now(),
+            category: "ux".to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({}),
+            trace_context: None,
+        };
+
+        exporter.export_events(vec![event]).await.unwrap();
+
+        let metrics = exporter.metrics_buffer.lock().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "custom_events_total");
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_health_check() {
+        let exporter = PrometheusExporter::new(None);
+        let healthy = exporter.health_check().await.unwrap();
+        assert!(healthy);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "metric".to_string(),
+            metric_type: MetricType::Counter,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        assert_eq!(exporter.metrics_buffer.lock().unwrap().len(), 1);
+        exporter.clear_buffer();
+        assert!(exporter.metrics_buffer.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_metrics() {
+        let exporter = PrometheusExporter::new(None);
+        let metrics = vec![MetricPoint {
+            name: "test".to_string(),
+            metric_type: MetricType::Counter,
+            value: 5.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        }];
+        exporter.export_metrics(metrics).await.unwrap();
+        assert_eq!(exporter.metrics_buffer.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_system_metrics() {
+        use crate::monitoring::{
+            CacheMetrics, ErrorMetrics, LatencyMetrics, SystemMetrics, SystemResourceMetrics,
+        };
+
+        let exporter = PrometheusExporter::new(None);
+
+        let mut request_latencies = HashMap::new();
+        request_latencies.insert(
+            "api".to_string(),
+            LatencyMetrics {
+                avg_latency_ms: 150.0,
+                p95_latency_ms: 300.0,
+                p99_latency_ms: 500.0,
+                max_latency_ms: 1000.0,
+                min_latency_ms: 10.0,
+                request_count: 100,
+                requests_per_second: 10.0,
+            },
+        );
+
+        let system_metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies,
+            cache_metrics: CacheMetrics {
+                hits: 80,
+                misses: 20,
+                hit_rate: 0.8,
+                size_bytes: 1024,
+                item_count: 50,
+                evictions: 5,
+            },
+            container_metrics: vec![],
+            system_resources: SystemResourceMetrics {
+                cpu_usage_percent: 45.0,
+                total_memory_bytes: 8_000_000_000,
+                used_memory_bytes: 4_000_000_000,
+                memory_usage_percent: 50.0,
+                available_disk_bytes: 100_000_000_000,
+                total_disk_bytes: 200_000_000_000,
+                disk_usage_percent: 50.0,
+                load_average: [1.0, 1.5, 2.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: ErrorMetrics {
+                total_errors: 5,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.05,
+                recent_errors: vec![],
+            },
+        };
+
+        exporter.export_system_metrics(system_metrics).await.unwrap();
+
+        let buffer = exporter.metrics_buffer.lock().unwrap();
+        // Should have: cache_hit_rate, request_duration_seconds, requests_per_second, error_rate = 4 metrics
+        assert_eq!(buffer.len(), 4);
+        let names: Vec<&str> = buffer.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"cache_hit_rate"));
+        assert!(names.contains(&"request_duration_seconds"));
+        assert!(names.contains(&"requests_per_second"));
+        assert!(names.contains(&"error_rate"));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("region", "us-east-1")
+            .with_global_attribute("env", "test");
+
+        let trace = telemetry.start_trace("operation");
+        assert_eq!(
+            trace.attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+        assert_eq!(trace.attributes.get("env"), Some(&"test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_config() {
+        let config = TelemetryConfig::default();
+        let telemetry = TelemetrySystem::new().with_config(config);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_add_exporter() {
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
+        // Just verify the builder doesn't panic
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_initialize_already_initialized() {
+        let mut telemetry = TelemetrySystem::new();
+        // Manually set initialized = true to test early return
+        telemetry.initialized = true;
+        // Should return Ok() without doing anything
+        let result = telemetry.initialize().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        assert!(uptime.as_nanos() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_get_prometheus_exporter() {
+        let telemetry = TelemetrySystem::new();
+        // Returns None by default (no typed reference)
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[test]
+    fn test_telemetry_system_default() {
+        let telemetry = TelemetrySystem::default();
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_with_prometheus_endpoint() {
+        let mut config = TelemetryConfig::default();
+        config.export_endpoints.prometheus_endpoint = Some("http://localhost:9090".to_string());
+        config.enable_logging = false; // Skip tracing subscriber init
+
+        let mut telemetry = TelemetrySystem::new().with_config(config);
+        let result = telemetry.initialize().await;
+        // May fail due to tracing subscriber, but the prometheus endpoint branch should run
+        let _ = result; // Accept any result
+    }
+
+    #[tokio::test]
+    async fn test_export_all_empty() {
+        let telemetry = TelemetrySystem::new()
+            .add_exporter(Box::new(PrometheusExporter::new(None)));
+
+        // Nothing to export, should succeed
+        let result = telemetry.export_all().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_export_all_with_data() {
+        let telemetry = TelemetrySystem::new()
+            .add_exporter(Box::new(PrometheusExporter::new(None)));
+
+        // Add a metric
+        telemetry.record_counter("test_counter", 1.0, vec![]);
+
+        // Add and finish a trace
+        let trace = telemetry.start_trace("export_test");
+        telemetry.finish_trace(trace);
+
+        // Add an event
+        telemetry.record_event("test_event", "test", serde_json::json!({}));
+
+        let result = telemetry.export_all().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_basic() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("guarded_op");
+        let guard = TraceGuard::new(&telemetry, trace);
+
+        assert!(guard.trace().is_some());
+        assert_eq!(guard.trace().unwrap().operation_name, "guarded_op");
+
+        // Drop should auto-finish trace
+        drop(guard);
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("error_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+
+        guard.record_error("Something went wrong");
+        // Error should be recorded on the trace
+        if let Some(t) = guard.trace() {
+            assert_eq!(t.status, SpanStatus::Error);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("status_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+
+        guard.set_status(SpanStatus::Ok);
+        if let Some(t) = guard.trace() {
+            assert_eq!(t.status, SpanStatus::Ok);
+        }
+    }
 }

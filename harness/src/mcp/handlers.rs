@@ -394,4 +394,74 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
     }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_missing_param() {
+        let params = serde_json::json!({});
+        let result = handle_onboard_repo(&params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("repo_path"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_assign_task_with_branch_and_model() {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "Test task",
+            "repo_path": "/tmp",
+            "branch": "my-branch",
+            "model": "custom-model",
+            "max_iterations": 5
+        });
+        let result = handle_assign_task(&params, &manager, &provider, "default-model", 100).await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_result_pending_task() {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "Test task",
+            "repo_path": "/tmp"
+        });
+        let submit_result =
+            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await.unwrap();
+        let task_id = submit_result["task_id"].as_str().unwrap();
+
+        let get_params = serde_json::json!({"task_id": task_id});
+        let result = handle_get_result(&get_params, &manager).await;
+        // Pending task should return error
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("pending"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_poll_task_pending_status() {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "Poll test task",
+            "repo_path": "/tmp"
+        });
+        let submit_result =
+            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await.unwrap();
+        let task_id = submit_result["task_id"].as_str().unwrap();
+
+        let poll_params = serde_json::json!({"task_id": task_id});
+        let result = handle_poll_task(&poll_params, &manager).await.unwrap();
+        assert_eq!(result["status"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_result_missing_task_id() {
+        let manager = Arc::new(TaskManager::default());
+        let params = serde_json::json!({});
+        let result = handle_get_result(&params, &manager).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("task_id"));
+    }
 }

@@ -166,4 +166,29 @@ mod tests {
             deserialized.default_context_length
         );
     }
+
+    #[test]
+    fn test_with_max_tokens() {
+        let config = OllamaConfig::new().with_max_tokens(2048);
+        assert_eq!(config.default_max_tokens, Some(2048));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_max_tokens_zero_fails_validation() {
+        let config = OllamaConfig {
+            default_max_tokens: Some(0),
+            ..OllamaConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("Max tokens"));
+    }
+
+    #[test]
+    fn test_model_defaults() {
+        let defaults = ModelDefaults::default();
+        assert_eq!(defaults.temperature, 0.7);
+        assert_eq!(defaults.max_tokens, None);
+        assert_eq!(defaults.context_length, 110_000);
+    }
 }

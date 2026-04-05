@@ -777,4 +777,231 @@ mod tests {
         let result = agent.run(context).await.unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), result.iterations);
     }
+
+    #[test]
+    fn test_task_id_default() {
+        let id1 = TaskId::default();
+        let id2 = TaskId::default();
+        assert_ne!(id1, id2);
+        // Default should generate a UUID
+        assert!(!id1.0.is_empty());
+    }
+
+    #[test]
+    fn test_task_id_display() {
+        let id = TaskId("my-task-id".to_string());
+        assert_eq!(format!("{}", id), "my-task-id");
+    }
+
+    #[test]
+    fn test_failure_diagnostics_to_json_with_all_fields() {
+        let diagnostics = FailureDiagnostics {
+            error_type: "WorkspaceError".to_string(),
+            iterations_completed: 5,
+            last_tool_call: None,
+            partial_changes: Some("diff content".to_string()),
+            tool_call_history: vec![],
+            last_agent_state: Some("EnrichingEntities".to_string()),
+            conversation_snapshot: None,
+        };
+        let json = diagnostics.to_json();
+        assert_eq!(json["error_type"], "WorkspaceError");
+        assert_eq!(json["iterations_completed"], 5);
+        assert_eq!(json["partial_changes"], "diff content");
+        assert_eq!(json["last_agent_state"], "EnrichingEntities");
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_default() {
+        let manager = TaskManager::default();
+        let tasks = manager.list().await;
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_get_result_empty() {
+        let manager = TaskManager::default();
+        let id = TaskId::new();
+        let result = manager.get_result(&id).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_completed_task_fails() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Completed {
+                finished_at: Utc::now(),
+                result: TaskResult {
+                    result_summary: "done".to_string(),
+                    changes_patch: None,
+                    format_patch: None,
+                    files_modified: vec![],
+                    tool_calls_made: vec![],
+                    iterations: 1,
+                    model_used: "mock".to_string(),
+                },
+            },
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        let result = manager.cancel(&task_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already finished"));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_failed_task_fails() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Failed {
+                finished_at: Utc::now(),
+                error: "previous error".to_string(),
+                diagnostics: FailureDiagnostics {
+                    error_type: "SomeError".to_string(),
+                    iterations_completed: 0,
+                    last_tool_call: None,
+                    partial_changes: None,
+                    tool_call_history: vec![],
+                    last_agent_state: None,
+                    conversation_snapshot: None,
+                },
+            },
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        let result = manager.cancel(&task_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_list_with_tasks() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test task".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Pending,
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        let list = manager.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, task_id);
+    }
+
+    #[tokio::test]
+    async fn test_poll_running_task_with_progress() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Running {
+                started_at: Utc::now(),
+                iterations: 0,
+            },
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        // Add a progress counter with value 5
+        let counter = Arc::new(AtomicUsize::new(5));
+        {
+            let mut progress = manager.progress.write().await;
+            progress.insert(task_id.clone(), Arc::clone(&counter));
+        }
+
+        let polled = manager.poll(&task_id).await.unwrap();
+        if let TaskStatus::Running { iterations, .. } = polled.status {
+            assert_eq!(iterations, 5);
+        } else {
+            panic!("Expected Running status");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_result_pending_task_returns_none() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Pending,
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        // Pending task should return None from get_result
+        let result = manager.get_result(&task_id).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_result_completed_task() {
+        let manager = TaskManager::default();
+        let task_id = TaskId::new();
+        let task_result = TaskResult {
+            result_summary: "completed".to_string(),
+            changes_patch: None,
+            format_patch: None,
+            files_modified: vec![],
+            tool_calls_made: vec![],
+            iterations: 2,
+            model_used: "mock".to_string(),
+        };
+        let task = Task {
+            id: task_id.clone(),
+            description: "test".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Completed {
+                finished_at: Utc::now(),
+                result: task_result.clone(),
+            },
+            created_at: Utc::now(),
+        };
+        {
+            let mut tasks = manager.tasks.write().await;
+            tasks.insert(task_id.clone(), task);
+        }
+        let result = manager.get_result(&task_id).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().result_summary, "completed");
+    }
 }

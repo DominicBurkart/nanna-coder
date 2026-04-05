@@ -414,4 +414,91 @@ mod tests {
         let resp = server.handle_request(req).await;
         assert!(resp.error.is_some());
     }
+
+    #[tokio::test]
+    async fn test_invalid_jsonrpc_version_returns_error() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".to_string(),
+            id: Some(serde_json::json!(5)),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn test_notifications_initialized_returns_no_id() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(6)),
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_none());
+        assert!(resp.result.is_none());
+        assert!(resp.id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initialized_returns_no_id() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(7)),
+            method: "initialized".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_none());
+        assert!(resp.result.is_none());
+        assert!(resp.id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_missing_name_returns_error() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(8)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({"arguments": {}})),
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_list_tasks() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(9)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "list_tasks",
+                "arguments": {}
+            })),
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_jsonrpc_response_success_and_error() {
+        let success = JsonRpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
+        assert!(success.result.is_some());
+        assert!(success.error.is_none());
+        assert_eq!(success.jsonrpc, "2.0");
+
+        let error = JsonRpcResponse::error(Some(serde_json::json!(2)), -32600, "bad".to_string());
+        assert!(error.result.is_none());
+        assert!(error.error.is_some());
+        assert_eq!(error.error.unwrap().code, -32600);
+    }
 }
