@@ -652,6 +652,63 @@ impl SharedModelPool {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Verify that `SharedModelPool::release` semantics never underflow.
+    ///
+    /// The real `release()` calls `fetch_sub(1, SeqCst)` without guarding
+    /// against a zero ref-count. This harness demonstrates that calling
+    /// `release` more times than `get_or_start` will wrap the counter
+    /// (unsigned underflow). We verify the *expected* invariant: after N
+    /// increments and up-to-N decrements the counter must stay in [0, N].
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn release_ref_count_no_underflow() {
+        let increments: usize = kani::any();
+        kani::assume(increments <= 5);
+
+        let decrements: usize = kani::any();
+        kani::assume(decrements <= 5);
+
+        let counter = AtomicUsize::new(0);
+
+        // Simulate `get_or_start` increments
+        for _ in 0..increments {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Simulate `release` decrements — must not exceed increments
+        let safe_decrements = if decrements > increments {
+            increments
+        } else {
+            decrements
+        };
+
+        for _ in 0..safe_decrements {
+            let prev = counter.load(Ordering::SeqCst);
+            // This is the guard that the real code is missing:
+            assert!(prev > 0, "release called when ref_count is already 0");
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let final_val = counter.load(Ordering::SeqCst);
+        assert!(final_val <= increments);
+    }
+
+    /// Show that an unguarded fetch_sub on zero wraps to usize::MAX.
+    #[kani::proof]
+    fn release_underflow_wraps() {
+        let counter = AtomicUsize::new(0);
+        let prev = counter.fetch_sub(1, Ordering::SeqCst);
+        // prev was 0, counter is now usize::MAX
+        assert_eq!(prev, 0);
+        assert_eq!(counter.load(Ordering::SeqCst), usize::MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

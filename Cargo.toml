@@ -17,4 +17,7 @@ repository = "https://github.com/DominicBurkart/nanna-coder"
 [workspace.metadata.crane]
 name = "nanna-coder"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [workspace.dependencies]

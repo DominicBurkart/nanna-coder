@@ -555,6 +555,35 @@ impl AgentLoop {
         self.state = new_state;
     }
 
+    /// Check whether a state transition is legal according to ARCHITECTURE.md.
+    ///
+    /// ```text
+    /// EnrichingEntities           → PlanningEntityModification
+    /// PlanningEntityModification  → PerformingEntityModification
+    /// PerformingEntityModification→ UpdatingEntities
+    /// UpdatingEntities            → CheckingTaskCompletion
+    /// CheckingTaskCompletion      → Completed | EntityModificationDecision
+    /// EntityModificationDecision  → QueryingEntities | PlanningEntityModification
+    /// QueryingEntities            → EntityModificationDecision
+    /// ```
+    #[allow(dead_code)]
+    fn is_legal_transition(from: &AgentState, to: &AgentState) -> bool {
+        use AgentState::*;
+        matches!(
+            (from, to),
+            (EnrichingEntities, PlanningEntityModification)
+                | (PlanningEntityModification, PerformingEntityModification)
+                | (PerformingEntityModification, UpdatingEntities)
+                | (UpdatingEntities, CheckingTaskCompletion)
+                | (CheckingTaskCompletion, Completed)
+                | (CheckingTaskCompletion, EntityModificationDecision)
+                | (EntityModificationDecision, QueryingEntities)
+                | (EntityModificationDecision, PlanningEntityModification)
+                | (QueryingEntities, EntityModificationDecision)
+                | (_, Error(_))
+        )
+    }
+
     /// Call LLM with retry logic and exponential backoff
     async fn call_llm_with_retry(
         &self,
@@ -2079,5 +2108,114 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Encode the legal transitions from ARCHITECTURE.md as a numeric table
+    /// so kani can exhaustively verify that is_legal_transition accepts
+    /// exactly the correct pairs and rejects everything else.
+    fn state_index(s: &AgentState) -> u8 {
+        match s {
+            AgentState::EnrichingEntities => 0,
+            AgentState::PlanningEntityModification => 1,
+            AgentState::PerformingEntityModification => 2,
+            AgentState::UpdatingEntities => 3,
+            AgentState::CheckingTaskCompletion => 4,
+            AgentState::EntityModificationDecision => 5,
+            AgentState::QueryingEntities => 6,
+            AgentState::Completed => 7,
+            AgentState::Error(_) => 8,
+        }
+    }
+
+    fn state_from_index(i: u8) -> AgentState {
+        match i {
+            0 => AgentState::EnrichingEntities,
+            1 => AgentState::PlanningEntityModification,
+            2 => AgentState::PerformingEntityModification,
+            3 => AgentState::UpdatingEntities,
+            4 => AgentState::CheckingTaskCompletion,
+            5 => AgentState::EntityModificationDecision,
+            6 => AgentState::QueryingEntities,
+            7 => AgentState::Completed,
+            _ => AgentState::Error("test".to_string()),
+        }
+    }
+
+    /// The allowed non-error edges (from_index, to_index).
+    const LEGAL_EDGES: [(u8, u8); 8] = [
+        (0, 1), // EnrichingEntities → PlanningEntityModification
+        (1, 2), // PlanningEntityModification → PerformingEntityModification
+        (2, 3), // PerformingEntityModification → UpdatingEntities
+        (3, 4), // UpdatingEntities → CheckingTaskCompletion
+        (4, 7), // CheckingTaskCompletion → Completed
+        (4, 5), // CheckingTaskCompletion → EntityModificationDecision
+        (5, 6), // EntityModificationDecision → QueryingEntities
+        (5, 1), // EntityModificationDecision → PlanningEntityModification
+    ];
+
+    /// Verify that is_legal_transition is consistent with the architecture
+    /// diagram for all non-error state pairs.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn legal_transitions_match_architecture() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7); // don't generate Error as target (tested separately)
+
+        let from = state_from_index(from_idx);
+        let to = state_from_index(to_idx);
+
+        let result = AgentLoop::is_legal_transition(&from, &to);
+
+        // Any state can transition to Error
+        // For non-error targets, only LEGAL_EDGES are allowed
+        let expected = LEGAL_EDGES
+            .iter()
+            .any(|&(f, t)| f == from_idx && t == to_idx);
+        assert_eq!(result, expected, "Mismatch for ({from_idx} -> {to_idx})");
+    }
+
+    /// Any state may transition to Error.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn any_state_can_error() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let from = state_from_index(from_idx);
+        let to = AgentState::Error("fail".to_string());
+        assert!(AgentLoop::is_legal_transition(&from, &to));
+    }
+
+    /// Completed and Error are terminal: no legal non-error successor.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn completed_is_terminal() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::Completed;
+        assert!(
+            !AgentLoop::is_legal_transition(&from, &to),
+            "Completed should have no non-error successors"
+        );
+    }
+
+    /// QueryingEntities can only go back to EntityModificationDecision.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn querying_only_returns_to_decision() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::QueryingEntities;
+        let result = AgentLoop::is_legal_transition(&from, &to);
+        let expected = to_idx == 5; // EntityModificationDecision
+        assert_eq!(result, expected);
     }
 }
