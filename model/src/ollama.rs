@@ -1,4 +1,4 @@
-use crate::config::OllamaConfig;
+use crate::config::{OllamaConfig, DEFAULT_MODEL};
 use crate::judge::{
     JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult,
 };
@@ -181,31 +181,11 @@ impl OllamaProvider {
         })
     }
 
-    fn handle_ollama_error(err: ollama_rs::error::OllamaError) -> ModelError {
-        match err {
-            ollama_rs::error::OllamaError::ReqwestError(e) => {
-                if e.is_timeout() {
-                    ModelError::ServiceUnavailable {
-                        message: "Request timeout".to_string(),
-                    }
-                } else if e.is_connect() {
-                    ModelError::ServiceUnavailable {
-                        message: "Cannot connect to Ollama service".to_string(),
-                    }
-                } else {
-                    ModelError::Unknown {
-                        message: format!("Network error: {}", e),
-                    }
-                }
-            }
-            ollama_rs::error::OllamaError::JsonError(e) => ModelError::Serialization(e),
-            _ => ModelError::Unknown {
-                message: format!("Ollama error: {}", err),
-            },
-        }
-    }
-
-    fn handle_reqwest_error(e: reqwest::Error) -> ModelError {
+    /// Shared mapping logic for `reqwest::Error` values.
+    ///
+    /// Both `handle_reqwest_error` and `handle_ollama_error` delegate here so
+    /// the timeout / connect / fallthrough pattern is defined exactly once.
+    fn map_reqwest_error(e: &reqwest::Error) -> ModelError {
         if e.is_timeout() {
             ModelError::ServiceUnavailable {
                 message: "Request timeout".to_string(),
@@ -219,6 +199,20 @@ impl OllamaProvider {
                 message: format!("Network error: {}", e),
             }
         }
+    }
+
+    fn handle_ollama_error(err: ollama_rs::error::OllamaError) -> ModelError {
+        match err {
+            ollama_rs::error::OllamaError::ReqwestError(e) => Self::map_reqwest_error(&e),
+            ollama_rs::error::OllamaError::JsonError(e) => ModelError::Serialization(e),
+            _ => ModelError::Unknown {
+                message: format!("Ollama error: {}", err),
+            },
+        }
+    }
+
+    fn handle_reqwest_error(e: reqwest::Error) -> ModelError {
+        Self::map_reqwest_error(&e)
     }
 }
 
@@ -466,7 +460,7 @@ impl ModelJudge for OllamaProvider {
         let config = &self.judge_config;
 
         loop {
-            let request = ChatRequest::new("qwen3:0.6b", vec![ChatMessage::user(prompt)]);
+            let request = ChatRequest::new(DEFAULT_MODEL, vec![ChatMessage::user(prompt)]);
 
             match self.chat(request).await {
                 Ok(response) => {
@@ -713,7 +707,7 @@ impl ModelJudge for OllamaProvider {
         }
 
         let request = ChatRequest::new(
-            "qwen2.5:0.5b",
+            DEFAULT_MODEL,
             vec![ChatMessage::user(
                 "What is the weather in Paris? Use the available tool.",
             )],
@@ -793,7 +787,7 @@ impl ModelJudge for OllamaProvider {
             for iteration in 0..iterations {
                 total_attempts += 1;
 
-                let request = ChatRequest::new("qwen3:0.6b", vec![ChatMessage::user(*prompt)]);
+                let request = ChatRequest::new(DEFAULT_MODEL, vec![ChatMessage::user(*prompt)]);
 
                 match self.chat(request).await {
                     Ok(response) => {
