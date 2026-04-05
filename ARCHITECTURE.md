@@ -10,7 +10,7 @@ config:
   theme: redux-dark
   layout: dagre
 ---
-flowchart TD
+flowchart LR
     %% Provider side
     subgraph ProviderHosted["Provider-Hosted"]
         subgraph ProviderAgent["Primary Agent"]
