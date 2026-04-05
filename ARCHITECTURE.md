@@ -8,7 +8,7 @@ Nanna is a tool for advanced agents to delegate simple coding tasks to smaller m
 ---
 config:
   theme: redux-dark
-  layout: dagre
+  layout: elk
 ---
 flowchart LR
     %% Provider side
