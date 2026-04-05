@@ -10,7 +10,7 @@ config:
   theme: redux-dark
   layout: elk
 ---
-flowchart LR
+flowchart TD
     %% Provider side
     subgraph ProviderHosted["Provider-Hosted"]
         subgraph ProviderAgent["Primary Agent"]
