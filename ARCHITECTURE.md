@@ -1,3 +1,60 @@
+# Nanna: A Delegation Tool for Coding Agents
+
+Nanna is a tool for advanced agents to delegate simple coding tasks to smaller models. It is designed to be integrated into orchestrator agent configurations, allowing frontier models to offload well-scoped work to cheaper, faster, local or secondary-provider models.
+
+## System Architecture
+
+```mermaid
+---
+config:
+  theme: redux-dark
+  layout: dagre
+---
+flowchart TD
+    %% Provider side
+    subgraph ProviderHosted["Provider-Hosted"]
+        subgraph ProviderAgent["Primary Agent"]
+            OrchestratorHarness["Orchestrator Harness"]
+            OrchestratorModel["Provider's Frontier Model"]
+            OrchestratorSecondaryModel["Provider's Specialized Secondary Models"]
+            OrchestratorHarness --> OrchestratorModel
+            OrchestratorHarness --> OrchestratorSecondaryModel
+            ProviderDevEnv["Agent Dev Env"]
+        end
+        OrchestratorHarness --> ProviderDevEnv
+    end
+
+    %% Nanna side (Self-hosted or in Provider)
+    subgraph Nanna["Nanna"]
+        subgraph NannaDev["Containers (Self-hosted or in Provider)"]
+            NannaHarness["Nanna Harness"]
+            NannaDevEnv["Agent Dev Container(s)"]
+            NannaHarness --> NannaDevEnv
+        end
+        subgraph GatewayHosted["Local or Secondary Provider"]
+            NannaModel["Nanna Model"]
+        end
+    end
+
+    %% Optional external model provider for Nanna
+    NannaHarness --> NannaModel
+
+    %% Connections between orchestration layers
+    OrchestratorHarness --> NannaHarness
+
+    %% Classes
+    classDef area fill:#202020,stroke:#555,stroke-width:1px,color:#DDD
+    classDef orchestrator stroke:#9D4EDD,fill:#E0AAFF,color:#5A189A
+    classDef subagent stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
+    classDef nanna stroke:#FFB703,fill:#FFE8B6,color:#8B4513
+    classDef model stroke:#B5179E,fill:#FFD6F0,color:#7209B7
+
+    class ProviderHosted,NannaDev,GatewayHosted area
+    class ProviderAgent orchestrator
+    class Nanna nanna
+    class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
+```
+
 # Harness Control Flow
 
 ```mermaid
