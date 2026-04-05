@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// The canonical default model name used across the harness and model crate.
+/// This matches the model referenced in the README quick-start instructions.
+pub const DEFAULT_MODEL: &str = "qwen3:0.6b";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
@@ -23,10 +27,6 @@ impl Default for OllamaConfig {
 }
 
 impl OllamaConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = OllamaConfig::new()
+        let config = OllamaConfig::default()
             .with_base_url("https://api.example.com")
             .with_context_length(50_000)
             .with_temperature(0.5)
@@ -165,5 +165,11 @@ mod tests {
             config.default_context_length,
             deserialized.default_context_length
         );
+    }
+
+    #[test]
+    fn test_default_model_constant() {
+        assert!(!DEFAULT_MODEL.is_empty());
+        assert!(DEFAULT_MODEL.contains(':'));
     }
 }
