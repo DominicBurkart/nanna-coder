@@ -51,6 +51,22 @@ flowchart TD
     class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
 ```
 
+# Delegation Sequence
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant N as Nanna
+    O->>N: assign_task(description, repo_path)
+    N-->>O: task_id
+    Note over O: continues other tasks
+    Note over N: agent loop in worktree
+    O->>N: poll_task(task_id)
+    N-->>O: running
+    O->>N: poll_task(task_id)
+    N-->>O: completed
+    O->>N: get_result(task_id)
+    N-->>O: result
 # Harness Control Flow
 
 ```mermaid
