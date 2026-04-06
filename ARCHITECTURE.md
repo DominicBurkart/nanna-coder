@@ -67,6 +67,8 @@ sequenceDiagram
     N-->>O: completed
     O->>N: get_result(task_id)
     N-->>O: result
+```
+
 # Harness Control Flow
 
 ```mermaid
