@@ -67,7 +67,6 @@ sequenceDiagram
     N-->>O: completed
     O->>N: get_result(task_id)
     N-->>O: result
-end
 ```
 
 # Harness Control Flow
