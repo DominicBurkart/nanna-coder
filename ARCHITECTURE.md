@@ -54,6 +54,11 @@ flowchart TD
 # Delegation Sequence
 
 ```mermaid
+---
+config:
+  theme: redux-dark
+  layout: dagre
+---
 sequenceDiagram
     participant O as Orchestrator
     participant N as Nanna
