@@ -85,56 +85,6 @@ flowchart TD
     classDef Aqua stroke-width:1px, stroke-dasharray:none, stroke:#46EDC8, fill:#DEFFF8, color:#378E7A
 ```
 
-# API
-
-```mermaid
----
-config:
-  theme: redux-dark
-  layout: elk
----
-flowchart LR
-    subgraph CLI["CLI (harness)"]
-        chat
-        agent
-        mcpserve["mcp-serve"]
-        models
-        tools
-        health
-    end
-    subgraph MCP["MCP (stdio, via mcp-serve)"]
-        assign_task
-        poll_task
-        get_result
-        list_tasks
-        cancel_task
-        onboard_repo
-    end
-    mcpserve --> MCP
-    classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
-    classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,mcpserve,models,tools,health cli
-    class assign_task,poll_task,get_result,list_tasks,cancel_task,onboard_repo mcp
-```
-
-# Delegation Sequence
-
-```mermaid
-sequenceDiagram
-    participant O as Orchestrator
-    participant N as Nanna
-    O->>N: assign_task(description, repo_path)
-    N-->>O: task_id
-    Note over O: continues other tasks
-    Note over N: agent loop in worktree
-    O->>N: poll_task(task_id)
-    N-->>O: running
-    O->>N: poll_task(task_id)
-    N-->>O: completed
-    O->>N: get_result(task_id)
-    N-->>O: result
-```
-
 # Container Topology
 
 ```mermaid
