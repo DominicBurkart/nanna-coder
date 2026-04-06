@@ -54,6 +54,11 @@ flowchart TD
 # Delegation Sequence
 
 ```mermaid
+---
+config:
+  theme: redux-dark
+  layout: dagre
+---
 sequenceDiagram
     participant O as Orchestrator
     participant N as Nanna
@@ -67,6 +72,8 @@ sequenceDiagram
     N-->>O: completed
     O->>N: get_result(task_id)
     N-->>O: result
+```
+
 # Harness Control Flow
 
 ```mermaid
