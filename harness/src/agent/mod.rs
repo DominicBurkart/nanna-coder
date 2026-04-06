@@ -12,11 +12,9 @@
 //! 8. Decision → **Query Entities (RAG)** → back to Decision
 //! 9. Decision → **Plan Entity Modification** (loop)
 
-pub mod decision;
 pub mod eval;
 pub mod eval_case;
 pub mod prompts;
-pub mod rag;
 
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
@@ -617,13 +615,16 @@ impl AgentLoop {
             tracing::info!("Enriching entities for prompt: {}", context.user_prompt);
         }
 
-        let query_results = rag::query_entities(
-            &self.entity_store,
-            &context.user_prompt,
-            Some(DEFAULT_PLANNING_RAG_LIMIT),
-        )
-        .await
-        .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
+        use crate::entities::EntityQuery;
+        let query_results = self
+            .entity_store
+            .query(&EntityQuery {
+                text_query: Some(context.user_prompt.clone()),
+                limit: Some(DEFAULT_PLANNING_RAG_LIMIT),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Found {} relevant entities", query_results.len());
@@ -838,13 +839,16 @@ impl AgentLoop {
     /// Query Entities / RAG (ARCHITECTURE.md) — retrieve additional entity
     /// context to inform the next modification decision.
     async fn query_entities(&self, context: &AgentContext) -> AgentResult<()> {
-        let results = rag::query_entities(
-            &self.entity_store,
-            &context.user_prompt,
-            Some(DEFAULT_QUERY_RAG_LIMIT),
-        )
-        .await
-        .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
+        use crate::entities::EntityQuery;
+        let results = self
+            .entity_store
+            .query(&EntityQuery {
+                text_query: Some(context.user_prompt.clone()),
+                limit: Some(DEFAULT_QUERY_RAG_LIMIT),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| bare_state_error(format!("RAG query failed: {}", e)))?;
 
         if self.config.verbose {
             tracing::info!("Additional query found {} entities", results.len());
