@@ -36,7 +36,7 @@ gantt
     section MCP & Evals
     MCP server infrastructure        :done, 2026-03-03, 1d
     Context entities                 :done, 2026-03-08, 8d
-    Dev container setup              :done, 2026-03-15, 1d
+    Dev container design             :done, 2026-03-15, 1d
     Shared model pool                :done, 2026-03-21, 1d
     Task lifecycle & dispatch        :done, 2026-03-21, 1d
     Repo onboarding                  :done, 2026-03-22, 1d
@@ -46,21 +46,20 @@ gantt
     LLMs wired into agent loop       :done, 2026-03-24, 2d
     100% patch coverage CI           :done, 2026-03-25, 1d
     Code cleanup & test coverage     :done, 2026-03-28, 1d
+
+    section Planned
+    Expose Nanna via MCP             :active, mcp
+    Agentic eval suite               :eval
+    SWE-bench adapter                :
+    Workspace isolation              :
+    AST & filesystem entities        :
+    Testing & analysis entities      :
+    Environment entities             :
+    Sandbox telemetry entities       :
+    Migrate to vLLM                  :
+    Observability consolidation      :
+    CI workflow consolidation        :
 ```
-
-### Planned
-
-- Expose Nanna via MCP
-- Agentic eval suite
-- SWE-bench adapter
-- Workspace isolation
-- AST & filesystem entities
-- Testing & analysis entities
-- Environment entities
-- Sandbox telemetry entities
-- Migrate to vLLM
-- Observability consolidation
-- CI workflow consolidation
 
 ## Documentation
 
