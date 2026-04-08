@@ -34,17 +34,11 @@ pub use tools::{
     GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
     ToolError, ToolRegistry, ToolResult, WriteFileTool,
 };
-
-// Export agent types
 pub use agent::{
     AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
     AgentState,
 };
-
-// Export eval report types
 pub use eval::report::EvalReport;
-
-// Export entity types
 pub use entities::{
     Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship, EntityResult,
     EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType, TimeRange,

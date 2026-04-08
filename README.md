@@ -24,14 +24,9 @@ A highly opinionated local coding assistant (WIP).
 ### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
-
-# Enter development environment
 nix develop
-
-# Build the project
 nix build
 ```
 
@@ -40,26 +35,16 @@ nix build
 The agent requires a running [Ollama](https://ollama.ai/) instance with a model installed:
 
 ```bash
-# Install Ollama (see https://ollama.ai/download)
 curl -fsSL https://ollama.ai/install.sh | sh
-
-# Pull the default model
 ollama pull qwen3:0.6b
-
-# Verify Ollama is running
 nix develop --command cargo run --bin harness -- health
 ```
 
 ### Running the Agent
 
 ```bash
-# Enter development environment
 nix develop
-
-# Run the agent with tools enabled (recommended)
 cargo run --bin harness -- agent --prompt "Your task description" --tools
-
-# Run with a specific model and verbose output
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
 ```
 
@@ -68,7 +53,6 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
 
 ```bash
-# Configure Cachix for faster builds (read-only access)
 nix run .#setup-cache
 ```
 
