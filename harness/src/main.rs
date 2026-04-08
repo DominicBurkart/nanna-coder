@@ -4,7 +4,9 @@ use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
 use model::prelude::*;
+use model::provider::ModelProvider;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -76,10 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
+    let provider: Arc<dyn ModelProvider> = Arc::new(OllamaProvider::new(config)?);
 
     let workspace_root = std::env::current_dir()?;
-    let tool_registry = create_tool_registry(&workspace_root);
 
     match cli.command {
         Commands::Chat {
@@ -91,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
+                let tool_registry = harness::tools::create_tool_registry(&workspace_root);
                 single_chat(
                     &provider,
                     &tool_registry,
@@ -101,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             } else {
+                let tool_registry = harness::tools::create_tool_registry(&workspace_root);
                 interactive_chat(
                     &provider,
                     &tool_registry,
@@ -116,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             list_models(&provider).await?;
         }
         Commands::Tools => {
+            let tool_registry = harness::tools::create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
         }
         Commands::Health => {
@@ -135,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                Arc::clone(&provider),
             )
             .await?;
         }
@@ -142,15 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            run_mcp_server(&model, max_iterations, provider).await?;
         }
     }
 
     Ok(())
-}
-
-fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    harness::tools::create_tool_registry(workspace_root)
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
@@ -181,7 +182,7 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
 }
 
 async fn single_chat(
-    provider: &OllamaProvider,
+    provider: &Arc<dyn ModelProvider>,
     tool_registry: &ToolRegistry,
     model: &str,
     prompt: &str,
@@ -249,7 +250,7 @@ async fn single_chat(
 }
 
 async fn interactive_chat(
-    provider: &OllamaProvider,
+    provider: &Arc<dyn ModelProvider>,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
@@ -348,7 +349,7 @@ async fn interactive_chat(
     Ok(())
 }
 
-async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_models(provider: &Arc<dyn ModelProvider>) -> Result<(), Box<dyn std::error::Error>> {
     println!("Available models:");
     let models = provider.list_models().await?;
 
@@ -386,16 +387,18 @@ fn list_tools(tool_registry: &ToolRegistry) {
     }
 }
 
-async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn health_check(
+    provider: &Arc<dyn ModelProvider>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Performing health check...");
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -411,12 +414,10 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    provider: Arc<dyn ModelProvider>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -440,7 +441,7 @@ async fn run_agent(
     }
 
     let mut agent = if tools {
-        let tool_registry = create_tool_registry(workspace_root);
+        let tool_registry = harness::tools::create_tool_registry(workspace_root);
         AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
     } else {
         AgentLoop::with_llm(agent_config, entity_store, provider)
@@ -478,13 +479,11 @@ async fn run_agent(
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
+    provider: Arc<dyn ModelProvider>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
 
     info!(

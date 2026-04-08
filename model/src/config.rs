@@ -23,10 +23,6 @@ impl Default for OllamaConfig {
 }
 
 impl OllamaConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -83,23 +79,6 @@ impl OllamaConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDefaults {
-    pub temperature: f32,
-    pub max_tokens: Option<u32>,
-    pub context_length: u32,
-}
-
-impl Default for ModelDefaults {
-    fn default() -> Self {
-        Self {
-            temperature: 0.7,
-            max_tokens: None,
-            context_length: 110_000,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = OllamaConfig::new()
+        let config = OllamaConfig::default()
             .with_base_url("https://api.example.com")
             .with_context_length(50_000)
             .with_temperature(0.5)
