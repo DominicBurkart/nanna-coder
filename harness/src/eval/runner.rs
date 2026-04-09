@@ -179,18 +179,20 @@ pub async fn run_eval(
         None => OllamaConfig::default(),
     };
 
-    let provider: Arc<dyn ModelProvider> = match OllamaProvider::new(ollama_config) {
+    let provider: Arc<dyn ModelProvider> = match OllamaProvider::new(ollama_config.clone()) {
         Ok(p) => match p.health_check().await {
             Ok(()) => Arc::new(p),
             Err(e) => {
                 return Err(EvalRunnerError::ProviderUnavailable(format!(
-                    "Ollama health check failed: {e}"
+                    "Ollama health check failed at {}: {e}",
+                    ollama_config.base_url
                 )));
             }
         },
         Err(e) => {
             return Err(EvalRunnerError::ProviderUnavailable(format!(
-                "Failed to create Ollama provider: {e}"
+                "Failed to create Ollama provider at {}: {e}",
+                ollama_config.base_url
             )));
         }
     };
@@ -646,5 +648,47 @@ mod tests {
         assert!(failures[1].contains("Test"));
         assert!(failures[2].contains("a.rs"));
         assert!(failures[3].contains("foo"));
+    }
+
+    /// Verify that run_eval returns ProviderUnavailable when Ollama is unreachable.
+    ///
+    /// This test does not require a running Ollama instance — it points the config
+    /// at a port that is guaranteed to refuse connections, so the health check fails
+    /// immediately and the correct error variant is returned.
+    #[tokio::test]
+    async fn test_provider_unavailable_bogus_url() {
+        let toml_str = r#"
+[case]
+id = "bogus-url-test"
+name = "Bogus URL test"
+description = "Should fail with ProviderUnavailable"
+
+[task]
+prompt = "Do something"
+
+[metadata]
+timeout_secs = 30
+"#;
+        let case = crate::agent::eval_case::EvalCase::from_toml_str(toml_str).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Port 1 is reserved and will refuse connections on any standard OS.
+        let config = EvalRunnerConfig::default()
+            .with_base_url("http://127.0.0.1:1");
+
+        let result = run_eval(&case, tmp.path(), &config).await;
+
+        assert!(
+            matches!(result, Err(EvalRunnerError::ProviderUnavailable(_))),
+            "Expected ProviderUnavailable, got: {result:?}"
+        );
+
+        // The error message should include the bogus URL for debuggability.
+        if let Err(EvalRunnerError::ProviderUnavailable(msg)) = result {
+            assert!(
+                msg.contains("127.0.0.1:1"),
+                "Error message should include the configured URL, got: {msg}"
+            );
+        }
     }
 }
