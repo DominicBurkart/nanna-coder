@@ -185,9 +185,13 @@ impl TaskManager {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
 
-        let runtime = crate::container::detect_runtime();
-        let image_ref = crate::container::load_image_from_path(&runtime, &image_path)
-            .map_err(|e| e.to_string())?;
+        let image_ref = tokio::task::spawn_blocking(move || {
+            let runtime = crate::container::detect_runtime();
+            crate::container::load_image_from_path(&runtime, &image_path)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
         {
             let mut cache_write = cache.write().await;
@@ -238,6 +242,12 @@ impl TaskManager {
         let join_handle = tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("Semaphore closed");
 
+            // Require both flake.nix AND .devcontainer/ to opt in to the
+            // container path, so that repos that merely happen to have a
+            // flake.nix are not affected.
+            let use_container = repo_path.join("flake.nix").exists()
+                && repo_path.join(".devcontainer").exists();
+
             {
                 let mut tasks = tasks_ref.write().await;
                 if let Some(task) = tasks.get_mut(&task_id_clone) {
@@ -248,18 +258,20 @@ impl TaskManager {
                 }
             }
 
-            // Require both flake.nix AND .devcontainer/ to opt in to the
-            // container path, so that repos that merely happen to have a
-            // flake.nix are not affected.
-            let use_container =
-                repo_path.join("flake.nix").exists() && repo_path.join(".devcontainer").exists();
-
             let workspace_result = if use_container {
                 let image_result =
                     Self::get_or_build_image(&image_cache_ref, &build_locks_ref, &repo_path).await;
                 let image_ref = match image_result {
                     Ok(r) => r,
                     Err(e) => {
+                        {
+                            let mut h = handles_ref.write().await;
+                            h.remove(&task_id_clone);
+                        }
+                        {
+                            let mut p = progress_ref.write().await;
+                            p.remove(&task_id_clone);
+                        }
                         let mut tasks = tasks_ref.write().await;
                         if let Some(task) = tasks.get_mut(&task_id_clone) {
                             task.status = TaskStatus::Failed {
@@ -320,11 +332,7 @@ impl TaskManager {
                     }
                 }
                 Ok(mut workspace) => {
-                    let tool_registry = if use_container {
-                        workspace.create_container_tool_registry()
-                    } else {
-                        workspace.create_tool_registry()
-                    };
+                    let tool_registry = workspace.create_container_tool_registry();
                     let entity_store = InMemoryEntityStore::new();
                     let agent_config = AgentConfig {
                         max_iterations,

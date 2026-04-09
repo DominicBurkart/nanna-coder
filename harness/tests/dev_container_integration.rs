@@ -200,6 +200,12 @@ async fn test_task_manager_submit_with_dev_container() {
         return;
     }
 
+    // Skip if Ollama is not reachable (e.g. CI without a local model server).
+    if tokio::net::TcpStream::connect("127.0.0.1:11434").await.is_err() {
+        eprintln!("Ollama not reachable on 127.0.0.1:11434, skipping test");
+        return;
+    }
+
     let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
 
     let ollama_config = model::OllamaConfig::default();

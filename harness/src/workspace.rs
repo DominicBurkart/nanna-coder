@@ -1,12 +1,16 @@
 use crate::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerRuntime,
 };
-use crate::tools::{create_container_tool_registry, create_tool_registry, ToolRegistry};
+use crate::tools::{
+    create_container_tool_registry, create_tool_registry, ToolRegistry,
+    CONTAINER_WORKSPACE_DIR,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -109,6 +113,9 @@ impl TaskWorkspace {
                 .output();
         };
 
+        // Detect once so the availability check and the Podman-specific flag
+        // both see the same runtime; `start_container_with_fallback` does its
+        // own internal detection but we need the value here first.
         let runtime = detect_runtime();
         if !runtime.is_available() {
             cleanup_worktree();
@@ -116,7 +123,8 @@ impl TaskWorkspace {
         }
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![format!("-v={}:/workspace", workspace_path.display())];
+        let mut additional_args =
+            vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", workspace_path.display())];
         if runtime == ContainerRuntime::Podman {
             additional_args.push("--userns=keep-id".to_string());
         }
@@ -177,7 +185,11 @@ impl TaskWorkspace {
 
     pub fn create_container_tool_registry(&self) -> ToolRegistry {
         if let Some(handle) = &self.container_handle {
-            create_container_tool_registry(&self.workspace_path, Arc::clone(handle), "/workspace")
+            create_container_tool_registry(
+                &self.workspace_path,
+                Arc::clone(handle),
+                CONTAINER_WORKSPACE_DIR,
+            )
         } else {
             create_tool_registry(&self.workspace_path)
         }

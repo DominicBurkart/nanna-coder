@@ -1852,12 +1852,18 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
+/// The working directory inside the dev container where the worktree is mounted.
+pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
+
 pub fn create_container_tool_registry(
     workspace_root: &std::path::Path,
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
     container_working_dir: &str,
 ) -> ToolRegistry {
     let mut registry = create_tool_registry(workspace_root);
+    // Deliberately overrides any `run_command` entry from `create_tool_registry`
+    // with a container-bound version; if `create_tool_registry` ever adds a
+    // `run_command` tool, this override is intentional and expected.
     registry.register(Box::new(RunCommandTool::new(
         container_handle,
         Some(container_working_dir.to_string()),
@@ -2079,7 +2085,7 @@ mod tests {
             needs_cleanup: false,
         });
 
-        let registry = create_container_tool_registry(&temp_dir, handle, "/workspace");
+        let registry = create_container_tool_registry(&temp_dir, handle, CONTAINER_WORKSPACE_DIR);
         assert!(registry.get_tool("run_command").is_some());
         assert!(registry.get_tool("read_file").is_some());
         assert!(registry.get_tool("write_file").is_some());
