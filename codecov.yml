@@ -4,3 +4,10 @@ coverage:
     patch:
       default:
         target: 100%
+
+# Paths excluded from coverage reporting.
+# These files contain integration entrypoints that require a live Ollama
+# instance or other external services and therefore cannot be exercised
+# by the unit-test suite.
+ignore:
+  - "harness/src/eval/runner.rs"
