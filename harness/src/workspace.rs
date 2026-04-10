@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
     #[error("Git worktree creation failed: {0}")]
@@ -179,10 +178,6 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub fn create_tool_registry(&self) -> ToolRegistry {
-        create_tool_registry(&self.workspace_path)
-    }
-
     pub fn create_container_tool_registry(&self) -> ToolRegistry {
         if let Some(handle) = &self.container_handle {
             create_container_tool_registry(
@@ -320,7 +315,7 @@ mod tests {
 
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-registry"), "HEAD").unwrap();
-        let registry = ws.create_tool_registry();
+        let registry = ws.create_container_tool_registry();
         assert!(registry.get_tool("read_file").is_some());
         ws.cleanup().unwrap();
     }
