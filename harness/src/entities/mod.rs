@@ -484,6 +484,11 @@ impl EntityStore for InMemoryEntityStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::git::GitRepository;
+
+    fn make_git_repo(remote: &str) -> GitRepository {
+        GitRepository::new(remote.to_string(), "main".to_string())
+    }
 
     #[test]
     fn test_entity_metadata_creation() {
@@ -491,6 +496,17 @@ mod tests {
         assert_eq!(metadata.entity_type, EntityType::Git);
         assert_eq!(metadata.version, 1);
         assert!(metadata.tags.is_empty());
+        // ID should be a non-empty UUID-like string
+        assert!(!metadata.id.is_empty());
+        // created_at and updated_at should be equal on creation
+        assert_eq!(metadata.created_at, metadata.updated_at);
+    }
+
+    #[test]
+    fn test_entity_metadata_ids_are_unique() {
+        let m1 = EntityMetadata::new(EntityType::Git);
+        let m2 = EntityMetadata::new(EntityType::Ast);
+        assert_ne!(m1.id, m2.id, "Each entity should get a unique ID");
     }
 
     #[test]
@@ -504,10 +520,250 @@ mod tests {
         assert_eq!(rel.relationship_type, RelationshipType::Calls);
     }
 
+    // ===== InMemoryEntityStore: store / exists / update / delete =====
+
     #[tokio::test]
-    async fn test_in_memory_store_basic_operations() {
-        // Note: Full tests will be added when concrete entity types are implemented
+    async fn test_store_and_exists() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/b");
+        let id = repo.id().to_string();
+
+        assert!(!store.exists(&id).await);
+        let returned_id = store.store(Box::new(repo)).await.unwrap();
+        assert_eq!(returned_id, id);
+        assert!(store.exists(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_store_duplicate_returns_error() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/b");
+        let id = repo.id().to_string();
+
+        store.store(Box::new(repo.clone())).await.unwrap();
+
+        // Storing the same entity again should fail
+        let result = store.store(Box::new(repo)).await;
+        assert!(matches!(result, Err(EntityError::AlreadyExists(_))));
+        assert!(result.unwrap_err().to_string().contains(&id));
+    }
+
+    #[tokio::test]
+    async fn test_delete_existing_entity() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/b");
+        let id = repo.id().to_string();
+
+        store.store(Box::new(repo)).await.unwrap();
+        assert!(store.exists(&id).await);
+
+        store.delete(&id).await.unwrap();
+        assert!(!store.exists(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_entity_returns_error() {
+        let mut store = InMemoryEntityStore::new();
+        let result = store.delete("nonexistent-id").await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_update_existing_entity() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/b");
+        let id = repo.id().to_string();
+
+        store.store(Box::new(repo.clone())).await.unwrap();
+
+        // Update with a different entity sharing the same ID
+        let result = store.update(Box::new(repo)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_nonexistent_entity_returns_error() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/b");
+
+        let result = store.update(Box::new(repo)).await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    // ===== InMemoryEntityStore: query =====
+
+    #[tokio::test]
+    async fn test_query_all_returns_all_entities() {
+        let mut store = InMemoryEntityStore::new();
+        store
+            .store(Box::new(make_git_repo("https://github.com/a/b")))
+            .await
+            .unwrap();
+        store
+            .store(Box::new(make_git_repo("https://github.com/c/d")))
+            .await
+            .unwrap();
+
+        let results = store.query(&EntityQuery::default()).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_query_by_entity_type_filters_correctly() {
+        let mut store = InMemoryEntityStore::new();
+        store
+            .store(Box::new(make_git_repo("https://github.com/a/b")))
+            .await
+            .unwrap();
+
+        // Query for Git entities — should return the one we stored
+        let git_query = EntityQuery {
+            entity_types: vec![EntityType::Git],
+            ..Default::default()
+        };
+        let git_results = store.query(&git_query).await.unwrap();
+        assert_eq!(git_results.len(), 1);
+        assert_eq!(git_results[0].entity_type, EntityType::Git);
+
+        // Query for Ast entities — should return none
+        let ast_query = EntityQuery {
+            entity_types: vec![EntityType::Ast],
+            ..Default::default()
+        };
+        let ast_results = store.query(&ast_query).await.unwrap();
+        assert_eq!(ast_results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_limit_is_respected() {
+        let mut store = InMemoryEntityStore::new();
+        for i in 0..5 {
+            store
+                .store(Box::new(make_git_repo(&format!("https://github.com/{}/r", i))))
+                .await
+                .unwrap();
+        }
+
+        let limited = EntityQuery {
+            limit: Some(3),
+            ..Default::default()
+        };
+        let results = store.query(&limited).await.unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_query_text_search_filters_by_content() {
+        let mut store = InMemoryEntityStore::new();
+        store
+            .store(Box::new(make_git_repo("https://github.com/foo/bar")))
+            .await
+            .unwrap();
+        store
+            .store(Box::new(make_git_repo("https://github.com/other/repo")))
+            .await
+            .unwrap();
+
+        let text_query = EntityQuery {
+            text_query: Some("foo".to_string()),
+            ..Default::default()
+        };
+        let results = store.query(&text_query).await.unwrap();
+        // Only the "foo/bar" repo should match
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].relevance, 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_query_empty_store_returns_empty() {
         let store = InMemoryEntityStore::new();
-        assert_eq!(store.entities.len(), 0);
+        let results = store.query(&EntityQuery::default()).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ===== InMemoryEntityStore: relationships =====
+
+    #[tokio::test]
+    async fn test_create_and_retrieve_relationship() {
+        let mut store = InMemoryEntityStore::new();
+        let repo_a = make_git_repo("https://github.com/a/r");
+        let repo_b = make_git_repo("https://github.com/b/r");
+        let id_a = repo_a.id().to_string();
+        let id_b = repo_b.id().to_string();
+
+        store.store(Box::new(repo_a)).await.unwrap();
+        store.store(Box::new(repo_b)).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id_a.clone(),
+            to: id_b.clone(),
+            relationship_type: RelationshipType::References,
+            metadata: HashMap::new(),
+        };
+        store.create_relationship(rel).await.unwrap();
+
+        let rels_a = store.get_relationships(&id_a).await.unwrap();
+        assert_eq!(rels_a.len(), 1);
+        assert_eq!(rels_a[0].relationship_type, RelationshipType::References);
+
+        // B is also a participant, so it should also appear
+        let rels_b = store.get_relationships(&id_b).await.unwrap();
+        assert_eq!(rels_b.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_relationship_with_missing_entity_fails() {
+        let mut store = InMemoryEntityStore::new();
+        let repo = make_git_repo("https://github.com/a/r");
+        let id = repo.id().to_string();
+        store.store(Box::new(repo)).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id,
+            to: "nonexistent".to_string(),
+            relationship_type: RelationshipType::Calls,
+            metadata: HashMap::new(),
+        };
+        let result = store.create_relationship(rel).await;
+        assert!(matches!(result, Err(EntityError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_delete_relationship() {
+        let mut store = InMemoryEntityStore::new();
+        let repo_a = make_git_repo("https://github.com/a/r");
+        let repo_b = make_git_repo("https://github.com/b/r");
+        let id_a = repo_a.id().to_string();
+        let id_b = repo_b.id().to_string();
+
+        store.store(Box::new(repo_a)).await.unwrap();
+        store.store(Box::new(repo_b)).await.unwrap();
+
+        let rel = EntityRelationship {
+            from: id_a.clone(),
+            to: id_b.clone(),
+            relationship_type: RelationshipType::Contains,
+            metadata: HashMap::new(),
+        };
+        store.create_relationship(rel).await.unwrap();
+
+        // Verify it exists
+        assert_eq!(store.get_relationships(&id_a).await.unwrap().len(), 1);
+
+        // Delete it
+        store
+            .delete_relationship(&id_a, &id_b, RelationshipType::Contains)
+            .await
+            .unwrap();
+
+        // Should be gone
+        assert_eq!(store.get_relationships(&id_a).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_relationships_for_unknown_entity() {
+        let store = InMemoryEntityStore::new();
+        let rels = store.get_relationships("unknown").await.unwrap();
+        assert!(rels.is_empty());
     }
 }

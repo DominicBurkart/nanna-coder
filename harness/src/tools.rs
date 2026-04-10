@@ -2442,4 +2442,73 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // ===== ToolRegistry unit tests =====
+
+    #[tokio::test]
+    async fn test_registry_execute_missing_tool_returns_not_found() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("no_such_tool", json!({})).await;
+        assert!(
+            matches!(result, Err(ToolError::NotFound { .. })),
+            "Expected NotFound error, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_register_overwrites_existing_name() {
+        let mut registry = ToolRegistry::new();
+        // Register echo twice — second should win (no panic, registry accepts it)
+        registry.register(Box::new(EchoTool::new()));
+        registry.register(Box::new(EchoTool::new()));
+        // Only one entry under the same name
+        assert_eq!(registry.list_tools().len(), 1);
+    }
+
+    #[test]
+    fn test_create_tool_registry_contains_expected_tools() {
+        let cwd = std::env::current_dir().unwrap();
+        let registry = create_tool_registry(&cwd);
+        let names = registry.list_tools();
+        // The standard registry should include at minimum these tools
+        for expected in &["echo", "read_file", "write_file", "list_dir", "search", "git_status", "git_diff"] {
+            assert!(
+                names.contains(expected),
+                "Registry missing expected tool: {}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_get_definitions_count_matches_registered() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        registry.register(Box::new(CalculatorTool::new()));
+
+        let defs = registry.get_definitions();
+        assert_eq!(
+            defs.len(),
+            registry.list_tools().len(),
+            "get_definitions() count should match list_tools() count"
+        );
+    }
+
+    #[test]
+    fn test_tool_definitions_have_non_empty_names_and_descriptions() {
+        let cwd = std::env::current_dir().unwrap();
+        let registry = create_tool_registry(&cwd);
+        for def in registry.get_definitions() {
+            assert!(
+                !def.function.name.is_empty(),
+                "Tool definition has empty name"
+            );
+            assert!(
+                !def.function.description.is_empty(),
+                "Tool '{}' has empty description",
+                def.function.name
+            );
+        }
+    }
 }
