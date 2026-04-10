@@ -11,3 +11,4 @@ coverage:
 # by the unit-test suite.
 ignore:
   - "harness/src/eval/runner.rs"
+  - "harness/tests/eval_runner_tests.rs"
