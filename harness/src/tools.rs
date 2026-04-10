@@ -2075,8 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_tool_registry_includes_run_command() {
         use std::sync::Arc;
-        let temp_dir = std::env::temp_dir().join("nanna_test_container_registry");
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
 
         let handle = Arc::new(crate::container::ContainerHandle {
             name: "test-container".to_string(),
@@ -2085,7 +2084,8 @@ mod tests {
             needs_cleanup: false,
         });
 
-        let registry = create_container_tool_registry(&temp_dir, handle, CONTAINER_WORKSPACE_DIR);
+        let registry =
+            create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
         assert!(registry.get_tool("run_command").is_some());
         assert!(registry.get_tool("read_file").is_some());
         assert!(registry.get_tool("write_file").is_some());
@@ -2093,8 +2093,6 @@ mod tests {
         assert!(registry.get_tool("search").is_some());
         assert!(registry.get_tool("git_status").is_some());
         assert!(registry.get_tool("git_diff").is_some());
-
-        std::fs::remove_dir_all(&temp_dir).ok();
     }
 
     // -- PrStatusData unit tests --

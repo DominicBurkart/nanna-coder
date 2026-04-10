@@ -201,7 +201,10 @@ async fn test_task_manager_submit_with_dev_container() {
     }
 
     // Skip if Ollama is not reachable (e.g. CI without a local model server).
-    if tokio::net::TcpStream::connect("127.0.0.1:11434").await.is_err() {
+    if tokio::net::TcpStream::connect("127.0.0.1:11434")
+        .await
+        .is_err()
+    {
         eprintln!("Ollama not reachable on 127.0.0.1:11434, skipping test");
         return;
     }

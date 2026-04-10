@@ -2,8 +2,7 @@ use crate::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerRuntime,
 };
 use crate::tools::{
-    create_container_tool_registry, create_tool_registry, ToolRegistry,
-    CONTAINER_WORKSPACE_DIR,
+    create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -122,8 +121,10 @@ impl TaskWorkspace {
         }
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args =
-            vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", workspace_path.display())];
+        let mut additional_args = vec![format!(
+            "-v={}:{CONTAINER_WORKSPACE_DIR}",
+            workspace_path.display()
+        )];
         if runtime == ContainerRuntime::Podman {
             additional_args.push("--userns=keep-id".to_string());
         }

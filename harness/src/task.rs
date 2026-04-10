@@ -195,7 +195,13 @@ impl TaskManager {
 
         {
             let mut cache_write = cache.write().await;
-            cache_write.insert(canonical, image_ref.clone());
+            cache_write.insert(canonical.clone(), image_ref.clone());
+        }
+        // Remove the per-path build lock now that the image is cached; future
+        // callers will hit the fast path and no longer need the lock.
+        {
+            let mut locks = build_locks.lock().await;
+            locks.remove(&canonical);
         }
         Ok(image_ref)
     }
@@ -244,9 +250,13 @@ impl TaskManager {
 
             // Require both flake.nix AND .devcontainer/ to opt in to the
             // container path, so that repos that merely happen to have a
-            // flake.nix are not affected.
-            let use_container = repo_path.join("flake.nix").exists()
-                && repo_path.join(".devcontainer").exists();
+            // flake.nix are not affected. Use tokio::fs to avoid blocking.
+            let use_container = tokio::fs::try_exists(repo_path.join("flake.nix"))
+                .await
+                .unwrap_or(false)
+                && tokio::fs::try_exists(repo_path.join(".devcontainer"))
+                    .await
+                    .unwrap_or(false);
 
             {
                 let mut tasks = tasks_ref.write().await;
