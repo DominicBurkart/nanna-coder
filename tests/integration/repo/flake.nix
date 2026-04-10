@@ -26,10 +26,20 @@
 
         nix2containerPkgs = nix2container.packages.${system};
 
+        # Filter out build artifacts so rustPlatform.buildRustPackage succeeds
+        # even if target/ was accidentally committed or is present locally.
+        cleanSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let baseName = baseNameOf (toString path);
+            in pkgs.lib.cleanSourceFilter path type
+               && baseName != "target";
+        };
+
         fibPackage = pkgs.rustPlatform.buildRustPackage {
           pname = "fibonacci-example";
           version = "0.1.0";
-          src = ./.;
+          src = cleanSrc;
           cargoLock.lockFile = ./Cargo.lock;
         };
 
