@@ -1,15 +1,17 @@
-//! Entity Modification Decision logic for the agent (ARCHITECTURE.md)
+//! Entity Modification Decision (placeholder)
 //!
-//! This module implements the "Entity Modification Decision" node from the
-//! Harness Control Flow diagram: given the current entity state, decide
-//! whether to **Query Entities (RAG)** for more context or proceed to
-//! **Plan Entity Modification**.
+//! This module is a **stub** for the "Entity Modification Decision" node in the
+//! ARCHITECTURE.md Harness Control Flow diagram. The node decides whether the
+//! agent should query entities for more context (RAG) or proceed to plan the
+//! next modification.
 //!
-//! The implementation is currently a stub and needs further problem definition.
+//! The actual decision logic lives in [`crate::agent::prompts::DecisionPrompt`],
+//! which builds and parses QUERY/PROCEED LLM responses. This module will hold
+//! higher-level orchestration once the interface is stabilised.
 
 use thiserror::Error;
 
-/// Errors related to entity modification decisions
+/// Errors produced by entity modification decision logic.
 #[derive(Error, Debug)]
 pub enum DecisionError {
     #[error("Entity modification decision error: {0}")]
@@ -17,30 +19,3 @@ pub enum DecisionError {
 }
 
 pub type DecisionResult<T> = Result<T, DecisionError>;
-
-/// Entity Modification Decision (ARCHITECTURE.md)
-///
-/// Determine whether additional entity context is needed (query) or
-/// whether the agent can proceed to plan the next modification.
-///
-/// # Note
-/// This is a stub implementation that requires further problem definition.
-pub fn entity_modification_decision() -> DecisionResult<()> {
-    unimplemented!(
-        "Entity modification decision logic requires further problem definition. \
-         This should analyze context and determine next actions."
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[should_panic(
-        expected = "Entity modification decision logic requires further problem definition"
-    )]
-    fn test_entity_modification_decision_unimplemented() {
-        let _ = entity_modification_decision();
-    }
-}
