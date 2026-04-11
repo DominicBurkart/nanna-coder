@@ -43,6 +43,7 @@ pub use agent::{
 
 // Export eval types
 pub use eval::report::EvalReport;
+#[cfg(feature = "eval-runner")]
 pub use eval::runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
 
 // Export entity types
