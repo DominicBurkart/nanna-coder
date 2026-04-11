@@ -1,53 +1,40 @@
-# Agent Control Flow
+# AGENTS.md
 
-```mermaid
----
-config:
-  theme: redux-dark
-  layout: dagre
----
-flowchart TD
-    A(["Application State 1"]) --> n6["Entity Enrichment"]
-    n10(["User Prompt"]) --> n4["Plan Entity Modification"]
-    B{"Task Complete?"} --> C["Yes"] & D["No"]
-    D --> n1["Entity Modification Decision"]
-    n1 --> n3["Query Entities (RAG)"] & n4
-    n4 --> n7["Perform Entity Modification"]
-    C --> n9(["Application State 2"])
-    n3 --> n1
-    n7 --> n11["Update Entities"]
-    n11 --> B
-    n6 --> n4
-    n6@{ shape: rect}
-    n4@{ shape: rect}
-    n1@{ shape: diam}
-    n3@{ shape: rect}
-    n7@{ shape: rect}
-    n11@{ shape: rect}
-     A:::Rose
-     A:::Aqua
-     n10:::Aqua
-     n9:::Aqua
-    classDef Rose stroke-width:1px, stroke-dasharray:none, stroke:#FF5978, fill:#FFDFE5, color:#8E2236
-    classDef Aqua stroke-width:1px, stroke-dasharray:none, stroke:#46EDC8, fill:#DEFFF8, color:#378E7A
+Instructions for agents building nanna. See [ARCHITECTURE.md](ARCHITECTURE.md) for system design and control flow diagrams.
+
+## Build & Test Commands
+
+All dev tools are provided by the Nix flake devShell. See [CLAUDE.md](CLAUDE.md) for the full command reference.
+
+```bash
+# Build
+nix develop --command cargo build --workspace
+
+# Test
+nix develop --command cargo nextest run --workspace --all-features
+
+# Lint
+nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Format check
+nix develop --command cargo fmt --all -- --check
+
+# Security
+nix develop --command cargo deny check
 ```
 
-# Agent State Machine
+## Key Source Locations
 
-```mermaid
-stateDiagram-v2
-    [*] --> Planning
-    Planning --> CheckingCompletion
-    CheckingCompletion --> Completed: Task Done
-    CheckingCompletion --> Deciding: Task Incomplete
-    Deciding --> Querying: Need Context
-    Deciding --> Performing: Ready to Act
-    Querying --> Planning
-    Performing --> CheckingCompletion
-    Completed --> [*]
-    Planning --> Error
-    Querying --> Error
-    Deciding --> Error
-    Performing --> Error
-    Error --> [*]
+- **Harness entrypoint**: [`harness/src/main.rs`](harness/src/main.rs)
+- **Agent loop**: [`harness/src/agent/`](harness/src/agent/)
+- **Entity system**: [`harness/src/entities/`](harness/src/entities/)
+- **Tool registry**: [`harness/src/tools.rs`](harness/src/tools.rs)
+- **MCP server**: [`harness/src/mcp/`](harness/src/mcp/)
+
+## Testing
+
+See [TESTING.md](TESTING.md) for the full test strategy. Run all tests with:
+
+```bash
+./tests/run-all-tests.sh
 ```
