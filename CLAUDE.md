@@ -1,5 +1,3 @@
-# CLAUDE.md
-
 All dev tools are provided by the Nix flake devShell. Prefix commands with
 `nix develop --command` (or enter the shell with `nix develop`).
 
