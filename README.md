@@ -1,6 +1,6 @@
 # Nanna Coder
 
-A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
+A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or other model providers.
 
 ## Documentation
 
@@ -53,9 +53,6 @@ nix develop --command cargo run --bin harness -- health
 ### Running the Agent
 
 ```bash
-# Enter development environment
-nix develop
-
 # Run the agent with tools enabled (recommended)
 cargo run --bin harness -- agent --prompt "Your task description" --tools
 
