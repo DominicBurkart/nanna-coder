@@ -147,6 +147,28 @@ impl TaskManager {
         build_locks: &BuildLocks,
         repo_path: &std::path::Path,
     ) -> Result<String, String> {
+        Self::get_or_build_image_using(cache, build_locks, repo_path, |source| {
+            let image_path =
+                image_builder::build_dev_container(source).map_err(|e| e.to_string())?;
+            let runtime = crate::container::detect_runtime();
+            crate::container::load_image_from_path(&runtime, &image_path).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Inner implementation of image acquisition that accepts a custom build+load
+    /// function.  Kept separate from `get_or_build_image` so the caching and
+    /// locking logic can be exercised in unit tests without a real Nix/container
+    /// environment.
+    async fn get_or_build_image_using<F>(
+        cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
+        build_locks: &BuildLocks,
+        repo_path: &std::path::Path,
+        build_fn: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce(&std::path::Path) -> Result<String, String> + Send + 'static,
+    {
         let canonical = repo_path.canonicalize().map_err(|e| e.to_string())?;
 
         // Fast path: return cached image if already built.
@@ -179,19 +201,9 @@ impl TaskManager {
         }
 
         let source = canonical.clone();
-        let image_path =
-            tokio::task::spawn_blocking(move || image_builder::build_dev_container(&source))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
-
-        let image_ref = tokio::task::spawn_blocking(move || {
-            let runtime = crate::container::detect_runtime();
-            crate::container::load_image_from_path(&runtime, &image_path)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        let image_ref = tokio::task::spawn_blocking(move || build_fn(&source))
+            .await
+            .map_err(|e| e.to_string())??;
 
         {
             let mut cache_write = cache.write().await;
@@ -984,6 +996,194 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // ---- get_or_build_image_using unit tests ----
+
+    fn make_build_locks() -> BuildLocks {
+        // BuildLocks uses tokio::sync::Mutex; use the fully-qualified path to
+        // avoid the std::sync::Mutex that is imported for MockProvider above.
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_success() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_source| {
+                Ok("built-image:v1".to_string())
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), "built-image:v1");
+
+        // Cache should be populated.
+        let canonical = dir.path().canonicalize().unwrap();
+        let cache_read = cache.read().await;
+        assert_eq!(
+            cache_read.get(&canonical).map(String::as_str),
+            Some("built-image:v1")
+        );
+
+        // Build lock entry should be cleaned up.
+        let locks = build_locks.lock().await;
+        assert!(!locks.contains_key(&canonical));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_cache_hit() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Pre-populate the cache to trigger the fast-path return.
+        cache
+            .write()
+            .await
+            .insert(canonical, "cached-image:fast".to_string());
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_| {
+                panic!("build_fn must not be called on a cache hit")
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), "cached-image:fast");
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_second_check_cache_hit() {
+        // Simulate the second-check path: cache is empty when we first look,
+        // but is populated by the time we hold the per-path lock.
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Acquire the per-path lock ourselves so that
+        // get_or_build_image_using blocks waiting for it.  While it is
+        // waiting we populate the cache, then release the lock so the second
+        // cache check inside the function sees the value and short-circuits
+        // without calling the build function.
+        let path_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        {
+            let mut locks = build_locks.lock().await;
+            locks.insert(canonical.clone(), Arc::clone(&path_lock));
+        }
+        let held = path_lock.lock().await;
+
+        let cache_clone = Arc::clone(&cache);
+        let canonical_clone = canonical.clone();
+        let build_locks_clone = Arc::clone(&build_locks);
+        let dir_path = dir.path().to_path_buf();
+
+        // Spawn the function — it will block because we hold the lock.
+        let handle = tokio::spawn(async move {
+            TaskManager::get_or_build_image_using(
+                &cache_clone,
+                &build_locks_clone,
+                &dir_path,
+                |_| panic!("build_fn must not be called on a cache hit"),
+            )
+            .await
+        });
+
+        // Give the spawned task time to start and block on the lock.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Populate the cache while the task is waiting.
+        cache
+            .write()
+            .await
+            .insert(canonical_clone, "second-check-hit:latest".to_string());
+
+        // Release the per-path lock so the task can proceed to the
+        // second cache check, where it will find the value we just inserted.
+        drop(held);
+
+        let result = handle.await.unwrap();
+        assert_eq!(result.unwrap(), "second-check-hit:latest");
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_build_failure() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_| {
+                Err("build exploded".to_string())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "build exploded");
+
+        // Cache must remain empty after a build failure.
+        let canonical = dir.path().canonicalize().unwrap();
+        let cache_read = cache.read().await;
+        assert!(cache_read.get(&canonical).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_submit_container_path_workspace_fail_with_cached_image() {
+        // Inject a pre-built image into the cache so that get_or_build_image
+        // returns immediately, then verify that a subsequent workspace-creation
+        // failure (non-git directory) is correctly recorded as
+        // WorkspaceCreationFailed.
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo_dir.path().join(".devcontainer")).unwrap();
+
+        // Pre-populate the image cache so get_or_build_image does not try to
+        // run nix.
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.image_cache.write().await;
+            cache.insert(canonical, "pre-built:latest".to_string());
+        }
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                // repo_dir is not a git repo so the worktree creation fails,
+                // which is reported as WorkspaceCreationFailed.
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete within 5 s"
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }

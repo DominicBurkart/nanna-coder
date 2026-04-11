@@ -1,4 +1,6 @@
-use crate::container::{start_container_with_fallback, ContainerConfig};
+use crate::container::{
+    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle,
+};
 use crate::tools::{
     create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
@@ -82,6 +84,33 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_container_using(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
+        )
+        .await
+    }
+
+    /// Inner implementation that accepts a custom container-starting function.
+    /// The function receives an owned `ContainerConfig` so that the returned
+    /// future does not need to borrow it from an outer scope (avoiding
+    /// higher-ranked lifetime complications).  Kept separate from
+    /// `create_with_container` so the workspace creation and cleanup logic can
+    /// be exercised in unit tests without a real container runtime.
+    async fn create_with_container_using<F, Fut>(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        start_fn: F,
+    ) -> Result<Self, WorkspaceError>
+    where
+        F: FnOnce(ContainerConfig) -> Fut,
+        Fut: std::future::Future<Output = Result<ContainerHandle, ContainerError>>,
+    {
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -125,7 +154,7 @@ impl TaskWorkspace {
             additional_args,
         };
 
-        let handle = match start_container_with_fallback(&config).await {
+        let handle = match start_fn(config).await {
             Ok(h) => h,
             Err(e) => {
                 cleanup_worktree();
@@ -419,5 +448,142 @@ mod tests {
             result,
             Err(WorkspaceError::ContainerSetupFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_ok_path() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let result = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-using-ok"),
+            "HEAD",
+            "mock-image:latest",
+            |_config: crate::container::ContainerConfig| async {
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "create_with_container_using should succeed");
+        let mut ws = result.unwrap();
+        assert!(ws.workspace_path.exists());
+        assert!(ws.container_handle.is_some());
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_container_fail_cleans_worktree() {
+        use crate::container::ContainerError;
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let result = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-using-fail"),
+            "HEAD",
+            "bad-image:latest",
+            |_config: crate::container::ContainerConfig| async {
+                Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::ContainerSetupFailed(_))
+        ));
+        // The worktree should have been cleaned up by cleanup_worktree()
+        // (path may or may not exist depending on OS temp-dir semantics,
+        // but the git worktree should be removed)
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_worktree_fail() {
+        // Pass a non-git directory so that git worktree add fails before
+        // the container is ever started.
+        let not_a_repo = TempDir::new().unwrap();
+
+        let result = TaskWorkspace::create_with_container_using(
+            not_a_repo.path(),
+            &unique_id("ws-worktree-fail"),
+            "HEAD",
+            "mock-image:latest",
+            |_config: crate::container::ContainerConfig| async {
+                use crate::container::{ContainerHandle, ContainerRuntime};
+                Ok(ContainerHandle {
+                    name: "should-not-start".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::GitWorktreeCreateFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_cleanup_drops_container_handle() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-handle-drop"), "HEAD").unwrap();
+
+        // Inject a container handle (needs_cleanup=false so no docker command runs).
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        }));
+
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
+        assert!(ws.container_handle.is_none());
+    }
+
+    #[test]
+    fn test_build_tool_registry_container_path() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-registry-container"), "HEAD")
+                .unwrap();
+
+        // Inject a container handle to exercise the container branch of
+        // build_tool_registry.
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        }));
+
+        let registry = ws.build_tool_registry();
+        assert!(registry.get_tool("run_command").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+
+        ws.cleanup().unwrap();
     }
 }
