@@ -1,11 +1,11 @@
 # Nanna Coder
 
-A highly opinionated local coding assistant (WIP).
+A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
 
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Agent control loop and implementation details
+- [AGENTS.md](AGENTS.md) - Instructions for agents building nanna
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
 
 ## Technologies
