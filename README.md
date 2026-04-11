@@ -1,11 +1,13 @@
 # Nanna Coder
 
-A highly opinionated local coding assistant (WIP).
+A coding agent for coding agents. 
+
+Nanna is a a delegation agent, designed for background agents to use to defer clearly defined work to local models or secondary model providers.
 
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Agent control loop and implementation details
+- [AGENTS.md](AGENTS.md) - Implementation commands details
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
 
 ## Technologies
