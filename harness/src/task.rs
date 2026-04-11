@@ -342,7 +342,7 @@ impl TaskManager {
                     }
                 }
                 Ok(mut workspace) => {
-                    let tool_registry = workspace.create_container_tool_registry();
+                    let tool_registry = workspace.build_tool_registry();
                     let entity_store = InMemoryEntityStore::new();
                     let agent_config = AgentConfig {
                         max_iterations,

@@ -1,7 +1,7 @@
 use harness::agent::{AgentConfig, AgentContext, AgentLoop};
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig, ContainerRuntime,
+    ContainerConfig,
 };
 use harness::entities::InMemoryEntityStore;
 use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -54,7 +54,7 @@ async fn test_dev_container_fibonacci_to_primes() {
     for attempt in 0..MAX_ATTEMPTS {
         eprintln!("Attempt {}/{}", attempt + 1, MAX_ATTEMPTS);
 
-        let result = timeout(TEST_TIMEOUT, run_single_attempt(&runtime, &image_ref)).await;
+        let result = timeout(TEST_TIMEOUT, run_single_attempt(&image_ref)).await;
 
         match result {
             Ok(Ok(())) => {
@@ -79,7 +79,7 @@ async fn test_dev_container_fibonacci_to_primes() {
     );
 }
 
-async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Result<(), String> {
+async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
     let tempdir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let workspace = tempdir.path().to_path_buf();
 
@@ -88,10 +88,7 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
 
     let container_name = format!("nanna-dev-container-test-{}", uuid::Uuid::new_v4());
 
-    let mut additional_args = vec![format!("-v={}:/workspace", workspace.display())];
-    if *runtime == ContainerRuntime::Podman {
-        additional_args.push("--userns=keep-id".to_string());
-    }
+    let additional_args = vec![format!("-v={}:/workspace", workspace.display())];
 
     let config = ContainerConfig {
         base_image: image_ref.to_string(),

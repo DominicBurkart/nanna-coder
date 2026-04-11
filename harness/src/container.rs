@@ -370,6 +370,12 @@ pub async fn start_container_with_fallback(
     let mut cmd = Command::new(runtime.command());
     cmd.args(["run", "-d", "--name", &config.container_name]);
 
+    // Podman requires --userns=keep-id so files created inside the container
+    // are owned by the host user rather than root.
+    if runtime == ContainerRuntime::Podman {
+        cmd.arg("--userns=keep-id");
+    }
+
     // Add port mapping if specified
     if let Some((host_port, container_port)) = config.port_mapping {
         cmd.args(["-p", &format!("{}:{}", host_port, container_port)]);

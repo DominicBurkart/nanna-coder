@@ -1,6 +1,4 @@
-use crate::container::{
-    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerRuntime,
-};
+use crate::container::{start_container_with_fallback, ContainerConfig};
 use crate::tools::{
     create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
@@ -24,8 +22,6 @@ pub enum WorkspaceError {
     FormatPatchFailed(String),
     #[error("Container setup failed: {0}")]
     ContainerSetupFailed(String),
-    #[error("No container runtime available")]
-    NoContainerRuntime,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -111,23 +107,11 @@ impl TaskWorkspace {
                 .output();
         };
 
-        // Detect once so the availability check and the Podman-specific flag
-        // both see the same runtime; `start_container_with_fallback` does its
-        // own internal detection but we need the value here first.
-        let runtime = detect_runtime();
-        if !runtime.is_available() {
-            cleanup_worktree();
-            return Err(WorkspaceError::NoContainerRuntime);
-        }
-
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![format!(
+        let additional_args = vec![format!(
             "-v={}:{CONTAINER_WORKSPACE_DIR}",
             workspace_path.display()
         )];
-        if runtime == ContainerRuntime::Podman {
-            additional_args.push("--userns=keep-id".to_string());
-        }
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),
@@ -179,7 +163,9 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub fn create_container_tool_registry(&self) -> ToolRegistry {
+    /// Returns a tool registry appropriate for this workspace: container-bound
+    /// when a container handle is present, plain otherwise.
+    pub fn build_tool_registry(&self) -> ToolRegistry {
         if let Some(handle) = &self.container_handle {
             create_container_tool_registry(
                 &self.workspace_path,
@@ -316,7 +302,7 @@ mod tests {
 
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-registry"), "HEAD").unwrap();
-        let registry = ws.create_container_tool_registry();
+        let registry = ws.build_tool_registry();
         assert!(registry.get_tool("read_file").is_some());
         ws.cleanup().unwrap();
     }
@@ -412,6 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_with_container_no_runtime() {
+        use crate::container::detect_runtime;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
@@ -428,6 +415,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(WorkspaceError::NoContainerRuntime)));
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::ContainerSetupFailed(_))
+        ));
     }
 }
