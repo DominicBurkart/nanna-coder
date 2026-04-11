@@ -60,3 +60,6 @@ result-*
 # Local development
 .local/
 .cache/
+
+# MCP config (machine-specific paths)
+.mcp.json

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
+# Unset git env vars inherited from the commit process so that
+# subprocesses (especially integration tests that spawn git) don't
+# corrupt the parent repo's index.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 echo "Running comprehensive pre-commit checks..."
 
 # Rust: Format check
