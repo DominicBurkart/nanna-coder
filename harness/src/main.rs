@@ -494,6 +494,8 @@ async fn run_mcp_server(
 
     let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
 
-    server.run_stdio().await?;
+    let reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let writer = tokio::io::stdout();
+    server.serve(reader, writer).await?;
     Ok(())
 }
