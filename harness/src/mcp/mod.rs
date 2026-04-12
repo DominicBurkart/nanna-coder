@@ -463,6 +463,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_serve_skips_blank_lines_between_requests() {
+        let input = b"\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(std::io::Cursor::new(input), &mut output)
+            .await
+            .unwrap();
+        let responses = parse_responses(&output);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_serve_returns_parse_error_on_invalid_json() {
+        let input = b"not-json-at-all\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(std::io::Cursor::new(input), &mut output)
+            .await
+            .unwrap();
+        let responses = parse_responses(&output);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert!(responses[0]["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_serve_returns_cleanly_on_eof_with_no_input() {
+        let input: Vec<u8> = Vec::new();
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(std::io::Cursor::new(input), &mut output)
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_serve_does_not_emit_content_length_headers() {
         let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
