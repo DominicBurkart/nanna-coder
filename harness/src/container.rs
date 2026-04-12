@@ -663,46 +663,13 @@ mod kani_proofs {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Verify that `SharedModelPool::release` semantics never underflow.
-    ///
-    /// The real `release()` calls `fetch_sub(1, SeqCst)` without guarding
-    /// against a zero ref-count. This harness demonstrates that calling
-    /// `release` more times than `get_or_start` will wrap the counter
-    /// (unsigned underflow). We verify the *expected* invariant: after N
-    /// increments and up-to-N decrements the counter must stay in [0, N].
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn release_ref_count_no_underflow() {
-        let increments: usize = kani::any();
-        kani::assume(increments <= 5);
-
-        let decrements: usize = kani::any();
-        kani::assume(decrements <= 5);
-
-        let counter = AtomicUsize::new(0);
-
-        // Simulate `get_or_start` increments
-        for _ in 0..increments {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // Simulate `release` decrements — must not exceed increments
-        let safe_decrements = if decrements > increments {
-            increments
-        } else {
-            decrements
-        };
-
-        for _ in 0..safe_decrements {
-            let prev = counter.load(Ordering::SeqCst);
-            // This is the guard that the real code is missing:
-            assert!(prev > 0, "release called when ref_count is already 0");
-            counter.fetch_sub(1, Ordering::SeqCst);
-        }
-
-        let final_val = counter.load(Ordering::SeqCst);
-        assert!(final_val <= increments);
-    }
+    // Note: a prior `release_ref_count_no_underflow` harness was removed
+    // because it modelled a bare `AtomicUsize` rather than driving the real
+    // `SharedModelPool::get_or_start` / `release` code paths (which are
+    // async and do container I/O, making them impractical to proof-check
+    // under Kani today). The remaining `release_underflow_wraps` proof
+    // demonstrates the underflow bug directly on `AtomicUsize`, which is
+    // the actual primitive used inside `SharedModelPool::release`.
 
     /// Show that an unguarded fetch_sub on zero wraps to usize::MAX.
     #[kani::proof]

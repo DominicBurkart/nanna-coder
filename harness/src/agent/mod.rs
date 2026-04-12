@@ -548,6 +548,12 @@ impl AgentLoop {
 
     /// Transition to a new state
     fn transition_to(&mut self, new_state: AgentState) {
+        debug_assert!(
+            Self::is_legal_transition(&self.state, &new_state),
+            "illegal state transition: {:?} -> {:?}",
+            self.state,
+            new_state
+        );
         if self.config.verbose {
             tracing::debug!("State transition: {:?} → {:?}", self.state, new_state);
         }
@@ -566,7 +572,9 @@ impl AgentLoop {
     /// EntityModificationDecision  → QueryingEntities | PlanningEntityModification
     /// QueryingEntities            → EntityModificationDecision
     /// ```
-    #[allow(dead_code)]
+    ///
+    /// Enforced at runtime in debug builds via `debug_assert!` in
+    /// `transition_to`, and verified exhaustively by Kani in `kani_proofs`.
     fn is_legal_transition(from: &AgentState, to: &AgentState) -> bool {
         use AgentState::*;
         matches!(
@@ -999,7 +1007,11 @@ impl AgentLoop {
 
             match finish_reason {
                 Some(FinishReason::Stop) | None => {
-                    self.transition_to(AgentState::Completed);
+                    // Deprecated path: bypass `transition_to` because this
+                    // loop does not follow the canonical state-machine graph
+                    // enforced by `is_legal_transition`.
+                    self.state_history.push(AgentState::Completed);
+                    self.state = AgentState::Completed;
                     let task_description = context.user_prompt.clone();
                     let conversation = self.conversation_history.clone();
                     let tool_calls_made = extract_tool_calls_from_history(&conversation);

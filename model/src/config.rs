@@ -145,14 +145,25 @@ mod kani_proofs {
         }
     }
 
-    /// ModelDefaults temperature must be non-negative.
+    /// The concrete `ModelDefaults::default()` temperature must fall
+    /// inside `OllamaConfig::validate`'s accepted range. Exercises the
+    /// real default constructor and verifies the invariant against the
+    /// actual value, not a re-asserted assumption.
     #[kani::proof]
-    fn model_defaults_temperature_non_negative() {
-        let temp: f32 = kani::any();
-        kani::assume(!temp.is_nan());
-        kani::assume((0.0..=2.0f32).contains(&temp));
-        assert!(temp >= 0.0);
-        assert!(temp <= 2.0);
+    fn model_defaults_default_temperature_is_valid() {
+        let defaults = super::ModelDefaults::default();
+        assert!(!defaults.temperature.is_nan());
+        assert!((0.0..=2.0f32).contains(&defaults.temperature));
+    }
+
+    /// The concrete `OllamaConfig::default()` must pass `validate()`.
+    /// If a future change to the defaults introduces an out-of-range
+    /// temperature, zero context length, or zero timeout, this proof
+    /// fails at verification time.
+    #[kani::proof]
+    fn ollama_config_default_validates() {
+        let cfg = super::OllamaConfig::default();
+        assert!(cfg.validate().is_ok());
     }
 }
 

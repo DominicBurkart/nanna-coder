@@ -507,7 +507,13 @@ mod kani_proofs {
         assert_eq!(map.len(), 1);
     }
 
-    /// store() rejects duplicates (mirrors InMemoryEntityStore::store).
+    /// store() rejects duplicates (mirrors InMemoryEntityStore::store,
+    /// which returns `Err(AlreadyExists)` on the second insert).
+    ///
+    /// We model this with the raw `HashMap` API so Kani can verify it
+    /// without async runtime. `HashMap::insert` returns `None` for a new
+    /// key and `Some(previous_value)` for a duplicate — the latter is the
+    /// signal that a `contains_key` guard in `store()` would fire on.
     #[kani::proof]
     fn store_rejects_duplicate() {
         let mut map: HashMap<u8, u8> = HashMap::new();
@@ -515,11 +521,28 @@ mod kani_proofs {
         let v1: u8 = kani::any();
         let v2: u8 = kani::any();
 
-        assert!(map.insert(key, v1).is_none()); // first insert succeeds (no old value)
+        // First insert must succeed (no previous value).
+        assert!(map.insert(key, v1).is_none());
 
-        // The real store checks contains_key before inserting
-        let already_exists = map.contains_key(&key);
-        assert!(already_exists, "Duplicate key must be detected");
+        // Mirror the `contains_key` guard used by `InMemoryEntityStore::store`.
+        // If we follow the real code path, we must reject the duplicate *before*
+        // mutating the map, leaving the original value untouched.
+        if map.contains_key(&key) {
+            // Duplicate detected — do NOT insert.
+            assert_eq!(map.get(&key), Some(&v1));
+            assert_eq!(map.len(), 1);
+        } else {
+            // Unreachable given the assertion above, but included so the
+            // proof fails loudly if the first insert didn't actually land.
+            assert!(false, "first insert did not persist");
+        }
+
+        // As a second independent witness: bypassing the guard and letting
+        // `HashMap::insert` overwrite returns `Some(old_value)` — i.e., the
+        // duplicate is observable from the return value, which is exactly
+        // what a guard would branch on.
+        let overwritten = map.insert(key, v2);
+        assert_eq!(overwritten, Some(v1));
     }
 
     /// delete() removes an entity and preserves others.
@@ -561,14 +584,12 @@ mod kani_proofs {
         assert!(results.len() <= limit);
     }
 
-    /// EntityMetadata version starts at 1.
-    #[kani::proof]
-    fn metadata_version_starts_at_one() {
-        // We can't call EntityMetadata::new (it uses chrono/uuid),
-        // so verify the invariant directly.
-        let version: u64 = 1;
-        assert!(version > 0);
-    }
+    // Note: a prior `metadata_version_starts_at_one` harness was removed
+    // because it was a tautology (`let version: u64 = 1; assert!(version > 0)`)
+    // that never actually touched `EntityMetadata::new`. `EntityMetadata::new`
+    // uses chrono/uuid which are impractical to model under Kani today; the
+    // `version == 1` invariant is instead covered by the unit test
+    // `test_entity_metadata_creation` below.
 }
 
 #[cfg(test)]
