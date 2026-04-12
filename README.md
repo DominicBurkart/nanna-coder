@@ -63,6 +63,12 @@ cargo run --bin harness -- agent --prompt "Your task description" --tools
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
 ```
 
+### Using as an MCP Server (Claude Code)
+
+```bash
+nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
+```
+
 ### Using Cachix (Optional but Recommended)
 
 Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
