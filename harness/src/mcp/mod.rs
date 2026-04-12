@@ -73,14 +73,14 @@ impl NannaMcpServer {
         }
     }
 
-    pub async fn run_stdio(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run_stdio(&self) -> Result<(), Box<dyn std::error::Error>> {
         let reader = BufReader::new(tokio::io::stdin());
         let writer = tokio::io::stdout();
         self.serve(reader, writer).await
     }
 
     pub async fn serve<R, W>(
-        self,
+        &self,
         mut reader: R,
         mut writer: W,
     ) -> Result<(), Box<dyn std::error::Error>>
@@ -95,25 +95,34 @@ impl NannaMcpServer {
             if bytes_read == 0 {
                 return Ok(());
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            if let Some(response_bytes) = self.process_line(&line).await? {
+                writer.write_all(&response_bytes).await?;
+                writer.flush().await?;
             }
-
-            let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-                Ok(req) => self.handle_request(req).await,
-                Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e)),
-            };
-
-            if response.id.is_none() && response.error.is_none() {
-                continue;
-            }
-
-            let mut body = serde_json::to_vec(&response)?;
-            body.push(b'\n');
-            writer.write_all(&body).await?;
-            writer.flush().await?;
         }
+    }
+
+    async fn process_line(
+        &self,
+        line: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(req) => self.handle_request(req).await,
+            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e)),
+        };
+
+        if response.id.is_none() && response.error.is_none() {
+            return Ok(None);
+        }
+
+        let mut body = serde_json::to_vec(&response)?;
+        body.push(b'\n');
+        Ok(Some(body))
     }
 
     async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
@@ -408,111 +417,88 @@ mod tests {
         assert!(resp.error.is_some());
     }
 
-    fn parse_responses(bytes: &[u8]) -> Vec<serde_json::Value> {
-        std::str::from_utf8(bytes)
+    fn parse_response(bytes: &[u8]) -> serde_json::Value {
+        let s = std::str::from_utf8(bytes).unwrap();
+        assert!(s.ends_with('\n'), "response must end with newline: {s}");
+        serde_json::from_str(s.trim_end()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_process_line_initialize_returns_single_line_json() {
+        let line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n";
+        let bytes = make_server().process_line(line).await.unwrap().unwrap();
+        let v = parse_response(&bytes);
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert!(v["result"]["capabilities"]["tools"].is_object());
+        assert!(!std::str::from_utf8(&bytes)
             .unwrap()
-            .split('\n')
-            .filter(|s| !s.is_empty())
-            .map(|s| serde_json::from_str(s).unwrap())
-            .collect()
+            .contains("Content-Length"));
     }
 
     #[tokio::test]
-    async fn test_serve_initialize_via_newline_framing() {
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
+    async fn test_process_line_tools_list_returns_newline_terminated() {
+        let bytes = make_server()
+            .process_line("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap()
+            .unwrap();
+        let v = parse_response(&bytes);
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_process_line_notification_produces_none() {
+        let out = make_server()
+            .process_line("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
             .await
             .unwrap();
-        let responses = parse_responses(&output);
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
-        assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+        assert!(out.is_none());
     }
 
     #[tokio::test]
-    async fn test_serve_handles_multiple_requests_sequentially() {
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
+    async fn test_process_line_blank_returns_none() {
+        assert!(make_server().process_line("").await.unwrap().is_none());
+        assert!(make_server().process_line("   \n").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_line_invalid_json_returns_parse_error() {
+        let bytes = make_server()
+            .process_line("not-json-at-all\n")
             .await
+            .unwrap()
             .unwrap();
-        let responses = parse_responses(&output);
-        assert_eq!(responses.len(), 2);
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[1]["id"], 2);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 6);
+        let v = parse_response(&bytes);
+        assert_eq!(v["error"]["code"], -32700);
+        assert!(v["id"].is_null());
     }
 
     #[tokio::test]
-    async fn test_serve_notification_produces_no_response() {
-        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
-            .await
-            .unwrap();
-        assert!(
-            output.is_empty(),
-            "notification must produce no bytes, got {:?}",
-            output
-        );
-    }
-
-    #[tokio::test]
-    async fn test_serve_skips_blank_lines_between_requests() {
-        let input = b"\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
-            .await
-            .unwrap();
-        let responses = parse_responses(&output);
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["id"], 1);
-    }
-
-    #[tokio::test]
-    async fn test_serve_returns_parse_error_on_invalid_json() {
-        let input = b"not-json-at-all\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
-            .await
-            .unwrap();
-        let responses = parse_responses(&output);
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["error"]["code"], -32700);
-        assert!(responses[0]["id"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_serve_returns_cleanly_on_eof_with_no_input() {
-        let input: Vec<u8> = Vec::new();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
-            .await
-            .unwrap();
-        assert!(output.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_serve_does_not_emit_content_length_headers() {
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n".to_vec();
+    async fn test_serve_drives_process_line_over_async_io() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
         make_server()
             .serve(std::io::Cursor::new(input), &mut output)
             .await
             .unwrap();
         let text = std::str::from_utf8(&output).unwrap();
-        assert!(
-            !text.contains("Content-Length"),
-            "response must be newline-delimited JSON, not LSP-framed: {text}"
-        );
-        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.split('\n').filter(|s| !s.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v0["id"], 1);
+        assert_eq!(v1["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_serve_returns_cleanly_on_eof_with_no_input() {
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(std::io::Cursor::new(Vec::<u8>::new()), &mut output)
+            .await
+            .unwrap();
+        assert!(output.is_empty());
     }
 }
