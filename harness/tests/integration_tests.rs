@@ -27,7 +27,7 @@ use tokio::time::{sleep, timeout};
 // use futures::future; // Reserved for future concurrent test implementation
 
 // E2E test configuration
-const E2E_MODEL: &str = "qwen3:0.6b";
+const E2E_MODEL: &str = "gemma4:e4b";
 const E2E_TIMEOUT: Duration = Duration::from_secs(300);
 const CONTAINER_STARTUP_WAIT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
