@@ -194,11 +194,16 @@ pub fn verify_image_exists(
         return Err(ContainerError::NoRuntimeAvailable);
     }
 
+    // `podman image exists` is a Podman-only subcommand; Docker does not support it.
+    // Use `image inspect` instead, which works correctly for both Docker and Podman:
+    // it exits 0 when the image is present and non-zero when it is absent.
     let output = Command::new(runtime.command())
-        .args(["image", "exists", image_name])
+        .args(["image", "inspect", "--format", "{{.Id}}", image_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .output()
         .map_err(|_e| ContainerError::CommandFailed {
-            command: format!("{} image exists {}", runtime.command(), image_name),
+            command: format!("{} image inspect {}", runtime.command(), image_name),
         })?;
 
     Ok(output.status.success())
