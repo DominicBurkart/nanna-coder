@@ -53,7 +53,16 @@ flowchart TD
 
 # API
 
-The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface: `assign_task` submits work and returns a `task_id`; `poll_task` returns the task's current status; `get_result` retrieves the final output once a task completes; `list_tasks` enumerates known tasks and their states; `cancel_task` requests termination of an in-flight task; and `onboard_repo` registers a repository so subsequent tasks can operate against it.
+The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface.
+
+The six MCP tools form a complete task-delegation surface:
+
+- **`assign_task`** — submit a new task (natural-language description plus target repo) and receive a `task_id`. Nanna spawns an agent loop in an isolated worktree on the designated repository.
+- **`poll_task`** — query the current status of a task by `task_id` without blocking. Returns one of `running`, `completed`, `failed`, or `cancelled`, allowing orchestrators to interleave work on multiple tasks.
+- **`get_result`** — fetch the final result for a completed task (conversation snapshot, tool calls made, result summary, and any written artefacts). Safe to call repeatedly.
+- **`list_tasks`** — enumerate all tasks Nanna is currently tracking along with their states, giving orchestrators a view over in-flight work without needing to remember every `task_id` they dispatched.
+- **`cancel_task`** — request termination of a running task by `task_id`. Nanna stops its agent loop at the next safe checkpoint and transitions the task to the `cancelled` state so subsequent `get_result` calls return a consistent terminal record.
+- **`onboard_repo`** — register a new repository with Nanna (clone, index entities, and prepare a reusable worktree pool) so that later `assign_task` calls against that repo start immediately instead of paying cold-start cost.
 
 ```mermaid
 ---
