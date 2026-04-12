@@ -23,10 +23,6 @@ impl Default for OllamaConfig {
 }
 
 impl OllamaConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -115,7 +111,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = OllamaConfig::new()
+        let config = OllamaConfig::default()
             .with_base_url("https://api.example.com")
             .with_context_length(50_000)
             .with_temperature(0.5)

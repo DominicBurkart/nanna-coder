@@ -4,6 +4,7 @@ use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
 use model::prelude::*;
+use model::provider::ModelProvider;
 use std::io::{self, Write};
 use tracing::{error, info};
 
@@ -180,8 +181,8 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
     store
 }
 
-async fn single_chat(
-    provider: &OllamaProvider,
+async fn single_chat<P: ModelProvider>(
+    provider: &P,
     tool_registry: &ToolRegistry,
     model: &str,
     prompt: &str,
@@ -248,8 +249,8 @@ async fn single_chat(
     Ok(())
 }
 
-async fn interactive_chat(
-    provider: &OllamaProvider,
+async fn interactive_chat<P: ModelProvider>(
+    provider: &P,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
@@ -348,7 +349,9 @@ async fn interactive_chat(
     Ok(())
 }
 
-async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_models<P: ModelProvider>(
+    provider: &P,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Available models:");
     let models = provider.list_models().await?;
 
@@ -386,16 +389,18 @@ fn list_tools(tool_registry: &ToolRegistry) {
     }
 }
 
-async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn health_check<P: ModelProvider>(
+    provider: &P,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Performing health check...");
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }

@@ -17,11 +17,15 @@ pub use types::{
 pub use ollama::OllamaProvider;
 
 pub mod prelude {
-    pub use crate::config::*;
-    pub use crate::judge::*;
-    pub use crate::provider::*;
-    pub use crate::types::*;
+    pub use crate::config::{ModelDefaults, OllamaConfig};
+    pub use crate::judge::{JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult};
+    pub use crate::provider::{ModelError, ModelProvider, ModelResult, StreamingModelProvider};
+    pub use crate::types::{
+        ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall,
+        FunctionDefinition, JsonSchema, MessageRole, ModelInfo, PropertySchema, SchemaType,
+        ToolCall, ToolChoice, ToolDefinition, Usage,
+    };
 
     #[cfg(feature = "ollama")]
-    pub use crate::ollama::*;
+    pub use crate::ollama::OllamaProvider;
 }
