@@ -8,3 +8,6 @@ coverage:
         # in CI (no container runtime / Ollama available), so some new
         # container-dispatch branches are genuinely uncoverable there.
         target: 90%
+
+ignore:
+  - "harness/src/main.rs"
