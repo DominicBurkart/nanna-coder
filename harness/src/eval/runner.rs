@@ -206,7 +206,7 @@ pub async fn run_eval(
 
     let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
 
-    let agent_outcome = tokio::time::timeout(timeout, agent.run(context)).await;
+    let agent_outcome = tokio::time::timeout(timeout, agent.run_tool_loop(context)).await;
 
     let (agent_result, mut failures) = match agent_outcome {
         Ok(Ok(result)) => {

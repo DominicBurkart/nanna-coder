@@ -444,8 +444,10 @@ impl AgentLoop {
 
     /// Run the agent loop with the given context.
     ///
-    /// All agents flow through the architectural state machine:
+    /// Flows through the architectural state machine:
     /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
+    /// When both a tool registry and LLM provider are present, the
+    /// `PerformingEntityModification` state dispatches to `run_tool_loop`.
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
@@ -924,11 +926,11 @@ impl AgentLoop {
 
     /// Full tool-calling run loop — formerly used when tool_registry is set.
     ///
-    /// Deprecated: The state machine `run()` method now handles tools via
-    /// `perform_entity_modification_with_tools()` in the Performing state, following the architecture.
-    #[deprecated(note = "run() now handles tools via the state machine")]
-    #[allow(dead_code)]
-    async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
+    /// Drive the agent via direct LLM tool-calling, bypassing the state machine.
+    ///
+    /// Used by the eval runner and tests that need to measure raw LLM iteration
+    /// counts and token usage without the planning/completion-check overhead.
+    pub async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
 
         if !self.config.system_prompt.is_empty() {
@@ -2119,7 +2121,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.run(context).await.unwrap();
+        let result = agent.run_tool_loop(context).await.unwrap();
         assert_eq!(
             result.iterations, 1,
             "Stop on first call should count as 1 iteration"
@@ -2146,7 +2148,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.run(context).await.unwrap();
+        let result = agent.run_tool_loop(context).await.unwrap();
         assert_eq!(
             result.iterations, 2,
             "One tool call then stop should count as 2 iterations"
@@ -2187,7 +2189,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.run(context).await.unwrap();
+        let result = agent.run_tool_loop(context).await.unwrap();
         let usage = result
             .token_usage
             .expect("tool loop should return Some(usage)");
