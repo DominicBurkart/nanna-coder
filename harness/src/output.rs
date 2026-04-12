@@ -277,4 +277,55 @@ mod tests {
         let s = render(&serde_json::json!("hello"), OutputFormat::Human);
         assert!(s.contains("hello"));
     }
+
+    #[test]
+    fn test_exit_code_process_exit_success() {
+        // Verify process_exit() returns the right exit code value.
+        let code = ExitCode::Success.process_exit();
+        // std::process::ExitCode doesn't expose its value directly, but we can
+        // verify the method compiles and runs without panicking.
+        let _ = code;
+    }
+
+    #[test]
+    fn test_exit_code_process_exit_interrupted() {
+        let code = ExitCode::Interrupted.process_exit();
+        let _ = code;
+    }
+
+    #[test]
+    fn test_human_bool_in_array() {
+        // Hits the `_ =>` fallthrough arm in array item rendering.
+        let v = serde_json::json!([true, false]);
+        let s = render(&v, OutputFormat::Human);
+        assert!(s.contains("true"));
+        assert!(s.contains("false"));
+    }
+
+    #[test]
+    fn test_human_null_in_array() {
+        // Also hits the `_ =>` fallthrough arm in array item rendering.
+        let v = serde_json::json!([null]);
+        let s = render(&v, OutputFormat::Human);
+        assert!(s.contains("null"));
+    }
+
+    #[test]
+    fn test_human_nested_object_in_object() {
+        // Hits the `Value::Object(_) | Value::Array(_)` arm in object rendering.
+        let v = serde_json::json!({"outer": {"inner": "value"}});
+        let s = render(&v, OutputFormat::Human);
+        assert!(s.contains("outer:"));
+        assert!(s.contains("inner: value"));
+    }
+
+    #[test]
+    fn test_human_array_in_object() {
+        // Also hits the `Value::Object(_) | Value::Array(_)` arm in object rendering.
+        let v = serde_json::json!({"items": ["a", "b"]});
+        let s = render(&v, OutputFormat::Human);
+        assert!(s.contains("items:"));
+        assert!(s.contains("- a"));
+        assert!(s.contains("- b"));
+    }
 }
