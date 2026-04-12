@@ -499,3 +499,19 @@ async fn run_mcp_server(
     server.serve(reader, writer).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// nextest (and tarpaulin) connect test-process stdin to a closed pipe,
+    /// so `serve()` reads EOF immediately and returns Ok(()).
+    /// This covers the three lines in `run_mcp_server` that construct the
+    /// real reader/writer and drive the serve loop.
+    #[tokio::test]
+    async fn test_run_mcp_server_returns_cleanly_on_stdin_eof() {
+        run_mcp_server("qwen3:0.6b", 1)
+            .await
+            .expect("run_mcp_server should succeed when stdin is closed (EOF)");
+    }
+}

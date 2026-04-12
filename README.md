@@ -66,7 +66,7 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 ### Using as an MCP Server (Claude Code)
 
 ```bash
-nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
+nix develop --command cargo build --release --bin harness && claude mcp add -s user nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
 ### Using Cachix (Optional but Recommended)
