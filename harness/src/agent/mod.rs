@@ -202,9 +202,6 @@ pub struct AgentContext {
     pub user_prompt: String,
     pub conversation_history: Vec<ChatMessage>,
     pub app_state_id: String,
-    /// Working directory for filesystem operations.  `None` means the agent
-    /// uses whatever workspace root was configured on its tools at construction.
-    pub work_dir: Option<std::path::PathBuf>,
 }
 
 /// Result of running the agent
@@ -222,8 +219,9 @@ pub struct AgentRunResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Snapshot of the full conversation
     pub conversation_snapshot: Vec<ChatMessage>,
-    /// Aggregated token usage across all LLM calls
-    pub token_usage: Usage,
+    /// Aggregated token usage across all LLM calls. `None` when the
+    /// entity-based loop ran without an LLM provider.
+    pub token_usage: Option<Usage>,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -494,11 +492,7 @@ impl AgentLoop {
                     result_summary,
                     tool_calls_made,
                     conversation_snapshot: conversation,
-                    token_usage: Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                    },
+                    token_usage: None,
                 });
             }
 
@@ -1024,7 +1018,7 @@ impl AgentLoop {
                         result_summary,
                         tool_calls_made,
                         conversation_snapshot: conversation,
-                        token_usage: total_usage,
+                        token_usage: Some(total_usage),
                     });
                 }
                 Some(FinishReason::ToolCalls) => {
@@ -1304,7 +1298,6 @@ mod tests {
             user_prompt: "Echo hello".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         // Pre-populate conversation history (normally done by run())
@@ -1354,7 +1347,6 @@ mod tests {
             user_prompt: "Do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1389,7 +1381,6 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.perform_entity_modification_mvp(&context).await;
@@ -1432,7 +1423,6 @@ mod tests {
             user_prompt: "Keep looping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let provider_clone = agent.llm_provider.as_ref().unwrap().clone();
@@ -1484,7 +1474,6 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1507,7 +1496,6 @@ mod tests {
             user_prompt: "test prompt".to_string(),
             conversation_history: vec![],
             app_state_id: "test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1530,7 +1518,6 @@ mod tests {
             user_prompt: "Test task".to_string(),
             conversation_history: vec![ChatMessage::user("Test task")],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
         let result = agent.run(context).await;
         assert!(matches!(
@@ -1577,7 +1564,6 @@ mod tests {
             user_prompt: "Create a new git repository entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp_test_state".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1663,7 +1649,6 @@ mod tests {
             user_prompt: "Create a user authentication module".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.plan_entity_modification(&context).await;
@@ -1693,7 +1678,6 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let is_complete = agent.check_task_completion(&context).await.unwrap();
@@ -1732,7 +1716,6 @@ mod tests {
             user_prompt: "Create git repository".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.check_task_completion(&context).await;
@@ -1769,7 +1752,6 @@ mod tests {
             user_prompt: "Add user authentication".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.entity_modification_decision(&context).await;
@@ -1813,7 +1795,6 @@ mod tests {
             user_prompt: "Create a new git repository for authentication service".to_string(),
             conversation_history: vec![],
             app_state_id: "llm_test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1863,7 +1844,6 @@ mod tests {
             user_prompt: "Create entity".to_string(),
             conversation_history: vec![],
             app_state_id: "mvp".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1914,7 +1894,6 @@ mod tests {
                 .to_string(),
             conversation_history: vec![],
             app_state_id: "integration_test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -1944,7 +1923,6 @@ mod tests {
             user_prompt: "store entity test".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -2011,7 +1989,6 @@ mod tests {
             user_prompt: "do something".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await;
@@ -2092,7 +2069,6 @@ mod tests {
             user_prompt: "echo ping".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         agent.run(context).await.unwrap();
@@ -2141,7 +2117,6 @@ mod tests {
             user_prompt: "test".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
@@ -2169,7 +2144,6 @@ mod tests {
             user_prompt: "echo hello".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
@@ -2211,12 +2185,14 @@ mod tests {
             user_prompt: "test usage".to_string(),
             conversation_history: vec![],
             app_state_id: "test".to_string(),
-            work_dir: None,
         };
 
         let result = agent.run(context).await.unwrap();
-        assert_eq!(result.token_usage.prompt_tokens, 300);
-        assert_eq!(result.token_usage.completion_tokens, 130);
-        assert_eq!(result.token_usage.total_tokens, 430);
+        let usage = result
+            .token_usage
+            .expect("tool loop should return Some(usage)");
+        assert_eq!(usage.prompt_tokens, 300);
+        assert_eq!(usage.completion_tokens, 130);
+        assert_eq!(usage.total_tokens, 430);
     }
 }

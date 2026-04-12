@@ -135,7 +135,6 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         user_prompt: "Modify the fibonacci project to compute prime numbers instead.".to_string(),
         conversation_history: vec![],
         app_state_id: uuid::Uuid::new_v4().to_string(),
-        work_dir: None,
     };
 
     let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, registry);
