@@ -17,7 +17,7 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "qwen3:0.6b";
+const E2E_MODEL: &str = "gemma4:e4b";
 
 fn example_repo_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
