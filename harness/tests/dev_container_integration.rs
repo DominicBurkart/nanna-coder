@@ -7,6 +7,7 @@ use harness::entities::InMemoryEntityStore;
 use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
 use harness::tools::{
     ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
+    CONTAINER_WORKSPACE_DIR,
 };
 use image_builder::build_dev_container;
 use model::prelude::*;
@@ -88,7 +89,10 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
 
     let container_name = format!("nanna-dev-container-test-{}", uuid::Uuid::new_v4());
 
-    let additional_args = vec![format!("-v={}:/workspace", workspace.display())];
+    let additional_args = vec![format!(
+        "-v={}:{CONTAINER_WORKSPACE_DIR}",
+        workspace.display()
+    )];
 
     let config = ContainerConfig {
         base_image: image_ref.to_string(),

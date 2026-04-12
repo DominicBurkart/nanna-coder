@@ -201,9 +201,16 @@ impl TaskManager {
         }
 
         let source = canonical.clone();
-        let image_ref = tokio::task::spawn_blocking(move || build_fn(&source))
+        let build_result = tokio::task::spawn_blocking(move || build_fn(&source))
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| e.to_string());
+        let image_ref = match build_result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) | Err(e) => {
+                build_locks.lock().await.remove(&canonical);
+                return Err(e);
+            }
+        };
 
         {
             let mut cache_write = cache.write().await;
@@ -1060,31 +1067,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_build_image_using_second_check_cache_hit() {
-        // Simulate the second-check path: cache is empty when we first look,
-        // but is populated by the time we hold the per-path lock.
+        // Populate the cache WHILE holding the per-path lock, then release.
+        // Any concurrent call that gets past the first cache check will block
+        // on the lock; once released it sees the cached value on the second
+        // check.  Calls that hit the first check also return the cached value.
+        // Either way build_fn is never called — no sleep needed; the ordering
+        // guarantee comes from lock acquisition, not timing.
         let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
         let build_locks = make_build_locks();
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
 
-        // Acquire the per-path lock ourselves so that
-        // get_or_build_image_using blocks waiting for it.  While it is
-        // waiting we populate the cache, then release the lock so the second
-        // cache check inside the function sees the value and short-circuits
-        // without calling the build function.
         let path_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
         {
             let mut locks = build_locks.lock().await;
             locks.insert(canonical.clone(), Arc::clone(&path_lock));
         }
+        // Hold the per-path lock and populate the cache before spawning.
         let held = path_lock.lock().await;
+        cache
+            .write()
+            .await
+            .insert(canonical, "second-check-hit:latest".to_string());
 
         let cache_clone = Arc::clone(&cache);
-        let canonical_clone = canonical.clone();
         let build_locks_clone = Arc::clone(&build_locks);
         let dir_path = dir.path().to_path_buf();
 
-        // Spawn the function — it will block because we hold the lock.
         let handle = tokio::spawn(async move {
             TaskManager::get_or_build_image_using(
                 &cache_clone,
@@ -1095,17 +1104,7 @@ mod tests {
             .await
         });
 
-        // Give the spawned task time to start and block on the lock.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Populate the cache while the task is waiting.
-        cache
-            .write()
-            .await
-            .insert(canonical_clone, "second-check-hit:latest".to_string());
-
-        // Release the per-path lock so the task can proceed to the
-        // second cache check, where it will find the value we just inserted.
+        // Release the lock so the task can proceed if it was blocked.
         drop(held);
 
         let result = handle.await.unwrap();

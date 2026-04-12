@@ -111,6 +111,12 @@ impl TaskWorkspace {
         F: FnOnce(ContainerConfig) -> Fut,
         Fut: std::future::Future<Output = Result<ContainerHandle, ContainerError>>,
     {
+        debug_assert!(
+            task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
+        );
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
