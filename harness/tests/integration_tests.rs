@@ -1888,16 +1888,21 @@ fn init_test_git_repo(dir: &Path) {
         vec!["init"],
         vec!["config", "user.email", "test@test.com"],
         vec!["config", "user.name", "Test"],
+        vec!["config", "commit.gpgsign", "false"],
     ] {
         git_cmd_clean(dir).args(args).output().unwrap();
     }
     std::fs::write(dir.join("README.md"), "# Test").unwrap();
     git_cmd_clean(dir).args(["add", "."]).output().unwrap();
-    let status = git_cmd_clean(dir)
-        .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
+    let out = git_cmd_clean(dir)
+        .args(["commit", "-m", "init"])
         .output()
         .unwrap();
-    assert!(status.status.success(), "git commit failed in test setup");
+    assert!(
+        out.status.success(),
+        "init commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[tokio::test]
