@@ -27,7 +27,7 @@ use tokio::time::{sleep, timeout};
 // use futures::future; // Reserved for future concurrent test implementation
 
 // E2E test configuration
-const E2E_MODEL: &str = "qwen3:0.6b";
+const E2E_MODEL: &str = "gemma4:e4b";
 const E2E_TIMEOUT: Duration = Duration::from_secs(300);
 const CONTAINER_STARTUP_WAIT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1888,16 +1888,21 @@ fn init_test_git_repo(dir: &Path) {
         vec!["init"],
         vec!["config", "user.email", "test@test.com"],
         vec!["config", "user.name", "Test"],
+        vec!["config", "commit.gpgsign", "false"],
     ] {
         git_cmd_clean(dir).args(args).output().unwrap();
     }
     std::fs::write(dir.join("README.md"), "# Test").unwrap();
     git_cmd_clean(dir).args(["add", "."]).output().unwrap();
-    let status = git_cmd_clean(dir)
-        .args(["-c", "commit.gpgsign=false", "commit", "-m", "init"])
+    let out = git_cmd_clean(dir)
+        .args(["commit", "-m", "init"])
         .output()
         .unwrap();
-    assert!(status.status.success(), "git commit failed in test setup");
+    assert!(
+        out.status.success(),
+        "init commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[tokio::test]

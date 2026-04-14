@@ -1852,6 +1852,25 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
+/// The working directory inside the dev container where the worktree is mounted.
+pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
+
+pub fn create_container_tool_registry(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+) -> ToolRegistry {
+    let mut registry = create_tool_registry(workspace_root);
+    // Deliberately overrides any `run_command` entry from `create_tool_registry`
+    // with a container-bound version; if `create_tool_registry` ever adds a
+    // `run_command` tool, this override is intentional and expected.
+    registry.register(Box::new(RunCommandTool::new(
+        container_handle,
+        Some(container_working_dir.to_string()),
+    )));
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,6 +2070,29 @@ mod tests {
             assert!(diff.get("diff").is_some());
             assert!(diff.get("has_changes").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_container_tool_registry_includes_run_command() {
+        use std::sync::Arc;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+
+        let registry =
+            create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+        assert!(registry.get_tool("run_command").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("list_directory").is_some());
+        assert!(registry.get_tool("search").is_some());
+        assert!(registry.get_tool("git_status").is_some());
+        assert!(registry.get_tool("git_diff").is_some());
     }
 
     // -- PrStatusData unit tests --

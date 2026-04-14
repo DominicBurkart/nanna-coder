@@ -1,14 +1,17 @@
 use harness::agent::{AgentConfig, AgentContext, AgentLoop};
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig, ContainerRuntime,
+    ContainerConfig,
 };
 use harness::entities::InMemoryEntityStore;
+use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
 use harness::tools::{
     ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
+    CONTAINER_WORKSPACE_DIR,
 };
 use image_builder::build_dev_container;
 use model::prelude::*;
+use model::provider::ModelProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +20,7 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "qwen3:0.6b";
+const E2E_MODEL: &str = "gemma4:e4b";
 
 fn example_repo_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,7 +55,7 @@ async fn test_dev_container_fibonacci_to_primes() {
     for attempt in 0..MAX_ATTEMPTS {
         eprintln!("Attempt {}/{}", attempt + 1, MAX_ATTEMPTS);
 
-        let result = timeout(TEST_TIMEOUT, run_single_attempt(&runtime, &image_ref)).await;
+        let result = timeout(TEST_TIMEOUT, run_single_attempt(&image_ref)).await;
 
         match result {
             Ok(Ok(())) => {
@@ -77,7 +80,7 @@ async fn test_dev_container_fibonacci_to_primes() {
     );
 }
 
-async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Result<(), String> {
+async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
     let tempdir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let workspace = tempdir.path().to_path_buf();
 
@@ -86,10 +89,10 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
 
     let container_name = format!("nanna-dev-container-test-{}", uuid::Uuid::new_v4());
 
-    let mut additional_args = vec![format!("-v={}:/workspace", workspace.display())];
-    if *runtime == ContainerRuntime::Podman {
-        additional_args.push("--userns=keep-id".to_string());
-    }
+    let additional_args = vec![format!(
+        "-v={}:{CONTAINER_WORKSPACE_DIR}",
+        workspace.display()
+    )];
 
     let config = ContainerConfig {
         base_image: image_ref.to_string(),
@@ -180,6 +183,74 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
     }
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_task_manager_submit_with_dev_container() {
+    let repo_path = example_repo_path();
+    assert!(
+        repo_path.exists(),
+        "Example repo not found at {:?}",
+        repo_path
+    );
+
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+
+    // Skip if Ollama is not reachable (e.g. CI without a local model server).
+    if tokio::net::TcpStream::connect("127.0.0.1:11434")
+        .await
+        .is_err()
+    {
+        eprintln!("Ollama not reachable on 127.0.0.1:11434, skipping test");
+        return;
+    }
+
+    let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+
+    let ollama_config = model::OllamaConfig::default();
+    let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
+    let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+
+    let task_id = manager
+        .submit(
+            "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
+                .to_string(),
+            repo_path,
+            "HEAD".to_string(),
+            E2E_MODEL.to_string(),
+            MAX_TURNS,
+            provider,
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(700);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("Task did not complete within timeout");
+        }
+
+        let task = manager.poll(&task_id).await.expect("task not found");
+        match &task.status {
+            TaskStatus::Completed { result, .. } => {
+                assert!(
+                    result.changes_patch.is_some(),
+                    "expected non-empty changes_patch"
+                );
+                return;
+            }
+            TaskStatus::Failed { error, .. } => {
+                panic!("Task failed: {}", error);
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
