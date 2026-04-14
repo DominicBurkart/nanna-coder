@@ -65,7 +65,7 @@ sequenceDiagram
     O->>N: assign_task(description, repo_path)
     N-->>O: task_id
     Note over O: continues other tasks
-    Note over N: agent loop in worktree
+    Note over N: agent loop (in container)
     O->>N: poll_task(task_id)
     N-->>O: running
     O->>N: poll_task(task_id)
