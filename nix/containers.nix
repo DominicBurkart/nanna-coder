@@ -211,11 +211,11 @@ let
       homepage = "https://ollama.com/library/mistral";
     };
     "gemma" = {
-      name = "gemma:2b";
+      name = "gemma4:e4b";
       hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Gemma 2B - Lightweight model for development (Ollama)";
-      size = "1.4GB";
-      homepage = "https://ollama.com/library/gemma";
+      description = "Gemma 4 E4B - Larger Gemma 4 variant for CI evaluation (Ollama)";
+      size = "~4GB";
+      homepage = "https://ollama.com/library/gemma4";
     };
   };
 

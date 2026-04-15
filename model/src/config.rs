@@ -14,7 +14,7 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:11434".to_string(),
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(300),
             default_context_length: 110_000,
             default_temperature: 0.7,
             default_max_tokens: None,

@@ -1,11 +1,11 @@
 # Nanna Coder
 
-A highly opinionated local coding assistant (WIP).
+A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
 
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Agent control loop and implementation details
+- [AGENTS.md](AGENTS.md) - Instructions for agents building nanna
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
 
 ## Technologies
@@ -61,6 +61,12 @@ cargo run --bin harness -- agent --prompt "Your task description" --tools
 
 # Run with a specific model and verbose output
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
+```
+
+### Using as an MCP Server (Claude Code)
+
+```bash
+nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
 ### Using Cachix (Optional but Recommended)
