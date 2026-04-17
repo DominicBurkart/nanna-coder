@@ -28,7 +28,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, MessageRole};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -548,11 +548,48 @@ impl AgentLoop {
 
     /// Transition to a new state
     fn transition_to(&mut self, new_state: AgentState) {
+        debug_assert!(
+            Self::is_legal_transition(&self.state, &new_state),
+            "illegal state transition: {:?} -> {:?}",
+            self.state,
+            new_state
+        );
         if self.config.verbose {
             tracing::debug!("State transition: {:?} → {:?}", self.state, new_state);
         }
         self.state_history.push(new_state.clone());
         self.state = new_state;
+    }
+
+    /// Check whether a state transition is legal according to ARCHITECTURE.md.
+    ///
+    /// ```text
+    /// EnrichingEntities           → PlanningEntityModification
+    /// PlanningEntityModification  → PerformingEntityModification
+    /// PerformingEntityModification→ UpdatingEntities
+    /// UpdatingEntities            → CheckingTaskCompletion
+    /// CheckingTaskCompletion      → Completed | EntityModificationDecision
+    /// EntityModificationDecision  → QueryingEntities | PlanningEntityModification
+    /// QueryingEntities            → EntityModificationDecision
+    /// ```
+    ///
+    /// Enforced at runtime in debug builds via `debug_assert!` in
+    /// `transition_to`, and verified exhaustively by Kani in `kani_proofs`.
+    fn is_legal_transition(from: &AgentState, to: &AgentState) -> bool {
+        use AgentState::*;
+        matches!(
+            (from, to),
+            (EnrichingEntities, PlanningEntityModification)
+                | (PlanningEntityModification, PerformingEntityModification)
+                | (PerformingEntityModification, UpdatingEntities)
+                | (UpdatingEntities, CheckingTaskCompletion)
+                | (CheckingTaskCompletion, Completed)
+                | (CheckingTaskCompletion, EntityModificationDecision)
+                | (EntityModificationDecision, QueryingEntities)
+                | (EntityModificationDecision, PlanningEntityModification)
+                | (QueryingEntities, EntityModificationDecision)
+                | (_, Error(_))
+        )
     }
 
     /// Call LLM with retry logic and exponential backoff
@@ -911,130 +948,6 @@ impl AgentLoop {
         }
 
         Ok(())
-    }
-
-    /// Full tool-calling run loop — formerly used when tool_registry is set.
-    ///
-    /// Deprecated: The state machine `run()` method now handles tools via
-    /// `perform_entity_modification_with_tools()` in the Performing state, following the architecture.
-    #[deprecated(note = "run() now handles tools via the state machine")]
-    #[allow(dead_code)]
-    async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
-        self.conversation_history.clear();
-
-        if !self.config.system_prompt.is_empty() {
-            let sp = self.config.system_prompt.clone();
-            self.conversation_history.push(ChatMessage::system(&sp));
-        }
-
-        for msg in context.conversation_history {
-            self.conversation_history.push(msg);
-        }
-
-        let tool_defs = self
-            .tool_registry
-            .as_ref()
-            .map(|r| r.get_definitions())
-            .unwrap_or_default();
-
-        self.iterations = 0;
-
-        loop {
-            if self.iterations >= self.config.max_iterations {
-                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
-            }
-
-            let model_name = self.config.model_name.clone();
-            let messages = self.conversation_history.clone();
-            let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
-
-            let provider = match self.llm_provider.clone() {
-                Some(p) => p,
-                None => {
-                    return Err(self.enrich_error(bare_state_error("No provider configured")));
-                }
-            };
-
-            let response = provider.chat(request).await.map_err(|e| {
-                self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
-            })?;
-
-            if response.choices.is_empty() {
-                return Err(self.enrich_error(bare_state_error("Empty response from model")));
-            }
-
-            let choice = response.choices.into_iter().next().unwrap();
-            let finish_reason = choice.finish_reason.clone();
-            let tool_calls = choice.message.tool_calls.clone();
-            self.conversation_history.push(choice.message);
-
-            match finish_reason {
-                Some(FinishReason::Stop) | None => {
-                    self.transition_to(AgentState::Completed);
-                    let task_description = context.user_prompt.clone();
-                    let conversation = self.conversation_history.clone();
-                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
-                    let result_summary = extract_result_summary(&conversation);
-                    let model_used = self.config.model_name.clone();
-                    let entity = ContextEntity::new(
-                        task_description,
-                        conversation.clone(),
-                        tool_calls_made.clone(),
-                        result_summary.clone(),
-                        model_used,
-                    );
-                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
-                        tracing::warn!("Failed to store context entity: {}", e);
-                    }
-                    return Ok(AgentRunResult {
-                        final_state: AgentState::Completed,
-                        iterations: self.iterations,
-                        task_completed: true,
-                        result_summary,
-                        tool_calls_made,
-                        conversation_snapshot: conversation,
-                    });
-                }
-                Some(FinishReason::ToolCalls) => {
-                    if let Some(calls) = tool_calls {
-                        for tool_call in &calls {
-                            let name = tool_call.function.name.clone();
-                            let args = tool_call.function.arguments.clone();
-                            let call_id = tool_call.id.clone();
-
-                            let response_content = {
-                                let registry = self.tool_registry.as_ref();
-                                match registry {
-                                    None => {
-                                        return Err(
-                                            self.enrich_error(bare_state_error("No tool registry"))
-                                        );
-                                    }
-                                    Some(r) => {
-                                        let result = r.execute(&name, args).await;
-                                        match result {
-                                            Ok(v) => v.to_string(),
-                                            Err(e) => format!("Error: {}", e),
-                                        }
-                                    }
-                                }
-                            };
-
-                            self.conversation_history
-                                .push(ChatMessage::tool_response(call_id, response_content));
-                        }
-                    }
-                }
-                Some(_) => {
-                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
-                }
-            }
-
-            self.iterations += 1;
-            if let Some(ref counter) = self.progress_counter {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// Tool-calling perform helper: inner loop for the state-machine
@@ -2079,5 +1992,114 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Encode the legal transitions from ARCHITECTURE.md as a numeric table
+    /// so kani can exhaustively verify that is_legal_transition accepts
+    /// exactly the correct pairs and rejects everything else.
+    fn state_index(s: &AgentState) -> u8 {
+        match s {
+            AgentState::EnrichingEntities => 0,
+            AgentState::PlanningEntityModification => 1,
+            AgentState::PerformingEntityModification => 2,
+            AgentState::UpdatingEntities => 3,
+            AgentState::CheckingTaskCompletion => 4,
+            AgentState::EntityModificationDecision => 5,
+            AgentState::QueryingEntities => 6,
+            AgentState::Completed => 7,
+            AgentState::Error(_) => 8,
+        }
+    }
+
+    fn state_from_index(i: u8) -> AgentState {
+        match i {
+            0 => AgentState::EnrichingEntities,
+            1 => AgentState::PlanningEntityModification,
+            2 => AgentState::PerformingEntityModification,
+            3 => AgentState::UpdatingEntities,
+            4 => AgentState::CheckingTaskCompletion,
+            5 => AgentState::EntityModificationDecision,
+            6 => AgentState::QueryingEntities,
+            7 => AgentState::Completed,
+            _ => AgentState::Error("test".to_string()),
+        }
+    }
+
+    /// The allowed non-error edges (from_index, to_index).
+    const LEGAL_EDGES: [(u8, u8); 8] = [
+        (0, 1), // EnrichingEntities → PlanningEntityModification
+        (1, 2), // PlanningEntityModification → PerformingEntityModification
+        (2, 3), // PerformingEntityModification → UpdatingEntities
+        (3, 4), // UpdatingEntities → CheckingTaskCompletion
+        (4, 7), // CheckingTaskCompletion → Completed
+        (4, 5), // CheckingTaskCompletion → EntityModificationDecision
+        (5, 6), // EntityModificationDecision → QueryingEntities
+        (5, 1), // EntityModificationDecision → PlanningEntityModification
+    ];
+
+    /// Verify that is_legal_transition is consistent with the architecture
+    /// diagram for all non-error state pairs.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn legal_transitions_match_architecture() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7); // don't generate Error as target (tested separately)
+
+        let from = state_from_index(from_idx);
+        let to = state_from_index(to_idx);
+
+        let result = AgentLoop::is_legal_transition(&from, &to);
+
+        // Any state can transition to Error
+        // For non-error targets, only LEGAL_EDGES are allowed
+        let expected = LEGAL_EDGES
+            .iter()
+            .any(|&(f, t)| f == from_idx && t == to_idx);
+        assert_eq!(result, expected, "Mismatch for ({from_idx} -> {to_idx})");
+    }
+
+    /// Any state may transition to Error.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn any_state_can_error() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let from = state_from_index(from_idx);
+        let to = AgentState::Error("fail".to_string());
+        assert!(AgentLoop::is_legal_transition(&from, &to));
+    }
+
+    /// Completed and Error are terminal: no legal non-error successor.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn completed_is_terminal() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::Completed;
+        assert!(
+            !AgentLoop::is_legal_transition(&from, &to),
+            "Completed should have no non-error successors"
+        );
+    }
+
+    /// QueryingEntities can only go back to EntityModificationDecision.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn querying_only_returns_to_decision() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::QueryingEntities;
+        let result = AgentLoop::is_legal_transition(&from, &to);
+        let expected = to_idx == 5; // EntityModificationDecision
+        assert_eq!(result, expected);
     }
 }
