@@ -15,6 +15,8 @@
 pub mod decision;
 pub mod eval;
 pub mod eval_case;
+pub mod project_detect;
+pub mod project_prompt;
 pub mod prompts;
 pub mod rag;
 
