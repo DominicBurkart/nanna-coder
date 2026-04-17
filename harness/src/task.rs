@@ -368,6 +368,7 @@ impl TaskManager {
                         verbose: false,
                         system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
                         model_name: model.clone(),
+                        animation_policy: crate::ui::AnimationPolicy::Off,
                     };
                     let context = AgentContext {
                         user_prompt: description.clone(),

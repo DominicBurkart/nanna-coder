@@ -473,6 +473,7 @@ impl AgentEvaluator {
             verbose: self.config.verbose,
             system_prompt: String::new(),
             model_name: self.config.model.clone(),
+            animation_policy: crate::ui::AnimationPolicy::Off,
         };
 
         let mut agent = AgentLoop::with_entity_store(agent_config, entity_store);

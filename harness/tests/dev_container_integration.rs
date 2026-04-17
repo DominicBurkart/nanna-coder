@@ -132,6 +132,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
         verbose: true,
         system_prompt: "You are a coding assistant. Modify this Rust project to compute the first 10 prime numbers instead of Fibonacci numbers. Update src/lib.rs to implement a `primes(n: usize) -> Vec<u64>` function that returns the first n prime numbers. Update src/main.rs to call `primes(10)` and print the result. Update tests/fib_test.rs to test that primes(10) returns [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]. Use run_command to run `cargo test` and `cargo run` to verify your changes work.".to_string(),
         model_name: E2E_MODEL.to_string(),
+    animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
