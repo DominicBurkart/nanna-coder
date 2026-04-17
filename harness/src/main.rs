@@ -2,9 +2,11 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::logging;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -13,6 +15,22 @@ use tracing::{error, info};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// EXPERIMENTAL: path to a JSON lines log file. When set, every tracing
+    /// event is additionally written to this file in a machine-readable
+    /// format. Absent by default — no file is created.
+    #[arg(long, global = true, env = "NANNA_LOG_FILE")]
+    log_file: Option<PathBuf>,
+
+    /// EXPERIMENTAL: tracing level filter applied to the `--log-file` JSON
+    /// layer only. The stderr human log continues to honor `RUST_LOG`.
+    #[arg(
+        long,
+        global = true,
+        default_value = "info",
+        env = "NANNA_LOG_FILE_LEVEL"
+    )]
+    log_file_level: String,
 }
 
 #[derive(Subcommand)]
@@ -69,11 +87,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    // Install tracing subscribers. The returned WorkerGuard (when `--log-file`
+    // is set) must live until the end of `main` so the non-blocking appender
+    // flushes buffered records on exit.
+    let _log_guard = logging::init(cli.log_file.as_deref(), &cli.log_file_level)?;
 
     let config = OllamaConfig::default();
     let provider = OllamaProvider::new(config)?;
@@ -415,6 +434,19 @@ async fn run_agent(
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
     use std::sync::Arc;
 
+    // Emit per-run correlation events. The session_id is a UUIDv4 that later
+    // PRs will thread through agent spans so every downstream event inherits
+    // it. For PR1 we emit it once here so log sinks can already group by run.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    logging::session_start(&session_id, prompt);
+
+    let git_repo = GitRepository::detect(workspace_root);
+    logging::env_snapshot(
+        workspace_root,
+        git_repo.as_ref().and_then(|g| g.current_branch.as_deref()),
+        git_repo.as_ref().and_then(|g| g.head_commit.as_deref()),
+    );
+
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let entity_store = initialize_workspace(workspace_root).await;
@@ -482,6 +514,20 @@ async fn run_mcp_server(
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
     use std::sync::Arc;
+
+    // Emit per-run correlation events for the MCP server lifecycle. The
+    // `user_prompt` field is deliberately a placeholder at server boot — per
+    // request prompts will be logged in later PRs at the task dispatch site.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    logging::session_start(&session_id, "<mcp-server>");
+
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let git_repo = GitRepository::detect(&workspace_root);
+    logging::env_snapshot(
+        &workspace_root,
+        git_repo.as_ref().and_then(|g| g.current_branch.as_deref()),
+        git_repo.as_ref().and_then(|g| g.head_commit.as_deref()),
+    );
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);

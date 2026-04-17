@@ -2,6 +2,7 @@ pub mod agent;
 pub mod container;
 pub mod entities;
 pub mod eval;
+pub mod logging;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
