@@ -5,6 +5,7 @@ use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -76,10 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
+    let provider = Arc::new(OllamaProvider::new(config)?);
 
     let workspace_root = std::env::current_dir()?;
-    let tool_registry = create_tool_registry(&workspace_root);
+    let tool_registry = harness::tools::create_tool_registry(&workspace_root);
 
     match cli.command {
         Commands::Chat {
@@ -135,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                provider.clone(),
             )
             .await?;
         }
@@ -142,15 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            run_mcp_server(&model, max_iterations, provider).await?;
         }
     }
 
     Ok(())
-}
-
-fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    harness::tools::create_tool_registry(workspace_root)
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
@@ -180,6 +178,49 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
     store
 }
 
+/// Execute a slice of tool calls, appending the assistant turn and each tool
+/// response to `messages`. Returns `true` if any tool calls were processed.
+async fn execute_tool_calls(
+    tool_calls: &[model::prelude::ToolCall],
+    assistant_message: ChatMessage,
+    tool_registry: &ToolRegistry,
+    messages: &mut Vec<ChatMessage>,
+    verbose: bool,
+) -> bool {
+    if verbose {
+        println!("\nTool calls:");
+    }
+    messages.push(assistant_message);
+    for tool_call in tool_calls {
+        if verbose {
+            println!(
+                "  Calling {}: {:?}",
+                tool_call.function.name, tool_call.function.arguments
+            );
+        }
+        let result = match tool_registry
+            .execute(
+                &tool_call.function.name,
+                tool_call.function.arguments.clone(),
+            )
+            .await
+        {
+            Ok(r) => {
+                if verbose {
+                    println!("  -> {}", r);
+                }
+                r.to_string()
+            }
+            Err(e) => {
+                error!("Tool execution failed: {}", e);
+                format!("Error: {}", e)
+            }
+        };
+        messages.push(ChatMessage::tool_response(tool_call.id.clone(), result));
+    }
+    true
+}
+
 async fn single_chat(
     provider: &OllamaProvider,
     tool_registry: &ToolRegistry,
@@ -194,8 +235,7 @@ async fn single_chat(
         let mut request = ChatRequest::new(model, messages.clone()).with_temperature(temperature);
 
         if enable_tools {
-            let tool_definitions = tool_registry.get_definitions();
-            request = request.with_tools(tool_definitions);
+            request = request.with_tools(tool_registry.get_definitions());
         }
 
         let response = provider.chat(request).await?;
@@ -206,39 +246,14 @@ async fn single_chat(
         }
 
         if let Some(tool_calls) = &choice.message.tool_calls {
-            println!("\nTool calls:");
-            for tool_call in tool_calls {
-                println!(
-                    "  Calling {}: {:?}",
-                    tool_call.function.name, tool_call.function.arguments
-                );
-
-                match tool_registry
-                    .execute(
-                        &tool_call.function.name,
-                        tool_call.function.arguments.clone(),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        println!("  Result: {}", result);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            result.to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        error!("Tool execution failed: {}", e);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            format!("Error: {}", e),
-                        ));
-                    }
-                }
-            }
-
+            execute_tool_calls(
+                tool_calls,
+                choice.message.clone(),
+                tool_registry,
+                &mut messages,
+                true,
+            )
+            .await;
             continue;
         }
 
@@ -292,8 +307,7 @@ async fn interactive_chat(
                 ChatRequest::new(model, messages.clone()).with_temperature(temperature);
 
             if enable_tools {
-                let tool_definitions = tool_registry.get_definitions();
-                request = request.with_tools(tool_definitions);
+                request = request.with_tools(tool_registry.get_definitions());
             }
 
             let response = provider.chat(request).await?;
@@ -304,38 +318,14 @@ async fn interactive_chat(
             }
 
             if let Some(tool_calls) = &choice.message.tool_calls {
-                println!("\n[Tool calls]");
-                for tool_call in tool_calls {
-                    println!(
-                        "  Calling {}: {:?}",
-                        tool_call.function.name, tool_call.function.arguments
-                    );
-
-                    match tool_registry
-                        .execute(
-                            &tool_call.function.name,
-                            tool_call.function.arguments.clone(),
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            println!("  -> {}", result);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                result.to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            error!("Tool execution failed: {}", e);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                format!("Error: {}", e),
-                            ));
-                        }
-                    }
-                }
+                execute_tool_calls(
+                    tool_calls,
+                    choice.message.clone(),
+                    tool_registry,
+                    &mut messages,
+                    true,
+                )
+                .await;
                 println!();
                 continue;
             }
@@ -391,11 +381,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -411,12 +401,10 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    provider: Arc<OllamaProvider>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -440,7 +428,7 @@ async fn run_agent(
     }
 
     let mut agent = if tools {
-        let tool_registry = create_tool_registry(workspace_root);
+        let tool_registry = harness::tools::create_tool_registry(workspace_root);
         AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
     } else {
         AgentLoop::with_llm(agent_config, entity_store, provider)
@@ -478,13 +466,11 @@ async fn run_agent(
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
+    provider: Arc<OllamaProvider>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
