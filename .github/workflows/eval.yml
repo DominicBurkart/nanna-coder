@@ -1,0 +1,123 @@
+name: Eval Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to post results comment (optional)'
+        required: false
+        default: ''
+      model:
+        description: 'Model to use for evaluation'
+        required: false
+        default: 'qwen3:0.6b'
+        type: choice
+        options:
+          - qwen3:0.6b
+          - llama3.1:8b
+      case_filter:
+        description: 'Additional nextest filter expression for case selection (optional)'
+        required: false
+        default: ''
+
+jobs:
+  eval:
+    name: Run Eval Suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+
+    - name: Build release binary
+      run: nix develop --command cargo build --release --workspace --all-features
+
+    - name: Start Ollama and pull model
+      env:
+        MODEL: ${{ inputs.model }}
+      run: |
+        curl -fsSL https://ollama.com/install.sh | sh
+        ollama serve &
+        # Wait for Ollama to be ready
+        for i in $(seq 1 30); do
+          ollama list > /dev/null 2>&1 && break
+          sleep 1
+        done
+        ollama pull "$MODEL"
+
+    - name: Run eval suite
+      id: eval
+      env:
+        MODEL: ${{ inputs.model }}
+        CASE_FILTER: ${{ inputs.case_filter }}
+      run: |
+        echo "## Eval Results" > eval-results.md
+        echo "" >> eval-results.md
+        echo "**Model:** \`${MODEL}\`" >> eval-results.md
+        echo "**Commit:** \`${{ github.sha }}\`" >> eval-results.md
+        echo "**Triggered by:** @${{ github.actor }}" >> eval-results.md
+        echo "" >> eval-results.md
+
+        echo "### Unit-level eval tests" >> eval-results.md
+        echo '```' >> eval-results.md
+
+        FILTER='test(eval)'
+        if [ -n "${CASE_FILTER}" ]; then
+          FILTER="${FILTER} & ${CASE_FILTER}"
+        fi
+
+        set +e
+        nix develop --command cargo nextest run \
+          --workspace --all-features \
+          -E "$FILTER" \
+          --no-fail-fast 2>&1 | tee eval-output.txt
+        EXIT_CODE=$?
+        set -e
+
+        cat eval-output.txt >> eval-results.md
+        echo '```' >> eval-results.md
+
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+          echo "" >> eval-results.md
+          echo "**Status: PASSED**" >> eval-results.md
+        else
+          echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          echo "" >> eval-results.md
+          echo "**Status: FAILED** (see logs above)" >> eval-results.md
+        fi
+
+    - name: Write eval summary
+      if: always()
+      run: cat eval-results.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post results as PR comment
+      if: inputs.pr_number != ''
+      uses: peter-evans/create-or-update-comment@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        issue-number: ${{ inputs.pr_number }}
+        body-path: eval-results.md
+
+    - name: Upload eval results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: eval-results
+        path: |
+          eval-results.md
+          eval-output.txt
+        if-no-files-found: warn
