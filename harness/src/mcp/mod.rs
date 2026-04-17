@@ -1,4 +1,6 @@
 pub mod handlers;
+#[doc(hidden)]
+pub mod mock_provider;
 
 use crate::task::TaskManager;
 use model::provider::ModelProvider;

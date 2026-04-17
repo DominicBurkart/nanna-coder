@@ -479,13 +479,23 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // NANNA_MCP_MOCK_PROVIDER test hook (issue #201): swap in a mock provider
+    // so the mcp_stdio_integration test can exercise stdio framing without a
+    // live Ollama or container. Keep at the top of this function — any future
+    // SharedModelPool wiring must preserve this bypass.
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
+    use model::provider::ModelProvider;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
+    let provider: Arc<dyn ModelProvider> = if std::env::var_os("NANNA_MCP_MOCK_PROVIDER").is_some()
+    {
+        Arc::new(harness::mcp::mock_provider::MockProvider)
+    } else {
+        let config = OllamaConfig::default();
+        Arc::new(OllamaProvider::new(config)?)
+    };
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {})",
