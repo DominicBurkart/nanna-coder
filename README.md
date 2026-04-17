@@ -1,6 +1,6 @@
 # Nanna Coder
 
-A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
+A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or other model providers.
 
 ## Documentation
 
@@ -9,6 +9,7 @@ A coding agent for coding agents. Designed for background agents to defer straig
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
 
 ## Technologies
+
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
@@ -18,20 +19,16 @@ A coding agent for coding agents. Designed for background agents to defer straig
 ## Quick Start
 
 ### Prerequisites
+
 - Nix with flakes enabled
 - (Optional) Cachix account for faster builds
 
 ### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
-
-# Enter development environment
 nix develop
-
-# Build the project
 nix build
 ```
 
@@ -40,26 +37,16 @@ nix build
 The agent requires a running [Ollama](https://ollama.ai/) instance with a model installed:
 
 ```bash
-# Install Ollama (see https://ollama.ai/download)
 curl -fsSL https://ollama.ai/install.sh | sh
-
-# Pull the default model
 ollama pull qwen3:0.6b
-
-# Verify Ollama is running
 nix develop --command cargo run --bin harness -- health
 ```
 
 ### Running the Agent
 
 ```bash
-# Enter development environment
 nix develop
-
-# Run the agent with tools enabled (recommended)
 cargo run --bin harness -- agent --prompt "Your task description" --tools
-
-# Run with a specific model and verbose output
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
 ```
 
@@ -69,12 +56,11 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
-### Using Cachix (Optional but Recommended)
+### Cachix (Optional)
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
+Provides a public binary cache — no account needed to pull pre-built artifacts.
 
 ```bash
-# Configure Cachix for faster builds (read-only access)
 nix run .#setup-cache
 ```
 
