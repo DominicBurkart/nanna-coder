@@ -2,10 +2,14 @@
 # Guard against silent relaxations of codecov.yml patch thresholds.
 #
 # Fails if, between $BASE_REF (default: origin/main) and HEAD, any `target:`
-# value in codecov.yml DECREASES or the `ignore:` list GAINS entries, UNLESS
-# one of the commits in the range contains a `codecov-override: <reason>`
-# trailer. Target raises and comment-only edits always pass. If codecov.yml
-# did not exist on BASE_REF (first-time add), any values are accepted.
+# value in codecov.yml DECREASES or the `ignore:` list GAINS entries. Target
+# raises and comment-only edits always pass. If codecov.yml did not exist on
+# BASE_REF (first-time add), any values are accepted.
+#
+# There is NO in-repo override. Repository admins who need to relax the
+# threshold must do so via GitHub's force-merge / admin-override path, which
+# is logged and auditable. This script must not provide any way for an
+# automated agent (or a commit trailer) to bypass the regression guard.
 #
 # Usage (local):   BASE_REF=origin/main bash scripts/check-codecov-guard.sh
 # Usage (CI):      invoked by .github/workflows/codecov-guard.yml
@@ -69,18 +73,10 @@ if [ "$REGRESSION" -eq 0 ]; then
   exit 0
 fi
 
-# Look for a codecov-override: trailer anywhere in the commit range.
-RANGE="${BASE_REF}..HEAD"
-if git log --format=%B "$RANGE" 2>/dev/null | grep -qiE '^codecov-override:[[:space:]]*.+'; then
-  echo "guard: regression detected but codecov-override: trailer found — allowing." >&2
-  for r in "${REASONS[@]}"; do echo "  - $r" >&2; done
-  exit 0
-fi
-
 {
-  echo "guard: codecov.yml regression requires a 'codecov-override: <reason>' commit trailer."
+  echo "guard: codecov.yml regression detected and there is no in-repo override."
   for r in "${REASONS[@]}"; do echo "  - $r"; done
-  echo "To override, amend a commit in this PR (or add a new commit) with a trailer like:"
-  echo "    codecov-override: temporarily dropping to unblock release"
+  echo "If this change is intentional, a repository admin must force-merge;"
+  echo "no commit trailer or script flag can bypass this check."
 } >&2
 exit 1

@@ -3,10 +3,10 @@ coverage:
     project: off
     patch:
       default:
-        # Hard floor — do not relax without explicit override.
-        # Agents modifying this file must include `codecov-override: <reason>`
-        # in a commit message trailer; enforced by
-        # .github/workflows/codecov-guard.yml.
+        # Hard floor — no in-repo override. Only a repo admin's force-merge
+        # can bypass this. The regression guard in
+        # .github/workflows/codecov-guard.yml blocks silent relaxations
+        # (target decreases or `ignore:` list growth).
         target: 100%
 
 ignore:
