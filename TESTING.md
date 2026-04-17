@@ -13,7 +13,8 @@ flowchart TD
 
 ## Principles
 
-- Prefer in order: realistic happy-path integration tests, happy-path doctests on interfaces, proptests, unit tests (especially edge cases), unhappy-path error legibility, edge-case doctests.
+- Sorted preferred strategies (note: you'll need an ensemble, use complementary approaches): realistic happy-path integration tests, happy-path doctests on interfaces, aneas/kani invariant validation, proptests, unit tests (edge cases), unhappy-path integration tests (error legibility), edge-case doctests. 
+- Design interfaces which can use the highest standards for validation (example: a de/serialization path needs to be compatible with both integration tests and formal methods validation, an external API surface needs to be expressible with both doctests and proptests). 
 - Surface failures as early as possible: compile-time > CI > runtime. Make control flow boring and obvious by validating invariants statically first.
 - Untested code is brittle. Harden it, don't bend it. Never merge `|| true`, silent failures, fallback parameters that shadow bad or dead code, or any other graceful-degradation pattern.
 
