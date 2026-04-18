@@ -51,21 +51,59 @@ flowchart TD
     class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
 ```
 
-# Delegation Sequence
+# API
+
+The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface.
+
+The six MCP tools form a complete task-delegation surface:
+
+- **`assign_task`** — submit a new task (natural-language description plus target repo) and receive a `task_id`. Nanna spawns an agent loop in an isolated worktree on the designated repository.
+- **`poll_task`** — query the current status of a task by `task_id` without blocking. Returns one of `running`, `completed`, `failed`, or `cancelled`, allowing orchestrators to interleave work on multiple tasks.
+- **`get_result`** — fetch the final result for a completed task (conversation snapshot, tool calls made, result summary, and any written artefacts). Safe to call repeatedly.
+- **`list_tasks`** — enumerate all tasks Nanna is currently tracking along with their states, giving orchestrators a view over in-flight work without needing to remember every `task_id` they dispatched.
+- **`cancel_task`** — request termination of a running task by `task_id`. Nanna stops its agent loop at the next safe checkpoint and transitions the task to the `cancelled` state so subsequent `get_result` calls return a consistent terminal record.
+- **`onboard_repo`** — register a new repository with Nanna (clone, index entities, and prepare a reusable worktree pool) so that later `assign_task` calls against that repo start immediately instead of paying cold-start cost.
 
 ```mermaid
 ---
 config:
   theme: redux-dark
-  layout: dagre
+  layout: elk
 ---
+flowchart LR
+    subgraph CLI["CLI (harness)"]
+        chat
+        agent
+        mcpserve["mcp-serve"]
+        models
+        tools
+        health
+    end
+    subgraph MCP["MCP (stdio, via mcp-serve)"]
+        assign_task
+        poll_task
+        get_result
+        list_tasks
+        cancel_task
+        onboard_repo
+    end
+    mcpserve --> MCP
+    classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
+    classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
+    class chat,agent,mcpserve,models,tools,health cli
+    class assign_task,poll_task,get_result,list_tasks,cancel_task,onboard_repo mcp
+```
+
+# Delegation Sequence
+
+```mermaid
 sequenceDiagram
     participant O as Orchestrator
     participant N as Nanna
     O->>N: assign_task(description, repo_path)
     N-->>O: task_id
     Note over O: continues other tasks
-    Note over N: agent loop
+    Note over N: agent loop in worktree
     O->>N: poll_task(task_id)
     N-->>O: running
     O->>N: poll_task(task_id)
