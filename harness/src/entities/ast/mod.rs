@@ -9,9 +9,12 @@ pub mod types;
 
 pub use types::*;
 
-use crate::entities::{EntityStore, InMemoryEntityStore};
+use crate::entities::EntityStore;
 use std::path::Path;
 use thiserror::Error;
+
+#[cfg(test)]
+use crate::entities::InMemoryEntityStore;
 
 #[derive(Error, Debug)]
 pub enum ScanError {
@@ -76,21 +79,21 @@ impl WorkspaceScanner {
         name.starts_with('.')
     }
 
-    pub async fn scan_workspace(
+    pub async fn scan_workspace<S: EntityStore + Send + ?Sized>(
         &self,
         root: &Path,
-        store: &mut InMemoryEntityStore,
+        store: &mut S,
     ) -> ScanResult<usize> {
         let mut count = 0;
         self.scan_directory(root, root, store, &mut count).await?;
         Ok(count)
     }
 
-    fn scan_directory<'a>(
+    fn scan_directory<'a, S: EntityStore + Send + ?Sized>(
         &'a self,
         dir: &'a Path,
         root: &'a Path,
-        store: &'a mut InMemoryEntityStore,
+        store: &'a mut S,
         count: &'a mut usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ScanResult<()>> + Send + 'a>> {
         Box::pin(async move {

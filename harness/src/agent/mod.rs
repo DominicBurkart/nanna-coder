@@ -271,11 +271,17 @@ fn extract_result_summary(history: &[ChatMessage]) -> String {
         .to_string()
 }
 
-pub struct AgentLoop {
+/// Agent control loop.
+///
+/// Generic over the backing entity store so that downstream callers can plug
+/// in either the default [`InMemoryEntityStore`] or future persistent
+/// backends (see issue #193). The default type parameter keeps the common
+/// call sites unchanged.
+pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
     state: AgentState,
     config: AgentConfig,
     iterations: usize,
-    entity_store: InMemoryEntityStore,
+    entity_store: S,
     performed_actions: usize,
     llm_provider: Option<Arc<dyn ModelProvider>>,
     plan_cache: Option<String>,
@@ -285,8 +291,8 @@ pub struct AgentLoop {
     state_history: Vec<AgentState>,
 }
 
-impl AgentLoop {
-    /// Create a new agent loop with default entity store
+impl AgentLoop<InMemoryEntityStore> {
+    /// Create a new agent loop with the default in-memory entity store.
     pub fn new(config: AgentConfig) -> Self {
         Self {
             state: AgentState::EnrichingEntities,
@@ -302,9 +308,11 @@ impl AgentLoop {
             state_history: Vec::new(),
         }
     }
+}
 
+impl<S: EntityStore + Send> AgentLoop<S> {
     /// Create a new agent loop with a provided entity store
-    pub fn with_entity_store(config: AgentConfig, entity_store: InMemoryEntityStore) -> Self {
+    pub fn with_entity_store(config: AgentConfig, entity_store: S) -> Self {
         Self {
             state: AgentState::EnrichingEntities,
             config,
@@ -323,7 +331,7 @@ impl AgentLoop {
     /// Create a new agent loop with entity store and LLM provider
     pub fn with_llm(
         config: AgentConfig,
-        entity_store: InMemoryEntityStore,
+        entity_store: S,
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
@@ -344,7 +352,7 @@ impl AgentLoop {
     /// Create a new agent loop with entity store, LLM provider, and tool registry
     pub fn with_tools(
         config: AgentConfig,
-        entity_store: InMemoryEntityStore,
+        entity_store: S,
         llm_provider: Arc<dyn ModelProvider>,
         tool_registry: ToolRegistry,
     ) -> Self {
@@ -377,12 +385,12 @@ impl AgentLoop {
     }
 
     /// Get reference to entity store
-    pub fn entity_store(&self) -> &InMemoryEntityStore {
+    pub fn entity_store(&self) -> &S {
         &self.entity_store
     }
 
     /// Get mutable reference to entity store
-    pub fn entity_store_mut(&mut self) -> &mut InMemoryEntityStore {
+    pub fn entity_store_mut(&mut self) -> &mut S {
         &mut self.entity_store
     }
 
@@ -705,7 +713,7 @@ impl AgentLoop {
         }
 
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let entity_count = self
                 .entity_store
@@ -752,7 +760,7 @@ impl AgentLoop {
     /// request has been fully satisfied.
     async fn check_task_completion(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let entities = self
                 .entity_store
@@ -816,7 +824,7 @@ impl AgentLoop {
     /// query for more context (true) or proceed to plan (false).
     async fn entity_modification_decision(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let plan = self.plan_cache.as_deref().unwrap_or("No plan yet");
             let entity_count = self
@@ -929,7 +937,7 @@ impl AgentLoop {
     /// the Performing state instead.
     #[deprecated(note = "Use with_tools constructor for LLM-driven performing")]
     async fn perform_entity_modification_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
-        use crate::entities::{git::types::GitRepository, EntityStore};
+        use crate::entities::git::types::GitRepository;
 
         self.performed_actions += 1;
 
