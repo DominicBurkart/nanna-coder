@@ -16,6 +16,46 @@ use uuid::Uuid;
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 
+/// Default system prompt used for task-dispatched agent runs.
+///
+/// Kept in lock-step with `DEFAULT_SESSION_SYSTEM_PROMPT` in `main.rs`. They
+/// are duplicated on purpose: `main.rs` is a `bin` target and cannot be
+/// imported from here.
+const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
+/// Build the system prompt for a task run, appending any repo-level guidance
+/// discovered under the task's workspace path (closes #231).
+///
+/// Precedence: `AGENTS.md` over `CLAUDE.md` (see
+/// [`crate::agent::agents_md::load`]). Missing files produce no injection;
+/// read errors are logged and swallowed so a broken guidance file never blocks
+/// a task from starting.
+fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+    match crate::agent::agents_md::load(workspace_path) {
+        Ok(Some(doc)) => {
+            tracing::info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance into task system prompt"
+            );
+            format!(
+                "{}\n\n{}",
+                DEFAULT_TASK_SYSTEM_PROMPT,
+                crate::agent::agents_md::format_system_prompt_fragment(&doc)
+            )
+        }
+        Ok(None) => DEFAULT_TASK_SYSTEM_PROMPT.to_string(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
+            );
+            DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
@@ -366,7 +406,7 @@ impl TaskManager {
                     let agent_config = AgentConfig {
                         max_iterations,
                         verbose: false,
-                        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
+                        system_prompt: build_task_system_prompt(&workspace.workspace_path),
                         model_name: model.clone(),
                     };
                     let context = AgentContext {
