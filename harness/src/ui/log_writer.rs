@@ -65,13 +65,22 @@ pub struct SpinnerAwareWriter {
 
 impl Write for SpinnerAwareWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // NOTE: this writer intentionally uses `std::io::stderr()` (sync).  The
+        // spinner tick task also goes through sync-locked stderr for its
+        // synchronous cursor-restore on Drop; the tokio stderr async path uses
+        // an atomic single-buffer write_all that never releases mid-frame.
+        // So the critical "no mojibake mid-frame" property is upheld by the
+        // atomicity of render_once, not by a shared lock across sync+async.
         let mut handle = self.stderr.lock();
         if self.active.load(Ordering::Acquire) {
             // Erase the current spinner frame before the log line so they do
             // not visually collide.  The next spinner tick will repaint.
             handle.write_all(b"\r\x1b[2K")?;
         }
-        handle.write(buf)
+        // Use write_all: `tracing` expects full writes.  Reporting a short
+        // write here would silently truncate log records.
+        handle.write_all(buf)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
