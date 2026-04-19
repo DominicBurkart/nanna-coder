@@ -179,13 +179,24 @@ pub async fn run_eval(
         None => OllamaConfig::default(),
     };
 
+    // Wrap the health check in a short timeout so a slow/hung Ollama (e.g. model
+    // loading in CI) fails fast as ProviderUnavailable rather than blocking for
+    // the inference timeout (`OllamaConfig::timeout`, default 30s).
+    const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
     let provider: Arc<dyn ModelProvider> = match OllamaProvider::new(ollama_config.clone()) {
-        Ok(p) => match p.health_check().await {
-            Ok(()) => Arc::new(p),
-            Err(e) => {
+        Ok(p) => match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, p.health_check()).await {
+            Ok(Ok(())) => Arc::new(p),
+            Ok(Err(e)) => {
                 return Err(EvalRunnerError::ProviderUnavailable(format!(
                     "Ollama health check failed at {}: {e}",
                     ollama_config.base_url
+                )));
+            }
+            Err(_) => {
+                return Err(EvalRunnerError::ProviderUnavailable(format!(
+                    "Ollama health check timed out at {} after {:?}",
+                    ollama_config.base_url, HEALTH_CHECK_TIMEOUT
                 )));
             }
         },
@@ -673,8 +684,7 @@ timeout_secs = 30
         let tmp = tempfile::TempDir::new().unwrap();
 
         // Port 1 is reserved and will refuse connections on any standard OS.
-        let config = EvalRunnerConfig::default()
-            .with_base_url("http://127.0.0.1:1");
+        let config = EvalRunnerConfig::default().with_base_url("http://127.0.0.1:1");
 
         let result = run_eval(&case, tmp.path(), &config).await;
 
