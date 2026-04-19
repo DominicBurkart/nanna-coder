@@ -96,7 +96,7 @@ jobs:
       run: nix run .#ci-cache-optimize
 
     - name: Pre-build test containers (Integration tests only)
-      if: matrix.test-type == 'integration-container' && runner.os == 'Linux'
+      if: (matrix.test-type == 'integration-container' || matrix.test-type == 'security') && runner.os == 'Linux'
       run: |
         echo "🔄 Building test containers for caching..."
         nix build .#ollamaImage --print-build-logs
@@ -126,6 +126,38 @@ jobs:
         nix build path:tests/integration/repo#devContainerImage --no-link
         echo "Dev container image built successfully"
 
+    - name: Start host Ollama for model integration tests
+      if: matrix.test-type == 'integration-container' || matrix.test-type == 'security'
+      shell: bash
+      run: |
+        docker run -d --name ci-ollama -p 11434:11434 nanna-coder-ollama:latest
+        for i in $(seq 1 60); do
+          if curl -sf --max-time 2 http://localhost:11434/api/tags >/dev/null; then
+            echo "Ollama ready after ${i} attempts"
+            break
+          fi
+          if [ "$i" = "60" ]; then
+            echo "::error::Ollama failed to start within 120s"
+            docker logs ci-ollama || true
+            exit 1
+          fi
+          sleep 2
+        done
+        docker exec ci-ollama ollama pull qwen3:0.6b
+
+    - name: Assert expected ignored-test count (issue #235)
+      if: matrix.test-type == 'integration-container'
+      shell: bash
+      run: |
+        # Floor set from audit for issue #235. Bump when adding ignored tests.
+        expected_minimum=11
+        found=$(nix develop --command cargo nextest list --workspace --test '*' --all-features --run-ignored ignored-only --message-format json | jq '[.["rust-suites"][].testcases[] | select(.ignored)] | length')
+        echo "Found ${found} ignored tests (minimum expected: ${expected_minimum})"
+        if [ "$found" -lt "$expected_minimum" ]; then
+          echo "::error::Expected >= ${expected_minimum} ignored tests, found ${found}. Did someone remove #[ignore] or rename a crate? See issue #235."
+          exit 1
+        fi
+
     - name: Run unit tests
       if: matrix.test-type == 'unit'
       shell: bash
@@ -147,11 +179,12 @@ jobs:
       shell: bash
       run: |
         nix develop --command cargo nextest run --workspace --test '*' --all-features --test-threads=1
-        if curl -s --max-time 5 http://localhost:11434/api/tags > /dev/null 2>&1; then
-          nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1
-        else
-          echo "Ollama not reachable on port 11434, skipping model integration tests"
-        fi
+        nix develop --command cargo nextest run --workspace --test '*' --all-features --run-ignored ignored-only --test-threads=1 --no-tests=fail
+
+    - name: Stop host Ollama
+      if: always() && matrix.test-type == 'integration-container'
+      shell: bash
+      run: docker rm -f ci-ollama || true
 
     - name: Run lint checks
       if: matrix.test-type == 'lint'
@@ -169,11 +202,17 @@ jobs:
           echo "⚠️ Skipping cargo audit due to CVSS 4.0 incompatibility"
           echo "⚠️ Skipping cargo deny due to CVSS 4.0 incompatibility"
           # Increased timeout from 600s to 1800s (30 min) to accommodate E2E containerized tests
-          # which run slower under tarpaulin instrumentation
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800
+          # which run slower under tarpaulin instrumentation.
+          # --run-ignored: include #[ignore]-gated model/harness tests so Codecov sees their coverage (issue #235).
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800 --run-ignored
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
+
+    - name: Stop host Ollama (security leg)
+      if: always() && matrix.test-type == 'security'
+      shell: bash
+      run: docker rm -f ci-ollama || true
 
     - name: Upload coverage reports
       if: matrix.test-type == 'security'
