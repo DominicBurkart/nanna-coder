@@ -19,3 +19,4 @@ ignore:
   # NOT listed here because it also contains many non-ignored tests.
   - "harness/tests/dev_container_integration.rs"
   - "harness/tests/nanna_self_dev_integration.rs"
+  - "harness/tests/eval_case_runner_integration.rs"

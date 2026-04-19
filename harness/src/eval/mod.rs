@@ -4,8 +4,12 @@
 //! by the agent evaluation framework in [`crate::agent::eval`].
 
 pub mod report;
+pub mod runner;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
     AgentEvaluationResult, BatchEvaluationResult, EvaluationCategory, EvaluationMetrics,
+};
+pub use runner::{
+    detect_changed_files, find_missing_symbols, run_eval_case, EvalRunConfig, EvalRunResult,
 };
