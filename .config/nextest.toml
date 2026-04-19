@@ -1,0 +1,7 @@
+# Cargo-nextest configuration.
+#
+# slow-timeout: print a warning after 30s, and hard-terminate the test after
+# 2 periods (60s total). This prevents individual tests from hanging pre-commit
+# or CI indefinitely on network/IO stalls. Tracked in issue #238.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2 }
