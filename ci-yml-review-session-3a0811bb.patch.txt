@@ -1,0 +1,73 @@
+From: CRON session 3a0811bb (address-comments)
+Subject: address review comments on PR #239 (model mismatch + `|| true` teardown)
+
+This patch cannot be pushed directly: the GitHub App token available to
+this session lacks the `workflows` permission required to modify
+`.github/workflows/ci.yml`. The two reviewer-blocking items are captured
+here for manual application on top of 310e65e.
+
+Addresses:
+  - review thread r3106662878 (model mismatch: pull qwen3:0.6b vs E2E_MODEL=gemma4:e4b)
+  - review thread r3106662989 (TESTING.md: no `|| true` graceful-degradation in teardown)
+
+Apply with: patch -p1 < ci-yml-review-session-3a0811bb.patch.txt
+
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -130,6 +130,9 @@ jobs:
+       if: matrix.test-type == 'integration-container' || matrix.test-type == 'security'
+       shell: bash
+       run: |
++        # Model must match harness::tests::E2E_MODEL (harness/tests/integration_tests.rs,
++        # dev_container_integration.rs, nanna_self_dev_integration.rs). If you change
++        # E2E_MODEL, update this pull and the Incomplete section of the PR body.
+         docker run -d --name ci-ollama -p 11434:11434 nanna-coder-ollama:latest
+         for i in $(seq 1 60); do
+           if curl -sf --max-time 2 http://localhost:11434/api/tags >/dev/null; then
+@@ -138,12 +141,12 @@ jobs:
+           fi
+           if [ "$i" = "60" ]; then
+             echo "::error::Ollama failed to start within 120s"
+-            docker logs ci-ollama || true
++            docker logs ci-ollama
+             exit 1
+           fi
+           sleep 2
+         done
+-        docker exec ci-ollama ollama pull qwen3:0.6b
++        docker exec ci-ollama ollama pull gemma4:e4b
+
+     - name: Assert expected ignored-test count (issue #235)
+       if: matrix.test-type == 'integration-container'
+@@ -187,7 +190,14 @@ jobs:
+     - name: Stop host Ollama
+       if: always() && matrix.test-type == 'integration-container'
+       shell: bash
+-      run: docker rm -f ci-ollama || true
++      run: |
++        # Per TESTING.md, no `|| true` graceful-degradation: a missing container
++        # is a no-op, but a broken daemon must surface loudly.
++        if docker inspect ci-ollama >/dev/null 2>&1; then
++          docker rm -f ci-ollama
++        else
++          echo "ci-ollama container already absent; skipping teardown"
++        fi
+
+     - name: Run lint checks
+       if: matrix.test-type == 'lint'
+@@ -217,7 +227,14 @@ jobs:
+     - name: Stop host Ollama (security leg)
+       if: always() && matrix.test-type == 'security'
+       shell: bash
+-      run: docker rm -f ci-ollama || true
++      run: |
++        # Per TESTING.md, no `|| true` graceful-degradation: a missing container
++        # is a no-op, but a broken daemon must surface loudly.
++        if docker inspect ci-ollama >/dev/null 2>&1; then
++          docker rm -f ci-ollama
++        else
++          echo "ci-ollama container already absent; skipping teardown"
++        fi
+
+     - name: Upload coverage reports
+       if: matrix.test-type == 'security'
