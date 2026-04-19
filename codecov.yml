@@ -3,10 +3,11 @@ coverage:
     project: off
     patch:
       default:
-        # Relaxed from 100%: the #[ignore] e2e test and the
-        # runtime-gated test_create_with_container_no_runtime exit early
-        # in CI (no container runtime / Ollama available), so some new
-        # container-dispatch branches are genuinely uncoverable there.
+        # Set to 90%. As of issue #235 the #[ignore]-gated e2e tests now
+        # actually execute in CI (Ollama is started on the security leg
+        # and --run-ignored is passed to tarpaulin), so most container
+        # dispatch branches are covered. A small buffer remains for
+        # runtime-gated paths like test_create_with_container_no_runtime.
         target: 90%
 
 ignore:
