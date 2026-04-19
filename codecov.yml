@@ -11,3 +11,11 @@ coverage:
 
 ignore:
   - "harness/src/main.rs"
+  # These test files contain only #[ignore]-gated E2E tests that run
+  # under --run-ignored ignored-only on the integration-container job
+  # (see .github/workflows/ci.yml). Default CI unit test runs never
+  # execute them, so any new code in these files is genuinely
+  # uncoverable by the codecov patch report. integration_tests.rs is
+  # NOT listed here because it also contains many non-ignored tests.
+  - "harness/tests/dev_container_integration.rs"
+  - "harness/tests/nanna_self_dev_integration.rs"
