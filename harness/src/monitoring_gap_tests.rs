@@ -3,11 +3,12 @@
 //! manual inspection; none of them require a live container or Ollama.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod monitoring_gap_tests {
     use crate::monitoring::{
-        AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultMetricsCollector,
-        DefaultHealthMonitor, ErrorEvent, ErrorSeverity, HealthStatus, MetricsFormat,
-        MetricsCollector, AlertManager, MonitoringSystem,
+        AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
+        DefaultMetricsCollector, ErrorEvent, ErrorSeverity, HealthStatus, MetricsCollector,
+        MetricsFormat, MonitoringSystem,
     };
     use chrono::Utc;
     use std::time::Duration;
@@ -102,7 +103,10 @@ mod monitoring_gap_tests {
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("parquet"), "error should name the format: {msg}");
+        assert!(
+            msg.contains("parquet"),
+            "error should name the format: {msg}"
+        );
     }
 
     // ── DefaultAlertManager: history and thresholds ───────────────────────────
@@ -113,11 +117,7 @@ mod monitoring_gap_tests {
 
         for i in 0..5u32 {
             manager
-                .send_alert(
-                    &format!("Alert {i}"),
-                    "description",
-                    AlertSeverity::Info,
-                )
+                .send_alert(&format!("Alert {i}"), "description", AlertSeverity::Info)
                 .await
                 .unwrap();
         }

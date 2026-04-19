@@ -158,7 +158,7 @@ async fn test_config_validation() {
     let valid_config = OllamaConfig::default();
     assert!(valid_config.validate().is_ok());
 
-    let invalid_config = OllamaConfig::new()
+    let invalid_config = OllamaConfig::default()
         .with_base_url("")
         .with_context_length(0)
         .with_temperature(-1.0);
@@ -357,7 +357,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
     }
 
     // Configure provider to use the containerized Ollama
-    let ollama_config = OllamaConfig::new()
+    let ollama_config = OllamaConfig::default()
         .with_base_url(format!(
             "http://localhost:{}",
             container_handle.port.unwrap_or(11436)
@@ -805,7 +805,7 @@ async fn test_e2e_container_to_validated_inference() {
 
     // Phase 3: Model Provider Setup and Validation
     println!("🤖 Phase 3: Setting up model provider with judge validation");
-    let ollama_config = OllamaConfig::new()
+    let ollama_config = OllamaConfig::default()
         .with_base_url(format!(
             "http://localhost:{}",
             container_handle.port.unwrap_or(11437)
@@ -1069,7 +1069,7 @@ async fn test_e2e_multi_model_comparison() {
         };
 
         // Setup provider
-        let ollama_config = OllamaConfig::new()
+        let ollama_config = OllamaConfig::default()
             .with_base_url(format!("http://localhost:{}", port))
             .with_timeout(Duration::from_secs(60));
 
@@ -1185,7 +1185,7 @@ async fn test_e2e_performance_and_reliability() {
         }
     };
 
-    let ollama_config = OllamaConfig::new()
+    let ollama_config = OllamaConfig::default()
         .with_base_url(format!(
             "http://localhost:{}",
             container_handle.port.unwrap_or(11439)
@@ -1783,7 +1783,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         }
     }
 
-    let ollama_config = OllamaConfig::new()
+    let ollama_config = OllamaConfig::default()
         .with_base_url(format!("http://localhost:{}", port))
         .with_timeout(Duration::from_secs(120));
 

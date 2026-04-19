@@ -37,9 +37,7 @@ pub enum DecisionAction {
 /// This is a stub implementation that requires further problem definition.
 /// The `context_sufficient` parameter will be replaced by a richer entity
 /// state type once that is defined.
-pub fn entity_modification_decision(
-    context_sufficient: bool,
-) -> DecisionResult<DecisionAction> {
+pub fn entity_modification_decision(context_sufficient: bool) -> DecisionResult<DecisionAction> {
     let _ = context_sufficient;
     unimplemented!(
         "Entity modification decision logic requires further problem definition. \

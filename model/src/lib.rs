@@ -4,7 +4,7 @@ pub mod ollama;
 pub mod provider;
 pub mod types;
 
-pub use config::{ModelDefaults, OllamaConfig};
+pub use config::OllamaConfig;
 pub use judge::{JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult};
 pub use provider::{ModelError, ModelProvider, ModelResult, StreamingModelProvider};
 pub use types::{
