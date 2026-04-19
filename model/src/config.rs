@@ -23,10 +23,6 @@ impl Default for OllamaConfig {
 }
 
 impl OllamaConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -83,23 +79,6 @@ impl OllamaConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDefaults {
-    pub temperature: f32,
-    pub max_tokens: Option<u32>,
-    pub context_length: u32,
-}
-
-impl Default for ModelDefaults {
-    fn default() -> Self {
-        Self {
-            temperature: 0.7,
-            max_tokens: None,
-            context_length: 110_000,
-        }
-    }
-}
-
 #[cfg(kani)]
 mod kani_proofs {
     /// Verify that OllamaConfig::validate rejects bad temperatures.
@@ -145,15 +124,13 @@ mod kani_proofs {
         }
     }
 
-    /// The concrete `ModelDefaults::default()` temperature must fall
-    /// inside `OllamaConfig::validate`'s accepted range. Exercises the
-    /// real default constructor and verifies the invariant against the
-    /// actual value, not a re-asserted assumption.
+    /// The concrete `OllamaConfig::default()` temperature must fall
+    /// inside `OllamaConfig::validate`'s accepted range.
     #[kani::proof]
-    fn model_defaults_default_temperature_is_valid() {
-        let defaults = super::ModelDefaults::default();
-        assert!(!defaults.temperature.is_nan());
-        assert!((0.0..=2.0f32).contains(&defaults.temperature));
+    fn ollama_config_default_temperature_is_valid() {
+        let cfg = super::OllamaConfig::default();
+        assert!(!cfg.default_temperature.is_nan());
+        assert!((0.0..=2.0f32).contains(&cfg.default_temperature));
     }
 
     /// The concrete `OllamaConfig::default()` must pass `validate()`.
@@ -182,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = OllamaConfig::new()
+        let config = OllamaConfig::default()
             .with_base_url("https://api.example.com")
             .with_context_length(50_000)
             .with_temperature(0.5)

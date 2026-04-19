@@ -18,14 +18,29 @@ pub enum DecisionError {
 
 pub type DecisionResult<T> = Result<T, DecisionError>;
 
+/// The two branches the decision node can take (see ARCHITECTURE.md control
+/// flow diagram).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionAction {
+    /// Insufficient context — route to Query Entities (RAG).
+    Query,
+    /// Enough context — route to Plan Entity Modification.
+    Perform,
+}
+
 /// Entity Modification Decision (ARCHITECTURE.md)
 ///
-/// Determine whether additional entity context is needed (query) or
-/// whether the agent can proceed to plan the next modification.
+/// Given whether the agent currently has sufficient context, decide whether
+/// to query for more entity information or proceed to plan a modification.
 ///
 /// # Note
 /// This is a stub implementation that requires further problem definition.
-pub fn entity_modification_decision() -> DecisionResult<()> {
+/// The `context_sufficient` parameter will be replaced by a richer entity
+/// state type once that is defined.
+pub fn entity_modification_decision(
+    context_sufficient: bool,
+) -> DecisionResult<DecisionAction> {
+    let _ = context_sufficient;
     unimplemented!(
         "Entity modification decision logic requires further problem definition. \
          This should analyze context and determine next actions."
@@ -41,6 +56,6 @@ mod tests {
         expected = "Entity modification decision logic requires further problem definition"
     )]
     fn test_entity_modification_decision_unimplemented() {
-        let _ = entity_modification_decision();
+        let _ = entity_modification_decision(false);
     }
 }
