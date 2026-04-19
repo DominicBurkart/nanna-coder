@@ -384,13 +384,51 @@ fn verify_symbols(
     let source_content = collect_source_content(work_dir, &extensions);
 
     for symbol in required_symbols {
-        if source_content.contains(symbol.as_str()) {
+        if contains_whole_word(&source_content, symbol) {
             found.push(symbol.clone());
         } else {
             missing.push(symbol.clone());
         }
     }
     (found, missing)
+}
+
+/// Returns `true` if `haystack` contains `needle` bounded by non-identifier
+/// characters (or haystack boundaries) on both sides.
+///
+/// This avoids spurious matches where the required symbol happens to be a
+/// substring of an unrelated identifier (e.g. looking for `greet` and
+/// accidentally matching `greetings`). An identifier character is any
+/// alphanumeric ASCII character or `_`, matching the common identifier
+/// convention shared across the supported languages.
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let bytes = haystack.as_bytes();
+    let nlen = needle.len();
+    let mut start = 0;
+    while let Some(idx) = haystack[start..].find(needle) {
+        let abs = start + idx;
+        let before_ok = abs == 0 || {
+            let prev = haystack[..abs].chars().next_back();
+            !prev.map(is_ident).unwrap_or(false)
+        };
+        let end = abs + nlen;
+        let after_ok = end >= bytes.len() || {
+            let next = haystack[end..].chars().next();
+            !next.map(is_ident).unwrap_or(false)
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// Map a language name to its common file extensions.
@@ -409,20 +447,65 @@ fn extensions_for_language(language: &str) -> Vec<&'static str> {
     }
 }
 
+/// Directory names that are never walked when searching for source content.
+///
+/// These are build artefacts, VCS metadata, or dependency caches that can be
+/// very large and are not part of the agent-produced source tree. Including
+/// them would produce false-positive symbol matches (e.g. a required symbol
+/// appearing in a compiled `target/` artefact) and slow verification
+/// dramatically on any non-trivial repo.
+const SOURCE_IGNORE_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+];
+
 /// Recursively read source files under `dir` matching the given extensions
 /// and concatenate their contents.
+///
+/// Directories listed in [`SOURCE_IGNORE_DIRS`] are skipped. Symlinks are not
+/// followed to avoid cycles and to keep verification scoped to the
+/// agent-produced tree.
 fn collect_source_content(dir: &Path, extensions: &[&str]) -> String {
     let mut content = String::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // Use the DirEntry's cheap file_type rather than following symlinks.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            // Skip symlinks entirely — verification should only inspect real
+            // files produced by the agent. Following symlinks can loop and can
+            // reach files outside the workspace.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if SOURCE_IGNORE_DIRS.contains(&name) {
+                        continue;
+                    }
+                }
                 content.push_str(&collect_source_content(&path, extensions));
-            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.contains(&ext) {
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        content.push_str(&text);
-                        content.push('\n');
+            } else if file_type.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if extensions.contains(&ext) {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            content.push_str(&text);
+                            content.push('\n');
+                        }
                     }
                 }
             }
@@ -453,6 +536,18 @@ fn verification_failures(v: &VerificationResult) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Recursively copy the contents of `src` into `dst`.
+///
+/// Symlinks are **not** followed: if a symlink is encountered anywhere in the
+/// source tree, this function returns an [`std::io::Error`] of kind
+/// [`std::io::ErrorKind::InvalidInput`] rather than silently dereferencing
+/// the target. This protects against cycles (a symlink pointing to an
+/// ancestor directory would otherwise recurse forever) and against accidental
+/// escape from the fixture workspace (a symlink could point outside `src`).
+///
+/// If a fixture repo genuinely needs symlinks, the caller should switch to
+/// a richer copy utility (e.g. `fs_extra::dir::copy`) that can preserve
+/// symlink targets. Current eval fixtures are plain source trees and do not
+/// contain symlinks.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
@@ -461,11 +556,26 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        // Use DirEntry::file_type so we inspect the entry itself rather than
+        // a followed target (path.is_dir()/is_file() traverse symlinks).
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "fixture repo contains a symlink ({}); symlinks are not supported \
+                     by the eval runner. Remove or replace the symlink in the fixture.",
+                    src_path.display()
+                ),
+            ));
+        }
+        if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
         }
+        // Silently skip other entry types (e.g. sockets, block devices) —
+        // they are never part of a source fixture.
     }
     Ok(())
 }
@@ -935,5 +1045,100 @@ mod tests {
         assert_eq!(result.token_usage.total_tokens, 0);
         assert!(result.failures.is_empty());
         assert!(result.agent_result.is_none());
+    }
+
+    #[test]
+    fn test_contains_whole_word_matches_on_boundary() {
+        assert!(contains_whole_word("pub fn greet() {}", "greet"));
+        assert!(contains_whole_word("greet()", "greet"));
+        assert!(contains_whole_word("greet", "greet"));
+        assert!(contains_whole_word("a.greet()", "greet"));
+    }
+
+    #[test]
+    fn test_contains_whole_word_rejects_substring() {
+        // `greet` should NOT match inside `greetings` or `ungreet`.
+        assert!(!contains_whole_word("fn greetings() {}", "greet"));
+        assert!(!contains_whole_word("fn ungreet() {}", "greet"));
+        assert!(!contains_whole_word("foo_greet_bar", "greet"));
+        assert!(!contains_whole_word("greet1", "greet"));
+    }
+
+    #[test]
+    fn test_contains_whole_word_empty_needle() {
+        assert!(!contains_whole_word("anything", ""));
+    }
+
+    #[test]
+    fn test_verify_symbols_rejects_substring_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        // Only `greetings` is present — asking for `greet` must NOT match.
+        std::fs::write(src.join("lib.rs"), "pub fn greetings() {}").unwrap();
+
+        let (found, missing) = verify_symbols(dir.path(), &["greet".to_string()], "rust");
+
+        assert!(
+            found.is_empty(),
+            "greet should not match substring of greetings"
+        );
+        assert_eq!(missing, vec!["greet"]);
+    }
+
+    #[test]
+    fn test_collect_source_content_skips_ignored_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Real source file that should be included.
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        // target/ should be skipped — content inside must NOT leak into search.
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("artifact.rs"), "fn should_be_ignored() {}").unwrap();
+        // .git/ should likewise be skipped.
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        std::fs::write(git.join("hooks.rs"), "fn git_hook() {}").unwrap();
+
+        let content = collect_source_content(dir.path(), &["rs"]);
+        assert!(content.contains("fn main()"));
+        assert!(!content.contains("should_be_ignored"));
+        assert!(!content.contains("git_hook"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_dir_recursive_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let src = tempfile::TempDir::new().unwrap();
+        let dst = tempfile::TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("real.txt"), "content").unwrap();
+        // Create a symlink inside the source tree pointing somewhere.
+        symlink(src.path().join("real.txt"), src.path().join("link.txt")).unwrap();
+
+        let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_source_content_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("outside.rs"), "fn outside_fn() {}").unwrap();
+        std::fs::write(dir.path().join("inside.rs"), "fn inside_fn() {}").unwrap();
+        // Symlink from inside the searched dir to a file outside.
+        symlink(
+            outside.path().join("outside.rs"),
+            dir.path().join("link.rs"),
+        )
+        .unwrap();
+
+        let content = collect_source_content(dir.path(), &["rs"]);
+        assert!(content.contains("inside_fn"));
+        assert!(!content.contains("outside_fn"));
     }
 }

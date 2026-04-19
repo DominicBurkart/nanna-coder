@@ -48,17 +48,33 @@ timeout_secs = 1
 "#;
     let case = EvalCase::from_toml_str(toml_str).unwrap();
 
-    // Give the agent many iterations but only 1 second timeout
+    // Give the agent many iterations but only 1 second timeout. With a real
+    // Ollama provider wired into run_eval, the agent is expected to spend
+    // at least a second in LLM calls for an open-ended prompt, which should
+    // trip the 1s timeout. We assert specifically on the timeout path so the
+    // test fails loudly if the timeout plumbing regresses — the previous
+    // `result.is_ok() || Err(Timeout)` assertion was trivially satisfied
+    // while a silent-fallback no-op agent existed.
     let config = EvalRunnerConfig::default().with_max_iterations(10000);
 
     // Use a temp dir as case_dir (no repo/ subdirectory)
     let tmp = tempfile::TempDir::new().unwrap();
     let result = run_eval(&case, tmp.path(), &config).await;
 
-    // The agent should either complete quickly (no LLM attached) or time out.
-    // With no LLM, it will complete via the entity-based loop, so it won't timeout.
-    // This test mainly verifies the timeout plumbing compiles and runs.
-    assert!(result.is_ok() || matches!(result, Err(EvalRunnerError::Timeout(_))));
+    match result {
+        Err(EvalRunnerError::Timeout(_)) => {}
+        Err(EvalRunnerError::ModelProvider(msg)) => {
+            // Ollama reachability is a prerequisite of this #[ignore] test;
+            // if provider init fails (e.g. daemon gone mid-suite), surface it
+            // rather than panic so the failure mode is distinct from a real
+            // timeout-plumbing regression.
+            eprintln!(
+                "test_run_eval_timeout: model provider unavailable ({msg}); \
+                 skipping timeout assertion"
+            );
+        }
+        other => panic!("expected Err(Timeout) (or ModelProvider unavailable), got {other:?}"),
+    }
 }
 
 #[tokio::test]
