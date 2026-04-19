@@ -150,11 +150,14 @@ jobs:
       shell: bash
       run: |
         # Floor set from audit for issue #235. Bump when adding ignored tests.
+        # Counts `#[ignore]` annotations in source rather than asking nextest,
+        # so the guard runs before cargo has compiled anything and is robust
+        # to nextest's JSON-format quirks.
         expected_minimum=11
-        found=$(nix develop --command cargo nextest list --workspace --test '*' --all-features --run-ignored ignored-only --message-format json | jq '[.["rust-suites"][].testcases[] | select(.ignored)] | length')
-        echo "Found ${found} ignored tests (minimum expected: ${expected_minimum})"
+        found=$(grep -rhE '^[[:space:]]*#\[ignore' --include='*.rs' harness model | wc -l | tr -d '[:space:]')
+        echo "Found ${found} #[ignore] annotations (minimum expected: ${expected_minimum})"
         if [ "$found" -lt "$expected_minimum" ]; then
-          echo "::error::Expected >= ${expected_minimum} ignored tests, found ${found}. Did someone remove #[ignore] or rename a crate? See issue #235."
+          echo "::error::Expected >= ${expected_minimum} #[ignore]-annotated tests, found ${found}. Did someone remove #[ignore] or rename a crate? See issue #235."
           exit 1
         fi
 
@@ -203,8 +206,10 @@ jobs:
           echo "⚠️ Skipping cargo deny due to CVSS 4.0 incompatibility"
           # Increased timeout from 600s to 1800s (30 min) to accommodate E2E containerized tests
           # which run slower under tarpaulin instrumentation.
-          # --run-ignored: include #[ignore]-gated model/harness tests so Codecov sees their coverage (issue #235).
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800 --run-ignored
+          # -- --include-ignored: test-harness passthrough so #[ignore]-gated model/harness
+          # tests also execute under tarpaulin (issue #235). Uses the stable rust test-harness
+          # flag rather than tarpaulin's own --run-ignored, which version-drifts across nixpkgs.
+          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800 -- --include-ignored
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
