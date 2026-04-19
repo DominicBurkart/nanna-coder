@@ -20,3 +20,8 @@ ignore:
   - "harness/tests/dev_container_integration.rs"
   - "harness/tests/nanna_self_dev_integration.rs"
   - "harness/tests/eval_case_runner_integration.rs"
+  # run_eval_case + run_cargo_in_container require a live container
+  # runtime (podman/docker) and cannot execute in the unit CI job.
+  # The pure helpers they compose live in runner.rs and are covered
+  # by unit tests in that file.
+  - "harness/src/eval/runner_orchestrator.rs"

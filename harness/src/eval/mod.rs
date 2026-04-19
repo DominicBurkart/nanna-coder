@@ -5,11 +5,11 @@
 
 pub mod report;
 pub mod runner;
+pub mod runner_orchestrator;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
     AgentEvaluationResult, BatchEvaluationResult, EvaluationCategory, EvaluationMetrics,
 };
-pub use runner::{
-    detect_changed_files, find_missing_symbols, run_eval_case, EvalRunConfig, EvalRunResult,
-};
+pub use runner::{detect_changed_files, find_missing_symbols, EvalRunConfig, EvalRunResult};
+pub use runner_orchestrator::run_eval_case;

@@ -12,23 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::agent::eval_case::EvalCase;
-use crate::agent::{AgentConfig, AgentContext, AgentLoop};
-use crate::container::{
-    detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig, ContainerHandle,
-};
 use crate::entities::context::types::ToolCallRecord;
-use crate::entities::InMemoryEntityStore;
-use crate::onboarding::{DeterministicOnboarder, Onboarder};
-use crate::tools::{
-    ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
-    CONTAINER_WORKSPACE_DIR,
-};
-use model::provider::ModelProvider;
 
 /// Runtime configuration for a single eval case run.
 #[derive(Debug, Clone)]
@@ -84,7 +71,7 @@ pub struct EvalRunResult {
 }
 
 impl EvalRunResult {
-    fn failure(case_id: &str, start: Instant, reason: impl Into<String>) -> Self {
+    pub(super) fn failure(case_id: &str, start: Instant, reason: impl Into<String>) -> Self {
         Self {
             case_id: case_id.to_string(),
             passed: false,
@@ -98,170 +85,6 @@ impl EvalRunResult {
             failure_reason: Some(reason.into()),
             tool_calls: Vec::new(),
         }
-    }
-}
-
-/// Execute a single eval case against the live agent.
-///
-/// `source_repo` is the checked-in fixture (read-only from the runner's
-/// perspective). `workspace` is a caller-owned directory into which the
-/// fixture is copied before the agent runs; it will be bind-mounted into
-/// the dev container at `CONTAINER_WORKSPACE_DIR`. Keeping workspace
-/// lifecycle outside the runner lets callers choose between `tempfile`
-/// (tests) and fixed paths (report collection).
-pub async fn run_eval_case(
-    case: &EvalCase,
-    source_repo: &Path,
-    workspace: &Path,
-    config: &EvalRunConfig,
-    provider: Arc<dyn ModelProvider>,
-) -> EvalRunResult {
-    let start = Instant::now();
-    let case_id = case.case.id.clone();
-
-    if let Err(e) = copy_dir_all(source_repo, workspace) {
-        return EvalRunResult::failure(&case_id, start, format!("fixture copy failed: {}", e));
-    }
-
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        return EvalRunResult::failure(
-            &case_id,
-            start,
-            "no container runtime (podman/docker) available",
-        );
-    }
-
-    // Fixture repos under `evals/cases/**/repo` don't carry a `flake.nix`
-    // (they're minimal Cargo crates), so onboard the workspace copy first
-    // to generate one before building the dev container.
-    if !workspace.join("flake.nix").exists() {
-        let onboarder = DeterministicOnboarder;
-        if let Err(e) = onboarder.onboard(workspace).await {
-            return EvalRunResult::failure(&case_id, start, format!("onboarding failed: {}", e));
-        }
-    }
-
-    let image_path = match image_builder::build_dev_container(workspace) {
-        Ok(p) => p,
-        Err(e) => {
-            return EvalRunResult::failure(
-                &case_id,
-                start,
-                format!("dev container build failed: {}", e),
-            )
-        }
-    };
-
-    let image_ref = match load_image_from_path(&runtime, &image_path) {
-        Ok(r) => r,
-        Err(e) => {
-            return EvalRunResult::failure(&case_id, start, format!("load image failed: {}", e))
-        }
-    };
-
-    let container_name = format!("nanna-eval-{}-{}", case.case.id, uuid::Uuid::new_v4());
-    let additional_args = vec![format!(
-        "-v={}:{CONTAINER_WORKSPACE_DIR}",
-        workspace.display()
-    )];
-    let container_config = ContainerConfig {
-        base_image: image_ref,
-        test_image: None,
-        container_name,
-        port_mapping: None,
-        model_to_pull: None,
-        startup_timeout: Duration::from_secs(5),
-        health_check_timeout: Duration::from_secs(5),
-        env_vars: vec![],
-        additional_args,
-    };
-
-    let handle = match start_container_with_fallback(&container_config).await {
-        Ok(h) => h,
-        Err(e) => {
-            return EvalRunResult::failure(
-                &case_id,
-                start,
-                format!("container start failed: {}", e),
-            )
-        }
-    };
-    let handle = Arc::new(handle);
-
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ReadFileTool::new(workspace.to_path_buf())));
-    registry.register(Box::new(WriteFileTool::new(workspace.to_path_buf())));
-    registry.register(Box::new(ListDirTool::new(workspace.to_path_buf())));
-    registry.register(Box::new(SearchTool::new(workspace.to_path_buf())));
-    registry.register(Box::new(RunCommandTool::new(
-        Arc::clone(&handle),
-        Some(CONTAINER_WORKSPACE_DIR.to_string()),
-    )));
-
-    let agent_config = AgentConfig {
-        max_iterations: config.max_iterations,
-        verbose: config.verbose,
-        system_prompt: build_system_prompt(case),
-        model_name: config.model_name.clone(),
-    };
-    let context = AgentContext {
-        user_prompt: case.task.prompt.clone(),
-        conversation_history: vec![],
-        app_state_id: uuid::Uuid::new_v4().to_string(),
-    };
-
-    let mut agent =
-        AgentLoop::with_tools(agent_config, InMemoryEntityStore::new(), provider, registry);
-
-    let agent_timeout = Duration::from_secs(case.metadata.timeout_secs);
-    let agent_result = match tokio::time::timeout(agent_timeout, agent.run(context)).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return EvalRunResult::failure(&case_id, start, format!("agent error: {}", e))
-        }
-        Err(_) => {
-            return EvalRunResult::failure(
-                &case_id,
-                start,
-                format!("agent timed out after {}s", case.metadata.timeout_secs),
-            )
-        }
-    };
-
-    let files_changed = detect_changed_files(source_repo, workspace);
-    let missing_symbols = find_missing_symbols(workspace, &case.expected.required_symbols);
-
-    let build_passed = if case.expected.build_must_pass {
-        Some(run_cargo_in_container(&handle, "build"))
-    } else {
-        None
-    };
-    let tests_passed = if case.expected.tests_must_pass {
-        Some(run_cargo_in_container(&handle, "test"))
-    } else {
-        None
-    };
-
-    let (passed, failure_reason) = classify_outcome(
-        agent_result.task_completed,
-        build_passed,
-        tests_passed,
-        &missing_symbols,
-    );
-
-    EvalRunResult {
-        case_id,
-        passed,
-        duration: start.elapsed(),
-        iterations: agent_result.iterations,
-        agent_completed: agent_result.task_completed,
-        build_passed,
-        tests_passed,
-        files_changed,
-        missing_symbols,
-        failure_reason,
-        tool_calls: agent_result.tool_calls_made,
     }
 }
 
@@ -298,7 +121,7 @@ pub(crate) fn classify_outcome(
 /// Build the system prompt sent to every eval case. Deliberately
 /// case-agnostic so outcomes across cases are comparable — task-specific
 /// instructions come from `case.task.prompt` via `AgentContext::user_prompt`.
-fn build_system_prompt(case: &EvalCase) -> String {
+pub(super) fn build_system_prompt(case: &EvalCase) -> String {
     format!(
         "You are a coding assistant working on a {language} project mounted at the workspace \
          directory. Use the provided file tools to read existing code, make the requested \
@@ -308,17 +131,7 @@ fn build_system_prompt(case: &EvalCase) -> String {
     )
 }
 
-fn run_cargo_in_container(handle: &ContainerHandle, subcommand: &str) -> bool {
-    exec_in_container(
-        handle,
-        &["cargo", subcommand],
-        Some(CONTAINER_WORKSPACE_DIR),
-    )
-    .map(|out| out.success)
-    .unwrap_or(false)
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(super) fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -374,7 +187,9 @@ fn symbol_appears(haystack: &str, symbol: &str) -> bool {
 }
 
 /// Diff two directory trees by file content. Returns paths (relative to either
-/// root) of files that differ, were added, or were removed. Output is sorted.
+/// root) of files that differ, were added, or were removed. Output is sorted
+/// and uses forward-slash separators on all platforms so results match the
+/// `expected.files_changed` entries declared in eval case TOML fixtures.
 pub fn detect_changed_files(original: &Path, modified: &Path) -> Vec<String> {
     let orig = walk_files(original);
     let modif = walk_files(modified);
@@ -384,19 +199,26 @@ pub fn detect_changed_files(original: &Path, modified: &Path) -> Vec<String> {
         match modif.get(path) {
             Some(m) if m == content => {}
             _ => {
-                changed.insert(path.to_string_lossy().into_owned());
+                changed.insert(normalize_rel_path(path));
             }
         }
     }
     for path in modif.keys() {
         if !orig.contains_key(path) {
-            changed.insert(path.to_string_lossy().into_owned());
+            changed.insert(normalize_rel_path(path));
         }
     }
 
     let mut result: Vec<String> = changed.into_iter().collect();
     result.sort();
     result
+}
+
+fn normalize_rel_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn walk_files(root: &Path) -> HashMap<PathBuf, Vec<u8>> {
@@ -511,7 +333,7 @@ mod tests {
         write(&a.path().join("src/lib.rs"), "old");
         write(&b.path().join("src/lib.rs"), "new");
         let changed = detect_changed_files(a.path(), b.path());
-        assert_eq!(changed, vec![PathBuf::from("src/lib.rs").to_string_lossy()]);
+        assert_eq!(changed, vec!["src/lib.rs".to_string()]);
     }
 
     #[test]
@@ -522,10 +344,7 @@ mod tests {
         write(&b.path().join("src/lib.rs"), "x");
         write(&b.path().join("src/utils.rs"), "new module");
         let changed = detect_changed_files(a.path(), b.path());
-        assert_eq!(
-            changed,
-            vec![PathBuf::from("src/utils.rs").to_string_lossy()]
-        );
+        assert_eq!(changed, vec!["src/utils.rs".to_string()]);
     }
 
     #[test]
@@ -536,10 +355,7 @@ mod tests {
         write(&a.path().join("src/gone.rs"), "dead");
         write(&b.path().join("src/lib.rs"), "x");
         let changed = detect_changed_files(a.path(), b.path());
-        assert_eq!(
-            changed,
-            vec![PathBuf::from("src/gone.rs").to_string_lossy()]
-        );
+        assert_eq!(changed, vec!["src/gone.rs".to_string()]);
     }
 
     #[test]
