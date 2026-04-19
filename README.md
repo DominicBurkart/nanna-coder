@@ -1,18 +1,19 @@
 # Nanna Coder
 
-A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
+A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or other model providers.
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Instructions for agents building nanna
+- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture, API reference, and control-flow diagrams
+- [AGENTS.md](AGENTS.md) - Agent state machine for agents building nanna
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
+- [CACHIX_SETUP.md](CACHIX_SETUP.md) - Binary cache push access (maintainers only)
 
 ## Technologies
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
-- [Rust](https://rustlang.org)
+- [Rust](https://www.rust-lang.org)
 - [Cachix](https://cachix.org/) - Binary cache for fast builds
 
 ## Quick Start
@@ -40,10 +41,7 @@ nix build
 The agent requires a running [Ollama](https://ollama.ai/) instance with a model installed:
 
 ```bash
-# Install Ollama (see https://ollama.ai/download)
-curl -fsSL https://ollama.ai/install.sh | sh
-
-# Pull the default model
+# Pull the default model (see https://ollama.ai/download for Ollama installation)
 ollama pull qwen3:0.6b
 
 # Verify Ollama is running
@@ -77,5 +75,3 @@ Cachix provides a public binary cache for faster builds. No account needed to pu
 # Configure Cachix for faster builds (read-only access)
 nix run .#setup-cache
 ```
-
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).

@@ -1,4 +1,4 @@
-# Primary Use-Case (Background Agents Delegate Tasks to Nanna)
+# Primary Use-Case: Background Agents Delegate Tasks to Nanna
 
 ```mermaid
 ---
@@ -121,13 +121,13 @@ config:
   layout: dagre
 ---
 flowchart TD
-    A(["Application State 1"]) --> n6["Entity Enrichment"]
+    A(["Application State"]) --> n6["Entity Enrichment"]
     n10(["User Prompt"]) --> n4["Plan Entity Modification"]
     B{"Task Complete?"} --> C["Yes"] & D["No"]
     D --> n1["Entity Modification Decision"]
     n1 --> n3["Query Entities (RAG)"] & n4
     n4 --> n7["Perform Entity Modification"]
-    C --> n9(["Application State 2"])
+    C --> n9(["Updated Application State"])
     n3 --> n1
     n7 --> n11["Update Entities"]
     n11 --> B
@@ -138,7 +138,6 @@ flowchart TD
     n3@{ shape: rect}
     n7@{ shape: rect}
     n11@{ shape: rect}
-     A:::Rose
      A:::Aqua
      n10:::Aqua
      n9:::Aqua
