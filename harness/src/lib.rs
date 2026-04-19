@@ -11,6 +11,9 @@ pub mod telemetry;
 pub mod tools;
 pub mod workspace;
 
+#[cfg(test)]
+mod monitoring_gap_tests;
+
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
