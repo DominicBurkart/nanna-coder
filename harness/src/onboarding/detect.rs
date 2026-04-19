@@ -55,8 +55,7 @@ pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
 
 fn parse_cargo_toml(path: &Path, repo_root: &Path) -> Result<CargoManifest, OnboardingError> {
     let content = std::fs::read_to_string(path).map_err(OnboardingError::Io)?;
-    let doc: toml::Value = content
-        .parse()
+    let doc: toml::Value = toml::from_str(&content)
         .map_err(|e| OnboardingError::ParseError(format!("invalid Cargo.toml: {}", e)))?;
 
     let is_workspace = doc.get("workspace").is_some();
@@ -138,7 +137,7 @@ fn parse_cargo_toml(path: &Path, repo_root: &Path) -> Result<CargoManifest, Onbo
         for member in &members {
             let member_cargo = repo_root.join(member).join("Cargo.toml");
             if let Ok(member_content) = std::fs::read_to_string(&member_cargo) {
-                if let Ok(member_doc) = member_content.parse::<toml::Value>() {
+                if let Ok(member_doc) = toml::from_str::<toml::Value>(&member_content) {
                     if let Some(member_deps) =
                         member_doc.get("dependencies").and_then(|d| d.as_table())
                     {
