@@ -6,20 +6,33 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Returns the external (MCP) status string for a task.
+///
+/// This surfaces a `Cancelled` status when a task failed specifically because
+/// it was cancelled. The internal `TaskStatus` uses `Failed` with a
+/// `diagnostics.error_type == "Cancelled"` marker, but the MCP contract in
+/// `ARCHITECTURE.md` defines `cancelled` as a distinct terminal state that
+/// orchestrators observe via `poll_task` / `get_result`.
+fn external_status_str(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "Pending",
+        TaskStatus::Running { .. } => "Running",
+        TaskStatus::Completed { .. } => "Completed",
+        TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled" => {
+            "Cancelled"
+        }
+        TaskStatus::Failed { .. } => "Failed",
+    }
+}
+
 pub async fn handle_list_tasks(task_manager: &Arc<TaskManager>) -> Result<Value, String> {
     let tasks = task_manager.list().await;
     let summaries: Vec<Value> = tasks
         .into_iter()
         .map(|t| {
-            let status_str = match &t.status {
-                TaskStatus::Pending => "Pending",
-                TaskStatus::Running { .. } => "Running",
-                TaskStatus::Completed { .. } => "Completed",
-                TaskStatus::Failed { .. } => "Failed",
-            };
             serde_json::json!({
                 "id": t.id.0,
-                "status": status_str,
+                "status": external_status_str(&t.status),
                 "description": t.description,
                 "created_at": t.created_at.to_rfc3339(),
             })
@@ -116,14 +129,13 @@ pub async fn handle_poll_task(
         .await
         .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
 
-    let (status_str, iterations, started_at) = match &task.status {
-        TaskStatus::Pending => ("Pending", None, None),
+    let status_str = external_status_str(&task.status);
+    let (iterations, started_at) = match &task.status {
         TaskStatus::Running {
             iterations,
             started_at,
-        } => ("Running", Some(*iterations), Some(started_at.to_rfc3339())),
-        TaskStatus::Completed { .. } => ("Completed", None, None),
-        TaskStatus::Failed { .. } => ("Failed", None, None),
+        } => (Some(*iterations), Some(started_at.to_rfc3339())),
+        _ => (None, None),
     };
 
     let mut response = serde_json::json!({
@@ -175,13 +187,22 @@ pub async fn handle_get_result(
             error,
             diagnostics,
             finished_at,
-        } => Ok(serde_json::json!({
-            "task_id": task_id_str,
-            "status": "Failed",
-            "finished_at": finished_at.to_rfc3339(),
-            "error": error,
-            "diagnostics": diagnostics.to_json(),
-        })),
+        } => {
+            // Surface cancellation as the distinct `Cancelled` state documented
+            // in ARCHITECTURE.md rather than a generic `Failed`.
+            let status_str = if diagnostics.error_type == "Cancelled" {
+                "Cancelled"
+            } else {
+                "Failed"
+            };
+            Ok(serde_json::json!({
+                "task_id": task_id_str,
+                "status": status_str,
+                "finished_at": finished_at.to_rfc3339(),
+                "error": error,
+                "diagnostics": diagnostics.to_json(),
+            }))
+        }
         TaskStatus::Pending => Err(format!("Task {} is still pending", task_id_str)),
         TaskStatus::Running { .. } => Err(format!("Task {} is still running", task_id_str)),
     }
@@ -393,5 +414,43 @@ mod tests {
         let result = handle_onboard_repo(&params).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
+    }
+
+    #[tokio::test]
+    async fn test_poll_cancelled_task_reports_cancelled_status() {
+        // After cancellation, poll_task must surface the documented `Cancelled`
+        // state (per ARCHITECTURE.md) rather than generic `Failed`.
+        let manager = Arc::new(TaskManager::new(0)); // concurrency=0 keeps task Pending
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "Test task",
+            "repo_path": "/tmp"
+        });
+        let assign = handle_assign_task(&params, &manager, &provider, "mock", 1)
+            .await
+            .unwrap();
+        let task_id = assign["task_id"].as_str().unwrap().to_string();
+        tokio::task::yield_now().await;
+
+        handle_cancel_task(&serde_json::json!({"task_id": task_id}), &manager)
+            .await
+            .unwrap();
+
+        let poll =
+            handle_poll_task(&serde_json::json!({"task_id": task_id}), &manager)
+                .await
+                .unwrap();
+        assert_eq!(poll["status"], "Cancelled");
+
+        let got =
+            handle_get_result(&serde_json::json!({"task_id": task_id}), &manager)
+                .await
+                .unwrap();
+        assert_eq!(got["status"], "Cancelled");
+
+        let listed = handle_list_tasks(&manager).await.unwrap();
+        let arr = listed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["status"], "Cancelled");
     }
 }
