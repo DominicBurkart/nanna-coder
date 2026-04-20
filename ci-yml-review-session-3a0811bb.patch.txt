@@ -1,30 +1,33 @@
-From: CRON session 3a0811bb (address-comments)
-Subject: address review comments on PR #239 (model mismatch + `|| true` teardown)
+From: CRON session ZNDBY (address-comments, revised)
+Subject: park remaining review comment on PR #239 (|| true teardown)
 
-This patch cannot be pushed directly: the GitHub App token available to
-this session lacks the `workflows` permission required to modify
-`.github/workflows/ci.yml`. The two reviewer-blocking items are captured
-here for manual application on top of 310e65e.
+This patch cannot be pushed directly: the GitHub App token available to this
+session lacks the `workflows` permission required to modify
+`.github/workflows/ci.yml`. The remaining reviewer-blocking item is captured
+here for manual application by a maintainer.
 
-Addresses:
-  - review thread r3106662878 (model mismatch: pull qwen3:0.6b vs E2E_MODEL=gemma4:e4b)
-  - review thread r3106662989 (TESTING.md: no `|| true` graceful-degradation in teardown)
+## Previously parked items, now status
+
+1. Review thread r3106662878 (model mismatch: pull `qwen3:0.6b` vs
+   `E2E_MODEL=gemma4:e4b`)  -->  **Resolved in-tree without workflow edit.**
+   Rather than change the CI pull to `gemma4:e4b` (which would require a
+   workflow edit and a ~4GB registry round-trip on every integration run),
+   the three harness test files were changed to use `E2E_MODEL = "qwen3:0.6b"`
+   to match what the host `ci-ollama` container already pulls. This aligns
+   `E2E_MODEL` with every other `qwen3:0.6b` reference in
+   `harness/src/**` and `model/**`. Rationale is documented inline above each
+   `E2E_MODEL` declaration.
+
+2. Review thread r3106662989 (TESTING.md: no `|| true` graceful-degradation
+   in teardown)  -->  **Still requires a workflow edit** — patch below.
+
+## Remaining patch for maintainer
 
 Apply with: patch -p1 < ci-yml-review-session-3a0811bb.patch.txt
 
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -130,6 +130,9 @@ jobs:
-       if: matrix.test-type == 'integration-container' || matrix.test-type == 'security'
-       shell: bash
-       run: |
-+        # Model must match harness::tests::E2E_MODEL (harness/tests/integration_tests.rs,
-+        # dev_container_integration.rs, nanna_self_dev_integration.rs). If you change
-+        # E2E_MODEL, update this pull and the Incomplete section of the PR body.
-         docker run -d --name ci-ollama -p 11434:11434 nanna-coder-ollama:latest
-         for i in $(seq 1 60); do
-           if curl -sf --max-time 2 http://localhost:11434/api/tags >/dev/null; then
-@@ -138,12 +141,12 @@ jobs:
+@@ -138,7 +138,7 @@ jobs:
            fi
            if [ "$i" = "60" ]; then
              echo "::error::Ollama failed to start within 120s"
@@ -33,13 +36,7 @@ Apply with: patch -p1 < ci-yml-review-session-3a0811bb.patch.txt
              exit 1
            fi
            sleep 2
-         done
--        docker exec ci-ollama ollama pull qwen3:0.6b
-+        docker exec ci-ollama ollama pull gemma4:e4b
-
-     - name: Assert expected ignored-test count (issue #235)
-       if: matrix.test-type == 'integration-container'
-@@ -187,7 +190,14 @@ jobs:
+@@ -187,7 +187,14 @@ jobs:
      - name: Stop host Ollama
        if: always() && matrix.test-type == 'integration-container'
        shell: bash
@@ -55,7 +52,7 @@ Apply with: patch -p1 < ci-yml-review-session-3a0811bb.patch.txt
 
      - name: Run lint checks
        if: matrix.test-type == 'lint'
-@@ -217,7 +227,14 @@ jobs:
+@@ -217,7 +224,14 @@ jobs:
      - name: Stop host Ollama (security leg)
        if: always() && matrix.test-type == 'security'
        shell: bash
