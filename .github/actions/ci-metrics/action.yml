@@ -1,0 +1,141 @@
+name: "CI Metrics"
+description: |
+  Minimum-viable CI health monitoring primitive. Call this action TWICE per
+  job: once near the start (with `phase: start`) and once at the end (with
+  `phase: end`). On the `end` invocation it writes a markdown summary to
+  $GITHUB_STEP_SUMMARY and uploads a JSON metrics artifact with 30-day
+  retention, so trends and regressions can be computed by a downstream
+  aggregator later.
+
+  Captured fields (best-effort, no external services required):
+    - workflow, job, run_id, run_attempt, run_number
+    - os, arch, runner_name
+    - ref, sha, event_name
+    - start_ts, end_ts, duration_seconds
+    - cache_hit (boolean, passed in by caller)
+    - job_status (success / failure / cancelled — derived from
+      `job.status` at end phase)
+
+  Dashboard, external monitoring, alerting, and regression detection are
+  explicitly out of scope for this action. See issue #5 follow-ups.
+
+inputs:
+  phase:
+    description: "'start' or 'end'. Call once with each per job."
+    required: true
+  cache-hit:
+    description: |
+      Boolean-ish string ('true' / 'false' / '') indicating whether the
+      job's primary cache restore hit. Pass through from actions like
+      actions/cache or cachix/cachix-action where available. Only read
+      on the 'end' phase.
+    required: false
+    default: ""
+  metric-name:
+    description: |
+      Logical name for this metric series (e.g. 'test-unit-linux',
+      'build-container-harness'). Defaults to the GitHub job id.
+    required: false
+    default: ""
+  artifact-name:
+    description: |
+      Override for the uploaded artifact name. Defaults to
+      'ci-metrics-<run_id>-<run_attempt>-<metric-name-or-job>'.
+    required: false
+    default: ""
+  retention-days:
+    description: "Artifact retention in days."
+    required: false
+    default: "30"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Record start timestamp
+      if: inputs.phase == 'start'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/ci-metrics"
+        date -u +%s > "${RUNNER_TEMP}/ci-metrics/start_ts"
+        echo "ci-metrics: start recorded at $(cat "${RUNNER_TEMP}/ci-metrics/start_ts")"
+
+    - name: Compose metrics payload
+      if: inputs.phase == 'end'
+      id: compose
+      shell: bash
+      env:
+        INPUT_CACHE_HIT: ${{ inputs.cache-hit }}
+        INPUT_METRIC_NAME: ${{ inputs.metric-name }}
+        JOB_STATUS: ${{ job.status }}
+      run: |
+        set -euo pipefail
+        metrics_dir="${RUNNER_TEMP}/ci-metrics"
+        mkdir -p "${metrics_dir}"
+
+        start_ts=0
+        if [ -f "${metrics_dir}/start_ts" ]; then
+          start_ts="$(cat "${metrics_dir}/start_ts")"
+        else
+          echo "::warning::ci-metrics end phase called without a matching start phase; duration will be reported as 0" 1>&2
+        fi
+        end_ts="$(date -u +%s)"
+        if [ "${start_ts}" -gt 0 ]; then
+          duration=$(( end_ts - start_ts ))
+        else
+          duration=0
+        fi
+
+        metric_name="${INPUT_METRIC_NAME:-${GITHUB_JOB}}"
+        # Sanitise to a safe filename fragment.
+        safe_metric_name="$(printf '%s' "${metric_name}" | tr -c 'A-Za-z0-9_.-' '-')"
+
+        payload="${metrics_dir}/${safe_metric_name}.json"
+        cat > "${payload}" <<JSON
+        {
+          "schema_version": 1,
+          "workflow": "${GITHUB_WORKFLOW:-}",
+          "job": "${GITHUB_JOB:-}",
+          "metric_name": "${metric_name}",
+          "run_id": "${GITHUB_RUN_ID:-}",
+          "run_attempt": "${GITHUB_RUN_ATTEMPT:-}",
+          "run_number": "${GITHUB_RUN_NUMBER:-}",
+          "event_name": "${GITHUB_EVENT_NAME:-}",
+          "ref": "${GITHUB_REF:-}",
+          "sha": "${GITHUB_SHA:-}",
+          "os": "${RUNNER_OS:-}",
+          "arch": "${RUNNER_ARCH:-}",
+          "runner_name": "${RUNNER_NAME:-}",
+          "start_ts": ${start_ts},
+          "end_ts": ${end_ts},
+          "duration_seconds": ${duration},
+          "cache_hit": "${INPUT_CACHE_HIT}",
+          "job_status": "${JOB_STATUS}"
+        }
+        JSON
+
+        echo "payload_path=${payload}" >> "${GITHUB_OUTPUT}"
+        echo "safe_metric_name=${safe_metric_name}" >> "${GITHUB_OUTPUT}"
+
+        {
+          echo "## CI Metrics: \`${metric_name}\`"
+          echo
+          echo "| field | value |"
+          echo "|-------|-------|"
+          echo "| workflow | \`${GITHUB_WORKFLOW:-}\` |"
+          echo "| job | \`${GITHUB_JOB:-}\` |"
+          echo "| os / arch | \`${RUNNER_OS:-}/${RUNNER_ARCH:-}\` |"
+          echo "| duration (s) | ${duration} |"
+          echo "| cache hit | \`${INPUT_CACHE_HIT:-unknown}\` |"
+          echo "| job status | \`${JOB_STATUS}\` |"
+          echo "| sha | \`${GITHUB_SHA:-}\` |"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Upload metrics artifact
+      if: inputs.phase == 'end'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name != '' && inputs.artifact-name || format('ci-metrics-{0}-{1}-{2}', github.run_id, github.run_attempt, steps.compose.outputs.safe_metric_name) }}
+        path: ${{ steps.compose.outputs.payload_path }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: warn
