@@ -1172,6 +1172,47 @@ mod tests {
         assert!(cache_read.get(&canonical).is_none());
     }
 
+    // ---- build_task_system_prompt unit tests ----
+
+    #[test]
+    fn test_build_task_system_prompt_no_guidance_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
+        assert!(prompt.contains("Use nextest."));
+        assert!(prompt.contains("</repo-guidance>"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_claude_md_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
+        assert!(prompt.contains("legacy rules"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_swallows_read_errors() {
+        // Non-UTF8 AGENTS.md makes the loader return Err; the prompt builder
+        // must log and fall back to the default system prompt without
+        // propagating the error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
     #[tokio::test]
     async fn test_submit_container_path_workspace_fail_with_cached_image() {
         // Inject a pre-built image into the cache so that get_or_build_image

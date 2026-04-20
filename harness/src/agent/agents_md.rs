@@ -279,6 +279,22 @@ mod tests {
         assert!(fragment.contains("source=\"CLAUDE.md\""));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metadata_error_other_than_not_found_is_propagated() {
+        // A symlink loop causes `fs::metadata` to fail with ELOOP — not
+        // NotFound — which must hit the `Err(e) => return Err(e)` arm in
+        // `try_load_one` rather than being swallowed as "missing".
+        let dir = tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD_FILENAME);
+        let hop = dir.path().join("loop_hop");
+        std::os::unix::fs::symlink(&hop, &agents).unwrap();
+        std::os::unix::fs::symlink(&agents, &hop).unwrap();
+
+        let err = load(dir.path()).expect_err("symlink loop must surface as error");
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+    }
+
     #[test]
     fn oversize_claude_md_is_also_truncated() {
         // Exercise the fallback branch with an oversize file so coverage stays
