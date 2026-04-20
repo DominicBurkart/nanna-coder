@@ -13,8 +13,12 @@ description: |
     - ref, sha, event_name
     - start_ts, end_ts, duration_seconds
     - cache_hit (boolean, passed in by caller)
-    - job_status (success / failure / cancelled — derived from
-      `job.status` at end phase)
+    - job_status (success / failure / cancelled — passed in by caller
+      via the `job-status` input as `${{ job.status }}`; composite
+      actions cannot reliably read the parent job's status context
+      themselves)
+    - matrix_key (optional caller-provided disambiguator for matrix
+      cells that share a base metric-name)
 
   Dashboard, external monitoring, alerting, and regression detection are
   explicitly out of scope for this action. See issue #5 follow-ups.
@@ -47,6 +51,25 @@ inputs:
     description: "Artifact retention in days."
     required: false
     default: "30"
+  job-status:
+    description: |
+      REQUIRED on the 'end' phase for an accurate failure-rate metric.
+      Pass `${{ job.status }}` from the calling workflow — composite
+      actions cannot read the parent job's status context themselves
+      (the `job.status` expression is evaluated *before* the calling
+      job's real steps run and will otherwise almost always be
+      reported as 'success'). Leave empty on the 'start' phase.
+    required: false
+    default: ""
+  matrix-key:
+    description: |
+      Optional disambiguator appended to the metric name / artifact
+      name so that two matrix cells that share the same base
+      `metric-name` (e.g. different OS / arch / feature flags) do not
+      collide on file path or artifact name. Pass e.g.
+      `${{ matrix.os }}-${{ matrix.arch }}` from the caller.
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -67,7 +90,8 @@ runs:
       env:
         INPUT_CACHE_HIT: ${{ inputs.cache-hit }}
         INPUT_METRIC_NAME: ${{ inputs.metric-name }}
-        JOB_STATUS: ${{ job.status }}
+        INPUT_JOB_STATUS: ${{ inputs.job-status }}
+        INPUT_MATRIX_KEY: ${{ inputs.matrix-key }}
       run: |
         set -euo pipefail
         metrics_dir="${RUNNER_TEMP}/ci-metrics"
@@ -86,33 +110,79 @@ runs:
           duration=0
         fi
 
-        metric_name="${INPUT_METRIC_NAME:-${GITHUB_JOB}}"
+        base_metric_name="${INPUT_METRIC_NAME:-${GITHUB_JOB}}"
+        if [ -n "${INPUT_MATRIX_KEY}" ]; then
+          metric_name="${base_metric_name}-${INPUT_MATRIX_KEY}"
+        else
+          metric_name="${base_metric_name}"
+        fi
+
+        # job_status: REQUIRE caller to pass ${{ job.status }} via the
+        # job-status input. `job.status` evaluated inside a composite
+        # action refers to the composite's own step status (which is
+        # almost always 'success' at the moment it runs), so reading it
+        # here would silently break the failure-rate metric.
+        if [ -z "${INPUT_JOB_STATUS}" ]; then
+          echo "::warning::ci-metrics end phase called without job-status input; failure-rate metric will be inaccurate. Pass job-status: \${{ job.status }} from the caller." 1>&2
+          job_status="unknown"
+        else
+          job_status="${INPUT_JOB_STATUS}"
+        fi
+
         # Sanitise to a safe filename fragment.
         safe_metric_name="$(printf '%s' "${metric_name}" | tr -c 'A-Za-z0-9_.-' '-')"
+        # Guard against the (admittedly unlikely) empty result.
+        if [ -z "${safe_metric_name}" ]; then
+          safe_metric_name="ci-metric"
+        fi
 
         payload="${metrics_dir}/${safe_metric_name}.json"
-        cat > "${payload}" <<JSON
-        {
-          "schema_version": 1,
-          "workflow": "${GITHUB_WORKFLOW:-}",
-          "job": "${GITHUB_JOB:-}",
-          "metric_name": "${metric_name}",
-          "run_id": "${GITHUB_RUN_ID:-}",
-          "run_attempt": "${GITHUB_RUN_ATTEMPT:-}",
-          "run_number": "${GITHUB_RUN_NUMBER:-}",
-          "event_name": "${GITHUB_EVENT_NAME:-}",
-          "ref": "${GITHUB_REF:-}",
-          "sha": "${GITHUB_SHA:-}",
-          "os": "${RUNNER_OS:-}",
-          "arch": "${RUNNER_ARCH:-}",
-          "runner_name": "${RUNNER_NAME:-}",
-          "start_ts": ${start_ts},
-          "end_ts": ${end_ts},
-          "duration_seconds": ${duration},
-          "cache_hit": "${INPUT_CACHE_HIT}",
-          "job_status": "${JOB_STATUS}"
-        }
-        JSON
+
+        # Build the JSON payload with jq so that metric-name /
+        # matrix-key / cache-hit values that contain quotes, newlines,
+        # or other JSON-significant characters cannot break the output
+        # (defence against accidental or hostile injection).
+        jq -n \
+          --argjson schema_version 1 \
+          --arg workflow       "${GITHUB_WORKFLOW:-}" \
+          --arg job            "${GITHUB_JOB:-}" \
+          --arg metric_name    "${metric_name}" \
+          --arg run_id         "${GITHUB_RUN_ID:-}" \
+          --arg run_attempt    "${GITHUB_RUN_ATTEMPT:-}" \
+          --arg run_number     "${GITHUB_RUN_NUMBER:-}" \
+          --arg event_name     "${GITHUB_EVENT_NAME:-}" \
+          --arg ref            "${GITHUB_REF:-}" \
+          --arg sha            "${GITHUB_SHA:-}" \
+          --arg os             "${RUNNER_OS:-}" \
+          --arg arch           "${RUNNER_ARCH:-}" \
+          --arg runner_name    "${RUNNER_NAME:-}" \
+          --arg matrix_key     "${INPUT_MATRIX_KEY}" \
+          --argjson start_ts        "${start_ts}" \
+          --argjson end_ts          "${end_ts}" \
+          --argjson duration_seconds "${duration}" \
+          --arg cache_hit      "${INPUT_CACHE_HIT}" \
+          --arg job_status     "${job_status}" \
+          '{
+            schema_version: $schema_version,
+            workflow: $workflow,
+            job: $job,
+            metric_name: $metric_name,
+            matrix_key: $matrix_key,
+            run_id: $run_id,
+            run_attempt: $run_attempt,
+            run_number: $run_number,
+            event_name: $event_name,
+            ref: $ref,
+            sha: $sha,
+            os: $os,
+            arch: $arch,
+            runner_name: $runner_name,
+            start_ts: $start_ts,
+            end_ts: $end_ts,
+            duration_seconds: $duration_seconds,
+            cache_hit: $cache_hit,
+            job_status: $job_status
+          }' > "${payload}"
 
         echo "payload_path=${payload}" >> "${GITHUB_OUTPUT}"
         echo "safe_metric_name=${safe_metric_name}" >> "${GITHUB_OUTPUT}"
@@ -127,7 +197,7 @@ runs:
           echo "| os / arch | \`${RUNNER_OS:-}/${RUNNER_ARCH:-}\` |"
           echo "| duration (s) | ${duration} |"
           echo "| cache hit | \`${INPUT_CACHE_HIT:-unknown}\` |"
-          echo "| job status | \`${JOB_STATUS}\` |"
+          echo "| job status | \`${job_status}\` |"
           echo "| sha | \`${GITHUB_SHA:-}\` |"
         } >> "${GITHUB_STEP_SUMMARY}"
 
