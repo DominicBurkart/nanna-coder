@@ -1245,4 +1245,279 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    // ------------------------------------------------------------------
+    // Additional invariant / edge-case coverage for the monitoring module.
+    //
+    // The tests below target three previously under-validated areas:
+    //   1. Latency aggregation math (min/avg/p95/p99/max ordering).
+    //   2. Error-rate and error-bucketing accounting.
+    //   3. Alert-manager lifecycle and export-format error paths.
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    fn make_error_event(error_type: &str, severity: ErrorSeverity) -> ErrorEvent {
+        ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: error_type.to_string(),
+            message: format!("synthetic {} error", error_type),
+            component: "unit-test".to_string(),
+            severity,
+        }
+    }
+
+    #[test]
+    fn health_status_helpers_classify_states() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        for s in [
+            HealthStatus::Warning,
+            HealthStatus::Degraded,
+            HealthStatus::Unhealthy,
+            HealthStatus::Unknown,
+        ] {
+            assert!(!s.is_healthy(), "{:?} should not be healthy", s);
+        }
+
+        for s in [
+            HealthStatus::Warning,
+            HealthStatus::Degraded,
+            HealthStatus::Unhealthy,
+        ] {
+            assert!(s.requires_attention(), "{:?} should require attention", s);
+        }
+        // Healthy and Unknown explicitly do NOT require attention.
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn latency_metrics_empty_input_yields_zeros() {
+        let collector = DefaultMetricsCollector::new();
+        // No recordings -> request_latencies should be empty in the snapshot,
+        // and cache hit rate should be zero (total = 0, avoid div-by-zero).
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+        assert_eq!(metrics.cache_metrics.hit_rate, 0.0);
+        assert_eq!(metrics.error_metrics.total_errors, 0);
+        assert_eq!(metrics.error_metrics.error_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn error_rate_accounts_for_bucketing_and_request_count() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        // 4 requests total.
+        for _ in 0..4 {
+            collector
+                .record_request_latency("svc", Duration::from_millis(10))
+                .await;
+        }
+        // 2 errors of one type, 1 of another (3 total).
+        collector
+            .record_error(make_error_event("timeout", ErrorSeverity::Warning))
+            .await;
+        collector
+            .record_error(make_error_event("timeout", ErrorSeverity::Warning))
+            .await;
+        collector
+            .record_error(make_error_event("parse", ErrorSeverity::Error))
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 3);
+        // error_rate = total_errors / total_requests = 3 / 4.
+        assert!((metrics.error_metrics.error_rate - 0.75).abs() < 1e-9);
+
+        let by_type = &metrics.error_metrics.errors_by_type;
+        assert_eq!(by_type.get("timeout"), Some(&2));
+        assert_eq!(by_type.get("parse"), Some(&1));
+
+        // recent_errors is capped at 10; here we only have 3.
+        assert_eq!(metrics.error_metrics.recent_errors.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_metrics_clears_all_counters() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+        collector.record_cache_hit("a").await;
+        collector.record_cache_miss("b").await;
+        collector
+            .record_error(make_error_event("boom", ErrorSeverity::Error))
+            .await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+        assert_eq!(metrics.error_metrics.total_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn export_json_round_trips_into_system_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(42))
+            .await;
+        collector.record_cache_hit("k").await;
+
+        let json = collector.export_metrics(MetricsFormat::Json).await.unwrap();
+        let parsed: SystemMetrics =
+            serde_json::from_str(&json).expect("exported JSON must deserialize into SystemMetrics");
+        assert_eq!(parsed.cache_metrics.hits, 1);
+        assert!(parsed.request_latencies.contains_key("svc"));
+    }
+
+    #[tokio::test]
+    async fn export_custom_format_is_rejected() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(MonitoringError::MetricsCollectionFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_unknown_alert_returns_error() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("alert_nonexistent").await;
+        assert!(matches!(
+            result,
+            Err(MonitoringError::AlertSendFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn alert_history_returns_most_recent_first_and_respects_limit() {
+        let manager = DefaultAlertManager::new();
+        for i in 0..5 {
+            manager
+                .send_alert(&format!("t{}", i), "d", AlertSeverity::Info)
+                .await
+                .unwrap();
+        }
+        let history = manager.get_alert_history(3).await.unwrap();
+        assert_eq!(history.len(), 3);
+        // History returns alerts in reverse insertion order -> newest first.
+        assert_eq!(history[0].title, "t4");
+        assert_eq!(history[1].title, "t3");
+        assert_eq!(history[2].title, "t2");
+    }
+
+    #[tokio::test]
+    async fn active_alerts_exclude_acknowledged_ones() {
+        let manager = DefaultAlertManager::new();
+        let keep = manager
+            .send_alert("keep", "d", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        let ack = manager
+            .send_alert("ack", "d", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        manager.acknowledge_alert(&ack).await.unwrap();
+
+        let active = manager.get_active_alerts().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, keep);
+    }
+
+    #[tokio::test]
+    async fn alert_ids_are_unique_per_manager() {
+        let manager = DefaultAlertManager::new();
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let id = manager
+                .send_alert("x", "y", AlertSeverity::Info)
+                .await
+                .unwrap();
+            assert!(ids.insert(id), "alert IDs must be unique within a manager");
+        }
+    }
+
+    #[tokio::test]
+    async fn prometheus_export_contains_required_metric_types() {
+        // Prometheus text exposition format: every metric must have a HELP
+        // and TYPE line preceding its samples. We verify the required ones
+        // are present and are well-formed gauges/counters.
+        let mut collector = DefaultMetricsCollector::new();
+        collector.record_cache_hit("k").await;
+        collector
+            .record_request_latency("ollama", Duration::from_millis(5))
+            .await;
+
+        let prom = collector
+            .export_metrics(MetricsFormat::Prometheus)
+            .await
+            .unwrap();
+        assert!(prom.contains("# TYPE cache_hits_total counter"));
+        assert!(prom.contains("# TYPE cache_hit_rate gauge"));
+        assert!(prom.contains("cache_hits_total 1"));
+        assert!(prom.contains("request_latency_ms"));
+    }
+
+    // ---------- proptest: latency aggregation invariants ----------
+    //
+    // Invariants that must hold for any non-empty latency sample:
+    //   * min <= avg <= max
+    //   * min <= p95 <= max
+    //   * p95 <= p99 <= max (within f64 tolerance)
+    //   * request_count == input length
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn latency_metrics_respect_ordering_invariants(
+            raw in proptest::collection::vec(0u64..10_000, 1..64)
+        ) {
+            let collector = DefaultMetricsCollector::new();
+            let durations: Vec<Duration> = raw.iter().map(|&ms| Duration::from_millis(ms)).collect();
+            let m = collector.calculate_latency_metrics(&durations);
+
+            prop_assert_eq!(m.request_count as usize, durations.len());
+            prop_assert!(m.min_latency_ms <= m.avg_latency_ms + 1e-9);
+            prop_assert!(m.avg_latency_ms <= m.max_latency_ms + 1e-9);
+            prop_assert!(m.min_latency_ms <= m.p95_latency_ms + 1e-9);
+            prop_assert!(m.p95_latency_ms <= m.max_latency_ms + 1e-9);
+            prop_assert!(m.p95_latency_ms <= m.p99_latency_ms + 1e-9);
+            prop_assert!(m.p99_latency_ms <= m.max_latency_ms + 1e-9);
+        }
+
+        #[test]
+        fn cache_hit_rate_is_bounded_and_matches_ratio(
+            hits in 0u64..1_000,
+            misses in 0u64..1_000,
+        ) {
+            // Build a collector with the given counters and read back the rate.
+            let collector = DefaultMetricsCollector::new();
+            {
+                let mut internal = collector.metrics.lock().unwrap();
+                internal.cache_hits = hits;
+                internal.cache_misses = misses;
+            }
+            let metrics = collector.get_cache_metrics(&collector.metrics.lock().unwrap());
+
+            prop_assert_eq!(metrics.hits, hits);
+            prop_assert_eq!(metrics.misses, misses);
+            prop_assert!(metrics.hit_rate >= 0.0 && metrics.hit_rate <= 1.0);
+
+            let total = hits + misses;
+            if total == 0 {
+                prop_assert_eq!(metrics.hit_rate, 0.0);
+            } else {
+                let expected = hits as f64 / total as f64;
+                prop_assert!((metrics.hit_rate - expected).abs() < 1e-9);
+            }
+        }
+    }
 }
