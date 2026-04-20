@@ -167,6 +167,22 @@ mod tests {
         fs::write(dir.join(name), contents).unwrap();
     }
 
+    /// Install a process-global tracing subscriber once so the `warn!` field
+    /// expressions in `try_load_one` actually execute under coverage. Without
+    /// a live subscriber, tracing short-circuits before evaluating its
+    /// fields, leaving the `path = %path.display()` line uncovered even when
+    /// the oversize branch is reached.
+    fn ensure_tracing_subscriber() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::TRACE)
+                .try_init();
+        });
+    }
+
     #[test]
     fn missing_both_files_returns_none() {
         let dir = tempdir().unwrap();
@@ -210,6 +226,7 @@ mod tests {
 
     #[test]
     fn oversize_file_is_truncated_with_warning() {
+        ensure_tracing_subscriber();
         let dir = tempdir().unwrap();
         // Write (MAX + 1024) bytes of ASCII.
         let big = vec![b'a'; (MAX_AGENTS_MD_BYTES as usize) + 1024];
@@ -279,10 +296,27 @@ mod tests {
         assert!(fragment.contains("source=\"CLAUDE.md\""));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metadata_error_other_than_not_found_is_propagated() {
+        // A symlink loop causes `fs::metadata` to fail with ELOOP — not
+        // NotFound — which must hit the `Err(e) => return Err(e)` arm in
+        // `try_load_one` rather than being swallowed as "missing".
+        let dir = tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD_FILENAME);
+        let hop = dir.path().join("loop_hop");
+        std::os::unix::fs::symlink(&hop, &agents).unwrap();
+        std::os::unix::fs::symlink(&agents, &hop).unwrap();
+
+        let err = load(dir.path()).expect_err("symlink loop must surface as error");
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+    }
+
     #[test]
     fn oversize_claude_md_is_also_truncated() {
         // Exercise the fallback branch with an oversize file so coverage stays
         // at 100% on the `ClaudeMd` path as well.
+        ensure_tracing_subscriber();
         let dir = tempdir().unwrap();
         let big = vec![b'c'; (MAX_AGENTS_MD_BYTES as usize) + 7];
         write_file(dir.path(), CLAUDE_MD_FILENAME, &big);
