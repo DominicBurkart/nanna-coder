@@ -416,6 +416,20 @@ mod tests {
         assert!(result.unwrap_err().contains("absolute"));
     }
 
+    #[test]
+    fn test_external_status_str_running() {
+        use crate::task::TaskStatus;
+        use chrono::Utc;
+        // Exercise the Running arm of external_status_str, which is not reachable
+        // via handler tests because tasks cannot be observed mid-execution in
+        // unit tests without real async workers.
+        let running = TaskStatus::Running {
+            started_at: Utc::now(),
+            iterations: 3,
+        };
+        assert_eq!(external_status_str(&running), "Running");
+    }
+
     #[tokio::test]
     async fn test_poll_cancelled_task_reports_cancelled_status() {
         // After cancellation, poll_task must surface the documented `Cancelled`
