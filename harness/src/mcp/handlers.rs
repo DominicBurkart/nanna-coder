@@ -410,10 +410,79 @@ mod tests {
         assert!(result.unwrap_err().contains("absolute"));
     }
 
+    /// Verify that `poll_task`, `get_result`, and `list_tasks` all surface
+    /// `Cancelled` (not `Failed`) after a **Running → Cancelled** transition.
+    /// This is the primary scenario described in the PR: a task that is
+    /// actively executing is cancelled mid-run, and subsequent MCP reads must
+    /// reflect the documented `cancelled` terminal state.
+    #[tokio::test]
+    async fn test_running_to_cancelled_reports_cancelled_status() {
+        use crate::task::{Task, TaskId, TaskStatus};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let manager = Arc::new(TaskManager::default());
+
+        // Insert a task that is already in the Running state, bypassing the
+        // real agent loop.  This is the motivating scenario: a live task is
+        // aborted mid-execution.
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id.clone(),
+            description: "running task".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status: TaskStatus::Running {
+                started_at: Utc::now(),
+                iterations: 3,
+            },
+            created_at: Utc::now(),
+        };
+        manager.insert_running_task_for_test(task).await;
+        manager
+            .insert_dummy_handle_for_test(task_id.clone())
+            .await;
+
+        // Cancel the running task via the MCP handler.
+        handle_cancel_task(
+            &serde_json::json!({"task_id": task_id.0}),
+            &manager,
+        )
+        .await
+        .unwrap();
+
+        // poll_task must report Cancelled, not Failed.
+        let poll = handle_poll_task(
+            &serde_json::json!({"task_id": task_id.0}),
+            &manager,
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll["status"], "Cancelled", "poll_task should return Cancelled after Running→Cancelled");
+
+        // get_result must also report Cancelled, not Failed.
+        let got = handle_get_result(
+            &serde_json::json!({"task_id": task_id.0}),
+            &manager,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["status"], "Cancelled", "get_result should return Cancelled after Running→Cancelled");
+
+        // list_tasks must list the task as Cancelled.
+        let listed = handle_list_tasks(&manager).await.unwrap();
+        let arr = listed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["status"], "Cancelled", "list_tasks should return Cancelled after Running→Cancelled");
+    }
+
     #[tokio::test]
     async fn test_poll_cancelled_task_reports_cancelled_status() {
-        // After cancellation, poll_task must surface the documented `Cancelled`
-        // state (per ARCHITECTURE.md) rather than generic `Failed`.
+        // After cancellation of a Pending task, poll_task must surface the
+        // documented `Cancelled` state (per ARCHITECTURE.md) rather than
+        // generic `Failed`.  See `test_running_to_cancelled_reports_cancelled_status`
+        // for the Running→Cancelled path (the primary motivating scenario).
         let manager = Arc::new(TaskManager::new(0)); // concurrency=0 keeps task Pending
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let params = serde_json::json!({
