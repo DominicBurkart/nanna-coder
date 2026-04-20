@@ -38,3 +38,8 @@ workspace = true
 futures = "0.3"
 tempfile = "3.0"
 serial_test = "3.0"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "agents_md_load"
+harness = false
