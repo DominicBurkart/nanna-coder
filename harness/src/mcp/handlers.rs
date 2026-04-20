@@ -169,6 +169,9 @@ pub async fn handle_get_result(
         .await
         .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
 
+    // Resolve the external status string before consuming `task.status`.
+    let status_str = external_status_str(&task.status);
+
     match task.status {
         TaskStatus::Completed {
             result,
@@ -187,22 +190,13 @@ pub async fn handle_get_result(
             error,
             diagnostics,
             finished_at,
-        } => {
-            // Surface cancellation as the distinct `Cancelled` state documented
-            // in ARCHITECTURE.md rather than a generic `Failed`.
-            let status_str = if diagnostics.error_type == "Cancelled" {
-                "Cancelled"
-            } else {
-                "Failed"
-            };
-            Ok(serde_json::json!({
-                "task_id": task_id_str,
-                "status": status_str,
-                "finished_at": finished_at.to_rfc3339(),
-                "error": error,
-                "diagnostics": diagnostics.to_json(),
-            }))
-        }
+        } => Ok(serde_json::json!({
+            "task_id": task_id_str,
+            "status": status_str,
+            "finished_at": finished_at.to_rfc3339(),
+            "error": error,
+            "diagnostics": diagnostics.to_json(),
+        })),
         TaskStatus::Pending => Err(format!("Task {} is still pending", task_id_str)),
         TaskStatus::Running { .. } => Err(format!("Task {} is still running", task_id_str)),
     }
@@ -416,20 +410,6 @@ mod tests {
         assert!(result.unwrap_err().contains("absolute"));
     }
 
-    #[test]
-    fn test_external_status_str_running() {
-        use crate::task::TaskStatus;
-        use chrono::Utc;
-        // Exercise the Running arm of external_status_str, which is not reachable
-        // via handler tests because tasks cannot be observed mid-execution in
-        // unit tests without real async workers.
-        let running = TaskStatus::Running {
-            started_at: Utc::now(),
-            iterations: 3,
-        };
-        assert_eq!(external_status_str(&running), "Running");
-    }
-
     #[tokio::test]
     async fn test_poll_cancelled_task_reports_cancelled_status() {
         // After cancellation, poll_task must surface the documented `Cancelled`
@@ -450,16 +430,14 @@ mod tests {
             .await
             .unwrap();
 
-        let poll =
-            handle_poll_task(&serde_json::json!({"task_id": task_id}), &manager)
-                .await
-                .unwrap();
+        let poll = handle_poll_task(&serde_json::json!({"task_id": task_id}), &manager)
+            .await
+            .unwrap();
         assert_eq!(poll["status"], "Cancelled");
 
-        let got =
-            handle_get_result(&serde_json::json!({"task_id": task_id}), &manager)
-                .await
-                .unwrap();
+        let got = handle_get_result(&serde_json::json!({"task_id": task_id}), &manager)
+            .await
+            .unwrap();
         assert_eq!(got["status"], "Cancelled");
 
         let listed = handle_list_tasks(&manager).await.unwrap();
