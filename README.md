@@ -1,19 +1,22 @@
 # Nanna Coder
 
-A coding agent for coding agents. Designed for background agents to defer straightforward work to local models or by other model providers.
+A coding agent for coding agents. Designed to let background agents delegate straightforward work to local models (or other providers).
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Instructions for agents building nanna
-- [TESTING.md](TESTING.md) - Testing strategy and guidelines
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture and entity management
+- [AGENTS.md](AGENTS.md) — instructions for agents building Nanna
+- [TESTING.md](TESTING.md) — testing strategy and guidelines
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow
+- [CACHIX_SETUP.md](CACHIX_SETUP.md) — binary-cache setup (maintainers)
 
 ## Technologies
+
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
-- [Rust](https://rustlang.org)
-- [Cachix](https://cachix.org/) - Binary cache for fast builds
+- [Rust](https://www.rust-lang.org/)
+- [Cachix](https://cachix.org/) — binary cache for fast builds
 
 ## Quick Start
 
