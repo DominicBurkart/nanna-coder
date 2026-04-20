@@ -17,7 +17,12 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "gemma4:e4b";
+// E2E model for self-dev integration tests.
+// See `harness/tests/integration_tests.rs` for the rationale behind the
+// qwen3:0.6b choice (issue #235: host ci-ollama pulls qwen3:0.6b, and the
+// fallback pull path is faster with the smaller image). Keep all three
+// harness test files in sync if you change this.
+const E2E_MODEL: &str = "qwen3:0.6b";
 const ORIGINAL_HELP_STRING: &str = "A CLI tool for interacting with language models";
 
 fn workspace_root() -> PathBuf {
