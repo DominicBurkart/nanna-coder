@@ -122,7 +122,8 @@ steps:
 ```
 
 ### Hybrid Approach
-Combine free and paid solutions:
+
+> **Not adopted.** This approach was evaluated but not used — see [cachix-migration.md](./cachix-migration.md) for the current setup. The YAML below is illustrative only; note that `if: secrets.CACHIX_AUTH != ''` is not valid GitHub Actions expression syntax (the correct form would be `if: ${{ secrets.CACHIX_AUTH != '' }}`).
 
 ```yaml
 steps:
@@ -136,7 +137,7 @@ steps:
 
 # Fallback cache: Cachix (only when token available)
 - uses: cachix/cachix-action@v12
-  if: secrets.CACHIX_AUTH != ''
+  if: secrets.CACHIX_AUTH != ''  # illustrative only — not valid GHA syntax
   with:
     name: nanna-coder
     authToken: ${{ secrets.CACHIX_AUTH }}
