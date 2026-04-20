@@ -1,0 +1,35 @@
+name: codecov-guard
+
+on:
+  pull_request:
+    paths:
+      - codecov.yml
+      - scripts/check-codecov-guard.sh
+      - .github/workflows/codecov-guard.yml
+  push:
+    branches: [main]
+    paths:
+      - codecov.yml
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: base
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=HEAD~1" >> "$GITHUB_OUTPUT"
+          fi
+      - shell: bash
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: bash scripts/check-codecov-guard.sh
