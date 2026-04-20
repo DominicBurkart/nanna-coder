@@ -440,41 +440,39 @@ mod tests {
             created_at: Utc::now(),
         };
         manager.insert_running_task_for_test(task).await;
-        manager
-            .insert_dummy_handle_for_test(task_id.clone())
-            .await;
+        manager.insert_dummy_handle_for_test(task_id.clone()).await;
 
         // Cancel the running task via the MCP handler.
-        handle_cancel_task(
-            &serde_json::json!({"task_id": task_id.0}),
-            &manager,
-        )
-        .await
-        .unwrap();
+        handle_cancel_task(&serde_json::json!({"task_id": task_id.0}), &manager)
+            .await
+            .unwrap();
 
         // poll_task must report Cancelled, not Failed.
-        let poll = handle_poll_task(
-            &serde_json::json!({"task_id": task_id.0}),
-            &manager,
-        )
-        .await
-        .unwrap();
-        assert_eq!(poll["status"], "Cancelled", "poll_task should return Cancelled after Running→Cancelled");
+        let poll = handle_poll_task(&serde_json::json!({"task_id": task_id.0}), &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            poll["status"], "Cancelled",
+            "poll_task should return Cancelled after Running→Cancelled"
+        );
 
         // get_result must also report Cancelled, not Failed.
-        let got = handle_get_result(
-            &serde_json::json!({"task_id": task_id.0}),
-            &manager,
-        )
-        .await
-        .unwrap();
-        assert_eq!(got["status"], "Cancelled", "get_result should return Cancelled after Running→Cancelled");
+        let got = handle_get_result(&serde_json::json!({"task_id": task_id.0}), &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            got["status"], "Cancelled",
+            "get_result should return Cancelled after Running→Cancelled"
+        );
 
         // list_tasks must list the task as Cancelled.
         let listed = handle_list_tasks(&manager).await.unwrap();
         let arr = listed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["status"], "Cancelled", "list_tasks should return Cancelled after Running→Cancelled");
+        assert_eq!(
+            arr[0]["status"], "Cancelled",
+            "list_tasks should return Cancelled after Running→Cancelled"
+        );
     }
 
     #[tokio::test]
