@@ -1,0 +1,64 @@
+name: "Setup Rust + Nix + Cachix"
+description: |
+  Composite action that consolidates the repeating setup block used across
+  .github/workflows/{ci,cache-warming,eval}.yml. Installs Nix (when requested),
+  configures Cachix with the repo's push filter, and optionally installs a
+  host Rust toolchain for non-Linux runners where the Nix dev shell is not
+  the source of truth. This is the single source of truth for the Cachix
+  cache name and push filter; change those values HERE, not per-workflow.
+
+inputs:
+  install-nix:
+    description: "Install Nix via DeterminateSystems/nix-installer-action."
+    required: false
+    default: "true"
+  configure-cachix:
+    description: "Configure Cachix for the nanna-coder binary cache."
+    required: false
+    default: "true"
+  cachix-auth-token:
+    description: "Cachix auth token (pass `secrets.CACHIX_AUTH`). Empty disables push."
+    required: false
+    default: ""
+  cachix-skip-push:
+    description: "If `true`, only pull from Cachix (no push). Use for fork PRs."
+    required: false
+    default: "false"
+  install-host-rust:
+    description: |
+      Install a host Rust toolchain via dtolnay/rust-toolchain. Intended for
+      macOS/Windows runners where we run cargo outside the Nix dev shell.
+      Set to `false` on Linux, where `nix develop` provides rustc/cargo.
+    required: false
+    default: "false"
+  rust-components:
+    description: "Comma-separated list of rustup components to install with the host toolchain."
+    required: false
+    default: "rustfmt,clippy"
+  rust-toolchain:
+    description: "Rust toolchain spec for dtolnay/rust-toolchain."
+    required: false
+    default: "stable"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Nix
+      if: inputs.install-nix == 'true'
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      if: inputs.configure-cachix == 'true'
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ inputs.cachix-auth-token }}
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ inputs.cachix-skip-push }}
+
+    - name: Setup host Rust toolchain
+      if: inputs.install-host-rust == 'true'
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: ${{ inputs.rust-components }}
