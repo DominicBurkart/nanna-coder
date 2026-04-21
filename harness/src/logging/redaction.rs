@@ -172,9 +172,7 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
         .replace_all(&out, |caps: &regex::Captures<'_>| {
             let whole = caps.get(0).unwrap().as_str();
             // Split on first `=` or `:` (the only separator per the regex).
-            let sep_idx = whole
-                .find(['=', ':'])
-                .unwrap_or(whole.len());
+            let sep_idx = whole.find(['=', ':']).unwrap_or(whole.len());
             let (key, rest) = whole.split_at(sep_idx);
             let sep = rest.chars().next().unwrap_or('=');
             format!("{key}{sep}{REDACTED}")
