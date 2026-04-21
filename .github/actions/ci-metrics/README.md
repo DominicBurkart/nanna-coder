@@ -93,12 +93,12 @@ same base `metric-name` do not collide on file / artifact name:
 
 | name             | required | default               | description |
 |------------------|----------|-----------------------|-------------|
-| `phase`          | yes      | —                     | `start` or `end`. |
+| `phase`          | yes      | —                     | `start` or `end`. Any other value is an immediate error. |
 | `cache-hit`      | no       | `""`                  | Pass through from your cache action. Read only on `end`. |
 | `metric-name`    | no       | `${{ github.job }}`   | Logical series name. Choose one per unique job × matrix cell. |
 | `matrix-key`     | no       | `""`                  | Disambiguator appended to `metric-name` for matrix cells (e.g. `${{ matrix.os }}-${{ matrix.arch }}`). |
 | `job-status`     | no\*     | `""`                  | Pass `${{ job.status }}` on the `end` phase. Omitting it records `job_status: "unknown"` and emits a workflow warning. |
-| `artifact-name`  | no       | derived               | Override for the uploaded artifact name. |
+| `artifact-name`  | no       | derived               | Override for the uploaded artifact name. The value is used **literally** — passing `'false'` names the artifact `false`, it does not fall back to the derived default. Leave empty (`""`) to use the derived name. |
 | `retention-days` | no       | `30`                  | Artifact retention. |
 
 \* `job-status` is functionally required on the `end` phase for the
