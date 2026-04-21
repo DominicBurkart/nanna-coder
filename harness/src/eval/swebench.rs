@@ -113,7 +113,10 @@ pub fn adapt_to_eval_case(task: &SWEBenchTask) -> EvalCase {
     let prompt = if task.hints_text.is_empty() {
         task.problem_statement.clone()
     } else {
-        format!("{}\n\nHints:\n{}", task.problem_statement, task.hints_text)
+        format!("{}
+
+Hints:
+{}", task.problem_statement, task.hints_text)
     };
 
     EvalCase {
@@ -248,6 +251,31 @@ mod tests {
             fail_to_pass: vec!["tests/auth_tests/test_validators.py::t1".to_string()],
             pass_to_pass: vec!["tests/auth_tests/test_validators.py::t2".to_string()],
             environment_setup_commit: None,
+        }
+    }
+
+    /// Convert a local filesystem path to a `file:///` URL that is valid on
+    /// all platforms, including Windows where `Path::display()` uses
+    /// backslashes and paths start with a drive letter (e.g. `C:\...`).
+    ///
+    /// RFC 8089 §2: a local file URL has the form `file:///path` (three
+    /// slashes — an empty authority followed by an absolute path).  On
+    /// Windows the absolute path begins with a drive letter, so the result
+    /// is `file:///C:/Users/...`.
+    fn path_to_file_url(path: &Path) -> String {
+        // Canonicalize to resolve any symlinks (tempdir can return symlinks
+        // on macOS via /var -> /private/var), then normalise separators.
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let s = canonical.to_string_lossy().replace('\\', "/");
+        // `s` is already absolute (starts with `/` on Unix, `C:/` on Windows).
+        // Prepend `file:///`; on Unix the leading `/` makes it `file:////tmp/…`
+        // which git2/libgit2 normalises correctly, but it is cleaner to strip
+        // a leading `/` before adding the three-slash prefix.
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            // Windows: s = "C:/Users/…" → "file:///C:/Users/…"
+            format!("file:///{s}")
         }
     }
 
@@ -512,7 +540,7 @@ mod tests {
 
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
-        let url = format!("file://{}", bare.path().display());
+        let url = path_to_file_url(bare.path());
         materialize_from_url(&url, &oid, "", &target).unwrap();
 
         assert!(target.join("hello.py").is_file());
@@ -533,7 +561,7 @@ mod tests {
 
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
-        let url = format!("file://{}", bare.path().display());
+        let url = path_to_file_url(bare.path());
 
         let test_patch = concat!(
             "diff --git a/test_new.py b/test_new.py\n",
@@ -563,7 +591,7 @@ mod tests {
 
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
-        let url = format!("file://{}", bare.path().display());
+        let url = path_to_file_url(bare.path());
         let err = materialize_from_url(&url, "not-a-real-oid", "", &target).unwrap_err();
         matches!(err, SWEBenchError::InvalidOid(_));
     }
