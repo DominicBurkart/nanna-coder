@@ -109,19 +109,28 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v14
       - uses: cachix/cachix-action@v15
         with:
           name: nanna-coder
           skipPush: "true"
       - run: nix build .#harnessImage --print-build-logs
-      - run: nix run .#harnessImage.copyToDockerDaemon
-      - name: Verify image is present
+      - id: image
+        name: Derive image reference from nix
+        shell: bash
         run: |
           set -euo pipefail
-          docker image inspect nanna-coder-harness:latest >/dev/null
+          name=$(nix eval --raw .#harnessImage.imageName)
+          tag=$(nix eval --raw .#harnessImage.imageTag)
+          echo "ref=${name}:${tag}" >> "$GITHUB_OUTPUT"
+      - run: nix run .#harnessImage.copyToDockerDaemon
+      - name: Verify image is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect '${{ steps.image.outputs.ref }}' >/dev/null
       - name: Smoke-run the image
-        run: docker run --rm nanna-coder-harness:latest --help | head -n 5
+        run: docker run --rm '${{ steps.image.outputs.ref }}' --help | head -n 5
 
   empty-cache:
     name: empty-cache (cold-start fallback)
@@ -129,7 +138,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v14
       - id: cold
         run: |
           set -euo pipefail
@@ -153,10 +162,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v14
       - id: brokenrun
         continue-on-error: true
-        run: nix build '.#__ci_integration_does_not_exist__' --no-link 2>&1 | tee /tmp/broken.log
+        shell: bash
+        run: |
+          set -o pipefail
+          nix build '.#__ci_integration_does_not_exist__' --no-link 2>&1 | tee /tmp/broken.log
       - run: |
           set -euo pipefail
           if [ '${{ steps.brokenrun.outcome }}' != 'failure' ]; then
