@@ -16,4 +16,4 @@ thiserror = "1.0"
 workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27"
