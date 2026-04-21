@@ -6,7 +6,7 @@
 //! The adapter is language-agnostic; it simply produces `EvalCase` values
 //! with `task.language = "python"` (SWE-bench Verified is Python-only).
 //! Executing these cases requires a Python-aware runner, which is a separate
-//! follow-up — the current [`crate::eval::runner`] only dispatches
+//! follow-up — the current `crate::eval::runner` only dispatches
 //! `cargo build` / `cargo test` and won't pass them yet.
 //!
 //! ```rust,no_run
@@ -113,10 +113,13 @@ pub fn adapt_to_eval_case(task: &SWEBenchTask) -> EvalCase {
     let prompt = if task.hints_text.is_empty() {
         task.problem_statement.clone()
     } else {
-        format!("{}
+        format!(
+            "{}
 
 Hints:
-{}", task.problem_statement, task.hints_text)
+{}",
+            task.problem_statement, task.hints_text
+        )
     };
 
     EvalCase {
@@ -169,7 +172,7 @@ pub(crate) fn extract_changed_files(patch: &str) -> Vec<String> {
 /// 3. Applies `test_patch` against the working directory so failing tests
 ///    are present when the agent starts.
 ///
-/// Network required. For tests, call [`materialize_from_url`] with a local
+/// Network required. For tests, call `materialize_from_url` with a local
 /// file:// URL instead.
 pub fn materialize(task: &SWEBenchTask, workspace: &Path) -> Result<(), SWEBenchError> {
     let url = format!("https://github.com/{}.git", task.repo);
@@ -266,8 +269,15 @@ mod tests {
         // Canonicalize to resolve any symlinks (tempdir can return symlinks
         // on macOS via /var -> /private/var), then normalise separators.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let s = canonical.to_string_lossy().replace('\\', "/");
-        // `s` is already absolute (starts with `/` on Unix, `C:/` on Windows).
+        let mut s = canonical.to_string_lossy().replace('\\', "/");
+        // On Windows, `canonicalize()` yields a UNC verbatim path like
+        // `\\?\C:\Users\...` → after the separator swap this becomes
+        // `//?/C:/Users/...`.  libgit2 can't parse that, so strip the
+        // verbatim prefix before building the URL.
+        if let Some(stripped) = s.strip_prefix("//?/") {
+            s = stripped.to_string();
+        }
+        // `s` is now absolute (starts with `/` on Unix, `C:/` on Windows).
         // Prepend `file:///`; on Unix the leading `/` makes it `file:////tmp/…`
         // which git2/libgit2 normalises correctly, but it is cleaner to strip
         // a leading `/` before adding the three-slash prefix.
