@@ -263,9 +263,9 @@ nix run .#setup-cache
 **Symptom:** Error about untrusted public key
 
 **Solution:**
-1. Get correct public key from app.cachix.org
-2. Update `flake.nix` line 779
-3. Update local config: `nix run .#setup-cache`
+1. Get the correct public key from [app.cachix.org](https://app.cachix.org/cache/nanna-coder).
+2. Update the `publicKey` in `flake.nix` (search for `nanna-coder.cachix.org`).
+3. Update local config: `nix run .#setup-cache`.
 
 ## Cost Analysis
 
