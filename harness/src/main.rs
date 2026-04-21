@@ -233,22 +233,38 @@ async fn store_repo_guidance_entity(
     }
 }
 
-async fn single_chat(
-    provider: &OllamaProvider,
-    tool_registry: &ToolRegistry,
-    model: &str,
-    prompt: &str,
+/// Shared settings for the CLI chat helpers (`single_chat` / `interactive_chat`).
+///
+/// Controls both model behaviour (tools / temperature) and surface output
+/// (`tool_header` / `tool_result_prefix`) so the one-shot and interactive
+/// modes can keep their distinct formatting while sharing the tool-call loop.
+struct ChatTurnConfig<'a> {
+    model: &'a str,
     enable_tools: bool,
     temperature: f32,
+    tool_header: &'a str,
+    tool_result_prefix: &'a str,
+    /// Whether to append the final tool-call-free assistant message to
+    /// `messages` so it persists across user turns.
+    push_final_assistant: bool,
+}
+
+/// Drive a single chat turn to completion, looping through any tool-call
+/// round-trips the model requests. Appends assistant and tool messages to
+/// `messages` and returns once the model produces a final (tool-call-free)
+/// response.
+async fn run_chat_turn(
+    provider: &OllamaProvider,
+    tool_registry: &ToolRegistry,
+    cfg: &ChatTurnConfig<'_>,
+    messages: &mut Vec<ChatMessage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut messages = vec![ChatMessage::user(prompt)];
-
     loop {
-        let mut request = ChatRequest::new(model, messages.clone()).with_temperature(temperature);
+        let mut request =
+            ChatRequest::new(cfg.model, messages.clone()).with_temperature(cfg.temperature);
 
-        if enable_tools {
-            let tool_definitions = tool_registry.get_definitions();
-            request = request.with_tools(tool_definitions);
+        if cfg.enable_tools {
+            request = request.with_tools(tool_registry.get_definitions());
         }
 
         let response = provider.chat(request).await?;
@@ -258,47 +274,66 @@ async fn single_chat(
             println!("Assistant: {}", content);
         }
 
-        if let Some(tool_calls) = &choice.message.tool_calls {
-            println!("\nTool calls:");
-            for tool_call in tool_calls {
-                println!(
-                    "  Calling {}: {:?}",
-                    tool_call.function.name, tool_call.function.arguments
-                );
-
-                match tool_registry
-                    .execute(
-                        &tool_call.function.name,
-                        tool_call.function.arguments.clone(),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        println!("  Result: {}", result);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            result.to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        error!("Tool execution failed: {}", e);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            format!("Error: {}", e),
-                        ));
-                    }
-                }
+        let Some(tool_calls) = &choice.message.tool_calls else {
+            if cfg.push_final_assistant {
+                messages.push(choice.message.clone());
             }
+            return Ok(());
+        };
 
-            continue;
+        // Push the assistant message once for this response turn, before
+        // iterating over the individual tool calls.  Pushing inside the loop
+        // caused the assistant message to be duplicated N times whenever the
+        // model returned N tool calls, corrupting the conversation history.
+        messages.push(choice.message.clone());
+
+        println!("{}", cfg.tool_header);
+        for tool_call in tool_calls {
+            println!(
+                "  Calling {}: {:?}",
+                tool_call.function.name, tool_call.function.arguments
+            );
+
+            let content = match tool_registry
+                .execute(
+                    &tool_call.function.name,
+                    tool_call.function.arguments.clone(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    println!("{}{}", cfg.tool_result_prefix, result);
+                    result.to_string()
+                }
+                Err(e) => {
+                    error!("Tool execution failed: {}", e);
+                    format!("Error: {}", e)
+                }
+            };
+
+            messages.push(ChatMessage::tool_response(tool_call.id.clone(), content));
         }
-
-        break;
     }
+}
 
-    Ok(())
+async fn single_chat(
+    provider: &OllamaProvider,
+    tool_registry: &ToolRegistry,
+    model: &str,
+    prompt: &str,
+    enable_tools: bool,
+    temperature: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut messages = vec![ChatMessage::user(prompt)];
+    let cfg = ChatTurnConfig {
+        model,
+        enable_tools,
+        temperature,
+        tool_header: "\nTool calls:",
+        tool_result_prefix: "  Result: ",
+        push_final_assistant: false,
+    };
+    run_chat_turn(provider, tool_registry, &cfg, &mut messages).await
 }
 
 async fn interactive_chat<S: EntityStore + Send>(
@@ -320,6 +355,14 @@ async fn interactive_chat<S: EntityStore + Send>(
     println!("Type 'quit' or 'exit' to end the conversation.\n");
 
     let mut messages = vec![];
+    let cfg = ChatTurnConfig {
+        model,
+        enable_tools,
+        temperature,
+        tool_header: "\n[Tool calls]",
+        tool_result_prefix: "  -> ",
+        push_final_assistant: true,
+    };
 
     loop {
         print!("You: ");
@@ -340,62 +383,7 @@ async fn interactive_chat<S: EntityStore + Send>(
 
         messages.push(ChatMessage::user(input));
 
-        loop {
-            let mut request =
-                ChatRequest::new(model, messages.clone()).with_temperature(temperature);
-
-            if enable_tools {
-                let tool_definitions = tool_registry.get_definitions();
-                request = request.with_tools(tool_definitions);
-            }
-
-            let response = provider.chat(request).await?;
-            let choice = &response.choices[0];
-
-            if let Some(content) = &choice.message.content {
-                println!("Assistant: {}", content);
-            }
-
-            if let Some(tool_calls) = &choice.message.tool_calls {
-                println!("\n[Tool calls]");
-                for tool_call in tool_calls {
-                    println!(
-                        "  Calling {}: {:?}",
-                        tool_call.function.name, tool_call.function.arguments
-                    );
-
-                    match tool_registry
-                        .execute(
-                            &tool_call.function.name,
-                            tool_call.function.arguments.clone(),
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            println!("  -> {}", result);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                result.to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            error!("Tool execution failed: {}", e);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                format!("Error: {}", e),
-                            ));
-                        }
-                    }
-                }
-                println!();
-                continue;
-            }
-
-            messages.push(choice.message.clone());
-            break;
-        }
+        run_chat_turn(provider, tool_registry, &cfg, &mut messages).await?;
     }
 
     Ok(())
