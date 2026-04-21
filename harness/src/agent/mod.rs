@@ -12,6 +12,7 @@
 //! 8. Decision → **Query Entities (RAG)** → back to Decision
 //! 9. Decision → **Plan Entity Modification** (loop)
 
+pub mod agents_md;
 pub mod decision;
 pub mod eval;
 pub mod eval_case;
