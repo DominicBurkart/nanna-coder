@@ -5,14 +5,19 @@ A coding agent for coding agents. Designed for background agents to defer straig
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Instructions for agents building nanna
+- [AGENTS.md](AGENTS.md) - Agent control flow and state machine
 - [TESTING.md](TESTING.md) - Testing strategy and guidelines
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution workflow
+- [CACHIX_SETUP.md](CACHIX_SETUP.md) - Cachix maintainer/contributor setup
+- [docs/cache-strategy.md](docs/cache-strategy.md) - Binary cache (Cachix) strategy and CI integration
+- [docs/developer-experience.md](docs/developer-experience.md) - Dev-shell utilities and workflows
+- [docs/agent-evaluation-patterns.md](docs/agent-evaluation-patterns.md) - Agent evaluation framework
 
 ## Technologies
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
-- [Rust](https://rustlang.org)
+- [Rust](https://rust-lang.org)
 - [Cachix](https://cachix.org/) - Binary cache for fast builds
 
 ## Quick Start
