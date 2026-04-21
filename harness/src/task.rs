@@ -16,6 +16,46 @@ use uuid::Uuid;
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 
+/// Default system prompt used for task-dispatched agent runs.
+///
+/// Kept in lock-step with `DEFAULT_SESSION_SYSTEM_PROMPT` in `main.rs`. They
+/// are duplicated on purpose: `main.rs` is a `bin` target and cannot be
+/// imported from here.
+const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
+/// Build the system prompt for a task run, appending any repo-level guidance
+/// discovered under the task's workspace path (closes #231).
+///
+/// Precedence: `AGENTS.md` over `CLAUDE.md` (see
+/// [`crate::agent::agents_md::load`]). Missing files produce no injection;
+/// read errors are logged and swallowed so a broken guidance file never blocks
+/// a task from starting.
+fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+    match crate::agent::agents_md::load(workspace_path) {
+        Ok(Some(doc)) => {
+            tracing::info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance into task system prompt"
+            );
+            format!(
+                "{}\n\n{}",
+                DEFAULT_TASK_SYSTEM_PROMPT,
+                crate::agent::agents_md::format_system_prompt_fragment(&doc)
+            )
+        }
+        Ok(None) => DEFAULT_TASK_SYSTEM_PROMPT.to_string(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
+            );
+            DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
@@ -366,7 +406,7 @@ impl TaskManager {
                     let agent_config = AgentConfig {
                         max_iterations,
                         verbose: false,
-                        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
+                        system_prompt: build_task_system_prompt(&workspace.workspace_path),
                         model_name: model.clone(),
                     };
                     let context = AgentContext {
@@ -1130,6 +1170,156 @@ mod tests {
         let canonical = dir.path().canonicalize().unwrap();
         let cache_read = cache.read().await;
         assert!(cache_read.get(&canonical).is_none());
+    }
+
+    // ---- build_task_system_prompt unit tests ----
+
+    /// Install a process-global tracing subscriber once so the info/error
+    /// macro bodies in `build_task_system_prompt` actually execute under
+    /// coverage. Without a subscriber at a live level the tracing crate
+    /// short-circuits before evaluating the field expressions, leaving lines
+    /// inside the macro uncovered.
+    fn ensure_tracing_subscriber() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::TRACE)
+                .try_init();
+        });
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_no_guidance_returns_default() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_agents_md() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
+        assert!(prompt.contains("Use nextest."));
+        assert!(prompt.contains("</repo-guidance>"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_claude_md_fallback() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
+        assert!(prompt.contains("legacy rules"));
+    }
+
+    /// Initialise a temporary directory as a git repo with a single initial
+    /// commit so it can be used as the source repository for
+    /// `TaskManager::submit` in tests. Mirrors `workspace::tests::init_git_repo`.
+    fn init_test_git_repo(dir: &std::path::Path) {
+        for args in &[
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(dir.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init commit failed");
+    }
+
+    #[tokio::test]
+    async fn test_submit_injects_agents_md_into_task_prompt() {
+        // Exercises the production call site of `build_task_system_prompt`
+        // (inside the `Ok(mut workspace)` branch of `submit`) so the
+        // AGENTS.md-injection path is covered end-to-end, not just by the
+        // direct unit tests above.
+        ensure_tracing_subscriber();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        std::fs::write(repo_dir.path().join("AGENTS.md"), "# repo rules\n").unwrap();
+        std::process::Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["add", "AGENTS.md"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "add guidance"])
+            .output()
+            .unwrap();
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("done")]),
+        );
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+            ) {
+                assert!(
+                    matches!(task.status, TaskStatus::Completed { .. }),
+                    "expected task to complete successfully, got {:?}",
+                    task.status
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submit task did not finish"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_swallows_read_errors() {
+        // Non-UTF8 AGENTS.md makes the loader return Err; the prompt builder
+        // must log and fall back to the default system prompt without
+        // propagating the error.
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     #[tokio::test]
