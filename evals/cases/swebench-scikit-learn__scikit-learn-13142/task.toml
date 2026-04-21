@@ -1,0 +1,26 @@
+[case]
+id = "scikit-learn__scikit-learn-13142"
+name = "scikit-learn__scikit-learn-13142"
+description = """
+GaussianMixture.predict disagrees with fit_predict when n_init > 1
+With n_init > 1 the mixture refits to pick the best seed. After fit_predict the stored parameters should match the labels returned, but predict(X) can return different labels because of an internal state bug. Ensure predict(X) == fit_predict(X)."""
+
+[task]
+prompt = """
+GaussianMixture.predict disagrees with fit_predict when n_init > 1
+With n_init > 1 the mixture refits to pick the best seed. After fit_predict the stored parameters should match the labels returned, but predict(X) can return different labels because of an internal state bug. Ensure predict(X) == fit_predict(X)."""
+language = "python"
+
+[expected]
+files_changed = ["sklearn/mixture/base.py"]
+build_must_pass = false
+tests_must_pass = true
+required_symbols = []
+
+[metadata]
+difficulty = "unknown"
+tags = [
+    "swebench-verified",
+    "scikit-learn",
+]
+timeout_secs = 1800

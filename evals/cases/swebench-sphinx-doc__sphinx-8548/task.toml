@@ -1,0 +1,26 @@
+[case]
+id = "sphinx-doc__sphinx-8548"
+name = "sphinx-doc__sphinx-8548"
+description = """
+autodoc inherited-members doesn't work for inherited attributes
+When a class inherits an attribute from a parent and :inherited-members: is set, the attribute does not appear in the generated docs. Expected behavior: inherited attributes should be documented like inherited methods."""
+
+[task]
+prompt = """
+autodoc inherited-members doesn't work for inherited attributes
+When a class inherits an attribute from a parent and :inherited-members: is set, the attribute does not appear in the generated docs. Expected behavior: inherited attributes should be documented like inherited methods."""
+language = "python"
+
+[expected]
+files_changed = ["sphinx/ext/autodoc/__init__.py"]
+build_must_pass = false
+tests_must_pass = true
+required_symbols = []
+
+[metadata]
+difficulty = "unknown"
+tags = [
+    "swebench-verified",
+    "sphinx",
+]
+timeout_secs = 1800

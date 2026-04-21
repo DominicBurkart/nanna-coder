@@ -4,8 +4,10 @@
 //! by the agent evaluation framework in [`crate::agent::eval`].
 
 pub mod report;
+pub mod swebench;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
     AgentEvaluationResult, BatchEvaluationResult, EvaluationCategory, EvaluationMetrics,
 };
+pub use swebench::{adapt_to_eval_case, load_swebench_dataset, materialize, SWEBenchTask};
