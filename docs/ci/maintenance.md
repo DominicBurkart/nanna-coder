@@ -18,7 +18,7 @@ if [ -n "$missing" ]; then
 fi
 ```
 
-The `yq` expression enumerates jobs dynamically from the YAML. That means adding a new job requires **only** updating the `jobs.all-checks.needs` list; there is no hand-maintained allowlist to keep in sync. This doc being in tree does not change that — but adding `docs-check` to `ci.yml` did require updating `needs:`, which happened in the same commit.
+The `yq` expression enumerates jobs dynamically from the YAML. That means adding a new job requires **only** updating the `jobs.all-checks.needs` list; there is no hand-maintained allowlist to keep in sync.
 
 When adding a new job:
 
@@ -28,15 +28,15 @@ When adding a new job:
 
 ## Workflow-coverage invariant
 
-`scripts/check-ci-doc-coverage.sh` asserts that every `.github/workflows/*.y{,a}ml` file has a dedicated `## <filename>` heading in [architecture.md](architecture.md), or is explicitly excluded via `OMITTED: <filename> — <reason>` somewhere in that file. This lives in the `docs-check` job of `ci.yml`. Consequences:
+`scripts/check-ci-doc-coverage.sh` asserts that every `.github/workflows/*.y{,a}ml` file has a dedicated `## <filename>` heading in [architecture.md](architecture.md), or is explicitly excluded via `OMITTED: <filename> — <reason>` somewhere in that file. Once the planned `docs-check` job is wired into `ci.yml` (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254)), this check will run automatically in CI. Until then, run it locally. Consequences:
 
-- New workflow? Add a heading to [architecture.md](architecture.md) **and** describe triggers/jobs/matrix/secrets before `docs-check` goes green.
+- New workflow? Add a heading to [architecture.md](architecture.md) **and** describe triggers/jobs/matrix/secrets before merging.
 - Rename? Update the heading.
 - Retire a workflow? Either delete it from disk, or add an `OMITTED:` marker with justification.
 
 ## Link-coverage invariant
 
-`scripts/check-docs-links.sh` validates relative links and `#anchor` fragments inside `docs/ci/*.md`. It does **not** check external HTTP URLs — that choice is documented in the script header and keeps CI free of flake on link-rot. When moving a doc, update its inbound references, then run `bash scripts/check-docs-links.sh` locally.
+`scripts/check-docs-links.sh` validates relative links and `#anchor` fragments inside `docs/ci/*.md`. It does **not** check external HTTP URLs — that choice is documented in the script header and keeps CI free of flake on link-rot. Once the planned `docs-check` job is wired into `ci.yml`, this will also run automatically in CI. When moving a doc, update its inbound references, then run `bash scripts/check-docs-links.sh` locally.
 
 ## Secret rotation
 
@@ -44,7 +44,7 @@ Secrets used by the workflows (see [architecture.md](architecture.md) table):
 
 | Secret | Used by | Rotation procedure |
 |---|---|---|
-| `CACHIX_AUTH` | `ci.yml` (every job that configures Cachix), `cache-warming.yml` (every job), `eval.yml` (`eval`) | Regenerate in Cachix dashboard, update in repository `codecov` environment settings, verify by re-running a cache-warming workflow. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md). |
+| `CACHIX_AUTH` | `ci.yml` (every job that configures Cachix), `cache-warming.yml` (every job), `eval.yml` (`eval`) | Regenerate in Cachix dashboard, update the `CACHIX_AUTH` repo-level secret in repository Settings → Secrets and variables → Actions, verify by re-running a cache-warming workflow. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md). |
 | `CODECOV_TOKEN` | `ci.yml` (`test-matrix` security variant) | Regenerate in Codecov UI; update in repository secrets; re-run a security test to confirm upload. |
 | `GITHUB_TOKEN` | `ci.yml` (container login, release upload), `eval.yml` (PR comments), `badges.yaml` (push) | Provided by GitHub Actions automatically; no rotation. Permissions are scoped per-job via `permissions:` blocks. |
 
@@ -75,11 +75,12 @@ Upgrade procedure:
 
 | Cadence | Task | Owner |
 |---|---|---|
-| Every PR | Review `docs-check` output for new workflows or broken links | PR author |
 | Weekly | Skim `cache-analytics` output from the most recent `cache-maintenance` run for regressions | Maintainer |
 | Monthly | Verify `badges.yaml` still produces SVGs (img.shields.io upstream occasionally changes paths) | Maintainer |
 | On `flake.lock` bump | Observe `cache-warming.yml` fires on path filter; if it does not, something has broken the trigger | Nix maintainer |
 | On Rust toolchain bump | Re-run `warm-dependencies` manually with `force_rebuild=true` | Rust maintainer |
+
+_Note: a "Every PR — Review `docs-check` output" task is planned but not yet active because the `docs-check` CI job has not yet been wired into `ci.yml` (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))._
 
 ## When things genuinely cannot be fixed here
 

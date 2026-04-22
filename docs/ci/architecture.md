@@ -10,12 +10,12 @@ For a narrative, higher-level view of the pipeline that predates this tree, see 
 
 | File | Trigger(s) | Jobs | Matrix dimensions | Secrets |
 |---|---|---|---|---|
-| `ci.yml` | `push` (main, develop), `pull_request` (main), `release` | `test-matrix`, `build-matrix`, `build-containers`, `security-scan`, `cache-maintenance`, `release`, `all-checks`, `docs-check` | OS x test-type; target x runner; arch x image | `CACHIX_AUTH`, `CODECOV_TOKEN`, `GITHUB_TOKEN` |
+| `ci.yml` | `push` (main, develop), `pull_request` (main), `release` | `test-matrix`, `build-matrix`, `build-containers`, `security-scan`, `cache-maintenance`, `release`, `all-checks` _(`docs-check` pending — see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))_ | OS x test-type; target x runner; arch x image | `CACHIX_AUTH` (repo-level secret), `CODECOV_TOKEN`, `GITHUB_TOKEN` |
 | `cache-warming.yml` | `push` (main, path-filtered), `workflow_dispatch` | `warm-dependencies`, `warm-containers`, `warm-cross-platform` (currently disabled via `if: false`), `summary` | `image` (harness, ollama); `target` x `runner` (disabled) | `CACHIX_AUTH` |
 | `eval.yml` | `workflow_dispatch` | `eval` | none | `CACHIX_AUTH`, `GITHUB_TOKEN` |
 | `badges.yaml` | `push` (main) | `update-badges` | none | `GITHUB_TOKEN` |
 
-Secrets are defined in the repository's GitHub environment settings. `CACHIX_AUTH` is required for any job that pushes to Cachix; Cachix pulls are unauthenticated. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md).
+`CACHIX_AUTH` and `CODECOV_TOKEN` are repo-level secrets (not scoped to any GitHub environment). `GITHUB_TOKEN` is provided automatically by GitHub Actions. The `test-matrix` job declares `environment: codecov` solely to satisfy Codecov's OIDC requirements; only `CODECOV_TOKEN` is consumed there. `CACHIX_AUTH` is required for any job that pushes to Cachix; Cachix pulls are unauthenticated. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md).
 
 ## ci.yml
 
@@ -29,7 +29,7 @@ The primary pipeline. Triggers on every push to `main`/`develop`, every PR targe
 - **`security-scan`** — runs on `needs: build-containers`, only on non-PR events. Runs `aquasecurity/trivy-action` against the pushed harness image and uploads SARIF via `github/codeql-action/upload-sarif@v3`. Requires `security-events: write`.
 - **`cache-maintenance`** — runs on `needs: [test-matrix, build-matrix, build-containers]`, gated to `push` events on `refs/heads/main`. Invokes `nix run .#cache-analytics` (defined in [../../nix/cache.nix](../../nix/cache.nix)) and appends the report to `$GITHUB_STEP_SUMMARY`.
 - **`release`** — runs on `needs: [test-matrix, build-matrix, build-containers]`, gated to `release` events. Rebuilds for each target and attaches `harness-<target>` to the GitHub release via `actions/upload-release-asset@v1`.
-- **`docs-check`** — runs on `ubuntu-latest`. Executes `scripts/check-docs-links.sh` and `scripts/check-ci-doc-coverage.sh` so this doc tree cannot silently drift from the workflows it describes.
+- **`docs-check`** _(pending — not yet in `ci.yml`; see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))_ — will run `scripts/check-docs-links.sh` and `scripts/check-ci-doc-coverage.sh` on `ubuntu-latest` so this doc tree cannot silently drift from the workflows it describes. The wiring commit was blocked on `workflows` permission scope and has not yet landed.
 - **`all-checks`** — the gate job. `if: always()`, `needs:` every other job. Contains a `yq`-backed self-check that asserts every declared job appears in its own `needs:` list (see [maintenance.md](maintenance.md) for the exact logic), then fails on any dependency `failure`/`cancelled`.
 
 ### Job graph
@@ -51,8 +51,9 @@ graph TD
     security-scan --> all-checks
     cache-maintenance --> all-checks
     release --> all-checks
-    docs-check --> all-checks
 ```
+
+_Note: a `docs-check --> all-checks` edge is planned but not yet wired (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))._
 
 ## cache-warming.yml
 
