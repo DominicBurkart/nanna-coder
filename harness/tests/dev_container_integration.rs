@@ -20,7 +20,9 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "gemma4:e4b";
+fn e2e_model() -> String {
+    std::env::var("NANNA_EVAL_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_string())
+}
 
 fn example_repo_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -131,7 +133,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
         max_iterations: MAX_TURNS,
         verbose: true,
         system_prompt: "You are a coding assistant. Modify this Rust project to compute the first 10 prime numbers instead of Fibonacci numbers. Update src/lib.rs to implement a `primes(n: usize) -> Vec<u64>` function that returns the first n prime numbers. Update src/main.rs to call `primes(10)` and print the result. Update tests/fib_test.rs to test that primes(10) returns [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]. Use run_command to run `cargo test` and `cargo run` to verify your changes work.".to_string(),
-        model_name: E2E_MODEL.to_string(),
+        model_name: e2e_model(),
     };
 
     let context = AgentContext {
@@ -222,7 +224,7 @@ async fn test_task_manager_submit_with_dev_container() {
                 .to_string(),
             repo_path,
             "HEAD".to_string(),
-            E2E_MODEL.to_string(),
+            e2e_model(),
             MAX_TURNS,
             provider,
         )

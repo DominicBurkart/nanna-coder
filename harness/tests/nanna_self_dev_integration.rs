@@ -17,7 +17,9 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "gemma4:e4b";
+fn e2e_model() -> String {
+    std::env::var("NANNA_EVAL_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_string())
+}
 const ORIGINAL_HELP_STRING: &str = "A CLI tool for interacting with language models";
 
 fn workspace_root() -> PathBuf {
@@ -138,7 +140,7 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
              After making changes, use run_command to verify with `cargo build --workspace` and \
              `cargo test --workspace` inside the container."
         ),
-        model_name: E2E_MODEL.to_string(),
+        model_name: e2e_model(),
     };
 
     let context = AgentContext {
