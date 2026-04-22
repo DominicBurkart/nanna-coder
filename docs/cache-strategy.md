@@ -15,7 +15,7 @@ All workflows use `cachix/cachix-action@v15`:
   with:
     name: nanna-coder
     authToken: '${{ secrets.CACHIX_AUTH }}'
-    pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+    pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
     skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 ```
 
@@ -26,7 +26,7 @@ All workflows use `cachix/cachix-action@v15`:
 
 ## Flake Configuration
 
-Binary cache configuration lives in [`flake.nix`](../flake.nix) via `binaryCacheConfig`:
+Binary cache configuration lives in [`nix/cache.nix`](../nix/cache.nix) via `binaryCacheConfig`:
 
 ```nix
 binaryCacheConfig = {
@@ -42,15 +42,19 @@ binaryCacheConfig = {
     "base-images"       = 30;
     "system-packages"   = 20;
   };
+  maxCacheSizeGB = 50;
+  retentionDays  = 30;
+  maxJobs        = 4;
 };
 ```
 
 ## Developer Setup
 
 ```bash
-nix run .#setup-cache     # one-time: add Cachix substituter
-nix build .#nanna-coder   # builds now pull from Cachix
-nix run .#cache-analytics # inspect local store / cache config
+nix run .#setup-cache       # one-time: add Cachix substituter
+nix build .#nanna-coder     # builds now pull from Cachix
+nix run .#ci-cache-optimize # apply optimal Nix settings for CI runners
+nix run .#cache-analytics   # inspect local store / cache config
 ```
 
 ## What Gets Cached
@@ -94,7 +98,7 @@ nix run .#setup-cache                            # re-apply if missing
 
 **Untrusted public-key error:** fetch the correct key from
 [app.cachix.org/cache/nanna-coder](https://app.cachix.org/cache/nanna-coder),
-update `flake.nix` (`binaryCacheConfig.publicKey`), then rerun
+update `nix/cache.nix` (`binaryCacheConfig.publicKey`), then rerun
 `nix run .#setup-cache`.
 
 ## References
