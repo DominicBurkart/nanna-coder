@@ -16,7 +16,7 @@
 # Rerun with FORCE=1 to overwrite.
 #
 # Exit codes:
-#   0 - hash captured and file updated
+#   0 - hash captured, file updated, and build confirmed
 #   1 - precondition failed (missing tool, bad arg, etc.)
 #   2 - capture attempt failed (network, ollama error, nix build error)
 
@@ -40,7 +40,7 @@ fi
 MODEL_KEY="$1"
 FORCE="${FORCE:-0}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/..' && pwd)"
 CONTAINERS_NIX="${REPO_ROOT}/nix/containers.nix"
 [[ -f "${CONTAINERS_NIX}" ]] || die "cannot find ${CONTAINERS_NIX}"
 
@@ -96,11 +96,17 @@ log "old hash  : ${CURRENT_HASH:-<unset>}"
 # We use `lib.fakeSha256` indirectly by passing the placeholder value (which
 # is a well-formed sha256 that just happens to be wrong) and scraping the
 # diagnostic out of stderr.
-BUILD_ATTR="models.${MODEL_KEY}-model"
+#
+# NOTE: The model derivations are exposed at the TOP LEVEL of the flake's
+# `packages` output (not under a `models` sub-attribute) via:
+#   inherit (containers.models) gemma-model llama3-model …
+# in flake.nix. The correct nix build attribute is therefore
+# `.#${MODEL_KEY}-model`, NOT `.#models.${MODEL_KEY}-model`.
+BUILD_ATTR="${MODEL_KEY}-model"
 log "running: nix build .#${BUILD_ATTR} (expected to fail with a hash mismatch)"
 
 BUILD_LOG="$(mktemp)"
-trap 'rm -f "${BUILD_LOG}"' EXIT
+trap 'rm -f "${BUILD_LOG}" "${CONTAINERS_NIX}.bak" 2>/dev/null || true' EXIT
 
 # Intentionally ignore the exit code: the build is supposed to fail. What
 # we care about is the `got: sha256-...` line in the error output.
@@ -114,10 +120,16 @@ fi
 
 # Grep for the line Nix prints on a hash mismatch. Format varies across
 # versions; accept both `got:` and `got    ` styles and both `sha256-`
-# (SRI) and raw-hex forms.
-NEW_HASH="$(grep -Eo 'got:? +sha256-[A-Za-z0-9+/=]+' "${BUILD_LOG}" \
+# (SRI) and raw-hex (64 hex chars) forms.
+NEW_HASH="$(grep -Eo 'got:? +(sha256-[A-Za-z0-9+/=]+|[0-9a-f]{64})' "${BUILD_LOG}" \
   | head -n1 \
   | awk '{print $NF}')"
+
+# If raw hex was captured, convert it to SRI form that Nix expects.
+if [[ "${NEW_HASH}" =~ ^[0-9a-f]{64}$ ]]; then
+  NEW_HASH="sha256-$(printf '%s' "${NEW_HASH}" | xxd -r -p | base64 -w0)="
+  log "converted raw hex to SRI: ${NEW_HASH}"
+fi
 
 if [[ -z "${NEW_HASH}" ]]; then
   warn "could not find a 'got: sha256-...' line in the build log"
@@ -132,6 +144,9 @@ log "captured hash: ${NEW_HASH}"
 # In-place replace only the hash line inside the matching block. We scope
 # the replacement with a small awk state machine so we don't accidentally
 # rewrite a placeholder belonging to another model.
+#
+# Keep a backup so the post-capture validation step can restore it on failure.
+cp "${CONTAINERS_NIX}" "${CONTAINERS_NIX}.bak"
 tmp="$(mktemp)"
 awk -v key="\"${MODEL_KEY}\"" -v new="${NEW_HASH}" '
   $0 ~ key" =" {in_block=1}
@@ -148,4 +163,24 @@ log "${GREEN}updated${NC} ${CONTAINERS_NIX}"
 log "diff:"
 git -C "${REPO_ROOT}" --no-pager diff -- "${CONTAINERS_NIX}" || true
 
-log "${GREEN}done.${NC} Verify with:  nix build .#${BUILD_ATTR}"
+# ---- Post-capture validation ---------------------------------------------
+# Rebuild with the newly written hash to confirm Nix accepts it. If the
+# build fails the captured hash was wrong (e.g. the log line was from a
+# different derivation, or the SRI conversion was incorrect). Restore the
+# original file and abort rather than leaving a broken containers.nix.
+log "running post-capture validation: nix build .#${BUILD_ATTR}"
+VALIDATION_LOG="$(mktemp)"
+if ! nix build --no-link --print-build-logs \
+    ".#${BUILD_ATTR}" 2> "${VALIDATION_LOG}" 1>&2; then
+  warn "post-capture build FAILED — the captured hash was not accepted by Nix"
+  warn "validation build log follows:"
+  cat "${VALIDATION_LOG}" >&2
+  warn "restoring original ${CONTAINERS_NIX}"
+  mv "${CONTAINERS_NIX}.bak" "${CONTAINERS_NIX}"
+  rm -f "${VALIDATION_LOG}"
+  die "hash validation failed; containers.nix has been restored" 2
+fi
+rm -f "${VALIDATION_LOG}" "${CONTAINERS_NIX}.bak"
+
+log "${GREEN}validation passed${NC} — nix build accepted the new hash"
+log "${GREEN}done.${NC} Commit with:  git add nix/containers.nix && git commit -m 'nix: capture ${MODEL_KEY} sha256 (closes #240)'"
