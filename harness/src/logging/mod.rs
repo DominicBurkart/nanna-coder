@@ -232,4 +232,27 @@ mod tests {
         assert!(out.contains("hello world"));
         assert!(!out.contains("***REDACTED***"));
     }
+
+    /// Exercises the `Err(_) => self.inner.write(buf)` branch in
+    /// `RedactingWriter::write`: bytes that are not valid UTF-8 must be
+    /// forwarded to the inner writer verbatim without being dropped or mangled.
+    #[test]
+    fn non_utf8_bytes_forwarded_verbatim() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = RedactingWriter { inner };
+        // 0xFF is not valid UTF-8.
+        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0x00];
+        let n = writer.write(bad_bytes).expect("write should succeed");
+        assert_eq!(n, bad_bytes.len(), "reported byte count must match input length");
+        assert_eq!(writer.inner, bad_bytes, "verbatim bytes must reach the inner sink");
+    }
+
+    /// Exercises `RedactingWriter::flush` to ensure the delegation to the
+    /// inner writer is covered.
+    #[test]
+    fn flush_delegates_to_inner() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = RedactingWriter { inner };
+        writer.flush().expect("flush should succeed");
+    }
 }
