@@ -1,17 +1,13 @@
-# Nix Binary Cache Migration Guide
+# Nix Binary Cache Migration Guide (Historical)
 
-## ✅ Migration Complete: Cachix Deprecated
+> **Superseded.** The project now uses Cachix — see [cachix-migration.md](./cachix-migration.md) and [CACHE_STRATEGY.md](./CACHE_STRATEGY.md) for the current strategy. This document is retained for historical context on the `cache-nix-action` interim step.
 
-**Status**: COMPLETED - All workflows migrated to cache-nix-action
-**Impact**: Fully free GitHub-native caching, no external dependencies
-**Benefits**: No secrets required, works with forks/PRs, 10GB cache per repo
+## Original Status (pre-Cachix adoption)
 
-## Migration Status
-
-Your workflows now use:
-- ✅ `nix-community/cache-nix-action@v5` - **ACTIVE** (free GitHub-native solution)
-- ❌ `DeterminateSystems/magic-nix-cache-action@main` - **REMOVED** (deprecated)
-- ❌ `cachix/cachix-action@v12` - **REMOVED** (external dependency eliminated)
+At the time of writing, workflows used:
+- `nix-community/cache-nix-action@v5` — active (GitHub-native, 10 GB per-repo limit)
+- `DeterminateSystems/magic-nix-cache-action@main` — removed (upstream deprecation)
+- `cachix/cachix-action@v12` — not yet adopted
 
 ## Workflows Updated
 
@@ -91,23 +87,13 @@ With this:
 - ❌ Requires paid subscription
 - ❌ Needs `CACHIX_AUTH` secret configuration
 
-## Migration Strategy
+## Migration Strategy (historical)
 
-### Phase 1: Test Alternative (In Progress)
-- [x] Test `cache-nix-action` with new workflow
-- [ ] Monitor performance compared to Magic Nix Cache
-- [ ] Verify cache hit rates and build time improvements
+Phase 1: test `cache-nix-action` against a baseline; monitor hit rates.
+Phase 2: migrate simplified workflow, then main CI, then remaining workflows.
+Phase 3: remove Magic Nix Cache references and update docs.
 
-### Phase 2: Gradual Migration (Before Feb 1, 2025)
-1. Update simplified enterprise workflow first
-2. Monitor for any issues or performance regressions
-3. Update main enterprise CI workflow
-4. Update all other workflows
-
-### Phase 3: Cleanup (After Migration)
-1. Remove Magic Nix Cache references
-2. Update documentation
-3. Configure optimal cache settings
+Both phases completed. The project subsequently moved to Cachix; see [cachix-migration.md](./cachix-migration.md).
 
 ## Implementation Examples
 
@@ -136,7 +122,8 @@ steps:
 ```
 
 ### Hybrid Approach
-Combine free and paid solutions:
+
+> **Not adopted.** This approach was evaluated but not used — see [cachix-migration.md](./cachix-migration.md) for the current setup. The YAML below is illustrative only; note that `if: secrets.CACHIX_AUTH != ''` is not valid GitHub Actions expression syntax (the correct form would be `if: ${{ secrets.CACHIX_AUTH != '' }}`).
 
 ```yaml
 steps:
@@ -150,7 +137,7 @@ steps:
 
 # Fallback cache: Cachix (only when token available)
 - uses: cachix/cachix-action@v12
-  if: secrets.CACHIX_AUTH != ''
+  if: secrets.CACHIX_AUTH != ''  # illustrative only — not valid GHA syntax
   with:
     name: nanna-coder
     authToken: ${{ secrets.CACHIX_AUTH }}
@@ -166,13 +153,6 @@ Based on community feedback:
 | FlakeHub Cache | Low | Excellent | Paid |
 | Cachix | Medium | Excellent | Paid |
 | Magic Nix Cache | None | Good | Free (until Feb 2025) |
-
-## Next Steps
-
-1. **Immediate**: Test the new `cache-migration-test.yml` workflow
-2. **This Week**: Choose primary alternative (recommend cache-nix-action)
-3. **Before Jan 15**: Migrate all workflows
-4. **Before Feb 1**: Remove all Magic Nix Cache references
 
 ## Support
 
