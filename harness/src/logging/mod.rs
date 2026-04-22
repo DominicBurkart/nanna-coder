@@ -24,6 +24,10 @@
 //!   `tracing_subscriber` (direct `println!`, `eprintln!`, `std::process`
 //!   output, panic messages).
 //!
+//! Note: PII (email addresses, phone numbers, IP addresses, SSNs, and credit-
+//! card PANs) is **out of scope** for this module. The redaction pass targets
+//! credential shapes only.
+//!
 //! See [`redaction`] for the enumerated field-name allowlist and regex set.
 pub mod redaction;
 
@@ -44,9 +48,9 @@ use tracing_subscriber::fmt::MakeWriter;
 ///   `tracing`'s private APIs,
 /// - cost is paid per-event rather than per-field.
 ///
-/// The adapter is UTF-8 tolerant: if a buffered write is not valid UTF-8 it is
-/// forwarded unmodified rather than being dropped. Redaction only operates on
-/// the UTF-8 prefix / interpretation of the bytes.
+/// The adapter is UTF-8 tolerant: if a flushed buffer is not valid UTF-8 the
+/// bytes are interpreted with `from_utf8_lossy` so that redaction still runs
+/// on the lossy string before being forwarded to the inner writer.
 #[derive(Clone, Debug)]
 pub struct RedactingMakeWriter<M> {
     inner: M,
@@ -62,23 +66,37 @@ impl<M> RedactingMakeWriter<M> {
 }
 
 /// Per-write handle returned by [`RedactingMakeWriter::make_writer`].
+///
+/// Bytes are accumulated in an internal buffer. Redaction runs and the buffer
+/// is flushed to the inner writer whenever a newline (`\n`) is seen in the
+/// incoming data, or when [`flush`](Write::flush) is called explicitly. This
+/// ensures that a secret split across two `write` calls — which the
+/// `MakeWriter` contract permits — is still fully redacted.
 pub struct RedactingWriter<W> {
     inner: W,
+    buf: Vec<u8>,
 }
 
 impl<W: Write> Write for RedactingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match std::str::from_utf8(buf) {
-            Ok(s) => {
-                let redacted = redaction::redact_secrets(s);
-                self.inner.write_all(redacted.as_bytes())?;
-                Ok(buf.len())
-            }
-            Err(_) => self.inner.write(buf),
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.contains(&b'\n') {
+            self.flush()?;
         }
+        Ok(data.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            // Use `from_utf8_lossy` so the redaction pass always runs, even
+            // when the buffer contains invalid UTF-8 bytes. This is strictly
+            // safer than forwarding verbatim: a secret prefixed with a single
+            // invalid byte would otherwise bypass redaction entirely.
+            let s = String::from_utf8_lossy(&chunk);
+            let redacted = redaction::redact_secrets(&s);
+            self.inner.write_all(redacted.as_bytes())?;
+        }
         self.inner.flush()
     }
 }
@@ -92,6 +110,7 @@ where
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
             inner: self.inner.make_writer(),
+            buf: Vec::new(),
         }
     }
 }
@@ -233,18 +252,56 @@ mod tests {
         assert!(!out.contains("***REDACTED***"));
     }
 
-    /// Exercises the `Err(_) => self.inner.write(buf)` branch in
-    /// `RedactingWriter::write`: bytes that are not valid UTF-8 must be
-    /// forwarded to the inner writer verbatim without being dropped or mangled.
+    /// Asserts that bytes containing invalid UTF-8 are processed via
+    /// `from_utf8_lossy` so the redaction pass still runs. A secret
+    /// prefixed with an invalid byte must not bypass redaction.
     #[test]
-    fn non_utf8_bytes_forwarded_verbatim() {
+    fn non_utf8_bytes_redacted_via_lossy() {
         let inner: Vec<u8> = Vec::new();
-        let mut writer = RedactingWriter { inner };
-        // 0xFF is not valid UTF-8.
-        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0x00];
-        let n = writer.write(bad_bytes).expect("write should succeed");
-        assert_eq!(n, bad_bytes.len(), "reported byte count must match input length");
-        assert_eq!(writer.inner, bad_bytes, "verbatim bytes must reach the inner sink");
+        let mut writer = RedactingWriter { inner, buf: Vec::new() };
+        // Prepend an invalid UTF-8 byte before a known secret pattern.
+        // The lossy conversion replaces 0xFF with U+FFFD; the `sk-` key that
+        // follows must still be redacted.
+        let secret = b"sk-ABCDEFabcdef0123456789TOPSECRETxyz";
+        let mut bad_bytes: Vec<u8> = vec![0xFF];
+        bad_bytes.extend_from_slice(secret);
+        bad_bytes.push(b'\n');
+        writer.write_all(&bad_bytes).expect("write should succeed");
+        let output = String::from_utf8_lossy(&writer.inner).into_owned();
+        assert!(
+            !output.contains("sk-ABCDEFabcdef0123456789TOPSECRETxyz"),
+            "secret must be redacted even after lossy UTF-8 conversion; got: {output}"
+        );
+        assert!(
+            output.contains("***REDACTED***"),
+            "expected REDACTED marker; got: {output}"
+        );
+    }
+
+    /// Asserts that a secret split across two `write` calls is still fully
+    /// redacted. The `MakeWriter` contract does not guarantee a single `write`
+    /// per event; this test exercises the buffering logic.
+    #[test]
+    fn split_write_redacts_secret() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = RedactingWriter { inner, buf: Vec::new() };
+        // Split a known `sk-` secret across two writes; the newline (and
+        // therefore the flush+redact) only arrives with the second write.
+        let first_half = b"oops sk-ABCDEFabcdef012345";
+        let second_half = b"6789TOPSECRETxyz\n";
+        writer.write_all(first_half).expect("first write");
+        // Buffer should still be held; nothing flushed yet.
+        assert!(writer.inner.is_empty(), "inner writer must be empty before newline");
+        writer.write_all(second_half).expect("second write");
+        let output = String::from_utf8_lossy(&writer.inner).into_owned();
+        assert!(
+            !output.contains("sk-ABCDEFabcdef0123456789TOPSECRETxyz"),
+            "split secret must be redacted; got: {output}"
+        );
+        assert!(
+            output.contains("***REDACTED***"),
+            "expected REDACTED marker; got: {output}"
+        );
     }
 
     /// Exercises `RedactingWriter::flush` to ensure the delegation to the
@@ -252,7 +309,7 @@ mod tests {
     #[test]
     fn flush_delegates_to_inner() {
         let inner: Vec<u8> = Vec::new();
-        let mut writer = RedactingWriter { inner };
+        let mut writer = RedactingWriter { inner, buf: Vec::new() };
         writer.flush().expect("flush should succeed");
     }
 }
