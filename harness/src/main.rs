@@ -196,6 +196,9 @@ struct ChatTurnConfig<'a> {
     temperature: f32,
     tool_header: &'a str,
     tool_result_prefix: &'a str,
+    /// Whether to print a blank line after the tool-call block (interactive
+    /// mode does; one-shot mode does not).
+    trailing_tool_newline: bool,
     /// Whether to append the final tool-call-free assistant message to
     /// `messages` so it persists across user turns.
     push_final_assistant: bool,
@@ -233,6 +236,10 @@ async fn run_chat_turn(
             return Ok(());
         };
 
+        // Push the assistant message once for the entire response batch,
+        // before iterating over individual tool calls.
+        messages.push(choice.message.clone());
+
         println!("{}", cfg.tool_header);
         for tool_call in tool_calls {
             println!(
@@ -257,8 +264,11 @@ async fn run_chat_turn(
                 }
             };
 
-            messages.push(choice.message.clone());
             messages.push(ChatMessage::tool_response(tool_call.id.clone(), content));
+        }
+
+        if cfg.trailing_tool_newline {
+            println!();
         }
     }
 }
@@ -278,6 +288,7 @@ async fn single_chat(
         temperature,
         tool_header: "\nTool calls:",
         tool_result_prefix: "  Result: ",
+        trailing_tool_newline: false,
         push_final_assistant: false,
     };
     run_chat_turn(provider, tool_registry, &cfg, &mut messages).await
@@ -308,6 +319,7 @@ async fn interactive_chat<S: EntityStore + Send>(
         temperature,
         tool_header: "\n[Tool calls]",
         tool_result_prefix: "  -> ",
+        trailing_tool_newline: true,
         push_final_assistant: true,
     };
 
@@ -379,11 +391,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
