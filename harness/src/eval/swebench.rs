@@ -154,10 +154,10 @@ pub(crate) fn extract_changed_files(patch: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix("diff --git ")?;
-            // Format: `a/<path> b/<path>` (paths may contain spaces — SWE-bench
-            // tasks use paths without spaces so the simple split is safe).
-            let (_a, b) = rest.split_once(' ')?;
-            b.strip_prefix("b/").map(str::to_string)
+            // Format: `a/<path> b/<path>`. Split on " b/" to correctly
+            // handle paths that contain spaces.
+            let (_a, b) = rest.split_once(" b/")?;
+            Some(b.to_string())
         })
         .collect();
     files.sort();
@@ -603,6 +603,6 @@ mod tests {
         let target = workspace.path().join("repo");
         let url = path_to_file_url(bare.path());
         let err = materialize_from_url(&url, "not-a-real-oid", "", &target).unwrap_err();
-        matches!(err, SWEBenchError::InvalidOid(_));
+        assert!(matches!(err, SWEBenchError::InvalidOid(_)));
     }
 }
