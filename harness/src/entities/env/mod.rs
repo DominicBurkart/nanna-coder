@@ -8,6 +8,12 @@
 // Placeholder for environment entity implementation
 // Full implementation tracked in issue #25
 
+pub mod bridge;
+pub mod deployment;
+pub mod security;
 pub mod types;
 
+pub use bridge::*;
+pub use deployment::*;
+pub use security::*;
 pub use types::*;
