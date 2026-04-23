@@ -8,6 +8,12 @@
 // Placeholder for test entity implementation
 // Full implementation tracked in issue #24
 
+pub mod correlation;
+pub mod execution;
+pub mod parse;
 pub mod types;
 
+pub use correlation::*;
+pub use execution::*;
+pub use parse::*;
 pub use types::*;
