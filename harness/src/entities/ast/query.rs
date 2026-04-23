@@ -165,4 +165,91 @@ mod tests {
         let q = AstQuery::new(&entity);
         assert!(q.find_impls("nowhere").is_empty());
     }
+
+    #[test]
+    fn test_find_all_matches_multiple_hits() {
+        // Build a fixture where every finder returns multiple matches, so
+        // each filter closure is exercised on both matching and
+        // non-matching items (the `false` branch was previously only seen
+        // when no items matched at all, making some closure arms appear
+        // uncovered).
+        let summary = AstSummary {
+            functions: vec![
+                FunctionSig {
+                    name: "parse_a".to_string(),
+                    is_pub: true,
+                    is_async: false,
+                    line: 1,
+                },
+                FunctionSig {
+                    name: "parse_b".to_string(),
+                    is_pub: false,
+                    is_async: true,
+                    line: 2,
+                },
+                FunctionSig {
+                    name: "unrelated".to_string(),
+                    is_pub: false,
+                    is_async: false,
+                    line: 3,
+                },
+            ],
+            structs: vec![
+                StructSig {
+                    name: "Node".to_string(),
+                    is_pub: true,
+                    line: 10,
+                },
+                StructSig {
+                    name: "NodeList".to_string(),
+                    is_pub: true,
+                    line: 11,
+                },
+                StructSig {
+                    name: "Other".to_string(),
+                    is_pub: false,
+                    line: 12,
+                },
+            ],
+            impls: vec![
+                ImplSig {
+                    type_name: "NodeInner".to_string(),
+                    trait_name: None,
+                    line: 20,
+                },
+                ImplSig {
+                    type_name: "Other".to_string(),
+                    trait_name: Some("MyTrait".to_string()),
+                    line: 21,
+                },
+                ImplSig {
+                    type_name: "Other".to_string(),
+                    trait_name: None,
+                    line: 22,
+                },
+            ],
+            uses: vec![],
+        };
+        let entity = RustAstEntity::new(PathBuf::from("x.rs"), summary, "src");
+        let q = AstQuery::new(&entity);
+
+        let fns = q.find_functions("parse_");
+        assert_eq!(fns.len(), 2);
+
+        let structs = q.find_structs("Node");
+        assert_eq!(structs.len(), 2);
+
+        // Two hits via type_name; the other impl has type_name matching
+        // but also tests the `Some(trait) && !contains` short-circuit.
+        let type_hits = q.find_impls("Node");
+        assert_eq!(type_hits.len(), 1);
+        assert_eq!(type_hits[0].type_name, "NodeInner");
+
+        // A trait-only hit: the matching impl has type_name "Other"
+        // (which does NOT contain "MyTrait") so the trait_name branch of
+        // the `||` must be evaluated to find it.
+        let trait_hits = q.find_impls("MyTrait");
+        assert_eq!(trait_hits.len(), 1);
+        assert_eq!(trait_hits[0].trait_name.as_deref(), Some("MyTrait"));
+    }
 }

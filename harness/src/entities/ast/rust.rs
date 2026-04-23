@@ -436,4 +436,71 @@ mod tests {
         let entity_b = RustAstEntity::new(PathBuf::from("b.rs"), a, src);
         assert_eq!(entity_a.source_hash, entity_b.source_hash);
     }
+
+    #[test]
+    fn test_parse_rust_file_no_extension() {
+        // Cover the `None =>` arm of the extension match in parse_rust_file.
+        let f = tempfile::Builder::new()
+            .prefix("noext")
+            .suffix("")
+            .tempfile()
+            .expect("tmp no-ext");
+        // Rebind to a path without any extension.
+        let path = f.path().with_extension("");
+        std::fs::write(&path, b"fn main() {}\n").unwrap();
+        let err = parse_rust_file(&path).expect_err("should fail");
+        match err {
+            AstError::UnsupportedLanguage(s) => assert!(s.contains("no extension")),
+            other => panic!("expected UnsupportedLanguage, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_type_path_string_reference_tuple_and_unknown() {
+        // `impl X for &Foo` exercises `syn::Type::Reference`.
+        let src = "struct Foo;\ntrait X {}\nimpl X for &Foo {}\n";
+        let summary = parse_rust_source(src).expect("parse");
+        assert_eq!(summary.impls.len(), 1);
+        assert_eq!(summary.impls[0].type_name, "&Foo");
+
+        // `impl X for ()` exercises the empty-tuple arm.
+        let src = "trait X {}\nimpl X for () {}\n";
+        let summary = parse_rust_source(src).expect("parse");
+        assert_eq!(summary.impls.len(), 1);
+        assert_eq!(summary.impls[0].type_name, "()");
+
+        // `impl X for [u8; 4]` falls through to the `_ => "<unknown>"` arm
+        // because `syn::Type::Array` is not matched.
+        let src = "trait X {}\nimpl X for [u8; 4] {}\n";
+        let summary = parse_rust_source(src).expect("parse");
+        assert_eq!(summary.impls.len(), 1);
+        assert_eq!(summary.impls[0].type_name, "<unknown>");
+    }
+
+    #[test]
+    fn test_metadata_mut_is_exposed() {
+        // Cover `Entity::metadata_mut` on RustAstEntity.
+        let mut entity =
+            RustAstEntity::new(PathBuf::from("x.rs"), AstSummary::default(), "fn x() {}\n");
+        let original_id = entity.metadata.id.clone();
+        {
+            let m = entity.metadata_mut();
+            m.tags.push("ast".to_string());
+        }
+        assert_eq!(entity.metadata.id, original_id);
+        assert_eq!(entity.metadata().tags, vec!["ast".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_rust_source_direct() {
+        // Drive `parse_rust_source` without the filesystem wrapper.
+        let summary = parse_rust_source("pub fn top() {}\n").expect("parse");
+        assert_eq!(summary.functions.len(), 1);
+        assert!(summary.functions[0].is_pub);
+
+        // Syntax error propagation from `parse_rust_source`.
+        let err = parse_rust_source("fn (( {}\n").expect_err("should fail");
+        assert!(matches!(err, AstError::Syntax(_)));
+    }
 }
