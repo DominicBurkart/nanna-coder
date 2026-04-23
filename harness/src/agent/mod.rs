@@ -13,7 +13,6 @@
 //! 9. Decision → **Plan Entity Modification** (loop)
 
 pub mod agents_md;
-pub mod decision;
 pub mod eval;
 pub mod eval_case;
 pub mod project_detect;
@@ -295,24 +294,18 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
 impl AgentLoop<InMemoryEntityStore> {
     /// Create a new agent loop with the default in-memory entity store.
     pub fn new(config: AgentConfig) -> Self {
-        Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store: InMemoryEntityStore::new(),
-            performed_actions: 0,
-            llm_provider: None,
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
-        }
+        Self::with_entity_store(config, InMemoryEntityStore::new())
     }
 }
 
 impl<S: EntityStore + Send> AgentLoop<S> {
-    /// Create a new agent loop with a provided entity store
+    /// Create a new agent loop with a provided entity store.
+    ///
+    /// This is the base constructor; [`with_llm`] and [`with_tools`] layer on
+    /// an LLM provider and tool registry respectively.
+    ///
+    /// [`with_llm`]: Self::with_llm
+    /// [`with_tools`]: Self::with_tools
     pub fn with_entity_store(config: AgentConfig, entity_store: S) -> Self {
         Self {
             state: AgentState::EnrichingEntities,
@@ -336,17 +329,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
             llm_provider: Some(llm_provider),
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_entity_store(config, entity_store)
         }
     }
 
@@ -358,17 +342,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         tool_registry: ToolRegistry,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
-            llm_provider: Some(llm_provider),
-            plan_cache: None,
             tool_registry: Some(tool_registry),
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_llm(config, entity_store, llm_provider)
         }
     }
 
@@ -447,8 +422,11 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
     /// Run the agent loop with the given context.
     ///
-    /// All agents flow through the architectural state machine:
-    /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
+    /// Drives the [`AgentState`] machine defined in ARCHITECTURE.md:
+    /// EnrichingEntities → PlanningEntityModification →
+    /// PerformingEntityModification → UpdatingEntities →
+    /// CheckingTaskCompletion → (Completed | EntityModificationDecision →
+    /// {QueryingEntities | PlanningEntityModification}).
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
