@@ -173,6 +173,17 @@ let
 
   # Model registry with metadata for all supported models
   # Updated to use HuggingFace models for vLLM
+  #
+  # NOTE: Legacy Ollama entries (llama3, mistral, gemma) below still carry
+  # the all-zeros placeholder sha256. That triggers the dev-mode branch in
+  # `createModelDerivation` (non-fixed-output stub). To replace a placeholder
+  # with a real, reproducible hash run:
+  #
+  #     scripts/update-model-sha256.sh <modelKey>
+  #
+  # from a machine that has `nix`, `ollama`, and outbound network access to
+  # `registry.ollama.ai`. See `nix/README.md` for the full capture procedure
+  # and issue #240 for context.
   modelRegistry = {
     "mimo-v2-flash" = {
       name = "XiaomiMiMo/MiMo-V2-Flash";

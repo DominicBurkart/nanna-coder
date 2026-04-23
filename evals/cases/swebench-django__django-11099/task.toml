@@ -1,0 +1,30 @@
+[case]
+id = "django__django-11099"
+name = "django__django-11099"
+description = '''
+UsernameValidator allows trailing newline in usernames
+ASCIIUsernameValidator and UnicodeUsernameValidator use the regex
+^[\w.@+-]+$
+The intent is to only allow alphanumerics plus a few special characters. However, a trailing newline is allowed because $ matches just before the newline at end of string. Fix by replacing ^/$ with \A/\Z.'''
+
+[task]
+prompt = '''
+UsernameValidator allows trailing newline in usernames
+ASCIIUsernameValidator and UnicodeUsernameValidator use the regex
+^[\w.@+-]+$
+The intent is to only allow alphanumerics plus a few special characters. However, a trailing newline is allowed because $ matches just before the newline at end of string. Fix by replacing ^/$ with \A/\Z.'''
+language = "python"
+
+[expected]
+files_changed = ["django/contrib/auth/validators.py"]
+build_must_pass = false
+tests_must_pass = true
+required_symbols = []
+
+[metadata]
+difficulty = "unknown"
+tags = [
+    "swebench-verified",
+    "django",
+]
+timeout_secs = 1800
