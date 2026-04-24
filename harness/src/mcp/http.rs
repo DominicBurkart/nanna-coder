@@ -1,11 +1,17 @@
 use crate::auth::{AuthError, RateLimiter, TokenStore};
 use crate::mcp::NannaMcpServer;
+use hyper::body::HttpBody;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// Maximum accepted request body size. JSON-RPC frames are tiny; 1 MiB is a
+/// generous cap that prevents an authenticated client from streaming an
+/// unbounded body and OOMing the server.
+pub(crate) const MAX_BODY_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// Extract bearer token from the Authorization header.
 pub(crate) fn extract_bearer_token(req: &Request<Body>) -> Result<&str, AuthError> {
@@ -52,8 +58,13 @@ async fn handle_http_request(
         return Ok(json_response(StatusCode::TOO_MANY_REQUESTS, &body));
     }
 
-    // Only accept POST
+    // Only accept POST — reject *before* attempting auth so bad-method requests
+    // don't consume auth-failure budget on the rate limiter, and so they are
+    // still counted toward the unauthenticated-request budget below.
     if req.method() != Method::POST {
+        // Bad-method requests from any IP count as a failure so a flood of
+        // GET/PUTs from a single IP can't exhaust the server forever.
+        rate_limiter.record_failure(&client_ip);
         let body = json_rpc_error(-32600, "Only POST is accepted");
         return Ok(json_response(StatusCode::METHOD_NOT_ALLOWED, &body));
     }
@@ -82,14 +93,32 @@ async fn handle_http_request(
     // Auth succeeded — clear any rate-limit state for this IP
     rate_limiter.record_success(&client_ip);
 
-    // Read body
-    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let body = json_rpc_error(-32700, "failed to read request body");
-            return Ok(json_response(StatusCode::BAD_REQUEST, &body));
+    // Enforce hard body-size cap before buffering. An authenticated client
+    // could otherwise stream an arbitrarily large body and OOM the process.
+    let mut body = req.into_body();
+    if body.size_hint().upper().is_some_and(|u| u > MAX_BODY_BYTES) {
+        let err = json_rpc_error(-32700, "request body too large");
+        return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, &err));
+    }
+    // Stream chunks so we can detect overflow when `size_hint` lies (chunked
+    // encoding with no advertised length). Stop reading as soon as we exceed
+    // the cap — we never buffer more than MAX_BODY_BYTES + one chunk.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => {
+                let err = json_rpc_error(-32700, "failed to read request body");
+                return Ok(json_response(StatusCode::BAD_REQUEST, &err));
+            }
+        };
+        buf.extend_from_slice(&chunk);
+        if buf.len() as u64 > MAX_BODY_BYTES {
+            let err = json_rpc_error(-32700, "request body too large");
+            return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, &err));
         }
-    };
+    }
+    let body_bytes = buf;
 
     // Parse JSON-RPC request
     let rpc_request: super::JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
@@ -108,34 +137,59 @@ async fn handle_http_request(
     Ok(json_response(StatusCode::OK, &response_body))
 }
 
-/// Start the HTTP JSON-RPC server with bearer-token authentication and rate limiting.
+/// Macro that constructs the per-connection hyper service. Factored into a
+/// macro (rather than a function) to avoid spelling out the deeply-nested
+/// `impl Service<...>` return type twice.
+macro_rules! build_make_service {
+    ($server:expr, $token_store:expr, $rate_limiter:expr) => {{
+        let server = $server;
+        let token_store = $token_store;
+        let rate_limiter = $rate_limiter;
+        make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
+            let server = Arc::clone(&server);
+            let token_store = Arc::clone(&token_store);
+            let rate_limiter = Arc::clone(&rate_limiter);
+            let remote_addr = conn.remote_addr();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    handle_http_request(
+                        req,
+                        Arc::clone(&server),
+                        Arc::clone(&token_store),
+                        Arc::clone(&rate_limiter),
+                        remote_addr,
+                    )
+                }))
+            }
+        })
+    }};
+}
+
+/// Start the HTTP JSON-RPC server with bearer-token authentication and rate
+/// limiting, binding the supplied address.
 pub async fn run_http(
     server: Arc<NannaMcpServer>,
     token_store: Arc<TokenStore>,
     rate_limiter: Arc<RateLimiter>,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
-        let server = Arc::clone(&server);
-        let token_store = Arc::clone(&token_store);
-        let rate_limiter = Arc::clone(&rate_limiter);
-        let remote_addr = conn.remote_addr();
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                handle_http_request(
-                    req,
-                    Arc::clone(&server),
-                    Arc::clone(&token_store),
-                    Arc::clone(&rate_limiter),
-                    remote_addr,
-                )
-            }))
-        }
-    });
+    let make_svc = build_make_service!(server, token_store, rate_limiter);
+    Server::bind(&addr).serve(make_svc).await?;
+    Ok(())
+}
 
-    let server = Server::bind(&addr).serve(make_svc);
-
-    server.await?;
+/// Start the server from an already-bound `std::net::TcpListener`. Used by
+/// tests to avoid the bind -> drop -> rebind race that caused intermittent CI
+/// flake on parallel runs — the listener is handed directly to hyper so the
+/// port is never released between allocation and serving.
+pub async fn run_http_from_listener(
+    server: Arc<NannaMcpServer>,
+    token_store: Arc<TokenStore>,
+    rate_limiter: Arc<RateLimiter>,
+    listener: std::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let make_svc = build_make_service!(server, token_store, rate_limiter);
+    Server::from_tcp(listener)?.serve(make_svc).await?;
     Ok(())
 }
 
@@ -230,21 +284,28 @@ mod tests {
     }
 
     /// Bind to an ephemeral port, spawn the server, return (addr, token_value).
+    ///
+    /// Uses `Server::from_tcp` on an already-bound std listener so the port is
+    /// never released between allocation and serving — this avoids the TOCTOU
+    /// race in the original bind/drop/rebind approach, which produced CI flake
+    /// under high test parallelism. The pre-startup sleep is no longer needed
+    /// because the listener is already accepting connections before we spawn.
     async fn spawn_test_server() -> (SocketAddr, String) {
-        // Port 0 lets the OS assign a free port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // Briefly release so hyper can rebind.
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
 
         let token_store = Arc::new(TokenStore::new(Duration::from_secs(3600)));
         let token_value = token_store.token().as_str().to_string();
         let rate_limiter = Arc::new(RateLimiter::new(10, Duration::from_secs(300)));
         let mcp_server = make_noop_server();
 
-        tokio::spawn(run_http(mcp_server, token_store, rate_limiter, addr));
-
-        // Give the server a moment to start accepting connections.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(run_http_from_listener(
+            mcp_server,
+            token_store,
+            rate_limiter,
+            std_listener,
+        ));
 
         (addr, token_value)
     }
@@ -366,12 +427,34 @@ mod tests {
     fn test_auth_token_debug_redacted() {
         use crate::auth::AuthToken;
         let secret = "super-secret-value-that-must-not-leak";
-        let token = AuthToken::from_string(secret.to_string());
+        let token = AuthToken::from_string_unchecked(secret.to_string());
         let debug = format!("{:?}", token);
         assert!(
             !debug.contains(secret),
             "AuthToken Debug must not contain the raw token"
         );
         assert!(debug.contains("REDACTED"));
+    }
+
+    /// An authenticated client posting a >1 MiB body must be rejected with 413
+    /// so a malicious client with a valid token can't OOM the server.
+    #[tokio::test]
+    async fn test_http_413_on_oversized_body() {
+        let (addr, token_value) = spawn_test_server().await;
+
+        // 2 MiB of zero bytes — valid UTF-8, invalid JSON, larger than the cap.
+        let big = vec![b'0'; (2 << 20) as usize];
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}", addr))
+            .header("Authorization", format!("Bearer {}", token_value))
+            .header("Content-Type", "application/json")
+            .body(big)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
