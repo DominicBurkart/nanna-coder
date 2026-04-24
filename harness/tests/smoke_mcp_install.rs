@@ -10,12 +10,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-// ── Live-tier constants ──────────────────────────────────────────────────────
+// ── Live-tier constants ────────────────────────────────────────────
 const MAX_ATTEMPTS: usize = 3;
 const LIVE_TASK_TIMEOUT: Duration = Duration::from_secs(300);
 const LIVE_MODEL: &str = "qwen3:0.6b";
 
-// ── Expected MCP tool names ──────────────────────────────────────────────────
+// ── Expected MCP tool names ─────────────────────────────────────────
 const EXPECTED_TOOLS: &[&str] = &[
     "assign_task",
     "poll_task",
@@ -25,7 +25,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "onboard_repo",
 ];
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────
 
 /// Send a single JSON-RPC message framed with Content-Length and read back
 /// the next framed response from the server.
@@ -69,11 +69,13 @@ fn send_and_recv(
         .unwrap_or(0);
 
     let mut body = vec![0u8; content_length];
-    let _ = stdout_reader.read_exact(&mut body);
+    stdout_reader
+        .read_exact(&mut body)
+        .expect("failed to read MCP response body");
     String::from_utf8_lossy(&body).into_owned()
 }
 
-// ── Mock-tier tests ──────────────────────────────────────────────────────────
+// ── Mock-tier tests ──────────────────────────────────────────────────
 
 #[test]
 fn test_harness_help_exits_zero() {
@@ -397,7 +399,7 @@ fn test_mcp_stdio_tools_call_list_tasks() {
     );
 }
 
-// ── Live-tier test ────────────────────────────────────────────────────────────
+// ── Live-tier test ─────────────────────────────────────────────────────
 
 /// Live MCP task roundtrip smoke test.
 ///
