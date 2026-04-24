@@ -354,14 +354,12 @@ fn test_mcp_stdio_tools_call_list_tasks() {
     let resp = result.unwrap_or_else(|e| panic!("tools/call list_tasks failed: {e}"));
 
     // The MCP tools/call response must contain a "content" array in the result.
-    let content = resp["result"]["content"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "tools/call list_tasks: expected result.content array, got: {}",
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
-            )
-        });
+    let content = resp["result"]["content"].as_array().unwrap_or_else(|| {
+        panic!(
+            "tools/call list_tasks: expected result.content array, got: {}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        )
+    });
 
     assert!(
         !content.is_empty(),
@@ -369,14 +367,12 @@ fn test_mcp_stdio_tools_call_list_tasks() {
     );
 
     // The first content element should have a "text" field with parseable JSON.
-    let text = content[0]["text"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "tools/call list_tasks: first content element missing 'text': {:?}",
-                content[0]
-            )
-        });
+    let text = content[0]["text"].as_str().unwrap_or_else(|| {
+        panic!(
+            "tools/call list_tasks: first content element missing 'text': {:?}",
+            content[0]
+        )
+    });
 
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|e| {
         panic!(
@@ -418,11 +414,7 @@ async fn test_mcp_live_task_roundtrip() {
     for attempt in 0..MAX_ATTEMPTS {
         eprintln!("[smoke_mcp live] attempt {}/{}", attempt + 1, MAX_ATTEMPTS);
 
-        let result = tokio::time::timeout(
-            LIVE_TASK_TIMEOUT,
-            run_live_task_attempt(),
-        )
-        .await;
+        let result = tokio::time::timeout(LIVE_TASK_TIMEOUT, run_live_task_attempt()).await;
 
         match result {
             Ok(Ok(())) => {
@@ -474,15 +466,9 @@ async fn run_live_task_attempt() -> Result<(), String> {
         "max_iterations": 3
     });
 
-    let assign_result = handle_assign_task(
-        &assign_params,
-        &task_manager,
-        &provider,
-        LIVE_MODEL,
-        3,
-    )
-    .await
-    .map_err(|e| format!("assign_task failed: {e}"))?;
+    let assign_result = handle_assign_task(&assign_params, &task_manager, &provider, LIVE_MODEL, 3)
+        .await
+        .map_err(|e| format!("assign_task failed: {e}"))?;
 
     let task_id = assign_result["task_id"]
         .as_str()
@@ -513,9 +499,7 @@ async fn run_live_task_attempt() -> Result<(), String> {
     }
 
     if !reached_terminal {
-        return Err(
-            "task did not reach a terminal state within polling budget".to_string(),
-        );
+        return Err("task did not reach a terminal state within polling budget".to_string());
     }
 
     // get_result must return a well-formed response; for Completed tasks
