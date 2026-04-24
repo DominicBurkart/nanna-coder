@@ -80,12 +80,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
     let workspace_root = std::env::current_dir()?;
     let tool_registry = create_tool_registry(&workspace_root);
 
+    // NOTE: `OllamaProvider::new` is constructed per-arm rather than at the
+    // top of `main` so that subcommands which do not talk to Ollama (`Tools`,
+    // `McpServe` — the latter builds its own provider inside
+    // `run_mcp_server`) do not fail at startup when Ollama is unreachable.
+    // This unblocks hermetic smoke tests for `mcp-serve` that run without a
+    // live Ollama in CI.
     match cli.command {
         Commands::Chat {
             model,
@@ -93,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             temperature,
         } => {
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -118,12 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             list_models(&provider).await?;
         }
         Commands::Tools => {
             list_tools(&tool_registry);
         }
         Commands::Health => {
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             health_check(&provider).await?;
         }
         Commands::Agent {
