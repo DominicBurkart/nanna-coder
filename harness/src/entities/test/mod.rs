@@ -13,7 +13,14 @@ pub mod execution;
 pub mod parse;
 pub mod types;
 
-pub use correlation::*;
-pub use execution::*;
-pub use parse::*;
-pub use types::*;
+// Explicit re-exports keep the public surface intentional. As more entity
+// kinds land under issue #24 (coverage, audit, trend, vulnerabilities) this
+// list should grow deliberately rather than via blanket globs, which risk
+// name collisions (e.g. a future `ExecutionError` shadowing `TestError`).
+pub use correlation::correlate_with_commit;
+pub use execution::{CargoTestExecutor, TestExecutor};
+pub use parse::{parse_cargo_test_messages, parse_clippy_messages};
+pub use types::{
+    LintLocation, LintResult, LintResultEntity, LintTool, Severity, TestEntity, TestError,
+    TestResult, TestRunEntity, TestStatus,
+};
