@@ -3,9 +3,13 @@ coverage:
     project: off
     patch:
       default:
-        # Relaxed from 100%: run_mcp_http_server in main.rs requires a live
-        # Ollama instance and bound network socket and is genuinely uncoverable
-        # in unit CI.  Matches the threshold already established on main.
+        # Relaxed from 100%: several code paths are genuinely uncoverable in
+        # unit CI:
+        # - run_mcp_http_server in main.rs requires a live Ollama instance
+        #   and a bound network socket (this PR)
+        # - the #[ignore] e2e test and the runtime-gated
+        #   test_create_with_container_no_runtime exit early in CI when no
+        #   container runtime / Ollama is available
         target: 90%
 
 ignore:
