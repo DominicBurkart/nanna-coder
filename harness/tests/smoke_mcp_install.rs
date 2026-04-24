@@ -101,7 +101,7 @@ fn test_mcp_serve_responds_to_initialize() {
         .spawn()
         .expect("Failed to start harness mcp-serve");
 
-    let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke-test","version":"0.0.0"}}}"#;
     let header = format!("Content-Length: {}\r\n\r\n", init_msg.len());
 
     let stdin = child.stdin.as_mut().unwrap();
@@ -187,7 +187,7 @@ fn test_mcp_stdio_tools_list() {
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
     std::thread::spawn(move || {
         // 1. initialize
-        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke-test","version":"0.0.0"}}}"#;
         let init_resp = send_and_recv(&mut stdin, &mut stdout, init_msg);
         if !init_resp.contains("protocolVersion") && !init_resp.contains("serverInfo") {
             let _ = tx.send(Err(format!(
@@ -297,7 +297,7 @@ fn test_mcp_stdio_tools_call_list_tasks() {
     let (tx, rx) = std::sync::mpsc::channel::<Result<serde_json::Value, String>>();
     std::thread::spawn(move || {
         // 1. initialize
-        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke-test","version":"0.0.0"}}}"#;
         let init_resp = send_and_recv(&mut stdin, &mut stdout, init_msg);
         if !init_resp.contains("protocolVersion") && !init_resp.contains("serverInfo") {
             let _ = tx.send(Err(format!(
