@@ -29,20 +29,28 @@ pub async fn correlate_with_commit<S: EntityStore + ?Sized>(
 mod tests {
     use super::*;
     use crate::entities::test::types::TestRunEntity;
-    use crate::entities::{git::types::GitRepository, Entity, EntityError, InMemoryEntityStore};
+    use crate::entities::{git::types::GitCommit, Entity, EntityError, InMemoryEntityStore};
 
     #[tokio::test]
     async fn test_correlate_creates_relationship() {
         let mut store = InMemoryEntityStore::new();
 
-        let commit = GitRepository::new("url".to_string(), "main".to_string());
+        // The parameter name is `commit_entity_id`, so the fixture must be an
+        // actual commit entity — not a repository — to mirror real usage.
+        let commit = GitCommit::new(
+            "deadbeef1234567890abcdef1234567890abcdef".to_string(),
+            "initial commit".to_string(),
+            "Dev".to_string(),
+            "dev@example.com".to_string(),
+            chrono::Utc::now(),
+        );
         let commit_id = commit.metadata().id.clone();
         store
             .store(Box::new(commit) as Box<dyn Entity>)
             .await
             .unwrap();
 
-        let run = TestRunEntity::new("cargo".to_string());
+        let run = TestRunEntity::new("nextest".to_string());
         let run_id = run.metadata().id.clone();
         store.store(Box::new(run) as Box<dyn Entity>).await.unwrap();
 
@@ -52,6 +60,8 @@ mod tests {
 
         let rels = store.get_relationships(&run_id).await.unwrap();
         assert_eq!(rels.len(), 1);
+        // A test-run `Validates` a commit — edge direction matches the doc on
+        // `RelationshipType::Validates` ("Test validates entity").
         assert_eq!(rels[0].from, run_id);
         assert_eq!(rels[0].to, commit_id);
         assert_eq!(rels[0].relationship_type, RelationshipType::Validates);
