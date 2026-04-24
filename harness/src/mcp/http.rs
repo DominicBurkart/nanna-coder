@@ -249,8 +249,17 @@ mod tests {
     // HTTP roundtrip integration tests
     // Each test spins up a real hyper server on 127.0.0.1:0 and talks to it
     // via reqwest, verifying end-to-end auth, routing, and response shape.
+    //
+    // Gated on `cfg(unix)` because the HTTP transport is only fully supported
+    // on Unix (read_token_file refuses to run on Windows — see auth.rs). The
+    // spawn-based tests also exercise loopback TCP plus tokio::spawn on CI
+    // runners where Windows has been observed to intermittently fail the
+    // hyper handshake under parallel nextest load. The pure-logic tests
+    // above (extract_bearer_token, missing/wrong header, Debug redaction)
+    // still run on all platforms.
     // -------------------------------------------------------------------------
 
+    #[cfg(unix)]
     fn make_noop_server() -> Arc<NannaMcpServer> {
         use crate::task::TaskManager;
         use async_trait::async_trait;
@@ -290,6 +299,7 @@ mod tests {
     /// race in the original bind/drop/rebind approach, which produced CI flake
     /// under high test parallelism. The pre-startup sleep is no longer needed
     /// because the listener is already accepting connections before we spawn.
+    #[cfg(unix)]
     async fn spawn_test_server() -> (SocketAddr, String) {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -312,6 +322,7 @@ mod tests {
 
     /// Full roundtrip: valid token + initialize => 200 with protocolVersion and
     /// capabilities.tools, token value absent from response body.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_http_roundtrip_initialize() {
         let (addr, token_value) = spawn_test_server().await;
@@ -359,6 +370,7 @@ mod tests {
     }
 
     /// Missing Authorization header => 401, body must not contain the real token.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_http_401_on_missing_auth() {
         let (addr, token_value) = spawn_test_server().await;
@@ -388,6 +400,7 @@ mod tests {
     }
 
     /// Wrong token => 401, body must not contain either the real or submitted token.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_http_401_on_wrong_token() {
         let (addr, token_value) = spawn_test_server().await;
@@ -438,6 +451,7 @@ mod tests {
 
     /// An authenticated client posting a >1 MiB body must be rejected with 413
     /// so a malicious client with a valid token can't OOM the server.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_http_413_on_oversized_body() {
         let (addr, token_value) = spawn_test_server().await;
