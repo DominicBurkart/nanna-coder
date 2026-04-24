@@ -5,16 +5,62 @@
 //! intentionally split: this module is responsible for spawning processes and
 //! collecting their stdout/stderr, while the pure-function parsers in
 //! [`super::parse`] turn that output into entity values.
+//!
+//! # Test runner: `cargo nextest` (stable)
+//!
+//! The first iteration of this module invoked
+//! `cargo test -- -Z unstable-options --format=json`, which requires a
+//! **nightly** toolchain and silently fails on stable. To keep the parser on
+//! a stable-compatible path we now invoke
+//! `cargo nextest run --message-format libtest-json`, whose output is
+//! byte-compatible with libtest's JSON format — the parser API is unchanged.
+//!
+//! `cargo-nextest` must be installed on the executor host. Nanna-coder's CI
+//! already provisions it (`taiki-e/install-action` on non-Nix runners; it is
+//! part of the Nix dev-shell otherwise). When the binary is missing,
+//! [`CargoTestExecutor::run_tests`] returns
+//! [`TestError::NextestUnavailable`] with an installation hint rather than a
+//! generic I/O error so callers can surface an actionable message.
 
 use super::parse::{parse_cargo_test_messages, parse_clippy_messages};
 use super::types::{LintResultEntity, TestError, TestRunEntity};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
+/// Probe for `cargo nextest` on `PATH` by invoking `cargo nextest --version`.
+///
+/// Returns `Ok(())` if the subcommand is available; otherwise
+/// [`TestError::NextestUnavailable`] with an installation hint.
+async fn ensure_nextest_available() -> Result<(), TestError> {
+    let probe = Command::new("cargo")
+        .args(["nextest", "--version"])
+        .output()
+        .await;
+    match probe {
+        Ok(out) if out.status.success() => Ok(()),
+        _ => Err(TestError::NextestUnavailable),
+    }
+}
+
+/// Best-effort `git rev-parse HEAD` against `workspace_root`.
+///
+/// Returns `None` when the workspace is not a git repo or the call fails —
+/// populating `commit_hash` is not load-bearing for correctness, so failures
+/// are swallowed rather than surfaced to the caller.
+fn try_read_head_sha(workspace_root: &Path) -> Option<String> {
+    crate::entities::git::operations::read_head_commit(workspace_root)
+        .ok()
+        .map(|c| c.sha)
+}
+
 /// Build a [`TestRunEntity`] from the raw stdout bytes of a
-/// `cargo test --message-format=json` invocation.
+/// `cargo nextest run --message-format libtest-json` invocation.
+///
+/// The output format is a superset of `cargo test --format=json` — every
+/// event kind the parser cares about (`{"type":"suite"|"test", ...}`) is
+/// emitted by both runners with the same field names.
 ///
 /// Split out from [`CargoTestExecutor::run_tests`] so the byte-to-entity
 /// transform can be exercised by unit tests without spawning `cargo`.
@@ -26,7 +72,7 @@ fn build_test_run_from_stdout(
         .map_err(|e| TestError::Parse(format!("invalid utf-8 in cargo stdout: {e}")))?;
     let results = parse_cargo_test_messages(&text)?;
 
-    let mut run = TestRunEntity::new("cargo".to_string());
+    let mut run = TestRunEntity::new("nextest".to_string());
     run.results = results;
     run.duration = duration;
     Ok(run)
@@ -54,8 +100,11 @@ pub trait TestExecutor: Send + Sync {
     async fn run_lints(&self) -> Result<LintResultEntity, TestError>;
 }
 
-/// `cargo`-backed [`TestExecutor`] that invokes `cargo test` and
-/// `cargo clippy` with `--message-format=json` and parses the output.
+/// `cargo`-backed [`TestExecutor`] that invokes `cargo nextest run` (tests)
+/// and `cargo clippy` (lints) with JSON output and parses the result.
+///
+/// `run_tests` requires `cargo-nextest` on `PATH`; see the module-level
+/// documentation for the rationale and how CI provisions it.
 pub struct CargoTestExecutor {
     /// Workspace root passed to `cargo -C` / `current_dir`.
     pub workspace_root: PathBuf,
@@ -88,23 +137,26 @@ impl CargoTestExecutor {
 #[async_trait]
 impl TestExecutor for CargoTestExecutor {
     async fn run_tests(&self) -> Result<TestRunEntity, TestError> {
+        ensure_nextest_available().await?;
+
         let started = Instant::now();
+        // `--message-format libtest-json` is stable as of cargo-nextest 0.9.64
+        // (behind the `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` env-flag on older
+        // versions) and emits the same shape as libtest's JSON output, so the
+        // parser is unchanged.
         let stdout = self
-            .run_cargo(&[
-                "test",
-                "--",
-                "-Z",
-                "unstable-options",
-                "--format=json",
-                "--report-time",
-            ])
+            .run_cargo(&["nextest", "run", "--message-format", "libtest-json"])
             .await?;
-        build_test_run_from_stdout(stdout, started.elapsed())
+        let mut run = build_test_run_from_stdout(stdout, started.elapsed())?;
+        run.commit_hash = try_read_head_sha(&self.workspace_root);
+        Ok(run)
     }
 
     async fn run_lints(&self) -> Result<LintResultEntity, TestError> {
         let stdout = self.run_cargo(&["clippy", "--message-format=json"]).await?;
-        build_lint_result_from_stdout(stdout)
+        let mut entity = build_lint_result_from_stdout(stdout)?;
+        entity.commit_hash = try_read_head_sha(&self.workspace_root);
+        Ok(entity)
     }
 }
 
@@ -127,9 +179,15 @@ mod tests {
             "/tmp/definitely-does-not-exist-nanna-issue-24",
         ));
         let err = exec.run_tests().await.expect_err("should fail");
-        // Either the CWD doesn't exist (Io) or cargo returns non-zero (CommandFailed).
+        // Possible failure paths:
+        //   - `cargo nextest` is not installed         -> NextestUnavailable
+        //   - `cargo nextest` is installed but the CWD does not exist -> Io
+        //   - cargo returns non-zero (e.g. workspace not found)       -> CommandFailed
         assert!(
-            matches!(err, TestError::Io(_) | TestError::CommandFailed { .. }),
+            matches!(
+                err,
+                TestError::Io(_) | TestError::CommandFailed { .. } | TestError::NextestUnavailable
+            ),
             "unexpected error: {err:?}"
         );
     }
@@ -163,7 +221,7 @@ mod tests {
         .to_vec();
 
         let run = build_test_run_from_stdout(stdout, Duration::from_millis(42)).expect("build ok");
-        assert_eq!(run.executor, "cargo");
+        assert_eq!(run.executor, "nextest");
         assert_eq!(run.duration, Duration::from_millis(42));
         assert_eq!(run.results.len(), 2);
         assert_eq!(run.passed(), 1);
