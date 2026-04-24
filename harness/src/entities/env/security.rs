@@ -7,6 +7,7 @@
 //! non-root UID, no extra capabilities, no additional allowed paths.
 //! Callers MUST explicitly opt in to relax this posture.
 
+use super::deployment::EnvError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -42,6 +43,30 @@ impl Default for SecurityContext {
             capabilities: CapabilitySet::None,
             allowed_paths: Vec::new(),
         }
+    }
+}
+
+impl SecurityContext {
+    /// Validate that this context is at least minimally restrictive.
+    ///
+    /// Finding #264-8: the `SecurityContext` fields are public, so the
+    /// restrictive default is only *advisory* — a caller can trivially
+    /// relax it by mutating the struct. This method enforces the minimum
+    /// invariant that AT LEAST ONE of `read_only_root_fs` or
+    /// `run_as_non_root` is enabled. Both disabled simultaneously is a
+    /// configuration we never want to allow through the entity layer.
+    ///
+    /// Returns [`EnvError::InsecureSecurityContext`] describing the
+    /// specific violation on rejection.
+    pub fn validate(&self) -> Result<(), EnvError> {
+        if !self.read_only_root_fs && !self.run_as_non_root {
+            return Err(EnvError::InsecureSecurityContext(
+                "both read_only_root_fs and run_as_non_root are disabled; \
+                 at least one is required"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +148,48 @@ mod tests {
         let json = serde_json::to_string(&cs).expect("serialize");
         let decoded: CapabilitySet = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, cs);
+    }
+
+    #[test]
+    fn test_security_context_validate_default_ok() {
+        // The restrictive default must pass `validate()`.
+        let sc = SecurityContext::default();
+        assert!(sc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_security_context_validate_both_disabled_rejected() {
+        // finding #264-8: both must not be simultaneously false.
+        let sc = SecurityContext {
+            read_only_root_fs: false,
+            run_as_non_root: false,
+            ..SecurityContext::default()
+        };
+        match sc.validate() {
+            Err(EnvError::InsecureSecurityContext(msg)) => {
+                assert!(msg.contains("read_only_root_fs"));
+                assert!(msg.contains("run_as_non_root"));
+            }
+            other => panic!("expected InsecureSecurityContext, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_security_context_validate_one_enabled_ok() {
+        // Either flag alone is sufficient.
+        let sc = SecurityContext {
+            read_only_root_fs: false,
+            run_as_non_root: true,
+            ..SecurityContext::default()
+        };
+        assert!(sc.validate().is_ok());
+
+        let sc = SecurityContext {
+            read_only_root_fs: true,
+            run_as_non_root: false,
+            ..SecurityContext::default()
+        };
+        assert!(sc.validate().is_ok());
     }
 
     #[test]
