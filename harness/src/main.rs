@@ -551,18 +551,37 @@ async fn run_mcp_http_server(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
 
-    // Resolve token: --token-file takes priority, then --token-env, then generate
+    // Resolve token: --token-file takes priority, then --token-env, then generate.
+    //
+    // DEFAULT_TOKEN_LIFETIME is extracted as a named constant so the default
+    // rotation cadence is discoverable here (a `--token-lifetime` flag is
+    // tracked for follow-up work).
+    const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400); // 24h
+
     let token_store = if let Some(path) = token_file {
         let token = read_token_file(std::path::Path::new(path))?;
-        TokenStore::with_token(token, Duration::from_secs(86400))
+        TokenStore::with_token(token, DEFAULT_TOKEN_LIFETIME)
     } else if let Ok(env_token) = std::env::var(token_env) {
         if env_token.is_empty() {
             return Err(format!("environment variable {} is set but empty", token_env).into());
         }
-        let token = AuthToken::from_string(env_token);
-        TokenStore::with_token(token, Duration::from_secs(86400))
+        // Validate format so a misconfigured operator fails loudly at startup
+        // rather than getting a server that rejects every request.
+        let token = AuthToken::from_string(env_token)
+            .map_err(|e| format!("invalid token in ${}: {}", token_env, e))?;
+        TokenStore::with_token(token, DEFAULT_TOKEN_LIFETIME)
     } else {
-        let store = TokenStore::new(Duration::from_secs(86400));
+        let store = TokenStore::new(DEFAULT_TOKEN_LIFETIME);
+        // The token is the only way a client can reach this server; in
+        // interactive use we print it to stderr. For headless deployments
+        // operators should supply --token-file or --token-env and treat stderr
+        // capture as potentially sensitive.
+        eprintln!(
+            "WARNING: auto-generated auth token printed to stderr — \
+             it may be captured by systemd/journal, Docker log drivers, or \
+             cloud logging agents. Pass --token-file or set ${} to avoid this.",
+            token_env
+        );
         eprintln!("Generated auth token: {}", store.token().as_str());
         store
     };
