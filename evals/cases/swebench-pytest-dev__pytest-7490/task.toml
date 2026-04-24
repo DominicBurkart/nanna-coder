@@ -1,0 +1,29 @@
+[case]
+id = "pytest-dev__pytest-7490"
+name = "pytest-dev__pytest-7490"
+description = """
+Dynamic xfail marker applied inside test body not respected
+Calling pytest.xfail() from within a test body used to mark the test as xfailed. After a recent refactor, the marker is ignored when the test is parametrized or invoked multiple times. Restore the previous behavior."""
+
+[task]
+prompt = """
+Dynamic xfail marker applied inside test body not respected
+Calling pytest.xfail() from within a test body used to mark the test as xfailed. After a recent refactor, the marker is ignored when the test is parametrized or invoked multiple times. Restore the previous behavior.
+
+Hints:
+The issue seems to be that xfailed_key is cleared between parametrized invocations."""
+language = "python"
+
+[expected]
+files_changed = ["src/_pytest/skipping.py"]
+build_must_pass = false
+tests_must_pass = true
+required_symbols = []
+
+[metadata]
+difficulty = "unknown"
+tags = [
+    "swebench-verified",
+    "pytest",
+]
+timeout_secs = 1800

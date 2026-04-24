@@ -1852,6 +1852,25 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
+/// The working directory inside the dev container where the worktree is mounted.
+pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
+
+pub fn create_container_tool_registry(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+) -> ToolRegistry {
+    let mut registry = create_tool_registry(workspace_root);
+    // Deliberately overrides any `run_command` entry from `create_tool_registry`
+    // with a container-bound version; if `create_tool_registry` ever adds a
+    // `run_command` tool, this override is intentional and expected.
+    registry.register(Box::new(RunCommandTool::new(
+        container_handle,
+        Some(container_working_dir.to_string()),
+    )));
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,6 +2070,29 @@ mod tests {
             assert!(diff.get("diff").is_some());
             assert!(diff.get("has_changes").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_container_tool_registry_includes_run_command() {
+        use std::sync::Arc;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+
+        let registry =
+            create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+        assert!(registry.get_tool("run_command").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("list_directory").is_some());
+        assert!(registry.get_tool("search").is_some());
+        assert!(registry.get_tool("git_status").is_some());
+        assert!(registry.get_tool("git_diff").is_some());
     }
 
     // -- PrStatusData unit tests --
@@ -2441,5 +2483,72 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use std::collections::HashMap;
+
+    /// Model ToolRegistry::register as a pure HashMap insert.
+    ///
+    /// The real `register()` calls `HashMap::insert(name, tool)` which
+    /// silently overwrites any previous entry with the same key. This
+    /// harness verifies that property: after two inserts with the same
+    /// key, only the last value survives and the collection size is 1.
+    #[kani::proof]
+    fn register_overwrites_duplicate_key() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let val1: u8 = kani::any();
+        let val2: u8 = kani::any();
+
+        map.insert(key, val1);
+        assert_eq!(map.len(), 1);
+
+        // Second insert with the same key silently overwrites
+        let old = map.insert(key, val2);
+        assert_eq!(old, Some(val1));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], val2);
+    }
+
+    /// When different keys are used, both entries are preserved.
+    #[kani::proof]
+    fn register_distinct_keys_preserved() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
+        kani::assume(k1 != k2);
+
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(k1, v1);
+        map.insert(k2, v2);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&k1], v1);
+        assert_eq!(map[&k2], v2);
+    }
+
+    /// After removing a key and re-registering, the new value is present.
+    #[kani::proof]
+    fn register_after_remove_succeeds() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(key, v1);
+        map.remove(&key);
+        assert!(map.is_empty());
+
+        map.insert(key, v2);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], v2);
     }
 }
