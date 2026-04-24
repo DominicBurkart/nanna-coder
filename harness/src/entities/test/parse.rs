@@ -1,9 +1,13 @@
-//! Pure-function parsers for `cargo test --message-format=json` and
-//! `cargo clippy --message-format=json` output.
+//! Pure-function parsers for
+//! `cargo nextest run --message-format libtest-json` (tests) and
+//! `cargo clippy --message-format=json` (lints) output.
 //!
 //! Input is expected to be newline-delimited JSON objects (`jsonl`). Unknown
 //! message kinds are ignored so that mixed streams (e.g. `compiler-artifact`
 //! messages interleaved with diagnostics) parse cleanly.
+//!
+//! Nextest's `libtest-json` format is a stable superset of libtest's unstable
+//! `--format=json` shape; the same parser handles both.
 
 use super::types::{
     LintLocation, LintResult, LintTool, Severity, TestError, TestResult, TestStatus,
@@ -15,7 +19,9 @@ use std::path::PathBuf;
 // cargo test --message-format=json
 // ---------------------------------------------------------------------------
 
-/// Shape of a single line emitted by `cargo test --message-format=json`.
+/// Shape of a single line emitted by
+/// `cargo nextest run --message-format libtest-json` (and the equivalent
+/// unstable libtest JSON output).
 ///
 /// We only capture the fields we care about; unknown fields are silently
 /// ignored by serde.
@@ -40,8 +46,10 @@ struct CargoTestEvent {
     stdout: Option<String>,
 }
 
-/// Parse the stdout produced by `cargo test -- -Z unstable-options --format=json`
-/// (or `cargo nextest`'s equivalent) into a list of [`TestResult`].
+/// Parse the stdout produced by
+/// `cargo nextest run --message-format libtest-json` (the stable path this
+/// crate uses) or `cargo test -- -Z unstable-options --format=json` (the
+/// legacy nightly path) into a list of [`TestResult`].
 ///
 /// Empty input yields an empty vector. Lines that are blank or fail to parse
 /// as JSON are treated as errors (except blank lines, which are skipped).
@@ -154,8 +162,12 @@ pub fn parse_clippy_messages(stdout: &str) -> Result<Vec<LintResult>, TestError>
             ClippyMessage::Other => continue,
         };
 
+        // rustc/clippy emit `level: "error" | "warning" | "note" | "help" |
+        // "info"`. Internal compiler errors also surface with `level: "error"`
+        // — the ICE detail lives in `message`, not the level — so we do not
+        // match a literal `"error: internal compiler error"` here.
         let severity = match diag.level.as_str() {
-            "error" | "error: internal compiler error" => Severity::Error,
+            "error" => Severity::Error,
             "warning" => Severity::Warning,
             "note" | "help" | "info" => Severity::Info,
             // Unknown levels default to Info to avoid losing data.
