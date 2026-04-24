@@ -20,7 +20,7 @@ flowchart TD
 
 ## CI gate
 
-Codecov patch coverage must be **100%** on every PR. A PR that drops patch coverage below 100% is blocked. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Codecov patch coverage must be **100%** on every PR. A PR that drops patch coverage below 100% is blocked. See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
 ## Running tests
 
@@ -50,18 +50,18 @@ cargo deny check
 
 | Category | Path | Runner |
 |---|---|---|
-| Unit (Rust `#[test]`) | [`harness/src/`](harness/src/) | nextest `--lib` |
-| Entity test fixtures | [`harness/src/entities/test/`](harness/src/entities/test/) | nextest `--lib` |
-| Eval cases | [`harness/src/eval/`](harness/src/eval/) | nextest `--lib` |
-| Integration (Rust) | [`harness/tests/`](harness/tests/) | nextest `--test` |
-| Model integration | [`model/tests/`](model/tests/) | nextest `--test` |
-| Shell security | [`tests/security/`](tests/security/) | bash |
-| Shell integration | [`tests/integration/`](tests/integration/) | bash |
-| Shell helpers | [`tests/lib/test-helpers.sh`](tests/lib/test-helpers.sh) | sourced |
-| CI matrix | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | GitHub Actions |
+| Unit (Rust `#[test]`) | [`harness/src/`](./harness/src/) | nextest `--lib` |
+| Entity test fixtures | [`harness/src/entities/test/`](./harness/src/entities/test/) | nextest `--lib` |
+| Eval cases | [`harness/src/eval/`](./harness/src/eval/) | nextest `--lib` |
+| Integration (Rust) | [`harness/tests/`](./harness/tests/) | nextest `--test` |
+| Model integration | [`model/tests/`](./model/tests/) | nextest `--test` |
+| Shell security | [`tests/security/`](./tests/security/) | bash |
+| Shell integration | [`tests/integration/`](./tests/integration/) | bash |
+| Shell helpers | [`tests/lib/test-helpers.sh`](./tests/lib/test-helpers.sh) | sourced |
+| CI matrix | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) | GitHub Actions |
 
 ## Adding a new test
 
 1. **Rust unit test** -- add `#[cfg(test)] mod tests` in the relevant `harness/src/` module.
-2. **Rust integration test** -- add a file under [`harness/tests/`](harness/tests/).
-3. **Shell test** -- create a script in `tests/security/` or `tests/integration/`, use helpers from [`tests/lib/test-helpers.sh`](tests/lib/test-helpers.sh), and register it in [`tests/run-all-tests.sh`](tests/run-all-tests.sh).
+2. **Rust integration test** -- add a file under [`harness/tests/`](./harness/tests/).
+3. **Shell test** -- create a script in `tests/security/` or `tests/integration/`, use helpers from [`tests/lib/test-helpers.sh`](./tests/lib/test-helpers.sh), and register it in [`tests/run-all-tests.sh`](./tests/run-all-tests.sh).

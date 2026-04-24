@@ -148,7 +148,7 @@ flowchart TD
 
 # Container Topology
 
-See [TESTING.md](TESTING.md) for the test topology and how each layer is exercised.
+See [TESTING.md](./TESTING.md) for the test topology and how each layer is exercised.
 
 ```mermaid
 ---

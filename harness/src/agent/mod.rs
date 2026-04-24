@@ -13,7 +13,6 @@
 //! 9. Decision → **Plan Entity Modification** (loop)
 
 pub mod agents_md;
-pub mod decision;
 pub mod eval;
 pub mod eval_case;
 pub mod project_detect;
@@ -294,25 +293,27 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
 
 impl AgentLoop<InMemoryEntityStore> {
     /// Create a new agent loop with the default in-memory entity store.
+    ///
+    /// ```
+    /// use harness::agent::{AgentConfig, AgentLoop, AgentState};
+    ///
+    /// let agent = AgentLoop::new(AgentConfig::default());
+    /// assert_eq!(*agent.state(), AgentState::EnrichingEntities);
+    /// assert!(agent.state_history().is_empty());
+    /// ```
     pub fn new(config: AgentConfig) -> Self {
-        Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store: InMemoryEntityStore::new(),
-            performed_actions: 0,
-            llm_provider: None,
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
-        }
+        Self::with_entity_store(config, InMemoryEntityStore::new())
     }
 }
 
 impl<S: EntityStore + Send> AgentLoop<S> {
-    /// Create a new agent loop with a provided entity store
+    /// Create a new agent loop with a provided entity store.
+    ///
+    /// This is the base constructor; [`with_llm`] and [`with_tools`] layer on
+    /// an LLM provider and tool registry respectively.
+    ///
+    /// [`with_llm`]: Self::with_llm
+    /// [`with_tools`]: Self::with_tools
     pub fn with_entity_store(config: AgentConfig, entity_store: S) -> Self {
         Self {
             state: AgentState::EnrichingEntities,
@@ -336,17 +337,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
             llm_provider: Some(llm_provider),
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_entity_store(config, entity_store)
         }
     }
 
@@ -358,17 +350,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         tool_registry: ToolRegistry,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
-            llm_provider: Some(llm_provider),
-            plan_cache: None,
             tool_registry: Some(tool_registry),
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_llm(config, entity_store, llm_provider)
         }
     }
 
@@ -447,8 +430,11 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
     /// Run the agent loop with the given context.
     ///
-    /// All agents flow through the architectural state machine:
-    /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
+    /// Drives the [`AgentState`] machine defined in ARCHITECTURE.md:
+    /// EnrichingEntities → PlanningEntityModification →
+    /// PerformingEntityModification → UpdatingEntities →
+    /// CheckingTaskCompletion → (Completed | EntityModificationDecision →
+    /// {QueryingEntities | PlanningEntityModification}).
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
@@ -2003,6 +1989,78 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+
+    // ===== History extraction helpers =====
+
+    fn assistant_with_call(id: &str, name: &str, args: serde_json::Value) -> ChatMessage {
+        ChatMessage::assistant_with_tools(
+            None,
+            vec![ToolCall {
+                id: id.to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }],
+        )
+    }
+
+    #[test]
+    fn extract_tool_calls_pairs_calls_with_tool_responses() {
+        let history = vec![
+            ChatMessage::user("hi"),
+            assistant_with_call("c1", "echo", serde_json::json!({"msg": "a"})),
+            ChatMessage::tool_response("c1", "a"),
+            assistant_with_call("c2", "echo", serde_json::json!({"msg": "b"})),
+            ChatMessage::tool_response("c2", "b"),
+        ];
+
+        let mut records = extract_tool_calls_from_history(&history);
+        records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].call_id, "c1");
+        assert_eq!(records[0].tool_name, "echo");
+        assert_eq!(records[0].result, "a");
+        assert_eq!(records[1].call_id, "c2");
+        assert_eq!(records[1].result, "b");
+    }
+
+    #[test]
+    fn extract_tool_calls_leaves_result_empty_when_tool_response_missing() {
+        // Orphan tool call without a matching tool response — must not panic
+        // and must surface an empty `result` for the caller.
+        let history = vec![assistant_with_call("orphan", "echo", serde_json::json!({}))];
+
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call_id, "orphan");
+        assert_eq!(records[0].result, "");
+    }
+
+    #[test]
+    fn extract_result_summary_returns_last_plain_assistant_message() {
+        let history = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("first answer"),
+            assistant_with_call("c1", "echo", serde_json::json!({})),
+            ChatMessage::tool_response("c1", "tool-output"),
+            ChatMessage::assistant("final answer"),
+        ];
+        assert_eq!(extract_result_summary(&history), "final answer");
+    }
+
+    #[test]
+    fn extract_result_summary_is_empty_when_only_tool_calls_present() {
+        // Assistant messages that only emit tool calls must not be treated as
+        // the result summary.
+        let history = vec![
+            ChatMessage::user("hi"),
+            assistant_with_call("c1", "echo", serde_json::json!({})),
+            ChatMessage::tool_response("c1", "tool-output"),
+        ];
+        assert_eq!(extract_result_summary(&history), "");
     }
 }
 

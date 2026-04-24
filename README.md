@@ -4,11 +4,11 @@ A coding agent for coding agents. Designed to let background agents delegate str
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture and entity management
-- [AGENTS.md](AGENTS.md) — instructions for agents building Nanna
-- [TESTING.md](TESTING.md) — testing strategy and guidelines
-- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow
-- [CACHIX_SETUP.md](CACHIX_SETUP.md) — binary-cache setup (maintainers)
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — system architecture and entity management
+- [AGENTS.md](./AGENTS.md) — instructions for agents building Nanna
+- [TESTING.md](./TESTING.md) — testing strategy and guidelines
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — contributor workflow
+- [CACHIX_SETUP.md](./CACHIX_SETUP.md) — binary-cache setup (maintainers)
 
 ## Technologies
 
@@ -81,4 +81,4 @@ Cachix provides a public binary cache for faster builds. No account needed to pu
 nix run .#setup-cache
 ```
 
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+See [CACHIX_SETUP.md](./CACHIX_SETUP.md) for push access setup (maintainers only).
