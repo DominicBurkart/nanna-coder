@@ -81,6 +81,28 @@ pub enum TestStatus {
 }
 
 /// A single test result.
+///
+/// # Schema divergence from issue #24
+///
+/// Issue #24's proposed spec is
+/// `{ name, status, duration: Duration, output: String, file: PathBuf, line: usize }`.
+/// This first slice intentionally diverges:
+///
+/// - `output` is not modeled directly — failure output is carried inside
+///   [`TestStatus::Failed::reason`], which covers the non-empty case. A
+///   standalone `output` field for passing tests can be added in a follow-up
+///   without breaking this schema.
+/// - `file` and `line` are omitted because `cargo test --message-format=json`
+///   (and `cargo nextest run --message-format libtest-json`) do **not** emit
+///   source-location metadata on a per-test basis. Reconstructing them
+///   requires a separate symbol-table lookup, which is out of scope for the
+///   first slice.
+/// - `duration_ms: Option<u64>` stands in for `Duration` because the
+///   underlying `exec_time` field is reported in seconds as an `f64` and is
+///   absent for skipped tests. Moving to `Option<Duration>` is tracked as a
+///   follow-up.
+///
+/// Follow-ups that revisit this schema are tracked against issue #24.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TestResult {
     /// Fully qualified test name, e.g. `crate::module::test_name`.
@@ -88,7 +110,8 @@ pub struct TestResult {
     /// Outcome of the test.
     pub status: TestStatus,
     /// Wall-clock duration in milliseconds. `None` when the runner did not
-    /// report a duration (e.g. skipped tests).
+    /// report a duration (e.g. skipped tests). See the type-level doc comment
+    /// for why this is `Option<u64>` rather than `Duration`.
     pub duration_ms: Option<u64>,
 }
 
@@ -219,7 +242,7 @@ impl LintResultEntity {
     /// Create a new lint result entity.
     pub fn new() -> Self {
         Self {
-            metadata: EntityMetadata::new(EntityType::Test),
+            metadata: EntityMetadata::new(EntityType::Lint),
             commit_hash: None,
             results: Vec::new(),
         }
@@ -268,6 +291,13 @@ pub enum TestError {
 
     #[error("command failed (exit {code:?}): {stderr}")]
     CommandFailed { code: Option<i32>, stderr: String },
+
+    #[error(
+        "cargo-nextest is not installed. Install it with \
+         `cargo install cargo-nextest --locked` \
+         or run inside the project's Nix dev-shell."
+    )]
+    NextestUnavailable,
 }
 
 #[cfg(test)]
@@ -381,7 +411,7 @@ mod new_types_tests {
             severity: Severity::Error,
         });
 
-        assert_eq!(lint.entity_type(), EntityType::Test);
+        assert_eq!(lint.entity_type(), EntityType::Lint);
         assert_eq!(lint.worst_severity(), Some(Severity::Error));
 
         let json = lint.to_json().expect("to_json");
