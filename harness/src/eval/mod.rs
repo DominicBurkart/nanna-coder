@@ -4,8 +4,8 @@
 //! by the agent evaluation framework in [`crate::agent::eval`].
 
 pub mod report;
-pub mod swebench;
 pub mod swebench_report;
+pub mod swebench_results;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
