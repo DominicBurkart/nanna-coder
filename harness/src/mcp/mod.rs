@@ -82,6 +82,8 @@ impl NannaMcpServer {
         R: tokio::io::AsyncBufRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
+        use tokio::io::AsyncReadExt;
+
         let mut line = String::new();
         loop {
             line.clear();
@@ -89,11 +91,79 @@ impl NannaMcpServer {
             if bytes_read == 0 {
                 return Ok(());
             }
+
+            // Detect Content-Length framing: if the first line of a message is a
+            // Content-Length header, consume the rest of the header block (an
+            // empty line), then read exactly N bytes of JSON body. Responses are
+            // written with matching Content-Length framing so framed clients can
+            // parse them. Otherwise we fall through to the line-delimited path
+            // used by the existing unit tests.
+            let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
+            if trimmed_hdr
+                .to_ascii_lowercase()
+                .starts_with("content-length:")
+            {
+                let content_length: usize = trimmed_hdr
+                    .split_once(':')
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+
+                // Consume header lines until we hit an empty line (end of headers).
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    if line.trim_end_matches(['\r', '\n']).is_empty() {
+                        break;
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).await?;
+                let body_str = String::from_utf8_lossy(&body).into_owned();
+
+                if let Some(response_bytes) = self.process_framed(&body_str).await? {
+                    writer.write_all(&response_bytes).await?;
+                    writer.flush().await?;
+                }
+                continue;
+            }
+
             if let Some(response_bytes) = self.process_line(&line).await? {
                 writer.write_all(&response_bytes).await?;
                 writer.flush().await?;
             }
         }
+    }
+
+    /// Process a single JSON-RPC message body (already extracted from
+    /// Content-Length framing) and return a Content-Length framed response.
+    async fn process_framed(
+        &self,
+        body: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(req) => self.handle_request(req).await,
+            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e)),
+        };
+
+        if response.id.is_none() && response.error.is_none() {
+            return Ok(None);
+        }
+
+        let json = serde_json::to_vec(&response)?;
+        let header = format!("Content-Length: {}\r\n\r\n", json.len());
+        let mut out = Vec::with_capacity(header.len() + json.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&json);
+        Ok(Some(out))
     }
 
     async fn process_line(
