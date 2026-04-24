@@ -93,6 +93,8 @@ fn test_harness_help_exits_zero() {
 
 #[test]
 fn test_mcp_serve_responds_to_initialize() {
+    use std::io::Read;
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_harness"))
         .args(["mcp-serve"])
         .stdin(Stdio::piped())
@@ -101,27 +103,22 @@ fn test_mcp_serve_responds_to_initialize() {
         .spawn()
         .expect("Failed to start harness mcp-serve");
 
-    let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke-test","version":"0.0.0"}}}"#;
-    let header = format!("Content-Length: {}\r\n\r\n", init_msg.len());
-
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin.write_all(header.as_bytes()).unwrap();
-    stdin.write_all(init_msg.as_bytes()).unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-
-    // Read stdout in a background thread with a timeout to avoid hanging indefinitely.
-    let stdout = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut response_buf = vec![0u8; 4096];
-        let n = reader.read(&mut response_buf).unwrap_or(0);
-        let _ = tx.send(String::from_utf8_lossy(&response_buf[..n]).into_owned());
-    });
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
 
     let timeout = Duration::from_secs(30);
+
+    // Drive the handshake in a background thread so we can enforce a wall-clock
+    // timeout via recv_timeout. The thread uses `send_and_recv`, which parses
+    // Content-Length framing and `read_exact`s the body — avoiding the latent
+    // single-shot `read` truncation risk.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let init_msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"smoke-test","version":"0.0.0"}}}"#;
+        let response = send_and_recv(&mut stdin, &mut stdout, init_msg);
+        let _ = tx.send(response);
+    });
+
     let response = match rx.recv_timeout(timeout) {
         Ok(r) => r,
         Err(_) => {
@@ -133,7 +130,6 @@ fn test_mcp_serve_responds_to_initialize() {
 
     // Capture stderr for diagnostics before killing the process.
     let stderr_output = child.stderr.take().map(|mut se| {
-        use std::io::Read;
         let mut buf = String::new();
         let _ = se.read_to_string(&mut buf);
         buf
