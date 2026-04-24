@@ -8,7 +8,7 @@ This document outlines the binary cache strategy used to optimize CI/CD performa
 
 ## Architecture
 
-### 1. Multi-Tier Caching System
+### 1. Two-Tier Caching System
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -16,26 +16,23 @@ This document outlines the binary cache strategy used to optimize CI/CD performa
 ├─────────────────────────────────────────────────────────────┤
 │ Tier 1: Cachix Public Cache (nanna-coder.cachix.org)      │
 │         - Shared across all CI runners and developers      │
-│         - Persistent storage with configurable retention   │
+│         - Persistent storage, unlimited retention          │
 │         - Optimized for frequent access patterns           │
 ├─────────────────────────────────────────────────────────────┤
-│ Tier 2: Magic Nix Cache (GitHub Actions)                  │
-│         - Per-job temporary caching                        │
-│         - Automatic cache warming and optimization         │
-│         - Zero-configuration setup                         │
-├─────────────────────────────────────────────────────────────┤
-│ Tier 3: Local Development Cache                           │
-│         - Developer machine cache                          │
-│         - Configurable via setup-cache utility             │
-│         - Optional Cachix integration                      │
+│ Tier 2: Local Development Cache                           │
+│         - Developer machine Nix store                      │
+│         - Configured via `nix run .#setup-cache`           │
+│         - Pulls from Cachix automatically                  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+(A previous iteration used a third tier, Magic Nix Cache, for per-job GitHub Actions caching. That action was deprecated upstream in 2025-02 and has been removed. See [cachix-migration.md](./cachix-migration.md) for the migration history.)
 
 ### 2. Cache Priority Matrix
 
 | Cache Type        | Priority | Use Case                    | TTL/Retention |
 |-------------------|----------|-----------------------------|---------------|
-| Rust Dependencies| 100      | Frequent cargo builds       | 30 days       |
+| Rust Dependencies | 100      | Frequent cargo builds       | 30 days       |
 | Test Containers   | 90       | Integration testing         | 14 days       |
 | Model Cache       | 80       | AI model storage            | 60 days       |
 | Build Artifacts   | 60       | Release binaries            | 90 days       |
@@ -75,7 +72,7 @@ Each CI job includes:
 
 ```yaml
 - name: Configure Cachix (Binary Cache)
-  uses: cachix/cachix-action@v12
+  uses: cachix/cachix-action@v15
   with:
     name: nanna-coder
     authToken: ${{ secrets.CACHIX_AUTH }}

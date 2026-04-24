@@ -1,8 +1,6 @@
-# Agent Control Flow
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
-
 # Agent State Machine
+
+The harness control-flow diagram lives in [ARCHITECTURE.md](./ARCHITECTURE.md#harness-control-flow). This document covers the complementary per-turn state machine that governs a single agent step.
 
 ```mermaid
 stateDiagram-v2

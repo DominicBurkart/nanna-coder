@@ -12,10 +12,10 @@ A coding agent for coding agents. Designed to let background agents delegate str
 
 ## Technologies
 
-- [Ollama](https://ollama.ai/)
-- [Nix](https://nixos.org/)
-- [Podman](https://podman.io/)
-- [Rust](https://www.rust-lang.org/)
+- [Ollama](https://ollama.ai/) — local LLM runtime
+- [Nix](https://nixos.org/) — reproducible builds and dev shell
+- [Podman](https://podman.io/) — rootless container runtime
+- [Rust](https://www.rust-lang.org/) — harness implementation language
 - [Cachix](https://cachix.org/) — binary cache for fast builds
 
 ## Quick Start
@@ -40,10 +40,10 @@ nix build
 
 ### LLM Setup (Ollama)
 
-The agent requires a running [Ollama](https://ollama.ai/) instance with a model installed:
+The agent requires a running [Ollama](https://ollama.ai/) instance with a model installed. See the [Ollama install guide](https://ollama.ai/download) for platform-specific instructions.
 
 ```bash
-# Install Ollama (see https://ollama.ai/download)
+# Install Ollama (Linux/macOS)
 curl -fsSL https://ollama.ai/install.sh | sh
 
 # Pull the default model
