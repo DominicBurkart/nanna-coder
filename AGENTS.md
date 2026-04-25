@@ -8,7 +8,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 - Lower the `target:` value in `codecov.yml`. The guard rejects decreases; admin bypass is the only path.
 - Add entries to `ignore:` in `codecov.yml`. The guard counts entries (block- and flow-style) and rejects growth.
 - Replace a numeric `target:` with `auto` or remove it. The guard rejects loss of a numeric floor.
-- Edit, rename, or delete `.github/workflows/codecov-guard.yml`, `.github/CODEOWNERS`, or other files in `.github/workflows/**` to circumvent the guard.
+- Edit, rename, or delete the `codecov-guard` job in `.github/workflows/ci.yml`, `.github/CODEOWNERS`, or other files in `.github/workflows/**` to circumvent the guard.
 
 ## When 100% patch coverage is genuinely unhittable
 
