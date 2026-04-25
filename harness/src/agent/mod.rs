@@ -1009,11 +1009,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let messages = self.conversation_history.clone();
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
-            let provider = self
-                .llm_provider
-                .clone()
-                .ok_or_else(|| bare_state_error("No provider configured"))
-                .map_err(|e| self.enrich_error(e))?;
+            let provider = match self.llm_provider.clone() {
+                Some(p) => p,
+                None => return Err(self.enrich_error(bare_state_error("No provider configured"))),
+            };
 
             let response = provider.chat(request).await.map_err(|e| {
                 self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
@@ -1096,11 +1095,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let name = tool_call.function.name.clone();
             let args = tool_call.function.arguments.clone();
             let call_id = tool_call.id.clone();
-            let registry = self
-                .tool_registry
-                .as_ref()
-                .ok_or_else(|| bare_state_error("No tool registry"))
-                .map_err(|e| self.enrich_error(e))?;
+            let registry = match self.tool_registry.as_ref() {
+                Some(r) => r,
+                None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
+            };
             let response_content = match registry.execute(&name, args).await {
                 Ok(v) => v.to_string(),
                 Err(e) => format!("Error: {}", e),
