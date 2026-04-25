@@ -52,10 +52,18 @@ jobs:
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
         ollama serve &
+        READY=false
         for i in $(seq 1 60); do
-          ollama list > /dev/null 2>&1 && break
+          if ollama list > /dev/null 2>&1; then
+            READY=true
+            break
+          fi
           sleep 1
         done
+        if [ "$READY" != "true" ]; then
+          echo "::error::ollama daemon never became ready within 60s" >&2
+          exit 1
+        fi
         for attempt in 1 2 3; do
           if timeout 600 ollama pull "$MODEL"; then
             break
