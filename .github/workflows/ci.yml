@@ -591,6 +591,18 @@ jobs:
         asset_name: harness-${{ matrix.target }}
         asset_content_type: application/octet-stream
 
+  docs-check:
+    name: Docs Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate internal doc links
+        run: bash scripts/check-docs-links.sh
+
+      - name: Validate CI workflow-doc coverage
+        run: bash scripts/check-ci-doc-coverage.sh
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest
@@ -602,6 +614,7 @@ jobs:
       - security-scan
       - cache-maintenance
       - release
+      - docs-check
     steps:
       - uses: actions/checkout@v4
 
