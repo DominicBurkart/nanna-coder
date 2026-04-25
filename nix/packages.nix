@@ -42,6 +42,11 @@ let
     cargoCheckCommand = "cargo check --workspace";
     cargoTestCommand = "cargo test --workspace";
 
+    # Tests are run in the test-matrix CI jobs (unit/integration/security).
+    # The HTTP roundtrip tests in mcp/http.rs bind real TCP sockets which
+    # are unavailable in the Nix derivation sandbox.
+    doCheck = false;
+
     # Additional build metadata
     meta = with lib; {
       description = "AI-powered coding assistant with tool calling and multi-model support";
@@ -61,6 +66,11 @@ let
     cargoBuildCommand = "cargo build --release --bin harness";
     cargoCheckCommand = "cargo check --bin harness";
     cargoTestCommand = "cargo test --package harness";
+
+    # Tests are run in the test-matrix CI jobs (unit/integration/security).
+    # The HTTP roundtrip tests in mcp/http.rs bind real TCP sockets which
+    # are unavailable in the Nix derivation sandbox.
+    doCheck = false;
 
     # Install only the harness binary
     installPhase = ''
