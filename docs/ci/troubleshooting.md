@@ -79,6 +79,22 @@ Triage guide for failures in each workflow defined under `.github/workflows/`. T
 | `warm-containers` succeeds but PR CI still rebuilds everything | Cache key mismatch between warming run and PR run | Compare `deps-key` output against the PR's Nix-derived hashes. See [../CACHE_STRATEGY.md](../CACHE_STRATEGY.md). |
 | `warm-cross-platform` never runs | Expected — `if: false` (disabled in-tree). See [architecture.md](architecture.md). | No action until cross-compilation is re-enabled. |
 
+## ci-integration.yml
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `container-loading` fails at "Verify image is present" | `nix run .#harnessImage.copyToDockerDaemon` did not actually load the image, or the derived image ref does not match what was loaded | Compare the `nix eval --raw .#harnessImage.imageName`/`.imageTag` outputs with `docker images` in the runner log. |
+| `empty-cache` exceeds the 10-minute timeout | Cold builds got slower upstream, or the Nix substituter list expanded silently | Time the build locally with `--option substituters https://cache.nixos.org`; if it really takes >10 min, raise the timeout — do not silently add Cachix back. |
+| `expected-failure` reports `Expected failure, got 'success'` | Someone accidentally defined a flake attribute that matches `__ci_integration_does_not_exist__`, or the assertion logic was changed | Pick a new attribute name guaranteed not to exist, or restore the original assertion. |
+
+## codecov-guard.yml
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `guard` fails with "base ref '...' not resolvable" | Branch was created without enough history, or the base ref string is malformed | Re-run after pushing/fetching the base branch. The check is fail-closed by design. |
+| `guard` fails with "patch target decreased" / "ignore: list grew" / "strict_yaml_branch changed" | A `codecov.yml` change is genuinely relaxing coverage policy | Either revert the change, or — if intentional — a repository admin must use GitHub's "merge without waiting for requirements" admin merge. No script flag bypasses this. |
+| `guard` fails with "did not exist on base" | First-time addition of `codecov.yml` is being attempted on a non-admin merge | Land the initial `codecov.yml` via admin merge, or rebase on a base where it already exists. |
+
 ## eval.yml
 
 | Symptom | Likely cause | Fix |

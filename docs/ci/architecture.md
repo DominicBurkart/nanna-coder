@@ -10,8 +10,10 @@ For a narrative, higher-level view of the pipeline that predates this tree, see 
 
 | File | Trigger(s) | Jobs | Matrix dimensions | Secrets |
 |---|---|---|---|---|
-| `ci.yml` | `push` (main, develop), `pull_request` (main), `release` | `test-matrix`, `build-matrix`, `build-containers`, `security-scan`, `cache-maintenance`, `release`, `all-checks` _(`docs-check` pending — see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))_ | OS x test-type; target x runner; arch x image | `CACHIX_AUTH` (repo-level secret), `CODECOV_TOKEN`, `GITHUB_TOKEN` |
+| `ci.yml` | `push` (main, develop), `pull_request` (main), `release` | `test-matrix`, `build-matrix`, `build-containers`, `security-scan`, `cache-maintenance`, `release`, `docs-check`, `all-checks` | OS x test-type; target x runner; arch x image | `CACHIX_AUTH` (repo-level secret), `CODECOV_TOKEN` (codecov environment), `GITHUB_TOKEN` |
+| `ci-integration.yml` | `pull_request` (paths-filtered on workflows/flake/nix/scripts), `schedule` (weekly Mon 06:00 UTC), `workflow_dispatch` | `container-loading`, `empty-cache`, `expected-failure` | none | `CACHIX_AUTH` (read-only via `skipPush: true`) |
 | `cache-warming.yml` | `push` (main, path-filtered), `workflow_dispatch` | `warm-dependencies`, `warm-containers`, `warm-cross-platform` (currently disabled via `if: false`), `summary` | `image` (harness, ollama); `target` x `runner` (disabled) | `CACHIX_AUTH` |
+| `codecov-guard.yml` | `pull_request` (paths-filtered on `codecov.yml`), `push` (main, same paths) | `guard` | none | `GITHUB_TOKEN` |
 | `eval.yml` | `workflow_dispatch` | `eval` | none | `CACHIX_AUTH`, `GITHUB_TOKEN` |
 | `badges.yaml` | `push` (main) | `update-badges` | none | `GITHUB_TOKEN` |
 
@@ -29,7 +31,7 @@ The primary pipeline. Triggers on every push to `main`/`develop`, every PR targe
 - **`security-scan`** — runs on `needs: build-containers`, only on non-PR events. Runs `aquasecurity/trivy-action` against the pushed harness image and uploads SARIF via `github/codeql-action/upload-sarif@v3`. Requires `security-events: write`.
 - **`cache-maintenance`** — runs on `needs: [test-matrix, build-matrix, build-containers]`, gated to `push` events on `refs/heads/main`. Invokes `nix run .#cache-analytics` (defined in [../../nix/cache.nix](../../nix/cache.nix)) and appends the report to `$GITHUB_STEP_SUMMARY`.
 - **`release`** — runs on `needs: [test-matrix, build-matrix, build-containers]`, gated to `release` events. Rebuilds for each target and attaches `harness-<target>` to the GitHub release via `actions/upload-release-asset@v1`.
-- **`docs-check`** _(pending — not yet in `ci.yml`; see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))_ — will run `scripts/check-docs-links.sh` and `scripts/check-ci-doc-coverage.sh` on `ubuntu-latest` so this doc tree cannot silently drift from the workflows it describes. The wiring commit was blocked on `workflows` permission scope and has not yet landed.
+- **`docs-check`** — runs `scripts/check-docs-links.sh` and `scripts/check-ci-doc-coverage.sh` on `ubuntu-latest` so this doc tree cannot silently drift from the workflows it describes. Wired into `all-checks.needs` so a docs/CI mismatch blocks merge.
 - **`all-checks`** — the gate job. `if: always()`, `needs:` every other job. Contains a `yq`-backed self-check that asserts every declared job appears in its own `needs:` list (see [maintenance.md](maintenance.md) for the exact logic), then fails on any dependency `failure`/`cancelled`.
 
 ### Job graph
@@ -51,9 +53,20 @@ graph TD
     security-scan --> all-checks
     cache-maintenance --> all-checks
     release --> all-checks
+    docs-check --> all-checks
 ```
 
-_Note: a `docs-check --> all-checks` edge is planned but not yet wired (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))._
+## ci-integration.yml
+
+Infrastructure smoke suite. Triggers on PRs that touch CI surface (`.github/workflows/**`, `.github/actions/**`, `flake.nix`, `flake.lock`, `nix/**`, `scripts/**`), on a weekly cron (Monday 06:00 UTC), and via `workflow_dispatch`. It is **not** wired into `ci.yml`'s `all-checks` gate — it exercises infrastructure, not product code, and runs in parallel rather than as a merge gate. See [.github/workflows/ci-integration.yml](../../.github/workflows/ci-integration.yml).
+
+### Jobs
+
+- **`container-loading`** — installs Nix and Cachix (with `skipPush: true`), runs `nix build .#harnessImage`, derives the image reference from `nix eval --raw .#harnessImage.imageName` and `.imageTag`, copies into the local Docker daemon via `nix run .#harnessImage.copyToDockerDaemon`, asserts `docker image inspect` succeeds, and smoke-runs `docker run --rm <ref> --help | head -n 5`. 10-minute timeout. Validates the harness container can be loaded and runs at all.
+- **`empty-cache`** — runs `nix build .#harness --print-build-logs --option substituters https://cache.nixos.org` (Cachix deliberately excluded), times the build, and writes the result to `$GITHUB_STEP_SUMMARY`. 10-minute timeout. Catches Cachix-only regressions where a build silently depends on the binary cache.
+- **`expected-failure`** — invokes `nix build '.#__ci_integration_does_not_exist__'` with `continue-on-error: true`, then asserts the step's outcome was `failure` and that the build log mentions the bogus attribute name. 10-minute timeout. Verifies that the runner's Nix install actually surfaces failures rather than masking them.
+
+`concurrency.group` is `ci-integration-${{ github.ref }}` with `cancel-in-progress: true`, so a new push to the same branch supersedes any in-flight run.
 
 ## cache-warming.yml
 
@@ -65,6 +78,20 @@ Pre-populates the Cachix binary cache on every push to `main` that touches `flak
 - **`warm-containers`** — parallel matrix over `image: [harness, ollama]`. Runs `nix build .#harnessImage` / `nix build .#ollamaImage` with `--no-link` so the outputs land only in the Nix store (and from there, Cachix).
 - **`warm-cross-platform`** — currently `if: false`. Preserved for when cross-compilation stabilizes. Would target `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`.
 - **`summary`** — `if: always()`, depends on the first two jobs, writes a markdown table to `$GITHUB_STEP_SUMMARY`.
+
+## codecov-guard.yml
+
+Single-purpose guard against silent relaxations of `codecov.yml`. Triggers on PRs and pushes to `main` that modify `codecov.yml` or this workflow file itself. Independent of `ci.yml` — it does not feed into `all-checks`, but should be made a required check via branch protection. See [.github/workflows/codecov-guard.yml](../../.github/workflows/codecov-guard.yml).
+
+### Jobs
+
+- **`guard`** — runs on `ubuntu-latest` with `permissions: contents: read`. Verifies `yq` is available, resolves the base ref (`origin/<base_ref>` for PRs, `HEAD~1` for pushes), and compares the previous and current `codecov.yml`. If the file is unchanged, exits 0. Otherwise it parses three keys with `yq` (`coverage.status.patch.default.target`, `ignore`, `codecov.strict_yaml_branch`) and fails the run if any of:
+  - the patch target moves from numeric to non-numeric (e.g. a value like `auto` replacing a numeric floor),
+  - the patch target decreases numerically,
+  - the `ignore` list grows in length,
+  - `codecov.strict_yaml_branch` is changed away from a previously-set value.
+
+  No commit trailer, env var, or script flag bypasses the check by design — the failure message documents that an admin merge is the only escape hatch.
 
 ## eval.yml
 

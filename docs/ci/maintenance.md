@@ -28,7 +28,7 @@ When adding a new job:
 
 ## Workflow-coverage invariant
 
-`scripts/check-ci-doc-coverage.sh` asserts that every `.github/workflows/*.y{,a}ml` file has a dedicated `## <filename>` heading in [architecture.md](architecture.md), or is explicitly excluded via `OMITTED: <filename> — <reason>` somewhere in that file. Once the planned `docs-check` job is wired into `ci.yml` (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254)), this check will run automatically in CI. Until then, run it locally. Consequences:
+`scripts/check-ci-doc-coverage.sh` asserts that every `.github/workflows/*.y{,a}ml` file has a dedicated `## <filename>` heading in [architecture.md](architecture.md), or is explicitly excluded via `OMITTED: <filename> — <reason>` somewhere in that file. The `docs-check` job in `ci.yml` runs this check on every PR. Consequences:
 
 - New workflow? Add a heading to [architecture.md](architecture.md) **and** describe triggers/jobs/matrix/secrets before merging.
 - Rename? Update the heading.
@@ -36,7 +36,7 @@ When adding a new job:
 
 ## Link-coverage invariant
 
-`scripts/check-docs-links.sh` validates relative links and `#anchor` fragments inside `docs/ci/*.md`. It does **not** check external HTTP URLs — that choice is documented in the script header and keeps CI free of flake on link-rot. Once the planned `docs-check` job is wired into `ci.yml`, this will also run automatically in CI. When moving a doc, update its inbound references, then run `bash scripts/check-docs-links.sh` locally.
+`scripts/check-docs-links.sh` validates relative links and `#anchor` fragments inside `docs/ci/*.md`. It does **not** check external HTTP URLs — that choice is documented in the script header and keeps CI free of flake on link-rot. The `docs-check` job in `ci.yml` runs this check on every PR. When moving a doc, update its inbound references, then run `bash scripts/check-docs-links.sh` locally before pushing.
 
 ## Secret rotation
 
@@ -79,8 +79,7 @@ Upgrade procedure:
 | Monthly | Verify `badges.yaml` still produces SVGs (img.shields.io upstream occasionally changes paths) | Maintainer |
 | On `flake.lock` bump | Observe `cache-warming.yml` fires on path filter; if it does not, something has broken the trigger | Nix maintainer |
 | On Rust toolchain bump | Re-run `warm-dependencies` manually with `force_rebuild=true` | Rust maintainer |
-
-_Note: a "Every PR — Review `docs-check` output" task is planned but not yet active because the `docs-check` CI job has not yet been wired into `ci.yml` (see [#254 follow-up](https://github.com/DominicBurkart/nanna-coder/pull/254))._
+| Every PR | Review `docs-check` output if it failed; either fix the doc or update the workflow heading list | Reviewer |
 
 ## When things genuinely cannot be fixed here
 
