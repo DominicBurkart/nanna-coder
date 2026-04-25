@@ -31,7 +31,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, MessageRole};
+use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, Usage};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -222,6 +222,9 @@ pub struct AgentRunResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Snapshot of the full conversation
     pub conversation_snapshot: Vec<ChatMessage>,
+    /// Aggregated token usage across all LLM calls. `None` when the
+    /// entity-based loop ran without an LLM provider.
+    pub token_usage: Option<Usage>,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -376,6 +379,11 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.progress_counter = Some(counter);
     }
 
+    /// Attach a tool registry to the agent loop.
+    pub fn set_tool_registry(&mut self, registry: ToolRegistry) {
+        self.tool_registry = Some(registry);
+    }
+
     pub fn conversation_history(&self) -> &[ChatMessage] {
         &self.conversation_history
     }
@@ -447,8 +455,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
     /// Run the agent loop with the given context.
     ///
-    /// All agents flow through the architectural state machine:
+    /// Flows through the architectural state machine:
     /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
+    /// When both a tool registry and LLM provider are present, the
+    /// `PerformingEntityModification` state dispatches to `run_tool_loop`.
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
@@ -495,6 +505,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     result_summary,
                     tool_calls_made,
                     conversation_snapshot: conversation,
+                    token_usage: None,
                 });
             }
 
@@ -961,6 +972,143 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         Ok(())
     }
 
+    /// Full tool-calling run loop — formerly used when tool_registry is set.
+    ///
+    /// Drive the agent via direct LLM tool-calling, bypassing the state machine.
+    ///
+    /// Used by the eval runner and tests that need to measure raw LLM iteration
+    /// counts and token usage without the planning/completion-check overhead.
+    pub async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
+        self.conversation_history.clear();
+
+        if !self.config.system_prompt.is_empty() {
+            let sp = self.config.system_prompt.clone();
+            self.conversation_history.push(ChatMessage::system(&sp));
+        }
+
+        for msg in context.conversation_history {
+            self.conversation_history.push(msg);
+        }
+
+        let tool_defs = self
+            .tool_registry
+            .as_ref()
+            .map(|r| r.get_definitions())
+            .unwrap_or_default();
+
+        self.iterations = 0;
+        let mut total_usage = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+
+        loop {
+            if self.iterations >= self.config.max_iterations {
+                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
+            }
+
+            let model_name = self.config.model_name.clone();
+            let messages = self.conversation_history.clone();
+            let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
+
+            let provider = match self.llm_provider.clone() {
+                Some(p) => p,
+                None => {
+                    return Err(self.enrich_error(bare_state_error("No provider configured")));
+                }
+            };
+
+            let response = provider.chat(request).await.map_err(|e| {
+                self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
+            })?;
+
+            if response.choices.is_empty() {
+                return Err(self.enrich_error(bare_state_error("Empty response from model")));
+            }
+
+            if let Some(ref u) = response.usage {
+                total_usage.prompt_tokens += u.prompt_tokens;
+                total_usage.completion_tokens += u.completion_tokens;
+                total_usage.total_tokens += u.total_tokens;
+            }
+
+            let choice = response.choices.into_iter().next().unwrap();
+            let finish_reason = choice.finish_reason.clone();
+            let tool_calls = choice.message.tool_calls.clone();
+            self.conversation_history.push(choice.message);
+
+            self.iterations += 1;
+            if let Some(ref counter) = self.progress_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+
+            match finish_reason {
+                Some(FinishReason::Stop) | None => {
+                    self.state_history.push(AgentState::Completed);
+                    self.state = AgentState::Completed;
+                    let task_description = context.user_prompt.clone();
+                    let conversation = self.conversation_history.clone();
+                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
+                    let result_summary = extract_result_summary(&conversation);
+                    let model_used = self.config.model_name.clone();
+                    let entity = ContextEntity::new(
+                        task_description,
+                        conversation.clone(),
+                        tool_calls_made.clone(),
+                        result_summary.clone(),
+                        model_used,
+                    );
+                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
+                        tracing::warn!("Failed to store context entity: {}", e);
+                    }
+                    return Ok(AgentRunResult {
+                        final_state: AgentState::Completed,
+                        iterations: self.iterations,
+                        task_completed: true,
+                        result_summary,
+                        tool_calls_made,
+                        conversation_snapshot: conversation,
+                        token_usage: Some(total_usage),
+                    });
+                }
+                Some(FinishReason::ToolCalls) => {
+                    if let Some(calls) = tool_calls {
+                        for tool_call in &calls {
+                            let name = tool_call.function.name.clone();
+                            let args = tool_call.function.arguments.clone();
+                            let call_id = tool_call.id.clone();
+
+                            let response_content = {
+                                let registry = self.tool_registry.as_ref();
+                                match registry {
+                                    None => {
+                                        return Err(
+                                            self.enrich_error(bare_state_error("No tool registry"))
+                                        );
+                                    }
+                                    Some(r) => {
+                                        let result = r.execute(&name, args).await;
+                                        match result {
+                                            Ok(v) => v.to_string(),
+                                            Err(e) => format!("Error: {}", e),
+                                        }
+                                    }
+                                }
+                            };
+
+                            self.conversation_history
+                                .push(ChatMessage::tool_response(call_id, response_content));
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
+                }
+            }
+        }
+    }
+
     /// Tool-calling perform helper: inner loop for the state-machine
     /// Perform Entity Modification step.
     ///
@@ -1059,7 +1207,7 @@ mod tests {
     use crate::tools::{EchoTool, ToolRegistry};
     use model::provider::{ModelError, ModelResult};
     use model::types::{
-        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall,
+        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall, Usage,
     };
     use std::sync::Mutex;
 
@@ -2003,6 +2151,100 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_single_stop_counts_one_iteration() {
+        let provider = MockProvider::new(vec![plain_response("Done")]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 1,
+            "Stop on first call should count as 1 iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_tool_call_then_stop_counts_two_iterations() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hello"})),
+            plain_response("All done."),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "echo hello".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 2,
+            "One tool call then stop should count as 2 iterations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_accumulates_token_usage() {
+        let provider = MockProvider::new(vec![
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                }),
+                ..tool_call_response("echo", serde_json::json!({"message": "hi"}))
+            },
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 200,
+                    completion_tokens: 80,
+                    total_tokens: 280,
+                }),
+                ..plain_response("Done")
+            },
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test usage".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        let usage = result
+            .token_usage
+            .expect("tool loop should return Some(usage)");
+        assert_eq!(usage.prompt_tokens, 300);
+        assert_eq!(usage.completion_tokens, 130);
+        assert_eq!(usage.total_tokens, 430);
     }
 }
 
