@@ -1,14 +1,16 @@
 use clap::{Parser, Subcommand};
+use harness::cli::{create_provider, emit, install_ctrlc_handler};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::mcp::handlers;
-use harness::output::{ExitCode, JsonEnvelope, OutputFormat};
+use harness::output::{ExitCode, OutputFormat};
 use harness::task::TaskManager;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -140,107 +142,6 @@ enum McpCommands {
     },
 }
 
-/// Returns true when we should use the mock provider (CI-friendly, no Ollama required).
-fn use_mock_provider() -> bool {
-    std::env::var("NANNA_TEST_MOCK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// A trivial mock provider that always returns a canned response.
-/// Used for integration tests in CI where Ollama is unavailable.
-struct MockCliProvider;
-
-#[async_trait::async_trait]
-impl ModelProvider for MockCliProvider {
-    async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
-        Ok(ChatResponse {
-            choices: vec![Choice {
-                message: ChatMessage {
-                    role: MessageRole::Assistant,
-                    content: Some("Mock response".to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                finish_reason: Some(FinishReason::Stop),
-            }],
-            usage: None,
-        })
-    }
-
-    async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
-        Ok(vec![ModelInfo {
-            name: "mock".to_string(),
-            size: Some(0),
-            digest: None,
-            modified_at: None,
-        }])
-    }
-
-    async fn health_check(&self) -> ModelResult<()> {
-        Ok(())
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "mock"
-    }
-}
-
-/// Create an `Arc<dyn ModelProvider>` — mock when `NANNA_TEST_MOCK=1`, else Ollama.
-fn create_provider() -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
-    if use_mock_provider() {
-        Ok(Arc::new(MockCliProvider))
-    } else {
-        let config = OllamaConfig::default();
-        Ok(Arc::new(OllamaProvider::new(config)?))
-    }
-}
-
-fn emit(format: OutputFormat, code: ExitCode, data: serde_json::Value) -> std::process::ExitCode {
-    match format {
-        OutputFormat::Json => {
-            let envelope = if code == ExitCode::Success {
-                JsonEnvelope::success(data)
-            } else {
-                let msg = data
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| data.to_string());
-                let error_code = match code {
-                    ExitCode::StateError => "STATE_ERROR",
-                    ExitCode::InfraError => "INFRA_ERROR",
-                    ExitCode::UserError => "USER_ERROR",
-                    ExitCode::Interrupted => "INTERRUPTED",
-                    ExitCode::Success => unreachable!(),
-                };
-                JsonEnvelope::error(error_code, &msg)
-            };
-            println!("{}", envelope.to_json_string());
-        }
-        OutputFormat::Human => {
-            if code == ExitCode::Success {
-                print!("{}", harness::output::render(&data, OutputFormat::Human));
-            } else {
-                let msg = data.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                    harness::output::render(&data, OutputFormat::Human)
-                        .trim()
-                        .to_string()
-                });
-                eprintln!("Error: {msg}");
-            }
-        }
-    }
-    code.process_exit()
-}
-
-fn format_from(cli: &Cli) -> OutputFormat {
-    if cli.json {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Human
-    }
-}
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
@@ -248,25 +149,19 @@ async fn main() -> std::process::ExitCode {
         .init();
 
     // Install Ctrl+C handler so we can return exit code 130.
-    let fmt_for_ctrlc = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fmt_clone = fmt_for_ctrlc.clone();
-    let _ = ctrlc::set_handler(move || {
-        // If JSON mode was set we can't easily detect from here, so just exit 130.
-        if fmt_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let envelope = JsonEnvelope::error("INTERRUPTED", "Received SIGINT");
-            // Best-effort print
-            let _ = writeln!(io::stdout(), "{}", envelope.to_json_string());
-        } else {
-            let _ = writeln!(io::stderr(), "Interrupted");
-        }
-        std::process::exit(130);
-    });
+    // Uses Ordering::Acquire internally for signal safety.
+    let json_mode = Arc::new(AtomicBool::new(false));
+    install_ctrlc_handler(json_mode.clone());
 
     let cli = Cli::parse();
-    let fmt = format_from(&cli);
+    let fmt = if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
 
     // Store whether JSON mode is active for the Ctrl+C handler.
-    fmt_for_ctrlc.store(cli.json, std::sync::atomic::Ordering::Relaxed);
+    json_mode.store(cli.json, std::sync::atomic::Ordering::SeqCst);
 
     match cli.command {
         // ── 6 MVP subcommands ────────────────────────────────
