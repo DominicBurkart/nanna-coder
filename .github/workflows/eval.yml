@@ -10,9 +10,10 @@ on:
       model:
         description: 'Model to use for evaluation'
         required: false
-        default: 'qwen3:0.6b'
+        default: 'gemma4:e4b'
         type: choice
         options:
+          - gemma4:e4b
           - qwen3:0.6b
           - llama3.1:8b
       case_filter:
@@ -51,17 +52,24 @@ jobs:
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
         ollama serve &
-        # Wait for Ollama to be ready
-        for i in $(seq 1 30); do
+        for i in $(seq 1 60); do
           ollama list > /dev/null 2>&1 && break
           sleep 1
         done
-        ollama pull "$MODEL"
+        for attempt in 1 2 3; do
+          if timeout 600 ollama pull "$MODEL"; then
+            break
+          fi
+          echo "ollama pull attempt ${attempt} failed; retrying..."
+          sleep 5
+        done
+        ollama list
 
     - name: Run eval suite
       id: eval
       env:
         MODEL: ${{ inputs.model }}
+        NANNA_EVAL_MODEL: ${{ inputs.model }}
         CASE_FILTER: ${{ inputs.case_filter }}
       run: |
         echo "## Eval Results" > eval-results.md
@@ -84,20 +92,37 @@ jobs:
           --workspace --all-features \
           -E "$FILTER" \
           --no-fail-fast 2>&1 | tee eval-output.txt
-        EXIT_CODE=$?
+        UNIT_EXIT=$?
         set -e
 
         cat eval-output.txt >> eval-results.md
         echo '```' >> eval-results.md
 
-        if [ "$EXIT_CODE" -eq 0 ]; then
+        echo "" >> eval-results.md
+        echo "### Happy-path eval cases" >> eval-results.md
+        echo '```' >> eval-results.md
+
+        set +e
+        nix develop --command cargo nextest run \
+          --workspace --features eval-runner \
+          --run-ignored ignored-only \
+          -E 'test(eval_runner)' \
+          --test-threads=1 \
+          --no-fail-fast 2>&1 | tee happy-path-output.txt
+        HAPPY_EXIT=$?
+        set -e
+
+        cat happy-path-output.txt >> eval-results.md
+        echo '```' >> eval-results.md
+
+        if [ "$UNIT_EXIT" -eq 0 ] && [ "$HAPPY_EXIT" -eq 0 ]; then
           echo "outcome=success" >> "$GITHUB_OUTPUT"
           echo "" >> eval-results.md
           echo "**Status: PASSED**" >> eval-results.md
         else
           echo "outcome=failure" >> "$GITHUB_OUTPUT"
           echo "" >> eval-results.md
-          echo "**Status: FAILED** (see logs above)" >> eval-results.md
+          echo "**Status: FAILED** (unit_exit=${UNIT_EXIT} happy_exit=${HAPPY_EXIT})" >> eval-results.md
         fi
 
     - name: Write eval summary
@@ -120,4 +145,5 @@ jobs:
         path: |
           eval-results.md
           eval-output.txt
+          happy-path-output.txt
         if-no-files-found: warn

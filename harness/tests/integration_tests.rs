@@ -27,7 +27,9 @@ use tokio::time::{sleep, timeout};
 // use futures::future; // Reserved for future concurrent test implementation
 
 // E2E test configuration
-const E2E_MODEL: &str = "gemma4:e4b";
+fn e2e_model() -> String {
+    std::env::var("NANNA_EVAL_MODEL").unwrap_or_else(|_| "gemma4:e4b".to_string())
+}
 const E2E_TIMEOUT: Duration = Duration::from_secs(300);
 const CONTAINER_STARTUP_WAIT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -765,7 +767,7 @@ async fn test_e2e_container_to_validated_inference() {
         test_image: Some("nanna-coder-test-ollama-qwen3:latest".to_string()),
         container_name: "e2e-test-container".to_string(),
         port_mapping: Some((11437, 11434)),
-        model_to_pull: Some(E2E_MODEL.to_string()),
+        model_to_pull: Some(e2e_model()),
         startup_timeout: CONTAINER_STARTUP_WAIT,
         health_check_timeout: HEALTH_CHECK_TIMEOUT,
         env_vars: vec![("OLLAMA_MODELS".to_string(), "/models".to_string())],
@@ -1166,7 +1168,7 @@ async fn test_e2e_performance_and_reliability() {
         test_image: Some("nanna-coder-test-ollama-qwen3:latest".to_string()),
         container_name: "e2e-performance-test".to_string(),
         port_mapping: Some((11439, 11434)),
-        model_to_pull: Some(E2E_MODEL.to_string()),
+        model_to_pull: Some(e2e_model()),
         startup_timeout: CONTAINER_STARTUP_WAIT,
         health_check_timeout: HEALTH_CHECK_TIMEOUT,
         env_vars: vec![
@@ -1244,7 +1246,7 @@ async fn test_e2e_performance_and_reliability() {
 
     for prompt in test_prompts {
         let messages = vec![ChatMessage::user(prompt)];
-        let request = ChatRequest::new(E2E_MODEL, messages).with_temperature(0.1);
+        let request = ChatRequest::new(e2e_model(), messages).with_temperature(0.1);
 
         match provider.chat(request).await {
             Ok(_) => successful_requests += 1,
@@ -1260,7 +1262,7 @@ async fn test_e2e_performance_and_reliability() {
     println!("💾 Performance Test 3: Resource efficiency validation");
     let memory_test_prompt = "Generate a detailed explanation of machine learning in 100 words";
     let memory_messages = vec![ChatMessage::user(memory_test_prompt)];
-    let memory_request = ChatRequest::new(E2E_MODEL, memory_messages)
+    let memory_request = ChatRequest::new(e2e_model(), memory_messages)
         .with_max_tokens(150)
         .with_temperature(0.3);
 
@@ -1757,7 +1759,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         test_image: Some("nanna-coder-test-ollama-qwen3:latest".to_string()),
         container_name: "e2e-agent-integration-test".to_string(),
         port_mapping: Some((11440, 11434)),
-        model_to_pull: Some(E2E_MODEL.to_string()),
+        model_to_pull: Some(e2e_model()),
         startup_timeout: CONTAINER_STARTUP_WAIT,
         health_check_timeout: HEALTH_CHECK_TIMEOUT,
         env_vars: vec![],
@@ -1802,7 +1804,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         max_iterations: 10,
         verbose: true,
         system_prompt: "You are a helpful assistant. Use the echo tool when asked to echo something. After using the tool, respond with a brief summary.".to_string(),
-        model_name: E2E_MODEL.to_string(),
+        model_name: e2e_model(),
     };
 
     let context = AgentContext {
