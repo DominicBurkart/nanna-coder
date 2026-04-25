@@ -56,11 +56,10 @@ fn opt_bool(args: &Value, name: &str, default: bool) -> bool {
     args.get(name).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
-/// Extract an optional u64 parameter.
-fn opt_u64(args: &Value, name: &str) -> Option<u64> {
-    args.get(name).and_then(|v| v.as_u64())
+/// Extract an optional u64 parameter with a default value.
+fn opt_u64(args: &Value, name: &str, default: u64) -> u64 {
+    args.get(name).and_then(|v| v.as_u64()).unwrap_or(default)
 }
-
 
 #[async_trait]
 pub trait Tool: Send + Sync {

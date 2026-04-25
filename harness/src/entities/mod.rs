@@ -198,8 +198,6 @@ macro_rules! impl_entity {
     };
 }
 
-pub use impl_entity;
-
 /// Relationship between entities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityRelationship {
