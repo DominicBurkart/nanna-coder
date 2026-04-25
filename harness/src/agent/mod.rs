@@ -31,7 +31,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, Usage};
+use model::types::{
+    ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, ToolCall, Usage,
+};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -986,7 +988,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             self.conversation_history.push(ChatMessage::system(&sp));
         }
 
-        for msg in context.conversation_history {
+        for msg in context.conversation_history.iter().cloned() {
             self.conversation_history.push(msg);
         }
 
@@ -1002,21 +1004,16 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             total_tokens: 0,
         };
 
-        loop {
-            if self.iterations >= self.config.max_iterations {
-                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
-            }
-
+        while self.iterations < self.config.max_iterations {
             let model_name = self.config.model_name.clone();
             let messages = self.conversation_history.clone();
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
-            let provider = match self.llm_provider.clone() {
-                Some(p) => p,
-                None => {
-                    return Err(self.enrich_error(bare_state_error("No provider configured")));
-                }
-            };
+            let provider = self
+                .llm_provider
+                .clone()
+                .ok_or_else(|| bare_state_error("No provider configured"))
+                .map_err(|e| self.enrich_error(e))?;
 
             let response = provider.chat(request).await.map_err(|e| {
                 self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
@@ -1042,70 +1039,76 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
 
-            match finish_reason {
-                Some(FinishReason::Stop) | None => {
-                    self.state_history.push(AgentState::Completed);
-                    self.state = AgentState::Completed;
-                    let task_description = context.user_prompt.clone();
-                    let conversation = self.conversation_history.clone();
-                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
-                    let result_summary = extract_result_summary(&conversation);
-                    let model_used = self.config.model_name.clone();
-                    let entity = ContextEntity::new(
-                        task_description,
-                        conversation.clone(),
-                        tool_calls_made.clone(),
-                        result_summary.clone(),
-                        model_used,
-                    );
-                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
-                        tracing::warn!("Failed to store context entity: {}", e);
-                    }
-                    return Ok(AgentRunResult {
-                        final_state: AgentState::Completed,
-                        iterations: self.iterations,
-                        task_completed: true,
-                        result_summary,
-                        tool_calls_made,
-                        conversation_snapshot: conversation,
-                        token_usage: Some(total_usage),
-                    });
-                }
-                Some(FinishReason::ToolCalls) => {
-                    if let Some(calls) = tool_calls {
-                        for tool_call in &calls {
-                            let name = tool_call.function.name.clone();
-                            let args = tool_call.function.arguments.clone();
-                            let call_id = tool_call.id.clone();
+            let is_stop = matches!(finish_reason, Some(FinishReason::Stop) | None);
+            let is_tool_calls = matches!(finish_reason, Some(FinishReason::ToolCalls));
 
-                            let response_content = {
-                                let registry = self.tool_registry.as_ref();
-                                match registry {
-                                    None => {
-                                        return Err(
-                                            self.enrich_error(bare_state_error("No tool registry"))
-                                        );
-                                    }
-                                    Some(r) => {
-                                        let result = r.execute(&name, args).await;
-                                        match result {
-                                            Ok(v) => v.to_string(),
-                                            Err(e) => format!("Error: {}", e),
-                                        }
-                                    }
-                                }
-                            };
-
-                            self.conversation_history
-                                .push(ChatMessage::tool_response(call_id, response_content));
-                        }
-                    }
-                }
-                Some(_) => {
-                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
-                }
+            if is_stop {
+                return Ok(self.complete_tool_loop(&context, total_usage).await);
             }
+            if !is_tool_calls {
+                return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
+            }
+            self.dispatch_tool_calls(tool_calls).await?;
         }
+
+        Err(self.enrich_error(bare_max_iterations(self.iterations)))
+    }
+
+    async fn complete_tool_loop(
+        &mut self,
+        context: &AgentContext,
+        total_usage: Usage,
+    ) -> AgentRunResult {
+        self.state_history.push(AgentState::Completed);
+        self.state = AgentState::Completed;
+        let task_description = context.user_prompt.clone();
+        let conversation = self.conversation_history.clone();
+        let tool_calls_made = extract_tool_calls_from_history(&conversation);
+        let result_summary = extract_result_summary(&conversation);
+        let model_used = self.config.model_name.clone();
+        let entity = ContextEntity::new(
+            task_description,
+            conversation.clone(),
+            tool_calls_made.clone(),
+            result_summary.clone(),
+            model_used,
+        );
+        if let Err(e) = self.entity_store.store(Box::new(entity)).await {
+            tracing::warn!("Failed to store context entity: {}", e);
+        }
+        AgentRunResult {
+            final_state: AgentState::Completed,
+            iterations: self.iterations,
+            task_completed: true,
+            result_summary,
+            tool_calls_made,
+            conversation_snapshot: conversation,
+            token_usage: Some(total_usage),
+        }
+    }
+
+    async fn dispatch_tool_calls(&mut self, tool_calls: Option<Vec<ToolCall>>) -> AgentResult<()> {
+        let calls = match tool_calls {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        for tool_call in &calls {
+            let name = tool_call.function.name.clone();
+            let args = tool_call.function.arguments.clone();
+            let call_id = tool_call.id.clone();
+            let registry = self
+                .tool_registry
+                .as_ref()
+                .ok_or_else(|| bare_state_error("No tool registry"))
+                .map_err(|e| self.enrich_error(e))?;
+            let response_content = match registry.execute(&name, args).await {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("Error: {}", e),
+            };
+            self.conversation_history
+                .push(ChatMessage::tool_response(call_id, response_content));
+        }
+        Ok(())
     }
 
     /// Tool-calling perform helper: inner loop for the state-machine
