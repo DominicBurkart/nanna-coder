@@ -410,11 +410,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -499,7 +499,7 @@ fn generate_swebench_report(
     output_dir: Option<&std::path::Path>,
     compare: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::eval::swebench::SweBenchRunResult;
+    use harness::eval::swebench_results::SweBenchRunResult;
     use harness::eval::swebench_report::SweBenchReport;
 
     let json = std::fs::read_to_string(input)?;
