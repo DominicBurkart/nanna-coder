@@ -23,7 +23,7 @@ async fn test_run_eval_returns_result() {
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
     let case_dir = task_toml.parent().unwrap();
 
-    // Use a short max_iterations so the entity-based agent completes quickly
+    // Limit iterations to keep the test run short.
     let config = EvalRunnerConfig::default().with_max_iterations(10);
     let result = run_eval(&case, case_dir, &config).await.unwrap();
 
