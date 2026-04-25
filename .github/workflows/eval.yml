@@ -64,13 +64,19 @@ jobs:
           echo "::error::ollama daemon never became ready within 60s" >&2
           exit 1
         fi
+        PULLED=false
         for attempt in 1 2 3; do
           if timeout 600 ollama pull "$MODEL"; then
+            PULLED=true
             break
           fi
           echo "ollama pull attempt ${attempt} failed; retrying..."
           sleep 5
         done
+        if [ "$PULLED" != "true" ]; then
+          echo "::error::ollama pull failed for $MODEL after 3 attempts" >&2
+          exit 1
+        fi
         ollama list
 
     - name: Run eval suite
