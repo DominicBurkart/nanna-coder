@@ -16,20 +16,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 2. If you are blocked because your architectural decisions yield untestable code, re-architect. 
 3. If the CI environment is broken in a way that you cannot fix and which is preventing your tests from being run, escalate by creating a github issue describing the exact misisng test problem.
 
-## Owner one-time setup (UI)
-
-After this guardrail's first PR lands:
-
-1. **Required status check.** Settings → Rules → Default branch protection: add `codecov-guard / guard` to the required status checks alongside `codecov/patch` and `All Checks Passed`.
-2. **Repository Ruleset.** Settings → Rules → Rulesets → New branch ruleset. Target `main`. Enable *Restrict file paths* with patterns:
-   - `codecov.yml`
-   - `tarpaulin.toml`
-   - `.github/workflows/**`
-   - `.github/CODEOWNERS`
-   - `.github/rulesets/**`
-
-   Bypass list: repository admin (you). Apply on PR and push events.
-3. Optional: enable *Require pull request before merging* on the same ruleset; CODEOWNERS will surface `@DominicBurkart` as a reviewer on relevant paths but does not block solo merges (admin bypass remains available).
 
 # Agent State Machine
 
