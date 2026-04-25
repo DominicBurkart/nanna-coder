@@ -79,6 +79,19 @@ jobs:
         fi
         ollama list
 
+    # Test-image / model coverage notes:
+    #   * This workflow installs Ollama directly on the runner and pulls $MODEL,
+    #     so NANNA_EVAL_MODEL flows end-to-end into the happy-path runner.
+    #   * The harness integration tests in ci.yml's "integration-container" leg
+    #     reference a pre-baked qwen3 image (nanna-coder-test-ollama-qwen3:latest,
+    #     defined in nix/containers.nix). When that image is present locally the
+    #     ContainerConfig short-circuits model_to_pull (see container.rs ~line 321),
+    #     so those tests effectively run against qwen3 regardless of NANNA_EVAL_MODEL.
+    #     That mismatch is pre-existing and orthogonal to this workflow; aligning
+    #     test images with NANNA_EVAL_MODEL is tracked separately.
+    #   * --workspace --features eval-runner: cargo applies the feature only to
+    #     packages that declare it (the eval crate); other workspace members
+    #     compile without it. The flag is package-scoped, not workspace-wide.
     - name: Run eval suite
       id: eval
       env:
