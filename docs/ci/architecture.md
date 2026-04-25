@@ -15,7 +15,7 @@ For a narrative, higher-level view of the pipeline that predates this tree, see 
 | `eval.yml` | `workflow_dispatch` | `eval` | none | `CACHIX_AUTH`, `GITHUB_TOKEN` |
 | `badges.yaml` | `push` (main) | `update-badges` | none | `GITHUB_TOKEN` |
 
-`CACHIX_AUTH` and `CODECOV_TOKEN` are repo-level secrets (not scoped to any GitHub environment). `GITHUB_TOKEN` is provided automatically by GitHub Actions. The `test-matrix` job declares `environment: codecov` solely to satisfy Codecov's OIDC requirements; only `CODECOV_TOKEN` is consumed there. `CACHIX_AUTH` is required for any job that pushes to Cachix; Cachix pulls are unauthenticated. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md).
+`CACHIX_AUTH` is a repo-level secret (not scoped to any GitHub environment); the five `ci.yml` jobs that consume it, plus every job in `cache-warming.yml` and the `eval` job in `eval.yml`, read it directly from repository secrets. `CODECOV_TOKEN` is the only environment-scoped secret: it lives in the `codecov` GitHub environment, which `test-matrix` opts into via `environment: codecov` solely to satisfy Codecov's OIDC requirements. `GITHUB_TOKEN` is provided automatically by GitHub Actions. `CACHIX_AUTH` is required for any job that pushes to Cachix; Cachix pulls are unauthenticated. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md).
 
 ## ci.yml
 

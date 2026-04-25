@@ -6,11 +6,11 @@ Secrets, permissions, and supply-chain posture of the workflows in `.github/work
 
 | Secret | Referenced in | Scope |
 |---|---|---|
-| `CACHIX_AUTH` | `ci.yml` (`test-matrix`, `build-matrix`, `build-containers`, `cache-maintenance`, `release`), `cache-warming.yml` (all jobs), `eval.yml` (`eval`) | Cachix push authentication. Pulls are unauthenticated. |
-| `CODECOV_TOKEN` | `ci.yml` (`test-matrix` `security` variant) | Uploading `lcov.info`. Scoped to the `codecov` environment on the job. |
+| `CACHIX_AUTH` | `ci.yml` (`test-matrix`, `build-matrix`, `build-containers`, `cache-maintenance`, `release`), `cache-warming.yml` (all jobs), `eval.yml` (`eval`) | Repository-level secret. Cachix push authentication; pulls are unauthenticated. Not scoped to any GitHub environment — every consuming job pulls it directly from repo secrets. |
+| `CODECOV_TOKEN` | `ci.yml` (`test-matrix` `security` variant) | Uploading `lcov.info`. Scoped to the `codecov` GitHub environment, which is referenced only by `test-matrix` via `environment: codecov`. |
 | `GITHUB_TOKEN` | `ci.yml` (`build-containers` registry login, `release` asset upload), `eval.yml` (PR comment), `badges.yaml` (commit push) | Per-run token issued by GitHub Actions. Permissions are constrained via per-job `permissions:` blocks. |
 
-`CACHIX_AUTH` and `CODECOV_TOKEN` are stored in the repository's `codecov` environment. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md) for how to provision the Cachix side and [../CACHE_STRATEGY.md](../CACHE_STRATEGY.md) for the keys it authenticates against.
+`CACHIX_AUTH` is a **repository-level** secret (no `environment:` block in any consuming job). `CODECOV_TOKEN` is the **only** environment-scoped secret here — it lives in the `codecov` environment, which `test-matrix` opts into via `environment: codecov`. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md) for how to provision the Cachix side and [../CACHE_STRATEGY.md](../CACHE_STRATEGY.md) for the keys it authenticates against.
 
 ## Fork safety
 
@@ -57,8 +57,8 @@ See [maintenance.md](maintenance.md) for the list. Actions pinned to `@main` / `
 
 See [maintenance.md](maintenance.md). The short version:
 
-- `CACHIX_AUTH`: regenerate in Cachix, update in GitHub environment, re-run cache warming.
-- `CODECOV_TOKEN`: regenerate in Codecov, update secret, re-run any `security` matrix job.
+- `CACHIX_AUTH`: regenerate in Cachix, update the repo-level secret under repository Settings → Secrets and variables → Actions (no environment), re-run cache warming.
+- `CODECOV_TOKEN`: regenerate in Codecov, update the secret inside the `codecov` GitHub environment under repository Settings → Environments → codecov, re-run any `security` matrix job.
 - `GITHUB_TOKEN`: managed by GitHub Actions; nothing to rotate.
 
 ## What we do not do (deliberately)

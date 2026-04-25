@@ -44,8 +44,8 @@ Secrets used by the workflows (see [architecture.md](architecture.md) table):
 
 | Secret | Used by | Rotation procedure |
 |---|---|---|
-| `CACHIX_AUTH` | `ci.yml` (every job that configures Cachix), `cache-warming.yml` (every job), `eval.yml` (`eval`) | Regenerate in Cachix dashboard, update the `CACHIX_AUTH` repo-level secret in repository Settings → Secrets and variables → Actions, verify by re-running a cache-warming workflow. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md). |
-| `CODECOV_TOKEN` | `ci.yml` (`test-matrix` security variant) | Regenerate in Codecov UI; update in repository secrets; re-run a security test to confirm upload. |
+| `CACHIX_AUTH` | `ci.yml` (every job that configures Cachix), `cache-warming.yml` (every job), `eval.yml` (`eval`) | Regenerate in Cachix dashboard, update the `CACHIX_AUTH` repo-level secret in repository Settings → Secrets and variables → Actions (no environment scope — none of the consuming jobs declare `environment:`), verify by re-running a cache-warming workflow. See [../../CACHIX_SETUP.md](../../CACHIX_SETUP.md). |
+| `CODECOV_TOKEN` | `ci.yml` (`test-matrix` security variant) | Regenerate in Codecov UI; update the secret inside the `codecov` GitHub environment under repository Settings → Environments → codecov (this is the only environment-scoped secret in the workflows); re-run a security test to confirm upload. |
 | `GITHUB_TOKEN` | `ci.yml` (container login, release upload), `eval.yml` (PR comments), `badges.yaml` (push) | Provided by GitHub Actions automatically; no rotation. Permissions are scoped per-job via `permissions:` blocks. |
 
 ## Upgrading pinned actions
