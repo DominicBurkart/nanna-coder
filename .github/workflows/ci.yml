@@ -706,7 +706,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify gate covers every job
+      - name: Verify gate covers every ci.yml job
         run: |
           set -euo pipefail
           all_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/ci.yml | sort)
@@ -720,6 +720,56 @@ jobs:
             exit 1
           fi
           echo "OK: all $(echo "$expected" | wc -l | tr -d ' ') non-gate jobs covered"
+
+      - name: Verify every PR-triggered job in other workflow files is acknowledged
+        run: |
+          set -euo pipefail
+
+          # Jobs in PR-triggered workflows OTHER THAN ci.yml that are
+          # explicitly acknowledged as not part of the all-checks gate.
+          # Additions require editing ci.yml (in CODEOWNERS scope).
+          ALLOWED_NON_CI_PR_JOBS="$(cat <<'ALLOWLIST'
+ci-integration.yml/container-loading
+ci-integration.yml/empty-cache
+ci-integration.yml/expected-failure
+ALLOWLIST
+)"
+
+          actual=""
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            [ "$base" = "ci.yml" ] && continue
+
+            if ! yq '.' "$f" >/dev/null 2>&1; then
+              echo "::error::yq cannot parse $f; fix the workflow before merge"
+              exit 1
+            fi
+
+            has_pr=$(yq '."on" | (has("pull_request") // false) or (has("pull_request_target") // false)' "$f" 2>/dev/null || echo false)
+            [ "$has_pr" = "true" ] || continue
+
+            jobs=$(yq -r '.jobs | keys | .[]' "$f" 2>/dev/null || true)
+            for j in $jobs; do
+              actual+="$base/$j"$'\n'
+            done
+          done
+
+          actual_sorted=$(printf '%s' "$actual" | sort -u)
+          allowed_sorted=$(printf '%s\n' "$ALLOWED_NON_CI_PR_JOBS" | sort -u)
+          missing=$(comm -23 <(printf '%s' "$actual_sorted") <(printf '%s' "$allowed_sorted") || true)
+
+          if [ -n "$missing" ]; then
+            echo "::error::PR-triggered jobs in non-ci.yml workflows are not acknowledged by the gate:"
+            echo "$missing"
+            echo
+            echo "Resolution options:"
+            echo "  1. Move the job into ci.yml so all-checks.needs requires it transitively (preferred)."
+            echo "  2. Add it to ALLOWED_NON_CI_PR_JOBS in this step AND to branch-protection's"
+            echo "     required status checks. Editing this list is in CODEOWNERS scope."
+            exit 1
+          fi
+          echo "OK: $(printf '%s' "$actual_sorted" | grep -c . || true) non-ci.yml PR-triggered jobs acknowledged"
 
       - name: Fail if any dependency failed or was cancelled
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
