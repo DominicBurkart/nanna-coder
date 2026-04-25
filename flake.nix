@@ -29,7 +29,7 @@
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix2container, cachix }:
     # Support multiple systems for cross-platform CI
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
+    nixpkgs.lib.recursiveUpdate (flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         # Reproducible overlays with pinned versions
         overlays = [
@@ -257,8 +257,8 @@
           '';
         };
       }
-    ) //
-    # Add cross-platform package support for CI matrix builds
+    )) # end eachSystem
+    # Merge cross-platform package support (load-container-image, load-ollama-image, vllmImage variants)
     {
       packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
         let
@@ -505,5 +505,5 @@
             }) else null;
         }
       );
-    };
+    }; # end recursiveUpdate second arg
 }
