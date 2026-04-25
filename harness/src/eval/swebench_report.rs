@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use harness::eval::swebench::{SweBenchRunResult, SweBenchRunConfig, TokenUsage};
+//! use harness::eval::swebench_results::{SweBenchRunResult, SweBenchRunConfig, TokenUsage};
 //! use harness::eval::swebench_report::SweBenchReport;
 //!
 //! # fn example(run_result: SweBenchRunResult) {
@@ -16,7 +16,7 @@
 //! # }
 //! ```
 
-use super::swebench::SweBenchRunResult;
+use super::swebench_results::SweBenchRunResult;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -425,7 +425,7 @@ fn truncate_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::swebench::*;
+    use crate::eval::swebench_results::*;
 
     fn make_instance(
         id: &str,
