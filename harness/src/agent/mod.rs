@@ -2246,6 +2246,347 @@ mod tests {
         assert_eq!(usage.completion_tokens, 130);
         assert_eq!(usage.total_tokens, 430);
     }
+
+    #[test]
+    fn test_set_tool_registry_attaches_registry() {
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.tool_registry().is_none());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        agent.set_tool_registry(registry);
+
+        assert!(agent.tool_registry().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_when_no_provider_configured() {
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        agent.set_tool_registry(registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("no provider should produce an error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No provider configured"),
+            "expected provider-missing diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_propagates_llm_call_failure() {
+        let provider = MockProvider::new(vec![]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let agent_config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(agent_config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("empty mock should error on chat()");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LLM call failed"),
+            "expected LLM-call-failed diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_on_empty_choices() {
+        let empty_choices = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![empty_choices]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("empty choices should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Empty response from model"),
+            "expected empty-response diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_max_iterations_exceeded() {
+        let provider = MockProvider::new(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"message": "loop forever"}),
+        )]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig {
+            max_iterations: 0,
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "loop".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("max_iterations=0 must trip the cap immediately");
+        assert!(matches!(err, AgentError::MaxIterationsExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_seeds_system_prompt_and_history() {
+        let provider = MockProvider::new(vec![plain_response("ack")]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig {
+            system_prompt: "you are a Rust assistant".to_string(),
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "ignored".to_string(),
+            conversation_history: vec![ChatMessage::user("seed message")],
+            app_state_id: "t".to_string(),
+        };
+
+        agent.run_tool_loop(context).await.unwrap();
+
+        let history = &agent.conversation_history;
+        let has_system = history.iter().any(|m| {
+            matches!(m.role, MessageRole::System)
+                && matches!(m.content.as_deref(), Some(c) if c.contains("Rust assistant"))
+        });
+        let has_seed = history.iter().any(|m| {
+            matches!(m.role, MessageRole::User)
+                && matches!(m.content.as_deref(), Some(c) if c.contains("seed message"))
+        });
+
+        assert!(has_system, "system prompt should be seeded into history");
+        assert!(has_seed, "context conversation_history should be appended");
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_increments_progress_counter() {
+        use std::sync::atomic::AtomicUsize;
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hi"})),
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+        let counter = Arc::new(AtomicUsize::new(0));
+        agent.set_progress_counter(counter.clone());
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "progress counter should track each LLM round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_formats_tool_execution_error_into_response() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("nonexistent_tool", serde_json::json!({})),
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        let saw_error_response = agent.conversation_history.iter().any(|m| {
+            matches!(m.role, MessageRole::Tool)
+                && matches!(m.content.as_deref(), Some(c) if c.starts_with("Error:"))
+        });
+        assert!(
+            saw_error_response,
+            "registry execute Err must be formatted as a tool response"
+        );
+        assert!(result.task_completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_tolerates_entity_store_failure() {
+        use crate::entities::{
+            Entity, EntityError, EntityId, EntityRelationship, EntityResult, EntityType,
+            QueryResult, RelationshipType,
+        };
+
+        struct FailingStore;
+        #[async_trait]
+        impl EntityStore for FailingStore {
+            async fn store(&mut self, _entity: Box<dyn Entity>) -> EntityResult<EntityId> {
+                Err(EntityError::StorageError("simulated".to_string()))
+            }
+            async fn exists(&self, _id: &str) -> bool {
+                false
+            }
+            async fn update(&mut self, _entity: Box<dyn Entity>) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn delete(&mut self, _id: &str) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn query(&self, _query: &EntityQuery) -> EntityResult<Vec<QueryResult>> {
+                Ok(vec![])
+            }
+            async fn get_relationships(&self, _id: &str) -> EntityResult<Vec<EntityRelationship>> {
+                Ok(vec![])
+            }
+            async fn create_relationship(
+                &mut self,
+                _relationship: EntityRelationship,
+            ) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn delete_relationship(
+                &mut self,
+                _from: &str,
+                _to: &str,
+                _relationship_type: RelationshipType,
+            ) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn list_by_kind(&self, _kind: EntityType) -> EntityResult<Vec<EntityId>> {
+                Ok(vec![])
+            }
+        }
+
+        let provider = MockProvider::new(vec![plain_response("done")]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let mut agent =
+            AgentLoop::with_tools(AgentConfig::default(), FailingStore, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent
+            .run_tool_loop(context)
+            .await
+            .expect("entity store failure must be tolerated, not propagated");
+        assert!(result.task_completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_on_unexpected_finish_reason() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("trimmed".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Length),
+            }],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![response]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("unexpected finish_reason must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Unexpected finish reason"),
+            "expected unexpected-finish-reason diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_when_tool_call_without_registry() {
+        let provider = MockProvider::new(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"message": "x"}),
+        )]);
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        agent.llm_provider = Some(provider);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("tool_calls finish reason without registry must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No tool registry"),
+            "expected no-tool-registry diagnostic, got: {msg}"
+        );
+    }
 }
 
 #[cfg(kani)]
