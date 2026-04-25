@@ -57,7 +57,7 @@ fn opt_bool(args: &Value, name: &str, default: bool) -> bool {
 }
 
 /// Extract an optional u64 parameter with a default value.
-fn opt_u64(args: &Value, name: &str, default: u64) -> u64 {
+fn opt_u64_or(args: &Value, name: &str, default: u64) -> u64 {
     args.get(name).and_then(|v| v.as_u64()).unwrap_or(default)
 }
 
@@ -411,11 +411,15 @@ impl Tool for ReadFileTool {
         let content = std::fs::read_to_string(&safe_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
-        let start = opt_u64(&args, "start_line")
+        let start = args
+            .get("start_line")
+            .and_then(|v| v.as_u64())
             .map(|n| (n as usize).saturating_sub(1))
             .unwrap_or(0);
 
-        let end = opt_u64(&args, "end_line")
+        let end = args
+            .get("end_line")
+            .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(lines.len());
 
@@ -809,7 +813,7 @@ impl Tool for SearchTool {
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
 
         let file_pattern = args.get("file_pattern").and_then(|v| v.as_str());
-        let max_results = opt_u64(&args, "max_results").unwrap_or(50) as usize;
+        let max_results = opt_u64_or(&args, "max_results", 50) as usize;
 
         let mut results = Vec::new();
         self.search_recursive(&safe_path, &regex, file_pattern, max_results, &mut results)?;
@@ -1844,6 +1848,7 @@ pub fn create_container_tool_registry(
     registry
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2067,6 +2072,7 @@ mod tests {
         assert!(registry.get_tool("git_status").is_some());
         assert!(registry.get_tool("git_diff").is_some());
     }
+
 
     // -- PrStatusData unit tests --
 

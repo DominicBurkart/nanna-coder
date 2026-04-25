@@ -175,26 +175,32 @@ pub trait Entity: Send + Sync {
     }
 }
 
-/// Implement the [`Entity`] trait for a `Serialize` type whose `EntityMetadata`
-/// lives in a field called `metadata`.
+/// Implement the [`Entity`] trait for one or more `Serialize` types whose
+/// `EntityMetadata` lives in a field called `metadata`.
+///
+/// Accepts a comma-separated list, e.g.
+/// `impl_entity!(GitRepository, GitBranch, GitCommit);`
 #[macro_export]
 macro_rules! impl_entity {
-    ($ty:ty) => {
-        #[async_trait::async_trait]
-        impl $crate::entities::Entity for $ty {
-            fn metadata(&self) -> &$crate::entities::EntityMetadata {
-                &self.metadata
-            }
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            #[async_trait::async_trait]
+            impl $crate::entities::Entity for $ty {
+                fn metadata(&self) -> &$crate::entities::EntityMetadata {
+                    &self.metadata
+                }
 
-            fn metadata_mut(&mut self) -> &mut $crate::entities::EntityMetadata {
-                &mut self.metadata
-            }
+                fn metadata_mut(&mut self) -> &mut $crate::entities::EntityMetadata {
+                    &mut self.metadata
+                }
 
-            fn to_json(&self) -> $crate::entities::EntityResult<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| $crate::entities::EntityError::SerializationError(e.to_string()))
+                fn to_json(&self) -> $crate::entities::EntityResult<String> {
+                    serde_json::to_string(self).map_err(|e| {
+                        $crate::entities::EntityError::SerializationError(e.to_string())
+                    })
+                }
             }
-        }
+        )+
     };
 }
 
