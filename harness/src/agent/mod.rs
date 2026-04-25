@@ -2060,11 +2060,7 @@ mod tests {
     #[test]
     fn extract_tool_calls_keeps_unanswered_calls_with_empty_result() {
         let history = vec![
-            assistant_tool_calls(vec![(
-                "orphan",
-                "search",
-                serde_json::json!({"q": "x"}),
-            )]),
+            assistant_tool_calls(vec![("orphan", "search", serde_json::json!({"q": "x"}))]),
             // No tool response for "orphan".
         ];
 
@@ -2096,11 +2092,7 @@ mod tests {
     fn extract_result_summary_skips_assistant_messages_with_tool_calls() {
         let history = vec![
             ChatMessage::user("ask"),
-            assistant_tool_calls(vec![(
-                "c1",
-                "search",
-                serde_json::json!({}),
-            )]),
+            assistant_tool_calls(vec![("c1", "search", serde_json::json!({}))]),
             ChatMessage::tool_response("c1", "42"),
             ChatMessage::assistant("the answer is 42"),
         ];
@@ -2114,11 +2106,7 @@ mod tests {
     fn extract_result_summary_empty_when_no_plain_assistant_turn() {
         let history = vec![
             ChatMessage::user("ask"),
-            assistant_tool_calls(vec![(
-                "c1",
-                "noop",
-                serde_json::json!({}),
-            )]),
+            assistant_tool_calls(vec![("c1", "noop", serde_json::json!({}))]),
         ];
         assert_eq!(extract_result_summary(&history), "");
     }
