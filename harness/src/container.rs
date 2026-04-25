@@ -321,12 +321,12 @@ pub async fn start_container_with_fallback(
     let (image_to_use, needs_model_pull) = if let Some(test_image) = &config.test_image {
         match verify_image_exists(&runtime, test_image) {
             Ok(true) => {
-                println!("✅ Using pre-built test container: {}", test_image);
+                println!("Using pre-built test container: {}", test_image);
                 (test_image.clone(), false)
             }
             Ok(false) => {
                 println!(
-                    "📦 Pre-built container not found, falling back to base: {}",
+                    "Pre-built container not found, falling back to base: {}",
                     config.base_image
                 );
                 println!("   To build cached container: nix build .#ollama-qwen3");
@@ -334,7 +334,7 @@ pub async fn start_container_with_fallback(
             }
             Err(_) => {
                 println!(
-                    "⚠️  Could not check test image, using base: {}",
+                    "Could not check test image, using base: {}",
                     config.base_image
                 );
                 (config.base_image.clone(), true)
@@ -344,9 +344,8 @@ pub async fn start_container_with_fallback(
         (config.base_image.clone(), config.model_to_pull.is_some())
     };
 
-    // Verify base image exists, pull if needed
     if !verify_image_exists(&runtime, &image_to_use)? {
-        println!("📥 Pulling container image: {}", image_to_use);
+        println!("Pulling container image: {}", image_to_use);
         let pull_output = Command::new(runtime.command())
             .args(["pull", &image_to_use])
             .output()
@@ -366,7 +365,6 @@ pub async fn start_container_with_fallback(
         }
     }
 
-    // Build container run command
     let mut cmd = Command::new(runtime.command());
     cmd.args(["run", "-d", "--name", &config.container_name]);
 
@@ -376,29 +374,22 @@ pub async fn start_container_with_fallback(
         cmd.arg("--userns=keep-id");
     }
 
-    // Add port mapping if specified
     if let Some((host_port, container_port)) = config.port_mapping {
         cmd.args(["-p", &format!("{}:{}", host_port, container_port)]);
     }
 
-    // Add environment variables
     for (key, value) in &config.env_vars {
         cmd.args(["-e", &format!("{}={}", key, value)]);
     }
 
-    // Add additional arguments
     for arg in &config.additional_args {
         cmd.arg(arg);
     }
 
-    // Add remove flag for automatic cleanup
     cmd.arg("--rm");
-
-    // Finally add the image
     cmd.arg(&image_to_use);
 
-    // Start the container
-    println!("🚀 Starting container: {}", config.container_name);
+    println!("Starting container: {}", config.container_name);
     let start_output = cmd
         .output()
         .map_err(|e| ContainerError::ContainerStartFailed {
@@ -413,15 +404,13 @@ pub async fn start_container_with_fallback(
         });
     }
 
-    // Wait for container to be ready
-    println!("⏳ Waiting for container to be ready...");
+    println!("Waiting for container to be ready...");
     sleep(config.startup_timeout).await;
 
-    // Pull model if needed
     if needs_model_pull {
         if let Some(model) = &config.model_to_pull {
             println!(
-                "📥 Pulling model: {} (this may take a while without cache)...",
+                "Pulling model: {} (this may take a while without cache)...",
                 model
             );
 
@@ -448,7 +437,7 @@ pub async fn start_container_with_fallback(
                             reason: String::from_utf8_lossy(&output.stderr).to_string(),
                         });
                     }
-                    println!("✅ Model pulled successfully");
+                    println!("Model pulled successfully");
                 }
                 Ok(Err(e)) => {
                     let _ = Command::new(runtime.command())
@@ -500,7 +489,7 @@ pub async fn health_check_container(
 
         match check_result {
             Ok(output) if output.status.success() => {
-                println!("✅ Health check passed for container: {}", handle.name);
+                println!("Health check passed for container: {}", handle.name);
                 return Ok(());
             }
             Ok(_) => {
@@ -548,7 +537,7 @@ pub fn cleanup_container(handle: &ContainerHandle) -> Result<(), ContainerError>
         });
     }
 
-    println!("✅ Container cleaned up: {}", handle.name);
+    println!("Container cleaned up: {}", handle.name);
     Ok(())
 }
 

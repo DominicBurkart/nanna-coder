@@ -1,8 +1,10 @@
-# Agent Control Flow
+# Agents
+
+## Agent Control Flow
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 
-# Agent State Machine
+## Agent State Machine
 
 ```mermaid
 stateDiagram-v2
