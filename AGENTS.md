@@ -2,17 +2,6 @@
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 
-# CI Guardrails (agent-relevant)
-
-The repo enforces a 100% patch-coverage floor on `codecov.yml`. The floor is protected against silent agent relaxation by a layered design:
-
-**Trust anchor.** The only files agents in the lower trust tier cannot edit are `.github/workflows/*`. All policy logic lives there — the regression guard for `codecov.yml` is fully inlined into `.github/workflows/codecov-guard.yml`, with no `scripts/*.sh` indirection. An agent that cannot push workflow files cannot weaken the policy.
-
-**Server-side path restriction (owner-managed Repository Ruleset).** For agents that *can* push workflow files, a Repository Ruleset blocks pushes containing changes to `codecov.yml`, `.github/workflows/**`, and `.github/CODEOWNERS`. The owner is on the bypass list; everyone else is rejected at `pre-receive`. See [GitHub: Restrict file paths](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#restrict-file-paths).
-
-**Codecov-side defense.** `codecov.yml` sets `codecov.strict_yaml_branch: main`, so PR-time `codecov/patch` checks always use `main`'s YAML — a PR cannot make its own check pass by lowering the threshold on the feature branch.
-
-**Escape hatch.** The repo has `enforce_admins: false` on `main`. The owner may use GitHub's "Merge without waiting for requirements to be met (bypass branch protections)" admin button on any PR that fails the guard. There is **no** in-repo override path: no commit trailer, no env var, no script flag.
 
 ## What an agent should NOT do
 
