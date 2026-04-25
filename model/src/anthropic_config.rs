@@ -3,6 +3,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
+    #[serde(skip_serializing)]
     pub api_key: String,
     pub model: String,
     pub base_url: String,
