@@ -15,13 +15,13 @@ use std::sync::Arc;
 /// orchestrators observe via `poll_task` / `get_result`.
 fn external_status_str(status: &TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Pending => "Pending",
-        TaskStatus::Running { .. } => "Running",
-        TaskStatus::Completed { .. } => "Completed",
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running { .. } => "running",
+        TaskStatus::Completed { .. } => "completed",
         TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled" => {
-            "Cancelled"
+            "cancelled"
         }
-        TaskStatus::Failed { .. } => "Failed",
+        TaskStatus::Failed { .. } => "failed",
     }
 }
 
@@ -55,7 +55,7 @@ pub async fn handle_cancel_task(
 
     Ok(serde_json::json!({
         "task_id": task_id_str,
-        "status": "Cancelled",
+        "status": "cancelled",
         "message": "Task has been cancelled"
     }))
 }
@@ -110,7 +110,7 @@ pub async fn handle_assign_task(
 
     Ok(serde_json::json!({
         "task_id": task_id.0,
-        "status": "Pending"
+        "status": "pending"
     }))
 }
 
@@ -178,7 +178,7 @@ pub async fn handle_get_result(
             finished_at,
         } => Ok(serde_json::json!({
             "task_id": task_id_str,
-            "status": "Completed",
+            "status": "completed",
             "finished_at": finished_at.to_rfc3339(),
             "result_summary": result.result_summary,
             "changes_patch": result.changes_patch,
@@ -331,7 +331,7 @@ mod tests {
         assert!(result.is_ok());
         let val = result.unwrap();
         assert!(val["task_id"].is_string());
-        assert_eq!(val["status"], "Pending");
+        assert_eq!(val["status"], "pending");
     }
 
     #[tokio::test]
@@ -447,31 +447,31 @@ mod tests {
             .await
             .unwrap();
 
-        // poll_task must report Cancelled, not Failed.
+        // poll_task must report cancelled, not failed.
         let poll = handle_poll_task(&serde_json::json!({"task_id": task_id.0}), &manager)
             .await
             .unwrap();
         assert_eq!(
-            poll["status"], "Cancelled",
-            "poll_task should return Cancelled after Running→Cancelled"
+            poll["status"], "cancelled",
+            "poll_task should return cancelled after Running→Cancelled"
         );
 
-        // get_result must also report Cancelled, not Failed.
+        // get_result must also report cancelled, not failed.
         let got = handle_get_result(&serde_json::json!({"task_id": task_id.0}), &manager)
             .await
             .unwrap();
         assert_eq!(
-            got["status"], "Cancelled",
-            "get_result should return Cancelled after Running→Cancelled"
+            got["status"], "cancelled",
+            "get_result should return cancelled after Running→Cancelled"
         );
 
-        // list_tasks must list the task as Cancelled.
+        // list_tasks must list the task as cancelled.
         let listed = handle_list_tasks(&manager).await.unwrap();
         let arr = listed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(
-            arr[0]["status"], "Cancelled",
-            "list_tasks should return Cancelled after Running→Cancelled"
+            arr[0]["status"], "cancelled",
+            "list_tasks should return cancelled after Running→Cancelled"
         );
     }
 
@@ -500,16 +500,16 @@ mod tests {
         let poll = handle_poll_task(&serde_json::json!({"task_id": task_id}), &manager)
             .await
             .unwrap();
-        assert_eq!(poll["status"], "Cancelled");
+        assert_eq!(poll["status"], "cancelled");
 
         let got = handle_get_result(&serde_json::json!({"task_id": task_id}), &manager)
             .await
             .unwrap();
-        assert_eq!(got["status"], "Cancelled");
+        assert_eq!(got["status"], "cancelled");
 
         let listed = handle_list_tasks(&manager).await.unwrap();
         let arr = listed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["status"], "Cancelled");
+        assert_eq!(arr[0]["status"], "cancelled");
     }
 }
