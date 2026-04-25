@@ -990,11 +990,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             self.conversation_history.push(msg);
         }
 
-        let tool_defs = self
-            .tool_registry
-            .as_ref()
-            .map(|r| r.get_definitions())
-            .unwrap_or_default();
+        let tool_defs = match self.tool_registry.as_ref() {
+            Some(r) => r.get_definitions(),
+            None => Vec::new(),
+        };
 
         self.iterations = 0;
         let mut total_usage = Usage {
@@ -2559,6 +2558,73 @@ mod tests {
         assert!(
             msg.contains("Unexpected finish reason"),
             "expected unexpected-finish-reason diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_treats_no_finish_reason_as_stop() {
+        let response_with_none_finish = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![response_with_none_finish]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.final_state, AgentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_handles_tool_calls_finish_with_no_calls() {
+        let provider = MockProvider::new(vec![
+            ChatResponse {
+                choices: vec![Choice {
+                    message: ChatMessage {
+                        role: MessageRole::Assistant,
+                        content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some(FinishReason::ToolCalls),
+                }],
+                usage: None,
+            },
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(
+            result.iterations, 2,
+            "ToolCalls finish with no calls should still advance an iteration"
         );
     }
 
