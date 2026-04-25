@@ -12,13 +12,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 
 ## When 100% patch coverage is genuinely unhittable
 
-If a PR introduces a branch that cannot be exercised by tests in CI (e.g., requires a real container runtime not available on the runner), the PR's author is responsible for either:
-
-1. Adding a unit test that uses a mock/stub at the same dispatch point (preferred — see `create_with_container_using` in `harness/src/workspace.rs` for the pattern).
-2. Refactoring so the uncoverable surface is minimal (e.g., a single delegating wrapper).
-3. As a last resort, requesting admin bypass from the owner with a clear justification.
-
-Bypassing coverage by adding `#[cfg(not(tarpaulin))]` or `#[ignore]` to source files to hide lines from the patch metric is **not acceptable** and is tracked as a separate guard initiative.
+1. If you are blocked because of disabled tests, enable them.
+2. If you are blocked because your architectural decisions yield untestable code, re-architect. 
+3. If the CI environment is broken in a way that you cannot fix and which is preventing your tests from being run, escalate by creating a github issue describing the exact misisng test problem.
 
 ## Owner one-time setup (UI)
 
