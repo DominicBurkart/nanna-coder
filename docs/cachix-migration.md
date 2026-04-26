@@ -1,72 +1,17 @@
-# Cachix Migration Guide
+# Cachix Migration (Historical)
 
-## Overview
+The project moved to Cachix-only binary caching after evaluating GitHub Actions cache and `cache-nix-action`. For the current strategy and operational details, see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md). For the prior `cache-nix-action` interim, see [cache-migration-guide.md](./cache-migration-guide.md).
 
-This project uses **Cachix exclusively** for binary caching, providing unlimited storage and persistent cache across all CI runs and developer machines.
+## Migration timeline
 
-## Migration History
+1. **Magic Nix Cache** — deprecated upstream Feb 2025; removed.
+2. **`cache-nix-action`** — used briefly; bound by GitHub's 10 GB per-repo cache and frequent evictions on container builds.
+3. **Cachix** — current. Unlimited storage, persistent across runs, shared between CI and developers.
 
-### Previous Approaches
-
-1. **Magic Nix Cache** (deprecated Feb 2025)
-   - Automatic caching by DeterminateSystems
-   - Deprecated and removed
-
-2. **cache-nix-action** (replaced)
-   - Free GitHub-native caching
-   - Limited to 10GB per repository
-   - Frequent evictions on large container builds
-
-3. **Current: Cachix-only** (implemented)
-   - Unlimited storage
-   - Persistent across CI runs
-   - Shared between CI and developers
-   - No deprecated dependencies
-
-## Architecture
-
-### Cachix Integration Points
-
-```
-┌─────────────────────────────────────────┐
-│         GitHub Actions CI               │
-│                                         │
-│  ┌─────────────────────────────────┐   │
-│  │  cachix-action@v15              │   │
-│  │  - Pull: Always (public cache)  │   │
-│  │  - Push: Main branch + PRs      │   │
-│  │  - Skip: Fork PRs               │   │
-│  └─────────────────────────────────┘   │
-│              ↓↑                         │
-└──────────────┼─────────────────────────┘
-               │
-               ↓↑
-    ┌──────────────────────┐
-    │  nanna-coder.cachix  │
-    │  Binary Cache        │
-    │  - Unlimited storage │
-    │  - Public read       │
-    │  - Authenticated push│
-    └──────────────────────┘
-               ↓↑
-┌──────────────┼─────────────────────────┐
-│    Developer Workstations              │
-│                                         │
-│  nix run .#setup-cache                 │
-│  → Configures Cachix substituters      │
-│  → Downloads pre-built artifacts       │
-└─────────────────────────────────────────┘
-```
-
-## Implementation Details
-
-### CI Workflow Configuration
-
-All workflows now use `cachix/cachix-action@v15`:
+## CI workflow shape
 
 ```yaml
-- name: Configure Cachix
-  uses: cachix/cachix-action@v15
+- uses: cachix/cachix-action@v15
   with:
     name: nanna-coder
     authToken: '${{ secrets.CACHIX_AUTH }}'
@@ -74,253 +19,57 @@ All workflows now use `cachix/cachix-action@v15`:
     skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
 ```
 
-**Key Features:**
-- **Public read access**: Anyone can download from cache
-- **Authenticated push**: Only CI with `CACHIX_AUTH` can upload
-- **Fork protection**: Forks read but don't push (security)
-- **Push filter**: Excludes source tarballs to save bandwidth
+- Public read; authenticated push gated on `CACHIX_AUTH`.
+- Fork PRs read but never push (`skipPush`).
+- Push filter drops source tarballs and `nixpkgs.tar.gz`.
 
-### Flake.nix Configuration
+## Flake configuration
 
-Binary cache configuration in `flake.nix`:
+`flake.nix` -> `binaryCacheConfig` holds `cacheName`, `publicKey`, `pushToCache`, and a `cacheKeyPriority` map (rust deps highest, system packages lowest). The same priorities are listed in [binary-cache-strategy.md](./binary-cache-strategy.md).
 
-```nix
-binaryCacheConfig = {
-  cacheName = "nanna-coder";
-  publicKey = "nanna-coder.cachix.org-1:<REAL_KEY>";  # From app.cachix.org
-  pushToCache = true;
-
-  cacheKeyPriority = {
-    "rust-dependencies" = 100;    # Cache first
-    "test-containers" = 90;
-    "model-cache" = 80;
-    "build-artifacts" = 60;
-    "cross-compilation" = 50;
-    "base-images" = 30;
-    "system-packages" = 20;       # Cache last
-  };
-};
-```
-
-### Developer Setup
-
-Developers can configure Cachix locally:
+## Developer setup
 
 ```bash
-# One-time setup
-nix run .#setup-cache
-
-# Builds now use Cachix automatically
+nix run .#setup-cache    # one-time
 nix build .#nanna-coder
-
-# Verify cache is working
 nix run .#cache-analytics
 ```
 
-## Cache Strategy
+## Trust and access
 
-### What Gets Cached
+- Artifacts: content-addressed, signed by Cachix, public-key verified on download.
+- Secrets: `CACHIX_AUTH` is repo-scoped and unavailable to fork PRs.
 
-**High Priority (Always cached):**
-- Rust dependencies (cargo artifacts)
-- Test containers (small, frequently used)
-- Build artifacts (binaries)
+## Migration checklist (completed 2025)
 
-**Medium Priority (Cached when space available):**
-- Cross-compilation outputs
-- Development tools
+- [x] Cache created at app.cachix.org
+- [x] Public signing key added to `flake.nix`
+- [x] `CACHIX_AUTH` added as repo secret
+- [x] All workflows updated to `cachix/cachix-action@v15`
+- [x] `cache-nix-action` references removed
+- [x] Developer-side `setup-cache` validated
 
-**Low Priority (Excluded from Cachix):**
-- Source tarballs (filtered out)
-- Large model files (downloaded on-demand)
-- nixpkgs tarballs (already cached upstream)
+## Cost reference
 
-### Push Filter Rationale
+| Tier | Storage | Bandwidth | Cost |
+|---|---|---|---|
+| GitHub Actions cache | 10 GB | unlimited | free |
+| Cachix Free | 5 GB | 10 GB/mo | free |
+| Cachix Pro | unlimited | unlimited | $29/mo |
 
-```yaml
-pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
-```
+## Troubleshooting (migration-specific)
 
-**Excludes:**
-- `*-source` derivations (save bandwidth)
-- `nixpkgs.tar.gz` files (redundant with upstream cache)
+**Untrusted public key**
 
-**Includes:**
-- Compiled binaries
-- Container images
-- Build dependencies
+1. Get the current key from [app.cachix.org/cache/nanna-coder](https://app.cachix.org/cache/nanna-coder).
+2. Update `publicKey` in `flake.nix` (search for `nanna-coder.cachix.org`).
+3. Re-run `nix run .#setup-cache`.
 
-## Performance Expectations
-
-### Build Times (with Cachix)
-
-| Scenario | Cold Build | Cachix Cache Hit |
-|----------|------------|------------------|
-| Rust workspace | 10-15 min | 30-60 sec |
-| Container images | 5-10 min | 1-2 min |
-| Full CI pipeline | 30-45 min | 5-10 min |
-
-### Cache Hit Rates (Target)
-
-- Rust dependencies: >95%
-- Container images: >90%
-- Overall CI: >85%
-
-## Security
-
-### Authentication
-
-**CI Push Access:**
-- Requires `CACHIX_AUTH` secret
-- Only configured in repository settings
-- Not accessible to fork PRs
-
-**Public Read Access:**
-- Anyone can download from cache
-- No authentication required
-- Cache is marked as "Public" on Cachix
-
-### Fork PR Protection
-
-Fork PRs:
-- ✅ Can read from Cachix (faster builds)
-- ❌ Cannot push to Cachix (security)
-- Configured via `skipPush` parameter
-
-### Content Trust
-
-All cached artifacts:
-- ✅ Verified by Nix content hash
-- ✅ Signed by Cachix
-- ✅ Public key verified on download
-
-## Monitoring
-
-### Cache Analytics
-
-Check cache performance:
-
-```bash
-nix run .#cache-analytics
-```
-
-**Reports:**
-- Cachix cache info
-- Local store statistics
-- Configuration validation
-
-### CI Integration
-
-Every CI run includes cache analytics in the job summary:
-
-```yaml
-- name: Cache analytics and reporting
-  run: |
-    echo "## 📊 Binary Cache Performance Report" >> $GITHUB_STEP_SUMMARY
-    nix run .#cache-analytics >> $GITHUB_STEP_SUMMARY
-```
-
-## Troubleshooting
-
-### Cache Not Working
-
-**Symptom:** Builds take full time, no downloads from Cachix
-
-**Diagnosis:**
-```bash
-# Check substituters configuration
-cat ~/.config/nix/nix.conf | grep substituters
-
-# Should include:
-# substituters = https://cache.nixos.org https://nanna-coder.cachix.org
-```
-
-**Solution:**
-```bash
-nix run .#setup-cache
-```
-
-### CI Not Pushing to Cache
-
-**Symptom:** CI builds successfully but cache not updated
-
-**Check:**
-1. Is `CACHIX_AUTH` secret configured?
-2. Is job running on main branch (not fork PR)?
-3. Check CI logs for "Pushing to cache" messages
-
-**Debug:**
-```bash
-# In CI workflow, add diagnostic step:
-- name: Debug Cachix
-  run: |
-    echo "Auth token configured: ${{ secrets.CACHIX_AUTH != '' }}"
-    echo "Is fork PR: ${{ github.event.pull_request.head.repo.fork }}"
-```
-
-### Public Key Mismatch
-
-**Symptom:** Error about untrusted public key
-
-**Solution:**
-1. Get the correct public key from [app.cachix.org](https://app.cachix.org/cache/nanna-coder).
-2. Update the `publicKey` in `flake.nix` (search for `nanna-coder.cachix.org`).
-3. Update local config: `nix run .#setup-cache`.
-
-## Cost Analysis
-
-### Cachix Free Tier
-
-**Limits:**
-- 5 GB storage
-- 10 GB/month bandwidth
-
-**Recommended for:**
-- Small projects
-- Open source projects
-- Personal development
-
-### Cachix Pro
-
-**Features:**
-- Unlimited storage
-- Unlimited bandwidth
-- Priority support
-
-**Recommended for:**
-- Large projects (>5GB artifacts)
-- High traffic projects
-- Enterprise use
-
-### Cost Comparison
-
-| Solution | Storage | Bandwidth | Cost |
-|----------|---------|-----------|------|
-| GitHub Actions Cache | 10GB | Unlimited | Free |
-| Cachix Free | 5GB | 10GB/month | Free |
-| Cachix Pro | Unlimited | Unlimited | $29/month |
-
-**Optimization Tips:**
-- Use `pushFilter` to exclude large artifacts
-- Monitor bandwidth with cache-analytics
-- Consider hybrid approach for very large projects
-
-## Migration Checklist
-
-- [x] Create Cachix cache at app.cachix.org
-- [x] Obtain public signing key
-- [x] Update flake.nix with real public key
-- [x] Add CACHIX_AUTH to GitHub secrets
-- [x] Update all workflows to use cachix-action@v15
-- [x] Remove cache-nix-action references
-- [x] Test cache in CI
-- [x] Verify developer setup works
-- [x] Monitor cache hit rates
-- [x] Document setup process
+For day-to-day cache operation issues (auth failures, cache misses), see the troubleshooting section of [CACHE_STRATEGY.md](./CACHE_STRATEGY.md).
 
 ## References
 
-- [Cachix Documentation](https://docs.cachix.org/)
-- [cachix-action GitHub](https://github.com/cachix/cachix-action)
-- [Nix Binary Cache Documentation](https://nixos.org/manual/nix/stable/command-ref/conf-file.html#conf-substituters)
-- [CACHIX_SETUP.md](../CACHIX_SETUP.md) - Setup instructions
+- [Cachix docs](https://docs.cachix.org/)
+- [cachix-action](https://github.com/cachix/cachix-action)
+- [Nix substituters](https://nixos.org/manual/nix/stable/command-ref/conf-file.html#conf-substituters)
+- Setup: [../CACHIX_SETUP.md](../CACHIX_SETUP.md)
