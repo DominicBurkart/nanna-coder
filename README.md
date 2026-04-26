@@ -49,8 +49,8 @@ curl -fsSL https://ollama.ai/install.sh | sh
 # Pull the default model
 ollama pull qwen3:0.6b
 
-# Verify Ollama is running
-nix develop --command cargo run --bin harness -- health
+# Start the Ollama server (must be running for agent commands and evals)
+ollama serve
 ```
 
 ### Running the Agent
@@ -70,6 +70,18 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 
 ```bash
 nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
+```
+
+### Running Eval Tests
+
+With Ollama running and a model pulled (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
+
+```bash
+nix develop --command cargo nextest run \
+  --workspace --features eval-runner \
+  --run-ignored ignored-only \
+  -E 'test(eval_runner)' \
+  --test-threads=1
 ```
 
 ### Using Cachix (Optional but Recommended)

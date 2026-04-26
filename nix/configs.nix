@@ -71,7 +71,7 @@ let
           depends_on:
             ollama:
               condition: service_healthy
-          command: ["harness", "chat", "--model", "llama3.1:8b", "--tools"]
+          command: ["harness", "chat", "--model", "gemma4:e4b", "--tools"]
 
       volumes:
         ollama_data:
