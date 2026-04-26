@@ -326,14 +326,26 @@ mod tests {
 
     #[test]
     fn test_decision_parse_query() {
-        assert_eq!(DecisionPrompt::parse_response("QUERY - need more context"), Some(true));
-        assert_eq!(DecisionPrompt::parse_response("query for additional entities"), Some(true));
+        assert_eq!(
+            DecisionPrompt::parse_response("QUERY - need more context"),
+            Some(true)
+        );
+        assert_eq!(
+            DecisionPrompt::parse_response("query for additional entities"),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_decision_parse_proceed() {
-        assert_eq!(DecisionPrompt::parse_response("PROCEED with the action"), Some(false));
-        assert_eq!(DecisionPrompt::parse_response("proceed to next step"), Some(false));
+        assert_eq!(
+            DecisionPrompt::parse_response("PROCEED with the action"),
+            Some(false)
+        );
+        assert_eq!(
+            DecisionPrompt::parse_response("proceed to next step"),
+            Some(false)
+        );
     }
 
     #[test]
@@ -379,14 +391,26 @@ mod tests {
 
     #[test]
     fn test_completion_parse_complete() {
-        assert_eq!(CompletionPrompt::parse_response("COMPLETE - task finished"), Some(true));
-        assert_eq!(CompletionPrompt::parse_response("complete, all done"), Some(true));
+        assert_eq!(
+            CompletionPrompt::parse_response("COMPLETE - task finished"),
+            Some(true)
+        );
+        assert_eq!(
+            CompletionPrompt::parse_response("complete, all done"),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_completion_parse_incomplete() {
-        assert_eq!(CompletionPrompt::parse_response("INCOMPLETE - more work needed"), Some(false));
-        assert_eq!(CompletionPrompt::parse_response("incomplete, still working"), Some(false));
+        assert_eq!(
+            CompletionPrompt::parse_response("INCOMPLETE - more work needed"),
+            Some(false)
+        );
+        assert_eq!(
+            CompletionPrompt::parse_response("incomplete, still working"),
+            Some(false)
+        );
     }
 
     #[test]
@@ -407,7 +431,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(CompletionPrompt::parse_response("COMPLETE INCOMPLETE"), None);
+        assert_eq!(
+            CompletionPrompt::parse_response("COMPLETE INCOMPLETE"),
+            None
+        );
     }
 
     // ===== Integration Tests =====
