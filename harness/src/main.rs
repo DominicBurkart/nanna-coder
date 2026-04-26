@@ -7,11 +7,6 @@ use model::prelude::*;
 use std::io::{self, Write};
 use tracing::{error, info};
 
-// NOTE: `main.rs` binds the workspace entity store to `InMemoryEntityStore`
-// concretely today, but the downstream callers accept any `EntityStore` via
-// generics (see `AgentLoop<S>` and `interactive_chat`). Issue #193 Phase B
-// will introduce `PersistentEntityStore` and swap the binding here.
-
 #[derive(Parser)]
 #[command(name = "harness")]
 #[command(about = "A CLI tool for interacting with language models")]
