@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use harness::agent::agents_md::AgentsMdDoc;
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
@@ -93,7 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             temperature,
         } => {
-            let entity_store = initialize_workspace(&workspace_root).await;
+            // Chat path: load guidance once here for entity-store injection;
+            // the session system prompt uses the same doc via
+            // `build_session_system_prompt_from_doc`.
+            let guidance = load_and_log_repo_guidance(&workspace_root);
+            let entity_store = initialize_workspace(&workspace_root, guidance.as_ref()).await;
 
             if let Some(initial_prompt) = prompt {
                 single_chat(
@@ -158,7 +163,41 @@ fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     harness::tools::create_tool_registry(workspace_root)
 }
 
-async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
+/// Load repo-level agent guidance from `workspace_root` exactly once.
+///
+/// Logs a structured `info` event on success (path + source filename) and a
+/// structured `error` event on I/O failure, then returns the loaded doc (or
+/// `None` when neither `AGENTS.md` nor `CLAUDE.md` is present).
+///
+/// All callers within a single session should share the returned value rather
+/// than calling `agents_md::load` independently, so the file is only read
+/// once per session.
+fn load_and_log_repo_guidance(workspace_root: &std::path::Path) -> Option<AgentsMdDoc> {
+    match harness::agent::agents_md::load(workspace_root) {
+        Ok(Some(doc)) => {
+            info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance"
+            );
+            Some(doc)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md; continuing without repo guidance"
+            );
+            None
+        }
+    }
+}
+
+async fn initialize_workspace(
+    workspace_root: &std::path::Path,
+    guidance: Option<&AgentsMdDoc>,
+) -> InMemoryEntityStore {
     let mut store = InMemoryEntityStore::new();
 
     if let Some(git_repo) = GitRepository::detect(workspace_root) {
@@ -176,7 +215,7 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
     // entity store as a `ContextEntity` so tool-accessible retrieval paths
     // (RAG, entity queries) can discover it the same way as conversation
     // history and tool-call records. See issue #231.
-    store_repo_guidance_entity(workspace_root, &mut store).await;
+    store_repo_guidance_entity(guidance, &mut store).await;
 
     let scanner = WorkspaceScanner::new();
     match scanner.scan_workspace(workspace_root, &mut store).await {
@@ -191,45 +230,40 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
     store
 }
 
+/// Inject a pre-loaded guidance document into `store` as a `ContextEntity`.
+///
+/// Accepts `None` silently so callers that have already established there is
+/// no guidance file can skip this without an extra branch.
 async fn store_repo_guidance_entity(
-    workspace_root: &std::path::Path,
+    guidance: Option<&AgentsMdDoc>,
     store: &mut InMemoryEntityStore,
 ) {
     use harness::entities::context::types::ContextEntity;
 
-    match harness::agent::agents_md::load(workspace_root) {
-        Ok(Some(doc)) => {
-            let mut entity = ContextEntity::new(
-                format!("repo-guidance:{}", doc.source.filename()),
-                Vec::new(),
-                Vec::new(),
-                doc.body.clone(),
-                "n/a".to_string(),
-            );
-            entity
-                .metadata
-                .tags
-                .push(format!("agents-md:{}", doc.source.filename()));
-            if doc.truncated {
-                entity.metadata.tags.push("truncated".to_string());
-            }
-            if let Err(e) = store.store(Box::new(entity)).await {
-                error!("Failed to store AGENTS.md entity: {}", e);
-            } else {
-                info!(
-                    path = %doc.path.display(),
-                    source = doc.source.filename(),
-                    "Stored repo-level agent guidance entity"
-                );
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            error!(
-                error = %e,
-                "Failed to read AGENTS.md / CLAUDE.md; skipping entity injection"
-            );
-        }
+    let Some(doc) = guidance else { return };
+
+    let mut entity = ContextEntity::new(
+        format!("repo-guidance:{}", doc.source.filename()),
+        Vec::new(),
+        Vec::new(),
+        doc.body.clone(),
+        "n/a".to_string(),
+    );
+    entity
+        .metadata
+        .tags
+        .push(format!("agents-md:{}", doc.source.filename()));
+    if doc.truncated {
+        entity.metadata.tags.push("truncated".to_string());
+    }
+    if let Err(e) = store.store(Box::new(entity)).await {
+        error!("Failed to store AGENTS.md entity: {}", e);
+    } else {
+        info!(
+            path = %doc.path.display(),
+            source = doc.source.filename(),
+            "Stored repo-level agent guidance entity"
+        );
     }
 }
 
@@ -444,11 +478,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -462,36 +496,20 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 /// task-dispatch path (`harness/src/task.rs`) share a single source of truth.
 const DEFAULT_SESSION_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
 
-/// Build the system prompt for a session, appending any repo-level guidance
-/// discovered under `workspace_root` (closes #231).
+/// Build the system prompt for a session from a pre-loaded guidance document.
 ///
-/// Precedence is enforced by [`harness::agent::agents_md::load`]: `AGENTS.md`
-/// wins over `CLAUDE.md`. Missing files produce no injection and no error.
-/// Read errors are logged and swallowed so a broken guidance file never blocks
-/// a session from starting.
-fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
-    match harness::agent::agents_md::load(workspace_root) {
-        Ok(Some(doc)) => {
-            info!(
-                path = %doc.path.display(),
-                source = doc.source.filename(),
-                truncated = doc.truncated,
-                "Loaded repo-level agent guidance into session system prompt"
-            );
-            format!(
-                "{}\n\n{}",
-                DEFAULT_SESSION_SYSTEM_PROMPT,
-                harness::agent::agents_md::format_system_prompt_fragment(&doc)
-            )
-        }
-        Ok(None) => DEFAULT_SESSION_SYSTEM_PROMPT.to_string(),
-        Err(e) => {
-            error!(
-                error = %e,
-                "Failed to read AGENTS.md / CLAUDE.md; continuing without repo guidance"
-            );
-            DEFAULT_SESSION_SYSTEM_PROMPT.to_string()
-        }
+/// Accepts the same `Option<AgentsMdDoc>` returned by
+/// `load_and_log_repo_guidance` so the file is only read once per session
+/// (fixes the duplicate `agents_md::load` calls that previously existed in
+/// `build_session_system_prompt` and `store_repo_guidance_entity`).
+fn build_session_system_prompt_from_doc(guidance: Option<&AgentsMdDoc>) -> String {
+    match guidance {
+        Some(doc) => format!(
+            "{}\n\n{}",
+            DEFAULT_SESSION_SYSTEM_PROMPT,
+            harness::agent::agents_md::format_system_prompt_fragment(doc)
+        ),
+        None => DEFAULT_SESSION_SYSTEM_PROMPT.to_string(),
     }
 }
 
@@ -508,12 +526,17 @@ async fn run_agent(
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let entity_store = initialize_workspace(workspace_root).await;
+
+    // Load repo-level guidance exactly once; share the result between the
+    // entity-store injection and the session system prompt so the file is
+    // only read from disk a single time.
+    let guidance = load_and_log_repo_guidance(workspace_root);
+    let entity_store = initialize_workspace(workspace_root, guidance.as_ref()).await;
 
     let agent_config = AgentConfig {
         max_iterations,
         verbose,
-        system_prompt: build_session_system_prompt(workspace_root),
+        system_prompt: build_session_system_prompt_from_doc(guidance.as_ref()),
         model_name: model.to_string(),
     };
 
