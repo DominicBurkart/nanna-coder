@@ -5,9 +5,10 @@ The CI pipeline lives in `.github/workflows/ci.yml`. For the cache strategy that
 ## Job graph
 
 ```
-test-matrix    (unit, integration, lint, security)
-build-matrix   (x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin)
-build-containers (harness, ollama, qwen3-container, llama3-container)
+prebuild-deps    (builds Rust toolchain + cargo deps once; populates Cachix; gates all matrix jobs)
+├── test-matrix    (unit, integration, lint, security)
+├── build-matrix   (x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin)
+└── build-containers (harness, ollama, qwen3-container, llama3-container)
 benchmark        (main only)
 cache-maintenance (main only)
 ci-summary       (always; aggregates status)
@@ -15,6 +16,10 @@ release          (on GitHub release events)
 ```
 
 The total matrix is roughly 30 parallel jobs.
+
+## `prebuild-deps`
+
+Runs first, before all matrix jobs. Builds the Rust toolchain and all cargo dependencies once, then pushes the results to the Cachix binary cache (`nanna-coder`) under the key `cachix-v1-deps-{flake.lock}-{Cargo.lock}`. Outputs a `cache-key` value consumed by every downstream job. Because this job gates `test-matrix`, `build-matrix`, and `build-containers`, a cache miss here adds one build step rather than repeating it across the full ~30-job matrix.
 
 ## `test-matrix`
 
