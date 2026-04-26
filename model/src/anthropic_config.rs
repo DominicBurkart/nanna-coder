@@ -151,5 +151,8 @@ mod tests {
         let deserialized: AnthropicConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.model, deserialized.model);
         assert_eq!(config.base_url, deserialized.base_url);
+        // api_key must never appear in serialized output (skip_serializing + default)
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("sk-test"));
     }
 }
