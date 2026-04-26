@@ -18,33 +18,33 @@ path = "src/main.rs"
 eval-runner = ["tempfile"]
 
 [dependencies]
-async-trait = "0.1"
+async-trait = { workspace = true }
 clap = { version = "4.0", features = ["derive"] }
 image-builder = { path = "../image-builder" }
 model = { path = "../model" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", features = ["serde"] }
-rand = "0.9"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
 git2 = "0.20"
 glob = "0.3"
 regex = "1.0"
-tempfile = { version = "3.0", optional = true }
+tempfile = { workspace = true, optional = true }
 toml = "0.8"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+reqwest = { workspace = true, features = ["blocking"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }
 serial_test = "3.4"
-tempfile = "3.0"
+tempfile = { workspace = true }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
