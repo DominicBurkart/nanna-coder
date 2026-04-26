@@ -14,6 +14,13 @@ pub mod telemetry;
 pub mod tools;
 pub mod workspace;
 
+/// Default system prompt used when a repo does not supply any repo-level
+/// guidance (no `AGENTS.md` / `CLAUDE.md`). Defined here — in the library
+/// root — so that both the binary entry-point (`main.rs`) and the
+/// task-dispatch path (`task.rs`) share a single source of truth instead of
+/// maintaining in-sync copies.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
