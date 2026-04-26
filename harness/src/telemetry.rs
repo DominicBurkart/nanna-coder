@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Telemetry system errors
 #[derive(Error, Debug)]
@@ -606,26 +605,6 @@ impl TelemetrySystem {
             return Ok(());
         }
 
-        // Initialize structured logging
-        if self.config.enable_logging {
-            let filter = EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&self.config.log_level));
-
-            let subscriber = FmtSubscriber::builder()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .finish();
-
-            tracing::subscriber::set_global_default(subscriber).map_err(|e| {
-                TelemetryError::InitializationFailed {
-                    reason: format!("Failed to set tracing subscriber: {}", e),
-                }
-            })?;
-        }
-
         // Add default Prometheus exporter if configured
         if let Some(endpoint) = &self.config.export_endpoints.prometheus_endpoint {
             let prometheus_exporter = PrometheusExporter::new(Some(endpoint.clone()));
@@ -936,17 +915,8 @@ mod tests {
             .with_version("1.0.0")
             .with_environment("test");
 
-        // In test environments, the tracing subscriber may already be initialized
-        match telemetry.initialize().await {
-            Ok(_) => assert!(telemetry.initialized),
-            Err(TelemetryError::InitializationFailed { reason })
-                if reason.contains("global default trace dispatcher has already been set") =>
-            {
-                // This is expected in parallel test runs - consider the test successful
-                println!("Tracing subscriber already initialized (expected in CI)");
-            }
-            Err(e) => panic!("Unexpected initialization error: {}", e),
-        }
+        assert_eq!(telemetry.initialize().await, Ok(()));
+        assert!(telemetry.initialized);
     }
 
     #[tokio::test]
