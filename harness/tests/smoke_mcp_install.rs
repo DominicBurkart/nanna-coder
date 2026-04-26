@@ -209,6 +209,7 @@ fn test_mcp_stdio_tools_list() {
         let tool_names: Vec<String> = match serde_json::from_str::<serde_json::Value>(&list_resp) {
             Ok(v) => v["result"]["tools"]
                 .as_array()
+                .map(Vec::as_slice)
                 .unwrap_or(&[])
                 .iter()
                 .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
