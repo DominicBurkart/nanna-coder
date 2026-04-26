@@ -3,10 +3,13 @@ pub mod container;
 pub mod entities;
 pub mod eval;
 pub mod mcp;
+#[cfg(feature = "observability")]
 pub mod monitoring;
+#[cfg(feature = "observability")]
 pub mod observability;
 pub mod onboarding;
 pub mod task;
+#[cfg(feature = "observability")]
 pub mod telemetry;
 pub mod tools;
 pub mod workspace;
@@ -16,15 +19,18 @@ pub use container::{
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
+#[cfg(feature = "observability")]
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
     MonitoringError, MonitoringSystem, SystemStatus,
 };
+#[cfg(feature = "observability")]
 pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
 };
+#[cfg(feature = "observability")]
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
