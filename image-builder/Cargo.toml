@@ -10,10 +10,10 @@ repository.workspace = true
 [lib]
 
 [dependencies]
-thiserror = "1.0"
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
