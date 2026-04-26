@@ -230,6 +230,27 @@ let
     };
   };
 
+  assertRealModelHash = modelKey: modelInfo:
+    if (lib.hasInfix "0000000000000000000000000000000000000000000" modelInfo.hash) then
+      throw ''
+        Model `${modelInfo.name}` (key=${modelKey}) is using the all-zeros
+        placeholder sha256 in nix/containers.nix. Production model paths
+        require a real, content-addressed hash so the weights are baked
+        into the image and pushed to the binary cache.
+
+        Capture the real hash by running, on a machine with network +
+        Ollama installed:
+
+            scripts/update-model-sha256.sh ${modelKey}
+
+        See nix/README.md ("Capturing a model sha256") and issue #240.
+      ''
+    else
+      modelInfo;
+
+  createStrictModelDerivation = modelKey: modelInfo:
+    createModelDerivation modelKey (assertRealModelHash modelKey modelInfo);
+
   # Function to create a model derivation with proper caching
   createModelDerivation = modelKey: modelInfo:
     # Use conditional logic to handle placeholder hashes
@@ -333,6 +354,13 @@ let
     gemma-model = createModelDerivation "gemma" modelRegistry.gemma;
   };
 
+  strictModels = {
+    qwen3-model-strict = createStrictModelDerivation "qwen3" modelRegistry.qwen3;
+    llama3-model-strict = createStrictModelDerivation "llama3" modelRegistry.llama3;
+    mistral-model-strict = createStrictModelDerivation "mistral" modelRegistry.mistral;
+    gemma-model-strict = createStrictModelDerivation "gemma" modelRegistry.gemma;
+  };
+
   # Multi-model containers with pre-cached models
   containers = {
     qwen3-container = nix2containerPkgs.nix2container.buildImage {
@@ -419,5 +447,5 @@ let
 in
 {
   inherit harnessImage ollamaImage vllmImage devContainerImage;
-  inherit modelRegistry models containers;
+  inherit modelRegistry models strictModels containers;
 }

@@ -51,8 +51,28 @@ Verify with a clean build:
 
 ```sh
 nix build .#gemma-model              # should succeed now
+nix build .#gemma-model-strict       # also succeeds; throws if hash is still placeholder
 nix build .#gemma-container          # pre-baked image
 ```
+
+### Strict variants (`*-model-strict`)
+
+For every entry under `containers.models` there is a parallel
+`containers.strictModels` entry exposed at the flake's package level as
+`<key>-model-strict`. The strict derivation routes the model info
+through `assertRealModelHash` first, which `throw`s with a reproduction
+recipe whenever the registered hash is still the all-zeros placeholder.
+
+Use the strict variant whenever an empty `$out/models` would be a latent
+bug rather than an intentional dev shortcut — for example, release
+container images, cached production paths, or as an acceptance check
+after running `scripts/update-model-sha256.sh`. The default
+`<key>-model` and `<key>-container` attributes still fall back to the
+dev-mode stub on placeholder hashes; strict variants do not.
+
+If you add a new model to `modelRegistry`, also wire it into both
+`models` and `strictModels` in `nix/containers.nix`, and inherit it in
+`flake.nix` alongside the existing entries.
 
 ### Why not `nix-prefetch-url`?
 
