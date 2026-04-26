@@ -233,6 +233,57 @@ async fn store_repo_guidance_entity(
     }
 }
 
+/// Execute all tool calls in `tool_calls`, append the assistant turn and each
+/// tool-response turn to `messages`, and print a result line using
+/// `result_label` (e.g. `"Result"` or `"->"`).  Returns `true` if any tool
+/// calls were present (so callers can `continue` their chat loop).
+///
+/// This helper was extracted to deduplicate the identical dispatch blocks that
+/// previously existed in both `single_chat` and `interactive_chat`.
+async fn finish_run(
+    tool_registry: &ToolRegistry,
+    tool_calls: &[model::prelude::ToolCall],
+    assistant_message: ChatMessage,
+    messages: &mut Vec<ChatMessage>,
+    result_label: &str,
+) -> bool {
+    if tool_calls.is_empty() {
+        return false;
+    }
+    for tool_call in tool_calls {
+        println!(
+            "  Calling {}: {:?}",
+            tool_call.function.name, tool_call.function.arguments
+        );
+
+        match tool_registry
+            .execute(
+                &tool_call.function.name,
+                tool_call.function.arguments.clone(),
+            )
+            .await
+        {
+            Ok(result) => {
+                println!("  {}: {}", result_label, result);
+                messages.push(assistant_message.clone());
+                messages.push(ChatMessage::tool_response(
+                    tool_call.id.clone(),
+                    result.to_string(),
+                ));
+            }
+            Err(e) => {
+                error!("Tool execution failed: {}", e);
+                messages.push(assistant_message.clone());
+                messages.push(ChatMessage::tool_response(
+                    tool_call.id.clone(),
+                    format!("Error: {}", e),
+                ));
+            }
+        }
+    }
+    true
+}
+
 async fn single_chat(
     provider: &OllamaProvider,
     tool_registry: &ToolRegistry,
@@ -260,39 +311,17 @@ async fn single_chat(
 
         if let Some(tool_calls) = &choice.message.tool_calls {
             println!("\nTool calls:");
-            for tool_call in tool_calls {
-                println!(
-                    "  Calling {}: {:?}",
-                    tool_call.function.name, tool_call.function.arguments
-                );
-
-                match tool_registry
-                    .execute(
-                        &tool_call.function.name,
-                        tool_call.function.arguments.clone(),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        println!("  Result: {}", result);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            result.to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        error!("Tool execution failed: {}", e);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
-                            tool_call.id.clone(),
-                            format!("Error: {}", e),
-                        ));
-                    }
-                }
+            if finish_run(
+                tool_registry,
+                tool_calls,
+                choice.message.clone(),
+                &mut messages,
+                "Result",
+            )
+            .await
+            {
+                continue;
             }
-
-            continue;
         }
 
         break;
@@ -358,39 +387,18 @@ async fn interactive_chat<S: EntityStore + Send>(
 
             if let Some(tool_calls) = &choice.message.tool_calls {
                 println!("\n[Tool calls]");
-                for tool_call in tool_calls {
-                    println!(
-                        "  Calling {}: {:?}",
-                        tool_call.function.name, tool_call.function.arguments
-                    );
-
-                    match tool_registry
-                        .execute(
-                            &tool_call.function.name,
-                            tool_call.function.arguments.clone(),
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            println!("  -> {}", result);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                result.to_string(),
-                            ));
-                        }
-                        Err(e) => {
-                            error!("Tool execution failed: {}", e);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
-                                tool_call.id.clone(),
-                                format!("Error: {}", e),
-                            ));
-                        }
-                    }
+                if finish_run(
+                    tool_registry,
+                    tool_calls,
+                    choice.message.clone(),
+                    &mut messages,
+                    "->",
+                )
+                .await
+                {
+                    println!();
+                    continue;
                 }
-                println!();
-                continue;
             }
 
             messages.push(choice.message.clone());
@@ -444,11 +452,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
