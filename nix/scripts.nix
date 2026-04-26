@@ -69,12 +69,10 @@ let
       echo ""
       echo "💡 Usage:"
       echo "  nix build .#qwen3-model     # Cache qwen3 model"
-      echo "  nix build .#llama3-model    # Cache llama3 model"
-      echo "  nix build .#mistral-model   # Cache mistral model"
       echo "  nix build .#gemma-model     # Cache gemma model"
       echo ""
       echo "  nix build .#ollama-qwen3    # Pre-built container with qwen3"
-      echo "  nix build .#ollama-llama3   # Pre-built container with llama3"
+      echo "  nix build .#ollama-gemma    # Pre-built container with gemma"
     '';
 
     # Script to clean up old cached models
