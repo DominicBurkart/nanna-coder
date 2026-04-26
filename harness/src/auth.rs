@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::TryRngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -52,7 +52,9 @@ impl std::fmt::Debug for AuthToken {
 impl AuthToken {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OsRng failed to generate random bytes");
         let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         Self(hex)
     }
