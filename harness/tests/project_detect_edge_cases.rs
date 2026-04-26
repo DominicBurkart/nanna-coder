@@ -7,12 +7,11 @@
 //!
 //! * `detect_package_json` — mocha via `devDependencies`, and the fallback when
 //!   the JSON is malformed.
-//! * `detect_requirements_txt` — `pytest[extras]>=7` (bracket-qualified version
+//! * `detect_requirements_txt` — `pytest[cov]>=7` (bracket-qualified version
 //!   spec, exercises the `[\[` arm of the regex).
 //! * `detect_pyproject_toml` — bare `[tool.pytest]` table without an
 //!   `ini_options` sub-table (exercises the `tool.contains_key("pytest")` branch
-//!   that `detect_pyproject_toml` tests never reach with only the `ini_options`
-//!   path).
+//!   that the existing test never reaches with only the `ini_options` path).
 //! * `detect_github_workflows` — `.yaml` extension accepted; non-yml/yaml files
 //!   skipped; duplicate CI expectations across two workflow files are emitted
 //!   only once.
@@ -127,13 +126,12 @@ fn github_workflows_yaml_extension_is_scanned() {
 #[test]
 fn github_workflows_non_yaml_files_are_ignored() {
     let dir = tempdir().unwrap();
-    // This JSON file mentions cargo commands — should be ignored.
+    // These files mention cargo commands but must be ignored.
     write(
         dir.path(),
         ".github/workflows/config.json",
         r#"{"run":"cargo fmt && cargo nextest run"}"#,
     );
-    // Also a `.toml` file.
     write(
         dir.path(),
         ".github/workflows/config.toml",
@@ -151,7 +149,6 @@ fn github_workflows_non_yaml_files_are_ignored() {
 #[test]
 fn github_workflows_duplicate_expectations_deduplicated() {
     let dir = tempdir().unwrap();
-    // Two independent workflow files, each mentioning `cargo fmt`.
     write(
         dir.path(),
         ".github/workflows/lint.yml",
@@ -195,12 +192,16 @@ fn detect_deduplicates_python_from_multiple_sources() {
 }
 
 // ── mcp server ────────────────────────────────────────────────────────────────
+//
+// Tests here exercise the `serve()` public API end-to-end. `process_line` is
+// intentionally private; routing through `serve` is the correct external
+// interface.
 
 mod mcp_edge_cases {
     use async_trait::async_trait;
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
-    use model::provider::{ModelResult, ModelProvider};
+    use model::provider::{ModelProvider, ModelResult};
     use model::types::{ChatRequest, ChatResponse, ModelInfo};
     use std::sync::Arc;
 
@@ -231,20 +232,33 @@ mod mcp_edge_cases {
         )
     }
 
+    /// Drive a single newline-terminated JSON-RPC request through `serve` and
+    /// return the parsed response. Panics if `serve` errors or if the output
+    /// is not valid JSON.
+    async fn round_trip(request_line: &str) -> serde_json::Value {
+        let input = request_line.as_bytes().to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(std::io::Cursor::new(input), &mut output)
+            .await
+            .expect("serve must not error");
+        let text = std::str::from_utf8(&output).expect("output must be utf-8");
+        // `serve` writes one newline-terminated JSON object per response.
+        let line = text
+            .lines()
+            .next()
+            .expect("serve must produce at least one response line");
+        serde_json::from_str(line).expect("response must be valid JSON")
+    }
+
     /// A JSON-RPC request with `"jsonrpc": "1.0"` must be rejected with
-    /// error code -32600 (Invalid Request), not -32601 (Method Not Found) or
-    /// a panic.
+    /// error code -32600 (Invalid Request).
     #[tokio::test]
     async fn invalid_jsonrpc_version_returns_32600() {
-        let line =
-            "{\"jsonrpc\":\"1.0\",\"id\":99,\"method\":\"tools/list\",\"params\":{}}\n";
-        let bytes = make_server()
-            .process_line(line)
-            .await
-            .unwrap()
-            .expect("should produce a response for a request with an id");
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be valid JSON");
+        let v = round_trip(
+            "{\"jsonrpc\":\"1.0\",\"id\":99,\"method\":\"tools/list\",\"params\":{}}\n",
+        )
+        .await;
         assert_eq!(
             v["error"]["code"], -32600,
             "expected -32600 for bad JSON-RPC version: {v}"
@@ -252,20 +266,14 @@ mod mcp_edge_cases {
         assert_eq!(v["id"], 99);
     }
 
-    /// A `tools/call` request with no `name` field in the arguments must
-    /// return error code -32602 (Invalid Params) rather than panicking or
-    /// routing to an unknown tool.
+    /// A `tools/call` request with no `name` field must return error code
+    /// -32602 (Invalid Params) rather than panicking.
     #[tokio::test]
     async fn tools_call_missing_name_returns_32602() {
-        let line =
-            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"arguments\":{}}}\n";
-        let bytes = make_server()
-            .process_line(line)
-            .await
-            .unwrap()
-            .expect("should produce a response");
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be valid JSON");
+        let v = round_trip(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"arguments\":{}}}\n",
+        )
+        .await;
         assert_eq!(
             v["error"]["code"], -32602,
             "expected -32602 for missing tool name: {v}"
