@@ -38,7 +38,8 @@ pub struct SweBenchInstanceResult {
     pub resolved: bool,
     /// Token usage from the Claude model
     pub claude_token_usage: TokenUsage,
-    /// Token usage from the nanna orchestrator model, if any
+    /// Token usage from the nanna orchestrator model, if any.
+    // TODO: surface nanna_token_usage in reports (detail table + summary)
     pub nanna_token_usage: Option<TokenUsage>,
     /// Wall-clock time in seconds
     pub wall_time_secs: f64,
@@ -91,7 +92,8 @@ impl SweBenchRunResult {
         total / self.instances.len() as f64
     }
 
-    /// Average Claude tokens per resolved instance. Returns 0 if none resolved.
+    /// Average Claude tokens per resolved instance (integer division, truncated).
+    /// Returns 0 if none resolved.
     pub fn tokens_per_resolved(&self) -> u64 {
         let resolved = self.resolved_count();
         if resolved == 0 {

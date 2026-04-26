@@ -4,11 +4,11 @@
 //! by the agent evaluation framework in [`crate::agent::eval`].
 
 pub mod report;
+#[cfg(feature = "eval-runner")]
+pub mod runner;
 pub mod swebench;
 pub mod swebench_report;
 pub mod swebench_results;
-#[cfg(feature = "eval-runner")]
-pub mod runner;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
