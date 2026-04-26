@@ -170,7 +170,7 @@
 
           # Multi-model cache system (Ollama - legacy)
           inherit (containers.models) qwen3-model llama3-model mistral-model gemma-model;
-          inherit (containers.strictModels) qwen3-model-strict llama3-model-strict mistral-model-strict gemma-model-strict;
+          inherit (containers.strictModels) qwen3-model-strict gemma-model-strict;
 
           # Multi-model containers (Ollama - legacy)
           inherit (containers.containers) qwen3-container llama3-container mistral-container gemma-container;

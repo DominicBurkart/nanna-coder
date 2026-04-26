@@ -356,8 +356,6 @@ let
 
   strictModels = {
     qwen3-model-strict = createStrictModelDerivation "qwen3" modelRegistry.qwen3;
-    llama3-model-strict = createStrictModelDerivation "llama3" modelRegistry.llama3;
-    mistral-model-strict = createStrictModelDerivation "mistral" modelRegistry.mistral;
     gemma-model-strict = createStrictModelDerivation "gemma" modelRegistry.gemma;
   };
 
