@@ -100,7 +100,7 @@ cachix-v1-deps-{flake-hash}-{cargo-hash}
 
 All workflows using Cachix require authentication to push to the binary cache:
 
-- **Secret Required**: `CACHIX_AUTH_TOKEN` must be configured in repository secrets
+- **Secret Required**: `CACHIX_AUTH` must be configured in repository secrets
 - **Cache Name**: `nanna-coder` (configured in workflows)
 - **Action**: `cachix/cachix-action@v15`
 
@@ -109,7 +109,7 @@ Example workflow configuration:
 - uses: cachix/cachix-action@v15
   with:
     name: nanna-coder
-    authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    authToken: '${{ secrets.CACHIX_AUTH }}'
 ```
 
 ### Cachix Dashboard
@@ -211,7 +211,7 @@ gh workflow run cache-warming.yml -f force_rebuild=true
 
 **Problem: Cachix Authentication Failed**
 ```bash
-# Verify CACHIX_AUTH_TOKEN secret is configured
+# Verify CACHIX_AUTH secret is configured
 gh secret list | grep CACHIX
 
 # Test authentication locally
@@ -254,7 +254,7 @@ open https://nanna-coder.cachix.org
 
 **Problem: Unable to Push to Cachix**
 ```bash
-# Verify push permissions for CACHIX_AUTH_TOKEN
+# Verify push permissions for CACHIX_AUTH
 # Token must have write access to nanna-coder cache
 
 # Check workflow logs for push errors
@@ -310,11 +310,11 @@ grep "name: nanna-coder" .github/workflows/*.yml
    ```
 
 3. **Manage Cachix authentication**
-   - Rotate `CACHIX_AUTH_TOKEN` periodically
+   - Rotate `CACHIX_AUTH` periodically
    - Verify token has write permissions
    - Update secret if authentication issues arise:
      ```bash
-     gh secret set CACHIX_AUTH_TOKEN
+     gh secret set CACHIX_AUTH
      ```
 
 ## Migration Guide
@@ -328,7 +328,7 @@ The migration from GitHub Actions cache to Cachix provides:
 - **Enhanced monitoring** via Cachix dashboard
 
 Migration steps:
-1. Configure `CACHIX_AUTH_TOKEN` repository secret
+1. Configure `CACHIX_AUTH` repository secret
 2. Update workflows to use `cachix/cachix-action@v15`
 3. Change cache key prefix from `nix-v3-deps-` to `cachix-v1-deps-`
 4. Remove GitHub Actions cache configuration (e.g., `gc-max-store-size`)
@@ -354,7 +354,7 @@ If issues arise with Cachix:
    # - uses: cachix/cachix-action@v15
    #   with:
    #     name: nanna-coder
-   #     authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+   #     authToken: '${{ secrets.CACHIX_AUTH }}'
    ```
 
 3. Monitor rollback impact:

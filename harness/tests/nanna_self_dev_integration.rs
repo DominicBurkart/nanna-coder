@@ -17,7 +17,7 @@ use tokio::time::timeout;
 const MAX_ATTEMPTS: usize = 5;
 const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const E2E_MODEL: &str = "qwen3:0.6b";
+const E2E_MODEL: &str = "gemma4:e4b";
 const ORIGINAL_HELP_STRING: &str = "A CLI tool for interacting with language models";
 
 fn workspace_root() -> PathBuf {

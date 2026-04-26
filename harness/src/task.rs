@@ -10,11 +10,54 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
+
+/// Default system prompt used for task-dispatched agent runs.
+///
+/// Kept in lock-step with `DEFAULT_SESSION_SYSTEM_PROMPT` in `main.rs`. They
+/// are duplicated on purpose: `main.rs` is a `bin` target and cannot be
+/// imported from here.
+const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
+/// Build the system prompt for a task run, appending any repo-level guidance
+/// discovered under the task's workspace path (closes #231).
+///
+/// Precedence: `AGENTS.md` over `CLAUDE.md` (see
+/// [`crate::agent::agents_md::load`]). Missing files produce no injection;
+/// read errors are logged and swallowed so a broken guidance file never blocks
+/// a task from starting.
+fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+    match crate::agent::agents_md::load(workspace_path) {
+        Ok(Some(doc)) => {
+            tracing::info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance into task system prompt"
+            );
+            format!(
+                "{}\n\n{}",
+                DEFAULT_TASK_SYSTEM_PROMPT,
+                crate::agent::agents_md::format_system_prompt_fragment(&doc)
+            )
+        }
+        Ok(None) => DEFAULT_TASK_SYSTEM_PROMPT.to_string(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
+            );
+            DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
+/// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
+type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
@@ -122,6 +165,9 @@ pub struct TaskManager {
     handles: Arc<RwLock<HashMap<TaskId, tokio::task::AbortHandle>>>,
     max_concurrent: Arc<Semaphore>,
     progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
+    image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
+    /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
+    build_locks: BuildLocks,
 }
 
 impl TaskManager {
@@ -131,7 +177,92 @@ impl TaskManager {
             handles: Arc::new(RwLock::new(HashMap::new())),
             max_concurrent: Arc::new(Semaphore::new(max_concurrent_tasks)),
             progress: Arc::new(RwLock::new(HashMap::new())),
+            image_cache: Arc::new(RwLock::new(HashMap::new())),
+            build_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn get_or_build_image(
+        cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
+        build_locks: &BuildLocks,
+        repo_path: &std::path::Path,
+    ) -> Result<String, String> {
+        Self::get_or_build_image_using(cache, build_locks, repo_path, |source| {
+            let image_path =
+                image_builder::build_dev_container(source).map_err(|e| e.to_string())?;
+            let runtime = crate::container::detect_runtime();
+            crate::container::load_image_from_path(&runtime, &image_path).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Inner implementation of image acquisition that accepts a custom build+load
+    /// function.  Kept separate from `get_or_build_image` so the caching and
+    /// locking logic can be exercised in unit tests without a real Nix/container
+    /// environment.
+    async fn get_or_build_image_using<F>(
+        cache: &Arc<RwLock<HashMap<PathBuf, String>>>,
+        build_locks: &BuildLocks,
+        repo_path: &std::path::Path,
+        build_fn: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce(&std::path::Path) -> Result<String, String> + Send + 'static,
+    {
+        let canonical = repo_path.canonicalize().map_err(|e| e.to_string())?;
+
+        // Fast path: return cached image if already built.
+        {
+            let cache_read = cache.read().await;
+            if let Some(image_ref) = cache_read.get(&canonical) {
+                return Ok(image_ref.clone());
+            }
+        }
+
+        // Obtain (or create) a per-path build lock so only one task builds
+        // the image for a given repo at a time.
+        let path_lock = {
+            let mut locks = build_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(canonical.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _build_guard = path_lock.lock().await;
+
+        // Re-check cache now that we hold the per-path lock — another task
+        // may have completed the build while we were waiting.
+        {
+            let cache_read = cache.read().await;
+            if let Some(image_ref) = cache_read.get(&canonical) {
+                return Ok(image_ref.clone());
+            }
+        }
+
+        let source = canonical.clone();
+        let build_result = tokio::task::spawn_blocking(move || build_fn(&source))
+            .await
+            .map_err(|e| e.to_string());
+        let image_ref = match build_result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) | Err(e) => {
+                build_locks.lock().await.remove(&canonical);
+                return Err(e);
+            }
+        };
+
+        {
+            let mut cache_write = cache.write().await;
+            cache_write.insert(canonical.clone(), image_ref.clone());
+        }
+        // Remove the per-path build lock now that the image is cached; future
+        // callers will hit the fast path and no longer need the lock.
+        {
+            let mut locks = build_locks.lock().await;
+            locks.remove(&canonical);
+        }
+        Ok(image_ref)
     }
 
     pub async fn submit(
@@ -168,11 +299,23 @@ impl TaskManager {
         let handles_ref = Arc::clone(&self.handles);
         let progress_ref = Arc::clone(&self.progress);
         let semaphore = Arc::clone(&self.max_concurrent);
+        let image_cache_ref = Arc::clone(&self.image_cache);
+        let build_locks_ref = Arc::clone(&self.build_locks);
         let task_id_clone = task_id.clone();
 
         let mut handles_guard = self.handles.write().await;
         let join_handle = tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("Semaphore closed");
+
+            // Require both flake.nix AND .devcontainer/ to opt in to the
+            // container path, so that repos that merely happen to have a
+            // flake.nix are not affected. Use tokio::fs to avoid blocking.
+            let use_container = tokio::fs::try_exists(repo_path.join("flake.nix"))
+                .await
+                .unwrap_or(false)
+                && tokio::fs::try_exists(repo_path.join(".devcontainer"))
+                    .await
+                    .unwrap_or(false);
 
             {
                 let mut tasks = tasks_ref.write().await;
@@ -184,9 +327,54 @@ impl TaskManager {
                 }
             }
 
-            let workspace_result = TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch);
+            let workspace_result = if use_container {
+                let image_result =
+                    Self::get_or_build_image(&image_cache_ref, &build_locks_ref, &repo_path).await;
+                let image_ref = match image_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        {
+                            let mut h = handles_ref.write().await;
+                            h.remove(&task_id_clone);
+                        }
+                        {
+                            let mut p = progress_ref.write().await;
+                            p.remove(&task_id_clone);
+                        }
+                        let mut tasks = tasks_ref.write().await;
+                        if let Some(task) = tasks.get_mut(&task_id_clone) {
+                            task.status = TaskStatus::Failed {
+                                finished_at: Utc::now(),
+                                error: e.clone(),
+                                diagnostics: FailureDiagnostics {
+                                    error_type: "ContainerSetupFailed".to_string(),
+                                    iterations_completed: 0,
+                                    last_tool_call: None,
+                                    partial_changes: None,
+                                    tool_call_history: vec![],
+                                    last_agent_state: None,
+                                    conversation_snapshot: None,
+                                },
+                            };
+                        }
+                        return;
+                    }
+                };
+                TaskWorkspace::create_with_container(
+                    &repo_path,
+                    &task_id_clone.0,
+                    &branch,
+                    &image_ref,
+                )
+                .await
+                .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
+            } else {
+                TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch)
+                    .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
+            };
+
             match workspace_result {
-                Err(e) => {
+                Err((e, error_type)) => {
                     {
                         let mut handles = handles_ref.write().await;
                         handles.remove(&task_id_clone);
@@ -199,9 +387,9 @@ impl TaskManager {
                     if let Some(task) = tasks.get_mut(&task_id_clone) {
                         task.status = TaskStatus::Failed {
                             finished_at: Utc::now(),
-                            error: e.to_string(),
+                            error: e,
                             diagnostics: FailureDiagnostics {
-                                error_type: "WorkspaceCreationFailed".to_string(),
+                                error_type: error_type.to_string(),
                                 iterations_completed: 0,
                                 last_tool_call: None,
                                 partial_changes: None,
@@ -213,12 +401,12 @@ impl TaskManager {
                     }
                 }
                 Ok(mut workspace) => {
-                    let tool_registry = workspace.create_tool_registry();
+                    let tool_registry = workspace.build_tool_registry();
                     let entity_store = InMemoryEntityStore::new();
                     let agent_config = AgentConfig {
                         max_iterations,
                         verbose: false,
-                        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
+                        system_prompt: build_task_system_prompt(&workspace.workspace_path),
                         model_name: model.clone(),
                     };
                     let context = AgentContext {
@@ -776,5 +964,417 @@ mod tests {
         };
         let result = agent.run(context).await.unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), result.iterations);
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_workspace_creation_failure() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let nonexistent_repo = PathBuf::from("/nonexistent/repo/path/that/does/not/exist");
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                nonexistent_repo,
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_container_setup_failure() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        // Both flake.nix and .devcontainer/ must exist to trigger the container path.
+        std::fs::create_dir(repo_dir.path().join(".devcontainer")).unwrap();
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "ContainerSetupFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // ---- get_or_build_image_using unit tests ----
+
+    fn make_build_locks() -> BuildLocks {
+        // BuildLocks uses tokio::sync::Mutex; use the fully-qualified path to
+        // avoid the std::sync::Mutex that is imported for MockProvider above.
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_success() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_source| {
+                Ok("built-image:v1".to_string())
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), "built-image:v1");
+
+        // Cache should be populated.
+        let canonical = dir.path().canonicalize().unwrap();
+        let cache_read = cache.read().await;
+        assert_eq!(
+            cache_read.get(&canonical).map(String::as_str),
+            Some("built-image:v1")
+        );
+
+        // Build lock entry should be cleaned up.
+        let locks = build_locks.lock().await;
+        assert!(!locks.contains_key(&canonical));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_cache_hit() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        // Pre-populate the cache to trigger the fast-path return.
+        cache
+            .write()
+            .await
+            .insert(canonical, "cached-image:fast".to_string());
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_| {
+                panic!("build_fn must not be called on a cache hit")
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), "cached-image:fast");
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_second_check_cache_hit() {
+        // Populate the cache WHILE holding the per-path lock, then release.
+        // Any concurrent call that gets past the first cache check will block
+        // on the lock; once released it sees the cached value on the second
+        // check.  Calls that hit the first check also return the cached value.
+        // Either way build_fn is never called — no sleep needed; the ordering
+        // guarantee comes from lock acquisition, not timing.
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let path_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        {
+            let mut locks = build_locks.lock().await;
+            locks.insert(canonical.clone(), Arc::clone(&path_lock));
+        }
+        // Hold the per-path lock and populate the cache before spawning.
+        let held = path_lock.lock().await;
+        cache
+            .write()
+            .await
+            .insert(canonical, "second-check-hit:latest".to_string());
+
+        let cache_clone = Arc::clone(&cache);
+        let build_locks_clone = Arc::clone(&build_locks);
+        let dir_path = dir.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            TaskManager::get_or_build_image_using(
+                &cache_clone,
+                &build_locks_clone,
+                &dir_path,
+                |_| panic!("build_fn must not be called on a cache hit"),
+            )
+            .await
+        });
+
+        // Release the lock so the task can proceed if it was blocked.
+        drop(held);
+
+        let result = handle.await.unwrap();
+        assert_eq!(result.unwrap(), "second-check-hit:latest");
+    }
+
+    #[tokio::test]
+    async fn test_get_or_build_image_using_build_failure() {
+        let cache: Arc<RwLock<HashMap<PathBuf, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        let build_locks = make_build_locks();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            TaskManager::get_or_build_image_using(&cache, &build_locks, dir.path(), |_| {
+                Err("build exploded".to_string())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "build exploded");
+
+        // Cache must remain empty after a build failure.
+        let canonical = dir.path().canonicalize().unwrap();
+        let cache_read = cache.read().await;
+        assert!(cache_read.get(&canonical).is_none());
+    }
+
+    // ---- build_task_system_prompt unit tests ----
+
+    /// Install a process-global tracing subscriber once so the info/error
+    /// macro bodies in `build_task_system_prompt` actually execute under
+    /// coverage. Without a subscriber at a live level the tracing crate
+    /// short-circuits before evaluating the field expressions, leaving lines
+    /// inside the macro uncovered.
+    fn ensure_tracing_subscriber() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::TRACE)
+                .try_init();
+        });
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_no_guidance_returns_default() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_agents_md() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
+        assert!(prompt.contains("Use nextest."));
+        assert!(prompt.contains("</repo-guidance>"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_appends_claude_md_fallback() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
+        assert!(prompt.contains("legacy rules"));
+    }
+
+    /// Initialise a temporary directory as a git repo with a single initial
+    /// commit so it can be used as the source repository for
+    /// `TaskManager::submit` in tests. Mirrors `workspace::tests::init_git_repo`.
+    fn init_test_git_repo(dir: &std::path::Path) {
+        for args in &[
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(dir.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", "init"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init commit failed");
+    }
+
+    #[tokio::test]
+    async fn test_submit_injects_agents_md_into_task_prompt() {
+        // Exercises the production call site of `build_task_system_prompt`
+        // (inside the `Ok(mut workspace)` branch of `submit`) so the
+        // AGENTS.md-injection path is covered end-to-end, not just by the
+        // direct unit tests above.
+        ensure_tracing_subscriber();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        std::fs::write(repo_dir.path().join("AGENTS.md"), "# repo rules\n").unwrap();
+        std::process::Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["add", "AGENTS.md"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "add guidance"])
+            .output()
+            .unwrap();
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("done")]),
+        );
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+            ) {
+                assert!(
+                    matches!(task.status, TaskStatus::Completed { .. }),
+                    "expected task to complete successfully, got {:?}",
+                    task.status
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submit task did not finish"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_swallows_read_errors() {
+        // Non-UTF8 AGENTS.md makes the loader return Err; the prompt builder
+        // must log and fall back to the default system prompt without
+        // propagating the error.
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn test_submit_container_path_workspace_fail_with_cached_image() {
+        // Inject a pre-built image into the cache so that get_or_build_image
+        // returns immediately, then verify that a subsequent workspace-creation
+        // failure (non-git directory) is correctly recorded as
+        // WorkspaceCreationFailed.
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo_dir.path().join(".devcontainer")).unwrap();
+
+        // Pre-populate the image cache so get_or_build_image does not try to
+        // run nix.
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.image_cache.write().await;
+            cache.insert(canonical, "pre-built:latest".to_string());
+        }
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                assert!(matches!(task.status, TaskStatus::Failed { .. }));
+                // repo_dir is not a git repo so the worktree creation fails,
+                // which is reported as WorkspaceCreationFailed.
+                if let TaskStatus::Failed { diagnostics, .. } = &task.status {
+                    assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete within 5 s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
     }
 }

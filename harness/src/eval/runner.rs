@@ -432,6 +432,11 @@ fn contains_whole_word(haystack: &str, needle: &str) -> bool {
 }
 
 /// Map a language name to its common file extensions.
+///
+/// Unknown languages fall through to Rust extensions since every eval case
+/// fixture in `evals/cases/` is currently Rust. The fallthrough is logged at
+/// `warn` level so a typo in `task.toml` doesn't silently mis-route symbol
+/// search.
 fn extensions_for_language(language: &str) -> Vec<&'static str> {
     match language.to_lowercase().as_str() {
         "rust" => vec!["rs"],
@@ -443,7 +448,13 @@ fn extensions_for_language(language: &str) -> Vec<&'static str> {
         "c" => vec!["c", "h"],
         "cpp" | "c++" => vec!["cpp", "cc", "cxx", "hpp", "h"],
         "ruby" => vec!["rb"],
-        _ => vec!["rs"], // default to Rust for backwards compatibility
+        unknown => {
+            tracing::warn!(
+                language = unknown,
+                "unknown language in eval case; defaulting to Rust extensions"
+            );
+            vec!["rs"]
+        }
     }
 }
 
