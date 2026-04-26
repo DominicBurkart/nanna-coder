@@ -36,18 +36,15 @@ pub use tools::{
     CONTAINER_WORKSPACE_DIR,
 };
 
-// Export agent types
 pub use agent::{
     AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
     AgentState,
 };
 
-// Export eval types
 pub use eval::report::EvalReport;
 #[cfg(feature = "eval-runner")]
 pub use eval::runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
 
-// Export entity types
 pub use entities::{
     Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship, EntityResult,
     EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType, TimeRange,
