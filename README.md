@@ -27,14 +27,9 @@ A coding agent for coding agents. Designed to let background agents delegate str
 ### Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
-
-# Enter development environment
 nix develop
-
-# Build the project
 nix build
 ```
 
@@ -46,17 +41,14 @@ The agent requires a running [Ollama](https://ollama.ai/) instance with a model 
 # Install Ollama (see https://ollama.ai/download)
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# Pull the default model
+# Pull the default model and start the server
 ollama pull qwen3:0.6b
-
-# Start the Ollama server (must be running for agent commands and evals)
 ollama serve
 ```
 
 ### Running the Agent
 
 ```bash
-# Enter development environment
 nix develop
 
 # Run the agent with tools enabled (recommended)
@@ -84,13 +76,12 @@ nix develop --command cargo nextest run \
   --test-threads=1
 ```
 
-### Using Cachix (Optional but Recommended)
+### Cachix (Optional)
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
+Cachix provides a public binary cache for faster builds. No account is needed for read-only access:
 
 ```bash
-# Configure Cachix for faster builds (read-only access)
 nix run .#setup-cache
 ```
 
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push-access setup (maintainers only).
