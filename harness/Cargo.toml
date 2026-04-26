@@ -16,6 +16,11 @@ path = "src/main.rs"
 # production builds (the harness binary, container images) do not pull in
 # tempfile unless explicitly requested.
 eval-runner = ["tempfile"]
+# Gate monitoring, observability, and telemetry infrastructure behind this
+# feature. These modules are never constructed in production code paths and
+# only exist for optional instrumentation. Keeping them behind this flag
+# ensures `cargo build --release` remains lean.
+observability = []
 
 [dependencies]
 async-trait = "0.1"
