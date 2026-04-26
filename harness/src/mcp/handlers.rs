@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct AssignTaskParams {
     pub description: String,
@@ -17,11 +18,13 @@ pub struct AssignTaskParams {
     pub max_iterations: Option<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TaskIdParams {
     pub task_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct OnboardRepoParams {
     pub repo_path: std::path::PathBuf,
@@ -84,7 +87,8 @@ pub async fn handle_assign_task(
     let repo_path = params
         .get("repo_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: repo_path".to_string())?;
+        .ok_or_else(|| "Missing required field: repo_path".to_string())?
+        .to_string();
     let repo_path = PathBuf::from(repo_path);
 
     let branch = params
@@ -129,13 +133,14 @@ pub async fn handle_poll_task(
     let task_id_str = params
         .get("task_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: task_id".to_string())?;
+        .ok_or_else(|| "Missing required field: task_id".to_string())?
+        .to_string();
 
-    let task_id = TaskId(task_id_str.to_string());
+    let task_id = TaskId(task_id_str);
     let task = task_manager
         .poll(&task_id)
         .await
-        .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
+        .ok_or_else(|| format!("Task not found: {}", task_id.0))?;
 
     let (status_str, iterations, started_at) = match &task.status {
         TaskStatus::Pending => ("Pending", None, None),
@@ -148,7 +153,7 @@ pub async fn handle_poll_task(
     };
 
     let mut response = serde_json::json!({
-        "task_id": task_id_str,
+        "task_id": task_id.0,
         "status": status_str,
         "description": task.description,
     });
@@ -170,20 +175,21 @@ pub async fn handle_get_result(
     let task_id_str = params
         .get("task_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: task_id".to_string())?;
+        .ok_or_else(|| "Missing required field: task_id".to_string())?
+        .to_string();
 
-    let task_id = TaskId(task_id_str.to_string());
+    let task_id = TaskId(task_id_str);
     let task = task_manager
         .poll(&task_id)
         .await
-        .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
+        .ok_or_else(|| format!("Task not found: {}", task_id.0))?;
 
     match task.status {
         TaskStatus::Completed {
             result,
             finished_at,
         } => Ok(serde_json::json!({
-            "task_id": task_id_str,
+            "task_id": task_id.0,
             "status": "Completed",
             "finished_at": finished_at.to_rfc3339(),
             "result_summary": result.result_summary,
@@ -197,14 +203,14 @@ pub async fn handle_get_result(
             diagnostics,
             finished_at,
         } => Ok(serde_json::json!({
-            "task_id": task_id_str,
+            "task_id": task_id.0,
             "status": "Failed",
             "finished_at": finished_at.to_rfc3339(),
             "error": error,
             "diagnostics": diagnostics.to_json(),
         })),
-        TaskStatus::Pending => Err(format!("Task {} is still pending", task_id_str)),
-        TaskStatus::Running { .. } => Err(format!("Task {} is still running", task_id_str)),
+        TaskStatus::Pending => Err(format!("Task {} is still pending", task_id.0)),
+        TaskStatus::Running { .. } => Err(format!("Task {} is still running", task_id.0)),
     }
 }
 
@@ -212,9 +218,10 @@ pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
     let repo_path = params
         .get("repo_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: repo_path".to_string())?;
+        .ok_or_else(|| "Missing required field: repo_path".to_string())?
+        .to_string();
 
-    let source = Path::new(repo_path);
+    let source = Path::new(&repo_path);
     if !source.is_absolute() {
         return Err("repo_path must be an absolute path".to_string());
     }
