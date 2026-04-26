@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn test_entity_metadata_new() {
         let before = chrono::Utc::now();
-        let metadata = EntityMetadata::new(EntityType::Ast);
+        let mut metadata = EntityMetadata::new(EntityType::Ast);
         let after = chrono::Utc::now();
 
         assert_eq!(metadata.version, 1);
@@ -761,6 +761,8 @@ mod tests {
         // ID must be a valid UUID v4 ("random") — rejects v1, v3, v5, and nil UUIDs.
         let parsed = uuid::Uuid::parse_str(&metadata.id).expect("should be valid UUID");
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random)); // v4
+        metadata.updated_at = chrono::Utc::now();
+        assert!(metadata.updated_at >= metadata.created_at, "updated_at must not precede created_at after mutation");
     }
 
     #[test]
