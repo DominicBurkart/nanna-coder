@@ -52,5 +52,5 @@ name = "agents_md_load"
 harness = false
 
 [[test]]
-name = "eval_runner_tests"
+name = "eval_case_tests"
 required-features = ["eval-runner"]
