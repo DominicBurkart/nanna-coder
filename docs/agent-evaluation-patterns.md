@@ -29,12 +29,14 @@ Per-evaluation: success/failure, all metrics above, final agent state, validatio
 
 ## Built-in scenarios
 
-| Constructor | Prompt | Expected | Cap |
-|---|---|---|---|
-| `EvaluationScenario::simple_entity_creation()` | "Create a new git repository entity" | >= 1 Git entity | 10 iters |
-| `EvaluationScenario::rag_retrieval_accuracy()` | "Find all git repository entities" | RAG relevance >= 0.7 (initial: 2 Git, 1 Context) | — |
-| `EvaluationScenario::multi_entity_workflow()` | "Create a git repository with associated test results" | Git + Test entities, >= 1 relationship | — |
-| `EvaluationScenario::decision_quality_test()` | "Analyze existing entities and create a related context entity" | Context entity, decision quality >= 0.8 | — |
+`max_iterations` is the hard loop cap passed to `AgentLoop`; `max_allowed_iterations` (part of `ExpectedOutcomes`) is the warn threshold — exceeding it records a warning but does not abort the run.
+
+| Constructor | Prompt | Expected | Loop cap (`max_iterations`) | Warn threshold (`max_allowed_iterations`) |
+|---|---|---|---|---|
+| `EvaluationScenario::simple_entity_creation()` | "Create a new git repository entity" | >= 1 Git entity | 10 | 15 |
+| `EvaluationScenario::rag_retrieval_accuracy()` | "Find all git repository entities" | RAG relevance >= 0.7 (initial: 2 Git, 1 Context) | 10 | 12 |
+| `EvaluationScenario::multi_entity_workflow()` | "Create a git repository with associated test results" | Git + Test entities, >= 1 relationship | 15 | 10 |
+| `EvaluationScenario::decision_quality_test()` | "Analyze existing entities and create a related context entity" | Context entity, decision quality >= 0.8 | 8 | 10 |
 
 ## Usage
 
