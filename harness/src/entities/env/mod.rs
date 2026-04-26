@@ -1,12 +1,16 @@
 //! Environment & Deployment Entities
 //!
-//! This module implements container configuration and deployment entities for
-//! managing the development, sandbox, and release environments.
+//! Container configuration and deployment entities for managing the
+//! development, sandbox, and release environments described in
+//! ARCHITECTURE.md ("Container Topology"). The submodules cover:
 //!
-//! See issue #25 and ARCHITECTURE.md for details.
-
-// Placeholder for environment entity implementation
-// Full implementation tracked in issue #25
+//! - [`types`] — `EnvEntity` and `DeploymentTier` schema
+//! - [`security`] — security-context primitives applied to a deployment
+//! - [`deployment`] — concrete deployment configuration helpers
+//! - [`bridge`] — bridge between an `EnvEntity` and the runtime container
+//!   handle (see `crate::container`)
+//!
+//! Tracked in issue #25.
 
 pub mod bridge;
 pub mod deployment;

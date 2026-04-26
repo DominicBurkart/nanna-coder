@@ -1,12 +1,11 @@
 //! Project Context Entities
 //!
-//! This module implements conversation and project context entities for
-//! tracking user prompts, agent decisions, and development progress.
+//! Conversation and project-context entities for tracking user prompts,
+//! agent decisions, and per-run history (`ContextEntity`, `ToolCallRecord`).
+//! These power the "Project context entity" leg of the entity-store API
+//! described in ARCHITECTURE.md.
 //!
-//! See issue #26 and ARCHITECTURE.md for details.
-
-// Placeholder for context entity implementation
-// Full implementation tracked in issue #26
+//! Tracked in issue #26.
 
 pub mod types;
 
