@@ -11,6 +11,8 @@ use tracing::{error, info};
 // concretely today, but the downstream callers accept any `EntityStore` via
 // generics (see `AgentLoop<S>` and `interactive_chat`). Issue #193 Phase B
 // will introduce `PersistentEntityStore` and swap the binding here.
+// TODO(arch-8): `run_tool_loop` was not located in main.rs or agent/mod.rs
+// (first 60 lines) — may have been removed or renamed in recent refactoring.
 
 #[derive(Parser)]
 #[command(name = "harness")]
@@ -444,11 +446,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
