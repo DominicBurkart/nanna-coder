@@ -33,18 +33,20 @@ To replace a placeholder with a real, reproducible hash you need:
 Then run the helper:
 
 ```sh
-scripts/update-model-sha256.sh gemma      # or llama3, mistral, ...
+scripts/update-model-sha256.sh gemma
 ```
 
 The script:
 
 1. Verifies the model key exists and is currently holding the placeholder
    (use `FORCE=1` to overwrite an existing non-placeholder hash).
-2. Runs `nix build .#models.<key>-model`, which is expected to fail with a
-   hash mismatch the first time - Nix reports the real hash as
-   `got: sha256-...`.
-3. Scrapes that value and rewrites the matching `hash = "..."` line in
-   `nix/containers.nix`.
+2. Temporarily swaps the placeholder for `lib.fakeSha256` (43 A's) so
+   `createModelDerivation` routes to the fixed-output path instead of the
+   dev-stub branch. The build is expected to fail with a hash mismatch
+   and Nix reports the real hash as `got: sha256-...`.
+3. Restores the original file, applies the captured real hash, and runs
+   a confirmation build. On any failure (capture or validation) the trap
+   restores `nix/containers.nix` from the backup.
 4. Prints the diff so you can review before committing.
 
 Verify with a clean build:

@@ -169,11 +169,11 @@
           vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
 
           # Multi-model cache system (Ollama - legacy)
-          inherit (containers.models) qwen3-model llama3-model mistral-model gemma-model;
+          inherit (containers.models) qwen3-model gemma-model;
           inherit (containers.strictModels) qwen3-model-strict gemma-model-strict;
 
           # Multi-model containers (Ollama - legacy)
-          inherit (containers.containers) qwen3-container llama3-container mistral-container gemma-container;
+          inherit (containers.containers) qwen3-container gemma-container;
 
           # Cache management utilities
           inherit (scripts.cacheUtils) cache-info cache-cleanup;
