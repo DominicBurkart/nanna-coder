@@ -5,7 +5,7 @@ use model::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -82,8 +82,6 @@ impl NannaMcpServer {
         R: tokio::io::AsyncBufRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        use tokio::io::AsyncReadExt;
-
         let mut line = String::new();
         loop {
             line.clear();
