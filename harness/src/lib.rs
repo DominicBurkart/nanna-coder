@@ -32,9 +32,10 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_tool_registry, CalculatorTool, EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus,
-    GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
-    ToolError, ToolRegistry, ToolResult, WriteFileTool,
+    create_container_tool_registry, create_tool_registry, CalculatorTool, EchoTool, GitDiffTool,
+    GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool, PrStatusData, ReadFileTool,
+    RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool,
+    CONTAINER_WORKSPACE_DIR,
 };
 
 // Export agent types
@@ -45,6 +46,8 @@ pub use agent::{
 
 // Export eval report types
 pub use eval::report::EvalReport;
+#[cfg(feature = "eval-runner")]
+pub use eval::runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
 
 // Export entity types
 pub use entities::{
