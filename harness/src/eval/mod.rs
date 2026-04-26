@@ -11,11 +11,13 @@
 pub mod report;
 #[cfg(feature = "eval-runner")]
 pub mod runner;
+pub mod swebench;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
     AgentEvaluationResult, BatchEvaluationResult, EvaluationCategory, EvaluationMetrics,
 };
+pub use swebench::{adapt_to_eval_case, load_swebench_dataset, materialize, SWEBenchTask};
 
 // Re-export runner types (only available with the eval-runner feature)
 #[cfg(feature = "eval-runner")]
