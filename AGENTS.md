@@ -14,7 +14,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 
 1. If you are blocked because of disabled tests, enable them.
 2. If you are blocked because your architectural decisions yield untestable code, re-architect. 
-3. If the CI environment is broken in a way that you cannot fix and which is preventing your tests from being run, escalate by creating a github issue describing the exact misisng test problem.
+3. If the CI environment is broken in a way that you cannot fix and which is preventing your tests from being run, escalate by creating a github issue describing the exact missing test problem.
 
 
 # Agent State Machine
