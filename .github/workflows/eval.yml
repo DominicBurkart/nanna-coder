@@ -17,7 +17,7 @@ on:
           - qwen3:0.6b
           - llama3.1:8b
       case_filter:
-        description: 'Additional nextest filter expression for case selection (optional)'
+        description: 'Substring matched against case ID (optional; empty = run all)'
         required: false
         default: ''
 
@@ -88,20 +88,14 @@ jobs:
         echo "**Triggered by:** @${{ github.actor }}" >> eval-results.md
         echo "" >> eval-results.md
 
-        echo "### Unit-level eval tests" >> eval-results.md
+        echo "### Eval cases" >> eval-results.md
         echo '```' >> eval-results.md
 
-        FILTER='test(eval)'
-        if [ -n "${CASE_FILTER}" ]; then
-          FILTER="${FILTER} & ${CASE_FILTER}"
-        fi
-
         set +e
-        nix develop --command cargo nextest run \
-          --workspace --all-features \
-          -E "$FILTER" \
-          --no-fail-fast 2>&1 | tee eval-output.txt
-        EXIT_CODE=$?
+        nix develop --command cargo run --release --bin harness-eval --features eval-runner -- \
+          --filter "${CASE_FILTER}" \
+          2>&1 | tee eval-output.txt
+        EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
         cat eval-output.txt >> eval-results.md
