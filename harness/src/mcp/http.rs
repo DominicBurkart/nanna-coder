@@ -53,7 +53,7 @@ async fn handle_http_request(
     let client_ip = remote_addr.ip();
 
     // Check rate limit before doing any work
-    if let Err(_e) = rate_limiter.check_rate_limit(&client_ip) {
+    if rate_limiter.check_rate_limit(&client_ip).is_err() {
         let body = json_rpc_error(-32000, "rate limited");
         return Ok(json_response(StatusCode::TOO_MANY_REQUESTS, &body));
     }
