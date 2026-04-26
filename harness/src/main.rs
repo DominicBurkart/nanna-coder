@@ -457,10 +457,7 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Default system prompt used when an onboarded repo does not supply any
-/// repo-level guidance. Kept in a `const` so the `AGENTS.md` loader and the
-/// task-dispatch path (`harness/src/task.rs`) share a single source of truth.
-const DEFAULT_SESSION_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+// DEFAULT_SYSTEM_PROMPT is the canonical copy; defined in harness::agent.
 
 /// Build the system prompt for a session, appending any repo-level guidance
 /// discovered under `workspace_root` (closes #231).
@@ -480,17 +477,17 @@ fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
             );
             format!(
                 "{}\n\n{}",
-                DEFAULT_SESSION_SYSTEM_PROMPT,
+                harness::agent::DEFAULT_SYSTEM_PROMPT,
                 harness::agent::agents_md::format_system_prompt_fragment(&doc)
             )
         }
-        Ok(None) => DEFAULT_SESSION_SYSTEM_PROMPT.to_string(),
+        Ok(None) => harness::agent::DEFAULT_SYSTEM_PROMPT.to_string(),
         Err(e) => {
             error!(
                 error = %e,
                 "Failed to read AGENTS.md / CLAUDE.md; continuing without repo guidance"
             );
-            DEFAULT_SESSION_SYSTEM_PROMPT.to_string()
+            harness::agent::DEFAULT_SYSTEM_PROMPT.to_string()
         }
     }
 }
