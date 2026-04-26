@@ -14,17 +14,17 @@ default = ["ollama"]
 ollama = ["dep:ollama-rs"]
 
 [dependencies]
-async-trait = "0.1"
-futures = "0.3"
+async-trait = { workspace = true }
+futures = { workspace = true }
 ollama-rs = { version = "0.2", optional = true }
-reqwest = { version = "0.11", features = ["json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-tokio = { version = "1.0", features = ["full", "time"] }
-tracing = "0.1"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 # Additional dependencies for validation framework
-rand = "0.9"
+rand = { workspace = true }
 
 [lints]
 workspace = true
