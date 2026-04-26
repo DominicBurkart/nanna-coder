@@ -762,7 +762,10 @@ mod tests {
         let parsed = uuid::Uuid::parse_str(&metadata.id).expect("should be valid UUID");
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random)); // v4
         metadata.updated_at = chrono::Utc::now();
-        assert!(metadata.updated_at >= metadata.created_at, "updated_at must not precede created_at after mutation");
+        assert!(
+            metadata.updated_at >= metadata.created_at,
+            "updated_at must not precede created_at after mutation"
+        );
     }
 
     #[test]
