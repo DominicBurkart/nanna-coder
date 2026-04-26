@@ -1,7 +1,9 @@
-//! Telemetry and observability infrastructure
+//! Telemetry infrastructure
 //!
-//! This module provides comprehensive telemetry capabilities including structured logging,
-//! distributed tracing, metrics export, and observability integrations.
+//! This module provides structured logging, distributed tracing, metrics export,
+//! and integrations with external telemetry systems.
+//! Observability aggregation (health checks, alert policies, trend analysis) lives
+//! in the sibling `observability` module.
 //!
 //! # Features
 //!
@@ -672,7 +674,8 @@ impl TelemetrySystem {
         trace
     }
 
-    /// Finish a trace
+    /// Finish a trace and remove it from the active-traces list.
+    /// Completed traces are flushed to exporters via [`export_all`].
     pub fn finish_trace(&self, mut trace: TraceContext) {
         trace.finish();
 
@@ -687,13 +690,6 @@ impl TelemetrySystem {
             "Finished trace: {} (duration: {:?})",
             trace.operation_name, trace.duration
         );
-
-        // Export the trace
-        tokio::spawn(async move {
-            // Note: In a real implementation, we'd have a reference to exporters here
-            // For now, we'll just log the trace completion
-            debug!("Trace exported: {}", trace.trace_id);
-        });
     }
 
     /// Record a counter metric
@@ -802,9 +798,11 @@ impl TelemetrySystem {
         metrics.len()
     }
 
-    /// Get a reference to the Prometheus exporter
+    /// Returns a typed reference to the Prometheus exporter, if one was registered.
+    ///
+    /// Currently unimplemented — always returns `None`. Use [`export_all`] to flush
+    /// buffered data through all registered exporters instead.
     pub fn get_prometheus_exporter(&self) -> Option<&PrometheusExporter> {
-        // In a real implementation, we'd maintain typed references to specific exporters
         None
     }
 
