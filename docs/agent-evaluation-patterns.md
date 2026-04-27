@@ -1,108 +1,46 @@
 # Agent Evaluation Patterns
 
-## Overview
+Evaluation framework for the full nanna-coder agent system, including subcontainers. The implementation lives at [../harness/src/agent/eval.rs](../harness/src/agent/eval.rs); for the agent control flow being evaluated, see [../AGENTS.md](../AGENTS.md) and [../ARCHITECTURE.md](../ARCHITECTURE.md). For general testing strategy, see [../TESTING.md](../TESTING.md).
 
-This document describes the comprehensive agent evaluation framework for testing the full nanna-coder agent system with all running subcontainers.
+## Levels
 
-## Architecture
+- **Unit** — individual agent components in isolation: state transitions (Planning -> Deciding -> Performing -> Checking), RAG query relevance, entity creation/modification, decision-making logic.
+- **Integration** — interactions between subsystems: full control loop, LLM-agent interaction, multi-entity workflows, entity-relationship management.
+- **System** — the full containerized system: model provider integration (Ollama / vLLM), observability, end-to-end task completion against real LLMs, performance under load.
 
-The evaluation framework operates at three distinct levels:
+## Core types
 
-### Level 1: Unit Evaluations
-Tests individual agent components in isolation:
-- State transitions (Planning → Deciding → Performing → Checking)
-- RAG query quality and relevance scoring
-- Entity creation and modification
-- Decision-making logic
+### `EvaluationScenario`
 
-### Level 2: Integration Evaluations
-Tests interaction between agent subsystems:
-- Complete agent control loop execution
-- LLM-agent interaction patterns
-- Multi-entity workflow coordination
-- Entity relationship management
+A test case with a user prompt, initial entity state, an `ExpectedOutcomes` block (min entities created, expected entity types, iteration limits, decision-quality and RAG-relevance thresholds), and a category.
 
-### Level 3: System Evaluations
-Tests the full containerized system:
-- Model provider integration (Ollama/vLLM)
-- Observability and telemetry collection
-- End-to-end task completion with real LLMs
-- Performance and reliability under load
+### Metrics
 
-## Core Concepts
+- `execution_time` — total time to complete.
+- `iterations` — control-loop cycles.
+- `decision_quality` (0.0-1.0) — task completion, iteration efficiency, state correctness.
+- `rag_relevance` (0.0-1.0) — average relevance of retrieved entities.
+- `entity_accuracy` (0.0-1.0) — match between created and expected entities.
+- `prompt_effectiveness` (0.0-1.0) — quality of LLM responses (future).
 
-### Evaluation Scenarios
+### `AgentEvaluationResult`
 
-An `EvaluationScenario` defines a test case with:
-- **User prompt**: The task given to the agent
-- **Initial entities**: Pre-populated entity state
-- **Expected outcomes**: Success criteria including:
-  - Minimum entities created
-  - Expected entity types
-  - Iteration limits
-  - Decision quality thresholds
-  - RAG relevance requirements
-- **Category**: Type of evaluation (entity creation, RAG, decision-making, etc.)
+Per-evaluation: success/failure, all metrics above, final agent state, validation failures and warnings, optional system metrics (when observability is enabled).
 
-### Evaluation Metrics
+## Built-in scenarios
 
-The framework collects comprehensive metrics:
-- **Execution time**: Total time to complete
-- **Iterations**: Number of control loop cycles
-- **Decision quality** (0.0-1.0): Based on task completion, iteration efficiency, and state correctness
-- **RAG relevance** (0.0-1.0): Average relevance of retrieved entities
-- **Entity accuracy** (0.0-1.0): Match between created and expected entities
-- **Prompt effectiveness** (0.0-1.0): Quality of LLM prompt responses (future)
+`max_iterations` is the hard loop cap passed to `AgentLoop`; `max_allowed_iterations` (part of `ExpectedOutcomes`) is the warn threshold — exceeding it records a warning but does not abort the run.
 
-### Evaluation Results
+| Constructor | Prompt | Expected | Loop cap (`max_iterations`) | Warn threshold (`max_allowed_iterations`) |
+|---|---|---|---|---|
+| `EvaluationScenario::simple_entity_creation()` | "Create a new git repository entity" | >= 1 Git entity | 10 | 15 |
+| `EvaluationScenario::rag_retrieval_accuracy()` | "Find all git repository entities" | RAG relevance >= 0.7 (initial: 2 Git, 1 Context) | 10 | 12 |
+| `EvaluationScenario::multi_entity_workflow()` | "Create a git repository with associated test results" | Git + Test entities, >= 1 relationship | 15 | 10 |
+| `EvaluationScenario::decision_quality_test()` | "Analyze existing entities and create a related context entity" | Context entity, decision quality >= 0.8 | 8 | 10 |
 
-Each evaluation produces an `AgentEvaluationResult`:
-- Success/failure status
-- All collected metrics
-- Final agent state
-- Validation failures and warnings
-- Optional system metrics (when observability enabled)
+## Usage
 
-## Built-in Scenarios
-
-### Simple Entity Creation
-Tests basic agent ability to create entities.
-```rust
-let scenario = EvaluationScenario::simple_entity_creation();
-```
-- **Prompt**: "Create a new git repository entity"
-- **Expected**: At least 1 Git entity created
-- **Max iterations**: 10
-
-### RAG Retrieval Accuracy
-Tests RAG system's ability to find relevant entities.
-```rust
-let scenario = EvaluationScenario::rag_retrieval_accuracy();
-```
-- **Prompt**: "Find all git repository entities"
-- **Initial state**: 2 Git entities, 1 Context entity
-- **Expected**: RAG relevance ≥ 0.7
-
-### Multi-Entity Workflow
-Tests coordination across multiple entity types.
-```rust
-let scenario = EvaluationScenario::multi_entity_workflow();
-```
-- **Prompt**: "Create a git repository with associated test results"
-- **Expected**: Git + Test entities with at least 1 relationship
-
-### Decision Quality Test
-Tests agent's decision-making between QUERY and PROCEED.
-```rust
-let scenario = EvaluationScenario::decision_quality_test();
-```
-- **Prompt**: "Analyze existing entities and create a related context entity"
-- **Initial state**: Git + Test entities
-- **Expected**: Context entity with decision quality ≥ 0.8
-
-## Usage Examples
-
-### Basic Evaluation
+### Basic
 
 ```rust
 use harness::agent::eval::{AgentEvaluator, EvaluationConfig, EvaluationScenario};
@@ -115,19 +53,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut evaluator = AgentEvaluator::new(config).await?;
     let scenario = EvaluationScenario::simple_entity_creation();
-    
+
     let result = evaluator.evaluate(scenario).await?;
-    
+
     println!("Success: {}", result.success);
     println!("Decision Quality: {:.2}", result.metrics.decision_quality);
     println!("RAG Relevance: {:.2}", result.metrics.rag_relevance);
     println!("Entities Created: {}", result.metrics.entities_created);
-    
+
     Ok(())
 }
 ```
 
-### Batch Evaluation
+### Batch
 
 ```rust
 let scenarios = vec![
@@ -137,13 +75,12 @@ let scenarios = vec![
 ];
 
 let batch_result = evaluator.evaluate_batch(scenarios).await?;
-
 println!("Total: {}", batch_result.total_scenarios);
 println!("Passed: {}", batch_result.passed);
 println!("Failed: {}", batch_result.failed);
 ```
 
-### With Containerized Model
+### Containerized model
 
 ```rust
 let config = EvaluationConfig::default()
@@ -152,10 +89,9 @@ let config = EvaluationConfig::default()
     .with_timeout(Duration::from_secs(600));
 
 let mut evaluator = AgentEvaluator::new(config).await?;
-// Evaluation will use the LLM for agent decision-making
 ```
 
-### With Observability
+### With observability
 
 ```rust
 let config = EvaluationConfig {
@@ -166,15 +102,13 @@ let config = EvaluationConfig {
 let mut evaluator = AgentEvaluator::new(config).await?;
 let result = evaluator.evaluate(scenario).await?;
 
-if let Some(sys_metrics) = result.system_metrics {
-    println!("CPU Usage: {:.1}%", sys_metrics.system_resources.cpu_usage_percent);
-    println!("Memory Usage: {:.1}%", sys_metrics.system_resources.memory_usage_percent);
+if let Some(sys) = result.system_metrics {
+    println!("CPU: {:.1}%", sys.system_resources.cpu_usage_percent);
+    println!("Mem: {:.1}%", sys.system_resources.memory_usage_percent);
 }
 ```
 
-## Custom Scenarios
-
-Create custom evaluation scenarios for specific test cases:
+## Custom scenarios
 
 ```rust
 use harness::agent::eval::{EvaluationScenario, EvaluationCategory, ExpectedOutcomes};
@@ -200,9 +134,9 @@ let custom_scenario = EvaluationScenario {
 };
 ```
 
-## Validation Criteria
+## Validation criteria
 
-For LLM-powered agents, add validation criteria:
+For LLM-powered scenarios, attach `ValidationCriteria` from the `model::judge` module:
 
 ```rust
 use model::judge::ValidationCriteria;
@@ -210,8 +144,8 @@ use model::judge::ValidationCriteria;
 let criteria = ValidationCriteria {
     min_response_length: 20,
     max_response_length: 500,
-    required_keywords: vec!["repository".to_string(), "created".to_string()],
-    forbidden_keywords: vec!["error".to_string(), "failed".to_string()],
+    required_keywords: vec!["repository".into(), "created".into()],
+    forbidden_keywords: vec!["error".into(), "failed".into()],
     min_coherence_score: 0.7,
     min_relevance_score: 0.8,
     require_factual_accuracy: true,
@@ -219,46 +153,41 @@ let criteria = ValidationCriteria {
 };
 
 let scenario = EvaluationScenario {
-    // ... other fields ...
+    // ...
     validation_criteria: Some(criteria),
     // ...
 };
 ```
 
-## Metrics Interpretation
+## Metric interpretation
 
-### Decision Quality (0.0 - 1.0)
-Composite score based on:
-- **Task completion** (50%): Did the agent complete the task?
-- **Iteration efficiency** (30%): How many iterations were needed?
-- **State correctness** (20%): Did it reach the expected final state?
+### Decision quality
 
-**Interpretation:**
-- `> 0.8`: Excellent - efficient and correct
-- `0.6 - 0.8`: Good - completed but could be more efficient
-- `< 0.6`: Poor - inefficient or incorrect
+Composite: 50% task completion + 30% iteration efficiency + 20% state correctness.
 
-### RAG Relevance (0.0 - 1.0)
-Average relevance score of retrieved entities.
+| Range | Reading |
+|---|---|
+| > 0.8 | excellent: efficient and correct |
+| 0.6-0.8 | good: completed but suboptimal |
+| < 0.6 | poor: inefficient or incorrect |
 
-**Interpretation:**
-- `> 0.8`: Highly relevant results
-- `0.6 - 0.8`: Moderately relevant
-- `< 0.6`: Poor relevance
+### RAG relevance
 
-### Entity Accuracy (0.0 - 1.0)
-Percentage of expected entity types that were created.
+Average relevance of retrieved entities.
 
-**Interpretation:**
-- `1.0`: All expected entities created
-- `< 1.0`: Some expected entities missing
+| Range | Reading |
+|---|---|
+| > 0.8 | highly relevant |
+| 0.6-0.8 | moderately relevant |
+| < 0.6 | poor relevance |
 
-## Integration with CI/CD
+### Entity accuracy
 
-The evaluation framework can be integrated into CI pipelines:
+Fraction of expected entity types created. `1.0` = all expected types present.
+
+## CI integration
 
 ```bash
-# Run evaluations as part of test suite
 cargo test --package harness --lib agent::eval
 
 # Custom evaluation binary
@@ -268,56 +197,37 @@ cargo run --bin evaluate-agent -- \
     --output results.json
 ```
 
-## Performance Considerations
+## Performance considerations
 
-- **Timeouts**: Set appropriate timeouts for containerized scenarios (300-600s)
-- **Parallelization**: Batch evaluations run sequentially; parallelize manually if needed
-- **Resource limits**: Container-based evaluations may require significant memory
-- **Observability overhead**: Collecting system metrics adds ~5-10% overhead
+- Containerized scenarios: timeouts of 300-600 s are typical.
+- Batch evaluations run sequentially; parallelize at the caller if needed.
+- Container-based evaluations may need significant memory.
+- Observability collection adds ~5-10% overhead.
 
-## Future Enhancements
+## Roadmap
 
-1. **LLM-Powered Evaluations**: Full integration with model providers for decision-making
-2. **Semantic Evaluation**: Use embeddings to evaluate response quality
-3. **Adversarial Testing**: Scenarios designed to challenge agent robustness
-4. **Performance Benchmarking**: Track metrics over time for regression detection
-5. **Multi-Model Comparison**: Evaluate same scenarios across different LLMs
-6. **Distributed Evaluation**: Run evaluations across multiple containers in parallel
+LLM-powered evaluation, embedding-based semantic scoring, adversarial scenarios, regression tracking, multi-model comparison, distributed evaluation across containers.
 
-## Best Practices
+## Best practices
 
-1. **Start Simple**: Begin with unit-level scenarios before system-level tests
-2. **Incremental Thresholds**: Gradually increase quality thresholds as agent improves
-3. **Document Failures**: When scenarios fail, document why and adjust expectations
-4. **Version Scenarios**: Track scenario definitions alongside code changes
-5. **Monitor Trends**: Watch for metric degradation over time
-6. **Test Edge Cases**: Include scenarios for error handling and boundary conditions
+- Start with unit-level scenarios; only escalate to system-level once those are stable.
+- Raise quality thresholds incrementally as the agent improves.
+- Keep scenario definitions versioned alongside the code they exercise.
+- Watch metric trends across runs for regressions.
 
 ## Troubleshooting
 
-### Evaluation Timeouts
-- Increase `timeout` in `EvaluationConfig`
-- Check container startup time
-- Verify model availability
+**Timeouts** — increase `timeout` in `EvaluationConfig`; check container startup time and model availability.
 
-### Low Decision Quality
-- Check `max_iterations` - may be too restrictive
-- Review agent state transitions in logs
-- Examine expected vs. actual final state
+**Low decision quality** — `max_iterations` may be too restrictive; review state transitions in logs; compare expected vs. actual final state.
 
-### Low RAG Relevance
-- Verify entity content matches query terms
-- Check that initial entities are created properly
-- Review RAG query implementation
+**Low RAG relevance** — verify entity content matches query terms; check that initial entities are seeded; review the RAG query implementation.
 
-### Observability Errors
-- Ensure tracing subscriber is initialized only once
-- Set `collect_observability: false` for simple tests
-- Check system permissions for metric collection
+**Observability errors** — initialize the tracing subscriber once; set `collect_observability: false` for simple tests; check permissions for system metrics.
 
-## Related Documentation
+## Related
 
-- [AGENTS.md](../AGENTS.md) - Agent control flow architecture
-- [ARCHITECTURE.md](../ARCHITECTURE.md) - System architecture overview
-- [TESTING.md](../TESTING.md) - General testing strategy
-- [harness/src/agent/eval.rs](../harness/src/agent/eval.rs) - Implementation
+- Implementation: [../harness/src/agent/eval.rs](../harness/src/agent/eval.rs)
+- Agent control flow: [../AGENTS.md](../AGENTS.md)
+- System architecture: [../ARCHITECTURE.md](../ARCHITECTURE.md)
+- Testing strategy: [../TESTING.md](../TESTING.md)
