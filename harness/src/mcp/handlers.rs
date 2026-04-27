@@ -394,4 +394,202 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
     }
+
+    // ── MCP JSON-contract invariants ────────────────────────────────────────
+    //
+    // The handlers in this module form the boundary between Nanna and any
+    // external MCP orchestrator. The tests below pin three invariants that
+    // orchestrators rely on (see `ARCHITECTURE.md` § API):
+    //
+    //   1. `handle_get_result` must distinguish `Pending` and `Running` from
+    //      "task not found". Returning the wrong shape would break
+    //      orchestrators that interleave `poll_task` and `get_result` per
+    //      the documented Delegation Sequence.
+    //   2. `handle_assign_task` must populate the persisted `Task` from
+    //      caller-supplied params *and* default sensibly when optional
+    //      params (`branch`, `model`, `max_iterations`) are omitted. The
+    //      ARCHITECTURE.md description says a task is dispatched against
+    //      "a designated repo" — orchestrators that omit `branch` expect
+    //      "HEAD" without specifying it.
+    //   3. `handle_onboard_repo` must reject malformed/missing input with
+    //      a textual error that names the offending field, so that an
+    //      orchestrator can produce an actionable error to its own user
+    //      without inspecting JSON-RPC error codes alone.
+
+    #[tokio::test]
+    async fn test_handle_get_result_pending_returns_pending_error() {
+        // Use TaskManager::new(0) so the submitted task can never start
+        // (semaphore has zero permits) and stays in Pending.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let assign_params = serde_json::json!({
+            "description": "pending forever",
+            "repo_path": "/tmp"
+        });
+        let assigned = handle_assign_task(&assign_params, &manager, &provider, "qwen3:0.6b", 100)
+            .await
+            .unwrap();
+        let task_id = assigned["task_id"].as_str().unwrap().to_string();
+
+        // Yield once but not long enough for the task loop to start
+        // (it's blocked on the semaphore anyway).
+        tokio::task::yield_now().await;
+
+        let params = serde_json::json!({"task_id": task_id});
+        let result = handle_get_result(&params, &manager).await;
+        assert!(
+            result.is_err(),
+            "get_result on Pending task must be Err: got {:?}",
+            result
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("still pending"),
+            "Pending error must say 'still pending', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&task_id),
+            "Pending error must include the task id, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_assign_task_defaults_flow_through() {
+        // Caller omits branch / model / max_iterations. The resulting Task
+        // must use the supplied defaults verbatim. This test exercises the
+        // `unwrap_or(default_model)` / `unwrap_or("HEAD")` /
+        // `unwrap_or(default_max_iterations)` branches in handle_assign_task,
+        // none of which are covered by the existing happy-path test
+        // (which only asserts the response shape).
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "minimal",
+            "repo_path": "/tmp/some-repo"
+        });
+        let assigned = handle_assign_task(&params, &manager, &provider, "default-model:1b", 42)
+            .await
+            .unwrap();
+        let task_id = TaskId(assigned["task_id"].as_str().unwrap().to_string());
+
+        // Inspect the persisted Task via poll(). Going through the public
+        // API confirms the defaults reach storage, not just submit()'s
+        // signature.
+        let task = manager
+            .poll(&task_id)
+            .await
+            .expect("submitted task must be retrievable");
+        assert_eq!(task.branch, "HEAD", "branch must default to HEAD");
+        assert_eq!(
+            task.model, "default-model:1b",
+            "model must default to handler's default_model"
+        );
+        // The list endpoint should also surface the description verbatim.
+        let list = handle_list_tasks(&manager).await.unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["description"], "minimal");
+        assert_eq!(arr[0]["status"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn test_handle_assign_task_branch_override_flows_through() {
+        // Explicit branch must override the "HEAD" default and reach the
+        // persisted Task.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({
+            "description": "with branch",
+            "repo_path": "/tmp/r",
+            "branch": "feature/x"
+        });
+        let assigned = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 1)
+            .await
+            .unwrap();
+        let task_id = TaskId(assigned["task_id"].as_str().unwrap().to_string());
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.branch, "feature/x");
+    }
+
+    #[tokio::test]
+    async fn test_handle_poll_task_pending_status_string() {
+        // The status string is part of the JSON contract. Pin its exact
+        // spelling so a future rename of `TaskStatus::Pending` doesn't
+        // silently break orchestrators reading `status` as a discriminator.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let assigned = handle_assign_task(
+            &serde_json::json!({"description": "p", "repo_path": "/tmp"}),
+            &manager,
+            &provider,
+            "qwen3:0.6b",
+            1,
+        )
+        .await
+        .unwrap();
+        let task_id = assigned["task_id"].as_str().unwrap().to_string();
+        let resp = handle_poll_task(&serde_json::json!({"task_id": task_id}), &manager)
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "Pending");
+        // Pending must NOT carry an `iterations` or `started_at` field.
+        assert!(
+            resp.get("iterations").is_none(),
+            "Pending response must omit iterations: {resp}"
+        );
+        assert!(
+            resp.get("started_at").is_none(),
+            "Pending response must omit started_at: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_missing_repo_path_field() {
+        // No `repo_path` at all (different from the existing test, which
+        // sends a relative path). The error must name the missing field
+        // so orchestrators can route it back to the user.
+        let params = serde_json::json!({});
+        let result = handle_onboard_repo(&params).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("repo_path"),
+            "missing-field error must name 'repo_path', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_cancel_task_returns_cancelled_status_string() {
+        // Pin the exact response shape: cancel() must return JSON with
+        // `status: "Cancelled"` so orchestrators can treat the response
+        // as terminal without re-polling.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let assigned = handle_assign_task(
+            &serde_json::json!({"description": "c", "repo_path": "/tmp"}),
+            &manager,
+            &provider,
+            "qwen3:0.6b",
+            1,
+        )
+        .await
+        .unwrap();
+        let task_id = assigned["task_id"].as_str().unwrap().to_string();
+        // Yield so the spawned task loop reaches its first await point
+        // (it will be blocked on the semaphore, which is fine — cancel()
+        // works against Pending tasks too).
+        tokio::task::yield_now().await;
+
+        let resp = handle_cancel_task(&serde_json::json!({"task_id": &task_id}), &manager)
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "Cancelled");
+        assert_eq!(resp["task_id"], task_id);
+        assert!(
+            resp["message"].as_str().unwrap().contains("cancelled"),
+            "cancel response must include human-readable confirmation: {resp}"
+        );
+    }
 }
