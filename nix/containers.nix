@@ -172,18 +172,6 @@ let
     };
 
   # Model registry with metadata for all supported models
-  # Updated to use HuggingFace models for vLLM
-  #
-  # NOTE: Legacy Ollama entries (llama3, mistral, gemma) below still carry
-  # the all-zeros placeholder sha256. That triggers the dev-mode branch in
-  # `createModelDerivation` (non-fixed-output stub). To replace a placeholder
-  # with a real, reproducible hash run:
-  #
-  #     scripts/update-model-sha256.sh <modelKey>
-  #
-  # from a machine that has `nix`, `ollama`, and outbound network access to
-  # `registry.ollama.ai`. See `nix/README.md` for the full capture procedure
-  # and issue #240 for context.
   modelRegistry = {
     "mimo-v2-flash" = {
       name = "XiaomiMiMo/MiMo-V2-Flash";
@@ -207,28 +195,35 @@ let
       size = "560MB";
       homepage = "https://ollama.com/library/qwen3";
     };
-    "llama3" = {
-      name = "llama3:8b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Llama3 8B - High quality general purpose model (Ollama)";
-      size = "4.7GB";
-      homepage = "https://ollama.com/library/llama3";
-    };
-    "mistral" = {
-      name = "mistral:7b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
-      description = "Mistral 7B - Balanced performance model (Ollama)";
-      size = "4.1GB";
-      homepage = "https://ollama.com/library/mistral";
-    };
     "gemma" = {
       name = "gemma4:e4b";
-      hash = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+      hash = "sha256-KkYtMpk6i++WJ9pqnzsOQ55qRA3zR57PxIewn8K0OeM=";
       description = "Gemma 4 E4B - Larger Gemma 4 variant for CI evaluation (Ollama)";
       size = "~4GB";
       homepage = "https://ollama.com/library/gemma4";
     };
   };
+
+  assertRealModelHash = modelKey: modelInfo:
+    if (lib.hasInfix "0000000000000000000000000000000000000000000" modelInfo.hash) then
+      throw ''
+        Model `${modelInfo.name}` (key=${modelKey}) is using the all-zeros
+        placeholder sha256 in nix/containers.nix. Production model paths
+        require a real, content-addressed hash so the weights are baked
+        into the image and pushed to the binary cache.
+
+        Capture the real hash by running, on a machine with network +
+        Ollama installed:
+
+            scripts/update-model-sha256.sh ${modelKey}
+
+        See nix/README.md ("Capturing a model sha256") and issue #240.
+      ''
+    else
+      modelInfo;
+
+  createStrictModelDerivation = modelKey: modelInfo:
+    createModelDerivation modelKey (assertRealModelHash modelKey modelInfo);
 
   # Function to create a model derivation with proper caching
   createModelDerivation = modelKey: modelInfo:
@@ -328,9 +323,12 @@ let
   # Multi-model cache system - reproducible model derivations
   models = {
     qwen3-model = createModelDerivation "qwen3" modelRegistry.qwen3;
-    llama3-model = createModelDerivation "llama3" modelRegistry.llama3;
-    mistral-model = createModelDerivation "mistral" modelRegistry.mistral;
     gemma-model = createModelDerivation "gemma" modelRegistry.gemma;
+  };
+
+  strictModels = {
+    qwen3-model-strict = createStrictModelDerivation "qwen3" modelRegistry.qwen3;
+    gemma-model-strict = createStrictModelDerivation "gemma" modelRegistry.gemma;
   };
 
   # Multi-model containers with pre-cached models
@@ -342,46 +340,6 @@ let
       copyToRoot = pkgs.buildEnv {
         name = "ollama-qwen3-env";
         paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.qwen3-model ];
-        pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
-      };
-      config = {
-        Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-        Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
-        WorkingDir = "/app";
-        ExposedPorts = { "11434/tcp" = {}; };
-        Volumes = { "/root/.ollama" = {}; };
-      };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
-    };
-
-    llama3-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-llama3";
-      tag = "latest";
-      fromImage = ollamaImage;
-      copyToRoot = pkgs.buildEnv {
-        name = "ollama-llama3-env";
-        paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.llama3-model ];
-        pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
-      };
-      config = {
-        Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-        Env = [ "OLLAMA_HOST=0.0.0.0" "OLLAMA_PORT=11434" "OLLAMA_MODELS=/models" "PATH=/bin" ];
-        WorkingDir = "/app";
-        ExposedPorts = { "11434/tcp" = {}; };
-        Volumes = { "/root/.ollama" = {}; };
-      };
-      created = "2025-09-20T00:00:00Z";
-      maxLayers = 100;
-    };
-
-    mistral-container = nix2containerPkgs.nix2container.buildImage {
-      name = "nanna-coder-ollama-mistral";
-      tag = "latest";
-      fromImage = ollamaImage;
-      copyToRoot = pkgs.buildEnv {
-        name = "ollama-mistral-env";
-        paths = [ pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.curl models.mistral-model ];
         pathsToLink = [ "/bin" "/etc" "/share" "/models" ];
       };
       config = {
@@ -419,5 +377,5 @@ let
 in
 {
   inherit harnessImage ollamaImage vllmImage devContainerImage;
-  inherit modelRegistry models containers;
+  inherit modelRegistry models strictModels containers;
 }
