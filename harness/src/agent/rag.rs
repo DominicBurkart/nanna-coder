@@ -52,11 +52,6 @@ pub async fn query_entities(
     Ok(results)
 }
 
-/// Extract relevant entity IDs from query results
-pub fn extract_entity_ids(results: &[QueryResult]) -> Vec<String> {
-    results.iter().map(|r| r.entity_id.clone()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,26 +76,5 @@ mod tests {
         // Query should find it via JSON text search
         let results = query_entities(&store, "Git", Some(10)).await.unwrap();
         assert!(!results.is_empty(), "Should find git entity");
-    }
-
-    #[tokio::test]
-    async fn test_extract_entity_ids() {
-        let results = vec![
-            QueryResult {
-                entity_id: "id1".to_string(),
-                entity_type: crate::entities::EntityType::Git,
-                relevance: 1.0,
-                snippet: None,
-            },
-            QueryResult {
-                entity_id: "id2".to_string(),
-                entity_type: crate::entities::EntityType::Git,
-                relevance: 0.8,
-                snippet: None,
-            },
-        ];
-
-        let ids = extract_entity_ids(&results);
-        assert_eq!(ids, vec!["id1", "id2"]);
     }
 }
