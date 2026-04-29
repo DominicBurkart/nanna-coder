@@ -97,7 +97,10 @@ impl NannaMcpServer {
             // parse them. Otherwise we fall through to the line-delimited path
             // used by the existing unit tests.
             let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
-            if trimmed_hdr.to_ascii_lowercase().starts_with("content-length:") {
+            if trimmed_hdr
+                .to_ascii_lowercase()
+                .starts_with("content-length:")
+            {
                 let content_length: usize = trimmed_hdr
                     .split_once(':')
                     .and_then(|(_, v)| v.trim().parse().ok())
