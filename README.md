@@ -2,6 +2,22 @@
 
 A coding agent for coding agents. Designed to let background agents delegate straightforward work to local models (or other providers).
 
+## One-line install
+
+Install nanna in a container and register it as an MCP tool for the Claude Code CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash -s -- --mcp --local-model gemma4:e4b
+```
+
+Install the standalone `harness` CLI (for direct use or for agents to invoke):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash -s -- --standalone --local-model gemma4:e4b
+```
+
+`--local-model` accepts any tag understood by `ollama pull` (default `gemma4:e4b`). Pass `--help` to the installer for the full flag list. The same one-liners are intended for the nanna landing page; no separate landing-page source currently lives in this repo.
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture and entity management
