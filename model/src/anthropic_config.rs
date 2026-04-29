@@ -1,3 +1,8 @@
+// NOTE: This file is also introduced by PR #135 (feat: Anthropic Claude API provider).
+// Whichever PR merges second will have a conflict here.
+// Merge order decision: #134 (data model + reports) should merge first; #135
+// should then resolve any conflict, keeping the richer version that includes
+// the `AnthropicProvider` implementation and feature-gate from that PR.
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
