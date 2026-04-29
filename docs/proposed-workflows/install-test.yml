@@ -1,0 +1,223 @@
+name: Install Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: shellcheck install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -x scripts/install.sh
+
+  ps1-lint:
+    name: PSScriptAnalyzer install.ps1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $issues = Invoke-ScriptAnalyzer -Path scripts/install.ps1 -Severity @('Error','Warning')
+          $issues | Format-Table -AutoSize
+          $errors = $issues | Where-Object { $_.Severity -eq 'Error' }
+          if ($errors) { throw "PSScriptAnalyzer errors found" }
+
+  linux-bringup:
+    name: Linux full bring-up (no pull, no model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: nanna-coder
+          authToken: ${{ secrets.CACHIX_AUTH }}
+          pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+          skipPush: ${{ github.event_name == 'pull_request' }}
+
+      - name: Build harness + ollama images
+        run: |
+          nix build .#harnessImage --print-build-logs
+          nix build .#ollamaImage  --print-build-logs
+
+      - name: Load images into podman
+        run: |
+          # Ubuntu-latest ships with podman; install if not present (older runners).
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y podman
+          fi
+          nix run .#harnessImage.copyToPodman
+          nix run .#ollamaImage.copyToPodman
+          podman images
+
+      - name: Run installer (--no-pull, --skip-model-pull)
+        run: |
+          bash scripts/install.sh \
+            --no-pull \
+            --skip-model-pull \
+            --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest
+
+      - name: Verify pod and ollama API
+        run: |
+          podman pod ps
+          podman ps
+          podman inspect ollama-service > /dev/null
+          # ollama listens on 11434 inside the pod; the pod publishes it to localhost.
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+              echo "ollama API up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "ollama did not come up in 60s"
+          podman logs ollama-service || true
+          exit 1
+
+      - name: Tear down (sanity)
+        if: always()
+        run: |
+          podman pod stop nanna-coder-pod || true
+          podman pod rm   nanna-coder-pod || true
+
+  macos-podman-bootstrap:
+    name: macOS podman + machine bootstrap
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stub images so --no-pull existence check passes
+        run: |
+          # We can't build linux container images natively on macOS without a
+          # linux builder; this CI lane validates only the macOS-specific bits
+          # of install.sh (brew install podman, podman machine init/start, image
+          # existence check, registry connectivity). Full pod bring-up is
+          # validated on the Linux + WSL lanes.
+          brew install podman
+          podman machine init --cpus 2 --memory 4096 --disk-size 20
+          podman machine start
+          podman pull docker.io/library/alpine:3
+          podman tag docker.io/library/alpine:3 nanna-coder-harness:latest
+          podman tag docker.io/library/alpine:3 nanna-coder-ollama:latest
+
+      - name: Run installer (--no-pull, --no-start)
+        run: |
+          bash scripts/install.sh \
+            --no-pull \
+            --no-start \
+            --skip-model-pull \
+            --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest
+
+      - name: Verify podman is responsive + can pull from a public registry
+        run: |
+          podman --version
+          podman info
+          podman pull docker.io/library/registry:2
+
+  windows-wsl-bringup:
+    name: Windows (WSL2) full bring-up
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up WSL2 (Ubuntu)
+        uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: |
+            curl
+            ca-certificates
+            git
+            xz-utils
+            sudo
+
+      - name: Install Nix inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          if ! command -v nix >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://install.determinate.systems/nix \
+              | sh -s -- install linux --no-confirm --init none
+          fi
+          # shellcheck disable=SC1091
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          mkdir -p ~/.config/nix
+          echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+          nix --version
+
+      - name: Build harness + ollama images in WSL
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          cd "$GITHUB_WORKSPACE"
+          nix build .#harnessImage --print-build-logs
+          nix build .#ollamaImage  --print-build-logs
+
+      - name: Run installer inside WSL (--no-pull, --skip-model-pull)
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          cd "$GITHUB_WORKSPACE"
+          # podman comes from install.sh's apt path
+          nix run .#harnessImage.copyToPodman
+          nix run .#ollamaImage.copyToPodman
+          bash scripts/install.sh \
+            --no-pull \
+            --skip-model-pull \
+            --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest
+
+      - name: Verify pod and ollama API inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          podman pod ps
+          podman ps
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+              echo "ollama API up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "ollama did not come up in 60s"
+          podman logs ollama-service || true
+          exit 1
+
+  install-test-gate:
+    name: Install Test (gate)
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - shellcheck
+      - ps1-lint
+      - linux-bringup
+      - macos-podman-bootstrap
+      - windows-wsl-bringup
+    steps:
+      - name: Fail if any dependency failed or was cancelled
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::One or more install-test jobs failed or were cancelled"
+          exit 1
