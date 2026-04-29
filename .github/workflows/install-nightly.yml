@@ -52,6 +52,14 @@ jobs:
           docker save nanna-coder-ollama:latest  -o /tmp/ollama.tar
           podman load -i /tmp/harness.tar
           podman load -i /tmp/ollama.tar
+          # Normalize: podman load adds localhost/ prefix to short-name
+          # docker-archives; install.sh's `podman image exists <ref>` check
+          # requires an exact match, so retag without the prefix.
+          for img in nanna-coder-harness nanna-coder-ollama; do
+            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
+            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
+            podman tag "$full" "${img}:latest"
+          done
 
       - name: Run installer with real Gemma 4 pull
         env:

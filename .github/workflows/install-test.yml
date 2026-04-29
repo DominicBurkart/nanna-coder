@@ -101,6 +101,15 @@ jobs:
           fi
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
+          # `podman load` of a docker-archive (saved with `docker save
+          # nanna-coder-harness:latest`) stores it as
+          # localhost/nanna-coder-harness:latest. Normalize so the simple
+          # `nanna-coder-harness:latest` ref the installer expects resolves.
+          for img in nanna-coder-harness nanna-coder-ollama; do
+            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
+            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
+            podman tag "$full" "${img}:latest"
+          done
           podman images
       - name: Run installer
         run: |
@@ -151,8 +160,14 @@ jobs:
       - name: Start colima with podman runtime, x86_64 arch
         run: |
           # 4 GiB / 2 CPUs is enough for ollama serve + small ops.
-          # qemu emulation is slow but functional for bring-up smoke.
-          colima start --runtime podman --arch x86_64 --cpu 2 --memory 4 --disk 20
+          # `--vm-type qemu` is required for cross-arch emulation: the
+          # default vm-type (`vz`, Apple Virtualization framework) cannot
+          # run x86_64 on arm64. qemu emulation is slow but functional.
+          colima start \
+            --runtime podman \
+            --vm-type qemu \
+            --arch x86_64 \
+            --cpu 2 --memory 4 --disk 20
           colima status
           podman info | head -40
 
@@ -160,6 +175,11 @@ jobs:
         run: |
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
+          for img in nanna-coder-harness nanna-coder-ollama; do
+            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
+            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
+            podman tag "$full" "${img}:latest"
+          done
           podman images
 
       - name: Run installer (skip podman-machine path inside install.sh)
@@ -223,17 +243,27 @@ jobs:
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
+          # Inside wsl-bash, $GITHUB_WORKSPACE is the Windows path
+          # (e.g. D:\a\nanna-coder\nanna-coder). Translate to a WSL path
+          # (/mnt/d/a/...) so `cd` and relative file lookups work.
+          ws=$(wslpath -u "$GITHUB_WORKSPACE")
+          cd "$ws"
           podman --version
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
+          for img in nanna-coder-harness nanna-coder-ollama; do
+            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
+            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
+            podman tag "$full" "${img}:latest"
+          done
           podman images
 
       - name: Run installer inside WSL
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
+          ws=$(wslpath -u "$GITHUB_WORKSPACE")
+          cd "$ws"
           bash scripts/install.sh \
             --no-pull --skip-model-pull --yes \
             --harness-image nanna-coder-harness:latest \
