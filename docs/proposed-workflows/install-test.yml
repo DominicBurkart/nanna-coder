@@ -1,0 +1,165 @@
+name: Install Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: shellcheck install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -x scripts/install.sh
+
+  ps1-lint:
+    name: PSScriptAnalyzer install.ps1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $issues = Invoke-ScriptAnalyzer -Path scripts/install.ps1 -Severity @('Error','Warning')
+          $issues | Format-Table -AutoSize
+          $errors = $issues | Where-Object { $_.Severity -eq 'Error' }
+          if ($errors) { throw "PSScriptAnalyzer errors found" }
+
+  dry-run:
+    name: Dry-run on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh --dry-run
+        run: bash scripts/install.sh --dry-run --yes
+      - name: install.sh --help
+        run: bash scripts/install.sh --help || true
+      - name: install.sh rejects unknown flags
+        run: |
+          if bash scripts/install.sh --bogus-flag 2>/dev/null; then
+            echo "expected non-zero exit on unknown flag"; exit 1
+          fi
+          echo OK
+
+  dry-run-wsl:
+    name: Dry-run inside WSL2 (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up WSL2 (Ubuntu)
+        uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+      - name: install.sh --dry-run inside WSL
+        shell: wsl-bash {0}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          bash scripts/install.sh --dry-run --yes
+      - name: install.ps1 syntax parses (PowerShell)
+        shell: pwsh
+        run: |
+          # Parse-only check: tokenize and look for syntax errors without
+          # executing. Avoids the WSL bootstrap path (which we don't run in CI).
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/scripts/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | Format-List; throw "install.ps1 has parse errors" }
+          Write-Host "install.ps1 parses cleanly"
+
+  linux-bringup:
+    name: Linux full bring-up (no pull, no model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: nanna-coder
+          authToken: ${{ secrets.CACHIX_AUTH }}
+          pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+          skipPush: ${{ github.event_name == 'pull_request' }}
+
+      - name: Build harness + ollama images
+        run: |
+          nix build .#harnessImage --print-build-logs
+          nix build .#ollamaImage  --print-build-logs
+
+      - name: Load images into podman (via docker bridge)
+        run: |
+          # ubuntu-latest has docker preinstalled. The flake's nix2container
+          # exposes copyToDockerDaemon (proven in ci.yml) but not
+          # copyToPodman in this revision, so we bridge: load into Docker via
+          # the working helper, then transfer to podman via docker-archive
+          # tarball, which `podman load` understands natively.
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y podman
+          fi
+          nix run .#harnessImage.copyToDockerDaemon
+          nix run .#ollamaImage.copyToDockerDaemon
+          docker save nanna-coder-harness:latest -o /tmp/harness.tar
+          docker save nanna-coder-ollama:latest  -o /tmp/ollama.tar
+          podman load -i /tmp/harness.tar
+          podman load -i /tmp/ollama.tar
+          podman images
+
+      - name: Run installer (--no-pull, --skip-model-pull)
+        run: |
+          bash scripts/install.sh \
+            --no-pull \
+            --skip-model-pull \
+            --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest
+
+      - name: Verify pod and ollama API
+        run: |
+          podman pod ps
+          podman ps
+          podman inspect ollama-service > /dev/null
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+              echo "ollama API up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "ollama did not come up in 60s"
+          podman logs ollama-service || true
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: |
+          podman pod stop nanna-coder-pod || true
+          podman pod rm   nanna-coder-pod || true
+
+  install-test-gate:
+    name: Install Test (gate)
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - shellcheck
+      - ps1-lint
+      - dry-run
+      - dry-run-wsl
+      - linux-bringup
+    steps:
+      - name: Fail if any dependency failed or was cancelled
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::One or more install-test jobs failed or were cancelled"
+          exit 1

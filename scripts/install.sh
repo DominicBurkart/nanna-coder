@@ -17,6 +17,9 @@
 #   --ollama-image <ref>   Use this exact ollama image ref (overrides --registry/--tag).
 #   --no-pull           Don't `podman pull` the images. Use already-loaded local images
 #                       (e.g. loaded via nix2container's copyToPodman). Used by CI.
+#   --dry-run           Print what the installer would do for the detected OS and exit.
+#                       Doesn't install anything. Used by CI to validate the script
+#                       across platforms without depending on container runtimes.
 #   --yes               Don't prompt; assume yes for sudo notices.
 #   -h, --help          Show this help.
 #
@@ -40,6 +43,7 @@ OLLAMA_IMAGE_OVERRIDE=""
 SKIP_MODEL_PULL=0
 NO_START=0
 NO_PULL=0
+DRY_RUN=0
 ASSUME_YES=0
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     --skip-model-pull) SKIP_MODEL_PULL=1; shift;;
     --no-start)        NO_START=1; shift;;
     --no-pull)         NO_PULL=1; shift;;
+    --dry-run)         DRY_RUN=1; shift;;
     --registry)        REGISTRY="$2"; shift 2;;
     --tag)             TAG="$2"; shift 2;;
     --model)           MODEL="$2"; shift 2;;
@@ -113,6 +118,28 @@ ${C_BOLD}Nanna Coder installer${C_RESET}
 This installer may invoke sudo to install Podman. You will see a clear
 notification before each privileged step.
 EOF
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  cat <<EOF
+
+${C_YELLOW}${C_BOLD}--dry-run set: not executing any commands.${C_RESET}
+
+Plan for $OS/$ARCH:
+  1. Install Podman if missing
+       Linux: sudo (apt-get|dnf|pacman|zypper) install -y podman
+       macOS: brew install podman
+  2. (macOS) podman machine init && podman machine start
+  3. Verify: podman info
+  4. Pull images$([[ $NO_PULL -eq 1 ]] && echo " — SKIPPED (--no-pull)")
+       $HARNESS_IMAGE
+       $OLLAMA_IMAGE
+  5. Create pod: $POD_NAME (publishes :8080 and :11434)
+  6. Run ollama-service from $OLLAMA_IMAGE
+  7. Wait for ollama API at http://localhost:11434/api/tags
+  8. Pull model$([[ $SKIP_MODEL_PULL -eq 1 ]] && echo " — SKIPPED (--skip-model-pull)"): podman exec ollama-service ollama pull $MODEL
+EOF
+  exit 0
+fi
 
 # ---------- 1. podman ----------
 
