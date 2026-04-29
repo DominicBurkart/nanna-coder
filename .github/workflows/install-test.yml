@@ -148,14 +148,20 @@ jobs:
           name: container-images
           path: _images
 
-      - name: Install podman + colima
+      - name: Install podman + colima + qemu
         run: |
           # macos-latest is arm64 (Apple Silicon). We built x86_64-linux
           # containers above, so the macOS lane runs an emulated x86_64 VM
           # via colima with the podman runtime. colima is the standard
           # podman/docker-on-mac VM manager and is far more reliable in CI
-          # than `podman machine` on arm64 GHA runners.
-          brew install podman colima docker
+          # than `podman machine` on arm64 GHA runners. qemu is the
+          # cross-arch emulator colima delegates to and is NOT pulled as a
+          # dep by every brew bottle; install it explicitly.
+          set -x
+          brew install podman colima docker qemu
+          colima version
+          podman --version
+          which qemu-system-x86_64 && qemu-system-x86_64 --version | head -1
 
       - name: Start colima with podman runtime, x86_64 arch
         run: |
@@ -163,11 +169,13 @@ jobs:
           # `--vm-type qemu` is required for cross-arch emulation: the
           # default vm-type (`vz`, Apple Virtualization framework) cannot
           # run x86_64 on arm64. qemu emulation is slow but functional.
+          set -x
           colima start \
             --runtime podman \
             --vm-type qemu \
             --arch x86_64 \
-            --cpu 2 --memory 4 --disk 20
+            --cpu 2 --memory 4 --disk 20 \
+            --verbose
           colima status
           podman info | head -40
 
@@ -232,6 +240,11 @@ jobs:
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
+          # Disable cache: the GHA cache service has been intermittently
+          # returning 400 ("Our services aren't available right now"),
+          # which makes setup-wsl fail on cache restore. Slower without
+          # cache but reliable.
+          use-cache: 'false'
           additional-packages: |
             curl
             ca-certificates
