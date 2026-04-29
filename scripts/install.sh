@@ -204,14 +204,35 @@ fi
 
 # ---------- 2. pull images ----------
 
+# `podman image exists <ref>` requires an exact ref match, but `podman load`
+# of a docker-archive often stores short-name images with a `localhost/`
+# prefix. Try common variants before giving up so callers can pass either
+# form (e.g. `nanna-coder-harness:latest` or
+# `localhost/nanna-coder-harness:latest`).
+image_loaded() {
+  local ref="$1"
+  podman image exists "$ref" 2>/dev/null && return 0
+  case "$ref" in
+    */*) ;;  # already has a registry/path component
+    *)   podman image exists "localhost/$ref"        2>/dev/null && return 0
+         podman image exists "docker.io/library/$ref" 2>/dev/null && return 0 ;;
+  esac
+  podman images --format '{{.Repository}}:{{.Tag}}' | grep -qE "(^|/)${ref//\//\\/}\$" && return 0
+  return 1
+}
+
 if [[ $NO_PULL -eq 1 ]]; then
   warn "--no-pull set: skipping podman pull. Expecting images already loaded:"
   warn "  $HARNESS_IMAGE"
   warn "  $OLLAMA_IMAGE"
-  podman image exists "$HARNESS_IMAGE" \
-    || die "harness image $HARNESS_IMAGE not loaded locally and --no-pull was set."
-  podman image exists "$OLLAMA_IMAGE" \
-    || die "ollama image $OLLAMA_IMAGE not loaded locally and --no-pull was set."
+  if ! image_loaded "$HARNESS_IMAGE"; then
+    podman images >&2 || true
+    die "harness image $HARNESS_IMAGE not loaded locally and --no-pull was set."
+  fi
+  if ! image_loaded "$OLLAMA_IMAGE"; then
+    podman images >&2 || true
+    die "ollama image $OLLAMA_IMAGE not loaded locally and --no-pull was set."
+  fi
 else
   log "pulling $HARNESS_IMAGE"
   podman pull "$HARNESS_IMAGE" \
