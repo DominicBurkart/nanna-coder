@@ -189,7 +189,13 @@ else
   ok "podman installed: $(podman --version)"
 fi
 
-if [[ "$OS" == macos ]]; then ensure_podman_machine_macos; fi
+if [[ "$OS" == macos ]]; then
+  if [[ "${NANNA_SKIP_PODMAN_MACHINE:-0}" == "1" ]]; then
+    warn "NANNA_SKIP_PODMAN_MACHINE=1: not touching podman machine (caller manages the VM, e.g. colima)."
+  else
+    ensure_podman_machine_macos
+  fi
+fi
 
 # Sanity: podman is responsive.
 if ! podman info >/dev/null 2>&1; then
