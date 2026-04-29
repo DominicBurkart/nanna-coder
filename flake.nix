@@ -97,7 +97,7 @@
 
         # Filter source files (exclude target, .git, etc.)
         src = pkgs.lib.cleanSourceWith {
-          src = ./.
+          src = ./.;
           filter = path: type:
             (pkgs.lib.hasSuffix "\.rs" path) ||
             (pkgs.lib.hasSuffix "\.toml" path) ||
@@ -248,11 +248,11 @@
             MIN_COVERAGE="70.0"
 
             # Compare coverage using awk since bc might not be available
-            if awk "BEGIN { exit !(${COVERAGE} >= ${MIN_COVERAGE}) }"; then
-              echo "Coverage: ${COVERAGE}% >= ${MIN_COVERAGE}%"
+            if awk "BEGIN { exit !($COVERAGE >= $MIN_COVERAGE) }"; then
+              echo "Coverage: $COVERAGE% >= $MIN_COVERAGE%"
               echo "$COVERAGE" > $out
             else
-              echo "Coverage too low: ${COVERAGE}% < ${MIN_COVERAGE}%"
+              echo "Coverage too low: $COVERAGE% < $MIN_COVERAGE%"
               exit 1
             fi
           '';
@@ -280,7 +280,7 @@
           commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git ];
 
           src = pkgs.lib.cleanSourceWith {
-            src = ./.
+            src = ./.;
             filter = path: type:
               (pkgs.lib.hasSuffix "\.rs" path) ||
               (pkgs.lib.hasSuffix "\.toml" path) ||
