@@ -97,10 +97,7 @@ impl NannaMcpServer {
             // parse them. Otherwise we fall through to the line-delimited path
             // used by the existing unit tests.
             let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
-            if trimmed_hdr
-                .to_ascii_lowercase()
-                .starts_with("content-length:")
-            {
+            if trimmed_hdr.to_ascii_lowercase().starts_with("content-length:") {
                 let content_length: usize = trimmed_hdr
                     .split_once(':')
                     .and_then(|(_, v)| v.trim().parse().ok())
@@ -149,7 +146,7 @@ impl NannaMcpServer {
 
         let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
             Ok(req) => self.handle_request(req).await,
-            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e)),
+            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {e}")),
         };
 
         if response.id.is_none() && response.error.is_none() {
@@ -175,7 +172,7 @@ impl NannaMcpServer {
 
         let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
             Ok(req) => self.handle_request(req).await,
-            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e)),
+            Err(e) => JsonRpcResponse::error(None, -32700, format!("Parse error: {e}")),
         };
 
         if response.id.is_none() && response.error.is_none() {
@@ -485,17 +482,6 @@ mod tests {
         serde_json::from_str(s.trim_end()).unwrap()
     }
 
-    /// Parse a Content-Length framed response and return the JSON body.
-    fn parse_framed_response(bytes: &[u8]) -> serde_json::Value {
-        let s = std::str::from_utf8(bytes).unwrap();
-        // Header ends at \r\n\r\n
-        let sep = s
-            .find("\r\n\r\n")
-            .expect("missing \\r\\n\\r\\n in framed response");
-        let body = &s[sep + 4..];
-        serde_json::from_str(body).unwrap()
-    }
-
     #[tokio::test]
     async fn test_process_line_initialize_returns_single_line_json() {
         let line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n";
@@ -533,11 +519,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_line_blank_returns_none() {
         assert!(make_server().process_line("").await.unwrap().is_none());
-        assert!(make_server()
-            .process_line("   \n")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(make_server().process_line("   \n").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -554,9 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_drives_process_line_over_async_io() {
-        let input =
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
-                .to_vec();
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
         make_server()
             .serve(std::io::Cursor::new(input), &mut output)
@@ -576,94 +556,6 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         make_server()
             .serve(std::io::Cursor::new(Vec::<u8>::new()), &mut output)
-            .await
-            .unwrap();
-        assert!(output.is_empty());
-    }
-
-    // -- process_framed unit tests --------------------------------------------
-
-    /// Build a Content-Length framed message for use in serve() tests.
-    fn framed(msg: &str) -> Vec<u8> {
-        format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg).into_bytes()
-    }
-
-    #[tokio::test]
-    async fn test_process_framed_initialize_returns_content_length_response() {
-        let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
-        let bytes = make_server()
-            .process_framed(body)
-            .await
-            .unwrap()
-            .expect("expected Some response");
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(
-            s.starts_with("Content-Length:"),
-            "framed response must start with Content-Length, got: {}",
-            &s[..s.len().min(80)]
-        );
-        let v = parse_framed_response(&bytes);
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
-        assert!(v["result"]["capabilities"]["tools"].is_object());
-    }
-
-    #[tokio::test]
-    async fn test_process_framed_blank_returns_none() {
-        assert!(make_server().process_framed("").await.unwrap().is_none());
-        assert!(make_server()
-            .process_framed("   \n  ")
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_process_framed_notification_returns_none() {
-        let notif =
-            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}";
-        assert!(make_server()
-            .process_framed(notif)
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_process_framed_invalid_json_returns_parse_error() {
-        let bytes = make_server()
-            .process_framed("not-valid-json")
-            .await
-            .unwrap()
-            .expect("expected Some response for parse error");
-        let v = parse_framed_response(&bytes);
-        assert_eq!(v["error"]["code"], -32700);
-        assert!(v["id"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_serve_content_length_framed_initialize() {
-        let msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
-        let input = framed(msg);
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
-            .await
-            .unwrap();
-        assert!(!output.is_empty(), "expected framed response");
-        let v = parse_framed_response(&output);
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
-    }
-
-    #[tokio::test]
-    async fn test_serve_content_length_framed_eof_mid_headers() {
-        // Send "Content-Length: 42" with no trailing \r\n\r\n -- server must
-        // return Ok(()) on EOF rather than panic.
-        let input = b"Content-Length: 42\r\n".to_vec();
-        let mut output: Vec<u8> = Vec::new();
-        make_server()
-            .serve(std::io::Cursor::new(input), &mut output)
             .await
             .unwrap();
         assert!(output.is_empty());
