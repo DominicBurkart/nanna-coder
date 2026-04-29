@@ -37,6 +37,11 @@ inner loop. The current guardrails (collected from `ARCHITECTURE.md`,
 - **Trait & registry scaffolding (planned).** Issues #203/#204 propose a
   `Workflow` trait, `WorkflowRegistry`, and a routing/selector node so
   multiple workflows can coexist and be picked per task.
+- **Complementarity runner (planned).** Issue #207 proposes an ensemble
+  runner that executes the same case across multiple workflows/models and
+  emits a complementarity matrix (which configs cover cases the others
+  miss). §3, §4, and §7 below all assume this runner as the substrate
+  for cross-variant comparison.
 
 The combination is *heavy* by design: it favours regression-safety and
 agent-resistance over throughput.
@@ -57,10 +62,13 @@ agent pays in tokens, wall time, and *behavioural distortion*:
 - Strong CI gates mean the agent can only learn from the *gate* signal,
   not from intermediate failure modes. This collapses the reward surface
   and reduces the diagnostic value of a failed run.
-- Coverage and lint gates create false-negatives on novel approaches:
-  a refactor that *would* pass a human reviewer's read but happens to
-  drop one untested edge-case path is killed at the gate, even when the
-  diff strictly improves architecture.
+- Coverage and lint gates create false rejections on novel approaches
+  (in standard test-theory framing this is a false *positive* — positive
+  means "rejected as bad" — phrased here as "false rejections" to avoid
+  the ambiguity for an audience of coding agents): a refactor that
+  *would* pass a human reviewer's read but happens to drop one untested
+  edge-case path is killed at the gate, even when the diff strictly
+  improves architecture.
 
 **Where lighter bites.** The same gradient that frees exploration also
 frees regression:
@@ -99,9 +107,11 @@ and need follow-up before being treated as load-bearing.
   pre-commit hooks plus, optionally, a configurable `--test-cmd`. There
   is no sandbox, no per-task container, no enforced coverage gate. This
   is roughly the *minimum* end of the spectrum: the human is the gate.
-  Aider's published SWE-bench numbers are competitive on edit-locality
-  tasks; it under-performs on tasks requiring multi-file orchestration
-  with strong test signal.
+  Aider's published SWE-bench numbers are competitive (historically
+  top-tier on the SWE-bench Verified leaderboard, including multi-file
+  edits); per-domain breakdowns by orchestration depth are not, to our
+  knowledge, published — treat any orchestration-vs-edit-locality split
+  as a hypothesis to test rather than a finding.
 - **OpenHands (formerly OpenDevin) without sandbox** (mixed; sandbox
   config is verifiable, "without-sandbox" perf is hand-waved). OpenHands
   ships with a runtime sandbox by default but exposes a "local runtime"
@@ -127,7 +137,11 @@ those numbers exist, the case studies above are *priors*, not evidence.
 
 **Setup.** Use the runner from #271 (`harness::eval::runner::run_eval`)
 and its workflow integration from #272 (`.github/workflows/eval.yml`,
-`NANNA_EVAL_MODEL=gemma4:e4b`). The cases under `evals/cases/` —
+which currently defaults to `model: qwen3:0.6b` per the workflow's
+`workflow_dispatch.inputs.model.default`; pre-registration must read
+the actual default at the time the experiment is committed, *not* the
+placeholder used in the prior draft of this note). The cases under
+`evals/cases/` —
 `happy-path-001..003` plus `swebench-{django,pytest,scikit-learn,sphinx,sympy}-*`
 — are the starting suite. Ensemble/coverage analysis lives in #207's
 runner.
@@ -139,11 +153,15 @@ runner.
   for promotion, all coverage-bypass guards active.
 - `verification = "medium"` — drop the 100%-patch-coverage promotion
   requirement (run coverage as advisory only), keep nix shell + container.
-- `verification = "light"` — no container, run inside the harness shell
-  directly, run only `cargo build` + `cargo test` (no clippy `-D warnings`,
-  no coverage). Still pinned to the nix toolchain to keep results
-  reproducible — that's a non-negotiable for eval comparability, even
-  in the light variant.
+- `verification = "light"` — no *blocking* container around the agent's
+  inner loop; the agent runs inside the harness shell directly and sees
+  no syscall denials or network blocks as errors. An **audit-only**
+  container wrapper is still present (see §6) recording security
+  violations for the eval report — this is non-blocking telemetry, not
+  enforcement. Within `light`, only `cargo build` + `cargo test` are
+  required (no clippy `-D warnings`, no coverage). Still pinned to the
+  nix toolchain to keep results reproducible — that's a non-negotiable
+  for eval comparability, even in the light variant.
 
 **Metrics.** Per case, per variant: pass/fail; wall time (median + p95
 across N≥5 seeds); prompt + completion tokens; iteration count;
@@ -166,10 +184,13 @@ cases = ["happy-path-001", "happy-path-002", "happy-path-003",
          "swebench-scikit-learn__scikit-learn-13142", "swebench-sphinx-doc__sphinx-8548",
          "swebench-sympy__sympy-20590"]
 seeds = [0, 1, 2, 3, 4]
-model = "gemma4:e4b"
+model = "qwen3:0.6b"  # match `.github/workflows/eval.yml` default at commit time
 primary_metric = "pass_rate"
 secondary_metrics = ["wall_time_p50", "tokens_total", "security_violations"]
 decision_rule = "promote `light` only if pass_rate(light) >= pass_rate(heavy) - 2pp AND security_violations(light) == 0"
+# NOTE: `model` above MUST be set from the live default of
+# `.github/workflows/eval.yml` (workflow_dispatch.inputs.model.default)
+# at commit time. As of 2026-04, that default is `qwen3:0.6b`.
 ```
 
 **Extra evals needed for light variants** (gaps to file as follow-ups):
