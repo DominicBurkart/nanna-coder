@@ -37,14 +37,21 @@ jobs:
           nix build .#harnessImage --print-build-logs
           nix build .#ollamaImage  --print-build-logs
 
-      - name: Load images into podman
+      - name: Load images into podman (via docker bridge)
         run: |
+          # The flake's nix2container exposes copyToDockerDaemon (proven in
+          # ci.yml) but not copyToPodman in this revision; bridge through a
+          # docker-archive tarball that podman load understands natively.
           if ! command -v podman >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y podman
           fi
-          nix run .#harnessImage.copyToPodman
-          nix run .#ollamaImage.copyToPodman
+          nix run .#harnessImage.copyToDockerDaemon
+          nix run .#ollamaImage.copyToDockerDaemon
+          docker save nanna-coder-harness:latest -o /tmp/harness.tar
+          docker save nanna-coder-ollama:latest  -o /tmp/ollama.tar
+          podman load -i /tmp/harness.tar
+          podman load -i /tmp/ollama.tar
 
       - name: Run installer with real Gemma 4 pull
         env:
