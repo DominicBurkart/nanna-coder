@@ -300,19 +300,7 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
 impl AgentLoop<InMemoryEntityStore> {
     /// Create a new agent loop with the default in-memory entity store.
     pub fn new(config: AgentConfig) -> Self {
-        Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store: InMemoryEntityStore::new(),
-            performed_actions: 0,
-            llm_provider: None,
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
-        }
+        Self::with_entity_store(config, InMemoryEntityStore::new())
     }
 }
 
@@ -341,17 +329,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
             llm_provider: Some(llm_provider),
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_entity_store(config, entity_store)
         }
     }
 
@@ -363,17 +342,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         tool_registry: ToolRegistry,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
-            llm_provider: Some(llm_provider),
-            plan_cache: None,
             tool_registry: Some(tool_registry),
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_llm(config, entity_store, llm_provider)
         }
     }
 
