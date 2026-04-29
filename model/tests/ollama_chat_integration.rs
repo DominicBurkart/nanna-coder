@@ -7,6 +7,28 @@ use std::time::Duration;
 
 const MODEL: &str = "qwen3:0.6b";
 const TIMEOUT: Duration = Duration::from_secs(120);
+const OLLAMA_PROBE_ADDR: &str = "127.0.0.1:11434";
+const OLLAMA_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Probe whether Ollama is reachable on the default port.
+///
+/// Mirrors the pattern in `harness/tests/dev_container_integration.rs` so the
+/// `#[ignore]` tests in this file can be invoked via `--run-ignored ignored-only`
+/// in CI without panicking on legs that lack a live Ollama. Uses a synchronous
+/// `TcpStream::connect_timeout` so the probe never hangs the runtime.
+///
+/// See issue #302.
+fn ollama_reachable() -> bool {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    let addr: SocketAddr = match OLLAMA_PROBE_ADDR.to_socket_addrs() {
+        Ok(mut iter) => match iter.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, OLLAMA_PROBE_TIMEOUT).is_ok()
+}
 
 fn make_provider() -> OllamaProvider {
     OllamaProvider::new(OllamaConfig::default().with_timeout(TIMEOUT)).expect("provider creation")
@@ -24,6 +46,10 @@ fn assert_valid_response(response: &ChatResponse) {
 #[tokio::test]
 #[ignore]
 async fn test_health_check() {
+    if !ollama_reachable() {
+        eprintln!("Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_health_check");
+        return;
+    }
     let provider = make_provider();
 
     let result = tokio::time::timeout(TIMEOUT, provider.health_check()).await;
@@ -46,6 +72,10 @@ async fn test_health_check() {
 #[tokio::test]
 #[ignore]
 async fn test_basic_chat() {
+    if !ollama_reachable() {
+        eprintln!("Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_basic_chat");
+        return;
+    }
     let provider = make_provider();
     let request = ChatRequest::new(MODEL, vec![ChatMessage::user("What is 2+2?")]);
 
@@ -74,6 +104,12 @@ async fn test_basic_chat() {
 #[tokio::test]
 #[ignore]
 async fn test_chat_with_system_message() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_chat_with_system_message"
+        );
+        return;
+    }
     let provider = make_provider();
     let request = ChatRequest::new(
         MODEL,
@@ -103,6 +139,12 @@ async fn test_chat_with_system_message() {
 #[tokio::test]
 #[ignore]
 async fn test_chat_with_tool_definitions() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_chat_with_tool_definitions"
+        );
+        return;
+    }
     let provider = make_provider();
 
     let mut properties = HashMap::new();
@@ -173,6 +215,12 @@ async fn test_chat_with_tool_definitions() {
 #[tokio::test]
 #[ignore]
 async fn test_chat_response_structure() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_chat_response_structure"
+        );
+        return;
+    }
     let provider = make_provider();
     let request = ChatRequest::new(MODEL, vec![ChatMessage::user("Say hello.")]);
 
@@ -194,6 +242,12 @@ async fn test_chat_response_structure() {
 #[tokio::test]
 #[ignore]
 async fn test_invalid_model_returns_error() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_invalid_model_returns_error"
+        );
+        return;
+    }
     let provider = make_provider();
     let request = ChatRequest::new("nonexistent-model-xyz", vec![ChatMessage::user("Hello")]);
 
@@ -207,6 +261,12 @@ async fn test_invalid_model_returns_error() {
 #[tokio::test]
 #[ignore]
 async fn test_ollama_chat_preserves_roles() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_ollama_chat_preserves_roles"
+        );
+        return;
+    }
     let provider = make_provider();
 
     let messages = vec![
@@ -240,6 +300,12 @@ async fn test_ollama_chat_preserves_roles() {
 #[tokio::test]
 #[ignore]
 async fn test_ollama_tool_calling_roundtrip() {
+    if !ollama_reachable() {
+        eprintln!(
+            "Ollama not reachable on {OLLAMA_PROBE_ADDR}, skipping test_ollama_tool_calling_roundtrip"
+        );
+        return;
+    }
     let provider = make_provider();
 
     let mut properties = HashMap::new();
