@@ -10,12 +10,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-// ── Live-tier constants ────────────────────────────────────────────
+// ── Live-tier constants ──────────────────────────────────
 const MAX_ATTEMPTS: usize = 3;
 const LIVE_TASK_TIMEOUT: Duration = Duration::from_secs(300);
 const LIVE_MODEL: &str = "qwen3:0.6b";
 
-// ── Expected MCP tool names ─────────────────────────────────────────
+// ── Expected MCP tool names ─────────────────────────────────
 const EXPECTED_TOOLS: &[&str] = &[
     "assign_task",
     "poll_task",
@@ -25,7 +25,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "onboard_repo",
 ];
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────
 
 /// Send a single JSON-RPC message framed with Content-Length and read back
 /// the next framed response from the server.
@@ -75,7 +75,7 @@ fn send_and_recv(
     String::from_utf8_lossy(&body).into_owned()
 }
 
-// ── Mock-tier tests ──────────────────────────────────────────────────
+// ── Mock-tier tests ──────────────────────────────────────────────
 
 #[test]
 fn test_harness_help_exits_zero() {
@@ -163,6 +163,10 @@ fn test_mcp_serve_responds_to_initialize() {
 /// and asserts that all 6 expected tools are returned. This exercises
 /// `NannaMcpServer::run_stdio()` end-to-end.
 #[test]
+// child.wait() is called on all outer-function code paths (timeout branch and
+// normal branch below). Clippy incorrectly flags early `return`s inside the
+// spawned thread closure as paths where `child` is not waited on.
+#[allow(clippy::zombie_processes)]
 fn test_mcp_stdio_tools_list() {
     use std::io::Read;
 
@@ -275,6 +279,10 @@ fn test_mcp_stdio_tools_list() {
 /// first element has parseable JSON text. This validates the full stdio
 /// transport for tool execution without needing Ollama.
 #[test]
+// child.wait() is called on all outer-function code paths (timeout branch and
+// normal branch below). Clippy incorrectly flags early `return`s inside the
+// spawned thread closure as paths where `child` is not waited on.
+#[allow(clippy::zombie_processes)]
 fn test_mcp_stdio_tools_call_list_tasks() {
     use std::io::Read;
 
@@ -392,7 +400,7 @@ fn test_mcp_stdio_tools_call_list_tasks() {
     );
 }
 
-// ── Live-tier test ─────────────────────────────────────────────────────
+// ── Live-tier test ──────────────────────────────────────────────────────
 
 /// Live MCP task roundtrip smoke test.
 ///
