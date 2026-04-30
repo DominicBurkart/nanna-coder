@@ -30,6 +30,15 @@ into exactly one of these slots:
   entry of the form `<workflow-file-basename-without-extension>/<job-id>`
   to `.github/required-status-checks.txt` under the "Required" section AND
   configure it as a required status check in branch protection for `main`.
+  NOTE: the string in branch protection is NOT the same as the allowlist
+  entry. Branch protection identifies a check by `<workflow `name:`> /
+  <job `name:` or job-id>` (with spaces around the slash) — e.g.
+  `codecov-guard / guard` — whereas the allowlist uses
+  `<workflow-filename-without-extension>/<job-id>` (no spaces) —
+  e.g. `codecov-guard/guard`. Configure each side independently. The
+  allowlist is documentation/enumeration only; actual merge enforcement
+  lives in branch-protection settings, which an agent cannot self-verify
+  in this sandbox.
 - **Optional / dispatch-only / scheduled job**: add an entry of the same
   form to `.github/required-status-checks.txt` under the "Optional" section.
   The gate will still account for it; branch protection will not require it.

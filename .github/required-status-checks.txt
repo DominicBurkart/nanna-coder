@@ -17,6 +17,15 @@
 #      release-only, etc.), add it to the OPTIONAL section below so the
 #      gate can still account for it.
 #
+# IMPORTANT: this file is documentation/enumeration only -- it does NOT
+# itself enforce required-status-check status. Actual merge enforcement
+# lives in branch-protection settings. The string used in branch
+# protection is `<workflow `name:`> / <job `name:` or job-id>`
+# (with spaces around the slash) -- e.g. `codecov-guard / guard` --
+# whereas the entries in this file use the slug
+# `<workflow-filename-without-extension>/<job-id>` (no spaces).
+# See AGENTS.md "Adding a new CI job" for details.
+#
 # Required (must be green to merge):
 codecov-guard/guard
 ci-integration/container-loading
