@@ -6,17 +6,7 @@ coverage:
     project: off
     patch:
       default:
-        # Relaxed from 100%: some infrastructure paths require a live
-        # container runtime / Ollama that is unavailable in CI, and the
-        # #[ignore] e2e test and runtime-gated
-        # test_create_with_container_no_runtime exit early in CI, so some
-        # container-dispatch branches are genuinely uncoverable there.
-        target: 90%
+        target: 100%
 
 ignore:
-  # harness/src/main.rs is the binary entry-point wiring that requires a
-  # full tokio runtime and real OS process context. All helpers
-  # (emit, create_provider, use_mock_provider, MockCliProvider,
-  # install_ctrlc_handler, format_from, exit_code_for) live in
-  # harness/src/cli.rs and are fully unit-tested there.
   - "harness/src/main.rs"
