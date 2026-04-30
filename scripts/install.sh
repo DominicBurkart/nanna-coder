@@ -95,12 +95,32 @@ notify_sudo() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+is_wsl() { [[ -r /proc/version ]] && grep -qiE 'microsoft|wsl' /proc/version; }
+
 # ---------- OS detection ----------
 
 case "$(uname -s)" in
-  Linux*)  OS=linux;;
-  Darwin*) OS=macos;;
-  *) die "unsupported OS: $(uname -s). Linux and macOS only. (Windows: use scripts/install.ps1)";;
+  Linux*)
+    if is_wsl; then
+      cat >&2 <<'EOF'
+✗ WSL2 (Windows Subsystem for Linux) is not a supported install target for
+  scripts/install.sh.
+
+  The bash installer drives podman directly inside the host kernel, but
+  WSL2's kernel does not provide the network-namespace bind-mount path
+  (/run/netns/) that podman pod creation requires. You will get errors
+  such as:
+    failed to bind mount ns at /run/netns/...: invalid argument
+
+  Supported Windows install path: run scripts/install.ps1 from a Windows
+  PowerShell session, which sets up Podman Desktop / WSL with a
+  preconfigured environment. See README for details.
+EOF
+      die "WSL2 detected; not supported by install.sh"
+    fi
+    OS=linux ;;
+  Darwin*) OS=macos ;;
+  *) die "unsupported OS: $(uname -s). Linux and macOS only. (Windows: use scripts/install.ps1)" ;;
 esac
 ARCH="$(uname -m)"
 log "detected: $OS/$ARCH"
