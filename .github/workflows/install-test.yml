@@ -96,20 +96,16 @@ jobs:
           path: _images
       - name: Install podman + load images
         run: |
+          set -x
           if ! command -v podman >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y podman
           fi
+          podman --version
+          podman info | head -20
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
-          # `podman load` of a docker-archive (saved with `docker save
-          # nanna-coder-harness:latest`) stores it as
-          # localhost/nanna-coder-harness:latest. Normalize so the simple
-          # `nanna-coder-harness:latest` ref the installer expects resolves.
-          for img in nanna-coder-harness nanna-coder-ollama; do
-            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
-            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
-            podman tag "$full" "${img}:latest"
-          done
+          # install.sh's resolve_image_ref() handles the localhost/ prefix
+          # podman applies to short names, so no re-tag is needed here.
           podman images
       - name: Run installer
         run: |
@@ -163,31 +159,35 @@ jobs:
           podman --version
           which qemu-system-x86_64 && qemu-system-x86_64 --version | head -1
 
-      - name: Start colima with podman runtime, x86_64 arch
+      - name: Start colima with podman runtime, x86_64 arch (vz + Rosetta)
         run: |
-          # 4 GiB / 2 CPUs is enough for ollama serve + small ops.
-          # `--vm-type qemu` is required for cross-arch emulation: the
-          # default vm-type (`vz`, Apple Virtualization framework) cannot
-          # run x86_64 on arm64. qemu emulation is slow but functional.
+          # macOS 13+ supports `--vm-type=vz` (Apple Virtualization
+          # framework) which, on Apple Silicon, can run x86_64 binaries via
+          # Rosetta 2. This is dramatically faster and more reliable than
+          # `--vm-type=qemu` cross-arch emulation, which has a long history
+          # of issues on GHA arm64 runners.
           set -x
           colima start \
             --runtime podman \
-            --vm-type qemu \
+            --vm-type vz \
+            --vz-rosetta \
             --arch x86_64 \
             --cpu 2 --memory 4 --disk 20 \
-            --verbose
+            --verbose || {
+            echo "::group::colima logs (failure)"
+            cat ~/.colima/_lima/colima/serial.log 2>/dev/null || true
+            cat ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null || true
+            echo "::endgroup::"
+            exit 1
+          }
           colima status
           podman info | head -40
 
       - name: Load images
         run: |
+          set -x
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
-          for img in nanna-coder-harness nanna-coder-ollama; do
-            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
-            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
-            podman tag "$full" "${img}:latest"
-          done
           podman images
 
       - name: Run installer (skip podman-machine path inside install.sh)
@@ -255,20 +255,21 @@ jobs:
       - name: Load images inside WSL
         shell: wsl-bash {0}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           # Inside wsl-bash, $GITHUB_WORKSPACE is the Windows path
           # (e.g. D:\a\nanna-coder\nanna-coder). Translate to a WSL path
           # (/mnt/d/a/...) so `cd` and relative file lookups work.
           ws=$(wslpath -u "$GITHUB_WORKSPACE")
           cd "$ws"
+          # Diagnostics — surface the WSL environment so any failure has
+          # context (kernel, podman version, package state).
+          uname -a
+          dpkg -l | grep -E '^ii\s+(podman|uidmap|slirp4netns)' || true
           podman --version
+          podman info | head -30 || true
+          ls -lh _images/
           podman load -i _images/harness.tar
           podman load -i _images/ollama.tar
-          for img in nanna-coder-harness nanna-coder-ollama; do
-            full=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E "(^|/)${img}:latest$" | head -1)
-            [ -n "$full" ] || { echo "could not find loaded image for $img"; podman images; exit 1; }
-            podman tag "$full" "${img}:latest"
-          done
           podman images
 
       - name: Run installer inside WSL
