@@ -120,11 +120,15 @@ async fn handle_http_request(
     }
     let body_bytes = buf;
 
-    // Parse JSON-RPC request
+    // Parse JSON-RPC request. Don't surface serde_json::Error detail to the
+    // client — its formatting includes line/column offsets and partial-content
+    // hints from the request bytes, which becomes an info-disclosure vector
+    // once non-loopback / TLS support lands. Route detail to logs.
     let rpc_request: super::JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
-            let body = json_rpc_error(-32700, &format!("Parse error: {}", e));
+            tracing::warn!(error = %e, "JSON-RPC parse error");
+            let body = json_rpc_error(-32700, "parse error");
             return Ok(json_response(StatusCode::BAD_REQUEST, &body));
         }
     };
@@ -470,5 +474,34 @@ mod tests {
             .expect("HTTP request failed");
 
         assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Regression test: an unauthenticated oversized body must be rejected at
+    /// 401 (auth) before reaching the body-size guard. The auth check happens
+    /// before `record_success` and body buffering, so even a 4 MiB unauth'd
+    /// request gets a quick UNAUTHORIZED without the server ever streaming the
+    /// payload. Pin that ordering so a future refactor cannot quietly invert
+    /// the check sequence.
+    #[tokio::test]
+    async fn test_http_401_short_circuits_before_body_read() {
+        let (addr, _) = spawn_test_server().await;
+
+        // Larger than MAX_BODY_BYTES (1 MiB).
+        let big = vec![b'0'; (4 << 20) as usize];
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}", addr))
+            .header("Content-Type", "application/json")
+            .body(big)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "unauthenticated request must 401 before body-size enforcement"
+        );
     }
 }

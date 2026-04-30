@@ -82,8 +82,11 @@ impl AuthToken {
     /// input. SAFETY: the caller must guarantee the string is a valid token;
     /// supplying a non-64-char value will make `TokenStore::validate` leak the
     /// candidate length via early return in constant-time comparison.
-    #[doc(hidden)]
-    pub fn from_string_unchecked(s: String) -> Self {
+    ///
+    /// Test-only: gated behind `#[cfg(test)]` so production callers cannot
+    /// bypass `from_string`'s format validation.
+    #[cfg(test)]
+    pub(crate) fn from_string_unchecked(s: String) -> Self {
         Self(s)
     }
 }
@@ -230,7 +233,10 @@ impl RateLimiter {
             // Window expired — reset.
             *entry = (1, Instant::now());
         } else {
-            entry.0 += 1;
+            // saturating_add prevents wrap-to-zero in release builds (which
+            // would reset the counter and bypass the rate limit) and overflow
+            // panic in debug builds.
+            entry.0 = entry.0.saturating_add(1);
         }
     }
 
