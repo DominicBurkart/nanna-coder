@@ -33,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // ── Task management (the 6 MVP subcommands) ──────────────────────
+    // ── Task management (the 6 MVP subcommands) ────────────────────
     /// Submit a coding task to be executed
     AssignTask {
         /// Description of the task
@@ -164,7 +164,7 @@ async fn main() -> std::process::ExitCode {
     json_mode.store(cli.json, std::sync::atomic::Ordering::SeqCst);
 
     match cli.command {
-        // ── 6 MVP subcommands ────────────────────────────────
+        // ── 6 MVP subcommands ─────────────────────────────────────────────
         Commands::AssignTask {
             description,
             repo_path,
@@ -275,7 +275,7 @@ async fn main() -> std::process::ExitCode {
             }
         }
 
-        // ── Legacy interactive commands (require provider) ───────────
+        // ── Legacy interactive commands (require provider) ───────────────────
         Commands::Chat {
             model,
             prompt,
