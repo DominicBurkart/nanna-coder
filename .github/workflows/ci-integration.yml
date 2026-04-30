@@ -1,0 +1,94 @@
+name: CI Infrastructure Integration
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - "flake.nix"
+      - "flake.lock"
+      - "nix/**"
+      - "scripts/**"
+      - ".github/workflows/ci-integration.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container-loading:
+    name: container-loading (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nanna-coder
+          skipPush: "true"
+      - run: nix build .#harnessImage --print-build-logs
+      - id: image
+        name: Derive image reference from nix
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(nix eval --raw .#harnessImage.imageName)
+          tag=$(nix eval --raw .#harnessImage.imageTag)
+          echo "ref=${name}:${tag}" >> "$GITHUB_OUTPUT"
+      - run: nix run .#harnessImage.copyToDockerDaemon
+      - name: Verify image is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect '${{ steps.image.outputs.ref }}' >/dev/null
+      - name: Smoke-run the image
+        run: docker run --rm '${{ steps.image.outputs.ref }}' --help | head -n 5
+
+  empty-cache:
+    name: empty-cache (cold-start fallback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+      - id: cold
+        run: |
+          set -euo pipefail
+          start=$(date -u +%s)
+          nix build .#harness --print-build-logs --option substituters https://cache.nixos.org
+          end=$(date -u +%s)
+          echo "duration_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+      - run: |
+          {
+            echo "## Cold-cache build"
+            echo
+            echo "| metric | value |"
+            echo "|--------|-------|"
+            echo "| duration (s) | ${{ steps.cold.outputs.duration_seconds }} |"
+            echo "| substituters | cache.nixos.org only (cachix deliberately skipped) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  expected-failure:
+    name: expected-failure (negative test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+      - id: brokenrun
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          nix build '.#__ci_integration_does_not_exist__' --no-link 2>&1 | tee /tmp/broken.log
+      - run: |
+          set -euo pipefail
+          if [ '${{ steps.brokenrun.outcome }}' != 'failure' ]; then
+            echo "::error::Expected failure, got '${{ steps.brokenrun.outcome }}'"
+            exit 1
+          fi
+          grep -q '__ci_integration_does_not_exist__' /tmp/broken.log

@@ -154,9 +154,6 @@ impl FileEntity {
     }
 }
 
-#[deprecated(note = "Use FileEntity instead")]
-pub type AstEntity = FileEntity;
-
 #[cfg(test)]
 mod tests {
     use super::*;

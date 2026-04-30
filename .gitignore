@@ -63,3 +63,8 @@ result-*
 
 # MCP config (machine-specific paths)
 .mcp.json
+
+# Materialized SWE-bench clones — large upstream repos (django/sympy/etc.),
+# produced on demand by `harness::eval::swebench::materialize`. Only the
+# `task.toml` files under swebench-*/ are checked in.
+evals/cases/swebench-*/repo/

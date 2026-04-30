@@ -204,7 +204,7 @@ in rec {
     # Model-specific image names
     models = {
       qwen3 = "nanna-coder-ollama-qwen3";
-      mistral = "nanna-coder-ollama-mistral";
+      gemma = "nanna-coder-ollama-gemma";
     };
   };
 
