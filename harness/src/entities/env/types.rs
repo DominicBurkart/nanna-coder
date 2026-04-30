@@ -162,8 +162,8 @@ impl EnvVarSource {
 #[cfg(test)]
 mod new_types_tests {
     use super::*;
-    use crate::entities::env::security::{Capability, CapabilitySet};
     use crate::entities::Entity;
+    use crate::entities::env::security::{Capability, CapabilitySet};
 
     #[test]
     fn test_container_config_entity_serde_roundtrip() {
