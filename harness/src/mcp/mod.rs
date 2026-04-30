@@ -96,15 +96,30 @@ impl NannaMcpServer {
             // written with matching Content-Length framing so framed clients can
             // parse them. Otherwise we fall through to the line-delimited path
             // used by the existing unit tests.
+            //
+            // Framing mode is selected per-message based on the first line of
+            // each loop iteration: a `Content-Length:` prefix → framed body; any
+            // other line → treated as a complete JSON-RPC line. Mixed framing
+            // within a single message is not supported; a malformed
+            // `Content-Length` header terminates the connection rather than
+            // silently desyncing.
             let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
             if trimmed_hdr
                 .to_ascii_lowercase()
                 .starts_with("content-length:")
             {
-                let content_length: usize = trimmed_hdr
+                let content_length: usize = match trimmed_hdr
                     .split_once(':')
-                    .and_then(|(_, v)| v.trim().parse().ok())
-                    .unwrap_or(0);
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        return Err(format!(
+                            "MCP stdio: malformed Content-Length header: {trimmed_hdr:?}"
+                        )
+                        .into());
+                    }
+                };
 
                 // Consume header lines until we hit an empty line (end of headers).
                 loop {
@@ -120,7 +135,8 @@ impl NannaMcpServer {
 
                 let mut body = vec![0u8; content_length];
                 reader.read_exact(&mut body).await?;
-                let body_str = String::from_utf8_lossy(&body).into_owned();
+                let body_str = String::from_utf8(body)
+                    .map_err(|e| format!("MCP stdio: framed body is not valid UTF-8: {e}"))?;
 
                 if let Some(response_bytes) = self.process_framed(&body_str).await? {
                     writer.write_all(&response_bytes).await?;

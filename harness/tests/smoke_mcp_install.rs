@@ -59,20 +59,22 @@ fn send_and_recv(
         }
     }
 
-    // Parse Content-Length from response header
-    let header_str = String::from_utf8_lossy(&header_bytes);
+    // Parse Content-Length from response header. A missing or malformed header
+    // is a framing bug — fail loudly rather than silently treating it as 0.
+    let header_str =
+        String::from_utf8(header_bytes.clone()).expect("MCP response header is not valid UTF-8");
     let content_length: usize = header_str
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
         .and_then(|l| l.split(':').nth(1))
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
+        .unwrap_or_else(|| panic!("MCP response missing valid Content-Length: {header_str:?}"));
 
     let mut body = vec![0u8; content_length];
     stdout_reader
         .read_exact(&mut body)
         .expect("failed to read MCP response body");
-    String::from_utf8_lossy(&body).into_owned()
+    String::from_utf8(body).expect("MCP response body is not valid UTF-8")
 }
 
 // ── Mock-tier tests ──────────────────────────────────────────────
@@ -391,11 +393,12 @@ fn test_mcp_stdio_tools_call_list_tasks() {
         )
     });
 
-    // Sanity: the parsed JSON should be an object (the list_tasks handler returns
-    // a JSON object with task information).
+    // `handle_list_tasks` returns a JSON array of task summaries
+    // (see `harness::mcp::handlers::handle_list_tasks`). Anything else is a
+    // shape regression.
     assert!(
-        parsed.is_object() || parsed.is_array(),
-        "tools/call list_tasks: expected JSON object or array, got: {}",
+        parsed.is_array(),
+        "tools/call list_tasks: expected JSON array, got: {}",
         &text[..text.len().min(200)]
     );
 }
@@ -468,10 +471,13 @@ async fn run_live_task_attempt() -> Result<(), String> {
     // (no git repo), which is acceptable: we only need to prove the handlers
     // complete a full assign -> poll -> get_result round-trip and return
     // a well-formed terminal-state response.
+    // `model` is provided via the positional `default_model` arg below;
+    // omitting it from the JSON params keeps a single source of truth so the
+    // test cannot silently diverge if `LIVE_MODEL` is changed in only one
+    // place.
     let assign_params = serde_json::json!({
         "description": "Print hello world",
         "repo_path": "/tmp",
-        "model": LIVE_MODEL,
         "max_iterations": 3
     });
 

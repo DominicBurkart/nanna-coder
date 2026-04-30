@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             temperature,
         } => {
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let provider = make_ollama_provider()?;
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -122,14 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let provider = make_ollama_provider()?;
             list_models(&provider).await?;
         }
         Commands::Tools => {
             list_tools(&tool_registry);
         }
         Commands::Health => {
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let provider = make_ollama_provider()?;
             health_check(&provider).await?;
         }
         Commands::Agent {
@@ -162,6 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     harness::tools::create_tool_registry(workspace_root)
+}
+
+fn make_ollama_provider() -> Result<OllamaProvider, model::ModelError> {
+    OllamaProvider::new(OllamaConfig::default())
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
