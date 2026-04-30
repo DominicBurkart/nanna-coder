@@ -9,7 +9,7 @@
 #   scripts/update-model-sha256.sh <modelKey>
 #
 # Where <modelKey> matches a key in `modelRegistry` in nix/containers.nix
-# (e.g. `gemma`, `llama3`, `mistral`).
+# (currently: `qwen3` (already real-hashed) or `gemma`).
 #
 # The script is idempotent: it fails fast if the key is already holding a
 # real (non-placeholder) hash, so reruns won't silently clobber a good value.
@@ -35,12 +35,12 @@ die()  { printf '%b[update-model-sha256]%b %s\n' "${RED}"   "${NC}" "$*" >&2; ex
 
 # ---- Args ----------------------------------------------------------------
 if [[ $# -ne 1 ]]; then
-  die "usage: $0 <modelKey>   (e.g. gemma, llama3, mistral)"
+  die "usage: $0 <modelKey>   (e.g. gemma)"
 fi
 MODEL_KEY="$1"
 FORCE="${FORCE:-0}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/..' && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTAINERS_NIX="${REPO_ROOT}/nix/containers.nix"
 [[ -f "${CONTAINERS_NIX}" ]] || die "cannot find ${CONTAINERS_NIX}"
 
@@ -89,33 +89,41 @@ log "model name: ${MODEL_NAME}"
 log "old hash  : ${CURRENT_HASH:-<unset>}"
 
 # ---- Capture -------------------------------------------------------------
-# Strategy: ask Nix to build the fixed-output derivation with a fake (valid
-# but wrong) hash. The build will run, download the model, then fail when
-# it checks the hash - and the error message contains the real `got:` hash.
-#
-# We use `lib.fakeSha256` indirectly by passing the placeholder value (which
-# is a well-formed sha256 that just happens to be wrong) and scraping the
-# diagnostic out of stderr.
-#
-# NOTE: The model derivations are exposed at the TOP LEVEL of the flake's
-# `packages` output (not under a `models` sub-attribute) via:
-#   inherit (containers.models) gemma-model llama3-model …
-# in flake.nix. The correct nix build attribute is therefore
-# `.#${MODEL_KEY}-model`, NOT `.#models.${MODEL_KEY}-model`.
+# Strategy: temporarily swap the placeholder hash for `lib.fakeSha256`
+# (43 A's, well-formed SRI but wrong). The placeholder routes
+# `createModelDerivation` to the dev-stub branch (empty success, no
+# capture possible); a non-zero-infix fake hash routes to the
+# fixed-output path, which downloads the model and then fails the
+# integrity check, printing the real `got: sha256-...` to stderr.
+# Restore on exit so a Ctrl-C mid-capture doesn't leave a corrupted
+# containers.nix.
 BUILD_ATTR="${MODEL_KEY}-model"
+FAKE_HASH='sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+
+cp "${CONTAINERS_NIX}" "${CONTAINERS_NIX}.bak"
+trap 'mv -f "${CONTAINERS_NIX}.bak" "${CONTAINERS_NIX}" 2>/dev/null || true; rm -f "${BUILD_LOG:-}" 2>/dev/null || true' EXIT
+
+tmp="$(mktemp)"
+awk -v key="\"${MODEL_KEY}\"" -v new="${FAKE_HASH}" '
+  $0 ~ key" =" {in_block=1}
+  in_block && /hash = / {
+    sub(/"sha256-[^"]*"/, "\"" new "\"")
+    in_block=0
+  }
+  { print }
+' "${CONTAINERS_NIX}" > "${tmp}"
+mv "${tmp}" "${CONTAINERS_NIX}"
+log "swapped placeholder for fakeSha256 to force fixed-output build"
+
 log "running: nix build .#${BUILD_ATTR} (expected to fail with a hash mismatch)"
 
 BUILD_LOG="$(mktemp)"
-trap 'rm -f "${BUILD_LOG}" "${CONTAINERS_NIX}.bak" 2>/dev/null || true' EXIT
 
 # Intentionally ignore the exit code: the build is supposed to fail. What
 # we care about is the `got: sha256-...` line in the error output.
 if nix build --no-link --print-build-logs \
     ".#${BUILD_ATTR}" 2> "${BUILD_LOG}" 1>&2; then
-  # Surprising: build succeeded. That means the current hash is already
-  # correct or the derivation is content-addressed differently than we
-  # expect. Bail so we don't clobber something good.
-  die "nix build succeeded unexpectedly; nothing to capture. Is the hash already correct?"
+  die "nix build succeeded unexpectedly with fakeSha256; the registry returned a model whose hash matches all-A's, which is essentially impossible. Inspect ${BUILD_LOG}."
 fi
 
 # Grep for the line Nix prints on a hash mismatch. Format varies across
@@ -141,12 +149,11 @@ fi
 log "captured hash: ${NEW_HASH}"
 
 # ---- Rewrite -------------------------------------------------------------
-# In-place replace only the hash line inside the matching block. We scope
-# the replacement with a small awk state machine so we don't accidentally
-# rewrite a placeholder belonging to another model.
-#
-# Keep a backup so the post-capture validation step can restore it on failure.
-cp "${CONTAINERS_NIX}" "${CONTAINERS_NIX}.bak"
+# At this point: containers.nix has fakeSha256 written in (we swapped it
+# above to force the fixed-output build), and ${CONTAINERS_NIX}.bak holds
+# the original (with the placeholder). Apply the captured real hash on
+# top of the original — keep .bak untouched so the trap can roll back if
+# validation fails.
 tmp="$(mktemp)"
 awk -v key="\"${MODEL_KEY}\"" -v new="${NEW_HASH}" '
   $0 ~ key" =" {in_block=1}
@@ -155,8 +162,7 @@ awk -v key="\"${MODEL_KEY}\"" -v new="${NEW_HASH}" '
     in_block=0
   }
   { print }
-' "${CONTAINERS_NIX}" > "${tmp}"
-
+' "${CONTAINERS_NIX}.bak" > "${tmp}"
 mv "${tmp}" "${CONTAINERS_NIX}"
 
 log "${GREEN}updated${NC} ${CONTAINERS_NIX}"
@@ -164,10 +170,6 @@ log "diff:"
 git -C "${REPO_ROOT}" --no-pager diff -- "${CONTAINERS_NIX}" || true
 
 # ---- Post-capture validation ---------------------------------------------
-# Rebuild with the newly written hash to confirm Nix accepts it. If the
-# build fails the captured hash was wrong (e.g. the log line was from a
-# different derivation, or the SRI conversion was incorrect). Restore the
-# original file and abort rather than leaving a broken containers.nix.
 log "running post-capture validation: nix build .#${BUILD_ATTR}"
 VALIDATION_LOG="$(mktemp)"
 if ! nix build --no-link --print-build-logs \
@@ -175,12 +177,11 @@ if ! nix build --no-link --print-build-logs \
   warn "post-capture build FAILED — the captured hash was not accepted by Nix"
   warn "validation build log follows:"
   cat "${VALIDATION_LOG}" >&2
-  warn "restoring original ${CONTAINERS_NIX}"
-  mv "${CONTAINERS_NIX}.bak" "${CONTAINERS_NIX}"
   rm -f "${VALIDATION_LOG}"
-  die "hash validation failed; containers.nix has been restored" 2
+  die "hash validation failed; containers.nix will be restored from .bak on exit" 2
 fi
 rm -f "${VALIDATION_LOG}" "${CONTAINERS_NIX}.bak"
+trap - EXIT
 
 log "${GREEN}validation passed${NC} — nix build accepted the new hash"
 log "${GREEN}done.${NC} Commit with:  git add nix/containers.nix && git commit -m 'nix: capture ${MODEL_KEY} sha256 (closes #240)'"
