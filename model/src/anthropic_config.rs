@@ -9,16 +9,35 @@ pub struct AnthropicConfig {
     pub base_url: String,
     pub timeout: Duration,
     pub max_retries: u32,
+    /// `anthropic-version` request header. Defaults to `2023-06-01`.
+    /// Override to opt into newer beta features (e.g. extended context).
+    #[serde(default = "default_anthropic_version")]
+    pub anthropic_version: String,
+    /// When true, the provider applies `cache_control: ephemeral` markers on
+    /// the system message and the tool catalog and sends the
+    /// `anthropic-beta: prompt-caching-2024-07-31` header. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enable_prompt_caching: bool,
+}
+
+fn default_anthropic_version() -> String {
+    "2023-06-01".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
             api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             timeout: Duration::from_secs(120),
             max_retries: 3,
+            anthropic_version: default_anthropic_version(),
+            enable_prompt_caching: true,
         }
     }
 }
@@ -50,6 +69,16 @@ impl AnthropicConfig {
 
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_anthropic_version(mut self, version: impl Into<String>) -> Self {
+        self.anthropic_version = version.into();
+        self
+    }
+
+    pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.enable_prompt_caching = enabled;
         self
     }
 
@@ -86,16 +115,20 @@ mod tests {
     fn test_config_builder() {
         let config = AnthropicConfig::new()
             .with_api_key("sk-test-key")
-            .with_model("claude-sonnet-4-20250514")
+            .with_model("claude-sonnet-4-6")
             .with_base_url("https://api.anthropic.com")
             .with_timeout(Duration::from_secs(60))
-            .with_max_retries(5);
+            .with_max_retries(5)
+            .with_anthropic_version("2024-11-01")
+            .with_prompt_caching(false);
 
         assert_eq!(config.api_key, "sk-test-key");
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.base_url, "https://api.anthropic.com");
         assert_eq!(config.timeout, Duration::from_secs(60));
         assert_eq!(config.max_retries, 5);
+        assert_eq!(config.anthropic_version, "2024-11-01");
+        assert!(!config.enable_prompt_caching);
         assert!(config.validate().is_ok());
     }
 
@@ -103,10 +136,12 @@ mod tests {
     fn test_config_from_env() {
         // Default reads from env; without the env var set, api_key will be empty
         let config = AnthropicConfig::default();
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.base_url, "https://api.anthropic.com");
         assert_eq!(config.timeout, Duration::from_secs(120));
         assert_eq!(config.max_retries, 3);
+        assert_eq!(config.anthropic_version, "2023-06-01");
+        assert!(config.enable_prompt_caching);
     }
 
     #[test]
