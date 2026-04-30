@@ -440,8 +440,8 @@ level = "warn"
 format = "text"
 "#;
         let tmp = write_tmp(toml_src);
-        let err = load_telemetry_config(tmp.path())
-            .expect_err("missing [metrics] section must error");
+        let err =
+            load_telemetry_config(tmp.path()).expect_err("missing [metrics] section must error");
         match err {
             TelemetryError::Toml(_) => {}
             other => panic!("expected Toml, got {:?}", other),
