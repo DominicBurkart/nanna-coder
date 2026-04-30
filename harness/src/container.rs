@@ -658,6 +658,30 @@ impl SharedModelPool {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Note: a prior `release_ref_count_no_underflow` harness was removed
+    // because it modelled a bare `AtomicUsize` rather than driving the real
+    // `SharedModelPool::get_or_start` / `release` code paths (which are
+    // async and do container I/O, making them impractical to proof-check
+    // under Kani today). The remaining `release_underflow_wraps` proof
+    // demonstrates the underflow bug directly on `AtomicUsize`, which is
+    // the actual primitive used inside `SharedModelPool::release`.
+
+    /// Show that an unguarded fetch_sub on zero wraps to usize::MAX.
+    #[kani::proof]
+    fn release_underflow_wraps() {
+        let counter = AtomicUsize::new(0);
+        let prev = counter.fetch_sub(1, Ordering::SeqCst);
+        // prev was 0, counter is now usize::MAX
+        assert_eq!(prev, 0);
+        assert_eq!(counter.load(Ordering::SeqCst), usize::MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

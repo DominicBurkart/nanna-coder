@@ -44,16 +44,33 @@ fn deserialize_happy_path_003() {
 #[test]
 fn discover_all_cases() {
     let cases = EvalCase::discover(Path::new(CASES_DIR)).expect("should discover cases");
-    assert_eq!(cases.len(), 3);
-    assert_eq!(cases[0].0.case.id, "happy-path-001");
-    assert_eq!(cases[1].0.case.id, "happy-path-002");
-    assert_eq!(cases[2].0.case.id, "happy-path-003");
+    let happy: Vec<_> = cases
+        .iter()
+        .filter(|(c, _)| c.case.id.starts_with("happy-path-"))
+        .map(|(c, _)| c.case.id.clone())
+        .collect();
+    assert_eq!(
+        happy,
+        vec![
+            "happy-path-001".to_string(),
+            "happy-path-002".to_string(),
+            "happy-path-003".to_string(),
+        ]
+    );
 }
 
 #[test]
-fn repo_directories_exist() {
+fn repo_directories_exist_for_rust_cases() {
+    // Rust happy-path fixtures ship a real `repo/` subtree used by the runner.
+    // SWE-bench fixtures gitignore `repo/` and materialize it on demand, so
+    // they are excluded from this invariant.
     let cases = EvalCase::discover(Path::new(CASES_DIR)).expect("should discover cases");
-    for (_, case_dir) in &cases {
+    let rust_cases: Vec<_> = cases
+        .iter()
+        .filter(|(c, _)| c.task.language == "rust")
+        .collect();
+    assert!(!rust_cases.is_empty(), "expected at least one rust case");
+    for (_, case_dir) in &rust_cases {
         let repo_dir = case_dir.join("repo");
         assert!(repo_dir.is_dir(), "repo dir should exist for {case_dir:?}");
         assert!(

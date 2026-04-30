@@ -8,6 +8,11 @@ use model::prelude::*;
 use std::io::{self, Write};
 use tracing::{error, info};
 
+// NOTE: `main.rs` binds the workspace entity store to `InMemoryEntityStore`
+// concretely today, but the downstream callers accept any `EntityStore` via
+// generics (see `AgentLoop<S>` and `interactive_chat`). Issue #193 Phase B
+// will introduce `PersistentEntityStore` and swap the binding here.
+
 #[derive(Parser)]
 #[command(name = "harness")]
 #[command(about = "A CLI tool for interacting with language models")]
@@ -184,6 +189,12 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
         }
     }
 
+    // Surface repo-level agent guidance (AGENTS.md / CLAUDE.md) into the
+    // entity store as a `ContextEntity` so tool-accessible retrieval paths
+    // (RAG, entity queries) can discover it the same way as conversation
+    // history and tool-call records. See issue #231.
+    store_repo_guidance_entity(workspace_root, &mut store).await;
+
     let scanner = WorkspaceScanner::new();
     match scanner.scan_workspace(workspace_root, &mut store).await {
         Ok(count) => {
@@ -195,6 +206,48 @@ async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntit
     }
 
     store
+}
+
+async fn store_repo_guidance_entity(
+    workspace_root: &std::path::Path,
+    store: &mut InMemoryEntityStore,
+) {
+    use harness::entities::context::types::ContextEntity;
+
+    match harness::agent::agents_md::load(workspace_root) {
+        Ok(Some(doc)) => {
+            let mut entity = ContextEntity::new(
+                format!("repo-guidance:{}", doc.source.filename()),
+                Vec::new(),
+                Vec::new(),
+                doc.body.clone(),
+                "n/a".to_string(),
+            );
+            entity
+                .metadata
+                .tags
+                .push(format!("agents-md:{}", doc.source.filename()));
+            if doc.truncated {
+                entity.metadata.tags.push("truncated".to_string());
+            }
+            if let Err(e) = store.store(Box::new(entity)).await {
+                error!("Failed to store AGENTS.md entity: {}", e);
+            } else {
+                info!(
+                    path = %doc.path.display(),
+                    source = doc.source.filename(),
+                    "Stored repo-level agent guidance entity"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md; skipping entity injection"
+            );
+        }
+    }
 }
 
 async fn single_chat(
@@ -273,13 +326,13 @@ async fn single_chat(
     Ok(())
 }
 
-async fn interactive_chat(
+async fn interactive_chat<S: EntityStore + Send>(
     provider: &OllamaProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
     temperature: f32,
-    entity_store: InMemoryEntityStore,
+    entity_store: S,
     policy: AnimationPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entity_count = entity_store
@@ -439,6 +492,44 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Default system prompt used when an onboarded repo does not supply any
+/// repo-level guidance. Kept in a `const` so the `AGENTS.md` loader and the
+/// task-dispatch path (`harness/src/task.rs`) share a single source of truth.
+const DEFAULT_SESSION_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
+/// Build the system prompt for a session, appending any repo-level guidance
+/// discovered under `workspace_root` (closes #231).
+///
+/// Precedence is enforced by [`harness::agent::agents_md::load`]: `AGENTS.md`
+/// wins over `CLAUDE.md`. Missing files produce no injection and no error.
+/// Read errors are logged and swallowed so a broken guidance file never blocks
+/// a session from starting.
+fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
+    match harness::agent::agents_md::load(workspace_root) {
+        Ok(Some(doc)) => {
+            info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance into session system prompt"
+            );
+            format!(
+                "{}\n\n{}",
+                DEFAULT_SESSION_SYSTEM_PROMPT,
+                harness::agent::agents_md::format_system_prompt_fragment(&doc)
+            )
+        }
+        Ok(None) => DEFAULT_SESSION_SYSTEM_PROMPT.to_string(),
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md; continuing without repo guidance"
+            );
+            DEFAULT_SESSION_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
 async fn run_agent(
     prompt: &str,
     model: &str,
@@ -458,7 +549,7 @@ async fn run_agent(
     let agent_config = AgentConfig {
         max_iterations,
         verbose,
-        system_prompt: "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.".to_string(),
+        system_prompt: build_session_system_prompt(workspace_root),
         model_name: model.to_string(),
         animation_policy: policy,
     };

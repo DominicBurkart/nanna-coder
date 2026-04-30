@@ -658,9 +658,9 @@ impl AgentEvaluator {
     }
 
     /// Evaluate RAG relevance
-    async fn evaluate_rag_relevance(
+    async fn evaluate_rag_relevance<S: EntityStore + Send>(
         &self,
-        agent: &AgentLoop,
+        agent: &AgentLoop<S>,
         scenario: &EvaluationScenario,
     ) -> EvaluationResult<f64> {
         // Query entities using the scenario's prompt
