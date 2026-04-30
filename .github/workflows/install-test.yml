@@ -114,9 +114,10 @@ jobs:
             --harness-image nanna-coder-harness:latest \
             --ollama-image  nanna-coder-ollama:latest
       - name: Verify pod and ollama API
+        if: always()
         run: |
           podman pod ps
-          podman ps
+          podman ps -a
           for i in $(seq 1 30); do
             if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
               echo "ollama API up"; exit 0
@@ -133,7 +134,7 @@ jobs:
           podman pod rm   nanna-coder-pod || true
 
   macos-bringup:
-    name: macOS full bring-up (colima + x86_64 emulation)
+    name: macOS full bring-up (podman machine + x86_64 emulation)
     runs-on: macos-latest
     needs: build-images
     timeout-minutes: 30
@@ -144,43 +145,26 @@ jobs:
           name: container-images
           path: _images
 
-      - name: Install podman + colima + qemu
+      - name: Install podman
+        run: |
+          set -x
+          brew install podman
+          podman --version
+
+      - name: Initialize and start podman machine
         run: |
           # macos-latest is arm64 (Apple Silicon). We built x86_64-linux
-          # containers above, so the macOS lane runs an emulated x86_64 VM
-          # via colima with the podman runtime. colima is the standard
-          # podman/docker-on-mac VM manager and is far more reliable in CI
-          # than `podman machine` on arm64 GHA runners. qemu is the
-          # cross-arch emulator colima delegates to and is NOT pulled as a
-          # dep by every brew bottle; install it explicitly.
+          # images, which run inside the podman-machine VM via QEMU
+          # user-mode emulation registered through binfmt_misc in fedora
+          # coreos. podman 5+ on Apple Silicon defaults to the applehv
+          # provider (Apple Virtualization framework). This is the path
+          # install.sh exercises for end users — earlier rounds tried to
+          # short-circuit it with colima, but colima dropped the podman
+          # runtime so that approach is no longer viable.
           set -x
-          brew install podman colima docker qemu
-          colima version
-          podman --version
-          which qemu-system-x86_64 && qemu-system-x86_64 --version | head -1
-
-      - name: Start colima with podman runtime, x86_64 arch (vz + Rosetta)
-        run: |
-          # macOS 13+ supports `--vm-type=vz` (Apple Virtualization
-          # framework) which, on Apple Silicon, can run x86_64 binaries via
-          # Rosetta 2. This is dramatically faster and more reliable than
-          # `--vm-type=qemu` cross-arch emulation, which has a long history
-          # of issues on GHA arm64 runners.
-          set -x
-          colima start \
-            --runtime podman \
-            --vm-type vz \
-            --vz-rosetta \
-            --arch x86_64 \
-            --cpu 2 --memory 4 --disk 20 \
-            --verbose || {
-            echo "::group::colima logs (failure)"
-            cat ~/.colima/_lima/colima/serial.log 2>/dev/null || true
-            cat ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null || true
-            echo "::endgroup::"
-            exit 1
-          }
-          colima status
+          podman machine init --cpus=2 --memory=4096 --disk-size=20
+          podman machine start
+          podman machine list
           podman info | head -40
 
       - name: Load images
@@ -190,22 +174,21 @@ jobs:
           podman load -i _images/ollama.tar
           podman images
 
-      - name: Run installer (skip podman-machine path inside install.sh)
-        env:
-          # install.sh detects macOS and tries `podman machine init/start`.
-          # colima already provides the VM, so neuter that path with an env
-          # flag the script honors.
-          NANNA_SKIP_PODMAN_MACHINE: "1"
+      - name: Run installer
         run: |
+          # install.sh's ensure_podman_machine_macos() is idempotent — it
+          # detects an existing running machine and skips re-init. No
+          # NANNA_SKIP_PODMAN_MACHINE override needed.
           bash scripts/install.sh \
             --no-pull --skip-model-pull --yes \
             --harness-image nanna-coder-harness:latest \
             --ollama-image  nanna-coder-ollama:latest
 
       - name: Verify pod and ollama API
+        if: always()
         run: |
           podman pod ps
-          podman ps
+          podman ps -a
           # Emulated x86_64 ollama startup can take longer than native; allow 3 min.
           for i in $(seq 1 90); do
             if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
@@ -222,7 +205,7 @@ jobs:
         run: |
           podman pod stop nanna-coder-pod || true
           podman pod rm   nanna-coder-pod || true
-          colima stop || true
+          podman machine stop || true
 
   windows-bringup:
     name: Windows full bring-up (WSL2 + native apt podman)
@@ -256,13 +239,11 @@ jobs:
         shell: wsl-bash {0}
         run: |
           set -euxo pipefail
-          # Inside wsl-bash, $GITHUB_WORKSPACE is the Windows path
-          # (e.g. D:\a\nanna-coder\nanna-coder). Translate to a WSL path
-          # (/mnt/d/a/...) so `cd` and relative file lookups work.
-          ws=$(wslpath -u "$GITHUB_WORKSPACE")
+          # GHA env vars are not forwarded into wsl-bash; resolve the
+          # workspace via the GHA expression context and translate the
+          # Windows path (e.g. D:\a\repo\repo) to a WSL path (/mnt/d/...).
+          ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
-          # Diagnostics — surface the WSL environment so any failure has
-          # context (kernel, podman version, package state).
           uname -a
           dpkg -l | grep -E '^ii\s+(podman|uidmap|slirp4netns)' || true
           podman --version
@@ -276,7 +257,7 @@ jobs:
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
-          ws=$(wslpath -u "$GITHUB_WORKSPACE")
+          ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
           bash scripts/install.sh \
             --no-pull --skip-model-pull --yes \
@@ -284,11 +265,12 @@ jobs:
             --ollama-image  nanna-coder-ollama:latest
 
       - name: Verify pod and ollama API inside WSL
+        if: always()
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
           podman pod ps
-          podman ps
+          podman ps -a
           for i in $(seq 1 30); do
             if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
               echo "ollama API up"; exit 0
