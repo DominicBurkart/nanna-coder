@@ -16,8 +16,9 @@
 //!
 //! [`MetricsConfig`], [`TracesConfig`], and [`LogsConfig`] are all
 //! **required** top-level sections — omit any one and
-//! [`load_telemetry_config`] returns
-//! [`TelemetryError::MissingSection`]. This is intentional even when
+//! [`load_telemetry_config`] returns [`TelemetryError::Toml`] (the missing
+//! required section is reported as a TOML deserialization error, since the
+//! schema fields are non-`Option`). This is intentional even when
 //! `enabled = false`: a future runtime that flips `enabled` on at runtime
 //! must still know what to do. The matching `enabled = false` test in this
 //! module's tests exercises that requirement explicitly.
@@ -203,15 +204,12 @@ pub enum TelemetryError {
     /// TOML parse error. Carries the structured `toml::de::Error` so the
     /// caller still has access to span info, the offending key, and the
     /// underlying message.
+    ///
+    /// A missing required section (`metrics`, `traces`, or `logs`) is
+    /// reported here, since those fields are non-`Option` on
+    /// [`TelemetryConfig`] and `toml::from_str` fails first.
     #[error("TOML parse error in telemetry config: {0}")]
     Toml(#[from] toml::de::Error),
-
-    /// A required top-level section (`metrics`, `traces`, or `logs`) was
-    /// missing. This is reported separately from [`Self::Toml`] so callers
-    /// can distinguish "the file doesn't even tokenize" from "the file
-    /// parsed but is missing a mandatory section".
-    #[error("missing required telemetry section: {0}")]
-    MissingSection(&'static str),
 
     /// A field value failed range / sanity validation. Carries the offending
     /// field name and a short human-readable reason.
@@ -231,8 +229,9 @@ pub enum TelemetryError {
 /// - `metrics.collect_interval_ms` is non-zero.
 ///
 /// Returns [`TelemetryError::Validation`] for out-of-range values, and
-/// [`TelemetryError::Toml`] for syntactic errors (preserving the underlying
-/// `toml::de::Error`).
+/// [`TelemetryError::Toml`] for syntactic errors and for omitted required
+/// sections (`metrics`, `traces`, `logs`), preserving the underlying
+/// `toml::de::Error`.
 pub fn load_telemetry_config(path: &Path) -> Result<TelemetryConfig, TelemetryError> {
     let raw = std::fs::read_to_string(path)?;
     let cfg: TelemetryConfig = toml::from_str(&raw)?;
@@ -420,11 +419,33 @@ format = "text"
         let v_display = format!("{}", validation);
         assert!(v_display.contains("validation error"));
         assert!(v_display.contains("traces.sampling_rate"));
+    }
 
-        let missing = TelemetryError::MissingSection("metrics");
-        let m_display = format!("{}", missing);
-        assert!(m_display.contains("missing required telemetry section"));
-        assert!(m_display.contains("metrics"));
+    /// Regression test: a missing required section (e.g. `[metrics]`) is
+    /// surfaced as [`TelemetryError::Toml`], because the schema fields are
+    /// non-`Option` and `toml::from_str` fails first. This test pins the
+    /// behavior the module-level docs now describe.
+    #[test]
+    fn test_load_telemetry_config_missing_required_section_is_toml_error() {
+        // No `[metrics]` table.
+        let toml_src = r#"
+enabled = false
+
+[traces]
+sampling_rate = 0.0
+exporter = "none"
+
+[logs]
+level = "warn"
+format = "text"
+"#;
+        let tmp = write_tmp(toml_src);
+        let err = load_telemetry_config(tmp.path())
+            .expect_err("missing [metrics] section must error");
+        match err {
+            TelemetryError::Toml(_) => {}
+            other => panic!("expected Toml, got {:?}", other),
+        }
     }
 
     /// Regression test: `traces.sampling_rate` must be inside `[0.0, 1.0]`.

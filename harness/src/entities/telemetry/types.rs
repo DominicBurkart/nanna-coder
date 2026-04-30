@@ -24,11 +24,16 @@
 //! # `value` field semantics
 //!
 //! The bare numeric [`TelemetryEntity::value`] field is preserved for
-//! backwards compatibility but is **only meaningful when
-//! [`TelemetryEntity::sample`] is `Some(TelemetrySample::Counter(_))` or
-//! `Some(TelemetrySample::Gauge(_))`**. For `Histogram`, `Trace`, `Log`, and
-//! `Event` samples, callers must read [`TelemetryEntity::sample`]; the bare
-//! `value` carries `0.0` purely so older code that reads it doesn't panic.
+//! backwards compatibility. It is populated by
+//! [`TelemetryEntity::new_signal`] from the sample's scalar value (Counter /
+//! Gauge), but a hand-built or deserialized entity can carry an arbitrary
+//! `value` regardless of [`TelemetryEntity::sample`] — the two fields are
+//! independent on the wire, and this struct does **not** enforce an
+//! invariant between them. New code should call
+//! [`TelemetryEntity::sample_value`], which prefers the typed sample's
+//! scalar value and only falls back to the legacy bare field when no sample
+//! is set; that way drift between the two fields cannot silently mislead
+//! consumers.
 //!
 //! # Not to be confused with `harness::telemetry`
 //!
@@ -128,23 +133,6 @@ impl TelemetrySample {
     }
 }
 
-/// A telemetry attribute value. Free-form `String` is preserved for
-/// compatibility, but new code can use the richer enum to avoid
-/// stringly-typed dimensions. Only the `String` form participates in the
-/// legacy `attributes: HashMap<String, String>` field on
-/// [`TelemetryEntity`]; `AttributeValue` exists today purely as a forward
-/// compat hook for callers migrating to the typed sample API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum AttributeValue {
-    /// String attribute (the only legacy-compatible form).
-    String(String),
-    /// Signed 64-bit integer attribute.
-    Int(i64),
-    /// Boolean attribute.
-    Bool(bool),
-}
-
 /// Telemetry entity — a single sampled telemetry signal.
 ///
 /// This is a deferred stub: the fields below are the schema we intend to use,
@@ -165,12 +153,15 @@ pub struct TelemetryEntity {
 
     /// Bare numeric value of the sample.
     ///
-    /// **Warning: this field is only meaningful when [`Self::sample`] is
-    /// `Some(TelemetrySample::Counter)` or `Some(TelemetrySample::Gauge)`.**
-    /// For `Histogram`, `Trace`, `Log`, and `Event` samples, this carries
-    /// `0.0` purely for legacy callers and means *no scalar value is
-    /// defined* — not "the counter is at zero". Use [`Self::sample`] to
-    /// disambiguate.
+    /// **Not an enforced invariant relative to [`Self::sample`].** The
+    /// constructors in this module keep the two fields consistent (see
+    /// [`Self::new_signal`]), but a hand-built or deserialized entity can
+    /// carry any `value` regardless of [`Self::sample`]. New code should
+    /// prefer [`Self::sample_value`], which consults the typed sample first
+    /// and falls back to this bare field only when no sample is attached.
+    /// Tracked by issue #27.
+    // TODO(#27): once `harness::agent::eval` migrates to the typed
+    // constructor, drop this bare field and rely solely on `sample`.
     pub value: f64,
 
     /// Typed sample payload. Optional for backwards-compat with the legacy
@@ -257,6 +248,26 @@ impl TelemetryEntity {
             value,
             sample: Some(sample),
             attributes: HashMap::new(),
+        }
+    }
+
+    /// Drift-safe scalar accessor for the sample's numeric value.
+    ///
+    /// Prefers the typed [`Self::sample`]'s `scalar_value()`. Returns:
+    ///
+    /// - `Some(v)` when `sample` is `Counter` or `Gauge` (using the typed
+    ///   sample, never the bare `value` field, so a hand-built or
+    ///   deserialized entity that has both fields out of sync still
+    ///   reports the typed value).
+    /// - `None` when `sample` is `Histogram`, `Trace`, `Log`, or `Event`
+    ///   (signals with no single scalar — callers must inspect
+    ///   [`Self::sample`] for the structured payload).
+    /// - `Some(self.value)` when `sample` is `None` (legacy placeholder
+    ///   path, where the bare field is the only thing we have).
+    pub fn sample_value(&self) -> Option<f64> {
+        match &self.sample {
+            Some(sample) => sample.scalar_value(),
+            None => Some(self.value),
         }
     }
 }
@@ -450,6 +461,54 @@ mod tests {
             let back: TelemetrySample = serde_json::from_str(&json).expect("deserialize sample");
             assert_eq!(sample, back, "round-trip mismatch for {sample:?}");
         }
+    }
+
+    /// Regression test: `TelemetryEntity::sample_value` prefers the typed
+    /// sample over the bare `value` field, so drift between the two cannot
+    /// silently mislead consumers. Pins the contract the new docs make on
+    /// the bare `value` field.
+    #[test]
+    fn test_telemetry_entity_sample_value_prefers_typed_sample() {
+        // Drifted hand-built entity: bare `value = 99.0` but the typed
+        // sample says the counter is at 7.
+        let mut drifted = TelemetryEntity::new_signal(
+            TelemetrySignalKind::RuntimeMetric,
+            "drifted",
+            TelemetrySample::Counter { value: 7 },
+        );
+        drifted.value = 99.0;
+        assert_eq!(
+            drifted.sample_value(),
+            Some(7.0),
+            "typed sample wins over a drifted bare value"
+        );
+
+        // Non-scalar sample reports `None` even if `value` is non-zero on
+        // the bare field.
+        let mut non_scalar = TelemetryEntity::new_signal(
+            TelemetrySignalKind::ErrorLog,
+            "panic",
+            TelemetrySample::Log {
+                level: "error".to_string(),
+                message: "boom".to_string(),
+            },
+        );
+        non_scalar.value = 42.0;
+        assert_eq!(
+            non_scalar.sample_value(),
+            None,
+            "log samples have no scalar regardless of the bare value field"
+        );
+
+        // Legacy placeholder (no typed sample) falls back to the bare
+        // field.
+        let mut legacy = TelemetryEntity::new();
+        legacy.value = 3.5;
+        assert_eq!(
+            legacy.sample_value(),
+            Some(3.5),
+            "no typed sample falls back to the bare value field"
+        );
     }
 
     /// Regression test: `TelemetrySample::scalar_value` only returns `Some`

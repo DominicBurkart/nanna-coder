@@ -48,4 +48,4 @@ pub use config::{
     PiiFilterConfig, ProjectTelemetryConfig, RetentionConfig, TelemetryConfig, TelemetryError,
     TracesConfig,
 };
-pub use types::{AttributeValue, TelemetryEntity, TelemetrySample, TelemetrySignalKind};
+pub use types::{TelemetryEntity, TelemetrySample, TelemetrySignalKind};
