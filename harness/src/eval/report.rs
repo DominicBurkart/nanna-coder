@@ -386,7 +386,6 @@ mod tests {
             },
             failures,
             warnings: vec![],
-            system_metrics: None,
             timestamp: chrono::Utc::now(),
         }
     }
