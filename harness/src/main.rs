@@ -307,7 +307,7 @@ async fn single_chat(
                             &mut messages,
                             choice.message.clone(),
                             tool_call.id.clone(),
-                            e.as_ref(),
+                            &e,
                         );
                     }
                 }
@@ -405,7 +405,7 @@ async fn interactive_chat<S: EntityStore + Send>(
                                 &mut messages,
                                 choice.message.clone(),
                                 tool_call.id.clone(),
-                                e.as_ref(),
+                                &e,
                             );
                         }
                     }
