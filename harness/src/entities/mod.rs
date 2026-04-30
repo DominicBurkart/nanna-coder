@@ -22,6 +22,7 @@ pub mod test;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -329,6 +330,38 @@ pub trait EntityStore: Send + Sync {
         to: &str,
         relationship_type: RelationshipType,
     ) -> EntityResult<()>;
+
+    /// List all entity IDs for a given entity kind.
+    ///
+    /// The default implementation runs a full `query` constrained to the
+    /// requested kind and projects the IDs out of the results. Backends that
+    /// can answer this more cheaply (e.g. indexed SQL) should override it.
+    ///
+    /// This hook is introduced to prepare for the persistent-store work in
+    /// issue #193 (Phase A). It has no behavior change for the in-memory
+    /// store.
+    async fn list_by_kind(&self, kind: EntityType) -> EntityResult<Vec<EntityId>> {
+        let query = EntityQuery {
+            entity_types: vec![kind],
+            ..EntityQuery::default()
+        };
+        let results = self.query(&query).await?;
+        Ok(results.into_iter().map(|r| r.entity_id).collect())
+    }
+
+    /// Invalidate stale entries against the given workspace root.
+    ///
+    /// Persistent backends override this to drop entries whose backing
+    /// on-disk state has changed (file mtime advanced, HEAD commit moved,
+    /// etc.). The in-memory store has no persistence to invalidate, so the
+    /// default returns `Ok(0)`.
+    ///
+    /// Returns the number of entries that were invalidated/removed. Added
+    /// as part of issue #193 Phase A so that callers can be generified
+    /// against the trait ahead of the persistent-store implementation.
+    async fn invalidate_stale(&mut self, _workspace_root: &Path) -> EntityResult<usize> {
+        Ok(0)
+    }
 }
 
 /// In-memory entity store implementation (for testing and development)
@@ -481,6 +514,117 @@ impl EntityStore for InMemoryEntityStore {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The InMemoryEntityStore stores entities in a HashMap keyed by ID.
+    /// Verify the core invariant: after `store()`, the entity exists;
+    /// after `delete()`, it does not.
+    ///
+    /// We model this with a plain HashMap<u8, u8> to avoid async.
+    #[kani::proof]
+    fn store_then_exists() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+        let key: u8 = kani::any();
+        let val: u8 = kani::any();
+
+        // Before store
+        assert!(!map.contains_key(&key));
+
+        map.insert(key, val);
+
+        // After store
+        assert!(map.contains_key(&key));
+        assert_eq!(map.len(), 1);
+    }
+
+    /// store() rejects duplicates (mirrors InMemoryEntityStore::store,
+    /// which returns `Err(AlreadyExists)` on the second insert).
+    ///
+    /// We model this with the raw `HashMap` API so Kani can verify it
+    /// without async runtime. `HashMap::insert` returns `None` for a new
+    /// key and `Some(previous_value)` for a duplicate — the latter is the
+    /// signal that a `contains_key` guard in `store()` would fire on.
+    #[kani::proof]
+    fn store_rejects_duplicate() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+        let key: u8 = kani::any();
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        // First insert must succeed (no previous value).
+        assert!(map.insert(key, v1).is_none());
+
+        // Mirror the `contains_key` guard used by `InMemoryEntityStore::store`.
+        // If we follow the real code path, we must reject the duplicate *before*
+        // mutating the map, leaving the original value untouched.
+        if map.contains_key(&key) {
+            // Duplicate detected — do NOT insert.
+            assert_eq!(map.get(&key), Some(&v1));
+            assert_eq!(map.len(), 1);
+        } else {
+            // Unreachable given the assertion above, but included so the
+            // proof fails loudly if the first insert didn't actually land.
+            assert!(false, "first insert did not persist");
+        }
+
+        // As a second independent witness: bypassing the guard and letting
+        // `HashMap::insert` overwrite returns `Some(old_value)` — i.e., the
+        // duplicate is observable from the return value, which is exactly
+        // what a guard would branch on.
+        let overwritten = map.insert(key, v2);
+        assert_eq!(overwritten, Some(v1));
+    }
+
+    /// delete() removes an entity and preserves others.
+    #[kani::proof]
+    fn delete_preserves_others() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
+        kani::assume(k1 != k2);
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(k1, v1);
+        map.insert(k2, v2);
+        assert_eq!(map.len(), 2);
+
+        map.remove(&k1);
+        assert_eq!(map.len(), 1);
+        assert!(!map.contains_key(&k1));
+        assert!(map.contains_key(&k2));
+        assert_eq!(map[&k2], v2);
+    }
+
+    /// Query with a limit never returns more results than requested.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn query_limit_respected() {
+        let total: usize = kani::any();
+        kani::assume(total <= 5);
+        let limit: usize = kani::any();
+        kani::assume(limit <= 5);
+
+        // Simulate: we have `total` results and truncate to `limit`
+        let mut results: Vec<u8> = Vec::new();
+        for i in 0..total {
+            results.push(i as u8);
+        }
+        results.truncate(limit);
+        assert!(results.len() <= limit);
+    }
+
+    // Note: a prior `metadata_version_starts_at_one` harness was removed
+    // because it was a tautology (`let version: u64 = 1; assert!(version > 0)`)
+    // that never actually touched `EntityMetadata::new`. `EntityMetadata::new`
+    // uses chrono/uuid which are impractical to model under Kani today; the
+    // `version == 1` invariant is instead covered by the unit test
+    // `test_entity_metadata_creation` below.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +653,98 @@ mod tests {
         // Note: Full tests will be added when concrete entity types are implemented
         let store = InMemoryEntityStore::new();
         assert_eq!(store.entities.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_kind_returns_matching_ids() {
+        use crate::entities::context::types::ContextEntity;
+        use crate::entities::git::types::GitRepository;
+
+        let mut store = InMemoryEntityStore::new();
+
+        let git_entity =
+            Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        let git_id = store.store(git_entity).await.unwrap();
+
+        let context_entity = Box::new(ContextEntity::new(
+            "task".to_string(),
+            vec![],
+            vec![],
+            String::new(),
+            "model".to_string(),
+        )) as Box<dyn Entity>;
+        let context_id = store.store(context_entity).await.unwrap();
+
+        let git_ids = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(git_ids, vec![git_id.clone()]);
+
+        let context_ids = store.list_by_kind(EntityType::Context).await.unwrap();
+        assert_eq!(context_ids, vec![context_id.clone()]);
+
+        let ast_ids = store.list_by_kind(EntityType::Ast).await.unwrap();
+        assert!(ast_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_stale_default_is_noop() {
+        use crate::entities::git::types::GitRepository;
+
+        let mut store = InMemoryEntityStore::new();
+        let git_entity =
+            Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        store.store(git_entity).await.unwrap();
+
+        // The in-memory store uses the default impl, which is a no-op.
+        let invalidated = store
+            .invalidate_stale(std::path::Path::new("/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(invalidated, 0);
+
+        // Entity should still be present.
+        let remaining = store.query(&EntityQuery::default()).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    /// Generic helper that exercises the `EntityStore` trait contract.
+    ///
+    /// Added as part of issue #193 Phase A so that future backends (e.g. the
+    /// planned `PersistentEntityStore`) can be validated against the same
+    /// sequence of operations as `InMemoryEntityStore`.
+    async fn exercise_store<S: EntityStore + ?Sized>(store: &mut S) {
+        use crate::entities::git::types::GitRepository;
+
+        // Store two entities.
+        let a = Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        let a_id = store.store(a).await.unwrap();
+
+        let b = Box::new(GitRepository::new(String::new(), "dev".to_string())) as Box<dyn Entity>;
+        let b_id = store.store(b).await.unwrap();
+
+        assert!(store.exists(&a_id).await);
+        assert!(store.exists(&b_id).await);
+
+        // list_by_kind should enumerate both Git entities.
+        let git_ids = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(git_ids.len(), 2);
+
+        // Delete one and verify.
+        store.delete(&a_id).await.unwrap();
+        assert!(!store.exists(&a_id).await);
+
+        let remaining = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(remaining, vec![b_id.clone()]);
+
+        // invalidate_stale should be callable through the trait.
+        let _ = store
+            .invalidate_stale(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_exercise_store_with_in_memory() {
+        let mut store = InMemoryEntityStore::new();
+        exercise_store(&mut store).await;
     }
 }

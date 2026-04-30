@@ -518,9 +518,6 @@ struct InternalMetrics {
     errors: Vec<ErrorEvent>,
     /// Model metrics
     model_metrics: HashMap<String, ModelMetrics>,
-    /// System resource snapshots
-    #[allow(dead_code)]
-    system_snapshots: Vec<SystemResourceMetrics>,
 }
 
 impl Default for DefaultMetricsCollector {

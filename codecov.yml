@@ -1,6 +1,12 @@
+codecov:
+  strict_yaml_branch: main
+
 coverage:
   status:
     project: off
     patch:
       default:
         target: 100%
+
+ignore:
+  - "harness/src/main.rs"

@@ -370,6 +370,12 @@ pub async fn start_container_with_fallback(
     let mut cmd = Command::new(runtime.command());
     cmd.args(["run", "-d", "--name", &config.container_name]);
 
+    // Podman requires --userns=keep-id so files created inside the container
+    // are owned by the host user rather than root.
+    if runtime == ContainerRuntime::Podman {
+        cmd.arg("--userns=keep-id");
+    }
+
     // Add port mapping if specified
     if let Some((host_port, container_port)) = config.port_mapping {
         cmd.args(["-p", &format!("{}:{}", host_port, container_port)]);
@@ -649,6 +655,30 @@ impl SharedModelPool {
 
     pub fn ref_count(&self) -> usize {
         self.ref_count.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Note: a prior `release_ref_count_no_underflow` harness was removed
+    // because it modelled a bare `AtomicUsize` rather than driving the real
+    // `SharedModelPool::get_or_start` / `release` code paths (which are
+    // async and do container I/O, making them impractical to proof-check
+    // under Kani today). The remaining `release_underflow_wraps` proof
+    // demonstrates the underflow bug directly on `AtomicUsize`, which is
+    // the actual primitive used inside `SharedModelPool::release`.
+
+    /// Show that an unguarded fetch_sub on zero wraps to usize::MAX.
+    #[kani::proof]
+    fn release_underflow_wraps() {
+        let counter = AtomicUsize::new(0);
+        let prev = counter.fetch_sub(1, Ordering::SeqCst);
+        // prev was 0, counter is now usize::MAX
+        assert_eq!(prev, 0);
+        assert_eq!(counter.load(Ordering::SeqCst), usize::MAX);
     }
 }
 
