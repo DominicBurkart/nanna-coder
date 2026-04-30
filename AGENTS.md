@@ -16,8 +16,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 ## When 100% patch coverage is genuinely unhittable
 
 1. If you are blocked because of disabled tests, enable them.
-2. If you are blocked because your architectural decisions yield untestable code, re-architect. 
-3. If the CI environment is broken in a way that you cannot fix and which is preventing your tests from being run, escalate by creating a github issue describing the exact misisng test problem.
+2. If you are blocked because your architectural decisions yield untestable code, re-architect.
+3. If a CI-environment failure you cannot fix is blocking your tests, escalate by opening a GitHub issue describing the exact missing-test problem.
 4. If, after the steps above, you still have a genuinely-untestable code path, a repository admin can apply the `coverage-exception-approved` label to the PR. The `coverage-bypass-guard` workflow will skip its net-delta check on the next `synchronize`/`labeled` event. This is the only escape hatch and is intentionally manual + admin-only.
 
 ## Coverage-bypass guard (the bypass-bypass guard)
