@@ -134,19 +134,23 @@ jobs:
           podman pod rm   nanna-coder-pod || true
 
   macos-bringup:
-    name: macOS full bring-up (Intel)
-    # macos-13 is the last Intel runner GitHub provides. Native x86_64
-    # means no cross-arch emulation: the harness/ollama images we built
-    # as x86_64-linux run inside an x86_64 Linux VM that podman machine
-    # spins up via QEMU on Intel mac (no vfkit/applehv pain). Round-7/8
-    # tried macos-latest (arm64) + applehv/vfkit + Rosetta but vfkit
-    # bailed with `exited unexpectedly with exit code 1` regardless of
-    # resource shape, which appears to be a known CI/sandboxed-runner
-    # limitation. Once vfkit becomes reliable (or libkrun lands), an
-    # arm64 lane can be added back.
-    runs-on: macos-13
+    name: macOS full bring-up (M-series + qemu provider)
+    # GHA-hosted M-series runners (macos-14/15/latest) ship `applehv`
+    # (Apple Virtualization framework + vfkit) as the default podman
+    # machine provider, but vfkit fails with `exited unexpectedly with
+    # exit code 1` in the GHA sandbox regardless of resource shape
+    # (verified rounds 7/8). Switching to the qemu provider sidesteps
+    # vfkit entirely — qemu runs in user-space, no entitlements needed.
+    # The macos-13 (Intel) alternative was tried in round-9/10 but the
+    # Intel runner queue was congested (~40 min queue). On arm64 mac,
+    # qemu emulates the x86_64 podman-machine VM; the x86_64 image
+    # workload inside runs natively from the VM's perspective. Slower
+    # than vfkit/applehv would be, but reliable.
+    runs-on: macos-14
     needs: build-images
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      CONTAINERS_MACHINE_PROVIDER: qemu
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -154,13 +158,14 @@ jobs:
           name: container-images
           path: _images
 
-      - name: Install podman
+      - name: Install podman + qemu
         run: |
           set -x
-          brew install podman
+          brew install podman qemu
           podman --version
+          qemu-system-x86_64 --version | head -1
 
-      - name: Initialize and start podman machine
+      - name: Initialize and start podman machine (qemu provider)
         run: |
           set -x
           df -h /
@@ -189,13 +194,14 @@ jobs:
         run: |
           podman pod ps
           podman ps -a
-          for i in $(seq 1 60); do
+          # qemu-emulated x86_64 startup can be slow; allow 4 min.
+          for i in $(seq 1 120); do
             if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
               echo "ollama API up"; exit 0
             fi
             sleep 2
           done
-          echo "ollama did not come up in 120s"
+          echo "ollama did not come up in 240s"
           podman logs ollama-service || true
           exit 1
 
