@@ -1,3 +1,6 @@
+codecov:
+  strict_yaml_branch: main
+
 coverage:
   status:
     project: off
