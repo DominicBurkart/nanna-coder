@@ -102,9 +102,9 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
-### Running Eval Tests
+### Running Tests and Evals
 
-With Ollama running and a model pulled (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
+See [TESTING.md](TESTING.md) for the full test topology and commands. Evals require Ollama and a pulled model (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
 
 ```bash
 nix develop --command cargo nextest run \
@@ -116,11 +116,4 @@ nix develop --command cargo nextest run \
 
 ### Using Cachix (Optional but Recommended)
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
-
-```bash
-# Configure Cachix for faster builds (read-only access)
-nix run .#setup-cache
-```
-
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+Run `nix run .#setup-cache` for read-only access to pre-built artifacts. See [CACHIX_SETUP.md](CACHIX_SETUP.md) for details and maintainer push setup.
