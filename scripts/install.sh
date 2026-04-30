@@ -204,20 +204,25 @@ fi
 
 # ---------- 2. pull images ----------
 
-# `podman image exists <ref>` requires an exact ref match, but `podman load`
-# of a docker-archive often stores short-name images with a `localhost/`
-# prefix. Try common variants before giving up so callers can pass either
-# form (e.g. `nanna-coder-harness:latest` or
-# `localhost/nanna-coder-harness:latest`).
-image_loaded() {
-  local ref="$1"
-  podman image exists "$ref" 2>/dev/null && return 0
-  case "$ref" in
-    */*) ;;  # already has a registry/path component
-    *)   podman image exists "localhost/$ref"        2>/dev/null && return 0
-         podman image exists "docker.io/library/$ref" 2>/dev/null && return 0 ;;
-  esac
-  podman images --format '{{.Repository}}:{{.Tag}}' | grep -qE "(^|/)${ref//\//\\/}\$" && return 0
+# `podman image exists <ref>` is an exact-match check, but `podman load` of a
+# docker-archive often stores short-name images with a `localhost/` prefix and
+# `podman run`/`podman tag` may reject bare refs under enforcing short-name
+# resolution. Resolve a user-supplied ref to whatever podman actually has it
+# stored as, so downstream `podman run` uses the canonical ref.
+resolve_image_ref() {
+  local ref="$1" candidate
+  for candidate in "$ref" "localhost/$ref" "docker.io/library/$ref"; do
+    if podman image exists "$candidate" 2>/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  candidate=$(podman images --format '{{.Repository}}:{{.Tag}}' \
+    | grep -E "(^|/)${ref//\//\\/}\$" | head -1)
+  if [[ -n "$candidate" ]]; then
+    echo "$candidate"
+    return 0
+  fi
   return 1
 }
 
@@ -225,11 +230,19 @@ if [[ $NO_PULL -eq 1 ]]; then
   warn "--no-pull set: skipping podman pull. Expecting images already loaded:"
   warn "  $HARNESS_IMAGE"
   warn "  $OLLAMA_IMAGE"
-  if ! image_loaded "$HARNESS_IMAGE"; then
+  if HARNESS_RESOLVED=$(resolve_image_ref "$HARNESS_IMAGE"); then
+    [[ "$HARNESS_RESOLVED" == "$HARNESS_IMAGE" ]] || \
+      log "harness image resolved: $HARNESS_IMAGE -> $HARNESS_RESOLVED"
+    HARNESS_IMAGE="$HARNESS_RESOLVED"
+  else
     podman images >&2 || true
     die "harness image $HARNESS_IMAGE not loaded locally and --no-pull was set."
   fi
-  if ! image_loaded "$OLLAMA_IMAGE"; then
+  if OLLAMA_RESOLVED=$(resolve_image_ref "$OLLAMA_IMAGE"); then
+    [[ "$OLLAMA_RESOLVED" == "$OLLAMA_IMAGE" ]] || \
+      log "ollama image resolved: $OLLAMA_IMAGE -> $OLLAMA_RESOLVED"
+    OLLAMA_IMAGE="$OLLAMA_RESOLVED"
+  else
     podman images >&2 || true
     die "ollama image $OLLAMA_IMAGE not loaded locally and --no-pull was set."
   fi
