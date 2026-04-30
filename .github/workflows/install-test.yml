@@ -153,19 +153,33 @@ jobs:
 
       - name: Initialize and start podman machine
         run: |
-          # macos-latest is arm64 (Apple Silicon). We built x86_64-linux
-          # images, which run inside the podman-machine VM via QEMU
-          # user-mode emulation registered through binfmt_misc in fedora
-          # coreos. podman 5+ on Apple Silicon defaults to the applehv
-          # provider (Apple Virtualization framework). This is the path
-          # install.sh exercises for end users — earlier rounds tried to
-          # short-circuit it with colima, but colima dropped the podman
-          # runtime so that approach is no longer viable.
+          # macos-latest is arm64 (Apple Silicon). x86_64-linux images run
+          # via Rosetta 2 inside the podman-machine VM (applehv provider,
+          # backed by Apple Virtualization framework + vfkit). Resource
+          # request kept conservative: GHA macos-latest has ~7 GB RAM and
+          # limited free disk; over-asking causes vfkit to bail out with
+          # `exited unexpectedly with exit code 1`.
           set -x
-          podman machine init --cpus=2 --memory=4096 --disk-size=20
+          df -h /
+          podman machine init --cpus=2 --memory=3072 --disk-size=10
           podman machine start
           podman machine list
           podman info | head -40
+
+      - name: Diagnostics on machine-start failure
+        if: failure()
+        run: |
+          echo "::group::df -h"
+          df -h
+          echo "::endgroup::"
+          echo "::group::podman machine list"
+          podman machine list || true
+          echo "::endgroup::"
+          echo "::group::vfkit/applehv logs"
+          ls -la ~/.local/share/containers/podman/machine/applehv/ 2>/dev/null || true
+          find ~/.local/share/containers/podman/machine -name '*.log' 2>/dev/null | xargs -I{} sh -c 'echo "=== {} ==="; tail -50 "{}"' || true
+          find ~/.config/containers/podman/machine -name '*.log' 2>/dev/null | xargs -I{} sh -c 'echo "=== {} ==="; tail -50 "{}"' || true
+          echo "::endgroup::"
 
       - name: Load images
         run: |
@@ -219,10 +233,15 @@ jobs:
           name: container-images
           path: _images
 
-      - name: Set up WSL2 (Ubuntu 22.04)
+      - name: Set up WSL2 (Ubuntu 24.04)
         uses: Vampire/setup-wsl@v3
         with:
-          distribution: Ubuntu-22.04
+          # Ubuntu-24.04 ships podman 4+, which correctly parses
+          # docker-archive RepoTags. Ubuntu-22.04's apt podman is 3.4.4,
+          # which has a known bug where loading a docker-archive whose
+          # `RepoTags` is `name:latest` (no registry prefix) ends up
+          # tagged as `localhost/latest:latest`, dropping the name.
+          distribution: Ubuntu-24.04
           # Disable cache: the GHA cache service has been intermittently
           # returning 400 ("Our services aren't available right now"),
           # which makes setup-wsl fail on cache restore. Slower without
