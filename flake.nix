@@ -29,7 +29,7 @@
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix2container, cachix }:
     # Support multiple systems for cross-platform CI
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
+    nixpkgs.lib.recursiveUpdate (flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         # Reproducible overlays with pinned versions
         overlays = [
@@ -169,10 +169,11 @@
           vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
 
           # Multi-model cache system (Ollama - legacy)
-          inherit (containers.models) qwen3-model llama3-model mistral-model gemma-model;
+          inherit (containers.models) qwen3-model gemma-model;
+          inherit (containers.strictModels) qwen3-model-strict gemma-model-strict;
 
           # Multi-model containers (Ollama - legacy)
-          inherit (containers.containers) qwen3-container llama3-container mistral-container gemma-container;
+          inherit (containers.containers) qwen3-container gemma-container;
 
           # Cache management utilities
           inherit (scripts.cacheUtils) cache-info cache-cleanup;
@@ -257,8 +258,8 @@
           '';
         };
       }
-    ) //
-    # Add cross-platform package support for CI matrix builds
+    )) # end eachSystem
+    # Merge cross-platform package support (load-container-image, load-ollama-image, vllmImage variants)
     {
       packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
         let
@@ -505,5 +506,5 @@
             }) else null;
         }
       );
-    };
+    }; # end recursiveUpdate second arg
 }
