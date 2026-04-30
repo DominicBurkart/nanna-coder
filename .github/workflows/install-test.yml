@@ -134,23 +134,20 @@ jobs:
           podman pod rm   nanna-coder-pod || true
 
   macos-bringup:
-    name: macOS full bring-up (M-series + qemu provider)
-    # GHA-hosted M-series runners (macos-14/15/latest) ship `applehv`
-    # (Apple Virtualization framework + vfkit) as the default podman
-    # machine provider, but vfkit fails with `exited unexpectedly with
-    # exit code 1` in the GHA sandbox regardless of resource shape
-    # (verified rounds 7/8). Switching to the qemu provider sidesteps
-    # vfkit entirely — qemu runs in user-space, no entitlements needed.
-    # The macos-13 (Intel) alternative was tried in round-9/10 but the
-    # Intel runner queue was congested (~40 min queue). On arm64 mac,
-    # qemu emulates the x86_64 podman-machine VM; the x86_64 image
-    # workload inside runs natively from the VM's perspective. Slower
-    # than vfkit/applehv would be, but reliable.
+    name: macOS full bring-up (M-series + libkrun provider)
+    # GHA-hosted M-series runners ship `applehv` (Apple Virtualization
+    # framework + vfkit) as the default podman machine provider. vfkit
+    # fails with `exited unexpectedly with exit code 1` in the GHA
+    # sandbox (verified rounds 7/8). Round 11 tried the qemu provider
+    # but podman 5.x removed qemu — only `applehv` and `libkrun` are
+    # supported. libkrun is the last option: it's a Hypervisor.framework
+    # backend that doesn't depend on vfkit. macos-13 (Intel) is the
+    # alternative but its runner queue is heavily congested (40+ min).
     runs-on: macos-14
     needs: build-images
     timeout-minutes: 45
     env:
-      CONTAINERS_MACHINE_PROVIDER: qemu
+      CONTAINERS_MACHINE_PROVIDER: libkrun
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -158,14 +155,13 @@ jobs:
           name: container-images
           path: _images
 
-      - name: Install podman + qemu
+      - name: Install podman + libkrun
         run: |
           set -x
-          brew install podman qemu
+          brew install podman libkrun
           podman --version
-          qemu-system-x86_64 --version | head -1
 
-      - name: Initialize and start podman machine (qemu provider)
+      - name: Initialize and start podman machine (libkrun provider)
         run: |
           set -x
           df -h /
