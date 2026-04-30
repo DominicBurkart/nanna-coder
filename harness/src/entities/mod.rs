@@ -22,6 +22,7 @@ pub mod test;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -329,6 +330,38 @@ pub trait EntityStore: Send + Sync {
         to: &str,
         relationship_type: RelationshipType,
     ) -> EntityResult<()>;
+
+    /// List all entity IDs for a given entity kind.
+    ///
+    /// The default implementation runs a full `query` constrained to the
+    /// requested kind and projects the IDs out of the results. Backends that
+    /// can answer this more cheaply (e.g. indexed SQL) should override it.
+    ///
+    /// This hook is introduced to prepare for the persistent-store work in
+    /// issue #193 (Phase A). It has no behavior change for the in-memory
+    /// store.
+    async fn list_by_kind(&self, kind: EntityType) -> EntityResult<Vec<EntityId>> {
+        let query = EntityQuery {
+            entity_types: vec![kind],
+            ..EntityQuery::default()
+        };
+        let results = self.query(&query).await?;
+        Ok(results.into_iter().map(|r| r.entity_id).collect())
+    }
+
+    /// Invalidate stale entries against the given workspace root.
+    ///
+    /// Persistent backends override this to drop entries whose backing
+    /// on-disk state has changed (file mtime advanced, HEAD commit moved,
+    /// etc.). The in-memory store has no persistence to invalidate, so the
+    /// default returns `Ok(0)`.
+    ///
+    /// Returns the number of entries that were invalidated/removed. Added
+    /// as part of issue #193 Phase A so that callers can be generified
+    /// against the trait ahead of the persistent-store implementation.
+    async fn invalidate_stale(&mut self, _workspace_root: &Path) -> EntityResult<usize> {
+        Ok(0)
+    }
 }
 
 /// In-memory entity store implementation (for testing and development)
@@ -620,5 +653,98 @@ mod tests {
         // Note: Full tests will be added when concrete entity types are implemented
         let store = InMemoryEntityStore::new();
         assert_eq!(store.entities.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_kind_returns_matching_ids() {
+        use crate::entities::context::types::ContextEntity;
+        use crate::entities::git::types::GitRepository;
+
+        let mut store = InMemoryEntityStore::new();
+
+        let git_entity =
+            Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        let git_id = store.store(git_entity).await.unwrap();
+
+        let context_entity = Box::new(ContextEntity::new(
+            "task".to_string(),
+            vec![],
+            vec![],
+            String::new(),
+            "model".to_string(),
+        )) as Box<dyn Entity>;
+        let context_id = store.store(context_entity).await.unwrap();
+
+        let git_ids = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(git_ids, vec![git_id.clone()]);
+
+        let context_ids = store.list_by_kind(EntityType::Context).await.unwrap();
+        assert_eq!(context_ids, vec![context_id.clone()]);
+
+        let ast_ids = store.list_by_kind(EntityType::Ast).await.unwrap();
+        assert!(ast_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_stale_default_is_noop() {
+        use crate::entities::git::types::GitRepository;
+
+        let mut store = InMemoryEntityStore::new();
+        let git_entity =
+            Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        store.store(git_entity).await.unwrap();
+
+        // The in-memory store uses the default impl, which is a no-op.
+        let invalidated = store
+            .invalidate_stale(std::path::Path::new("/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(invalidated, 0);
+
+        // Entity should still be present.
+        let remaining = store.query(&EntityQuery::default()).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    /// Generic helper that exercises the `EntityStore` trait contract.
+    ///
+    /// Added as part of issue #193 Phase A so that future backends (e.g. the
+    /// planned `PersistentEntityStore`) can be validated against the same
+    /// sequence of operations as `InMemoryEntityStore`.
+    async fn exercise_store<S: EntityStore + ?Sized>(store: &mut S) {
+        use crate::entities::git::types::GitRepository;
+
+        // Store two entities.
+        let a = Box::new(GitRepository::new(String::new(), "main".to_string())) as Box<dyn Entity>;
+        let a_id = store.store(a).await.unwrap();
+
+        let b = Box::new(GitRepository::new(String::new(), "dev".to_string())) as Box<dyn Entity>;
+        let b_id = store.store(b).await.unwrap();
+
+        assert!(store.exists(&a_id).await);
+        assert!(store.exists(&b_id).await);
+
+        // list_by_kind should enumerate both Git entities.
+        let git_ids = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(git_ids.len(), 2);
+
+        // Delete one and verify.
+        store.delete(&a_id).await.unwrap();
+        assert!(!store.exists(&a_id).await);
+
+        let remaining = store.list_by_kind(EntityType::Git).await.unwrap();
+        assert_eq!(remaining, vec![b_id.clone()]);
+
+        // invalidate_stale should be callable through the trait.
+        let _ = store
+            .invalidate_stale(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_exercise_store_with_in_memory() {
+        let mut store = InMemoryEntityStore::new();
+        exercise_store(&mut store).await;
     }
 }
