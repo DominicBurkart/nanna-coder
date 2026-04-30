@@ -255,10 +255,9 @@ mod mcp_edge_cases {
     /// error code -32600 (Invalid Request).
     #[tokio::test]
     async fn invalid_jsonrpc_version_returns_32600() {
-        let v = round_trip(
-            "{\"jsonrpc\":\"1.0\",\"id\":99,\"method\":\"tools/list\",\"params\":{}}\n",
-        )
-        .await;
+        let v =
+            round_trip("{\"jsonrpc\":\"1.0\",\"id\":99,\"method\":\"tools/list\",\"params\":{}}\n")
+                .await;
         assert_eq!(
             v["error"]["code"], -32600,
             "expected -32600 for bad JSON-RPC version: {v}"
