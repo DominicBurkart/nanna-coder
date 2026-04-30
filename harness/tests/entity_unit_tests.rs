@@ -5,12 +5,12 @@
 //! types so that no production logic is stubbed out.  They are intentionally
 //! small and fast — no containers, no network, no filesystem access.
 
-use harness::entities::{
-    EntityError, EntityQuery, EntityRelationship, EntityStore, EntityType,
-    InMemoryEntityStore, RelationshipType,
-};
 use harness::entities::context::types::ContextEntity;
 use harness::entities::git::types::GitRepository;
+use harness::entities::{
+    EntityError, EntityQuery, EntityRelationship, EntityStore, EntityType, InMemoryEntityStore,
+    RelationshipType,
+};
 
 // ---------------------------------------------------------------------------
 // Helper: build a minimal ContextEntity
@@ -40,7 +40,10 @@ async fn store_and_exists_by_id() {
     let entity = make_context_entity("store and exists test");
     let id = store.store(Box::new(entity)).await.unwrap();
 
-    assert!(store.exists(&id).await, "stored entity should be found by id");
+    assert!(
+        store.exists(&id).await,
+        "stored entity should be found by id"
+    );
     assert!(
         !store.exists("nonexistent-id").await,
         "unknown id must not exist"
@@ -73,16 +76,11 @@ async fn store_duplicate_id_returns_already_exists_error() {
 async fn store_multiple_entities_all_retrievable_via_query() {
     let mut store = InMemoryEntityStore::new();
 
-    let ids: Vec<String> = futures::future::join_all(
-        (0..3).map(|i| {
-            let entity = make_context_entity(&format!("entity {}", i));
-            store.store(Box::new(entity))
-        }),
-    )
-    .await
-    .into_iter()
-    .map(|r| r.unwrap())
-    .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let entity = make_context_entity(&format!("entity {}", i));
+        ids.push(store.store(Box::new(entity)).await.unwrap());
+    }
 
     // Querying with no filters should return all three.
     let query = EntityQuery::default();
@@ -96,7 +94,11 @@ async fn store_multiple_entities_all_retrievable_via_query() {
 
     let result_ids: Vec<_> = results.iter().map(|r| r.entity_id.clone()).collect();
     for id in &ids {
-        assert!(result_ids.contains(id), "id {} missing from query results", id);
+        assert!(
+            result_ids.contains(id),
+            "id {} missing from query results",
+            id
+        );
     }
 }
 
@@ -197,7 +199,10 @@ async fn delete_removes_entity() {
     let id = store.store(Box::new(entity)).await.unwrap();
 
     store.delete(&id).await.unwrap();
-    assert!(!store.exists(&id).await, "entity should no longer exist after deletion");
+    assert!(
+        !store.exists(&id).await,
+        "entity should no longer exist after deletion"
+    );
 }
 
 #[tokio::test]

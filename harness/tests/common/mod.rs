@@ -18,11 +18,11 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
-use model::{
-    ModelError, ModelProvider, ModelResult,
-    types::{ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall, ModelInfo, ToolCall},
-};
 use model::types::ChatMessage;
+use model::{
+    types::{ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall, ModelInfo, ToolCall},
+    ModelError, ModelProvider, ModelResult,
+};
 use std::sync::Mutex;
 
 /// A scripted [`ModelProvider`] that pops and returns responses in FIFO order.
@@ -114,7 +114,7 @@ pub fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> V
         make_stop_response("Plan: execute the task"), // PlanningEntityModification
     ];
     responses.extend(tool_responses); // PerformingEntityModification
-    // UpdatingEntities: no LLM call
+                                      // UpdatingEntities: no LLM call
     responses.push(make_stop_response("COMPLETE - task done")); // CheckingTaskCompletion
     responses
 }

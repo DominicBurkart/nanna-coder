@@ -1,12 +1,12 @@
-# Nanna Coder PoC: Complete System Overview
+# Nanna Coder PoC: System Overview
 
-## 🎯 Executive Summary
+> Historical PoC summary. For current architecture see [ARCHITECTURE.md](../ARCHITECTURE.md); for cache specifics see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md).
 
-This document provides a comprehensive overview of the Nanna Coder Proof of Concept (PoC) implementation featuring a **production-ready AI assistant system** with **advanced model caching**, **containerized infrastructure**, **comprehensive monitoring**, and **intelligent quality validation**.
+## Summary
 
-### ✅ Success Criteria - All Phases Completed
+Overview of the Nanna Coder Proof of Concept: a containerized AI assistant system covering model caching, container infrastructure, monitoring, and automated quality validation.
 
-**🏆 COMPLETE PoC SUCCESS:** All planned phases have been successfully implemented and validated.
+### Delivered phases
 
 | Phase | Component | Status | Success Criteria Met |
 |-------|-----------|---------|---------------------|
@@ -229,7 +229,7 @@ graph LR
 ### System Performance Targets
 
 | Metric | Target | Current | Status |
-|--------|--------|---------|---------|
+|--------|--------|---------|--------|
 | **Cache Hit Rate** | >85% | ~90% | ✅ **EXCEEDS** |
 | **API Response Time** | <2000ms | ~150ms | ✅ **EXCEEDS** |
 | **Error Rate** | <5% | <1% | ✅ **EXCEEDS** |
@@ -344,7 +344,7 @@ Pre-commit Validation Pipeline:
 ### Technical Success Metrics
 
 | Category | Metric | Target | Achieved | Status |
-|----------|--------|---------|----------|---------|
+|----------|--------|---------|----------|--------|
 | **Quality** | Test Coverage | >90% | 95%+ | ✅ **EXCEEDED** |
 | **Performance** | Build Time | <5min | 2-3min | ✅ **EXCEEDED** |
 | **Reliability** | Test Pass Rate | >95% | 100% | ✅ **EXCEEDED** |
@@ -664,6 +664,6 @@ let handle = start_container_with_fallback(&config).await?;
 
 ---
 
-**🎉 PoC COMPLETE: Mission Accomplished!**
+## Status
 
-This comprehensive PoC demonstrates a production-ready AI assistant system with advanced model caching, containerized infrastructure, intelligent quality validation, and comprehensive monitoring. All success criteria have been met or exceeded, establishing a solid foundation for production deployment and future enhancements.
+All PoC phases delivered. Subsequent work has continued on the `main` branch; consult current docs (README, ARCHITECTURE, TESTING) for the active state of the project.

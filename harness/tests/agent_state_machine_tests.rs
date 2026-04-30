@@ -20,8 +20,9 @@ use harness::{
 use model::types::{ChatMessage, ChatResponse, Choice, FinishReason};
 use serde_json::json;
 
-use common::{make_stop_response, make_tool_call, wrap_with_state_machine_responses,
-             SequenceMockProvider};
+use common::{
+    make_stop_response, make_tool_call, wrap_with_state_machine_responses, SequenceMockProvider,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -164,15 +165,15 @@ async fn agent_loop_recognizes_completion_signal() {
 async fn agent_loop_replans_when_incomplete() {
     let provider = Arc::new(SequenceMockProvider::new(vec![
         // Enrich: no LLM
-        make_stop_response("Plan: first attempt"),  // PlanningEntityModification (1st)
-        make_stop_response("First action done."),   // PerformingEntityModification
+        make_stop_response("Plan: first attempt"), // PlanningEntityModification (1st)
+        make_stop_response("First action done."),  // PerformingEntityModification
         // Update: no LLM
-        make_stop_response("INCOMPLETE"),            // CheckingTaskCompletion → re-loop
-        make_stop_response("PROCEED"),               // EntityModificationDecision
+        make_stop_response("INCOMPLETE"), // CheckingTaskCompletion → re-loop
+        make_stop_response("PROCEED"),    // EntityModificationDecision
         make_stop_response("Plan: second attempt"), // PlanningEntityModification (2nd)
-        make_stop_response("Second action done."),  // PerformingEntityModification
+        make_stop_response("Second action done."), // PerformingEntityModification
         // Update: no LLM
-        make_stop_response("COMPLETE"),              // CheckingTaskCompletion
+        make_stop_response("COMPLETE"), // CheckingTaskCompletion
     ]));
 
     let mut agent = AgentLoop::with_tools(
@@ -203,17 +204,17 @@ async fn agent_loop_replans_when_incomplete() {
 async fn agent_loop_enters_querying_entities_on_query_decision() {
     let provider = Arc::new(SequenceMockProvider::new(vec![
         // Enrich: no LLM
-        make_stop_response("Plan: initial"),          // PlanningEntityModification
-        make_stop_response("Action done."),           // PerformingEntityModification
+        make_stop_response("Plan: initial"), // PlanningEntityModification
+        make_stop_response("Action done."),  // PerformingEntityModification
         // Update: no LLM
-        make_stop_response("INCOMPLETE"),              // CheckingTaskCompletion
-        make_stop_response("QUERY - need context"),   // EntityModificationDecision → query branch
+        make_stop_response("INCOMPLETE"), // CheckingTaskCompletion
+        make_stop_response("QUERY - need context"), // EntityModificationDecision → query branch
         // QueryingEntities: no LLM, loops back to Decision
-        make_stop_response("PROCEED"),                // EntityModificationDecision → plan branch
-        make_stop_response("Revised plan"),           // PlanningEntityModification (2nd)
-        make_stop_response("Revised action done."),   // PerformingEntityModification (2nd)
+        make_stop_response("PROCEED"), // EntityModificationDecision → plan branch
+        make_stop_response("Revised plan"), // PlanningEntityModification (2nd)
+        make_stop_response("Revised action done."), // PerformingEntityModification (2nd)
         // Update: no LLM
-        make_stop_response("COMPLETE"),               // CheckingTaskCompletion
+        make_stop_response("COMPLETE"), // CheckingTaskCompletion
     ]));
 
     let mut agent = AgentLoop::with_tools(
