@@ -134,8 +134,17 @@ jobs:
           podman pod rm   nanna-coder-pod || true
 
   macos-bringup:
-    name: macOS full bring-up (podman machine + x86_64 emulation)
-    runs-on: macos-latest
+    name: macOS full bring-up (Intel)
+    # macos-13 is the last Intel runner GitHub provides. Native x86_64
+    # means no cross-arch emulation: the harness/ollama images we built
+    # as x86_64-linux run inside an x86_64 Linux VM that podman machine
+    # spins up via QEMU on Intel mac (no vfkit/applehv pain). Round-7/8
+    # tried macos-latest (arm64) + applehv/vfkit + Rosetta but vfkit
+    # bailed with `exited unexpectedly with exit code 1` regardless of
+    # resource shape, which appears to be a known CI/sandboxed-runner
+    # limitation. Once vfkit becomes reliable (or libkrun lands), an
+    # arm64 lane can be added back.
+    runs-on: macos-13
     needs: build-images
     timeout-minutes: 30
     steps:
@@ -153,33 +162,12 @@ jobs:
 
       - name: Initialize and start podman machine
         run: |
-          # macos-latest is arm64 (Apple Silicon). x86_64-linux images run
-          # via Rosetta 2 inside the podman-machine VM (applehv provider,
-          # backed by Apple Virtualization framework + vfkit). Resource
-          # request kept conservative: GHA macos-latest has ~7 GB RAM and
-          # limited free disk; over-asking causes vfkit to bail out with
-          # `exited unexpectedly with exit code 1`.
           set -x
           df -h /
           podman machine init --cpus=2 --memory=3072 --disk-size=10
           podman machine start
           podman machine list
           podman info | head -40
-
-      - name: Diagnostics on machine-start failure
-        if: failure()
-        run: |
-          echo "::group::df -h"
-          df -h
-          echo "::endgroup::"
-          echo "::group::podman machine list"
-          podman machine list || true
-          echo "::endgroup::"
-          echo "::group::vfkit/applehv logs"
-          ls -la ~/.local/share/containers/podman/machine/applehv/ 2>/dev/null || true
-          find ~/.local/share/containers/podman/machine -name '*.log' 2>/dev/null | xargs -I{} sh -c 'echo "=== {} ==="; tail -50 "{}"' || true
-          find ~/.config/containers/podman/machine -name '*.log' 2>/dev/null | xargs -I{} sh -c 'echo "=== {} ==="; tail -50 "{}"' || true
-          echo "::endgroup::"
 
       - name: Load images
         run: |
@@ -190,9 +178,7 @@ jobs:
 
       - name: Run installer
         run: |
-          # install.sh's ensure_podman_machine_macos() is idempotent — it
-          # detects an existing running machine and skips re-init. No
-          # NANNA_SKIP_PODMAN_MACHINE override needed.
+          # install.sh's ensure_podman_machine_macos() is idempotent.
           bash scripts/install.sh \
             --no-pull --skip-model-pull --yes \
             --harness-image nanna-coder-harness:latest \
@@ -203,14 +189,13 @@ jobs:
         run: |
           podman pod ps
           podman ps -a
-          # Emulated x86_64 ollama startup can take longer than native; allow 3 min.
-          for i in $(seq 1 90); do
+          for i in $(seq 1 60); do
             if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
               echo "ollama API up"; exit 0
             fi
             sleep 2
           done
-          echo "ollama did not come up in 180s"
+          echo "ollama did not come up in 120s"
           podman logs ollama-service || true
           exit 1
 
@@ -253,6 +238,7 @@ jobs:
             podman
             uidmap
             slirp4netns
+            catatonit
 
       - name: Load images inside WSL
         shell: wsl-bash {0}
