@@ -1,16 +1,38 @@
-//! Sandbox Telemetry Entities (TODO)
+//! Sandbox Telemetry Entities (deferred — TODO, tracked in issue #27)
 //!
-//! This module will implement telemetry entities for runtime observability
-//! and metrics from sandbox execution.
+//! This module provides a **typed stub** for telemetry entities alongside
+//! a TOML-backed configuration loader. The runtime wiring that actually
+//! collects and emits samples is intentionally deferred.
 //!
-//! See issue #27 and ARCHITECTURE.md for details.
+//! # Status
 //!
-//! NOTE: This implementation is deferred due to per-project configuration
-//! requirements and larger scope.
+//! This is marked TODO. Only the schema, the entity trait impl, and the
+//! config parser are implemented in this slice. No runtime collection is
+//! wired up.
+//!
+//! # Prerequisite issues
+//!
+//! Full telemetry-entity support depends on the following work landing
+//! first:
+//!
+//! - #23 — entity store persistence layer
+//! - #24 — runtime instrumentation surface
+//! - #25 — cross-entity correlation / relationship indexing
+//!
+//! Until those land, [`TelemetryEntity::new`] remains a zero-argument
+//! placeholder constructor so that existing call sites (notably
+//! `harness::agent::eval`) keep compiling.
+//!
+//! # Do not confuse with `harness::telemetry`
+//!
+//! The top-level [`crate::telemetry`] module is the runtime observability
+//! subsystem (exporters, trace contexts, etc.). This module
+//! (`harness::entities::telemetry`) is the **entity-store** representation
+//! of telemetry samples — a separate abstraction that lets telemetry be
+//! queried, related, and persisted like any other entity.
 
-// Placeholder for telemetry entity implementation
-// Full implementation tracked in issue #27 (marked as TODO)
-
+pub mod config;
 pub mod types;
 
+pub use config::*;
 pub use types::*;
