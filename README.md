@@ -49,8 +49,8 @@ curl -fsSL https://ollama.ai/install.sh | sh
 # Pull the default model
 ollama pull qwen3:0.6b
 
-# Verify Ollama is running
-nix develop --command cargo run --bin harness -- health
+# Start the Ollama server (must be running for agent commands and evals)
+ollama serve
 ```
 
 ### Running the Agent
@@ -72,13 +72,18 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
-### Using Cachix (Optional but Recommended)
+### Running Tests and Evals
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
+See [TESTING.md](TESTING.md) for the full test topology and commands. Evals require Ollama and a pulled model (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
 
 ```bash
-# Configure Cachix for faster builds (read-only access)
-nix run .#setup-cache
+nix develop --command cargo nextest run \
+  --workspace --features eval-runner \
+  --run-ignored ignored-only \
+  -E 'test(eval_runner)' \
+  --test-threads=1
 ```
 
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+### Using Cachix (Optional but Recommended)
+
+Run `nix run .#setup-cache` for read-only access to pre-built artifacts. See [CACHIX_SETUP.md](CACHIX_SETUP.md) for details and maintainer push setup.

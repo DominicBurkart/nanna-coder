@@ -1,0 +1,116 @@
+name: codecov-guard
+
+on:
+  pull_request:
+    paths:
+      - codecov.yml
+      - .github/workflows/codecov-guard.yml
+  push:
+    branches: [main]
+    paths:
+      - codecov.yml
+      - .github/workflows/codecov-guard.yml
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify yq is available
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "::error::yq is required but not installed on this runner"
+            exit 1
+          fi
+          yq --version
+
+      - name: Resolve base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=HEAD~1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guard codecov.yml against silent relaxations
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          set -euo pipefail
+          FILE="codecov.yml"
+
+          if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+            echo "::error::base ref '$BASE_REF' not resolvable; fail-closed per policy"
+            exit 1
+          fi
+
+          if ! git cat-file -e "$BASE_REF:$FILE" 2>/dev/null; then
+            echo "::error::$FILE did not exist on $BASE_REF. First-time adds must go through admin merge."
+            exit 1
+          fi
+
+          OLD_CONTENT="$(git show "$BASE_REF:$FILE")"
+          NEW_CONTENT="$(cat "$FILE")"
+
+          if [ "$OLD_CONTENT" = "$NEW_CONTENT" ]; then
+            echo "no change to $FILE"
+            exit 0
+          fi
+
+          OLD_TARGET="$(printf '%s\n' "$OLD_CONTENT" | yq '.coverage.status.patch.default.target // "null"' -)"
+          NEW_TARGET="$(printf '%s\n' "$NEW_CONTENT" | yq '.coverage.status.patch.default.target // "null"' -)"
+          OLD_IGNORE="$(printf '%s\n' "$OLD_CONTENT" | yq '.ignore // [] | length' -)"
+          NEW_IGNORE="$(printf '%s\n' "$NEW_CONTENT" | yq '.ignore // [] | length' -)"
+          OLD_STRICT="$(printf '%s\n' "$OLD_CONTENT" | yq '.codecov.strict_yaml_branch // "null"' -)"
+          NEW_STRICT="$(printf '%s\n' "$NEW_CONTENT" | yq '.codecov.strict_yaml_branch // "null"' -)"
+
+          OLD_NUM=""
+          NEW_NUM=""
+          if [[ "$OLD_TARGET" =~ ^([0-9]+(\.[0-9]+)?)%?$ ]]; then OLD_NUM="${BASH_REMATCH[1]}"; fi
+          if [[ "$NEW_TARGET" =~ ^([0-9]+(\.[0-9]+)?)%?$ ]]; then NEW_NUM="${BASH_REMATCH[1]}"; fi
+
+          REGRESSION=0
+          REASONS=()
+
+          if [ -n "$OLD_NUM" ] && [ -z "$NEW_NUM" ]; then
+            REGRESSION=1
+            REASONS+=("patch target became non-numeric or was removed: '$OLD_TARGET' -> '$NEW_TARGET' (e.g., 'auto' is a regression from a numeric floor)")
+          elif [ -n "$OLD_NUM" ] && [ -n "$NEW_NUM" ]; then
+            if awk "BEGIN { exit !($NEW_NUM < $OLD_NUM) }"; then
+              REGRESSION=1
+              REASONS+=("patch target decreased: $OLD_TARGET -> $NEW_TARGET")
+            fi
+          fi
+
+          if [ "$NEW_IGNORE" -gt "$OLD_IGNORE" ]; then
+            REGRESSION=1
+            REASONS+=("ignore: list grew from $OLD_IGNORE to $NEW_IGNORE entries")
+          fi
+
+          if [ "$OLD_STRICT" != "null" ] && [ "$NEW_STRICT" != "$OLD_STRICT" ]; then
+            REGRESSION=1
+            REASONS+=("codecov.strict_yaml_branch changed: '$OLD_STRICT' -> '$NEW_STRICT' (relaxing strict_yaml_branch lets PR-side YAML edits take effect)")
+          fi
+
+          if [ "$REGRESSION" -eq 0 ]; then
+            echo "codecov.yml change accepted (no regression detected)"
+            exit 0
+          fi
+
+          {
+            echo "::error::codecov.yml regression detected and there is no in-repo override."
+            for r in "${REASONS[@]}"; do echo "  - $r"; done
+            echo ""
+            echo "If this change is intentional, a repository admin must use GitHub's"
+            echo "\"Merge without waiting for requirements to be met (bypass branch protections)\""
+            echo "button. No commit trailer, env var, or script flag can bypass this check."
+          } >&2
+          exit 1
