@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 /// Integration-level unit tests for `model::judge`.
 ///
 /// All tests here are pure (no network / no Ollama) and use an in-process
@@ -13,7 +14,6 @@ use model::provider::{ModelError, ModelProvider, ModelResult};
 use model::types::{
     ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, ModelInfo, ToolDefinition,
 };
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -127,11 +127,9 @@ impl ModelJudge for MockModelJudge {
         &self,
         _tools: &[ToolDefinition],
     ) -> ModelResult<ValidationResult> {
-        self.tool_result
-            .clone()
-            .ok_or_else(|| ModelError::Unknown {
-                message: "no tool result configured".into(),
-            })
+        self.tool_result.clone().ok_or_else(|| ModelError::Unknown {
+            message: "no tool result configured".into(),
+        })
     }
 
     async fn validate_consistency(
@@ -206,8 +204,7 @@ fn coherence_high_word_variety_boosts_score() {
     // All same word – low variety.
     let low_variety = "dog dog dog dog dog dog dog dog dog dog dog dog dog dog dog";
     // All different words – high variety.
-    let high_variety =
-        "apple orange banana grape mango cherry blueberry raspberry strawberry kiwi";
+    let high_variety = "apple orange banana grape mango cherry blueberry raspberry strawberry kiwi";
     let low_score = calculate_coherence_score(low_variety);
     let high_score = calculate_coherence_score(high_variety);
     assert!(
@@ -223,7 +220,7 @@ fn coherence_very_long_text_does_not_get_length_bonus() {
     // Texts outside [50, 5000] chars lose the length bonus. Build something
     // just over 5000 chars and compare to the same text truncated to < 5000.
     let base = "word ".repeat(1100); // ~5500 chars
-    let short = "word ".repeat(900);  // ~4500 chars
+    let short = "word ".repeat(900); // ~4500 chars
     let long_score = calculate_coherence_score(&base);
     let short_score = calculate_coherence_score(&short);
     // Both scores are valid floats in [0,1]; the long one should not be higher
@@ -417,7 +414,10 @@ fn criteria_default_has_sensible_values() {
     let c = ValidationCriteria::default();
     assert!(c.min_response_length > 0);
     assert!(c.max_response_length > c.min_response_length);
-    assert!(!c.forbidden_keywords.is_empty(), "default should forbid some phrases");
+    assert!(
+        !c.forbidden_keywords.is_empty(),
+        "default should forbid some phrases"
+    );
     assert!(c.min_coherence_score > 0.0 && c.min_coherence_score < 1.0);
     assert!(c.min_relevance_score > 0.0 && c.min_relevance_score < 1.0);
 }
@@ -607,16 +607,32 @@ fn metrics_display_includes_all_populated_fields() {
     assert!(s.contains("500ms"), "expected duration, got: {}", s);
     assert!(s.contains("retries: 2"), "expected retries, got: {}", s);
     assert!(s.contains("length: 100"), "expected length, got: {}", s);
-    assert!(s.contains("coherence: 0.85"), "expected coherence, got: {}", s);
-    assert!(s.contains("relevance: 0.92"), "expected relevance, got: {}", s);
-    assert!(s.contains("success_rate: 75.00%"), "expected success_rate, got: {}", s);
+    assert!(
+        s.contains("coherence: 0.85"),
+        "expected coherence, got: {}",
+        s
+    );
+    assert!(
+        s.contains("relevance: 0.92"),
+        "expected relevance, got: {}",
+        s
+    );
+    assert!(
+        s.contains("success_rate: 75.00%"),
+        "expected success_rate, got: {}",
+        s
+    );
 }
 
 #[test]
 fn metrics_display_omits_zero_retry_count() {
     let m = ValidationMetrics::with_duration(Duration::from_millis(10));
     let s = format!("{}", m);
-    assert!(!s.contains("retries"), "zero retries should be omitted, got: {}", s);
+    assert!(
+        !s.contains("retries"),
+        "zero retries should be omitted, got: {}",
+        s
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -731,7 +747,12 @@ async fn comprehensive_with_no_tools_and_no_prompts_returns_two_results() {
         .expect("validate_comprehensive should not error");
 
     // Only responsiveness + quality when tools and prompts are both empty.
-    assert_eq!(results.len(), 2, "expected 2 results, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        2,
+        "expected 2 results, got {}",
+        results.len()
+    );
     assert!(results.iter().all(|r| r.is_success()));
 }
 
@@ -759,7 +780,12 @@ async fn comprehensive_with_tools_adds_tool_result() {
         .await
         .expect("validate_comprehensive should not error");
 
-    assert_eq!(results.len(), 3, "expected 3 results with tools, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        3,
+        "expected 3 results with tools, got {}",
+        results.len()
+    );
 }
 
 #[tokio::test]
@@ -768,13 +794,7 @@ async fn comprehensive_with_consistency_prompts_adds_consistency_result() {
     let criteria = ValidationCriteria::default();
 
     let results = judge
-        .validate_comprehensive(
-            Duration::from_secs(1),
-            &criteria,
-            &[],
-            &["What is 2+2?"],
-            2,
-        )
+        .validate_comprehensive(Duration::from_secs(1), &criteria, &[], &["What is 2+2?"], 2)
         .await
         .expect("validate_comprehensive should not error");
 
@@ -882,13 +902,7 @@ async fn comprehensive_all_fail_all_results_are_failures() {
 
     let criteria = ValidationCriteria::default();
     let results = judge
-        .validate_comprehensive(
-            Duration::from_secs(1),
-            &criteria,
-            &[tool],
-            &["prompt"],
-            1,
-        )
+        .validate_comprehensive(Duration::from_secs(1), &criteria, &[tool], &["prompt"], 1)
         .await
         .expect("validate_comprehensive should not error");
 
@@ -916,6 +930,9 @@ async fn comprehensive_mixed_pass_fail_results_are_ordered_correctly() {
         .expect("validate_comprehensive should not error");
 
     assert_eq!(results.len(), 2);
-    assert!(results[0].is_success(), "index 0 should be responsiveness success");
+    assert!(
+        results[0].is_success(),
+        "index 0 should be responsiveness success"
+    );
     assert!(results[1].is_failure(), "index 1 should be quality failure");
 }

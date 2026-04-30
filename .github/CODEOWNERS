@@ -1,0 +1,5 @@
+codecov.yml                 @DominicBurkart
+tarpaulin.toml              @DominicBurkart
+.github/workflows/*         @DominicBurkart
+.github/CODEOWNERS          @DominicBurkart
+.github/rulesets/*          @DominicBurkart

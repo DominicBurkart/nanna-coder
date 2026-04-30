@@ -1,36 +1,21 @@
 # Agent Control Flow
 
-```mermaid
----
-config:
-  theme: redux-dark
-  layout: dagre
----
-flowchart TD
-    A(["Application State 1"]) --> n6["Entity Enrichment"]
-    n10(["User Prompt"]) --> n4["Plan Entity Modification"]
-    B{"Task Complete?"} --> C["Yes"] & D["No"]
-    D --> n1["Entity Modification Decision"]
-    n1 --> n3["Query Entities (RAG)"] & n4
-    n4 --> n7["Perform Entity Modification"]
-    C --> n9(["Application State 2"])
-    n3 --> n1
-    n7 --> n11["Update Entities"]
-    n11 --> B
-    n6 --> n4
-    n6@{ shape: rect}
-    n4@{ shape: rect}
-    n1@{ shape: diam}
-    n3@{ shape: rect}
-    n7@{ shape: rect}
-    n11@{ shape: rect}
-     A:::Rose
-     A:::Aqua
-     n10:::Aqua
-     n9:::Aqua
-    classDef Rose stroke-width:1px, stroke-dasharray:none, stroke:#FF5978, fill:#FFDFE5, color:#8E2236
-    classDef Aqua stroke-width:1px, stroke-dasharray:none, stroke:#46EDC8, fill:#DEFFF8, color:#378E7A
-```
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
+
+
+## What an agent should NOT do
+
+- Lower the `target:` value in `codecov.yml`. The guard rejects decreases; admin bypass is the only path.
+- Add entries to `ignore:` in `codecov.yml`. The guard counts entries (block- and flow-style) and rejects growth.
+- Replace a numeric `target:` with `auto` or remove it. The guard rejects loss of a numeric floor.
+- Edit, rename, or delete `.github/workflows/codecov-guard.yml`, `.github/CODEOWNERS`, or other files in `.github/workflows/**` to circumvent the guard.
+
+## When 100% patch coverage is genuinely unhittable
+
+1. If you are blocked because of disabled tests, enable them.
+2. If you are blocked because your architectural decisions yield untestable code, re-architect.
+3. If a CI-environment failure you cannot fix is blocking your tests, escalate by opening a GitHub issue describing the exact missing-test problem.
+
 
 # Agent State Machine
 

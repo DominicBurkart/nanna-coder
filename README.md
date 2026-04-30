@@ -1,19 +1,22 @@
 # Nanna Coder
 
-A highly opinionated local coding assistant (WIP).
+A coding agent for coding agents. Designed to let background agents delegate straightforward work to local models (or other providers).
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and entity management
-- [AGENTS.md](AGENTS.md) - Agent control loop and implementation details
-- [TESTING.md](TESTING.md) - Testing strategy and guidelines
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture and entity management
+- [AGENTS.md](AGENTS.md) — instructions for agents building Nanna
+- [TESTING.md](TESTING.md) — testing strategy and guidelines
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow
+- [CACHIX_SETUP.md](CACHIX_SETUP.md) — binary-cache setup (maintainers)
 
 ## Technologies
+
 - [Ollama](https://ollama.ai/)
 - [Nix](https://nixos.org/)
 - [Podman](https://podman.io/)
-- [Rust](https://rustlang.org)
-- [Cachix](https://cachix.org/) - Binary cache for fast builds
+- [Rust](https://www.rust-lang.org/)
+- [Cachix](https://cachix.org/) — binary cache for fast builds
 
 ## Quick Start
 
@@ -46,8 +49,8 @@ curl -fsSL https://ollama.ai/install.sh | sh
 # Pull the default model
 ollama pull qwen3:0.6b
 
-# Verify Ollama is running
-nix develop --command cargo run --bin harness -- health
+# Start the Ollama server (must be running for agent commands and evals)
+ollama serve
 ```
 
 ### Running the Agent
@@ -63,13 +66,24 @@ cargo run --bin harness -- agent --prompt "Your task description" --tools
 cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools --verbose
 ```
 
-### Using Cachix (Optional but Recommended)
-
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
+### Using as an MCP Server (Claude Code)
 
 ```bash
-# Configure Cachix for faster builds (read-only access)
-nix run .#setup-cache
+nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+### Running Tests and Evals
+
+See [TESTING.md](TESTING.md) for the full test topology and commands. Evals require Ollama and a pulled model (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
+
+```bash
+nix develop --command cargo nextest run \
+  --workspace --features eval-runner \
+  --run-ignored ignored-only \
+  -E 'test(eval_runner)' \
+  --test-threads=1
+```
+
+### Using Cachix (Optional but Recommended)
+
+Run `nix run .#setup-cache` for read-only access to pre-built artifacts. See [CACHIX_SETUP.md](CACHIX_SETUP.md) for details and maintainer push setup.
