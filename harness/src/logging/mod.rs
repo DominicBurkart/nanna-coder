@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn non_utf8_bytes_redacted_via_lossy() {
         let inner: Vec<u8> = Vec::new();
-        let mut writer = RedactingWriter { inner, buf: Vec::new() };
+        let mut writer = RedactingWriter {
+            inner,
+            buf: Vec::new(),
+        };
         // Prepend an invalid UTF-8 byte before a known secret pattern.
         // The lossy conversion replaces 0xFF with U+FFFD; the `sk-` key that
         // follows must still be redacted.
@@ -284,14 +287,20 @@ mod tests {
     #[test]
     fn split_write_redacts_secret() {
         let inner: Vec<u8> = Vec::new();
-        let mut writer = RedactingWriter { inner, buf: Vec::new() };
+        let mut writer = RedactingWriter {
+            inner,
+            buf: Vec::new(),
+        };
         // Split a known `sk-` secret across two writes; the newline (and
         // therefore the flush+redact) only arrives with the second write.
         let first_half = b"oops sk-ABCDEFabcdef012345";
         let second_half = b"6789TOPSECRETxyz\n";
         writer.write_all(first_half).expect("first write");
         // Buffer should still be held; nothing flushed yet.
-        assert!(writer.inner.is_empty(), "inner writer must be empty before newline");
+        assert!(
+            writer.inner.is_empty(),
+            "inner writer must be empty before newline"
+        );
         writer.write_all(second_half).expect("second write");
         let output = String::from_utf8_lossy(&writer.inner).into_owned();
         assert!(
@@ -309,7 +318,10 @@ mod tests {
     #[test]
     fn flush_delegates_to_inner() {
         let inner: Vec<u8> = Vec::new();
-        let mut writer = RedactingWriter { inner, buf: Vec::new() };
+        let mut writer = RedactingWriter {
+            inner,
+            buf: Vec::new(),
+        };
         writer.flush().expect("flush should succeed");
     }
 }

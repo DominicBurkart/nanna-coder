@@ -311,7 +311,10 @@ mod tests {
         // known secret shape, so only the kv pass should fire.
         let input = "secret=plainvalue extra=ok";
         let out = redact_secrets(input);
-        assert!(!out.contains("plainvalue"), "kv field value should be redacted: {out}");
+        assert!(
+            !out.contains("plainvalue"),
+            "kv field value should be redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
         assert!(out.contains("extra=ok"));
     }
@@ -320,7 +323,10 @@ mod tests {
     fn redacts_json_field_token() {
         let input = r#"{"token":"mysupersecrettoken"}"#;
         let out = redact_secrets(input);
-        assert!(!out.contains("mysupersecrettoken"), "token field not redacted: {out}");
+        assert!(
+            !out.contains("mysupersecrettoken"),
+            "token field not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -328,7 +334,10 @@ mod tests {
     fn redacts_logfmt_secret() {
         let input = "user=bob secret=topsecretvalue action=login";
         let out = redact_secrets(input);
-        assert!(!out.contains("topsecretvalue"), "secret field not redacted: {out}");
+        assert!(
+            !out.contains("topsecretvalue"),
+            "secret field not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
         assert!(out.contains("user=bob"));
     }
@@ -337,7 +346,10 @@ mod tests {
     fn redacts_logfmt_gh_token() {
         let input = "gh_token=mypersonalghtoken123 user=alice";
         let out = redact_secrets(input);
-        assert!(!out.contains("mypersonalghtoken123"), "gh_token not redacted: {out}");
+        assert!(
+            !out.contains("mypersonalghtoken123"),
+            "gh_token not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -345,7 +357,10 @@ mod tests {
     fn redacts_logfmt_access_key() {
         let input = "access_key=MYACCESSKEY12345678 region=us-east-1";
         let out = redact_secrets(input);
-        assert!(!out.contains("MYACCESSKEY12345678"), "access_key not redacted: {out}");
+        assert!(
+            !out.contains("MYACCESSKEY12345678"),
+            "access_key not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -353,7 +368,10 @@ mod tests {
     fn redacts_logfmt_access_token() {
         let input = "access_token=myoauthtoken789 scope=read";
         let out = redact_secrets(input);
-        assert!(!out.contains("myoauthtoken789"), "access_token not redacted: {out}");
+        assert!(
+            !out.contains("myoauthtoken789"),
+            "access_token not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -361,7 +379,10 @@ mod tests {
     fn redacts_logfmt_refresh_token() {
         let input = "refresh_token=myrefreshtoken456 client=app";
         let out = redact_secrets(input);
-        assert!(!out.contains("myrefreshtoken456"), "refresh_token not redacted: {out}");
+        assert!(
+            !out.contains("myrefreshtoken456"),
+            "refresh_token not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -369,7 +390,10 @@ mod tests {
     fn redacts_logfmt_private_key() {
         let input = "private_key=myprivkeyvalue999 algo=rsa";
         let out = redact_secrets(input);
-        assert!(!out.contains("myprivkeyvalue999"), "private_key not redacted: {out}");
+        assert!(
+            !out.contains("myprivkeyvalue999"),
+            "private_key not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -377,7 +401,10 @@ mod tests {
     fn redacts_logfmt_client_secret() {
         let input = "client_secret=oauth2secret321 grant=code";
         let out = redact_secrets(input);
-        assert!(!out.contains("oauth2secret321"), "client_secret not redacted: {out}");
+        assert!(
+            !out.contains("oauth2secret321"),
+            "client_secret not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -385,7 +412,10 @@ mod tests {
     fn redacts_json_field_apikey() {
         let input = r#"{"apikey":"directapivalue"}"#;
         let out = redact_secrets(input);
-        assert!(!out.contains("directapivalue"), "apikey field not redacted: {out}");
+        assert!(
+            !out.contains("directapivalue"),
+            "apikey field not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 
@@ -393,7 +423,10 @@ mod tests {
     fn redacts_json_field_github_token() {
         let input = r#"{"github_token":"mygithubtoken"}"#;
         let out = redact_secrets(input);
-        assert!(!out.contains("mygithubtoken"), "github_token field not redacted: {out}");
+        assert!(
+            !out.contains("mygithubtoken"),
+            "github_token field not redacted: {out}"
+        );
         assert!(out.contains(REDACTED));
     }
 }
