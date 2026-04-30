@@ -1,240 +1,69 @@
 # Binary Cache Strategy for CI/CD
 
-> For the operational cache setup (keys, workflow wiring, troubleshooting), see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md). This document focuses on the high-level architecture and priorities.
-
-## Overview
-
-This document outlines the binary cache strategy used to optimize CI/CD performance and reduce build times.
+> **Scope:** high-level architecture and cache-priority framing only.
+> For the operational setup (workflow wiring, cache keys, developer
+> commands, troubleshooting) see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md)
+> and [cachix-migration.md](./cachix-migration.md). Top-level setup
+> instructions live in [../CACHIX_SETUP.md](../CACHIX_SETUP.md).
 
 ## Architecture
 
-### 1. Multi-Tier Caching System
+The project uses a single shared binary cache (Cachix, `nanna-coder.cachix.org`)
+that is read by both CI runners and developer machines. Local Nix stores act
+as a per-machine cache layer in front of it; there is no GitHub-Actions-cache
+tier (the previous `cache-nix-action` and Magic Nix Cache layers were removed
+when the project moved to Cachix-only — see [cachix-migration.md](./cachix-migration.md)).
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Binary Cache Hierarchy                   │
-├─────────────────────────────────────────────────────────────┤
-│ Tier 1: Cachix Public Cache (nanna-coder.cachix.org)      │
-│         - Shared across all CI runners and developers      │
-│         - Persistent storage with configurable retention   │
-│         - Optimized for frequent access patterns           │
-├─────────────────────────────────────────────────────────────┤
-│ Tier 2: Magic Nix Cache (GitHub Actions)                  │
-│         - Per-job temporary caching                        │
-│         - Automatic cache warming and optimization         │
-│         - Zero-configuration setup                         │
-├─────────────────────────────────────────────────────────────┤
-│ Tier 3: Local Development Cache                           │
-│         - Developer machine cache                          │
-│         - Configurable via setup-cache utility             │
-│         - Optional Cachix integration                      │
-└─────────────────────────────────────────────────────────────┘
+Cachix (nanna-coder.cachix.org)
+  - shared by CI runners and developer machines
+  - public read, authenticated push (CI on main, non-fork PRs)
+  ↑↓
+Local Nix store (per machine)
+  - populated via `nix run .#setup-cache`
 ```
 
-### 2. Cache Priority Matrix
+## Cache Priority Matrix
 
-| Cache Type        | Priority | Use Case                    | TTL/Retention |
-|-------------------|----------|-----------------------------|---------------|
-| Rust Dependencies| 100      | Frequent cargo builds       | 30 days       |
-| Test Containers   | 90       | Integration testing         | 14 days       |
-| Model Cache       | 80       | AI model storage            | 60 days       |
-| Build Artifacts   | 60       | Release binaries            | 90 days       |
-| Cross Compilation | 50       | Multi-arch builds           | 30 days       |
-| Base Images       | 30       | Container foundations       | 90 days       |
-| System Packages   | 20       | Nix package dependencies    | 180 days      |
+Pushes are prioritised so the artifacts most expensive to rebuild and most
+broadly reused land in the cache first. Priorities are encoded in
+`flake.nix` (`binaryCacheConfig.cacheKeyPriority`); retention is managed
+by Cachix and is informational here.
 
-## Implementation
+| Cache type        | Priority | Use case                  | Suggested retention |
+|-------------------|----------|---------------------------|---------------------|
+| Rust dependencies | 100      | Frequent cargo builds     | 30 days             |
+| Test containers   | 90       | Integration testing       | 14 days             |
+| Model cache       | 80       | AI model storage          | 60 days             |
+| Build artifacts   | 60       | Release binaries          | 90 days             |
+| Cross-compilation | 50       | Multi-arch builds         | 30 days             |
+| Base images       | 30       | Container foundations     | 90 days             |
+| System packages   | 20       | Nix package dependencies  | 180 days            |
 
-### 1. Flake Configuration
+## Push Policy
 
-The binary cache system is configured in `flake.nix` with the following components:
+- **Push filter** — exclude `*-source` derivations and `nixpkgs.tar.gz`
+  (already cached upstream). Configured on the `cachix-action` step in CI
+  and documented in [cachix-migration.md](./cachix-migration.md).
+- **Fork PRs** — pull only; pushes are skipped to avoid leaking auth.
+- **Main / non-fork PRs** — push enabled, gated on `CACHIX_AUTH`.
 
-#### Cache Configuration
-```nix
-binaryCacheConfig = {
-  cacheName = "nanna-coder";
-  pushToCache = true;
-  maxCacheSizeGB = 50;
-  retentionDays = 30;
-  maxJobs = 4;
-  buildCores = 0; # Use all available cores
-};
-```
+## Targets
 
-#### Cache Management Utilities
-- `setup-cache`: Configure local development environment
-- `push-cache`: Upload builds to binary cache
-- `ci-cache-optimize`: Optimize CI cache settings
-- `cache-analytics`: Monitor cache performance
+| Metric                         | Target                                  |
+|--------------------------------|-----------------------------------------|
+| CI cache hit rate              | >85%                                    |
+| Build time vs. cold build      | >70% reduction                          |
+| Cachix push time (full build)  | <5 min                                  |
 
-### 2. CI/CD Integration
+Concrete per-job times and how to measure them live in
+[CACHE_STRATEGY.md](./CACHE_STRATEGY.md#performance-metrics).
 
-#### GitHub Actions Workflow Enhancement
+## Security
 
-Each CI job includes:
-
-```yaml
-- name: Configure Cachix (Binary Cache)
-  uses: cachix/cachix-action@v12
-  with:
-    name: nanna-coder
-    authToken: ${{ secrets.CACHIX_AUTH }}
-    pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
-
-- name: Optimize CI cache settings
-  run: nix run .#ci-cache-optimize
-```
-
-#### Cache Maintenance Job
-
-Dedicated job for cache management:
-- Pushes successful builds to cache
-- Generates performance analytics
-- Reports cache health metrics
-
-### 3. Performance Optimizations
-
-#### Build Parallelization
-- Max jobs: 4 concurrent builds
-- Core utilization: All available CPU cores
-- Intelligent dependency ordering
-
-#### Cache Warming Strategy
-- Pre-populate development dependencies
-- Prioritize frequently accessed artifacts
-- Batch upload of related derivations
-
-#### Artifact Filtering
-- Exclude source tarballs from push
-- Filter temporary build artifacts
-- Optimize for reproducible outputs
-
-## Usage
-
-### For Developers
-
-#### Initial Setup
-```bash
-# Configure local binary cache
-nix run .#setup-cache
-
-# Verify configuration
-nix run .#cache-analytics
-```
-
-#### Building with Cache
-```bash
-# Normal builds automatically use cache
-nix build .#nanna-coder
-
-# Force cache refresh
-nix build .#nanna-coder --refresh
-```
-
-### For CI/CD
-
-#### Manual Cache Upload
-```bash
-# Build and push to cache (requires CACHIX_AUTH)
-nix run .#push-cache
-```
-
-#### Cache Analytics
-```bash
-# Generate performance report
-nix run .#cache-analytics
-```
-
-## Monitoring and Analytics
-
-### Key Metrics
-
-1. **Cache Hit Rate**: Percentage of builds served from cache
-2. **Build Time Reduction**: Comparison vs. cold builds
-3. **Storage Efficiency**: Cache size vs. utility ratio
-4. **Network Performance**: Upload/download speeds
-
-### Performance Targets
-
-- Cache hit rate: >85% for CI builds
-- Build time reduction: >70% vs. cold builds
-- Storage efficiency: <50GB total cache size
-- Upload time: <5 minutes for full push
-
-### Dashboard Integration
-
-The cache-analytics utility provides:
-- Real-time cache statistics
-- Build dependency analysis
-- Storage optimization recommendations
-- Performance trend monitoring
-
-## Security Considerations
-
-### Access Control
-- CACHIX_AUTH stored as GitHub secret
-- Read-only access for public cache consumption
-- Write access restricted to CI automation
-
-### Content Validation
-- Cryptographic verification of all cached artifacts
-- Reproducible build validation
-- Source code integrity checks
-
-### Privacy
-- No sensitive data cached
-- Build logs sanitized before upload
-- Model caches use content-addressed storage
-
-## Troubleshooting
-
-### Common Issues
-
-#### Cache Miss Scenarios
-- First build on new branch
-- Dependency version updates
-- Configuration changes
-
-#### Resolution Steps
-1. Check cache-analytics output
-2. Verify Cachix configuration
-3. Rebuild with cache-refresh
-4. Contact cache maintainers
-
-#### Performance Issues
-- Monitor cache hit rates
-- Analyze build dependency graphs
-- Optimize artifact filtering
-- Review retention policies
-
-### Support Commands
-
-```bash
-# Diagnose cache issues
-nix run .#cache-analytics
-
-# Reconfigure cache
-nix run .#setup-cache
-
-# Force cache rebuild
-nix build .#nanna-coder --refresh --print-build-logs
-```
-
-## Future Enhancements
-
-### Planned Improvements
-1. **Multi-Region Caching**: Geographic distribution for global teams
-2. **Intelligent Warming**: ML-based cache prediction
-3. **Cross-Platform Optimization**: ARM64 and x86_64 unified caching
-4. **Integration APIs**: Programmatic cache management
-5. **Advanced Analytics**: Cost analysis and optimization recommendations
-
-### Performance Goals
-- 95% cache hit rate target
-- <1 minute average build time
-- Multi-arch container support
-- Real-time cache health monitoring
-
----
-
-For questions or issues with the binary cache system, please refer to the cache-analytics output or contact the development team.
+- `CACHIX_AUTH` is a GitHub Actions secret; only main-branch and
+  non-fork-PR jobs receive it.
+- All artifacts are content-addressed and signed by Cachix; the public
+  signing key is pinned in `flake.nix` (`binaryCacheConfig.publicKey`).
+- No model weights or other potentially sensitive payloads are pushed —
+  large model files are downloaded on demand at runtime.
