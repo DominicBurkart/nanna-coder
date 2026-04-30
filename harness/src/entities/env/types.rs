@@ -79,21 +79,7 @@ impl ContainerConfigEntity {
     }
 }
 
-#[async_trait]
-impl Entity for ContainerConfigEntity {
-    fn metadata(&self) -> &EntityMetadata {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut EntityMetadata {
-        &mut self.metadata
-    }
-
-    fn to_json(&self) -> EntityResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| crate::entities::EntityError::SerializationError(e.to_string()))
-    }
-}
+impl_entity!(ContainerConfigEntity);
 
 /// Runtime configuration for a container (resources, networking, volumes).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +163,7 @@ impl EnvVarSource {
 mod new_types_tests {
     use super::*;
     use crate::entities::env::security::{Capability, CapabilitySet};
+    use crate::entities::Entity;
 
     #[test]
     fn test_container_config_entity_serde_roundtrip() {

@@ -112,6 +112,7 @@ impl Default for TelemetryEntity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::Entity;
 
     #[test]
     fn test_telemetry_entity_default_preserves_placeholder_behavior() {
