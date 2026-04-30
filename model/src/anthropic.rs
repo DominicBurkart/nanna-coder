@@ -701,7 +701,7 @@ mod tests {
     fn test_config_from_env() {
         let config = AnthropicConfig::default();
         // Without ANTHROPIC_API_KEY set, it defaults to empty string
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.base_url, "https://api.anthropic.com");
     }
 
