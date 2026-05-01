@@ -323,10 +323,7 @@ impl SweBenchReport {
         let _ = writeln!(out, "## Comparison Chart\n");
         let _ = writeln!(out, "```mermaid");
         let _ = writeln!(out, "xychart-beta");
-        let _ = writeln!(
-            out,
-            "    title \"Scenario Comparison: Resolve Rate and Avg Time\""
-        );
+        let _ = writeln!(out, "    title \"Scenario Comparison: Resolve Rate\"");
         let _ = writeln!(
             out,
             "    x-axis [\"{}\", \"{}\"]",
@@ -371,12 +368,27 @@ impl SweBenchReport {
         let mut diffs: Vec<(&str, &str, &str)> = Vec::new();
 
         for (id, &a_resolved) in &a_map {
-            if let Some(&b_resolved) = b_map.get(id) {
-                if a_resolved != b_resolved {
+            match b_map.get(id) {
+                Some(&b_resolved) if a_resolved != b_resolved => {
                     let a_status = if a_resolved { "YES" } else { "NO" };
                     let b_status = if b_resolved { "YES" } else { "NO" };
                     diffs.push((id, a_status, b_status));
                 }
+                None => {
+                    // Present in A only — surface as a difference so callers
+                    // see the asymmetric coverage rather than a "no diffs"
+                    // message that hides it.
+                    let a_status = if a_resolved { "YES" } else { "NO" };
+                    diffs.push((id, a_status, "MISSING"));
+                }
+                _ => {}
+            }
+        }
+
+        for (id, &b_resolved) in &b_map {
+            if !a_map.contains_key(id) {
+                let b_status = if b_resolved { "YES" } else { "NO" };
+                diffs.push((id, "MISSING", b_status));
             }
         }
 
@@ -404,9 +416,18 @@ impl SweBenchReport {
 }
 
 /// Truncate an instance ID for chart x-axis labels, wrapping in quotes for Mermaid.
+///
+/// Slices on `char_indices` rather than byte offsets so multi-byte characters
+/// in IDs (no current SWE-bench instance has them, but tests and future
+/// dataset variants might) cannot panic at a slice boundary.
 fn truncate_id(id: &str) -> String {
-    let label = if id.len() > 16 {
-        format!("{}...", &id[..13])
+    let label = if id.chars().count() > 16 {
+        let cut = id
+            .char_indices()
+            .nth(13)
+            .map(|(i, _)| i)
+            .unwrap_or(id.len());
+        format!("{}...", &id[..cut])
     } else {
         id.to_string()
     };
@@ -414,9 +435,16 @@ fn truncate_id(id: &str) -> String {
 }
 
 /// Truncate a scenario label for chart axes.
+///
+/// Char-boundary safe (see `truncate_id`).
 fn truncate_label(label: &str) -> String {
-    if label.len() > 24 {
-        format!("{}...", &label[..21])
+    if label.chars().count() > 24 {
+        let cut = label
+            .char_indices()
+            .nth(21)
+            .map(|(i, _)| i)
+            .unwrap_or(label.len());
+        format!("{}...", &label[..cut])
     } else {
         label.to_string()
     }
@@ -654,6 +682,137 @@ mod tests {
             truncate_id("very_long_instance_identifier"),
             "\"very_long_ins...\""
         );
+    }
+
+    #[test]
+    fn test_truncate_id_handles_multibyte_chars() {
+        // 17 chars (each 3 bytes) — `id.len() > 16` would trigger truncation
+        // and a byte-wise slice at offset 13 would land mid-codepoint.
+        let id = "ééééééééééééééééé";
+        let truncated = truncate_id(id);
+        assert!(
+            truncated.starts_with('"') && truncated.ends_with('"'),
+            "expected quoted output, got {truncated}"
+        );
+        assert!(
+            truncated.contains("..."),
+            "expected truncated to contain ellipsis, got {truncated}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_label_handles_multibyte_chars() {
+        // 25 multi-byte chars — must not panic on the slice.
+        let label = "épépépépépépépépépépépépé";
+        let truncated = truncate_label(label);
+        assert!(truncated.contains("..."));
+    }
+
+    #[test]
+    fn test_comparison_chart_y_max_clamps_at_100() {
+        // Both runs at >83% resolve rate would push `max_rate * 1.2` above
+        // 100, but the y-axis must clamp at 100 for a percentage scale.
+        let run_a = make_run(
+            "high_a",
+            vec![
+                make_instance("x", true, 100, 1.0),
+                make_instance("y", true, 100, 1.0),
+                make_instance("z", true, 100, 1.0),
+                make_instance("w", true, 100, 1.0),
+                make_instance("v", true, 100, 1.0),
+                make_instance("u", false, 100, 1.0),
+            ],
+        );
+        let run_b = make_run(
+            "high_b",
+            vec![
+                make_instance("x", true, 100, 1.0),
+                make_instance("y", true, 100, 1.0),
+                make_instance("z", true, 100, 1.0),
+                make_instance("w", true, 100, 1.0),
+                make_instance("v", true, 100, 1.0),
+                make_instance("u", false, 100, 1.0),
+            ],
+        );
+        let report = SweBenchReport::new("Clamp Test", run_a);
+        let md = report.render_comparison(&run_b);
+        // y-axis max must be exactly 100 (not 99.96 → 119.95).
+        assert!(
+            md.contains("y-axis \"Resolve Rate (%)\" 0 --> 100"),
+            "expected y-axis clamped to 100, got:\n{md}"
+        );
+        // Title must not promise wall-time data the chart doesn't show.
+        assert!(md.contains("Scenario Comparison: Resolve Rate"));
+        assert!(!md.contains("and Avg Time"));
+    }
+
+    #[test]
+    fn test_comparison_chart_y_max_floors_when_both_zero() {
+        // Both 0%: the `< 0.01` branch hits → y_max = 100.
+        let run_a = make_run("zero_a", vec![make_instance("x", false, 100, 1.0)]);
+        let run_b = make_run("zero_b", vec![make_instance("x", false, 100, 1.0)]);
+        let report = SweBenchReport::new("Zero Test", run_a);
+        let md = report.render_comparison(&run_b);
+        assert!(md.contains("y-axis \"Resolve Rate (%)\" 0 --> 100"));
+    }
+
+    #[test]
+    fn test_comparison_table_columns_and_diff_rows() {
+        // Asserts the comparison table has scenario-named column headers and
+        // that each diff row carries the expected YES/NO values.
+        let run_a = make_run(
+            "scenario_a",
+            vec![
+                make_instance("alpha", true, 1000, 10.0),
+                make_instance("beta", false, 2000, 20.0),
+            ],
+        );
+        let run_b = make_run(
+            "scenario_b",
+            vec![
+                make_instance("alpha", false, 1500, 12.0),
+                make_instance("beta", true, 2500, 22.0),
+            ],
+        );
+        let report = SweBenchReport::new("Cols", run_a);
+        let md = report.render_comparison(&run_b);
+
+        // Differing-instances table headers reflect scenario names.
+        assert!(md.contains("| Instance | scenario_a | scenario_b |"));
+        // Per-instance diff rows show the precise YES/NO pairs.
+        assert!(md.contains("| alpha | YES | NO |"));
+        assert!(md.contains("| beta | NO | YES |"));
+    }
+
+    #[test]
+    fn test_comparison_surfaces_b_only_and_a_only_instances() {
+        // Instances unique to either side must appear in the diff with
+        // MISSING, not be silently dropped (which would mask asymmetric
+        // coverage between scenarios).
+        let run_a = make_run(
+            "only_a",
+            vec![
+                make_instance("shared", true, 1000, 10.0),
+                make_instance("a_only", true, 1000, 10.0),
+            ],
+        );
+        let run_b = make_run(
+            "only_b",
+            vec![
+                make_instance("shared", true, 1000, 10.0),
+                make_instance("b_only", false, 2000, 20.0),
+            ],
+        );
+        let report = SweBenchReport::new("Asym", run_a);
+        let md = report.render_comparison(&run_b);
+
+        // Both unique instances are surfaced.
+        assert!(md.contains("| a_only | YES | MISSING |"));
+        assert!(md.contains("| b_only | MISSING | NO |"));
+        // The "shared" instance has the same status on both sides → not a
+        // diff row, so it should not appear in the diff table block.
+        // (Spot-check: "shared" only appears in non-table contexts here.)
+        assert!(!md.contains("| shared |"));
     }
 
     #[test]

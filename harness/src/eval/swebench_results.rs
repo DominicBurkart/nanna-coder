@@ -75,6 +75,10 @@ impl SweBenchRunResult {
     }
 
     /// Sum of all Claude token usage across instances.
+    ///
+    /// `nanna_token_usage` is intentionally excluded — this metric tracks
+    /// only the foundational-model (Claude) cost, which is the comparable
+    /// quantity across `claude_only` / `claude_plus_nanna` scenarios.
     pub fn total_claude_tokens(&self) -> u64 {
         self.instances
             .iter()
@@ -91,7 +95,12 @@ impl SweBenchRunResult {
         total / self.instances.len() as f64
     }
 
-    /// Average Claude tokens per resolved instance. Returns 0 if none resolved.
+    /// Integer-truncated average Claude tokens per resolved instance.
+    ///
+    /// The result is `total_claude_tokens / resolved_count` using integer
+    /// division — fractional remainders are dropped. Returns 0 if none
+    /// resolved. For higher-precision reporting, compute
+    /// `total_claude_tokens() as f64 / resolved_count() as f64` directly.
     pub fn tokens_per_resolved(&self) -> u64 {
         let resolved = self.resolved_count();
         if resolved == 0 {
@@ -180,6 +189,29 @@ mod tests {
         assert!((run.resolve_rate() - 0.0).abs() < f64::EPSILON);
         assert!((run.avg_wall_time() - 0.0).abs() < f64::EPSILON);
         assert_eq!(run.tokens_per_resolved(), 0);
+    }
+
+    #[test]
+    fn test_total_claude_tokens_excludes_nanna_usage() {
+        // Construct an instance with nanna_token_usage populated and confirm
+        // `total_claude_tokens` does not sum it. This is the metric contract:
+        // only the foundational-model spend is comparable across scenarios.
+        let mut a = make_instance("a", true, 1000, 10.0);
+        a.nanna_token_usage = Some(TokenUsage {
+            prompt_tokens: 500,
+            completion_tokens: 500,
+            total_tokens: 1000,
+        });
+        let mut b = make_instance("b", true, 2000, 20.0);
+        b.nanna_token_usage = Some(TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+            total_tokens: 2000,
+        });
+        let run = make_run(vec![a, b]);
+
+        assert_eq!(run.total_claude_tokens(), 3000);
+        assert_eq!(run.tokens_per_resolved(), 1500);
     }
 
     #[test]

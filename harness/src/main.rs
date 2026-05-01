@@ -75,7 +75,9 @@ enum Commands {
         /// Path to the JSON results file
         #[arg(short, long)]
         input: std::path::PathBuf,
-        /// Output directory (default: results/<sha>/<bench>/<scenario>/)
+        /// Output base directory. The final report is written under
+        /// `<output_dir>/<sha>/<bench>/<scenario>/report.md`. Defaults to
+        /// `<current_working_directory>/results`.
         #[arg(short, long)]
         output_dir: Option<std::path::PathBuf>,
         /// Optional second JSON file for comparison report
@@ -166,7 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_dir,
             compare,
         } => {
-            generate_swebench_report(&input, output_dir.as_deref(), compare.as_deref())?;
+            let (report_path, comparison_path) =
+                generate_swebench_report(&input, output_dir.as_deref(), compare.as_deref())?;
+            println!("Report written to: {}", report_path.display());
+            if let Some(p) = comparison_path {
+                println!("Comparison report written to: {}", p.display());
+            }
         }
     }
 
@@ -177,30 +184,34 @@ fn generate_swebench_report(
     input: &std::path::Path,
     output_dir: Option<&std::path::Path>,
     compare: Option<&std::path::Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), Box<dyn std::error::Error>> {
     use harness::eval::swebench_report::SweBenchReport;
     use harness::eval::swebench_results::SweBenchRunResult;
 
     let json = std::fs::read_to_string(input)?;
     let run_result: SweBenchRunResult = serde_json::from_str(&json)?;
 
-    let base_dir = output_dir.unwrap_or_else(|| std::path::Path::new("results"));
+    let owned_default;
+    let base_dir: &std::path::Path = match output_dir {
+        Some(p) => p,
+        None => {
+            owned_default = std::env::current_dir()?.join("results");
+            owned_default.as_path()
+        }
+    };
 
     let report = SweBenchReport::new("SWE-bench Report", run_result);
     let report_path = report.write_to_directory(base_dir)?;
-    println!("Report written to: {}", report_path.display());
 
-    if let Some(compare_path) = compare {
+    let comparison_path = if let Some(compare_path) = compare {
         let compare_json = std::fs::read_to_string(compare_path)?;
         let compare_result: SweBenchRunResult = serde_json::from_str(&compare_json)?;
-        let comparison_path = report.write_comparison_to_directory(&compare_result, base_dir)?;
-        println!(
-            "Comparison report written to: {}",
-            comparison_path.display()
-        );
-    }
+        Some(report.write_comparison_to_directory(&compare_result, base_dir)?)
+    } else {
+        None
+    };
 
-    Ok(())
+    Ok((report_path, comparison_path))
 }
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
@@ -638,4 +649,100 @@ async fn run_mcp_server(
     let writer = tokio::io::stdout();
     server.serve(reader, writer).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness::eval::swebench_results::{
+        SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
+    };
+
+    fn fixture_run(scenario: &str) -> SweBenchRunResult {
+        SweBenchRunResult {
+            config: SweBenchRunConfig {
+                commit_sha: "abc123".to_string(),
+                bench_name: "swebench_verified".to_string(),
+                scenario: scenario.to_string(),
+                model_name: Some("gemma4:e4b".to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+            instances: vec![SweBenchInstanceResult {
+                instance_id: "django__django-11099".to_string(),
+                resolved: true,
+                claude_token_usage: TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                },
+                nanna_token_usage: None,
+                wall_time_secs: 12.0,
+                error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn generate_report_compare_path_writes_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.json");
+        let b_path = dir.path().join("b.json");
+        std::fs::write(
+            &a_path,
+            serde_json::to_string(&fixture_run("nanna_only")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &b_path,
+            serde_json::to_string(&fixture_run("claude_plus_nanna")).unwrap(),
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let (report_path, comparison_path) =
+            generate_swebench_report(&a_path, Some(out.as_path()), Some(b_path.as_path()))
+                .expect("generate should succeed");
+
+        assert!(report_path.exists(), "report.md missing");
+        let comparison_path = comparison_path.expect("comparison path returned");
+        assert!(comparison_path.exists(), "comparison.md missing");
+        assert!(comparison_path
+            .to_string_lossy()
+            .contains("nanna_only_vs_claude_plus_nanna"));
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_bad_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{not valid json").unwrap();
+
+        let out = dir.path().join("out");
+        let result = generate_swebench_report(&bad, Some(out.as_path()), None);
+        assert!(result.is_err(), "expected error on malformed JSON");
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.json");
+        let out = dir.path().join("out");
+        let result = generate_swebench_report(&missing, Some(out.as_path()), None);
+        assert!(result.is_err(), "expected error on missing input file");
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_missing_compare_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.json");
+        std::fs::write(&a_path, serde_json::to_string(&fixture_run("a")).unwrap()).unwrap();
+        let out = dir.path().join("out");
+        let missing_compare = dir.path().join("missing.json");
+        let result = generate_swebench_report(
+            &a_path,
+            Some(out.as_path()),
+            Some(missing_compare.as_path()),
+        );
+        assert!(result.is_err(), "expected error on missing compare file");
+    }
 }
