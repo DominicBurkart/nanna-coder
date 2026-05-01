@@ -104,18 +104,31 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_entity_trait_methods() {
+    #[test]
+    fn test_entity_metadata_mut_persists_mutation() {
+        // Construct as Test, mutate via metadata_mut() to a *different* variant,
+        // and assert that the change is observable through the immutable
+        // metadata() accessor and through to_json(). This catches a bug where
+        // metadata_mut() returned a reference into a separate field or a
+        // throwaway copy.
         let mut entity = TestEntity::new();
-
-        // metadata() returns the right type
         assert_eq!(entity.metadata().entity_type, EntityType::Test);
 
-        // metadata_mut() gives mutable access
-        entity.metadata_mut().entity_type = EntityType::Test; // no-op change, just verifies access
+        entity.metadata_mut().entity_type = EntityType::Telemetry;
 
-        // to_json() works
-        assert!(entity.to_json().is_ok());
+        // Mutation visible through the immutable accessor.
+        assert_eq!(entity.metadata().entity_type, EntityType::Telemetry);
+
+        // And the mutation is reflected in the serialized form.
+        let json = entity.to_json().expect("serialization should succeed");
+        assert!(
+            json.contains("Telemetry"),
+            "Mutated entity_type should appear in JSON, got: {json}"
+        );
+        assert!(
+            !json.contains("\"Test\""),
+            "Old entity_type should not appear in JSON after mutation, got: {json}"
+        );
     }
 
     #[test]

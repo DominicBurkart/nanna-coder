@@ -238,6 +238,23 @@ pub enum SlaStatus {
     Breached,
 }
 
+/// Derive an [`SlaStatus`] from an observed availability and a target.
+///
+/// Pure function so it can be tested independently of any system state:
+/// - `Compliant` when `availability >= target`
+/// - `AtRisk` when availability is within ~1 percentage point below target
+///   (i.e. `>= target - 0.9`), reflecting "below target but not yet breached"
+/// - `Breached` otherwise
+pub fn sla_status_for(availability: f64, target: f64) -> SlaStatus {
+    if availability >= target {
+        SlaStatus::Compliant
+    } else if availability >= target - 0.9 {
+        SlaStatus::AtRisk
+    } else {
+        SlaStatus::Breached
+    }
+}
+
 /// Uptime statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UptimeStats {
@@ -827,6 +844,7 @@ impl ObservabilitySystem {
     fn calculate_availability_metrics(&self) -> Result<AvailabilityMetrics, ObservabilityError> {
         let uptime = self.start_time.elapsed();
         let availability = 99.5; // Would be calculated from actual downtime
+        let target = 99.9;
 
         Ok(AvailabilityMetrics {
             uptime,
@@ -834,15 +852,9 @@ impl ObservabilitySystem {
             mtbf: Some(Duration::from_secs(86400)), // 24 hours
             mttr: Some(Duration::from_secs(300)),   // 5 minutes
             sla_compliance: SlaCompliance {
-                target_availability: 99.9,
+                target_availability: target,
                 current_availability: availability,
-                status: if availability >= 99.9 {
-                    SlaStatus::Compliant
-                } else if availability >= 99.0 {
-                    SlaStatus::AtRisk
-                } else {
-                    SlaStatus::Breached
-                },
+                status: sla_status_for(availability, target),
                 time_to_breach: None,
             },
         })
@@ -1423,7 +1435,17 @@ mod tests {
             acknowledged: false,
         };
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
-        assert!(!actions.is_empty());
+        let joined = actions.join(" ").to_lowercase();
+        // Performance arm must surface its production-specific guidance, so a
+        // mistakenly-swapped match arm would change these strings and fail.
+        assert!(
+            joined.contains("resource"),
+            "Performance actions should mention resources, got: {joined}"
+        );
+        assert!(
+            joined.contains("scale"),
+            "Performance actions should mention scaling, got: {joined}"
+        );
     }
 
     #[test]
@@ -1440,44 +1462,59 @@ mod tests {
             acknowledged: false,
         };
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::Availability);
+        let joined = actions.join(" ").to_lowercase();
+        // Fallback arm has its own distinct guidance ("investigate ...",
+        // "check system logs", "contact support"). Asserting on those strings
+        // catches a swap where another arm is returned by mistake.
         assert!(
-            !actions.is_empty(),
-            "Should always return at least one action"
+            joined.contains("investigate"),
+            "Fallback actions should mention investigating, got: {joined}"
+        );
+        assert!(
+            joined.contains("logs"),
+            "Fallback actions should mention checking logs, got: {joined}"
+        );
+        assert!(
+            joined.contains("support"),
+            "Fallback actions should mention support, got: {joined}"
         );
     }
 
     #[test]
-    fn test_sla_status_compliant() {
-        let compliance = SlaCompliance {
-            target_availability: 99.9,
-            current_availability: 99.95,
-            status: SlaStatus::Compliant,
-            time_to_breach: None,
-        };
-        assert_eq!(compliance.status, SlaStatus::Compliant);
+    fn test_sla_status_for_compliant_branch() {
+        // At-or-above target → Compliant.
+        assert_eq!(sla_status_for(99.95, 99.9), SlaStatus::Compliant);
+        assert_eq!(sla_status_for(100.0, 99.9), SlaStatus::Compliant);
+        // Boundary: exactly at target is Compliant (>=).
+        assert_eq!(sla_status_for(99.9, 99.9), SlaStatus::Compliant);
     }
 
     #[test]
-    fn test_sla_status_at_risk() {
-        let compliance = SlaCompliance {
-            target_availability: 99.9,
-            current_availability: 99.5, // below 99.9 but above 99.0
-            status: SlaStatus::AtRisk,
-            time_to_breach: Some(Duration::from_secs(3600)),
-        };
-        assert_eq!(compliance.status, SlaStatus::AtRisk);
-        assert!(compliance.time_to_breach.is_some());
+    fn test_sla_status_for_at_risk_branch() {
+        // Below target but within the 0.9-point at-risk window.
+        assert_eq!(sla_status_for(99.5, 99.9), SlaStatus::AtRisk);
+        // Just under target.
+        assert_eq!(sla_status_for(99.89, 99.9), SlaStatus::AtRisk);
+        // Boundary: at the at-risk floor (target - 0.9) is still AtRisk (>=).
+        assert_eq!(sla_status_for(99.0, 99.9), SlaStatus::AtRisk);
     }
 
     #[test]
-    fn test_sla_status_breached() {
-        let compliance = SlaCompliance {
-            target_availability: 99.9,
-            current_availability: 98.0, // below 99.0
-            status: SlaStatus::Breached,
-            time_to_breach: None,
-        };
-        assert_eq!(compliance.status, SlaStatus::Breached);
+    fn test_sla_status_for_breached_branch() {
+        // Below the at-risk floor → Breached.
+        assert_eq!(sla_status_for(98.0, 99.9), SlaStatus::Breached);
+        assert_eq!(sla_status_for(0.0, 99.9), SlaStatus::Breached);
+        // Just under the at-risk floor.
+        assert_eq!(sla_status_for(98.99, 99.9), SlaStatus::Breached);
+    }
+
+    #[test]
+    fn test_sla_status_for_works_with_other_targets() {
+        // Helper is parameterised on target, so it should classify correctly
+        // for SLOs other than 99.9 (e.g. 95% availability).
+        assert_eq!(sla_status_for(96.0, 95.0), SlaStatus::Compliant);
+        assert_eq!(sla_status_for(94.5, 95.0), SlaStatus::AtRisk);
+        assert_eq!(sla_status_for(90.0, 95.0), SlaStatus::Breached);
     }
 
     #[test]
@@ -1532,16 +1569,39 @@ mod tests {
         assert!(critical_rule.escalation_factor > 1.0);
     }
 
-    #[test]
-    fn test_uptime_stats_struct() {
-        let stats = UptimeStats {
-            current_uptime: Duration::from_secs(3600),
-            average_uptime: Duration::from_secs(7200),
-            max_uptime: Duration::from_secs(86400),
-            min_uptime: Duration::ZERO,
-        };
-        assert!(stats.max_uptime > stats.current_uptime);
-        assert_eq!(stats.min_uptime, Duration::ZERO);
+    #[tokio::test]
+    async fn test_get_container_summary_populates_uptime_stats() {
+        // Exercise the actual production call site that constructs UptimeStats
+        // (`get_container_summary`) and verify the invariants it must maintain:
+        // current/avg/max are all derived from `start_time.elapsed()` and
+        // therefore monotonically non-decreasing, and min_uptime is zero.
+        let system = ObservabilitySystem::new();
+        let summary = system
+            .get_container_summary()
+            .await
+            .expect("get_container_summary should succeed");
+
+        let stats = &summary.uptime_stats;
+        assert_eq!(
+            stats.min_uptime,
+            Duration::ZERO,
+            "min_uptime is initialised to zero in get_container_summary"
+        );
+        // current/average/max are all sampled from the same elapsed clock, so
+        // they must be equal-or-ordered (max >= average >= current sample
+        // ordering may flip by nanoseconds; just assert all are non-zero-ish
+        // bounded and non-decreasing relative to one another).
+        assert!(
+            stats.max_uptime >= stats.current_uptime,
+            "max_uptime ({:?}) must be >= current_uptime ({:?})",
+            stats.max_uptime,
+            stats.current_uptime
+        );
+        assert!(
+            stats.average_uptime >= stats.min_uptime,
+            "average_uptime ({:?}) must be >= min_uptime",
+            stats.average_uptime
+        );
     }
 
     #[test]
