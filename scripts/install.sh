@@ -15,6 +15,16 @@
 #   --model <name>      Ollama model to pull (default: gemma4:e4b; env: NANNA_MODEL).
 #   --harness-image <ref>  Use this exact harness image ref (overrides --registry/--tag).
 #   --ollama-image <ref>   Use this exact ollama image ref (overrides --registry/--tag).
+#   --harness-port <n>  Host port to publish the harness on (default: 18080; env:
+#                       NANNA_PORT). Was 8080 historically; 18080 avoids the very
+#                       common frontend-dev collision on :8080. See #330.
+#   --use-host-ollama   Skip the in-pod ollama container; reuse the Ollama already
+#                       running on the host at http://localhost:11434. Auto-enabled
+#                       when a working Ollama is detected on :11434 unless
+#                       --no-use-host-ollama is passed. (env: NANNA_USE_HOST_OLLAMA=1)
+#   --no-use-host-ollama  Force the installer to start its own ollama container even
+#                       if one is already running on the host. Useful for CI or when
+#                       you explicitly want pod-isolated state.
 #   --no-pull           Don't `podman pull` the images. Use already-loaded local images
 #                       (e.g. loaded via nix2container's copyToPodman). Used by CI.
 #   --dry-run           Print what the installer would do for the detected OS and exit.
@@ -50,21 +60,32 @@ NO_PULL=0
 DRY_RUN=0
 ASSUME_YES=0
 NO_CLAUDE_MCP=0
+# Default harness host port. Was 8080 (collides with most frontend dev
+# servers); 18080 is high enough to be unclaimed by typical local stacks.
+# See #330. Override via NANNA_PORT or --harness-port.
+HARNESS_PORT="${NANNA_PORT:-18080}"
+# Tri-state for host-ollama: empty means "auto-detect at audit time".
+# Setting to 1 forces reuse of host Ollama; setting to 0 forces in-pod
+# Ollama. See #330.
+USE_HOST_OLLAMA="${NANNA_USE_HOST_OLLAMA:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-model-pull) SKIP_MODEL_PULL=1; shift;;
-    --no-start)        NO_START=1; shift;;
-    --no-pull)         NO_PULL=1; shift;;
-    --dry-run)         DRY_RUN=1; shift;;
-    --registry)        REGISTRY="$2"; shift 2;;
-    --tag)             TAG="$2"; shift 2;;
-    --model)           MODEL="$2"; shift 2;;
-    --harness-image)   HARNESS_IMAGE_OVERRIDE="$2"; shift 2;;
-    --ollama-image)    OLLAMA_IMAGE_OVERRIDE="$2"; shift 2;;
-    --yes|-y)          ASSUME_YES=1; shift;;
-    --no-claude-mcp)   NO_CLAUDE_MCP=1; shift;;
-    -h|--help)         sed -n '2,32p' "$0" 2>/dev/null || true; exit 0;;
+    --skip-model-pull)    SKIP_MODEL_PULL=1; shift;;
+    --no-start)           NO_START=1; shift;;
+    --no-pull)            NO_PULL=1; shift;;
+    --dry-run)            DRY_RUN=1; shift;;
+    --registry)           REGISTRY="$2"; shift 2;;
+    --tag)                TAG="$2"; shift 2;;
+    --model)              MODEL="$2"; shift 2;;
+    --harness-image)      HARNESS_IMAGE_OVERRIDE="$2"; shift 2;;
+    --ollama-image)       OLLAMA_IMAGE_OVERRIDE="$2"; shift 2;;
+    --harness-port)       HARNESS_PORT="$2"; shift 2;;
+    --use-host-ollama)    USE_HOST_OLLAMA=1; shift;;
+    --no-use-host-ollama) USE_HOST_OLLAMA=0; shift;;
+    --yes|-y)             ASSUME_YES=1; shift;;
+    --no-claude-mcp)      NO_CLAUDE_MCP=1; shift;;
+    -h|--help)            sed -n '2,40p' "$0" 2>/dev/null || true; exit 0;;
     *) echo "unknown flag: $1" >&2; exit 64;;
   esac
 done
@@ -170,8 +191,10 @@ audit_system() {
   AUDIT_PODMAN_VERSION=""
   AUDIT_MACHINE_RUNNING=no
   AUDIT_POD_EXISTS=no
-  AUDIT_PORT_8080_HOLDER=""
+  AUDIT_HARNESS_PORT_HOLDER=""
   AUDIT_PORT_11434_HOLDER=""
+  AUDIT_HOST_OLLAMA_REACHABLE=no
+  AUDIT_HOST_OLLAMA_VERSION=""
   AUDIT_HARNESS_LOADED=no
   AUDIT_OLLAMA_LOADED=no
   AUDIT_CLAUDE_CONFIG=""
@@ -199,8 +222,32 @@ audit_system() {
     fi
   fi
 
-  AUDIT_PORT_8080_HOLDER="$(port_in_use_by 8080)"
+  AUDIT_HARNESS_PORT_HOLDER="$(port_in_use_by "$HARNESS_PORT")"
   AUDIT_PORT_11434_HOLDER="$(port_in_use_by 11434)"
+
+  # Probe host Ollama. A *real* Ollama answers /api/version with a JSON
+  # blob; a random process on :11434 won't, so this is a sharper signal
+  # than just "port is open". See #330.
+  if have curl; then
+    local body
+    body="$(curl -fsS --max-time 2 http://localhost:11434/api/version 2>/dev/null || true)"
+    if [[ -n "$body" ]]; then
+      AUDIT_HOST_OLLAMA_REACHABLE=yes
+      AUDIT_HOST_OLLAMA_VERSION="$body"
+    fi
+  fi
+
+  # Resolve the host-ollama tri-state. If the user didn't pin it, default
+  # to "yes" iff a real Ollama answered. Otherwise honour the explicit
+  # 0/1 from CLI/env.
+  if [[ -z "$USE_HOST_OLLAMA" ]]; then
+    if [[ "$AUDIT_HOST_OLLAMA_REACHABLE" == yes ]]; then
+      USE_HOST_OLLAMA=1
+    else
+      USE_HOST_OLLAMA=0
+    fi
+  fi
+
   AUDIT_CLAUDE_CONFIG="$(claude_config_path 2>/dev/null || true)"
 }
 
@@ -212,6 +259,16 @@ print_plan() {
   printf '  model:          %s%s\n' "$MODEL" \
     "$([[ $SKIP_MODEL_PULL -eq 1 ]] && echo ' (skipped)')"
   printf '  pod name:       %s\n' "$POD_NAME"
+  if [[ "$HARNESS_PORT" == "18080" ]]; then
+    printf '  harness port:   %s (default; override with --harness-port / NANNA_PORT)\n' "$HARNESS_PORT"
+  else
+    printf '  harness port:   %s (overridden from default 18080)\n' "$HARNESS_PORT"
+  fi
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    printf '  ollama:         host (reusing existing Ollama on :11434)\n'
+  else
+    printf '  ollama:         in-pod container\n'
+  fi
 
   printf '\n%sCurrent state:%s\n' "$C_BOLD" "$C_RESET"
   if [[ "$AUDIT_PODMAN" == yes ]]; then
@@ -230,11 +287,32 @@ print_plan() {
     printf '  %s!%s existing pod %s detected (will be replaced for a clean start)\n' \
       "$C_YELLOW" "$C_RESET" "$POD_NAME"
   fi
-  if [[ -n "$AUDIT_PORT_8080_HOLDER" && "$AUDIT_POD_EXISTS" != yes ]]; then
-    printf '  %s!%s port 8080 in use by another process:\n' "$C_YELLOW" "$C_RESET"
-    printf '%s\n' "$AUDIT_PORT_8080_HOLDER" | sed 's/^/      /'
+  if [[ "$AUDIT_HOST_OLLAMA_REACHABLE" == yes ]]; then
+    local _v
+    # /api/version returns {"version":"X.Y.Z"}; show it if jq is around,
+    # otherwise just dump the raw line. Best-effort.
+    if have jq; then
+      _v="$(printf '%s' "$AUDIT_HOST_OLLAMA_VERSION" | jq -r '.version // empty' 2>/dev/null || true)"
+    fi
+    [[ -z "${_v:-}" ]] && _v="${AUDIT_HOST_OLLAMA_VERSION//[$'\n\r']/}"
+    if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+      printf '  %s✓%s host Ollama detected on :11434 (%s) — re-using it (skipping in-pod ollama)\n' \
+        "$C_GREEN" "$C_RESET" "$_v"
+    else
+      printf '  %si%s host Ollama detected on :11434 (%s) — ignored (--no-use-host-ollama)\n' \
+        "$C_BLUE" "$C_RESET" "$_v"
+    fi
   fi
-  if [[ -n "$AUDIT_PORT_11434_HOLDER" && "$AUDIT_POD_EXISTS" != yes ]]; then
+  if [[ -n "$AUDIT_HARNESS_PORT_HOLDER" && "$AUDIT_POD_EXISTS" != yes ]]; then
+    printf '  %s!%s port %s in use by another process:\n' "$C_YELLOW" "$C_RESET" "$HARNESS_PORT"
+    printf '%s\n' "$AUDIT_HARNESS_PORT_HOLDER" | sed 's/^/      /'
+  fi
+  # Only flag :11434 conflict when we plan to bind it ourselves. In
+  # host-ollama mode, the listener on :11434 *is* the thing we're going
+  # to use, so it's not a conflict.
+  if [[ "$USE_HOST_OLLAMA" != 1 \
+        && -n "$AUDIT_PORT_11434_HOLDER" \
+        && "$AUDIT_POD_EXISTS" != yes ]]; then
     printf '  %s!%s port 11434 in use by another process:\n' "$C_YELLOW" "$C_RESET"
     printf '%s\n' "$AUDIT_PORT_11434_HOLDER" | sed 's/^/      /'
   fi
@@ -291,17 +369,32 @@ print_plan() {
     printf '  %d. Pull harness + ollama images from %s\n' "$n" "$REGISTRY"; n=$((n+1))
   fi
   if [[ $NO_START -eq 0 ]]; then
-    if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
-      printf '  %d. Stop and remove existing %s, recreate publishing :8080 and :11434\n' \
-        "$n" "$POD_NAME"
+    local pub_desc
+    if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+      pub_desc=":${HARNESS_PORT} (ollama: re-using host)"
     else
-      printf '  %d. Create pod %s publishing :8080 and :11434\n' "$n" "$POD_NAME"
+      pub_desc=":${HARNESS_PORT} and :11434"
+    fi
+    if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
+      printf '  %d. Stop and remove existing %s, recreate publishing %s\n' \
+        "$n" "$POD_NAME" "$pub_desc"
+    else
+      printf '  %d. Create pod %s publishing %s\n' "$n" "$POD_NAME" "$pub_desc"
     fi
     n=$((n+1))
-    printf '  %d. Run ollama-service inside the pod\n' "$n"; n=$((n+1))
-    printf '  %d. Wait for ollama API at http://localhost:11434/api/tags (120s timeout)\n' "$n"; n=$((n+1))
+    if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+      printf '  %d. Skip in-pod ollama-service; use host Ollama at http://localhost:11434\n' "$n"; n=$((n+1))
+      printf '  %d. Verify host ollama API at http://localhost:11434/api/tags\n' "$n"; n=$((n+1))
+    else
+      printf '  %d. Run ollama-service inside the pod\n' "$n"; n=$((n+1))
+      printf '  %d. Wait for ollama API at http://localhost:11434/api/tags (120s timeout)\n' "$n"; n=$((n+1))
+    fi
     if [[ $SKIP_MODEL_PULL -eq 0 ]]; then
-      printf '  %d. Pull model %s (multi-GB, the slow step)\n' "$n" "$MODEL"; n=$((n+1))
+      if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+        printf '  %d. Pull model %s via host ollama (multi-GB, the slow step)\n' "$n" "$MODEL"; n=$((n+1))
+      else
+        printf '  %d. Pull model %s (multi-GB, the slow step)\n' "$n" "$MODEL"; n=$((n+1))
+      fi
     fi
     if [[ -n "$AUDIT_CLAUDE_CONFIG" && $NO_CLAUDE_MCP -eq 0 ]] && have jq; then
       printf '  %d. Register nanna-coder as MCP server in %s (idempotent; backs up the file first)\n' \
@@ -338,12 +431,19 @@ preflight_port_check() {
     # pasta exits. Without this, the re-probe can race and miss a still-
     # transitioning port.
     sleep 1
-    AUDIT_PORT_8080_HOLDER="$(port_in_use_by 8080)"
+    AUDIT_HARNESS_PORT_HOLDER="$(port_in_use_by "$HARNESS_PORT")"
     AUDIT_PORT_11434_HOLDER="$(port_in_use_by 11434)"
   fi
 
   local conflict=0 holder
-  for spec in "8080:AUDIT_PORT_8080_HOLDER" "11434:AUDIT_PORT_11434_HOLDER"; do
+  # Always check the harness port. Only check 11434 when we plan to
+  # publish it ourselves; in host-ollama mode the holder of :11434 is
+  # the Ollama we're going to talk to (#330).
+  local specs=("$HARNESS_PORT:AUDIT_HARNESS_PORT_HOLDER")
+  if [[ "$USE_HOST_OLLAMA" != 1 ]]; then
+    specs+=("11434:AUDIT_PORT_11434_HOLDER")
+  fi
+  for spec in "${specs[@]}"; do
     local port="${spec%%:*}" var="${spec##*:}"
     holder="${!var}"
     [[ -z "$holder" ]] && continue
@@ -354,17 +454,18 @@ preflight_port_check() {
   [[ $conflict -eq 0 ]] && return 0
   cat >&2 <<EOF
 
-${C_RED}${C_BOLD}✗ port conflict on 8080 and/or 11434${C_RESET}
+${C_RED}${C_BOLD}✗ port conflict on ${HARNESS_PORT} and/or 11434${C_RESET}
 
 Free the port(s) and re-run. Common culprits:
   - host ollama on 11434:
+      pass --use-host-ollama to re-use it (or auto-detect on next run), or:
       Linux:  sudo systemctl stop ollama
       macOS:  pkill ollama   (or brew services stop ollama)
   - another pod publishing the same ports:
-      podman ps -a | grep -E '8080|11434'
-  - an orphaned process holding the port:
-      Linux:  ss -ltnp | grep -E ':8080|:11434'
-      macOS:  lsof -iTCP:11434 -sTCP:LISTEN
+      podman ps -a | grep -E ':${HARNESS_PORT}|:11434'
+  - an orphaned process holding the harness port:
+      Linux:  ss -ltnp | grep -E ':${HARNESS_PORT}|:11434'
+      macOS:  lsof -iTCP:${HARNESS_PORT} -sTCP:LISTEN
 EOF
   exit 1
 }
@@ -399,15 +500,23 @@ register_claude_mcp() {
   # spawns `podman run` with -i so the harness's mcp-serve can talk JSON
   # over stdin/stdout. --rm cleans up the per-invocation container.
   # --pod attaches to nanna-coder-pod's network namespace so the harness
-  # reaches ollama-service at http://localhost:11434.
-  local entry
+  # reaches ollama-service at http://localhost:11434. In host-Ollama
+  # mode the pod has no ollama-service; we tell the harness to talk to
+  # the host's loopback via host.containers.internal (#330).
+  local entry ollama_url
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    ollama_url="http://host.containers.internal:11434"
+  else
+    ollama_url="http://localhost:11434"
+  fi
   entry=$(jq -n \
     --arg pod "$POD_NAME" \
     --arg img "$HARNESS_IMAGE" \
     --arg model "$MODEL" \
+    --arg ollama "$ollama_url" \
     '{
       command: "podman",
-      args: ["run","--rm","-i","--pod",$pod,$img,"/bin/harness","mcp-serve","--model",$model]
+      args: ["run","--rm","-i","--pod",$pod,"-e","OLLAMA_URL="+$ollama,$img,"/bin/harness","mcp-serve","--model",$model]
     }')
 
   # Idempotent: if an entry with the same content already exists, skip.
@@ -540,7 +649,9 @@ resolve_image_ref() {
 if [[ $NO_PULL -eq 1 ]]; then
   warn "--no-pull set: skipping podman pull. Expecting images already loaded:"
   warn "  $HARNESS_IMAGE"
-  warn "  $OLLAMA_IMAGE"
+  if [[ "$USE_HOST_OLLAMA" != 1 ]]; then
+    warn "  $OLLAMA_IMAGE"
+  fi
   if HARNESS_RESOLVED=$(resolve_image_ref "$HARNESS_IMAGE"); then
     [[ "$HARNESS_RESOLVED" == "$HARNESS_IMAGE" ]] || \
       log "harness image resolved: $HARNESS_IMAGE -> $HARNESS_RESOLVED"
@@ -549,21 +660,27 @@ if [[ $NO_PULL -eq 1 ]]; then
     podman images >&2 || true
     die "harness image $HARNESS_IMAGE not loaded locally and --no-pull was set."
   fi
-  if OLLAMA_RESOLVED=$(resolve_image_ref "$OLLAMA_IMAGE"); then
-    [[ "$OLLAMA_RESOLVED" == "$OLLAMA_IMAGE" ]] || \
-      log "ollama image resolved: $OLLAMA_IMAGE -> $OLLAMA_RESOLVED"
-    OLLAMA_IMAGE="$OLLAMA_RESOLVED"
-  else
-    podman images >&2 || true
-    die "ollama image $OLLAMA_IMAGE not loaded locally and --no-pull was set."
+  if [[ "$USE_HOST_OLLAMA" != 1 ]]; then
+    if OLLAMA_RESOLVED=$(resolve_image_ref "$OLLAMA_IMAGE"); then
+      [[ "$OLLAMA_RESOLVED" == "$OLLAMA_IMAGE" ]] || \
+        log "ollama image resolved: $OLLAMA_IMAGE -> $OLLAMA_RESOLVED"
+      OLLAMA_IMAGE="$OLLAMA_RESOLVED"
+    else
+      podman images >&2 || true
+      die "ollama image $OLLAMA_IMAGE not loaded locally and --no-pull was set."
+    fi
   fi
 else
   log "pulling $HARNESS_IMAGE"
   podman pull "$HARNESS_IMAGE" \
     || die "failed to pull $HARNESS_IMAGE. The image may be private; run \`podman login ghcr.io\` and re-run, or override with --registry."
 
-  log "pulling $OLLAMA_IMAGE"
-  podman pull "$OLLAMA_IMAGE" || die "failed to pull $OLLAMA_IMAGE."
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    log "host Ollama mode: skipping pull of $OLLAMA_IMAGE"
+  else
+    log "pulling $OLLAMA_IMAGE"
+    podman pull "$OLLAMA_IMAGE" || die "failed to pull $OLLAMA_IMAGE."
+  fi
 
   ok "images pulled"
 fi
@@ -573,12 +690,21 @@ fi
 start_pod() {
   # preflight_port_check() handles teardown of any existing pod before
   # we get here, so this function can assume a clean slate.
-  log "creating pod $POD_NAME (ports 8080, 11434)..."
-  podman pod create --name "$POD_NAME" -p 8080:8080 -p 11434:11434
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    # Host-Ollama mode: only publish the harness port; host already
+    # owns :11434 and we'll talk to it via host.containers.internal
+    # from inside the pod's netns. See #330.
+    log "creating pod $POD_NAME (port ${HARNESS_PORT}; ollama: host)..."
+    podman pod create --name "$POD_NAME" -p "${HARNESS_PORT}:8080"
+    ok "pod $POD_NAME up; using host Ollama at http://localhost:11434 (no in-pod ollama-service)"
+  else
+    log "creating pod $POD_NAME (ports ${HARNESS_PORT}, 11434)..."
+    podman pod create --name "$POD_NAME" -p "${HARNESS_PORT}:8080" -p 11434:11434
 
-  log "starting ollama-service..."
-  podman run -d --pod "$POD_NAME" --name ollama-service \
-    -v ollama-data:/root/.ollama "$OLLAMA_IMAGE"
+    log "starting ollama-service..."
+    podman run -d --pod "$POD_NAME" --name ollama-service \
+      -v ollama-data:/root/.ollama "$OLLAMA_IMAGE"
+  fi
 
   # The harness binary is a CLI, not a long-running daemon, so we don't keep a
   # harness-service container running. Invoke it on-demand against the pod:
@@ -593,6 +719,17 @@ dump_ollama_logs() {
 }
 
 wait_for_ollama() {
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    # Host Ollama already passed audit_system's /api/version probe; just
+    # re-confirm /api/tags (the endpoint pull_model implicitly relies on)
+    # so we fail fast if the host process died between audit and start.
+    if curl -fsS --max-time 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
+      ok "host ollama API is reachable (skipping container readiness wait)"
+      return 0
+    fi
+    die "host Ollama at :11434 was reachable during audit but no longer responds. Restart it and re-run, or pass --no-use-host-ollama to start the pod's own ollama."
+  fi
+
   local i=0 status
   log "waiting for ollama API to come up..."
   until curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; do
@@ -614,6 +751,24 @@ wait_for_ollama() {
 }
 
 pull_model() {
+  if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+    # Host mode: shell out to whichever `ollama` binary the user has,
+    # falling back to the HTTP /api/pull endpoint if the CLI isn't on
+    # PATH (common when host Ollama was installed via a non-PATH-y
+    # method like the macOS .app or systemd-only). See #330.
+    if have ollama; then
+      log "pulling model $MODEL via host ollama CLI (this is the multi-GB step)..."
+      ollama pull "$MODEL"
+    else
+      log "pulling model $MODEL via host ollama HTTP API (no \`ollama\` binary on PATH; this is the multi-GB step)..."
+      curl -fsS --max-time 86400 -X POST http://localhost:11434/api/pull \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"${MODEL}\",\"stream\":false}" >/dev/null \
+        || die "ollama HTTP pull of $MODEL failed."
+    fi
+    ok "model $MODEL ready (via host ollama)"
+    return 0
+  fi
   log "pulling model $MODEL into the running ollama container (this is the multi-GB step)..."
   podman exec ollama-service ollama pull "$MODEL"
   ok "model $MODEL ready"
@@ -626,7 +781,11 @@ else
   wait_for_ollama
   if [[ $SKIP_MODEL_PULL -eq 1 ]]; then
     warn "--skip-model-pull set: NOT pulling $MODEL. Chat/agent will fail until you pull a model."
-    warn "to pull later: podman exec ollama-service ollama pull $MODEL"
+    if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+      warn "to pull later: ollama pull $MODEL   (host Ollama)"
+    else
+      warn "to pull later: podman exec ollama-service ollama pull $MODEL"
+    fi
   else
     pull_model
   fi
@@ -635,23 +794,31 @@ fi
 
 # ---------- done ----------
 
+if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
+  OLLAMA_URL_FOR_HARNESS="http://host.containers.internal:11434"
+  OLLAMA_DESC="http://localhost:11434 (host process; in-pod harness reaches it via host.containers.internal)"
+else
+  OLLAMA_URL_FOR_HARNESS="http://localhost:11434"
+  OLLAMA_DESC="http://localhost:11434"
+fi
+
 cat <<EOF
 
 ${C_GREEN}${C_BOLD}✓ Nanna Coder installed${C_RESET}
 
   pod:          $POD_NAME
-  harness:      http://localhost:8080
-  ollama:       http://localhost:11434
+  harness:      http://localhost:${HARNESS_PORT}
+  ollama:       ${OLLAMA_DESC}
   model:        $([[ $SKIP_MODEL_PULL -eq 1 ]] && echo "(none — pull manually)" || echo "$MODEL")
 
 Common commands:
   podman pod ps
-  podman logs -f ollama-service
+  $([[ "$USE_HOST_OLLAMA" == 1 ]] && echo "# host ollama: use \`journalctl -u ollama\` (Linux) or your normal ollama logs path" || echo "podman logs -f ollama-service")
   podman pod stop $POD_NAME
   podman pod start $POD_NAME
 
 Run the harness CLI against the running pod (one-shot):
   podman run --rm --pod $POD_NAME \\
-    -e OLLAMA_URL=http://localhost:11434 \\
+    -e OLLAMA_URL=${OLLAMA_URL_FOR_HARNESS} \\
     $HARNESS_IMAGE /bin/harness models
 EOF
