@@ -45,13 +45,15 @@ pkgs.mkShell {
     git
 
     # Nix tools
+    nix-tree
     nix-du
-    nixfmt
+    nixfmt-rfc-style
 
     # Documentation
     mdbook
 
     # Additional reproducibility tools
+    nix-diff
     nix-output-monitor
   ];
 
