@@ -1086,8 +1086,7 @@ mod tests {
 
     #[test]
     fn test_trace_context_serialization_roundtrip() {
-        let trace = TraceContext::new("serialize_test")
-            .with_attribute("key", "value");
+        let trace = TraceContext::new("serialize_test").with_attribute("key", "value");
 
         let json = serde_json::to_string(&trace).expect("should serialize");
         let back: TraceContext = serde_json::from_str(&json).expect("should deserialize");
@@ -1240,17 +1239,16 @@ mod tests {
     async fn test_prometheus_exporter_health_check() {
         let exporter = PrometheusExporter::new(None);
         let result = exporter.health_check().await.unwrap();
-        assert!(result, "Prometheus exporter health check should return true");
+        assert!(
+            result,
+            "Prometheus exporter health check should return true"
+        );
     }
 
     #[test]
     fn test_telemetry_system_record_event_stores_in_buffer() {
         let telemetry = TelemetrySystem::new();
-        telemetry.record_event(
-            "test_event",
-            "testing",
-            serde_json::json!({"key": "value"}),
-        );
+        telemetry.record_event("test_event", "testing", serde_json::json!({"key": "value"}));
         let events = telemetry.events_buffer.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "test_event");
@@ -1296,8 +1294,7 @@ mod tests {
 
     #[test]
     fn test_start_trace_includes_global_attributes() {
-        let telemetry = TelemetrySystem::new()
-            .with_global_attribute("datacenter", "us-west-2");
+        let telemetry = TelemetrySystem::new().with_global_attribute("datacenter", "us-west-2");
 
         let trace = telemetry.start_trace("op");
         assert_eq!(

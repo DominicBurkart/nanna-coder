@@ -1440,7 +1440,10 @@ mod tests {
             acknowledged: false,
         };
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::Availability);
-        assert!(!actions.is_empty(), "Should always return at least one action");
+        assert!(
+            !actions.is_empty(),
+            "Should always return at least one action"
+        );
     }
 
     #[test]
@@ -1498,7 +1501,10 @@ mod tests {
             .iter()
             .filter(|ch| ch.channel_type == ChannelType::Console)
             .collect();
-        assert!(!console_channels.is_empty(), "Should have a console channel");
+        assert!(
+            !console_channels.is_empty(),
+            "Should have a console channel"
+        );
         assert_eq!(console_channels[0].min_severity, AlertSeverity::Info);
     }
 

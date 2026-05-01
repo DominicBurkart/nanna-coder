@@ -68,7 +68,10 @@ mod tests {
         let result = entity.to_json();
         assert!(result.is_ok(), "TestEntity should serialize to JSON");
         let json = result.unwrap();
-        assert!(json.contains("\"entity_type\""), "JSON should contain entity_type");
+        assert!(
+            json.contains("\"entity_type\""),
+            "JSON should contain entity_type"
+        );
     }
 
     #[test]
@@ -76,20 +79,29 @@ mod tests {
         let entity = TestEntity::new();
         let json = entity.to_json().unwrap();
         let deserialized: TestEntity = serde_json::from_str(&json).unwrap();
-        assert_eq!(entity.metadata.entity_type, deserialized.metadata.entity_type);
+        assert_eq!(
+            entity.metadata.entity_type,
+            deserialized.metadata.entity_type
+        );
     }
 
     #[test]
     fn test_entity_metadata_id_is_nonempty() {
         let entity = TestEntity::new();
-        assert!(!entity.metadata.id.is_empty(), "Entity ID should not be empty");
+        assert!(
+            !entity.metadata.id.is_empty(),
+            "Entity ID should not be empty"
+        );
     }
 
     #[test]
     fn test_two_entities_have_distinct_ids() {
         let a = TestEntity::new();
         let b = TestEntity::new();
-        assert_ne!(a.metadata.id, b.metadata.id, "Each entity should have a unique ID");
+        assert_ne!(
+            a.metadata.id, b.metadata.id,
+            "Each entity should have a unique ID"
+        );
     }
 
     #[tokio::test]
