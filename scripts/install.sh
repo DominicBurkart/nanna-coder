@@ -82,15 +82,13 @@ warn() { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%s✗%s %s\n'  "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 notify_sudo() {
-  printf '\n%s┌─ sudo required ─────────────────────────────────%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
+  # The wizard's plan + confirmation already covered the sudo step. Print
+  # a short banner so the user knows this is the privileged moment, but
+  # don't double-prompt; sudo itself will ask for the password.
+  printf '\n%s┌─ sudo step ─────────────────────────────────────%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
   printf '%s│%s component: %s\n' "$C_YELLOW" "$C_RESET" "$1"
   printf '%s│%s reason:    %s\n' "$C_YELLOW" "$C_RESET" "$2"
-  printf '%s│%s you may be prompted for your password.\n' "$C_YELLOW" "$C_RESET"
   printf '%s└─────────────────────────────────────────────────%s\n\n' "$C_YELLOW" "$C_RESET"
-  if [[ $ASSUME_YES -eq 0 && -t 0 ]]; then
-    read -r -p "Continue? [Y/n] " ans
-    case "$ans" in N|n|no|No) die "aborted by user";; esac
-  fi
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -123,43 +121,242 @@ EOF
   *) die "unsupported OS: $(uname -s). Linux and macOS only. (Windows: use scripts/install.ps1)" ;;
 esac
 ARCH="$(uname -m)"
-log "detected: $OS/$ARCH"
 
-# ---------- banner ----------
+# ---------- audit / plan / confirm ----------
+#
+# Before doing anything, inspect the system and tell the user exactly which
+# steps will run, which will be skipped (already done), and where sudo will
+# kick in. This is the wizard the user sees first; nothing destructive runs
+# until they confirm. resolve_image_ref() is defined later but only called
+# from audit_system() during execution — fine because audit runs after all
+# functions are defined.
 
-cat <<EOF
-${C_BOLD}Nanna Coder installer${C_RESET}
-  registry:       $REGISTRY
-  tag:            $TAG
-  model:          $MODEL$(if [[ $SKIP_MODEL_PULL -eq 1 ]]; then echo " (skipped)"; fi)
-  pod name:       $POD_NAME
-  start pod:      $([[ $NO_START -eq 1 ]] && echo no || echo yes)
+port_in_use_by() {
+  local port="$1"
+  if have ss; then
+    ss -ltnp 2>/dev/null | awk -v p=":$port\$" '$4 ~ p' | head -3
+  elif have lsof; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3
+  elif have netstat; then
+    netstat -an 2>/dev/null | awk -v p="\\.$port\$|:$port\$" '$4 ~ p && /LISTEN/' | head -3
+  fi
+}
 
-This installer may invoke sudo to install Podman. You will see a clear
-notification before each privileged step.
+detect_pkg_mgr() {
+  if [[ "$OS" == macos ]]; then echo brew; return; fi
+  for m in apt-get dnf pacman zypper; do have "$m" && { echo "$m"; return; }; done
+  echo "(none — manual podman install required)"
+}
+
+claude_config_path() {
+  local p
+  for p in "$HOME/.claude/settings.json" "$HOME/.claude.json" \
+           "$HOME/Library/Application Support/Claude/claude_desktop_config.json"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+audit_system() {
+  AUDIT_PODMAN=no
+  AUDIT_PODMAN_VERSION=""
+  AUDIT_MACHINE_RUNNING=no
+  AUDIT_POD_EXISTS=no
+  AUDIT_PORT_8080_HOLDER=""
+  AUDIT_PORT_11434_HOLDER=""
+  AUDIT_HARNESS_LOADED=no
+  AUDIT_OLLAMA_LOADED=no
+  AUDIT_CLAUDE_CONFIG=""
+
+  if have podman; then
+    AUDIT_PODMAN=yes
+    AUDIT_PODMAN_VERSION="$(podman --version 2>/dev/null | head -1)"
+    if [[ "$OS" == macos ]] && [[ "${NANNA_SKIP_PODMAN_MACHINE:-0}" != "1" ]]; then
+      podman machine list --format '{{.Running}}' 2>/dev/null | grep -qi true \
+        && AUDIT_MACHINE_RUNNING=yes
+    fi
+    # podman info works only once the machine is up (mac) or the daemon is
+    # responsive (linux). Skip pod/image probes silently if it isn't.
+    if podman info >/dev/null 2>&1; then
+      podman pod exists "$POD_NAME" 2>/dev/null && AUDIT_POD_EXISTS=yes
+      if [[ $NO_PULL -eq 1 ]]; then
+        # Self-contained: don't depend on resolve_image_ref (defined later).
+        for cand in "$HARNESS_IMAGE" "localhost/$HARNESS_IMAGE" "docker.io/library/$HARNESS_IMAGE"; do
+          podman image exists "$cand" 2>/dev/null && AUDIT_HARNESS_LOADED=yes && break
+        done
+        for cand in "$OLLAMA_IMAGE" "localhost/$OLLAMA_IMAGE" "docker.io/library/$OLLAMA_IMAGE"; do
+          podman image exists "$cand" 2>/dev/null && AUDIT_OLLAMA_LOADED=yes && break
+        done
+      fi
+    fi
+  fi
+
+  AUDIT_PORT_8080_HOLDER="$(port_in_use_by 8080)"
+  AUDIT_PORT_11434_HOLDER="$(port_in_use_by 11434)"
+  AUDIT_CLAUDE_CONFIG="$(claude_config_path 2>/dev/null || true)"
+}
+
+print_plan() {
+  printf '\n%sNanna Coder installer%s\n' "$C_BOLD" "$C_RESET"
+  printf '  detected:       %s/%s\n' "$OS" "$ARCH"
+  printf '  registry:       %s\n' "$REGISTRY"
+  printf '  tag:            %s\n' "$TAG"
+  printf '  model:          %s%s\n' "$MODEL" \
+    "$([[ $SKIP_MODEL_PULL -eq 1 ]] && echo ' (skipped)')"
+  printf '  pod name:       %s\n' "$POD_NAME"
+
+  printf '\n%sCurrent state:%s\n' "$C_BOLD" "$C_RESET"
+  if [[ "$AUDIT_PODMAN" == yes ]]; then
+    printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$AUDIT_PODMAN_VERSION"
+  else
+    printf '  %s✗%s podman: not installed\n' "$C_RED" "$C_RESET"
+  fi
+  if [[ "$OS" == macos && "${NANNA_SKIP_PODMAN_MACHINE:-0}" != "1" ]]; then
+    if [[ "$AUDIT_MACHINE_RUNNING" == yes ]]; then
+      printf '  %s✓%s podman machine: running\n' "$C_GREEN" "$C_RESET"
+    elif [[ "$AUDIT_PODMAN" == yes ]]; then
+      printf '  %s✗%s podman machine: not running\n' "$C_RED" "$C_RESET"
+    fi
+  fi
+  if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
+    printf '  %s!%s existing pod %s detected (will be replaced for a clean start)\n' \
+      "$C_YELLOW" "$C_RESET" "$POD_NAME"
+  fi
+  if [[ -n "$AUDIT_PORT_8080_HOLDER" && "$AUDIT_POD_EXISTS" != yes ]]; then
+    printf '  %s!%s port 8080 in use by another process:\n' "$C_YELLOW" "$C_RESET"
+    printf '%s\n' "$AUDIT_PORT_8080_HOLDER" | sed 's/^/      /'
+  fi
+  if [[ -n "$AUDIT_PORT_11434_HOLDER" && "$AUDIT_POD_EXISTS" != yes ]]; then
+    printf '  %s!%s port 11434 in use by another process:\n' "$C_YELLOW" "$C_RESET"
+    printf '%s\n' "$AUDIT_PORT_11434_HOLDER" | sed 's/^/      /'
+  fi
+  if [[ $NO_PULL -eq 1 ]]; then
+    if [[ "$AUDIT_HARNESS_LOADED" == yes ]]; then
+      printf '  %s✓%s harness image already loaded locally\n' "$C_GREEN" "$C_RESET"
+    fi
+    if [[ "$AUDIT_OLLAMA_LOADED" == yes ]]; then
+      printf '  %s✓%s ollama image already loaded locally\n' "$C_GREEN" "$C_RESET"
+    fi
+  fi
+  if [[ -n "$AUDIT_CLAUDE_CONFIG" ]]; then
+    printf '  %si%s Claude Code config at %s (auto-MCP wiring is a planned feature, not run yet)\n' \
+      "$C_BLUE" "$C_RESET" "$AUDIT_CLAUDE_CONFIG"
+  fi
+
+  printf '\n%sPlan:%s\n' "$C_BOLD" "$C_RESET"
+  local n=1 sudo_needed=0
+  if [[ "$AUDIT_PODMAN" != yes ]]; then
+    local pm; pm="$(detect_pkg_mgr)"
+    if [[ "$OS" == linux ]]; then
+      printf '  %d. Install podman via %s   %s(REQUIRES SUDO)%s\n' \
+        "$n" "$pm" "$C_YELLOW$C_BOLD" "$C_RESET"
+      sudo_needed=1
+    else
+      printf '  %d. Install podman via %s\n' "$n" "$pm"
+    fi
+    n=$((n+1))
+  else
+    printf '  %s·%s podman already installed — skipping install\n' "$C_BLUE" "$C_RESET"
+  fi
+  if [[ "$OS" == macos && "${NANNA_SKIP_PODMAN_MACHINE:-0}" != "1" ]]; then
+    if [[ "$AUDIT_MACHINE_RUNNING" != yes ]]; then
+      printf '  %d. Init/start podman machine\n' "$n"; n=$((n+1))
+    else
+      printf '  %s·%s podman machine already running — skipping\n' "$C_BLUE" "$C_RESET"
+    fi
+  fi
+  if [[ $NO_PULL -eq 1 ]]; then
+    if [[ "$AUDIT_HARNESS_LOADED" == yes && "$AUDIT_OLLAMA_LOADED" == yes ]]; then
+      printf '  %s·%s images already loaded (--no-pull) — skipping pull\n' "$C_BLUE" "$C_RESET"
+    else
+      printf '  %d. Resolve already-loaded images (--no-pull set)\n' "$n"; n=$((n+1))
+    fi
+  else
+    printf '  %d. Pull harness + ollama images from %s\n' "$n" "$REGISTRY"; n=$((n+1))
+  fi
+  if [[ $NO_START -eq 0 ]]; then
+    if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
+      printf '  %d. Stop and remove existing %s, recreate publishing :8080 and :11434\n' \
+        "$n" "$POD_NAME"
+    else
+      printf '  %d. Create pod %s publishing :8080 and :11434\n' "$n" "$POD_NAME"
+    fi
+    n=$((n+1))
+    printf '  %d. Run ollama-service inside the pod\n' "$n"; n=$((n+1))
+    printf '  %d. Wait for ollama API at http://localhost:11434/api/tags (120s timeout)\n' "$n"; n=$((n+1))
+    if [[ $SKIP_MODEL_PULL -eq 0 ]]; then
+      printf '  %d. Pull model %s (multi-GB, the slow step)\n' "$n" "$MODEL"; n=$((n+1))
+    fi
+  else
+    printf '  %s·%s --no-start: skipping pod bring-up\n' "$C_BLUE" "$C_RESET"
+  fi
+
+  if [[ $sudo_needed -eq 1 ]]; then
+    printf '\n  %sNote:%s the install step needs sudo. The shell will prompt for your password before the privileged command runs.\n' \
+      "$C_YELLOW$C_BOLD" "$C_RESET"
+  fi
+
+  printf '\n%sIdempotency:%s re-running this script is safe — it skips any step\n' \
+    "$C_BOLD" "$C_RESET"
+  printf '  already complete and replaces an existing %s for a clean restart.\n' "$POD_NAME"
+}
+
+preflight_port_check() {
+  local conflict=0 holder
+  for spec in "8080:AUDIT_PORT_8080_HOLDER" "11434:AUDIT_PORT_11434_HOLDER"; do
+    local port="${spec%%:*}" var="${spec##*:}"
+    holder="${!var}"
+    [[ -z "$holder" ]] && continue
+    if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
+      # Existing nanna-coder-pod will be torn down by start_pod; not a conflict.
+      continue
+    fi
+    warn "port $port is held by another process:"
+    printf '%s\n' "$holder" | sed 's/^/    /' >&2
+    conflict=1
+  done
+  [[ $conflict -eq 0 ]] && return 0
+  cat >&2 <<EOF
+
+${C_RED}${C_BOLD}✗ port conflict on 8080 and/or 11434${C_RESET}
+
+Free the port(s) and re-run. Common culprits:
+  - host ollama on 11434:
+      Linux:  sudo systemctl stop ollama
+      macOS:  pkill ollama   (or brew services stop ollama)
+  - another pod publishing the same ports:
+      podman ps -a | grep -E '8080|11434'
+  - an orphaned process holding the port:
+      Linux:  ss -ltnp | grep -E ':8080|:11434'
+      macOS:  lsof -iTCP:11434 -sTCP:LISTEN
 EOF
+  exit 1
+}
+
+confirm_plan() {
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    log "--yes set: proceeding without prompt"
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    log "non-interactive (no tty): proceeding"
+    return 0
+  fi
+  printf '\n'
+  read -r -p "Proceed with the plan above? [Y/n] " ans
+  case "$ans" in N|n|no|No) die "aborted by user" ;; esac
+}
+
+audit_system
+print_plan
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  cat <<EOF
-
-${C_YELLOW}${C_BOLD}--dry-run set: not executing any commands.${C_RESET}
-
-Plan for $OS/$ARCH:
-  1. Install Podman if missing
-       Linux: sudo (apt-get|dnf|pacman|zypper) install -y podman
-       macOS: brew install podman
-  2. (macOS) podman machine init && podman machine start
-  3. Verify: podman info
-  4. Pull images$([[ $NO_PULL -eq 1 ]] && echo " — SKIPPED (--no-pull)")
-       $HARNESS_IMAGE
-       $OLLAMA_IMAGE
-  5. Create pod: $POD_NAME (publishes :8080 and :11434)
-  6. Run ollama-service from $OLLAMA_IMAGE
-  7. Wait for ollama API at http://localhost:11434/api/tags
-  8. Pull model$([[ $SKIP_MODEL_PULL -eq 1 ]] && echo " — SKIPPED (--skip-model-pull)"): podman exec ollama-service ollama pull $MODEL
-EOF
+  printf '\n%s--dry-run set: nothing executed.%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
   exit 0
 fi
+
+confirm_plan
+preflight_port_check
 
 # ---------- 1. podman ----------
 
