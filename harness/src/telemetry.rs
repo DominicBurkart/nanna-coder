@@ -1044,4 +1044,358 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[test]
+    fn test_trace_context_with_attribute_builder() {
+        let trace = TraceContext::new("my_op")
+            .with_attribute("model", "qwen3")
+            .with_attribute("user", "alice");
+
+        assert_eq!(trace.attributes.get("model"), Some(&"qwen3".to_string()));
+        assert_eq!(trace.attributes.get("user"), Some(&"alice".to_string()));
+        assert_eq!(trace.operation_name, "my_op");
+        assert_eq!(trace.status, SpanStatus::InProgress);
+    }
+
+    #[test]
+    fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("op");
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_trace_context_set_status_timeout() {
+        let mut trace = TraceContext::new("op");
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+    }
+
+    #[test]
+    fn test_trace_context_finish_preserves_error_status() {
+        let mut trace = TraceContext::new("op");
+        trace.record_error("failed");
+        // Status is Error before finishing
+        assert_eq!(trace.status, SpanStatus::Error);
+        trace.finish();
+        // After finish, error status should remain (not overwritten by Ok)
+        assert_eq!(trace.status, SpanStatus::Error);
+        assert!(trace.end_time.is_some());
+        assert!(trace.duration.is_some());
+    }
+
+    #[test]
+    fn test_trace_context_serialization_roundtrip() {
+        let trace = TraceContext::new("serialize_test")
+            .with_attribute("key", "value");
+
+        let json = serde_json::to_string(&trace).expect("should serialize");
+        let back: TraceContext = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(trace.operation_name, back.operation_name);
+        assert_eq!(trace.trace_id, back.trace_id);
+        assert_eq!(trace.span_id, back.span_id);
+        assert_eq!(trace.status, back.status);
+        assert_eq!(trace.attributes.get("key"), back.attributes.get("key"));
+    }
+
+    #[test]
+    fn test_child_span_shares_trace_id() {
+        let parent = TraceContext::new("parent_op");
+        let child = parent.create_child("child_op");
+
+        assert_eq!(parent.trace_id, child.trace_id);
+        assert_ne!(parent.span_id, child.span_id);
+        assert_eq!(child.parent_span_id, Some(parent.span_id.clone()));
+        assert_eq!(child.operation_name, "child_op");
+        assert_eq!(child.status, SpanStatus::InProgress);
+    }
+
+    #[test]
+    fn test_telemetry_config_default_values() {
+        let config = TelemetryConfig::default();
+        assert_eq!(config.service.name, "nanna-coder");
+        assert_eq!(config.service.version, "0.1.0");
+        assert_eq!(config.service.environment, "development");
+        assert!(config.enable_logging);
+        assert!(config.enable_tracing);
+        assert!(config.enable_metrics);
+        assert_eq!(config.log_level, "info");
+        assert_eq!(config.metrics_export_interval, Duration::from_secs(60));
+        assert_eq!(config.trace_sample_rate, 1.0);
+        assert!(config.export_endpoints.prometheus_endpoint.is_none());
+        assert!(config.export_endpoints.otlp_endpoint.is_none());
+        assert!(config.export_endpoints.webhook_endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_telemetry_system_builder_sets_fields() {
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("svc")
+            .with_version("2.0.0")
+            .with_environment("production")
+            .with_global_attribute("region", "us-east-1");
+
+        assert_eq!(telemetry.config.service.name, "svc");
+        assert_eq!(telemetry.config.service.version, "2.0.0");
+        assert_eq!(telemetry.config.service.environment, "production");
+        assert_eq!(
+            telemetry.config.global_attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_metric_type_variants_serde() {
+        let types = [
+            MetricType::Counter,
+            MetricType::Gauge,
+            MetricType::Histogram,
+            MetricType::Summary,
+        ];
+        for mt in &types {
+            let json = serde_json::to_string(mt).expect("serialize");
+            let back: MetricType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(mt, &back);
+        }
+    }
+
+    #[test]
+    fn test_span_status_variants_serde() {
+        let statuses = [
+            SpanStatus::InProgress,
+            SpanStatus::Ok,
+            SpanStatus::Error,
+            SpanStatus::Cancelled,
+            SpanStatus::Timeout,
+        ];
+        for s in &statuses {
+            let json = serde_json::to_string(s).expect("serialize");
+            let back: SpanStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(s, &back);
+        }
+    }
+
+    #[test]
+    fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "m1".to_string(),
+            metric_type: MetricType::Counter,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        {
+            let buf = exporter.metrics_buffer.lock().unwrap();
+            assert_eq!(buf.len(), 1);
+        }
+        exporter.clear_buffer();
+        {
+            let buf = exporter.metrics_buffer.lock().unwrap();
+            assert_eq!(buf.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_no_description() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "no_desc".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 7.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        let output = exporter.export_prometheus().await.unwrap();
+        // No HELP line when description is absent
+        assert!(!output.contains("# HELP"));
+        assert!(output.contains("# TYPE no_desc gauge"));
+        assert!(output.contains("no_desc 7.5"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_no_labels_no_braces() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "plain_metric".to_string(),
+            metric_type: MetricType::Counter,
+            value: 42.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        let output = exporter.export_prometheus().await.unwrap();
+        // Without labels, no curly braces in the metric line
+        assert!(!output.contains('{'));
+        assert!(output.contains("plain_metric 42"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_health_check() {
+        let exporter = PrometheusExporter::new(None);
+        let result = exporter.health_check().await.unwrap();
+        assert!(result, "Prometheus exporter health check should return true");
+    }
+
+    #[test]
+    fn test_telemetry_system_record_event_stores_in_buffer() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_event(
+            "test_event",
+            "testing",
+            serde_json::json!({"key": "value"}),
+        );
+        let events = telemetry.events_buffer.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "test_event");
+        assert_eq!(events[0].category, "testing");
+        assert_eq!(events[0].data["key"], "value");
+    }
+
+    #[test]
+    fn test_telemetry_system_multiple_events() {
+        let telemetry = TelemetrySystem::new();
+        for i in 0..5 {
+            telemetry.record_event(
+                &format!("event_{}", i),
+                "batch",
+                serde_json::json!({"idx": i}),
+            );
+        }
+        let events = telemetry.events_buffer.lock().unwrap();
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn test_start_trace_adds_service_attributes() {
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("my-svc")
+            .with_version("1.2.3")
+            .with_environment("staging");
+
+        let trace = telemetry.start_trace("my_op");
+        assert_eq!(
+            trace.attributes.get("service.name"),
+            Some(&"my-svc".to_string())
+        );
+        assert_eq!(
+            trace.attributes.get("service.version"),
+            Some(&"1.2.3".to_string())
+        );
+        assert_eq!(
+            trace.attributes.get("service.environment"),
+            Some(&"staging".to_string())
+        );
+    }
+
+    #[test]
+    fn test_start_trace_includes_global_attributes() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("datacenter", "us-west-2");
+
+        let trace = telemetry.start_trace("op");
+        assert_eq!(
+            trace.attributes.get("datacenter"),
+            Some(&"us-west-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_uptime_is_positive() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        // Uptime should be very small (near zero) right after creation
+        assert!(uptime < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_auto_finishes_on_drop() {
+        let telemetry = TelemetrySystem::new();
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+
+        {
+            let trace = telemetry.start_trace("guarded_op");
+            let _guard = TraceGuard::new(&telemetry, trace);
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+        } // guard is dropped here, should finish the trace
+
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("failing_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.record_error("operation failed");
+
+        // Verify error was recorded on the inner trace
+        let inner = guard.trace().unwrap();
+        assert_eq!(inner.status, SpanStatus::Error);
+        assert_eq!(
+            inner.attributes.get("error"),
+            Some(&"operation failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("cancelled_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.set_status(SpanStatus::Cancelled);
+
+        let inner = guard.trace().unwrap();
+        assert_eq!(inner.status, SpanStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_custom_event_struct_fields() {
+        let event = CustomEvent {
+            name: "deploy".to_string(),
+            timestamp: Utc::now(),
+            category: "lifecycle".to_string(),
+            attributes: HashMap::from([("version".to_string(), "1.2.3".to_string())]),
+            data: serde_json::json!({"sha": "abc123"}),
+            trace_context: None,
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let back: CustomEvent = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.name, "deploy");
+        assert_eq!(back.category, "lifecycle");
+        assert_eq!(back.attributes.get("version"), Some(&"1.2.3".to_string()));
+        assert_eq!(back.data["sha"], "abc123");
+        assert!(back.trace_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_all_clears_buffers() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("c1", 1.0, vec![]);
+        telemetry.record_gauge("g1", 2.0, vec![]);
+        telemetry.record_event("e1", "cat", serde_json::json!({}));
+
+        assert_eq!(telemetry.get_buffered_metrics_count(), 2);
+        {
+            let events = telemetry.events_buffer.lock().unwrap();
+            assert_eq!(events.len(), 1);
+        }
+
+        // export_all should drain buffers (no exporters configured, so it just clears)
+        telemetry.export_all().await.unwrap();
+
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+        {
+            let events = telemetry.events_buffer.lock().unwrap();
+            assert_eq!(events.len(), 0);
+        }
+    }
 }
