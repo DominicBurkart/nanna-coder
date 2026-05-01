@@ -20,14 +20,38 @@ A coding agent for coding agents. Designed to let background agents delegate str
 
 ## Quick Start
 
-### Prerequisites
-- Nix with flakes enabled
-- (Optional) Cachix account for faster builds
+### One-line install (Linux / macOS)
 
-### Setup
+Bootstraps Podman, pulls the prebuilt harness + ollama containers, brings up the
+Nanna pod, and pulls the Gemma 4 model. The script prints a clear notification
+before each step that requires `sudo`.
 
 ```bash
-# Clone the repository
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash
+```
+
+Useful flags (pass after `bash -s --` for the curl form):
+
+| Flag                | Purpose                                                         |
+|---------------------|-----------------------------------------------------------------|
+| `--skip-model-pull` | Bring up the pod without pulling the multi-GB Gemma 4 model.    |
+| `--no-start`        | Install + pull images, but don't create the pod.                |
+| `--model NAME`      | Pull a different Ollama model (default `gemma4:e4b`).           |
+| `--registry URL`    | Use a different container registry.                             |
+| `--yes`             | Skip the sudo confirmation prompts (for unattended installs).   |
+
+After install:
+```bash
+podman pod ps                          # see the running pod
+podman logs -f harness-service         # tail harness logs
+curl http://localhost:11434/api/tags   # ollama API
+```
+
+### Build from source (developers)
+
+Prerequisites: Nix with flakes enabled, optionally Cachix for faster builds.
+
+```bash
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
 
