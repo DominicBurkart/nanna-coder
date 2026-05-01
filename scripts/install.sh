@@ -39,6 +39,8 @@ set -euo pipefail
 
 REGISTRY="${NANNA_REGISTRY:-ghcr.io/dominicburkart/nanna-coder}"
 TAG="${NANNA_TAG:-latest}"
+# Ollama 0.20.7+ required for gemma4:e4b model -- see #332. Image ships
+# pkgs.ollama from flake.lock'd nixpkgs; bump nixpkgs if you change MODEL.
 MODEL="${NANNA_MODEL:-gemma4:e4b}"
 HARNESS_IMAGE_OVERRIDE=""
 OLLAMA_IMAGE_OVERRIDE=""
