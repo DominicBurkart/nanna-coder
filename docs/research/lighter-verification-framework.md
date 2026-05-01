@@ -3,15 +3,21 @@
 Research note for issue [#274](https://github.com/DominicBurkart/nanna-coder/issues/274).
 Follow-up to the ADAS framing in [#196](https://github.com/DominicBurkart/nanna-coder/issues/196).
 
-> **Post-review reframing (2026-05).** §§1–6 were drafted around a single
-> `heavy` ↔ `light` axis. The owner's review on
-> [#277](https://github.com/DominicBurkart/nanna-coder/pull/277) argues
-> the more accurate framing is **domain-specific verification**: "lighter"
-> only legitimately applies when validation is deferred to CI or when the
-> domain is not meaningfully decomposable. Otherwise the right move is
-> *decomposition* + per-step verification matched to each sub-domain.
-> §7 captures that reframing in full and §8 (follow-ups) is rewritten
-> against it; the original §§1–6 are retained as the prior analysis they
+> **Post-review reframing (2026-05).** §§1–6 conflate two different
+> things under one heading: **(A)** nanna-coder's own CI/CD — the gates
+> that protect nanna-coder *as a project being built and released*
+> (codecov 100%, the #275/#276 coverage-bypass guards, AGENTS.md hard
+> rules, `nix develop` pinning, the `.github/workflows/` gates) — and
+> **(B)** the per-turn verification Nanna applies to its own
+> intermediate outputs while acting as a coding agent on a user task.
+> The owner's review on
+> [#277](https://github.com/DominicBurkart/nanna-coder/pull/277) is
+> entirely about (B); the right reframing of "lighter verification" is
+> **domain-specific per-turn verification** within (B). (A) is invariant
+> under task domain — you do not lower the codecov floor on nanna-coder
+> because Nanna happens to be working on a SQL task. §7 develops the
+> distinction in full and §8 (follow-ups) is rewritten against it; the
+> original §§1–6 are retained as the prior, conflated analysis they
 > were reviewed against.
 
 ## 1. Definition: what "verification framework" means here
@@ -231,6 +237,15 @@ today; other values (`"sql-generation"`, `"natural-language"`,
 `"mechanical-edit"`) are placeholders for the domain-specific workflows
 §7 anticipates.
 
+**Scope note.** The `verification` and `domain` fields below describe
+Nanna's *per-turn verification while acting as a coding agent on a user
+task* (the (B) layer in the top-of-doc note). They do **not** describe
+the gates that protect nanna-coder itself: codecov, the
+coverage-bypass guard, AGENTS.md hard rules, and the
+`.github/workflows/` gates apply to every PR landed in nanna-coder
+regardless of which workflow produced it and which domain that workflow
+serves.
+
 ```toml
 # Sketch — extends what #203 proposes for registry metadata.
 [[workflow]]
@@ -312,145 +327,217 @@ strength:
   touching those files. The lighter variant lives at the workflow layer,
   not the repo-policy layer.
 
-## 7. Reframing: domain-specific verification
+## 7. Reframing: domain-specific per-turn verification
 
-The §§1–6 analysis treated `heavy ↔ light` as the primary axis. The
-owner's review on PR #277 argues that's a proxy for the real axis,
-which is **domain-specific verification**. The reframing in full:
+§§1–6 conflate two layers; §7 separates them and applies the
+reframing to one of them.
 
-**When "lighter" is genuinely the right call.** Two cases only:
+### 7.1 Two layers, not one
 
-1. **Validation deferred to CI.** The agent's inner loop skips a check
-   that the merge gate runs anyway. Net signal is unchanged; agent
-   wall-time and tokens drop. This is what the §4 `light` variant
-   captures.
-2. **Domains that are not meaningfully decomposable.** If a task
-   genuinely cannot be split into sub-domains with their own validation
-   primitives, then per-step verification has nothing to attach to and
-   "lighter at the outer level" is the only knob. Most tasks are not in
-   this bucket.
+- **(A) nanna-coder's CI/CD.** The gates that protect nanna-coder *as
+  a project being built and released*. Concretely: codecov 100% patch
+  coverage, the #275/#276 coverage-bypass guards, the hard rules in
+  `AGENTS.md`, the `nix develop` pinning, and the
+  `.github/workflows/` gates (`ci.yml`, `eval.yml`, `codecov-guard.yml`,
+  etc.). These run on every PR opened against nanna-coder, regardless
+  of which workflow produced the diff and regardless of what user task
+  triggered the work.
+- **(B) Nanna's per-turn verification while acting as a coding agent
+  on a user task.** What Nanna runs on its own intermediate outputs
+  *inside the agent loop*: which checks it consults, which signals it
+  feeds back into the next turn, what it spends tokens validating
+  before committing to a next step.
 
-For everything else, "lighter" is the wrong frame. The right frame is
-**decomposition + per-sub-domain verification**: split the task into
-sub-domains whose outputs can be validated with the toolset that suits
-each one, then route each sub-step to a workflow specialised for that
-sub-domain. Nanna's job becomes "decomposition + domain-specific
-verification" rather than "ReAct with a verification dial".
+§§1–6 list (A) items (codecov, coverage guards, AGENTS.md, nix
+shell, GitHub Action gates) and treat them as if they parameterise
+(B). They do not. (A) is invariant under task domain. The reframing
+below applies to (B) only.
 
-**Why the dial is a poor primitive.** Software development is not a
-single domain with a single verification toolset. Nanna today is
-specialised for rust+nix codebases — its harness, prompts, and tools
-encode that specialisation. SWE-bench (Python; pytest contracts;
-project-specific test layouts) is *outside that domain*; running Nanna
-on it measures cross-domain transfer, not Nanna's quality on its actual
-domain. The verification stack described in §1 is calibrated for
-rust+nix and applying it wholesale to other domains either
-under-validates (wrong primitives — a Python type-check tells us
-nothing about borrow-checker invariants) or over-validates (wasting
-tokens collecting signal that doesn't bear on the domain).
+### 7.2 The reframing, scoped to (B)
 
-**Worked example: NL → SQL.** Generating 500 lines of correct SQL from
-a natural-language question requires both (a) a correct semantic model
-(the intent of the question maps to relationships expressible in the
-target schema) and (b) syntactically valid SQL against that schema.
-Trying to do both in one pass and then "verify with `cargo build`"
-makes no sense — there's no rust to build, and the failure modes have
-nothing to do with what the rust+nix toolset can detect. The
-domain-specific decomposition:
+The owner's review on PR #277 argues that within (B), `heavy ↔ light`
+is a proxy for the real axis: **domain-specific per-turn
+verification**. Lighter (B)-verification is genuinely the right call
+in two cases only:
+
+1. **Validation deferred to CI** — either the user-project's CI or, if
+   Nanna is editing nanna-coder itself, layer (A). The agent's inner
+   loop skips a check that the project's own merge gate will run
+   anyway; net signal is unchanged. This is what motivates the §4
+   `light` variant when the eval target is nanna-coder.
+2. **Domains that are not meaningfully decomposable.** If the task
+   cannot be split into sub-domains with their own validation
+   primitives, per-step verification has nothing to attach to and
+   "lighter at the outer level" is the only knob. Most tasks are not
+   in this bucket.
+
+For everything else within (B), "lighter" is the wrong frame. The
+right frame is **decomposition + per-sub-domain verification**: split
+the task into sub-domains whose outputs can be validated with the
+toolset that suits each one, then route each sub-step to a workflow
+specialised for that sub-domain. Nanna's job within (B) is
+"decomposition + domain-specific verification" rather than "ReAct with
+a single verification dial".
+
+### 7.3 Why a single dial is a poor (B) primitive
+
+The set of useful per-turn verifications depends on the task's domain.
+"Software development" is not one domain with one verification toolset.
+Nanna's current harness, prompts, and tool surface are specialised for
+rust+nix codebases; its per-turn verification primitives (run `cargo
+build`, run `cargo test`, parse `clippy` output, query the rustc type
+checker through the LSP) are calibrated for that domain. Reusing those
+primitives wholesale on a non-rust task either under-validates (wrong
+primitives — a Python type-check tells us nothing about borrow-checker
+invariants, and vice versa) or over-validates (wasting tokens
+collecting signal that doesn't bear on the task domain).
+
+Note this is a separate concern from layer (A). When Nanna is asked
+to do work on a non-rust user codebase, layer (A) doesn't even apply
+to that work — (A) only fires when Nanna's output lands as a PR
+against nanna-coder. The mismatch is purely a (B) problem: Nanna's
+per-turn verification primitives are domain-mismatched.
+
+### 7.4 Worked example: NL → SQL (a (B) decomposition)
+
+Generating 500 lines of correct SQL from a natural-language question
+requires both (a) a correct semantic model (the intent maps to
+relationships expressible in the target schema) and (b) syntactically
+valid SQL against that schema. Trying to do both in one pass and then
+"verify with `cargo build`" makes no sense — there's no rust to
+build, and the failure modes have nothing to do with what the
+rust+nix per-turn primitives can detect. The domain-specific
+decomposition:
 
 - **Step 1 — input filtering** (deterministic / classifier). Reject
   off-domain or adversarial inputs before they reach a model. *Cost:
-  near-zero. Verification: the filter's own contract.*
+  near-zero. Per-turn verification: the filter's own contract.*
 - **Step 2 — NL → structure-specific intermediate** (LLM-as-judge for
   semantics). Translate the natural-language question into a
-  schema-aware intermediate representation. Validate via: domain
-  alignment (does the output describe relationships expressible in this
-  schema?), inversion (does an "agnosticator" LLM round-trip the
-  intermediate back to a paraphrase of the input?), internal
+  schema-aware intermediate representation. Per-turn verification via:
+  domain alignment (does the output describe relationships expressible
+  in this schema?), inversion (does an "agnosticator" LLM round-trip
+  the intermediate back to a paraphrase of the input?), internal
   consistency (formalise the relationships and check invariants — a
   LEAN proof can identify semantic failures and drive iteration).
 - **Step 3 — intermediate → SQL** (deterministic). Generate SQL from
-  the intermediate. Validate via: parse the SQL, type-check it against
-  the live schema, dry-run with `EXPLAIN`. *Cost: low. Verification:
-  fully deterministic.*
+  the intermediate. Per-turn verification via: parse the SQL,
+  type-check it against the live schema, dry-run with `EXPLAIN`.
+  *Cost: low. Verification: fully deterministic.*
 
-This is *more* verification than the `heavy` variant in §4, not less —
-but each piece is matched to its sub-domain. Code verification is
-irrelevant while validating an NL-to-language conversion, *unless* a
-sub-step decomposes into a code-expressible domain. "Is this system
-design or prompt engineering?" — under the ADAS framing in #196 there
-isn't a meaningful difference; Nanna is formalising and validating its
-chain of thought through specialised agents.
+This is *more* per-turn verification than nanna-coder's current
+rust+nix-specialised loop applies, not less — but each piece is
+matched to its sub-domain. Code verification is irrelevant while
+validating an NL-to-language conversion, *unless* a sub-step
+decomposes into a code-expressible domain. "Is this system design or
+prompt engineering?" — under the ADAS framing in #196 there isn't a
+meaningful difference; Nanna is formalising and validating its chain
+of thought through specialised agents.
 
-**Worked example: mechanical AST transform.** When the orchestrator
-has already decomposed a task to "rename `AAA` to `BBB` via an AST
-transform", the work delegated to the inner step is a single call to a
-fully deterministic, well-tested tool. The right verification is
-*essentially nothing*: "I called the tool with the requested
-parameters and it returned success." Anything more is wasted tokens.
-If a cosmic-ray-class anomaly does corrupt the result, the orchestrator
-re-issues the call. This is the case for `verification = "none"` in
-the registry sketch above.
+### 7.5 Worked example: mechanical AST transform (a (B) zero case)
 
-**The actionable framing.** "Remove domain-irrelevant verification
-strategies" is more actionable than "lighter verification". It tells
-the registry, the selector, and the eval suite what to *do*: identify
-the domain, select the workflow specialised for it, validate with the
-primitives that fit, and don't pay for primitives that don't.
+When the orchestrator has already decomposed a task to "rename `AAA`
+to `BBB` via an AST transform", the work delegated to the inner step
+is a single call to a fully deterministic, well-tested tool. The right
+per-turn verification is *essentially nothing*: "I called the tool
+with the requested parameters and it returned success." Anything more
+is wasted tokens. If a cosmic-ray-class anomaly does corrupt the
+result, the orchestrator re-issues the call. This is the case for
+`verification = "none"` in the §5 registry sketch.
 
-**What this implies for §4 and §5.** The §4 A/B test (`heavy` /
-`medium` / `light` on rust+nix cases) remains useful — it measures
-whether deferring rust+nix-appropriate checks to CI changes outcomes
-on rust+nix tasks. But it should be understood as one slice of a
-larger evaluation matrix that adds **domain** as a dimension. The §5
-registry sketch already adds a `domain` field for this reason; the
-selector contract grows from "pick a verification level" to "pick a
-domain-appropriate workflow whose verification level is
-appropriate for this task within that domain".
+(A) is unaffected: if this AST transform produces a diff against
+nanna-coder, the diff still has to clear codecov, the
+coverage-bypass guard, and the rest of nanna-coder's CI. The (B)
+zero-verification setting is about not paying tokens for
+agent-internal checks the deterministic tool already implies — not
+about loosening the repo's release gates.
+
+### 7.6 Actionable framing
+
+"Remove domain-irrelevant per-turn verification strategies" is more
+actionable than "lighter verification". It tells the registry, the
+selector, and the eval suite what to *do*: identify the task's
+domain, select the workflow specialised for it, validate per-turn
+with the primitives that fit, and don't pay tokens for primitives
+that don't. Layer (A) sits underneath all of this and is unchanged.
+
+### 7.7 What this implies for §§4 and §5
+
+- **§4's variants conflate (A) and (B).** The `heavy` variant lists
+  "100% patch coverage required for promotion" (an (A) thing) next to
+  "container-isolated agent loop" (a (B) thing). The actually-useful
+  A/B test holds (A) constant — every variant produces output that
+  must clear nanna-coder's CI to land — and varies (B): does the
+  workflow's per-turn loop run inside a container, does it consult
+  `cargo test` on every iteration, does it consult coverage at all
+  during the loop. Re-read §4 with that scope restriction; the §4
+  pre-registration template is still usable but the variant
+  definitions need rewriting before any pre-registration commits.
+- **§5's `verification` and `domain` are (B) fields.** They describe
+  per-turn verification within a workflow, not the gates that promote
+  the workflow's output. The selector (#204) routes on (B); the
+  promotion gate is (A) and is invariant.
 
 ## 8. Recommended next steps (do not file yet)
 
-Reorganised against the §7 reframing. Items 1–7 from the prior draft
-are preserved (now items 4–10) since the underlying work is still
-required; items 1–3 capture the new direction.
+Reorganised against the §7 reframing. Each item is tagged (A) or (B)
+to make the layer explicit; items in the prior draft are preserved
+where the work is still required, with notes when their scope was
+narrowed by disentangling the layers.
 
-1. **Spec issue: `Domain` field + per-domain verification toolsets** —
-   formalise `Domain` on the `Workflow` trait, document the in-scope
-   default (`rust-nix`), and define what "verification toolset for
-   domain X" means as a structured object (which checks run, which
-   are advisory, which are blocking).
-2. **Spec issue: decomposition orchestrator** — a workflow whose
+1. **(B) Spec issue: `Domain` field + per-domain per-turn verification
+   toolsets** — formalise `Domain` on the `Workflow` trait, document
+   the in-scope default (`rust-nix`), and define what "per-turn
+   verification toolset for domain X" means as a structured object
+   (which checks run inside the agent loop, which are advisory, which
+   gate the next turn).
+2. **(B) Spec issue: decomposition orchestrator** — a workflow whose
    output is a *plan* of sub-domain calls plus their per-step
-   verification, executed by the selector from #204. This is the
-   concrete implementation of "Nanna's job is decomposition +
-   domain-specific verification".
-3. **Spec issue: zero-verification path for mechanical transforms** —
-   a `verification = "none"` workflow class for deterministic,
-   well-tested tools (AST transforms, formatters, codemods); the
-   selector picks it when the orchestrator has decomposed to a single
-   deterministic call.
-4. **Spec issue: `VerificationLevel` field on `Workflow`** — add to
-   the #203 trait + registry, including selector behaviour from #204
-   for security-sensitive tasks. (Was item 1.)
-5. **Spec issue: light workflow variant** — concrete `react-light`
-   implementation, audit-only sandbox, two-stage promotion to a
-   `heavy` re-validation step. Scope this as a rust+nix-domain
-   workflow specifically; the broader reframing means "light" is not a
-   universal mode. (Was item 2.)
-6. **Eval issue: security eval suite** — prompt-injection /
+   per-turn verification, executed by the selector from #204. This is
+   the concrete implementation of "Nanna's job within (B) is
+   decomposition + domain-specific verification".
+3. **(B) Spec issue: zero-verification path for mechanical
+   transforms** — a `verification = "none"` workflow class for
+   deterministic, well-tested tools (AST transforms, formatters,
+   codemods); the selector picks it when the orchestrator has
+   decomposed to a single deterministic call. Note this changes only
+   per-turn verification; the (A) PR gate is unchanged.
+4. **(B) Spec issue: `VerificationLevel` field on `Workflow`** — add
+   to the #203 trait + registry, including selector behaviour from
+   #204 for security-sensitive tasks. (Was item 1; clarified scope to
+   (B).)
+5. **(B) Spec issue: light workflow variant for rust+nix** — concrete
+   `react-light` implementation that drops blocking container
+   isolation from the agent's inner loop and runs `cargo test` only
+   advisorily during iteration. The "two-stage promotion" idea from
+   §6 becomes redundant once (A)/(B) are separated: every workflow's
+   output already passes through (A) before landing on `main`.
+   (Was item 2; rescoped against the conflation.)
+6. **(B) Eval issue: security eval suite** — prompt-injection /
    exfiltration / out-of-worktree write cases under
-   `evals/cases/security/`, runnable by all variants. (Was item 3.)
-7. **Eval issue: coverage-faithfulness eval** — cross-check #276-style
-   bypasses end-to-end, not just at PR-time. (Was item 4.)
-8. **Eval issue: pre-registration template & decision-rule machinery**
-   in `harness::eval::experiment` so A/B comparisons are committed
-   before they're run. (Was item 5.)
-9. **Runner extension to #207** — accept `VerificationLevel` *and*
-   `Domain` as dimensions and emit per-(level, domain) matrices in the
-   complementarity report. (Was item 6, extended.)
-10. **Reference-systems benchmark** — run Aider and OpenHands
+   `evals/cases/security/`, runnable by all variants; tests what a
+   workflow does inside its loop, not what (A) lets through.
+   (Was item 3.)
+7. **§4 rewrite (B)** — re-do §4's variant definitions so each
+   variant varies (B) only and explicitly holds (A) constant; commit
+   the rewrite *before* any pre-registration so the experiment isn't
+   measuring an (A)/(B) mixture. (New, replaces the (A)-flavoured
+   parts of the original draft.)
+8. **(A) Eval issue: coverage-faithfulness eval** — cross-check
+   #276-style bypasses end-to-end, not just at PR-time. This is an
+   (A) concern: it asks whether agents editing nanna-coder are gaming
+   the codecov gate, regardless of what (B) workflow they used.
+   (Was item 4; relabelled.)
+9. **(B) Eval issue: pre-registration template & decision-rule
+   machinery** in `harness::eval::experiment` so A/B comparisons are
+   committed before they're run. (Was item 5.)
+10. **(B) Runner extension to #207** — accept `VerificationLevel`
+    *and* `Domain` as dimensions and emit per-(level, domain)
+    matrices in the complementarity report. (Was item 6, extended.)
+11. **(B) Reference-systems benchmark** — run Aider and OpenHands
     (sandboxed and unsandboxed) on the same `evals/cases/` subset to
     replace the hand-waved §3 ranking with measurements before any
     nanna-coder workflow ships its `verification` setting. Note that
     the rust+nix-vs-Python domain mismatch must be controlled for
-    explicitly. (Was item 7.)
+    explicitly: this measures (B) per-turn verification differences,
+    not differences in the user-project's CI. (Was item 7.)
