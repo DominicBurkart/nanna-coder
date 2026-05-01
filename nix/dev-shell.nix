@@ -45,7 +45,6 @@ pkgs.mkShell {
     git
 
     # Nix tools
-    nix-tree
     nix-du
     nixfmt
 
@@ -53,7 +52,6 @@ pkgs.mkShell {
     mdbook
 
     # Additional reproducibility tools
-    nix-diff
     nix-output-monitor
   ];
 
