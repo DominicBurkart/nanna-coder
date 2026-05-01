@@ -288,6 +288,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-ollama": {
+      "locked": {
+        "lastModified": 1777268161,
+        "narHash": "sha256-bxrdOn8SCOv8tN4JbTF/TXq7kjo9ag4M+C8yzzIRYbE=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1c3fe55ad329cbcb28471bb30f05c9827f724c76",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "cachix": "cachix",
@@ -295,6 +311,7 @@
         "flake-utils": "flake-utils",
         "nix2container": "nix2container",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-ollama": "nixpkgs-ollama",
         "rust-overlay": "rust-overlay"
       }
     },
