@@ -364,6 +364,7 @@
               config = {
                 Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
                 Env = [
+                  "HOME=/root"
                   "OLLAMA_HOST=0.0.0.0"
                   "OLLAMA_PORT=11434"
                   "PATH=/bin"
