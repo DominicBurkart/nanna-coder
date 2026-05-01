@@ -47,7 +47,7 @@ pkgs.mkShell {
     # Nix tools
     nix-tree
     nix-du
-    nixfmt-rfc-style
+    nixfmt
 
     # Documentation
     mdbook
