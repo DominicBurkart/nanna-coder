@@ -21,6 +21,8 @@
 #                       Doesn't install anything. Used by CI to validate the script
 #                       across platforms without depending on container runtimes.
 #   --yes               Don't prompt; assume yes for sudo notices.
+#   --no-claude-mcp     Don't register nanna-coder as a Claude Code MCP server even
+#                       if a Claude Code config is detected.
 #   -h, --help          Show this help.
 #
 # What this script does (in order):
@@ -45,6 +47,7 @@ NO_START=0
 NO_PULL=0
 DRY_RUN=0
 ASSUME_YES=0
+NO_CLAUDE_MCP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --harness-image)   HARNESS_IMAGE_OVERRIDE="$2"; shift 2;;
     --ollama-image)    OLLAMA_IMAGE_OVERRIDE="$2"; shift 2;;
     --yes|-y)          ASSUME_YES=1; shift;;
+    --no-claude-mcp)   NO_CLAUDE_MCP=1; shift;;
     -h|--help)         sed -n '2,32p' "$0" 2>/dev/null || true; exit 0;;
     *) echo "unknown flag: $1" >&2; exit 64;;
   esac
@@ -149,9 +153,11 @@ detect_pkg_mgr() {
 }
 
 claude_config_path() {
+  # Prefer ~/.claude.json (the canonical user-scoped Claude Code config),
+  # fall back to ~/.claude/settings.json. Both accept a top-level
+  # `mcpServers` object.
   local p
-  for p in "$HOME/.claude/settings.json" "$HOME/.claude.json" \
-           "$HOME/Library/Application Support/Claude/claude_desktop_config.json"; do
+  for p in "$HOME/.claude.json" "$HOME/.claude/settings.json"; do
     [[ -f "$p" ]] && { echo "$p"; return 0; }
   done
   return 1
@@ -239,8 +245,16 @@ print_plan() {
     fi
   fi
   if [[ -n "$AUDIT_CLAUDE_CONFIG" ]]; then
-    printf '  %si%s Claude Code config at %s (auto-MCP wiring is a planned feature, not run yet)\n' \
-      "$C_BLUE" "$C_RESET" "$AUDIT_CLAUDE_CONFIG"
+    if [[ $NO_CLAUDE_MCP -eq 1 ]]; then
+      printf '  %si%s Claude Code config at %s (skipping auto-MCP registration: --no-claude-mcp)\n' \
+        "$C_BLUE" "$C_RESET" "$AUDIT_CLAUDE_CONFIG"
+    elif ! have jq; then
+      printf '  %s!%s Claude Code config at %s — jq not installed, MCP auto-registration will be skipped\n' \
+        "$C_YELLOW" "$C_RESET" "$AUDIT_CLAUDE_CONFIG"
+    else
+      printf '  %s✓%s Claude Code config at %s (will register nanna-coder as MCP server)\n' \
+        "$C_GREEN" "$C_RESET" "$AUDIT_CLAUDE_CONFIG"
+    fi
   fi
 
   printf '\n%sPlan:%s\n' "$C_BOLD" "$C_RESET"
@@ -287,6 +301,10 @@ print_plan() {
     if [[ $SKIP_MODEL_PULL -eq 0 ]]; then
       printf '  %d. Pull model %s (multi-GB, the slow step)\n' "$n" "$MODEL"; n=$((n+1))
     fi
+    if [[ -n "$AUDIT_CLAUDE_CONFIG" && $NO_CLAUDE_MCP -eq 0 ]] && have jq; then
+      printf '  %d. Register nanna-coder as MCP server in %s (idempotent; backs up the file first)\n' \
+        "$n" "$AUDIT_CLAUDE_CONFIG"; n=$((n+1))
+    fi
   else
     printf '  %s·%s --no-start: skipping pod bring-up\n' "$C_BLUE" "$C_RESET"
   fi
@@ -302,15 +320,31 @@ print_plan() {
 }
 
 preflight_port_check() {
+  # If our pod already exists, tear it down FIRST so its containers
+  # release any ports they hold. Then probe ports — anything still
+  # listening is a real conflict from a process outside our pod.
+  # Previously start_pod() did the cleanup, but that meant the audit's
+  # port probe ran while our stale pod's containers were still bound,
+  # masking conflicts from other processes (e.g. a host ollama on
+  # :11434).
+  if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
+    log "removing existing $POD_NAME so its ports are released before the conflict check..."
+    podman pod stop "$POD_NAME" >/dev/null 2>&1 || true
+    podman pod rm   "$POD_NAME" >/dev/null 2>&1 || true
+    AUDIT_POD_EXISTS=no
+    # Give the kernel a moment to release the listening sockets after
+    # pasta exits. Without this, the re-probe can race and miss a still-
+    # transitioning port.
+    sleep 1
+    AUDIT_PORT_8080_HOLDER="$(port_in_use_by 8080)"
+    AUDIT_PORT_11434_HOLDER="$(port_in_use_by 11434)"
+  fi
+
   local conflict=0 holder
   for spec in "8080:AUDIT_PORT_8080_HOLDER" "11434:AUDIT_PORT_11434_HOLDER"; do
     local port="${spec%%:*}" var="${spec##*:}"
     holder="${!var}"
     [[ -z "$holder" ]] && continue
-    if [[ "$AUDIT_POD_EXISTS" == yes ]]; then
-      # Existing nanna-coder-pod will be torn down by start_pod; not a conflict.
-      continue
-    fi
     warn "port $port is held by another process:"
     printf '%s\n' "$holder" | sed 's/^/    /' >&2
     conflict=1
@@ -345,6 +379,64 @@ confirm_plan() {
   printf '\n'
   read -r -p "Proceed with the plan above? [Y/n] " ans
   case "$ans" in N|n|no|No) die "aborted by user" ;; esac
+}
+
+register_claude_mcp() {
+  [[ -z "$AUDIT_CLAUDE_CONFIG" ]] && return 0
+  if [[ $NO_CLAUDE_MCP -eq 1 ]]; then
+    log "skipping Claude MCP registration (--no-claude-mcp)"
+    return 0
+  fi
+  if ! have jq; then
+    warn "jq not installed; skipping Claude Code MCP auto-registration."
+    warn "To enable later: install jq, then re-run this script."
+    return 0
+  fi
+
+  # Build the desired MCP server entry. Stdio transport: Claude Code
+  # spawns `podman run` with -i so the harness's mcp-serve can talk JSON
+  # over stdin/stdout. --rm cleans up the per-invocation container.
+  # --pod attaches to nanna-coder-pod's network namespace so the harness
+  # reaches ollama-service at http://localhost:11434.
+  local entry
+  entry=$(jq -n \
+    --arg pod "$POD_NAME" \
+    --arg img "$HARNESS_IMAGE" \
+    --arg model "$MODEL" \
+    '{
+      command: "podman",
+      args: ["run","--rm","-i","--pod",$pod,$img,"/bin/harness","mcp-serve","--model",$model]
+    }')
+
+  # Idempotent: if an entry with the same content already exists, skip.
+  local existing
+  existing=$(jq -er '.mcpServers["nanna-coder"] // empty' "$AUDIT_CLAUDE_CONFIG" 2>/dev/null || true)
+  if [[ -n "$existing" ]] \
+     && jq -en --argjson a "$existing" --argjson b "$entry" '$a == $b' >/dev/null 2>&1; then
+    ok "Claude MCP entry for nanna-coder already up-to-date — skipping write"
+    return 0
+  fi
+
+  # Backup before mutating user state.
+  local backup ts
+  ts=$(date +%Y%m%dT%H%M%S)
+  backup="${AUDIT_CLAUDE_CONFIG}.nanna-coder.bak.${ts}"
+  cp "$AUDIT_CLAUDE_CONFIG" "$backup"
+  log "backed up $AUDIT_CLAUDE_CONFIG -> $backup"
+
+  # Merge: ensure .mcpServers exists, then set our entry. jq's
+  # `(.x // {})` idiom handles both "key missing" and "key is null".
+  local tmp; tmp="$(mktemp)"
+  if ! jq --argjson entry "$entry" \
+        '.mcpServers = (.mcpServers // {}) | .mcpServers["nanna-coder"] = $entry' \
+        "$AUDIT_CLAUDE_CONFIG" > "$tmp"; then
+    rm -f "$tmp"
+    warn "jq failed to update $AUDIT_CLAUDE_CONFIG; original left untouched (backup at $backup)."
+    return 1
+  fi
+  mv "$tmp" "$AUDIT_CLAUDE_CONFIG"
+  ok "registered nanna-coder as MCP server in $AUDIT_CLAUDE_CONFIG"
+  log "  command:  podman run --rm -i --pod $POD_NAME $HARNESS_IMAGE /bin/harness mcp-serve --model $MODEL"
 }
 
 audit_system
@@ -477,12 +569,8 @@ fi
 # ---------- 3. start pod ----------
 
 start_pod() {
-  if podman pod exists "$POD_NAME" 2>/dev/null; then
-    warn "pod $POD_NAME already exists; stopping + removing for a clean start"
-    podman pod stop "$POD_NAME" >/dev/null 2>&1 || true
-    podman pod rm   "$POD_NAME" >/dev/null 2>&1 || true
-  fi
-
+  # preflight_port_check() handles teardown of any existing pod before
+  # we get here, so this function can assume a clean slate.
   log "creating pod $POD_NAME (ports 8080, 11434)..."
   podman pod create --name "$POD_NAME" -p 8080:8080 -p 11434:11434
 
@@ -526,6 +614,7 @@ else
   else
     pull_model
   fi
+  register_claude_mcp
 fi
 
 # ---------- done ----------
