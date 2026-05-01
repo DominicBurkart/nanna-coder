@@ -482,6 +482,7 @@ mod tests {
     /// request gets a quick UNAUTHORIZED without the server ever streaming the
     /// payload. Pin that ordering so a future refactor cannot quietly invert
     /// the check sequence.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_http_401_short_circuits_before_body_read() {
         let (addr, _) = spawn_test_server().await;
