@@ -1,5 +1,6 @@
 pub mod config;
 pub mod judge;
+#[cfg(feature = "ollama")]
 pub mod ollama;
 pub mod provider;
 pub mod types;
