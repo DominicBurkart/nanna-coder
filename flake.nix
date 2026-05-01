@@ -178,9 +178,8 @@
             inherit src;
           };
 
-          workspace-audit = craneLib.cargoAudit {
-            inherit src;
-          };
+          # workspace-audit omitted: craneLib.cargoAudit requires a mandatory
+      # advisory-db parameter; use `cargo audit` in CI shell steps instead.
 
           workspace-deny = pkgs.runCommand "cargo-deny-check" {
             buildInputs = [ pkgs.cargo-deny rustToolchain ];
@@ -217,7 +216,7 @@
         };
       }
     )) # end eachSystem
-    # Merge cross-platform package support (load-container-image, load-ollama-image, vllmImage variants)
+    # Merge additional Linux-only container loading utilities not defined in eachSystem
     {
       packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
         let
@@ -226,241 +225,62 @@
             overlays = [ (import rust-overlay) ];
             config.allowUnfree = false;
           };
-          rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
-            extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
-          };
-          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-          
-          # Add nix2container for container builds
-          nix2containerPkgs = nix2container.packages.${system};
-
-          commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git ];
-
-          src = pkgs.lib.cleanSourceWith {
-            src = ./.;
-            filter = path: type:
-              (pkgs.lib.hasSuffix "\.rs" path) ||
-              (pkgs.lib.hasSuffix "\.toml" path) ||
-              (pkgs.lib.hasSuffix "\.lock" path) ||
-              (type == "directory");
-          };
-
-          cargoArtifacts = craneLib.buildDepsOnly {
-            inherit src;
-            buildInputs = commonBuildInputs;
-            nativeBuildInputs = commonNativeBuildInputs;
-          };
         in
         {
-          nanna-coder = craneLib.buildPackage {
-            inherit src cargoArtifacts;
-            buildInputs = commonBuildInputs;
-            nativeBuildInputs = commonNativeBuildInputs;
-            cargoBuildCommand = "cargo build --workspace --release";
-            cargoCheckCommand = "cargo check --workspace";
-            cargoTestCommand = "cargo test --workspace";
-          };
-
-          harness = craneLib.buildPackage {
-            inherit src cargoArtifacts;
-            buildInputs = commonBuildInputs;
-            nativeBuildInputs = commonNativeBuildInputs;
-            cargoBuildCommand = "cargo build --release --bin harness";
-            cargoCheckCommand = "cargo check --bin harness";
-            cargoTestCommand = "cargo test --package harness";
-            installPhase = ''
-              mkdir -p $out/bin
-              cp target/release/harness $out/bin/
-            '';
-          };
-
-          # Container images (Linux only)
-          harnessImage = if pkgs.stdenv.isLinux then
-            (nix2container.packages.${system}.nix2container.buildImage {
-              name = "nanna-coder-harness";
-              tag = "latest";
-              copyToRoot = pkgs.buildEnv {
-                name = "harness-env";
-                paths = [
-                  (craneLib.buildPackage {
-                    inherit src cargoArtifacts;
-                    buildInputs = commonBuildInputs;
-                    nativeBuildInputs = commonNativeBuildInputs;
-                    cargoBuildCommand = "cargo build --release --bin harness";
-                    installPhase = ''
-                      mkdir -p $out/bin
-                      cp target/release/harness $out/bin/
-                    '';
-                  })
-                  pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils
-                ];
-                pathsToLink = [ "/bin" "/etc" "/share" ];
-              };
-              config = {
-                Cmd = [ "/bin/harness" ];
-                Env = [
-                  "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-                  "RUST_LOG=info"
-                  "PATH=/bin"
-                ];
-                WorkingDir = "/app";
-                ExposedPorts = { "8080/tcp" = {}; };
-              };
-              maxLayers = 100;
-            }) else null;
-
-          ollamaImage = if pkgs.stdenv.isLinux then
-            (nix2container.packages.${system}.nix2container.buildImage {
-              name = "nanna-coder-ollama";
-              tag = "latest";
-              copyToRoot = pkgs.buildEnv {
-                name = "ollama-env";
-                paths = [ pkgs.ollama pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils ];
-                pathsToLink = [ "/bin" "/etc" "/share" ];
-              };
-              config = {
-                Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
-                Env = [
-                  "HOME=/root"
-                  "OLLAMA_HOST=0.0.0.0"
-                  "OLLAMA_PORT=11434"
-                  "PATH=/bin"
-                ];
-                WorkingDir = "/app";
-                ExposedPorts = { "11434/tcp" = {}; };
-                Volumes = { "/root/.ollama" = {}; };
-              };
-              maxLayers = 100;
-            }) else null;
-
-          # vLLM wrapper scripts (cross-platform compatible)
-          # Note: These are wrapper scripts that use the official vllm/vllm-openai Docker image
-          vllmImage = (import ./nix/containers.nix {
-            inherit pkgs nix2containerPkgs;
-            lib = pkgs.lib;
-            harness = (craneLib.buildPackage {
-              inherit src cargoArtifacts;
-              buildInputs = commonBuildInputs;
-              nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
-              installPhase = ''
-                mkdir -p $out/bin
-                cp target/release/harness $out/bin/
-              '';
-            });
-          }).vllmImage { };
-
-          vllmImageMimo = (import ./nix/containers.nix {
-            inherit pkgs nix2containerPkgs;
-            lib = pkgs.lib;
-            harness = (craneLib.buildPackage {
-              inherit src cargoArtifacts;
-              buildInputs = commonBuildInputs;
-              nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
-              installPhase = ''
-                mkdir -p $out/bin
-                cp target/release/harness $out/bin/
-              '';
-            });
-          }).vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
-
-          vllmImageQwen = (import ./nix/containers.nix {
-            inherit pkgs nix2containerPkgs;
-            lib = pkgs.lib;
-            harness = (craneLib.buildPackage {
-              inherit src cargoArtifacts;
-              buildInputs = commonBuildInputs;
-              nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
-              installPhase = ''
-                mkdir -p $out/bin
-                cp target/release/harness $out/bin/
-              '';
-            });
-          }).vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
-
-          # Container loading utilities for CI
+          # Container loading utilities for CI (Linux only)
           load-ollama-image = if pkgs.stdenv.isLinux then
             (pkgs.writeShellApplication {
               name = "load-ollama-image";
               runtimeInputs = [ pkgs.skopeo ];
               text = ''
-                echo "📦 Loading ollama image using nix2container JSON format..."
+                echo "Loading ollama image using nix2container JSON format..."
                 IMAGE_PATH=$(nix build .#ollamaImage --print-out-paths --no-link)
                 echo "Image built at: $IMAGE_PATH"
-
-                # Use skopeo to load the nix2container JSON format
-                echo "Using skopeo to load image..."
                 skopeo copy "nix:$IMAGE_PATH" containers-storage:nanna-coder-ollama:latest
-                echo "✅ Image loaded successfully"
+                echo "Image loaded successfully"
               '';
             }) else null;
 
-          # Universal container loading utility for CI builds
           load-container-image = if pkgs.stdenv.isLinux then
             (pkgs.writeShellApplication {
               name = "load-container-image";
-              runtimeInputs = [ pkgs.skopeo pkgs.docker pkgs.file ];
+              runtimeInputs = with pkgs; [ skopeo docker_28 file ];
               text = ''
                 if [ $# -eq 0 ]; then
                   echo "Usage: load-container-image <image-name> [tag]"
-                  echo "Examples:"
-                    echo "  load-container-image harness"
-                  echo "  load-container-image ollama latest"
                   exit 1
                 fi
 
                 IMAGE_NAME="$1"
                 TAG="''${2:-latest}"
 
-                echo "📦 Loading container image: $IMAGE_NAME:$TAG"
+                echo "Loading container image: $IMAGE_NAME:$TAG"
 
-                # Handle the 'result' symlink created by nix build
                 if [ -L result ]; then
                   IMAGE_PATH=$(readlink -f result)
-                  echo "📂 Image path: $IMAGE_PATH"
 
-                  # Check if it's a nix2container JSON format
                   if file "$IMAGE_PATH" | grep -q "JSON"; then
-                    echo "🔧 Detected nix2container JSON format, using skopeo..."
-
-                    # Use docker load with nix2container images (they are OCI compatible)
                     docker load < "$IMAGE_PATH" 2>/dev/null || {
-                      echo "⚠️ Docker load failed, trying nix2container-specific approach..."
-                      # For nix2container, we need to use the image name from the JSON
                       IMAGE_ID=$(docker import "$IMAGE_PATH" 2>/dev/null) || {
-                        echo "❌ Failed to import nix2container image"
+                        echo "Failed to import nix2container image"
                         exit 1
                       }
-                      echo "✅ Imported image with ID: $IMAGE_ID"
+                      echo "Imported image with ID: $IMAGE_ID"
                     }
-                    echo "✅ JSON image loaded successfully"
                   else
-                    echo "🔧 Detected tar format, using docker load..."
-                    # Traditional tar format
                     docker load < "$IMAGE_PATH"
-                    echo "✅ Tar image loaded via docker load"
                   fi
                 else
-                  echo "❌ Error: 'result' symlink not found"
-                  echo "Run 'nix build' first to create the image"
+                  echo "Error: 'result' symlink not found. Run 'nix build' first."
                   exit 1
                 fi
 
-                # Convert repository name to lowercase for Docker compatibility
                 REPO_NAME="dominicburkart/nanna-coder"
-                echo "🏷️ Tagging image as: ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG"
-
-                # Tag the loaded image appropriately for registry push
                 docker tag "$IMAGE_NAME:$TAG" "ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG" 2>/dev/null || {
-                  echo "⚠️ Direct tag failed, trying to find loaded image..."
-                  # Find the loaded image by name pattern and tag it
                   docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "(nanna-coder|$IMAGE_NAME)" | head -1 | xargs -I {} docker tag {} "ghcr.io/$REPO_NAME/$IMAGE_NAME:$TAG"
                 }
 
-                echo "✅ Container image $IMAGE_NAME:$TAG ready for push"
+                echo "Container image $IMAGE_NAME:$TAG ready for push"
               '';
             }) else null;
         }

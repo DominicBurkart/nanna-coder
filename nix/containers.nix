@@ -133,7 +133,7 @@ let
   vllmImage = { model ? "XiaomiMiMo/MiMo-V2-Flash", extraArgs ? [] }:
     pkgs.writeShellApplication {
       name = "run-vllm-${builtins.replaceStrings ["/"] ["-"] model}";
-      runtimeInputs = with pkgs; [ docker podman ];
+      runtimeInputs = with pkgs; [ podman ];
       text = ''
         # Default model: ${model}
         MODEL="''${1:-${model}}"
