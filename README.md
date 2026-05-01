@@ -20,20 +20,14 @@ A coding agent for coding agents. Designed to let background agents delegate str
 
 ## Quick Start
 
-### One-line install (Linux / macOS / Windows)
+### One-line install (Linux / macOS)
 
 Bootstraps Podman, pulls the prebuilt harness + ollama containers, brings up the
 Nanna pod, and pulls the Gemma 4 model. The script prints a clear notification
-before each step that requires `sudo` (or Administrator on Windows).
+before each step that requires `sudo`.
 
-**Linux / macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash
-```
-
-**Windows (PowerShell, runs inside WSL2):**
-```powershell
-irm https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.ps1 | iex
 ```
 
 Useful flags (pass after `bash -s --` for the curl form):
