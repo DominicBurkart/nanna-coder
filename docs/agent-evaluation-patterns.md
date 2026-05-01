@@ -24,8 +24,7 @@ Tests interaction between agent subsystems:
 
 ### Level 3: System Evaluations
 Tests the full containerized system:
-- Model provider integration (Ollama/vLLM)
-- Observability and telemetry collection
+- Model provider integration (Ollama)
 - End-to-end task completion with real LLMs
 - Performance and reliability under load
 
