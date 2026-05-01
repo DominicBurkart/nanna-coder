@@ -173,4 +173,21 @@ edition = "2021"
         let result = ensure_dev_container(dir.path(), &NeverOnboarder).await;
         assert!(result.is_err());
     }
+
+    /// `OnboardingError` exposes a `From<image_builder::ImageBuilderError>`
+    /// so that `ensure_dev_container` can use `?` against
+    /// `image_builder::build_dev_container`. The conversion stringifies
+    /// the source error into the `ImageBuilder` variant. This pins the
+    /// contract (variant + message preservation) so a future refactor of
+    /// either error enum cannot silently break the bridge.
+    #[test]
+    fn onboarding_error_from_image_builder_error_preserves_message() {
+        let inner = image_builder::ImageBuilderError::InvalidConfig("missing flake".into());
+        let inner_msg = inner.to_string();
+        let onboarding: OnboardingError = inner.into();
+        match onboarding {
+            OnboardingError::ImageBuilder(msg) => assert_eq!(msg, inner_msg),
+            other => panic!("expected ImageBuilder variant, got {:?}", other),
+        }
+    }
 }
