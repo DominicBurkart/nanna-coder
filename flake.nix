@@ -4,6 +4,14 @@
   inputs = {
     # Pin to specific commit for reproducibility
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Separate, more recent nixpkgs pin for ollama only. The main nixpkgs
+    # input is kept conservative because rust-overlay's rust-docs-1.87.0
+    # build chokes on newer stdenvs ("do not know how to unpack source
+    # archive"). Bumping the entire toolchain to chase ollama's release
+    # cadence is too much churn for a server we just need a recent
+    # version of. This input is consumed via an overlay that replaces
+    # `pkgs.ollama` only; everything else stays on the main pin.
+    nixpkgs-ollama.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -27,13 +35,20 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nix2container, cachix }:
+  outputs = { self, nixpkgs, nixpkgs-ollama, flake-utils, rust-overlay, crane, nix2container, cachix }:
     # Support multiple systems for cross-platform CI
     nixpkgs.lib.recursiveUpdate (flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         # Reproducible overlays with pinned versions
+        ollamaPkgs = import nixpkgs-ollama { inherit system; config.allowUnfree = false; };
         overlays = [
           (import rust-overlay)
+          # Replace the main nixpkgs ollama with the version from
+          # nixpkgs-ollama. The main nixpkgs is intentionally pinned
+          # ~6 months old (see input docstring); ollama on that pin is
+          # 0.11.10 which predates Gemma 4 support and returns HTTP
+          # 412 on any pull of the project's default `gemma4:e4b`.
+          (final: prev: { ollama = ollamaPkgs.ollama; })
           # Pin security tools to versions with CVSS 4.0 support
           (final: prev: {
             cargo-audit = prev.rustPlatform.buildRustPackage rec {
