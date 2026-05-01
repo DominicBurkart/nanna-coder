@@ -584,13 +584,27 @@ start_pod() {
   #     $HARNESS_IMAGE /bin/harness <subcommand> ...
 }
 
+dump_ollama_logs() {
+  printf '%s┌─ podman logs ollama-service (last 50 lines) ─────%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" >&2
+  podman logs --tail 50 ollama-service 2>&1 | sed 's/^/    /' >&2 || true
+  printf '%s└──────────────────────────────────────────────────%s\n' "$C_YELLOW" "$C_RESET" >&2
+}
+
 wait_for_ollama() {
-  local i=0
+  local i=0 status
   log "waiting for ollama API to come up..."
   until curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; do
+    # Detect crashloop early: if the container has already exited,
+    # waiting another 120s won't help. Surface the logs immediately.
+    status=$(podman inspect ollama-service --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+    if [[ "$status" == "exited" || "$status" == "missing" ]]; then
+      dump_ollama_logs
+      die "ollama-service container exited (status=$status). Container did not stay running long enough to serve. Common cause: image config bug — e.g. ollama panics with 'panic: \$HOME is not defined' if HOME is missing from the container Env (fixed in PR #321; if you pulled from ghcr.io you may have an older image — try \`podman pull --policy=always\` or rebuild locally + use --no-pull)."
+    fi
     i=$((i + 1))
     if [[ $i -gt 60 ]]; then
-      die "ollama did not become ready within 120s. Check: podman logs ollama-service"
+      dump_ollama_logs
+      die "ollama did not become ready within 120s (container is $status). See logs above."
     fi
     sleep 2
   done
