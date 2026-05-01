@@ -2,6 +2,28 @@
 
 A coding agent for coding agents. Designed to let background agents delegate straightforward work to local models (or other providers).
 
+## One-line install
+
+Install nanna in a container and register it as an MCP tool for the Claude Code CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash -s -- --mcp --local-model gemma4:e4b
+```
+
+Install the standalone `harness` CLI (for direct use or for agents to invoke):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash -s -- --standalone --local-model gemma4:e4b
+```
+
+`--local-model` accepts any tag understood by `ollama pull` (default `gemma4:e4b`). One of `--mcp` or `--standalone` is required (no silent fallback). Pass `--help` to the installer for the full flag list. The same one-liners are intended for the nanna landing page; no separate landing-page source currently lives in this repo.
+
+> **Integrity warning.** The URLs above pull `scripts/install.sh` from `refs/heads/main`, a mutable ref, with no checksum or signature verification. Until a tagged release pipeline and a `cosign` / `minisign` `--verify` flag land (tracked in PR #314), prefer one of:
+> - download and inspect first: `curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh --mcp ...`
+> - pin to a commit SHA in the URL once one is published.
+>
+> Promoting these one-liners on the public landing page is gated on the integrity work above.
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture and entity management
