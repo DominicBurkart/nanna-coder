@@ -1044,4 +1044,495 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    // -----------------------------------------------------------------
+    // Invariants below: trace lifecycle, builder configuration injection,
+    // PrometheusExporter conversion, and export_all draining behaviour.
+    // -----------------------------------------------------------------
+
+    /// `start_trace` must enrich the new span with service identity and any
+    /// configured global attributes; otherwise downstream observability
+    /// can't correlate spans back to a deployment.
+    #[tokio::test]
+    async fn test_start_trace_injects_service_identity_and_global_attributes() {
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("svc-x")
+            .with_version("9.9.9")
+            .with_environment("staging")
+            .with_global_attribute("region", "eu-west-1")
+            .with_global_attribute("tenant", "acme");
+
+        let trace = telemetry.start_trace("op");
+
+        assert_eq!(
+            trace.attributes.get("service.name").map(String::as_str),
+            Some("svc-x")
+        );
+        assert_eq!(
+            trace.attributes.get("service.version").map(String::as_str),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            trace
+                .attributes
+                .get("service.environment")
+                .map(String::as_str),
+            Some("staging"),
+        );
+        assert_eq!(
+            trace.attributes.get("region").map(String::as_str),
+            Some("eu-west-1")
+        );
+        assert_eq!(
+            trace.attributes.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+    }
+
+    /// `finish_trace` must remove the matching span (by `span_id`) from the
+    /// active list, not just any span. Otherwise concurrent traces would
+    /// confuse each other.
+    #[tokio::test]
+    async fn test_finish_trace_removes_specific_span_by_id() {
+        let telemetry = TelemetrySystem::new();
+        let a = telemetry.start_trace("a");
+        let b = telemetry.start_trace("b");
+        let c = telemetry.start_trace("c");
+        assert_eq!(telemetry.get_active_trace_count(), 3);
+
+        let b_span_id = b.span_id.clone();
+        telemetry.finish_trace(b);
+
+        let traces = telemetry.active_traces.lock().unwrap();
+        assert_eq!(traces.len(), 2);
+        assert!(traces.iter().all(|t| t.span_id != b_span_id));
+        assert!(traces.iter().any(|t| t.span_id == a.span_id));
+        assert!(traces.iter().any(|t| t.span_id == c.span_id));
+    }
+
+    /// The `TraceGuard` RAII wrapper must call `finish_trace` on drop, so
+    /// scoped tracing via `trace_span!` cannot leak active spans.
+    #[tokio::test]
+    async fn test_trace_guard_finishes_on_drop() {
+        let telemetry = TelemetrySystem::new();
+        {
+            let trace = telemetry.start_trace("scoped");
+            let _guard = TraceGuard::new(&telemetry, trace);
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+        }
+        // Drop should have triggered finish_trace, removing the span.
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    /// `TraceGuard::record_error` and `set_status` must mutate the inner
+    /// trace; the recorded state should be visible after the guard finishes.
+    #[tokio::test]
+    async fn test_trace_guard_record_error_and_set_status_mutate_inner_trace() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+
+        guard.record_error("boom");
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
+        assert_eq!(
+            guard
+                .trace()
+                .unwrap()
+                .attributes
+                .get("error")
+                .map(String::as_str),
+            Some("boom"),
+        );
+
+        guard.set_status(SpanStatus::Cancelled);
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
+    }
+
+    /// Prometheus output should omit the `# HELP` line when no description
+    /// is provided, and emit a bare metric name without `{}` braces when
+    /// there are no labels.
+    #[tokio::test]
+    async fn test_prometheus_exporter_handles_missing_description_and_labels() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "bare_gauge".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 7.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+
+        let out = exporter.export_prometheus().await.unwrap();
+        assert!(
+            !out.contains("# HELP bare_gauge"),
+            "no help when description is None: {out}"
+        );
+        assert!(out.contains("# TYPE bare_gauge gauge"));
+        // No labels => no curly braces between name and value.
+        assert!(
+            out.contains("bare_gauge 7.5"),
+            "expected bare line, got: {out}"
+        );
+    }
+
+    /// `clear_buffer` must empty the buffer so that subsequent
+    /// `export_prometheus` returns no metrics.
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer_drops_all_metrics() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "m".to_string(),
+            metric_type: MetricType::Counter,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        exporter.clear_buffer();
+        let out = exporter.export_prometheus().await.unwrap();
+        assert!(
+            out.is_empty(),
+            "buffer should be empty after clear, got: {out:?}"
+        );
+    }
+
+    /// Only finished traces (those with a `duration`) should produce a
+    /// `trace_duration_seconds` metric on export. In-progress traces must
+    /// be dropped silently.
+    #[tokio::test]
+    async fn test_prometheus_export_traces_only_emits_for_finished_spans() {
+        let exporter = PrometheusExporter::new(None);
+
+        let mut finished = TraceContext::new("finished_op");
+        finished.finish(); // sets duration
+        let in_progress = TraceContext::new("still_running");
+        assert!(in_progress.duration.is_none());
+
+        exporter
+            .export_traces(vec![finished.clone(), in_progress])
+            .await
+            .unwrap();
+
+        let out = exporter.export_prometheus().await.unwrap();
+        assert!(out.contains("# TYPE trace_duration_seconds histogram"));
+        assert!(out.contains("operation=\"finished_op\""));
+        // Only one metric line for the finished span — the still-running
+        // span must not produce a metric.
+        let trace_metric_lines = out
+            .lines()
+            .filter(|l| l.starts_with("trace_duration_seconds"))
+            .count();
+        assert_eq!(trace_metric_lines, 1, "got: {out}");
+    }
+
+    /// Each exported event becomes one `custom_events_total` counter sample
+    /// labelled with the event name and category.
+    #[tokio::test]
+    async fn test_prometheus_export_events_emits_counter_per_event() {
+        let exporter = PrometheusExporter::new(None);
+        let make_event = |name: &str, cat: &str| CustomEvent {
+            name: name.to_string(),
+            timestamp: Utc::now(),
+            category: cat.to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({}),
+            trace_context: None,
+        };
+
+        exporter
+            .export_events(vec![
+                make_event("login", "auth"),
+                make_event("logout", "auth"),
+            ])
+            .await
+            .unwrap();
+
+        let out = exporter.export_prometheus().await.unwrap();
+        let event_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("custom_events_total"))
+            .collect();
+        assert_eq!(event_lines.len(), 2, "got: {out}");
+        assert!(out.contains("event_name=\"login\""));
+        assert!(out.contains("event_name=\"logout\""));
+        assert!(out.contains("category=\"auth\""));
+    }
+
+    /// `export_system_metrics` must produce Prometheus samples for the
+    /// canonical metrics consumers depend on: cache hit rate, error rate,
+    /// per-service request duration, and per-service requests-per-second.
+    #[tokio::test]
+    async fn test_prometheus_export_system_metrics_emits_canonical_metric_names() {
+        use crate::monitoring::{
+            CacheMetrics, ErrorMetrics, LatencyMetrics, ModelMetrics, SystemResourceMetrics,
+        };
+
+        let exporter = PrometheusExporter::new(None);
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::from([(
+                "ollama".to_string(),
+                LatencyMetrics {
+                    avg_latency_ms: 250.0,
+                    p95_latency_ms: 400.0,
+                    p99_latency_ms: 500.0,
+                    max_latency_ms: 600.0,
+                    min_latency_ms: 50.0,
+                    request_count: 10,
+                    requests_per_second: 4.2,
+                },
+            )]),
+            cache_metrics: CacheMetrics {
+                hits: 9,
+                misses: 1,
+                hit_rate: 0.9,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: vec![],
+            system_resources: SystemResourceMetrics {
+                cpu_usage_percent: 0.0,
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                memory_usage_percent: 0.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 0,
+                disk_usage_percent: 0.0,
+                load_average: [0.0, 0.0, 0.0],
+            },
+            model_metrics: HashMap::<String, ModelMetrics>::new(),
+            error_metrics: ErrorMetrics {
+                total_errors: 1,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.1,
+                recent_errors: vec![],
+            },
+        };
+
+        exporter.export_system_metrics(metrics).await.unwrap();
+        let out = exporter.export_prometheus().await.unwrap();
+
+        assert!(
+            out.contains("cache_hit_rate"),
+            "missing cache_hit_rate: {out}"
+        );
+        assert!(out.contains("error_rate"), "missing error_rate: {out}");
+        assert!(
+            out.contains("request_duration_seconds"),
+            "missing request_duration_seconds: {out}",
+        );
+        assert!(
+            out.contains("requests_per_second"),
+            "missing requests_per_second: {out}",
+        );
+        // Avg latency 250ms must be reported in seconds (0.25).
+        assert!(
+            out.contains("request_duration_seconds{service=\"ollama\"} 0.25"),
+            "expected ollama request_duration_seconds=0.25, got: {out}",
+        );
+        // RPS must be reported as a gauge labelled by service.
+        assert!(
+            out.contains("requests_per_second{service=\"ollama\"} 4.2"),
+            "expected ollama requests_per_second=4.2, got: {out}",
+        );
+    }
+
+    /// `health_check` on the default Prometheus exporter must succeed even
+    /// without a configured endpoint — it never blocks initialization.
+    #[tokio::test]
+    async fn test_prometheus_exporter_health_check_ok() {
+        let exporter = PrometheusExporter::new(None);
+        assert!(exporter.health_check().await.unwrap());
+    }
+
+    /// `add_exporter` must make the exporter participate in `export_all`:
+    /// its `export_metrics` is called with the buffered metrics, and the
+    /// internal metrics buffer is drained on every successful export.
+    #[tokio::test]
+    async fn test_export_all_drains_buffers_through_added_exporter() {
+        // Custom exporter that records what it received.
+        struct RecordingExporter {
+            traces: Arc<Mutex<Vec<TraceContext>>>,
+            metrics: Arc<Mutex<Vec<MetricPoint>>>,
+            events: Arc<Mutex<Vec<CustomEvent>>>,
+        }
+        #[async_trait]
+        impl TelemetryExporter for RecordingExporter {
+            async fn export_traces(&self, traces: Vec<TraceContext>) -> Result<(), TelemetryError> {
+                self.traces.lock().unwrap().extend(traces);
+                Ok(())
+            }
+            async fn export_metrics(
+                &self,
+                metrics: Vec<MetricPoint>,
+            ) -> Result<(), TelemetryError> {
+                self.metrics.lock().unwrap().extend(metrics);
+                Ok(())
+            }
+            async fn export_events(&self, events: Vec<CustomEvent>) -> Result<(), TelemetryError> {
+                self.events.lock().unwrap().extend(events);
+                Ok(())
+            }
+            async fn export_system_metrics(&self, _: SystemMetrics) -> Result<(), TelemetryError> {
+                Ok(())
+            }
+            async fn health_check(&self) -> Result<bool, TelemetryError> {
+                Ok(true)
+            }
+        }
+
+        let traces_seen = Arc::new(Mutex::new(Vec::<TraceContext>::new()));
+        let metrics_seen = Arc::new(Mutex::new(Vec::<MetricPoint>::new()));
+        let events_seen = Arc::new(Mutex::new(Vec::<CustomEvent>::new()));
+        let recorder = RecordingExporter {
+            traces: Arc::clone(&traces_seen),
+            metrics: Arc::clone(&metrics_seen),
+            events: Arc::clone(&events_seen),
+        };
+
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(recorder));
+
+        // Inject one in-progress and one finished trace directly into the
+        // active list. `export_all` filters the active list by end_time:
+        // finished ones are exported and dropped, in-progress ones are
+        // retained for later completion. We bypass `finish_trace` here
+        // because its current implementation removes the span from the
+        // active list synchronously (so it would never reach `export_all`).
+        let in_progress = TraceContext::new("in_progress_op");
+        let mut finished = TraceContext::new("finished_op");
+        finished.finish();
+        let in_progress_span_id = in_progress.span_id.clone();
+        {
+            let mut active = telemetry.active_traces.lock().unwrap();
+            active.push(in_progress);
+            active.push(finished);
+        }
+
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.record_event("evt", "cat", serde_json::json!({}));
+
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+
+        telemetry.export_all().await.unwrap();
+
+        // Buffers should be drained.
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+        assert_eq!(telemetry.events_buffer.lock().unwrap().len(), 0);
+
+        // Only the finished trace was exported; the in-progress one stays
+        // in the active list for later completion.
+        let exported_traces = traces_seen.lock().unwrap();
+        assert_eq!(exported_traces.len(), 1);
+        assert_eq!(exported_traces[0].operation_name, "finished_op");
+        let remaining = telemetry.active_traces.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].span_id, in_progress_span_id);
+
+        // Metric and event passthrough.
+        let exported_metrics = metrics_seen.lock().unwrap();
+        assert_eq!(exported_metrics.len(), 1);
+        assert_eq!(exported_metrics[0].name, "c");
+        let exported_events = events_seen.lock().unwrap();
+        assert_eq!(exported_events.len(), 1);
+        assert_eq!(exported_events[0].name, "evt");
+    }
+
+    /// `export_all` must propagate exporter errors to the caller so the
+    /// surrounding pipeline can react (retry, page, etc.).
+    #[tokio::test]
+    async fn test_export_all_propagates_exporter_failure() {
+        struct FailingExporter;
+        #[async_trait]
+        impl TelemetryExporter for FailingExporter {
+            async fn export_traces(&self, _: Vec<TraceContext>) -> Result<(), TelemetryError> {
+                Ok(())
+            }
+            async fn export_metrics(&self, _: Vec<MetricPoint>) -> Result<(), TelemetryError> {
+                Err(TelemetryError::ExportFailed {
+                    reason: "downstream offline".to_string(),
+                })
+            }
+            async fn export_events(&self, _: Vec<CustomEvent>) -> Result<(), TelemetryError> {
+                Ok(())
+            }
+            async fn export_system_metrics(&self, _: SystemMetrics) -> Result<(), TelemetryError> {
+                Ok(())
+            }
+            async fn health_check(&self) -> Result<bool, TelemetryError> {
+                Ok(true)
+            }
+        }
+
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(FailingExporter));
+        telemetry.record_counter("c", 1.0, vec![]);
+        let err = telemetry.export_all().await.unwrap_err();
+        assert!(matches!(err, TelemetryError::ExportFailed { .. }));
+    }
+
+    /// `with_config` must replace the configuration wholesale, including
+    /// service identity reflected in subsequent `start_trace` attributes.
+    #[tokio::test]
+    async fn test_with_config_replaces_configuration_wholesale() {
+        let mut cfg = TelemetryConfig::default();
+        cfg.service.name = "from-config".to_string();
+        cfg.service.version = "2.0.0".to_string();
+        cfg.global_attributes
+            .insert("k".to_string(), "v".to_string());
+
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("ignored")
+            .with_config(cfg);
+
+        let trace = telemetry.start_trace("op");
+        assert_eq!(
+            trace.attributes.get("service.name").map(String::as_str),
+            Some("from-config"),
+        );
+        assert_eq!(
+            trace.attributes.get("service.version").map(String::as_str),
+            Some("2.0.0"),
+        );
+        assert_eq!(trace.attributes.get("k").map(String::as_str), Some("v"));
+    }
+
+    /// `initialize` must be idempotent — calling it twice on the same
+    /// system after first success is a no-op, not an error.
+    #[tokio::test]
+    async fn test_initialize_is_idempotent_after_success() {
+        let mut telemetry = TelemetrySystem::new();
+        // Pretend initialization succeeded already by setting the flag
+        // directly; this avoids fighting the global tracing subscriber.
+        telemetry.initialized = true;
+        // Should be a no-op success.
+        telemetry.initialize().await.unwrap();
+        assert!(telemetry.initialized);
+    }
+
+    /// `get_uptime` must return a non-decreasing duration since system
+    /// creation; in particular, it must be non-zero after observable
+    /// async work.
+    #[tokio::test]
+    async fn test_get_uptime_is_monotonic() {
+        let telemetry = TelemetrySystem::new();
+        let first = telemetry.get_uptime();
+        // tokio::yield_now is enough to ensure the Instant has advanced
+        // on any reasonable clock, but use a tiny sleep to be portable.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second = telemetry.get_uptime();
+        assert!(second >= first, "uptime must be non-decreasing");
+        assert!(second > Duration::ZERO);
+    }
+
+    /// `get_prometheus_exporter` is documented as a placeholder that
+    /// currently returns `None`. Pin that contract so a future change
+    /// without a corresponding test update is caught.
+    #[tokio::test]
+    async fn test_get_prometheus_exporter_placeholder_returns_none() {
+        let telemetry = TelemetrySystem::new();
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
 }
