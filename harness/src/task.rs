@@ -608,6 +608,29 @@ impl Default for TaskManager {
     }
 }
 
+#[cfg(test)]
+impl TaskManager {
+    /// Insert a task in `Running` state directly into the store.  Only for
+    /// tests that need to exercise the `Running → Cancelled` transition without
+    /// spawning a real agent loop.
+    pub async fn insert_running_task_for_test(&self, task: Task) {
+        let mut tasks = self.tasks.write().await;
+        tasks.insert(task.id.clone(), task);
+    }
+
+    /// Insert a dummy abort handle for a task so `cancel()` sees a handle to
+    /// remove (matching the real behaviour when a background spawn is live).
+    pub async fn insert_dummy_handle_for_test(&self, task_id: TaskId) {
+        let dummy = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = dummy.abort_handle();
+        let mut handles = self.handles.write().await;
+        handles.insert(task_id, abort_handle);
+        // `dummy` is intentionally leaked here; the abort_handle will abort it
+        // when cancel() is called.
+        dummy.abort();
+    }
+}
+
 fn parse_modified_files(diff: Option<&str>) -> Vec<String> {
     let Some(diff) = diff else {
         return vec![];

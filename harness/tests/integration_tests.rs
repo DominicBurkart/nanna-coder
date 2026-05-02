@@ -1925,7 +1925,7 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
         .await
         .unwrap();
 
-    assert_eq!(assign_result["status"], "Pending");
+    assert_eq!(assign_result["status"], "pending");
     let task_id = assign_result["task_id"].as_str().unwrap().to_string();
 
     let poll_params = json!({"task_id": task_id});
@@ -1934,7 +1934,7 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
         loop {
             let poll = handle_poll_task(&poll_params, &manager).await.unwrap();
             let status = poll["status"].as_str().unwrap().to_string();
-            if status != "Pending" && status != "Running" {
+            if status != "pending" && status != "running" {
                 return status;
             }
             sleep(Duration::from_millis(100)).await;
@@ -1943,12 +1943,12 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
     .await
     .expect("Task did not reach terminal state within timeout");
 
-    assert_eq!(final_status, "Completed");
+    assert_eq!(final_status, "completed");
 
     let get_params = json!({"task_id": task_id});
     let result = handle_get_result(&get_params, &manager).await.unwrap();
 
-    assert_eq!(result["status"], "Completed");
+    assert_eq!(result["status"], "completed");
     assert_eq!(result["task_id"], task_id.as_str());
     assert_eq!(result["model_used"], "test-model");
     assert!(result["iterations"].is_number());
@@ -1982,7 +1982,7 @@ async fn test_e2e_mcp_assign_poll_get_result_failure() {
         loop {
             let poll = handle_poll_task(&poll_params, &manager).await.unwrap();
             let status = poll["status"].as_str().unwrap().to_string();
-            if status != "Pending" && status != "Running" {
+            if status != "pending" && status != "running" {
                 return status;
             }
             sleep(Duration::from_millis(100)).await;
@@ -1991,12 +1991,12 @@ async fn test_e2e_mcp_assign_poll_get_result_failure() {
     .await
     .expect("Task did not reach terminal state within timeout");
 
-    assert_eq!(final_status, "Failed");
+    assert_eq!(final_status, "failed");
 
     let get_params = json!({"task_id": task_id});
     let result = handle_get_result(&get_params, &manager).await.unwrap();
 
-    assert_eq!(result["status"], "Failed");
+    assert_eq!(result["status"], "failed");
     assert!(result["error"].as_str().is_some_and(|e| !e.is_empty()));
     assert!(result["diagnostics"].is_object());
 }
@@ -2025,7 +2025,7 @@ async fn test_e2e_mcp_get_result_while_pending_returns_error() {
         .await
         .unwrap();
     let status = poll["status"].as_str().unwrap();
-    if status == "Pending" || status == "Running" {
+    if status == "pending" || status == "running" {
         let get_result = handle_get_result(&json!({"task_id": task_id}), &manager).await;
         assert!(
             get_result.is_err(),
@@ -2089,7 +2089,7 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
                     .await
                     .unwrap();
                 let s = poll["status"].as_str().unwrap().to_string();
-                if s != "Pending" && s != "Running" {
+                if s != "pending" && s != "running" {
                     return s;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -2101,7 +2101,7 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
                     .await
                     .unwrap();
                 let s = poll["status"].as_str().unwrap().to_string();
-                if s != "Pending" && s != "Running" {
+                if s != "pending" && s != "running" {
                     return s;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -2112,8 +2112,8 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
     .await
     .expect("Tasks did not complete within timeout");
 
-    assert_eq!(status_a, "Completed");
-    assert_eq!(status_b, "Completed");
+    assert_eq!(status_a, "completed");
+    assert_eq!(status_b, "completed");
 
     let result_a = handle_get_result(&json!({"task_id": task_id_a}), &manager)
         .await
