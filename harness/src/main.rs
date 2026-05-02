@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
-use harness::tools::ToolRegistry;
+use harness::tools::{create_tool_registry, ToolRegistry};
 use model::prelude::*;
 use std::io::{self, Write};
 use tracing::{error, info};
@@ -152,10 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    harness::tools::create_tool_registry(workspace_root)
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
