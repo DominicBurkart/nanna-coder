@@ -10,7 +10,10 @@
 //! - `TaskId`: `Display` / `fmt` implementation
 
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    CalculatorTool, GitDiffTool, ListDirTool, ReadFileTool, SearchTool, Tool, ToolError,
+    ToolRegistry, WriteFileTool,
+};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -256,4 +259,145 @@ fn task_id_new_display_is_non_empty() {
     assert!(!s.is_empty(), "TaskId display must not be empty");
     // UUID v4 is 36 chars (with hyphens)
     assert_eq!(s.len(), 36, "UUID v4 should be 36 chars, got: {s}");
+}
+
+// ---------------------------------------------------------------------------
+// ListDirTool – recursive listing and invalid glob
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_dir_recursive_finds_nested_files() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sub = temp_dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("nested.txt"), "hello").unwrap();
+    std::fs::write(temp_dir.path().join("top.txt"), "world").unwrap();
+
+    let tool = ListDirTool::new(temp_dir.path().to_path_buf());
+    let result = tool
+        .execute(serde_json::json!({ "recursive": true }))
+        .await
+        .expect("recursive list must succeed");
+
+    let entries = result["entries"].as_array().expect("entries array");
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"nested.txt"),
+        "nested file must appear; got {names:?}"
+    );
+    assert!(
+        names.contains(&"top.txt"),
+        "top-level file must appear; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_dir_recursive_invalid_glob_returns_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp_dir.path().join("a.txt"), "x").unwrap();
+
+    let tool = ListDirTool::new(temp_dir.path().to_path_buf());
+    let err = tool
+        .execute(serde_json::json!({ "recursive": true, "pattern": "[invalid" }))
+        .await
+        .expect_err("invalid glob must return an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments for bad glob, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_dir_non_recursive_invalid_glob_returns_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp_dir.path().join("b.rs"), "fn main() {}").unwrap();
+
+    let tool = ListDirTool::new(temp_dir.path().to_path_buf());
+    let err = tool
+        .execute(serde_json::json!({ "recursive": false, "pattern": "[bad" }))
+        .await
+        .expect_err("invalid glob must return an error in non-recursive mode");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments for bad glob, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SearchTool – invalid regex and max_results cap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_tool_invalid_regex_returns_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let tool = SearchTool::new(temp_dir.path().to_path_buf());
+    let err = tool
+        .execute(serde_json::json!({ "pattern": "([unclosed" }))
+        .await
+        .expect_err("invalid regex must return an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments for bad regex, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_tool_max_results_caps_output() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    // Write a file where every line matches the pattern.
+    let content = (0..10).map(|i| format!("match {i}")).collect::<Vec<_>>().join("\n");
+    std::fs::write(temp_dir.path().join("data.txt"), content).unwrap();
+
+    let tool = SearchTool::new(temp_dir.path().to_path_buf());
+    let result = tool
+        .execute(serde_json::json!({ "pattern": "match", "max_results": 3 }))
+        .await
+        .expect("capped search must succeed");
+
+    let count = result["count"].as_u64().unwrap_or(0);
+    assert_eq!(count, 3, "results must be capped at max_results=3, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// GitDiffTool – staged flag exercises the `git diff --cached` path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn git_diff_tool_staged_flag() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+
+    // Initialise a bare-minimum git repo so `git diff --cached` can run.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "ci@example.com"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "CI"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git config name");
+
+    let tool = GitDiffTool::new(temp_dir.path().to_path_buf());
+    let result = tool
+        .execute(serde_json::json!({ "staged": true }))
+        .await
+        .expect("git diff --cached in a fresh repo must succeed");
+
+    assert_eq!(
+        result["staged"], true,
+        "response must reflect staged=true flag"
+    );
+    assert_eq!(
+        result["has_changes"], false,
+        "fresh repo has no staged changes"
+    );
 }
