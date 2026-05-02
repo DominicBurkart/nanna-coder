@@ -1,4 +1,9 @@
 [config]
 exclude-files = [
-    "model/tests/*_integration.rs"
+    "model/tests/*_integration.rs",
+    # run_http and run_http_from_listener are two-line server-loop entry points
+    # (Server::bind/from_tcp -> serve) that block indefinitely.  All reachable
+    # logic inside them is exercised by the roundtrip tests via tokio::spawn;
+    # the entry points themselves cannot be driven to completion in a unit test.
+    "harness/src/mcp/http.rs"
 ]

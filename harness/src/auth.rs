@@ -394,6 +394,53 @@ mod tests {
         assert!(limiter.check_rate_limit(&ip).is_ok());
     }
 
+    /// check_rate_limit must evict an entry whose window has expired and allow
+    /// the request, even if the recorded failure count was at the threshold.
+    #[test]
+    fn test_check_rate_limit_evicts_expired_entry() {
+        // Window of 0 means every entry is already expired on next check.
+        let limiter = RateLimiter::new(1, Duration::from_secs(0));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Push failure count to threshold.
+        limiter.record_failure(&ip);
+        // A tiny sleep to ensure elapsed() > Duration::ZERO.
+        std::thread::sleep(Duration::from_millis(1));
+
+        // The window has expired: check_rate_limit must evict the entry and
+        // return Ok rather than RateLimited.
+        assert!(
+            limiter.check_rate_limit(&ip).is_ok(),
+            "expired window entry must be evicted and request allowed"
+        );
+    }
+
+    /// record_failure must reset the counter (to 1) when the existing entry's
+    /// window has expired, rather than incrementing the stale count.
+    #[test]
+    fn test_record_failure_resets_on_expired_window() {
+        // Window of 0 ms — expires immediately.
+        let limiter = RateLimiter::new(10, Duration::from_secs(0));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Saturate the counter well above the max_failures threshold.
+        for _ in 0..5 {
+            limiter.record_failure(&ip);
+        }
+
+        // Wait for the window to expire.
+        std::thread::sleep(Duration::from_millis(1));
+
+        // A new failure after window expiry must reset the counter to 1, not
+        // increment the old stale count.  After the reset the limiter should
+        // allow requests (count=1 < max_failures=10).
+        limiter.record_failure(&ip);
+        assert!(
+            limiter.check_rate_limit(&ip).is_ok(),
+            "counter must have been reset to 1 after window expiry, not accumulated"
+        );
+    }
+
     // ---------------------------------------------------------------
     // Token-file tests
     // ---------------------------------------------------------------
