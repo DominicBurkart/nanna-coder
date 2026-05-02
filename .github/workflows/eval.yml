@@ -10,9 +10,10 @@ on:
       model:
         description: 'Model to use for evaluation'
         required: false
-        default: 'qwen3:0.6b'
+        default: 'gemma4:e4b'
         type: choice
         options:
+          - gemma4:e4b
           - qwen3:0.6b
           - llama3.1:8b
       case_filter:
@@ -51,17 +52,33 @@ jobs:
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
         ollama serve &
-        # Wait for Ollama to be ready
-        for i in $(seq 1 30); do
+        # Wait up to 60s for Ollama to be ready
+        for i in $(seq 1 60); do
           ollama list > /dev/null 2>&1 && break
           sleep 1
         done
-        ollama pull "$MODEL"
+        if ! ollama list > /dev/null 2>&1; then
+          echo "Ollama did not become ready within 60s"
+          exit 1
+        fi
+        for attempt in 1 2 3; do
+          echo "Pulling $MODEL (attempt $attempt/3)..."
+          if timeout 600 ollama pull "$MODEL"; then
+            echo "Pulled $MODEL"
+            break
+          fi
+          if [ "$attempt" = "3" ]; then
+            echo "Failed to pull $MODEL after 3 attempts"
+            exit 1
+          fi
+          sleep $((attempt * 10))
+        done
 
     - name: Run eval suite
       id: eval
       env:
         MODEL: ${{ inputs.model }}
+        NANNA_EVAL_MODEL: ${{ inputs.model }}
         CASE_FILTER: ${{ inputs.case_filter }}
       run: |
         echo "## Eval Results" > eval-results.md
