@@ -13,6 +13,10 @@ use std::sync::Arc;
 /// unbounded body and OOMing the server.
 pub(crate) const MAX_BODY_BYTES: u64 = 1 << 20; // 1 MiB
 
+/// The WWW-Authenticate challenge returned on every 401 response.
+/// RFC 7235 §4.1 requires this header whenever 401 is returned.
+const WWW_AUTHENTICATE: &str = "Bearer realm=\"nanna-mcp\"";
+
 /// Extract bearer token from the Authorization header.
 pub(crate) fn extract_bearer_token(req: &Request<Body>) -> Result<&str, AuthError> {
     let header = req
@@ -41,6 +45,18 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Body> {
         .header("Content-Type", "application/json")
         .body(Body::from(serde_json::to_vec(body).unwrap_or_default()))
         .expect("failed to build response")
+}
+
+/// Build a 401 Unauthorized response with the required WWW-Authenticate header
+/// (RFC 7235 §4.1) and a JSON-RPC error body.
+fn unauthorized_response(message: &str) -> Response<Body> {
+    let body = json_rpc_error(-32000, message);
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("Content-Type", "application/json")
+        .header("WWW-Authenticate", WWW_AUTHENTICATE)
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+        .expect("failed to build 401 response")
 }
 
 async fn handle_http_request(
@@ -74,19 +90,17 @@ async fn handle_http_request(
         Ok(token) => {
             if let Err(e) = token_store.validate(token) {
                 rate_limiter.record_failure(&client_ip);
-                let (status, msg) = match e {
-                    AuthError::ExpiredToken => (StatusCode::UNAUTHORIZED, "expired token"),
-                    AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid token"),
-                    _ => (StatusCode::UNAUTHORIZED, "authentication failed"),
+                let msg = match e {
+                    AuthError::ExpiredToken => "expired token",
+                    AuthError::InvalidToken => "invalid token",
+                    _ => "authentication failed",
                 };
-                let body = json_rpc_error(-32000, msg);
-                return Ok(json_response(status, &body));
+                return Ok(unauthorized_response(msg));
             }
         }
         Err(_) => {
             rate_limiter.record_failure(&client_ip);
-            let body = json_rpc_error(-32000, "missing authorization header");
-            return Ok(json_response(StatusCode::UNAUTHORIZED, &body));
+            return Ok(unauthorized_response("missing authorization header"));
         }
     }
 
@@ -373,7 +387,8 @@ mod tests {
         );
     }
 
-    /// Missing Authorization header => 401, body must not contain the real token.
+    /// Missing Authorization header => 401 with WWW-Authenticate header, body
+    /// must not contain the real token.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_http_401_on_missing_auth() {
@@ -395,6 +410,10 @@ mod tests {
             .expect("HTTP request failed");
 
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "401 must include WWW-Authenticate header"
+        );
 
         let body = response.text().await.unwrap();
         assert!(
@@ -403,7 +422,8 @@ mod tests {
         );
     }
 
-    /// Wrong token => 401, body must not contain either the real or submitted token.
+    /// Wrong token => 401 with WWW-Authenticate header, body must not contain
+    /// either the real or submitted token.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_http_401_on_wrong_token() {
@@ -427,6 +447,10 @@ mod tests {
             .expect("HTTP request failed");
 
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "401 must include WWW-Authenticate header"
+        );
 
         let body = response.text().await.unwrap();
         assert!(
@@ -503,6 +527,10 @@ mod tests {
             response.status(),
             reqwest::StatusCode::UNAUTHORIZED,
             "unauthenticated request must 401 before body-size enforcement"
+        );
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "unauthenticated 401 must include WWW-Authenticate header"
         );
     }
 }
