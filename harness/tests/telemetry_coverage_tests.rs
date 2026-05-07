@@ -39,7 +39,7 @@ async fn prometheus_exporter_clear_buffer_empties_output() {
 async fn prometheus_exporter_health_check_returns_true() {
     let exporter = PrometheusExporter::new(None);
     let result = exporter.health_check().await;
-    assert_eq!(result.unwrap(), true);
+    assert!(result.unwrap());
 }
 
 #[tokio::test]
