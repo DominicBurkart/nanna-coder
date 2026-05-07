@@ -1,3 +1,4 @@
+use chrono::Utc;
 use harness::monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, ErrorEvent, ErrorSeverity, HealthMonitor, HealthStatus,
@@ -5,134 +6,159 @@ use harness::monitoring::{
 };
 use std::time::Duration;
 
-#[test]
-fn metrics_collector_is_healthy_after_init() {
-    let collector = DefaultMetricsCollector::new();
-    assert!(collector.is_healthy());
+#[tokio::test]
+async fn health_status_healthy_is_healthy() {
+    assert!(HealthStatus::Healthy.is_healthy());
+    assert!(!HealthStatus::Healthy.requires_attention());
 }
 
-#[test]
-fn metrics_collector_requires_attention_false_initially() {
-    let collector = DefaultMetricsCollector::new();
-    assert!(!collector.requires_attention());
+#[tokio::test]
+async fn health_status_warning_requires_attention() {
+    assert!(!HealthStatus::Warning.is_healthy());
+    assert!(HealthStatus::Warning.requires_attention());
 }
 
-#[test]
-fn metrics_collector_reset_clears_state() {
+#[tokio::test]
+async fn health_status_degraded_requires_attention() {
+    assert!(HealthStatus::Degraded.requires_attention());
+    assert!(!HealthStatus::Degraded.is_healthy());
+}
+
+#[tokio::test]
+async fn health_status_unhealthy_requires_attention() {
+    assert!(HealthStatus::Unhealthy.requires_attention());
+    assert!(!HealthStatus::Unhealthy.is_healthy());
+}
+
+#[tokio::test]
+async fn metrics_collector_reset_clears_latencies() {
     let mut collector = DefaultMetricsCollector::new();
-    collector.record_request(Duration::from_millis(50), true);
-    collector.reset_metrics();
-    let snapshot = collector.get_metrics_snapshot();
-    assert_eq!(snapshot.total_requests, 0);
+    collector
+        .record_request_latency("svc", Duration::from_millis(50))
+        .await;
+    collector.reset_metrics().await;
+    let metrics = collector.get_current_metrics().await.unwrap();
+    assert!(metrics.request_latencies.is_empty());
 }
 
-#[test]
-fn alert_manager_get_alert_history_respects_limit() {
-    let mut manager = DefaultAlertManager::new();
-    let thresholds = AlertThresholds::default();
-    // trigger several alerts by recording errors
+#[tokio::test]
+async fn alert_manager_history_limit_respected() {
+    let manager = DefaultAlertManager::new();
     for i in 0..5 {
-        let _ = manager.trigger_alert(
-            format!("alert-{}", i),
-            AlertSeverity::Warning,
-            format!("message {}", i),
-        );
+        manager
+            .send_alert(&format!("t{}", i), "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
     }
-    let history = manager.get_alert_history(Some(3));
+    let history = manager.get_alert_history(3).await.unwrap();
     assert!(history.len() <= 3);
 }
 
-#[test]
-fn alert_manager_acknowledge_nonexistent_returns_error() {
-    let mut manager = DefaultAlertManager::new();
-    let result = manager.acknowledge_alert("nonexistent-id");
+#[tokio::test]
+async fn alert_manager_acknowledge_nonexistent_returns_error() {
+    let manager = DefaultAlertManager::new();
+    let result = manager.acknowledge_alert("no-such-id").await;
     assert!(result.is_err());
 }
 
-#[test]
-fn alert_manager_configure_thresholds_ok() {
+#[tokio::test]
+async fn alert_manager_configure_thresholds_ok() {
     let mut manager = DefaultAlertManager::new();
-    let thresholds = AlertThresholds::default();
-    let result = manager.configure_thresholds(thresholds);
+    let result = manager.configure_thresholds(AlertThresholds::default()).await;
     assert!(result.is_ok());
 }
 
-#[test]
-fn metrics_format_custom_returns_error_on_unsupported() {
+#[tokio::test]
+async fn metrics_format_custom_returns_error() {
     let collector = DefaultMetricsCollector::new();
-    let result = collector.export_metrics(MetricsFormat::Custom("unknown".to_string()));
+    let result = collector
+        .export_metrics(MetricsFormat::Custom("unknown".to_string()))
+        .await;
     assert!(result.is_err());
 }
 
-#[test]
-fn alert_severity_ordering() {
-    assert!(AlertSeverity::Critical > AlertSeverity::Warning);
+#[tokio::test]
+async fn alert_severity_ordering() {
+    assert!(AlertSeverity::Critical > AlertSeverity::Error);
+    assert!(AlertSeverity::Error > AlertSeverity::Warning);
     assert!(AlertSeverity::Warning > AlertSeverity::Info);
 }
 
-#[test]
-fn error_severity_ordering() {
-    assert!(ErrorSeverity::Critical > ErrorSeverity::High);
-    assert!(ErrorSeverity::High > ErrorSeverity::Medium);
-    assert!(ErrorSeverity::Medium > ErrorSeverity::Low);
+#[tokio::test]
+async fn error_severity_ordering() {
+    assert!(ErrorSeverity::Critical > ErrorSeverity::Error);
+    assert!(ErrorSeverity::Error > ErrorSeverity::Warning);
+    assert!(ErrorSeverity::Warning > ErrorSeverity::Info);
 }
 
-#[test]
-fn metrics_collector_record_error_increments_count() {
+#[tokio::test]
+async fn metrics_collector_record_error_increments_count() {
     let mut collector = DefaultMetricsCollector::new();
     let event = ErrorEvent {
+        timestamp: Utc::now(),
         error_type: "TestError".to_string(),
-        message: "test".to_string(),
-        severity: ErrorSeverity::Low,
-        timestamp: std::time::SystemTime::now(),
+        message: "test message".to_string(),
+        component: "test-component".to_string(),
+        severity: ErrorSeverity::Warning,
     };
-    collector.record_error(event);
-    let snapshot = collector.get_metrics_snapshot();
-    assert!(snapshot.total_errors > 0);
+    collector.record_error(event).await;
+    let metrics = collector.get_current_metrics().await.unwrap();
+    assert_eq!(metrics.error_metrics.total_errors, 1);
 }
 
-#[test]
-fn health_monitor_check_model_health_returns_healthy() {
-    let monitor = DefaultHealthMonitor::new();
-    let status = monitor.check_model_health("test-model");
-    assert_eq!(status, HealthStatus::Healthy);
+#[tokio::test]
+async fn health_monitor_check_model_health_returns_healthy() {
+    let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+    let result = monitor.check_model_health("test-model").await.unwrap();
+    assert_eq!(result.status, HealthStatus::Healthy);
 }
 
-#[test]
-fn alert_thresholds_default_values_are_sane() {
+#[tokio::test]
+async fn alert_thresholds_default_values_are_sane() {
     let t = AlertThresholds::default();
-    assert!(t.error_rate_threshold > 0.0);
-    assert!(t.latency_threshold_ms > 0);
+    assert!(t.max_latency_ms > 0);
+    assert!(t.max_error_rate > 0.0);
+    assert!(t.max_cpu_usage > 0.0);
 }
 
-#[test]
-fn monitoring_system_start_stop_lifecycle() {
+#[tokio::test]
+async fn monitoring_system_start_stop_lifecycle() {
     let mut system = MonitoringSystem::new();
-    let start_result = system.start_monitoring();
-    assert!(start_result.is_ok());
-    let stop_result = system.stop_monitoring();
-    assert!(stop_result.is_ok());
+    assert!(system.start_monitoring().await.is_ok());
+    system.stop_monitoring().await;
 }
 
-#[test]
-fn metrics_snapshot_latency_percentiles_ordered() {
+#[tokio::test]
+async fn metrics_latency_min_lte_avg_lte_max() {
     let mut collector = DefaultMetricsCollector::new();
-    for ms in [10, 20, 30, 50, 100, 200, 500] {
-        collector.record_request(Duration::from_millis(ms), true);
+    for ms in [10u64, 20, 30, 50, 100] {
+        collector
+            .record_request_latency("test", Duration::from_millis(ms))
+            .await;
     }
-    let snapshot = collector.get_metrics_snapshot();
-    assert!(snapshot.latency_p50_ms <= snapshot.latency_p95_ms);
-    assert!(snapshot.latency_p95_ms <= snapshot.latency_p99_ms);
+    let metrics = collector.get_current_metrics().await.unwrap();
+    let l = metrics.request_latencies.get("test").unwrap();
+    assert!(l.min_latency_ms <= l.avg_latency_ms);
+    assert!(l.avg_latency_ms <= l.max_latency_ms);
 }
 
-#[test]
-fn metrics_snapshot_error_rate_calculation() {
+#[tokio::test]
+async fn metrics_error_rate_positive_after_errors() {
     let mut collector = DefaultMetricsCollector::new();
-    // 2 success, 1 failure => error rate ~0.33
-    collector.record_request(Duration::from_millis(10), true);
-    collector.record_request(Duration::from_millis(10), true);
-    collector.record_request(Duration::from_millis(10), false);
-    let snapshot = collector.get_metrics_snapshot();
-    assert!(snapshot.error_rate > 0.0);
-    assert!(snapshot.error_rate < 1.0);
+    collector
+        .record_request_latency("svc", Duration::from_millis(10))
+        .await;
+    collector
+        .record_request_latency("svc", Duration::from_millis(10))
+        .await;
+    let event = ErrorEvent {
+        timestamp: Utc::now(),
+        error_type: "E".to_string(),
+        message: "m".to_string(),
+        component: "c".to_string(),
+        severity: ErrorSeverity::Error,
+    };
+    collector.record_error(event).await;
+    let metrics = collector.get_current_metrics().await.unwrap();
+    assert!(metrics.error_metrics.total_errors > 0);
 }

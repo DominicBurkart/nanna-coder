@@ -11,14 +11,17 @@ fn observability_system_uptime_increases() {
 }
 
 #[test]
-fn observability_system_with_health_thresholds() {
+fn observability_system_with_custom_health_threshold() {
     let threshold = HealthThreshold {
-        metric_name: "error_rate".to_string(),
-        warning_value: 0.05,
-        critical_value: 0.15,
+        cpu_threshold: 70.0,
+        memory_threshold: 80.0,
+        disk_threshold: 85.0,
+        max_latency_ms: 1000,
+        min_cache_hit_rate: 0.7,
+        max_error_rate: 0.1,
+        container_timeout: Duration::from_secs(15),
     };
-    let system = ObservabilitySystem::new().with_health_thresholds(vec![threshold]);
-    // just verifies construction doesn't panic
+    let system = ObservabilitySystem::new().with_health_thresholds(threshold);
     drop(system);
 }
 
@@ -29,25 +32,38 @@ fn observability_system_with_immediate_critical_alert_policy() {
     drop(system);
 }
 
-#[test]
-fn observability_system_start_and_stop_monitoring() {
+#[tokio::test]
+async fn observability_system_start_and_stop_monitoring() {
     let mut system = ObservabilitySystem::new();
-    assert!(system.start_monitoring().is_ok());
-    assert!(system.stop_monitoring().is_ok());
+    assert!(system.start_monitoring().await.is_ok());
+    system.stop_monitoring().await;
 }
 
-#[test]
-fn observability_system_stop_monitoring_twice_is_safe() {
+#[tokio::test]
+async fn observability_system_stop_without_start_is_safe() {
     let mut system = ObservabilitySystem::new();
-    let _ = system.start_monitoring();
-    let _ = system.stop_monitoring();
-    // second stop should not panic
-    let _ = system.stop_monitoring();
+    system.stop_monitoring().await;
 }
 
 #[test]
 fn health_threshold_default_is_well_formed() {
     let t = HealthThreshold::default();
-    assert!(t.warning_value < t.critical_value);
-    assert!(!t.metric_name.is_empty());
+    assert!(t.cpu_threshold > 0.0 && t.cpu_threshold <= 100.0);
+    assert!(t.memory_threshold > 0.0 && t.memory_threshold <= 100.0);
+    assert!(t.max_latency_ms > 0);
+    assert!(t.max_error_rate > 0.0 && t.max_error_rate < 1.0);
+}
+
+#[test]
+fn alert_policy_balanced_has_grouping_rules() {
+    let policy = AlertPolicy::balanced();
+    assert!(!policy.escalation_rules.is_empty());
+    assert!(!policy.grouping_rules.is_empty());
+}
+
+#[test]
+fn alert_policy_immediate_critical_has_escalation_rules() {
+    let policy = AlertPolicy::immediate_critical();
+    assert!(!policy.escalation_rules.is_empty());
+    assert!(!policy.notification_channels.is_empty());
 }
