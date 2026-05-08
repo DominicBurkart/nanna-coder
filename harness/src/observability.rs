@@ -1097,4 +1097,199 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_determine_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-1".to_string(),
+            title: "Container crash".to_string(),
+            description: "Container stopped unexpectedly".to_string(),
+            severity: AlertSeverity::Error,
+            component: "container:nanna-coder".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
+    }
+
+    #[tokio::test]
+    async fn test_determine_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-2".to_string(),
+            title: "Quality degraded".to_string(),
+            description: "Model quality below threshold".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "model:qwen3".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
+    }
+
+    #[tokio::test]
+    async fn test_determine_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-3".to_string(),
+            title: "Performance degradation detected".to_string(),
+            description: "Latency increased 3x".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
+    }
+
+    #[tokio::test]
+    async fn test_determine_alert_category_availability_fallback() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-4".to_string(),
+            title: "Something is wrong".to_string(),
+            description: "Unknown issue".to_string(),
+            severity: AlertSeverity::Info,
+            component: "network".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
+    }
+
+    #[tokio::test]
+    async fn test_calculate_priority_score_critical_capped() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-5".to_string(),
+            title: "Critical failure".to_string(),
+            description: "System down".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "container:main".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Critical(100) + ContainerHealth(+20) = 120, capped at 100
+        let score =
+            system.calculate_priority_score(&alert, &AlertCategory::ContainerHealth);
+        assert_eq!(score, 100);
+    }
+
+    #[tokio::test]
+    async fn test_calculate_priority_score_warning_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-6".to_string(),
+            title: "Perf warning".to_string(),
+            description: "Slow response".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Warning(50) + Performance(+10) = 60
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Performance);
+        assert_eq!(score, 60);
+    }
+
+    #[tokio::test]
+    async fn test_calculate_priority_score_info_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-7".to_string(),
+            title: "Info alert".to_string(),
+            description: "FYI".to_string(),
+            severity: AlertSeverity::Info,
+            component: "api".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Info(25) + Availability(+20) = 45
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Availability);
+        assert_eq!(score, 45);
+    }
+
+    #[tokio::test]
+    async fn test_sla_compliance_at_risk() {
+        let system = ObservabilitySystem::new();
+        let metrics = system.calculate_availability_metrics().unwrap();
+        assert_eq!(metrics.sla_compliance.status, SlaStatus::AtRisk);
+        assert!(metrics.sla_compliance.current_availability < 99.9);
+        assert!(
+            (metrics.sla_compliance.target_availability - 99.9).abs() < f64::EPSILON
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_recommended_actions_container() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-8".to_string(),
+            title: "Container issue".to_string(),
+            description: "".to_string(),
+            severity: AlertSeverity::Error,
+            component: "container:x".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions =
+            system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.to_lowercase().contains("container")));
+    }
+
+    #[tokio::test]
+    async fn test_generate_recommended_actions_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "test-9".to_string(),
+            title: "Slow response".to_string(),
+            description: "".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "api".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions =
+            system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_health_threshold_defaults() {
+        let thresholds = HealthThreshold::default();
+        assert!((thresholds.cpu_threshold - 80.0).abs() < f64::EPSILON);
+        assert!((thresholds.memory_threshold - 85.0).abs() < f64::EPSILON);
+        assert!((thresholds.disk_threshold - 90.0).abs() < f64::EPSILON);
+        assert_eq!(thresholds.max_latency_ms, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_alert_policy_balanced_has_grouping_rules() {
+        let policy = AlertPolicy::balanced();
+        assert!(!policy.grouping_rules.is_empty());
+        assert!(!policy.escalation_rules.is_empty());
+    }
 }
