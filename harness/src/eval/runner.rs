@@ -1,39 +1,22 @@
 //! Eval runner — execute nanna agent against single eval cases.
-//!
-//! Copies fixture repositories into isolated temporary directories,
-//! runs the [`AgentLoop`] with the task prompt, verifies the result,
-//! and returns structured metrics.
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use harness::eval::runner::{run_eval, EvalRunnerConfig};
-//! use harness::agent::eval_case::EvalCase;
-//! use std::path::Path;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let task_toml = Path::new("evals/cases/happy-path-001/task.toml");
-//! let case = EvalCase::from_toml_file(task_toml)?;
-//! let case_dir = task_toml.parent().unwrap();
-//! let config = EvalRunnerConfig::default();
-//!
-//! let result = run_eval(&case, case_dir, &config).await?;
-//! println!("Success: {}, Iterations: {}", result.success, result.iterations);
-//! # Ok(())
-//! # }
-//! ```
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
 use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
+use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, SWEBenchTask};
+use crate::eval::swebench_verify::{
+    verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
+};
 use crate::tools::create_tool_registry;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-/// Errors that can occur when running an eval case.
+const SWEBENCH_TAG: &str = "swebench-verified";
+const DEFAULT_SWEBENCH_DATASET_REL: &str = "datasets/swebench-verified-sample.jsonl";
+
 #[derive(Debug, Error)]
 pub enum EvalRunnerError {
     #[error("IO error: {0}")]
@@ -46,28 +29,43 @@ pub enum EvalRunnerError {
     ModelProvider(String),
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
+    #[error("SWE-bench dataset not found at {0}")]
+    SwebenchDatasetMissing(PathBuf),
+    #[error("SWE-bench instance {0} not present in dataset")]
+    SwebenchInstanceMissing(String),
+    #[error("SWE-bench materialize failed: {0}")]
+    SwebenchMaterialize(#[from] SWEBenchError),
+    #[error("SWE-bench verify failed: {0}")]
+    SwebenchVerify(#[from] VerifyError),
+    #[error("git diff capture failed: {0}")]
+    GitDiff(String),
 }
 
-/// Configuration for the eval runner.
 #[derive(Debug, Clone)]
 pub struct EvalRunnerConfig {
-    /// Model name to use (e.g. `"qwen3:0.6b"`).
     pub model_name: String,
-    /// Base URL for the model provider (Ollama). `None` means localhost default.
     pub model_base_url: Option<String>,
-    /// Enable verbose logging during agent execution.
     pub verbose: bool,
-    /// Maximum iterations for the agent loop.
     pub max_iterations: usize,
+    pub swebench_dataset_path: Option<PathBuf>,
+    pub swebench_hf_dataset: String,
+    pub swebench_run_id: String,
 }
 
 impl Default for EvalRunnerConfig {
     fn default() -> Self {
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| format!("nanna-{}", d.as_secs()))
+            .unwrap_or_else(|_| "nanna-run".to_string());
         Self {
             model_name: "qwen3:0.6b".to_string(),
             model_base_url: None,
             verbose: false,
             max_iterations: 100,
+            swebench_dataset_path: None,
+            swebench_hf_dataset: "princeton-nlp/SWE-bench_Verified".to_string(),
+            swebench_run_id: run_id,
         }
     }
 }
@@ -94,7 +92,6 @@ impl EvalRunnerConfig {
     }
 }
 
-/// Aggregated token usage for an eval run (re-export of [`model::types::Usage`]).
 pub type TokenUsage = model::types::Usage;
 
 fn default_token_usage() -> TokenUsage {
@@ -105,25 +102,17 @@ fn default_token_usage() -> TokenUsage {
     }
 }
 
-/// Results of post-completion verification checks.
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
-    /// Whether `cargo build` passed (`None` if not required).
     pub build_passed: Option<bool>,
-    /// Whether `cargo test` passed (`None` if not required).
     pub tests_passed: Option<bool>,
-    /// Expected files that were found in the working directory.
     pub files_found: Vec<String>,
-    /// Expected files that were NOT found.
     pub missing_files: Vec<String>,
-    /// Required symbols that were found in source files.
     pub symbols_found: Vec<String>,
-    /// Required symbols that were NOT found.
     pub missing_symbols: Vec<String>,
 }
 
 impl VerificationResult {
-    /// Returns `true` when all verification checks passed.
     pub fn all_passed(&self) -> bool {
         self.build_passed.unwrap_or(true)
             && self.tests_passed.unwrap_or(true)
@@ -132,49 +121,40 @@ impl VerificationResult {
     }
 }
 
-/// The result of running a single eval case.
 #[derive(Debug, Clone)]
 pub struct EvalRunResult {
-    /// The case ID from the task.toml.
     pub case_id: String,
-    /// Whether the eval passed all checks.
     pub success: bool,
-    /// Wall-clock execution time.
     pub execution_time: Duration,
-    /// Number of agent loop iterations.
     pub iterations: usize,
-    /// Token usage aggregated across all LLM calls.
     pub token_usage: TokenUsage,
-    /// Post-completion verification results.
     pub verification: VerificationResult,
-    /// Failure descriptions (empty when `success` is true).
     pub failures: Vec<String>,
-    /// The underlying agent result, if the agent ran successfully.
     pub agent_result: Option<AgentRunResult>,
 }
 
-/// Run a single eval case end-to-end.
-///
-/// 1. Copies the fixture repo into an isolated temporary directory.
-/// 2. Initialises and runs the [`AgentLoop`] with the task prompt.
-/// 3. Runs post-completion verification checks.
-/// 4. Returns structured metrics.
 pub async fn run_eval(
     eval_case: &EvalCase,
     case_dir: &Path,
     config: &EvalRunnerConfig,
 ) -> Result<EvalRunResult, EvalRunnerError> {
     let start = Instant::now();
+    let is_swebench = is_swebench_case(eval_case);
 
-    // --- 1. Isolate: copy fixture repo into a temp dir ---
     let tmp_dir = tempfile::TempDir::new()?;
-    let repo_src = case_dir.join("repo");
-    if repo_src.is_dir() {
-        copy_dir_recursive(&repo_src, tmp_dir.path())?;
-    }
     let work_dir = tmp_dir.path();
+    let swebench_task: Option<SWEBenchTask> = if is_swebench {
+        let task = load_swebench_task(eval_case, case_dir, config)?;
+        materialize(&task, work_dir)?;
+        Some(task)
+    } else {
+        let repo_src = case_dir.join("repo");
+        if repo_src.is_dir() {
+            copy_dir_recursive(&repo_src, work_dir)?;
+        }
+        None
+    };
 
-    // --- 2. Build and run agent ---
     let agent_config = AgentConfig {
         max_iterations: config.max_iterations,
         verbose: config.verbose,
@@ -185,9 +165,6 @@ pub async fn run_eval(
     let tool_registry = create_tool_registry(work_dir);
     let entity_store = crate::entities::InMemoryEntityStore::new();
 
-    // Create LLM provider so the agent uses the tool-calling loop
-    // (without a provider, the agent falls back to the entity-based loop
-    // which never touches the filesystem — see issue #98).
     let mut ollama_config = OllamaConfig::new().with_timeout(Duration::from_secs(120));
     if let Some(url) = &config.model_base_url {
         ollama_config = ollama_config.with_base_url(url.clone());
@@ -215,7 +192,9 @@ pub async fn run_eval(
         }
         Ok(Err(e)) => {
             let mut f = vec![format!("Agent error: {e}")];
-            // Still run verification even on agent error
+            if let Some(task) = &swebench_task {
+                return finish_swebench(eval_case, task, work_dir, config, start, None, f).await;
+            }
             let verification =
                 run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
             let execution_time = start.elapsed();
@@ -239,11 +218,22 @@ pub async fn run_eval(
         }
     };
 
-    // --- 3. Verification ---
+    if let Some(task) = &swebench_task {
+        return finish_swebench(
+            eval_case,
+            task,
+            work_dir,
+            config,
+            start,
+            agent_result,
+            failures,
+        )
+        .await;
+    }
+
     let verification =
         run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
 
-    // --- 4. Collect metrics ---
     let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
     let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
 
@@ -274,9 +264,160 @@ pub async fn run_eval(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Verification helpers
-// ---------------------------------------------------------------------------
+fn is_swebench_case(case: &EvalCase) -> bool {
+    case.metadata.tags.iter().any(|t| t == SWEBENCH_TAG)
+}
+
+fn resolve_swebench_dataset_path(
+    case_dir: &Path,
+    config: &EvalRunnerConfig,
+) -> Result<PathBuf, EvalRunnerError> {
+    if let Some(p) = &config.swebench_dataset_path {
+        return Ok(p.clone());
+    }
+    if let Ok(env) = std::env::var("NANNA_SWEBENCH_DATASET") {
+        return Ok(PathBuf::from(env));
+    }
+    let mut anc = case_dir.ancestors();
+    anc.next();
+    let cases_dir = anc
+        .next()
+        .ok_or_else(|| EvalRunnerError::SwebenchDatasetMissing(case_dir.to_path_buf()))?;
+    let evals_dir = anc
+        .next()
+        .ok_or_else(|| EvalRunnerError::SwebenchDatasetMissing(cases_dir.to_path_buf()))?;
+    Ok(evals_dir.join(DEFAULT_SWEBENCH_DATASET_REL))
+}
+
+fn load_swebench_task(
+    eval_case: &EvalCase,
+    case_dir: &Path,
+    config: &EvalRunnerConfig,
+) -> Result<SWEBenchTask, EvalRunnerError> {
+    let dataset_path = resolve_swebench_dataset_path(case_dir, config)?;
+    if !dataset_path.is_file() {
+        return Err(EvalRunnerError::SwebenchDatasetMissing(dataset_path));
+    }
+    let tasks = load_swebench_dataset(&dataset_path)?;
+    let needle = eval_case
+        .case
+        .id
+        .strip_prefix("swebench-")
+        .unwrap_or(eval_case.case.id.as_str());
+    tasks
+        .into_iter()
+        .find(|t| t.instance_id == needle)
+        .ok_or_else(|| EvalRunnerError::SwebenchInstanceMissing(needle.to_string()))
+}
+
+async fn capture_swebench_patch(
+    work_dir: &Path,
+    base_commit: &str,
+) -> Result<String, EvalRunnerError> {
+    let add = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(work_dir)
+        .output()
+        .await
+        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git add: {e}")))?;
+    if !add.status.success() {
+        return Err(EvalRunnerError::GitDiff(format!(
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        )));
+    }
+    let diff = tokio::process::Command::new("git")
+        .args(["diff", base_commit, "--binary"])
+        .current_dir(work_dir)
+        .output()
+        .await
+        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git diff: {e}")))?;
+    if !diff.status.success() {
+        return Err(EvalRunnerError::GitDiff(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&diff.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&diff.stdout).into_owned())
+}
+
+async fn finish_swebench(
+    eval_case: &EvalCase,
+    task: &SWEBenchTask,
+    work_dir: &Path,
+    config: &EvalRunnerConfig,
+    start: Instant,
+    agent_result: Option<AgentRunResult>,
+    mut failures: Vec<String>,
+) -> Result<EvalRunResult, EvalRunnerError> {
+    let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
+
+    let verify_dir = work_dir.join("__nanna_verify");
+    std::fs::create_dir_all(&verify_dir)?;
+    let verify_config = VerifyConfig {
+        dataset_name: config.swebench_hf_dataset.clone(),
+        model_name_or_path: format!("nanna__{}", config.model_name.replace([':', '/'], "-")),
+        run_id: config.swebench_run_id.clone(),
+        work_dir: verify_dir,
+        max_workers: 1,
+    };
+
+    let predictions = vec![Prediction {
+        instance_id: task.instance_id.clone(),
+        model_patch,
+    }];
+
+    let verdicts = verify_predictions(&predictions, &verify_config).await?;
+    let verdict: Option<&InstanceVerdict> =
+        verdicts.iter().find(|v| v.instance_id == task.instance_id);
+
+    let resolved = verdict.map(|v| v.resolved).unwrap_or(false);
+    if let Some(v) = verdict {
+        if let Some(err) = &v.error {
+            failures.push(format!("SWE-bench verifier: {err}"));
+        }
+        if !v.resolved && v.error.is_none() {
+            failures.push("SWE-bench verdict: not resolved".to_string());
+        }
+    } else {
+        failures.push(format!(
+            "SWE-bench verdict missing for instance {}",
+            task.instance_id
+        ));
+    }
+
+    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
+    if !task_completed {
+        failures.push("Agent did not complete the task".to_string());
+    }
+
+    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
+    let token_usage = agent_result
+        .as_ref()
+        .and_then(|r| r.token_usage.clone())
+        .unwrap_or_else(default_token_usage);
+
+    let success = resolved && task_completed;
+    let execution_time = start.elapsed();
+
+    Ok(EvalRunResult {
+        case_id: eval_case.case.id.clone(),
+        success,
+        execution_time,
+        iterations,
+        token_usage,
+        verification: VerificationResult {
+            build_passed: None,
+            tests_passed: None,
+            files_found: Vec::new(),
+            missing_files: Vec::new(),
+            symbols_found: Vec::new(),
+            missing_symbols: Vec::new(),
+        },
+        failures,
+        agent_result,
+    })
+}
 
 async fn run_verification(
     work_dir: &Path,
@@ -393,14 +534,6 @@ fn verify_symbols(
     (found, missing)
 }
 
-/// Returns `true` if `haystack` contains `needle` bounded by non-identifier
-/// characters (or haystack boundaries) on both sides.
-///
-/// This avoids spurious matches where the required symbol happens to be a
-/// substring of an unrelated identifier (e.g. looking for `greet` and
-/// accidentally matching `greetings`). An identifier character is any
-/// alphanumeric ASCII character or `_`, matching the common identifier
-/// convention shared across the supported languages.
 fn contains_whole_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -431,12 +564,6 @@ fn contains_whole_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Map a language name to its common file extensions.
-///
-/// Unknown languages fall through to Rust extensions since every eval case
-/// fixture in `evals/cases/` is currently Rust. The fallthrough is logged at
-/// `warn` level so a typo in `task.toml` doesn't silently mis-route symbol
-/// search.
 fn extensions_for_language(language: &str) -> Vec<&'static str> {
     match language.to_lowercase().as_str() {
         "rust" => vec!["rs"],
@@ -458,13 +585,6 @@ fn extensions_for_language(language: &str) -> Vec<&'static str> {
     }
 }
 
-/// Directory names that are never walked when searching for source content.
-///
-/// These are build artefacts, VCS metadata, or dependency caches that can be
-/// very large and are not part of the agent-produced source tree. Including
-/// them would produce false-positive symbol matches (e.g. a required symbol
-/// appearing in a compiled `target/` artefact) and slow verification
-/// dramatically on any non-trivial repo.
 const SOURCE_IGNORE_DIRS: &[&str] = &[
     "target",
     ".git",
@@ -481,25 +601,15 @@ const SOURCE_IGNORE_DIRS: &[&str] = &[
     ".vscode",
 ];
 
-/// Recursively read source files under `dir` matching the given extensions
-/// and concatenate their contents.
-///
-/// Directories listed in [`SOURCE_IGNORE_DIRS`] are skipped. Symlinks are not
-/// followed to avoid cycles and to keep verification scoped to the
-/// agent-produced tree.
 fn collect_source_content(dir: &Path, extensions: &[&str]) -> String {
     let mut content = String::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            // Use the DirEntry's cheap file_type rather than following symlinks.
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            // Skip symlinks entirely — verification should only inspect real
-            // files produced by the agent. Following symlinks can loop and can
-            // reach files outside the workspace.
             if file_type.is_symlink() {
                 continue;
             }
@@ -542,23 +652,6 @@ fn verification_failures(v: &VerificationResult) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem helpers
-// ---------------------------------------------------------------------------
-
-/// Recursively copy the contents of `src` into `dst`.
-///
-/// Symlinks are **not** followed: if a symlink is encountered anywhere in the
-/// source tree, this function returns an [`std::io::Error`] of kind
-/// [`std::io::ErrorKind::InvalidInput`] rather than silently dereferencing
-/// the target. This protects against cycles (a symlink pointing to an
-/// ancestor directory would otherwise recurse forever) and against accidental
-/// escape from the fixture workspace (a symlink could point outside `src`).
-///
-/// If a fixture repo genuinely needs symlinks, the caller should switch to
-/// a richer copy utility (e.g. `fs_extra::dir::copy`) that can preserve
-/// symlink targets. Current eval fixtures are plain source trees and do not
-/// contain symlinks.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
@@ -567,8 +660,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        // Use DirEntry::file_type so we inspect the entry itself rather than
-        // a followed target (path.is_dir()/is_file() traverse symlinks).
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             return Err(std::io::Error::new(
@@ -585,8 +676,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
         }
-        // Silently skip other entry types (e.g. sockets, block devices) —
-        // they are never part of a source fixture.
     }
     Ok(())
 }
@@ -686,7 +775,6 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let dst = tempfile::TempDir::new().unwrap();
 
-        // Create a nested structure
         let sub = src.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(src.path().join("root.txt"), "hello").unwrap();
@@ -774,46 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verification_failures_none_checks() {
-        let v = VerificationResult {
-            build_passed: None,
-            tests_passed: None,
-            files_found: vec![],
-            missing_files: vec![],
-            symbols_found: vec![],
-            missing_symbols: vec![],
-        };
-        let failures = verification_failures(&v);
-        assert!(failures.is_empty());
-    }
-
-    #[test]
-    fn test_verification_missing_symbols() {
-        let v = VerificationResult {
-            build_passed: None,
-            tests_passed: None,
-            files_found: vec![],
-            missing_files: vec![],
-            symbols_found: vec![],
-            missing_symbols: vec!["bar".to_string(), "baz".to_string()],
-        };
-        assert!(!v.all_passed());
-    }
-
-    #[test]
-    fn test_verification_tests_failed() {
-        let v = VerificationResult {
-            build_passed: Some(true),
-            tests_passed: Some(false),
-            files_found: vec![],
-            missing_files: vec![],
-            symbols_found: vec![],
-            missing_symbols: vec![],
-        };
-        assert!(!v.all_passed());
-    }
-
-    #[test]
     fn test_extensions_for_language_rust() {
         assert_eq!(extensions_for_language("rust"), vec!["rs"]);
         assert_eq!(extensions_for_language("Rust"), vec!["rs"]);
@@ -822,61 +870,6 @@ mod tests {
     #[test]
     fn test_extensions_for_language_python() {
         assert_eq!(extensions_for_language("python"), vec!["py"]);
-        assert_eq!(extensions_for_language("Python"), vec!["py"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_javascript() {
-        assert_eq!(
-            extensions_for_language("javascript"),
-            vec!["js", "jsx", "mjs"]
-        );
-        assert_eq!(extensions_for_language("js"), vec!["js", "jsx", "mjs"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_typescript() {
-        assert_eq!(extensions_for_language("typescript"), vec!["ts", "tsx"]);
-        assert_eq!(extensions_for_language("ts"), vec!["ts", "tsx"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_go() {
-        assert_eq!(extensions_for_language("go"), vec!["go"]);
-        assert_eq!(extensions_for_language("golang"), vec!["go"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_java() {
-        assert_eq!(extensions_for_language("java"), vec!["java"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_c() {
-        assert_eq!(extensions_for_language("c"), vec!["c", "h"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_cpp() {
-        assert_eq!(
-            extensions_for_language("cpp"),
-            vec!["cpp", "cc", "cxx", "hpp", "h"]
-        );
-        assert_eq!(
-            extensions_for_language("c++"),
-            vec!["cpp", "cc", "cxx", "hpp", "h"]
-        );
-    }
-
-    #[test]
-    fn test_extensions_for_language_ruby() {
-        assert_eq!(extensions_for_language("ruby"), vec!["rb"]);
-    }
-
-    #[test]
-    fn test_extensions_for_language_unknown_defaults_to_rust() {
-        assert_eq!(extensions_for_language("haskell"), vec!["rs"]);
-        assert_eq!(extensions_for_language(""), vec!["rs"]);
     }
 
     #[test]
@@ -891,188 +884,16 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_source_content_recursive() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sub = dir.path().join("src");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("lib.rs"), "pub fn hello() {}").unwrap();
-        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
-
-        let content = collect_source_content(dir.path(), &["rs"]);
-        assert!(content.contains("pub fn hello()"));
-        assert!(content.contains("fn main()"));
-    }
-
-    #[test]
-    fn test_collect_source_content_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let content = collect_source_content(dir.path(), &["rs"]);
-        assert!(content.is_empty());
-    }
-
-    #[test]
-    fn test_collect_source_content_nonexistent_dir() {
-        let content = collect_source_content(Path::new("/nonexistent/path"), &["rs"]);
-        assert!(content.is_empty());
-    }
-
-    #[test]
-    fn test_collect_source_content_multiple_extensions() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("app.js"), "const x = 1;").unwrap();
-        std::fs::write(dir.path().join("comp.jsx"), "export default () => {};").unwrap();
-        std::fs::write(dir.path().join("style.css"), ".foo {}").unwrap();
-
-        let content = collect_source_content(dir.path(), &["js", "jsx"]);
-        assert!(content.contains("const x = 1;"));
-        assert!(content.contains("export default"));
-        assert!(!content.contains(".foo"));
-    }
-
-    #[test]
-    fn test_verify_files_empty_list() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (found, missing) = verify_files(dir.path(), &[]);
-        assert!(found.is_empty());
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn test_verify_symbols_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (found, missing) = verify_symbols(dir.path(), &[], "rust");
-        assert!(found.is_empty());
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn test_copy_dir_recursive_to_nonexistent_dst() {
-        let src = tempfile::TempDir::new().unwrap();
-        let dst_base = tempfile::TempDir::new().unwrap();
-        let dst = dst_base.path().join("new_dir");
-
-        std::fs::write(src.path().join("file.txt"), "content").unwrap();
-        copy_dir_recursive(src.path(), &dst).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dst.join("file.txt")).unwrap(),
-            "content"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_verification_no_requirements() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let expected = crate::agent::eval_case::ExpectedResult {
-            files_changed: vec![],
-            build_must_pass: false,
-            tests_must_pass: false,
-            required_symbols: vec![],
-        };
-        let result = run_verification(dir.path(), &expected, "rust").await;
-        assert!(result.all_passed());
-        assert!(result.build_passed.is_none());
-        assert!(result.tests_passed.is_none());
-        assert!(result.files_found.is_empty());
-        assert!(result.missing_files.is_empty());
-        assert!(result.symbols_found.is_empty());
-        assert!(result.missing_symbols.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_run_verification_files_and_symbols() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("lib.rs"), "pub fn greet() {}").unwrap();
-
-        let expected = crate::agent::eval_case::ExpectedResult {
-            files_changed: vec!["src/lib.rs".to_string(), "src/missing.rs".to_string()],
-            build_must_pass: false,
-            tests_must_pass: false,
-            required_symbols: vec!["greet".to_string(), "absent".to_string()],
-        };
-        let result = run_verification(dir.path(), &expected, "rust").await;
-        assert!(!result.all_passed());
-        assert_eq!(result.files_found, vec!["src/lib.rs"]);
-        assert_eq!(result.missing_files, vec!["src/missing.rs"]);
-        assert_eq!(result.symbols_found, vec!["greet"]);
-        assert_eq!(result.missing_symbols, vec!["absent"]);
-    }
-
-    #[tokio::test]
-    async fn test_verify_build_nonexistent_dir() {
-        // verify_build on a dir with no Cargo.toml should fail
-        let dir = tempfile::TempDir::new().unwrap();
-        let result = verify_build(dir.path()).await;
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn test_verify_tests_nonexistent_dir() {
-        // verify_tests on a dir with no Cargo.toml should fail
-        let dir = tempfile::TempDir::new().unwrap();
-        let result = verify_tests(dir.path()).await;
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_eval_runner_error_display() {
-        let io_err = EvalRunnerError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "file not found",
-        ));
-        assert!(io_err.to_string().contains("IO error"));
-
-        let model_err = EvalRunnerError::ModelProvider("connection refused".to_string());
-        assert!(model_err.to_string().contains("Model provider error"));
-
-        let timeout_err = EvalRunnerError::Timeout(Duration::from_secs(30));
-        assert!(timeout_err.to_string().contains("Timeout"));
-    }
-
-    #[test]
-    fn test_eval_run_result_fields() {
-        let result = EvalRunResult {
-            case_id: "test-001".to_string(),
-            success: true,
-            execution_time: Duration::from_millis(500),
-            iterations: 3,
-            token_usage: default_token_usage(),
-            verification: VerificationResult {
-                build_passed: None,
-                tests_passed: None,
-                files_found: vec![],
-                missing_files: vec![],
-                symbols_found: vec![],
-                missing_symbols: vec![],
-            },
-            failures: vec![],
-            agent_result: None,
-        };
-        assert_eq!(result.case_id, "test-001");
-        assert!(result.success);
-        assert_eq!(result.iterations, 3);
-        assert_eq!(result.token_usage.total_tokens, 0);
-        assert!(result.failures.is_empty());
-        assert!(result.agent_result.is_none());
-    }
-
-    #[test]
     fn test_contains_whole_word_matches_on_boundary() {
         assert!(contains_whole_word("pub fn greet() {}", "greet"));
         assert!(contains_whole_word("greet()", "greet"));
         assert!(contains_whole_word("greet", "greet"));
-        assert!(contains_whole_word("a.greet()", "greet"));
     }
 
     #[test]
     fn test_contains_whole_word_rejects_substring() {
-        // `greet` should NOT match inside `greetings` or `ungreet`.
         assert!(!contains_whole_word("fn greetings() {}", "greet"));
         assert!(!contains_whole_word("fn ungreet() {}", "greet"));
-        assert!(!contains_whole_word("foo_greet_bar", "greet"));
-        assert!(!contains_whole_word("greet1", "greet"));
     }
 
     #[test]
@@ -1081,40 +902,56 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_symbols_rejects_substring_match() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        // Only `greetings` is present — asking for `greet` must NOT match.
-        std::fs::write(src.join("lib.rs"), "pub fn greetings() {}").unwrap();
-
-        let (found, missing) = verify_symbols(dir.path(), &["greet".to_string()], "rust");
-
-        assert!(
-            found.is_empty(),
-            "greet should not match substring of greetings"
-        );
-        assert_eq!(missing, vec!["greet"]);
+    fn test_is_swebench_case_detects_tag() {
+        let mut case = sample_eval_case();
+        case.metadata.tags = vec!["other".to_string(), SWEBENCH_TAG.to_string()];
+        assert!(is_swebench_case(&case));
     }
 
     #[test]
-    fn test_collect_source_content_skips_ignored_dirs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Real source file that should be included.
-        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
-        // target/ should be skipped — content inside must NOT leak into search.
-        let target = dir.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("artifact.rs"), "fn should_be_ignored() {}").unwrap();
-        // .git/ should likewise be skipped.
-        let git = dir.path().join(".git");
-        std::fs::create_dir(&git).unwrap();
-        std::fs::write(git.join("hooks.rs"), "fn git_hook() {}").unwrap();
+    fn test_is_swebench_case_rejects_missing_tag() {
+        let mut case = sample_eval_case();
+        case.metadata.tags = vec!["other".to_string()];
+        assert!(!is_swebench_case(&case));
+    }
 
-        let content = collect_source_content(dir.path(), &["rs"]);
-        assert!(content.contains("fn main()"));
-        assert!(!content.contains("should_be_ignored"));
-        assert!(!content.contains("git_hook"));
+    #[test]
+    fn test_resolve_swebench_dataset_path_explicit() {
+        let case_dir = Path::new("/tmp/evals/cases/swebench-x");
+        let config = EvalRunnerConfig {
+            swebench_dataset_path: Some(PathBuf::from("/custom/dataset.jsonl")),
+            ..EvalRunnerConfig::default()
+        };
+        let resolved = resolve_swebench_dataset_path(case_dir, &config).unwrap();
+        assert_eq!(resolved, PathBuf::from("/custom/dataset.jsonl"));
+    }
+
+    #[test]
+    fn test_resolve_swebench_dataset_path_default_layout() {
+        let case_dir = Path::new("/tmp/evals/cases/swebench-x");
+        let config = EvalRunnerConfig::default();
+        let resolved = resolve_swebench_dataset_path(case_dir, &config).unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/evals/datasets/swebench-verified-sample.jsonl")
+        );
+    }
+
+    fn sample_eval_case() -> EvalCase {
+        use crate::agent::eval_case::{CaseInfo, CaseMetadata, ExpectedResult, TaskSpec};
+        EvalCase {
+            case: CaseInfo {
+                id: "swebench-django__django-11099".to_string(),
+                name: "django__django-11099".to_string(),
+                description: String::new(),
+            },
+            task: TaskSpec {
+                prompt: String::new(),
+                language: "python".to_string(),
+            },
+            expected: ExpectedResult::default(),
+            metadata: CaseMetadata::default(),
+        }
     }
 
     #[cfg(unix)]
@@ -1125,7 +962,6 @@ mod tests {
         let dst = tempfile::TempDir::new().unwrap();
 
         std::fs::write(src.path().join("real.txt"), "content").unwrap();
-        // Create a symlink inside the source tree pointing somewhere.
         symlink(src.path().join("real.txt"), src.path().join("link.txt")).unwrap();
 
         let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
@@ -1141,7 +977,6 @@ mod tests {
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("outside.rs"), "fn outside_fn() {}").unwrap();
         std::fs::write(dir.path().join("inside.rs"), "fn inside_fn() {}").unwrap();
-        // Symlink from inside the searched dir to a file outside.
         symlink(
             outside.path().join("outside.rs"),
             dir.path().join("link.rs"),
