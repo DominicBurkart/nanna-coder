@@ -85,6 +85,11 @@ pub struct EvalRunnerConfig {
     /// Run-id label used by the upstream harness output tree. Defaults to
     /// the wall-clock seconds at config-construction time.
     pub swebench_run_id: String,
+    /// When `true`, the runner captures the agent's patch but skips the
+    /// upstream Python harness call. Used by batched scoring (`harness-score`)
+    /// where verification happens once across all instances after every
+    /// agent has run, rather than per-instance.
+    pub swebench_skip_verify: bool,
 }
 
 impl Default for EvalRunnerConfig {
@@ -101,6 +106,7 @@ impl Default for EvalRunnerConfig {
             swebench_dataset_path: None,
             swebench_hf_dataset: "princeton-nlp/SWE-bench_Verified".to_string(),
             swebench_run_id: run_id,
+            swebench_skip_verify: false,
         }
     }
 }
@@ -123,6 +129,11 @@ impl EvalRunnerConfig {
 
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    pub fn with_swebench_skip_verify(mut self, skip: bool) -> Self {
+        self.swebench_skip_verify = skip;
         self
     }
 }
@@ -184,6 +195,11 @@ pub struct EvalRunResult {
     pub failures: Vec<String>,
     /// The underlying agent result, if the agent ran successfully.
     pub agent_result: Option<AgentRunResult>,
+    /// Unified-diff patch the agent produced against the materialized repo.
+    /// Populated only for SWE-bench cases (`swebench-verified` tag); `None`
+    /// for happy-path fixtures. Set whether or not `swebench_skip_verify`
+    /// is enabled, so callers can persist or batch-verify the patch later.
+    pub swebench_patch: Option<String>,
 }
 
 /// Run a single eval case end-to-end.
@@ -279,6 +295,7 @@ pub async fn run_eval(
                 verification,
                 failures: f,
                 agent_result: None,
+                swebench_patch: None,
             });
         }
         Err(_elapsed) => {
@@ -331,6 +348,7 @@ pub async fn run_eval(
         verification,
         failures,
         agent_result,
+        swebench_patch: None,
     })
 }
 
@@ -426,50 +444,52 @@ async fn finish_swebench(
 ) -> Result<EvalRunResult, EvalRunnerError> {
     let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
 
-    let verify_dir = work_dir.join("__nanna_verify");
-    std::fs::create_dir_all(&verify_dir)?;
-    let verify_config = VerifyConfig {
-        dataset_name: config.swebench_hf_dataset.clone(),
-        model_name_or_path: format!("nanna__{}", config.model_name.replace([':', '/'], "-")),
-        run_id: config.swebench_run_id.clone(),
-        work_dir: verify_dir,
-        max_workers: 1,
-    };
-
-    let predictions = vec![Prediction {
-        instance_id: task.instance_id.clone(),
-        model_patch,
-    }];
-
-    let verdicts = verify_predictions(&predictions, &verify_config).await?;
-    let verdict: Option<&InstanceVerdict> =
-        verdicts.iter().find(|v| v.instance_id == task.instance_id);
-
-    let resolved = verdict.map(|v| v.resolved).unwrap_or(false);
-    if let Some(v) = verdict {
-        if let Some(err) = &v.error {
-            failures.push(format!("SWE-bench verifier: {err}"));
-        }
-        if !v.resolved && v.error.is_none() {
-            failures.push("SWE-bench verdict: not resolved".to_string());
-        }
-    } else {
-        failures.push(format!(
-            "SWE-bench verdict missing for instance {}",
-            task.instance_id
-        ));
-    }
-
     let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
     if !task_completed {
         failures.push("Agent did not complete the task".to_string());
     }
-
     let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
     let token_usage = agent_result
         .as_ref()
         .and_then(|r| r.token_usage.clone())
         .unwrap_or_else(default_token_usage);
+
+    let resolved = if config.swebench_skip_verify {
+        failures.push("verifier skipped — score-mode batched run".to_string());
+        false
+    } else {
+        let verify_dir = work_dir.join("__nanna_verify");
+        std::fs::create_dir_all(&verify_dir)?;
+        let verify_config = VerifyConfig {
+            dataset_name: config.swebench_hf_dataset.clone(),
+            model_name_or_path: format!("nanna__{}", config.model_name.replace([':', '/'], "-")),
+            run_id: config.swebench_run_id.clone(),
+            work_dir: verify_dir,
+            max_workers: 1,
+        };
+        let predictions = vec![Prediction {
+            instance_id: task.instance_id.clone(),
+            model_patch: model_patch.clone(),
+        }];
+        let verdicts = verify_predictions(&predictions, &verify_config).await?;
+        let verdict: Option<&InstanceVerdict> =
+            verdicts.iter().find(|v| v.instance_id == task.instance_id);
+        if let Some(v) = verdict {
+            if let Some(err) = &v.error {
+                failures.push(format!("SWE-bench verifier: {err}"));
+            }
+            if !v.resolved && v.error.is_none() {
+                failures.push("SWE-bench verdict: not resolved".to_string());
+            }
+            v.resolved
+        } else {
+            failures.push(format!(
+                "SWE-bench verdict missing for instance {}",
+                task.instance_id
+            ));
+            false
+        }
+    };
 
     let success = resolved && task_completed;
     let execution_time = start.elapsed();
@@ -490,6 +510,7 @@ async fn finish_swebench(
         },
         failures,
         agent_result,
+        swebench_patch: Some(model_patch),
     })
 }
 
@@ -1268,6 +1289,7 @@ mod tests {
             },
             failures: vec![],
             agent_result: None,
+            swebench_patch: None,
         };
         assert_eq!(result.case_id, "test-001");
         assert!(result.success);
@@ -1275,6 +1297,22 @@ mod tests {
         assert_eq!(result.token_usage.total_tokens, 0);
         assert!(result.failures.is_empty());
         assert!(result.agent_result.is_none());
+        assert!(result.swebench_patch.is_none());
+    }
+
+    #[test]
+    fn test_config_default_swebench_skip_verify_off() {
+        let config = EvalRunnerConfig::default();
+        assert!(
+            !config.swebench_skip_verify,
+            "default must preserve current per-instance verify behaviour"
+        );
+    }
+
+    #[test]
+    fn test_config_with_swebench_skip_verify() {
+        let config = EvalRunnerConfig::default().with_swebench_skip_verify(true);
+        assert!(config.swebench_skip_verify);
     }
 
     #[test]
