@@ -11,6 +11,8 @@
 pub mod report;
 #[cfg(feature = "eval-runner")]
 pub mod runner;
+#[cfg(feature = "eval-runner")]
+pub mod scoring;
 pub mod swebench;
 pub mod swebench_report;
 pub mod swebench_results;
@@ -30,5 +32,10 @@ pub use swebench_results::{
 // Re-export runner types (only available with the eval-runner feature)
 #[cfg(feature = "eval-runner")]
 pub use runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
+#[cfg(feature = "eval-runner")]
+pub use scoring::{
+    aggregate_scorecard, AgentMetrics, InstanceState, InstanceStatus, Scorecard, ScorecardMetadata,
+    StoredVerdict, SCHEMA_VERSION as SCORING_SCHEMA_VERSION,
+};
 #[cfg(feature = "eval-runner")]
 pub use swebench_verify::{InstanceVerdict, Prediction, VerifyConfig, VerifyError};
