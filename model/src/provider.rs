@@ -42,17 +42,6 @@ pub trait ModelProvider: Send + Sync {
     fn provider_name(&self) -> &'static str;
 }
 
-#[async_trait]
-pub trait StreamingModelProvider: ModelProvider {
-    type StreamItem;
-    type StreamError;
-
-    async fn chat_stream(
-        &self,
-        request: ChatRequest,
-    ) -> ModelResult<impl futures::Stream<Item = Result<Self::StreamItem, Self::StreamError>>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
