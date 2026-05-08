@@ -118,6 +118,15 @@ impl TokenStore {
         if self.is_expired() {
             return Err(AuthError::ExpiredToken);
         }
+        // Reject an empty bearer token explicitly before the constant-time
+        // compare. An empty candidate (e.g. `Authorization: Bearer `) would
+        // lose to `subtle::ct_eq` anyway because the stored token is always
+        // 64 chars, but the early check makes the intent unambiguous and
+        // prevents the caller from wondering whether `InvalidToken` could
+        // ever be returned for a trivially malformed header value.
+        if candidate.is_empty() {
+            return Err(AuthError::InvalidToken);
+        }
         if !constant_time_eq(self.token.as_str().as_bytes(), candidate.as_bytes()) {
             return Err(AuthError::InvalidToken);
         }
@@ -280,6 +289,17 @@ mod tests {
         match result.unwrap_err() {
             AuthError::InvalidToken => {}
             other => panic!("Expected InvalidToken, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_empty_token_rejected() {
+        let store = TokenStore::new(Duration::from_secs(3600));
+        let result = store.validate("");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AuthError::InvalidToken => {}
+            other => panic!("Expected InvalidToken for empty candidate, got: {:?}", other),
         }
     }
 

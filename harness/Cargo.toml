@@ -43,7 +43,6 @@ tempfile = { version = "3.0", optional = true }
 toml = "0.8"
 hyper = { version = "0.14", features = ["full"] }
 subtle = "2.5"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
 
 [lints]
 workspace = true
@@ -53,6 +52,7 @@ futures = "0.3"
 serial_test = "3.4"
 tempfile = "3.0"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
 
 [[bench]]
 name = "agents_md_load"
