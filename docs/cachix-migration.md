@@ -119,36 +119,7 @@ nix run .#cache-analytics
 
 ## Cache Strategy
 
-### What Gets Cached
-
-**High Priority (Always cached):**
-- Rust dependencies (cargo artifacts)
-- Test containers (small, frequently used)
-- Build artifacts (binaries)
-
-**Medium Priority (Cached when space available):**
-- Cross-compilation outputs
-- Development tools
-
-**Low Priority (Excluded from Cachix):**
-- Source tarballs (filtered out)
-- Large model files (downloaded on-demand)
-- nixpkgs tarballs (already cached upstream)
-
-### Push Filter Rationale
-
-```yaml
-pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
-```
-
-**Excludes:**
-- `*-source` derivations (save bandwidth)
-- `nixpkgs.tar.gz` files (redundant with upstream cache)
-
-**Includes:**
-- Compiled binaries
-- Container images
-- Build dependencies
+For what gets cached, push-filter rationale, and cache-key design see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md).
 
 ## Performance Expectations
 
