@@ -30,3 +30,5 @@ pub use swebench_results::{
 // Re-export runner types (only available with the eval-runner feature)
 #[cfg(feature = "eval-runner")]
 pub use runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
+#[cfg(feature = "eval-runner")]
+pub use swebench_verify::{InstanceVerdict, Prediction, VerifyConfig, VerifyError};
