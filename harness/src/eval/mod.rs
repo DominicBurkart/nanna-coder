@@ -12,13 +12,23 @@ pub mod report;
 #[cfg(feature = "eval-runner")]
 pub mod runner;
 pub mod swebench;
+pub mod swebench_report;
+pub mod swebench_results;
+#[cfg(feature = "eval-runner")]
+pub mod swebench_verify;
 
 // Re-export commonly used types from the agent eval module
 pub use crate::agent::eval::{
     AgentEvaluationResult, BatchEvaluationResult, EvaluationCategory, EvaluationMetrics,
 };
 pub use swebench::{adapt_to_eval_case, load_swebench_dataset, materialize, SWEBenchTask};
+pub use swebench_report::SweBenchReport;
+pub use swebench_results::{
+    SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage as SweBenchTokenUsage,
+};
 
 // Re-export runner types (only available with the eval-runner feature)
 #[cfg(feature = "eval-runner")]
 pub use runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
+#[cfg(feature = "eval-runner")]
+pub use swebench_verify::{InstanceVerdict, Prediction, VerifyConfig, VerifyError};
