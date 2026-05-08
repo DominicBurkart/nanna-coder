@@ -531,11 +531,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -730,7 +730,7 @@ async fn run_mcp_http_server(
         // operators should supply --token-file or --token-env and treat stderr
         // capture as potentially sensitive.
         eprintln!(
-            "WARNING: auto-generated auth token printed to stderr — \
+            "WARNING: auto-generated auth token printed to stderr \u{2014} \
              it may be captured by systemd/journal, Docker log drivers, or \
              cloud logging agents. Pass --token-file or set ${} to avoid this.",
             token_env
