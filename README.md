@@ -21,14 +21,38 @@ A coding agent for coding agents. Designed to let background agents delegate str
 
 ## Quick Start
 
-### Prerequisites
-- Nix with flakes enabled
-- (Optional) Cachix account for faster builds
+### One-line install (Linux / macOS)
 
-### Setup
+Bootstraps Podman, pulls the prebuilt harness + ollama containers, brings up the
+Nanna pod, and pulls the Gemma 4 model. The script prints a clear notification
+before each step that requires `sudo`.
 
 ```bash
-# Clone the repository
+curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash
+```
+
+Useful flags (pass after `bash -s --` for the curl form):
+
+| Flag                | Purpose                                                         |
+|---------------------|-----------------------------------------------------------------|
+| `--skip-model-pull` | Bring up the pod without pulling the multi-GB Gemma 4 model.    |
+| `--no-start`        | Install + pull images, but don't create the pod.                |
+| `--model NAME`      | Pull a different Ollama model (default `gemma4:e4b`).           |
+| `--registry URL`    | Use a different container registry.                             |
+| `--yes`             | Skip the sudo confirmation prompts (for unattended installs).   |
+
+After install:
+```bash
+podman pod ps                          # see the running pod
+podman logs -f harness-service         # tail harness logs
+curl http://localhost:11434/api/tags   # ollama API
+```
+
+### Build from source (developers)
+
+Prerequisites: Nix with flakes enabled, optionally Cachix for faster builds.
+
+```bash
 git clone https://github.com/DominicBurkart/nanna-coder.git
 cd nanna-coder
 
@@ -73,9 +97,9 @@ cargo run --bin harness -- agent --prompt "Your task" --model qwen3:0.6b --tools
 nix develop --command cargo build --release --bin harness && claude mcp add nanna -- "$(pwd)/target/release/harness" mcp-serve --model gemma4:e4b
 ```
 
-### Running Eval Tests
+### Running Tests and Evals
 
-With Ollama running and a model pulled (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
+See [TESTING.md](TESTING.md) for the full test topology and commands. Evals require Ollama and a pulled model (default `gemma4:e4b`, override via `NANNA_EVAL_MODEL`):
 
 ```bash
 nix develop --command cargo nextest run \
@@ -87,11 +111,4 @@ nix develop --command cargo nextest run \
 
 ### Using Cachix (Optional but Recommended)
 
-Cachix provides a public binary cache for faster builds. No account needed to pull pre-built artifacts.
-
-```bash
-# Configure Cachix for faster builds (read-only access)
-nix run .#setup-cache
-```
-
-See [CACHIX_SETUP.md](CACHIX_SETUP.md) for push access setup (maintainers only).
+Run `nix run .#setup-cache` for read-only access to pre-built artifacts. See [CACHIX_SETUP.md](CACHIX_SETUP.md) for details and maintainer push setup.
