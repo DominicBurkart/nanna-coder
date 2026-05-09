@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             temperature,
             no_ensure_pod,
         } => {
-            ensure_pod_or_exit(no_ensure_pod);
+            ensure_pod_or_exit(no_ensure_pod).await;
             let provider = OllamaProvider::new(OllamaConfig::default())?;
             let workspace_root = std::env::current_dir()?;
             let tool_registry = create_tool_registry(&workspace_root);
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             list_tools(&tool_registry);
         }
         Commands::Health { no_ensure_pod } => {
-            ensure_pod_or_exit(no_ensure_pod);
+            ensure_pod_or_exit(no_ensure_pod).await;
             let provider = OllamaProvider::new(OllamaConfig::default())?;
             health_check(&provider).await?;
         }
@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ollama_url,
             no_ensure_pod,
         } => {
-            ensure_pod_or_exit(no_ensure_pod);
+            ensure_pod_or_exit(no_ensure_pod).await;
             let workspace_root = match work_dir {
                 Some(p) => p,
                 None => std::env::current_dir()?,
@@ -594,9 +594,14 @@ fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
 /// Run `pod::ensure_running`; on failure, print to stderr and exit with
 /// code 3 so the eval-side caller (or a CI step) can distinguish pod
 /// bring-up failures from agent-loop failures.
-fn ensure_pod_or_exit(no_ensure_pod_flag: bool) {
+///
+/// `async` to match `pod::ensure_running` — the probe and post-bring-up
+/// health wait both run on the Tokio executor. The previous sync wrapper
+/// used `std::thread::sleep` inside `wait_for_ollama` and stalled the
+/// runtime for up to 60s.
+async fn ensure_pod_or_exit(no_ensure_pod_flag: bool) {
     let cfg = harness::pod::EnsureConfig::from_env_and_flag(no_ensure_pod_flag);
-    match harness::pod::ensure_running(&cfg) {
+    match harness::pod::ensure_running(&cfg).await {
         Ok(_) => {}
         Err(e) => {
             eprintln!("nanna: pod ensure failed: {e}");
