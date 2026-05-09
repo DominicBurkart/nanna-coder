@@ -535,50 +535,75 @@ mod tests {
     /// Build a tiny local bare git repo at `bare_path` with one file and a
     /// single commit. Returns the commit OID as hex.
     fn init_local_fixture(work_path: &Path, bare_path: &Path) -> String {
-        Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(work_path)
-            .status()
-            .unwrap();
-        for (key, val) in [("user.email", "test@example.com"), ("user.name", "Test")] {
-            Command::new("git")
-                .args(["-C"])
-                .arg(work_path)
-                .args(["config", key, val])
-                .status()
-                .unwrap();
+        // Helper to run a git command, asserting success and printing stderr on
+        // failure so test output is actionable.
+        fn git_must<I, S>(args: I, cwd: &Path, extra_env: &[(&str, &str)])
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<std::ffi::OsStr>,
+        {
+            let mut cmd = Command::new("git");
+            cmd.args(args).current_dir(cwd);
+            // Isolate from any system/global git config (e.g. commit signing)
+            // so the fixture works in both developer sandboxes and CI.
+            cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+            cmd.env("HOME", cwd); // empty home → no ~/.gitconfig
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git command failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
+
+        git_must(["init", "--quiet"], work_path, &[]);
+        git_must(
+            ["config", "user.email", "test@example.com"],
+            work_path,
+            &[],
+        );
+        git_must(["config", "user.name", "Test"], work_path, &[]);
+        git_must(["config", "commit.gpgsign", "false"], work_path, &[]);
+
         std::fs::write(work_path.join("hello.py"), "print('hi')\n").unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(work_path)
-            .args(["add", "hello.py"])
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args(["-C"])
-            .arg(work_path)
-            .args(["commit", "-q", "-m", "init"])
-            .status()
-            .unwrap();
-        let oid_out = Command::new("git")
-            .args(["-C"])
-            .arg(work_path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
+        git_must(["add", "hello.py"], work_path, &[]);
+        git_must(
+            ["commit", "-q", "-m", "init"],
+            work_path,
+            &[
+                ("GIT_AUTHOR_NAME", "Test"),
+                ("GIT_AUTHOR_EMAIL", "test@example.com"),
+                ("GIT_COMMITTER_NAME", "Test"),
+                ("GIT_COMMITTER_EMAIL", "test@example.com"),
+            ],
+        );
+
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "HEAD"])
+            .current_dir(work_path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", work_path);
+        let oid_out = cmd.output().unwrap();
+        assert!(
+            oid_out.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&oid_out.stderr)
+        );
         let oid = String::from_utf8(oid_out.stdout)
             .unwrap()
             .trim()
             .to_string();
 
         // Clone as a bare repo that materialize_from_url can fetch from.
-        Command::new("git")
-            .args(["clone", "--bare", "--quiet"])
-            .arg(work_path)
-            .arg(bare_path)
-            .status()
-            .unwrap();
+        git_must(
+            ["clone", "--bare", "--quiet", work_path.to_str().unwrap(), bare_path.to_str().unwrap()],
+            work_path,
+            &[],
+        );
         oid
     }
 
