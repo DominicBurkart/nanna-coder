@@ -130,7 +130,12 @@ impl SweBenchReport {
         let _ = writeln!(out, "| Total instances | {} |", r.total_count());
         let _ = writeln!(out, "| Resolved | {} |", r.resolved_count());
         let _ = writeln!(out, "| Resolve rate | {:.1}% |", r.resolve_rate() * 100.0);
-        let _ = writeln!(out, "| Total Claude tokens | {} |", r.total_claude_tokens());
+        let _ = writeln!(
+            out,
+            "| Total orchestrator tokens | {} |",
+            r.total_orchestrator_tokens()
+        );
+        let _ = writeln!(out, "| Total worker tokens | {} |", r.total_worker_tokens());
         let _ = writeln!(out, "| Avg wall time | {:.1}s |", r.avg_wall_time());
         let _ = writeln!(out, "| Tokens per resolved | {} |", r.tokens_per_resolved());
         let _ = writeln!(out);
@@ -195,7 +200,7 @@ impl SweBenchReport {
         let _ = writeln!(out, "## Token Usage per Instance\n");
         let _ = writeln!(out, "```mermaid");
         let _ = writeln!(out, "xychart-beta");
-        let _ = writeln!(out, "    title \"Claude Token Usage by Instance\"");
+        let _ = writeln!(out, "    title \"Orchestrator Token Usage by Instance\"");
 
         let labels: Vec<String> = instances
             .iter()
@@ -205,7 +210,7 @@ impl SweBenchReport {
 
         let max_tokens = instances
             .iter()
-            .map(|i| i.claude_token_usage.total_tokens)
+            .map(|i| i.orchestrator_token_usage.total_tokens)
             .max()
             .unwrap_or(1);
         let y_max = (max_tokens as f64 * 1.2) as u64;
@@ -213,7 +218,7 @@ impl SweBenchReport {
 
         let tokens: Vec<String> = instances
             .iter()
-            .map(|i| i.claude_token_usage.total_tokens.to_string())
+            .map(|i| i.orchestrator_token_usage.total_tokens.to_string())
             .collect();
         let _ = writeln!(out, "    bar [{}]", tokens.join(", "));
 
@@ -229,11 +234,11 @@ impl SweBenchReport {
         let _ = writeln!(out, "## Instance Details\n");
         let _ = writeln!(
             out,
-            "| Instance | Resolved | Claude Tokens | Wall Time | Error |"
+            "| Instance | Resolved | Orchestrator Tokens | Wall Time | Error |"
         );
         let _ = writeln!(
             out,
-            "|----------|----------|---------------|-----------|-------|"
+            "|----------|----------|---------------------|-----------|-------|"
         );
 
         for i in instances {
@@ -242,7 +247,11 @@ impl SweBenchReport {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {:.1}s | {} |",
-                i.instance_id, status, i.claude_token_usage.total_tokens, i.wall_time_secs, error,
+                i.instance_id,
+                status,
+                i.orchestrator_token_usage.total_tokens,
+                i.wall_time_secs,
+                error,
             );
         }
         let _ = writeln!(out);
@@ -269,8 +278,8 @@ impl SweBenchReport {
         let rate_b = b.resolve_rate() * 100.0;
         let rate_delta = rate_b - rate_a;
 
-        let tokens_a = a.total_claude_tokens();
-        let tokens_b = b.total_claude_tokens();
+        let tokens_a = a.total_orchestrator_tokens();
+        let tokens_b = b.total_orchestrator_tokens();
         let tokens_delta = tokens_b as i64 - tokens_a as i64;
 
         let time_a = a.avg_wall_time();
@@ -305,7 +314,7 @@ impl SweBenchReport {
         );
         let _ = writeln!(
             out,
-            "| Total Claude tokens | {} | {} | {:+} |",
+            "| Total orchestrator tokens | {} | {} | {:+} |",
             tokens_a, tokens_b, tokens_delta,
         );
         let _ = writeln!(
@@ -464,12 +473,12 @@ mod tests {
         SweBenchInstanceResult {
             instance_id: id.to_string(),
             resolved,
-            claude_token_usage: TokenUsage {
+            orchestrator_token_usage: TokenUsage {
                 prompt_tokens: tokens / 2,
                 completion_tokens: tokens / 2,
                 total_tokens: tokens,
             },
-            nanna_token_usage: None,
+            worker_token_usage: None,
             wall_time_secs: wall_time,
             error: if resolved {
                 None
