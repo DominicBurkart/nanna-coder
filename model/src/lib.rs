@@ -1,3 +1,5 @@
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
 pub mod config;
 pub mod judge;
 pub mod ollama;
@@ -13,6 +15,8 @@ pub use types::{
     ToolDefinition, Usage,
 };
 
+#[cfg(feature = "anthropic")]
+pub use anthropic::AnthropicProvider;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaProvider;
 
@@ -22,6 +26,8 @@ pub mod prelude {
     pub use crate::provider::*;
     pub use crate::types::*;
 
+    #[cfg(feature = "anthropic")]
+    pub use crate::anthropic::*;
     #[cfg(feature = "ollama")]
     pub use crate::ollama::*;
 }
