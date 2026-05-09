@@ -1758,6 +1758,47 @@ timeout_secs = 3
     }
 
     #[tokio::test]
+    async fn run_eval_non_swebench_pushes_test_verification_failures() {
+        // Cover line 715 (verify_tests call) by setting tests_must_pass=true.
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-tests-required"
+name = "fixture requiring tests"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = false
+tests_must_pass = true
+
+[metadata]
+timeout_secs = 3
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url("http://127.0.0.1:1")
+            .with_max_iterations(1);
+        let result = run_eval(&case, case_dir.path(), &config)
+            .await
+            .expect("structured result expected");
+        assert!(!result.success);
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.to_lowercase().contains("test")),
+            "expected a test-related failure, got {:?}",
+            result.failures
+        );
+    }
+
+    #[tokio::test]
     async fn run_eval_non_swebench_pushes_verification_failures() {
         // Covers `failures.extend(verification_failures(&verification))`
         // in run_eval's non-SWE-bench soft-error path. With
