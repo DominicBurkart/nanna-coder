@@ -545,9 +545,10 @@ mod tests {
             let mut cmd = Command::new("git");
             cmd.args(args).current_dir(cwd);
             // Isolate from any system/global git config (e.g. commit signing)
-            // so the fixture works in both developer sandboxes and CI.
+            // so the fixture works in both developer sandboxes and Nix CI.
             cmd.env("GIT_CONFIG_NOSYSTEM", "1");
-            cmd.env("HOME", cwd); // empty home → no ~/.gitconfig
+            cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+            cmd.env("HOME", cwd); // belt-and-suspenders: empty home dir
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
@@ -572,7 +573,7 @@ mod tests {
         std::fs::write(work_path.join("hello.py"), "print('hi')\n").unwrap();
         git_must(["add", "hello.py"], work_path, &[]);
         git_must(
-            ["commit", "-q", "-m", "init"],
+            ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
             work_path,
             &[
                 ("GIT_AUTHOR_NAME", "Test"),
@@ -586,6 +587,7 @@ mod tests {
         cmd.args(["rev-parse", "HEAD"])
             .current_dir(work_path)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("HOME", work_path);
         let oid_out = cmd.output().unwrap();
         assert!(
