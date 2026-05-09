@@ -33,6 +33,12 @@
 #   --yes               Don't prompt; assume yes for sudo notices.
 #   --no-claude-mcp     Don't register nanna-coder as a Claude Code MCP server even
 #                       if a Claude Code config is detected.
+#   --branch <name>     Accepted for parity with install.ps1's -Branch passthrough.
+#                       Has no effect on install.sh itself; the Windows installer
+#                       fetches install.sh from the chosen branch *before* invoking
+#                       it, so by the time we run, the branch choice is already
+#                       baked into our $0. We accept and ignore the value so the
+#                       Windows path doesn't trip the unknown-flag guard.
 #   -h, --help          Show this help.
 #
 # What this script does (in order):
@@ -50,7 +56,8 @@ set -euo pipefail
 REGISTRY="${NANNA_REGISTRY:-ghcr.io/dominicburkart/nanna-coder}"
 TAG="${NANNA_TAG:-latest}"
 # Ollama 0.20.7+ required for gemma4:e4b model -- see #332. Image ships
-# pkgs.ollama from flake.lock'd nixpkgs; bump nixpkgs if you change MODEL.
+# pkgs.ollama from flake.lock'd nixpkgs (via the dedicated nixpkgs-ollama
+# input pinned in flake.nix; do not bump the main nixpkgs to fix this).
 MODEL="${NANNA_MODEL:-gemma4:e4b}"
 HARNESS_IMAGE_OVERRIDE=""
 OLLAMA_IMAGE_OVERRIDE=""
@@ -69,6 +76,17 @@ HARNESS_PORT="${NANNA_PORT:-18080}"
 # Ollama. See #330.
 USE_HOST_OLLAMA="${NANNA_USE_HOST_OLLAMA:-}"
 
+# Validate a string parses as a TCP port. Centralised so --harness-port
+# and NANNA_PORT both flow through it, and the error message is the same
+# regardless of how the bad value was supplied. See #330 review thread.
+validate_port() {
+  local v="$1" src="$2"
+  if [[ ! "$v" =~ ^[0-9]+$ ]] || (( v <= 0 || v >= 65536 )); then
+    echo "invalid port from $src: '$v' (must be an integer in 1..65535)" >&2
+    exit 64
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-model-pull)    SKIP_MODEL_PULL=1; shift;;
@@ -80,15 +98,21 @@ while [[ $# -gt 0 ]]; do
     --model)              MODEL="$2"; shift 2;;
     --harness-image)      HARNESS_IMAGE_OVERRIDE="$2"; shift 2;;
     --ollama-image)       OLLAMA_IMAGE_OVERRIDE="$2"; shift 2;;
-    --harness-port)       HARNESS_PORT="$2"; shift 2;;
+    --harness-port)       HARNESS_PORT="$2"; validate_port "$HARNESS_PORT" "--harness-port"; shift 2;;
     --use-host-ollama)    USE_HOST_OLLAMA=1; shift;;
     --no-use-host-ollama) USE_HOST_OLLAMA=0; shift;;
     --yes|-y)             ASSUME_YES=1; shift;;
     --no-claude-mcp)      NO_CLAUDE_MCP=1; shift;;
-    -h|--help)            sed -n '2,40p' "$0" 2>/dev/null || true; exit 0;;
+    --branch)             shift; if [[ $# -gt 0 ]]; then shift; fi;;  # see help text; ignored in-script
+    -h|--help)            sed -n '2,49p' "$0" 2>/dev/null || true; exit 0;;
     *) echo "unknown flag: $1" >&2; exit 64;;
   esac
 done
+
+# Validate the resolved port even if it came from NANNA_PORT (the
+# --harness-port branch already validated; re-validating is cheap and
+# closes the env-only path).
+validate_port "$HARNESS_PORT" "NANNA_PORT/HARNESS_PORT"
 
 HARNESS_IMAGE="${HARNESS_IMAGE_OVERRIDE:-$REGISTRY/harness:$TAG}"
 OLLAMA_IMAGE="${OLLAMA_IMAGE_OVERRIDE:-$REGISTRY/ollama:$TAG}"
@@ -121,6 +145,31 @@ notify_sudo() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 is_wsl() { [[ -r /proc/version ]] && grep -qiE 'microsoft|wsl' /proc/version; }
+
+# curl is a hard dependency: we use it for the host-ollama probe in
+# audit_system, the readiness wait in wait_for_ollama, and the HTTP
+# fallback in pull_model. If it's missing, the host-ollama auto-detect
+# silently degrades to "in-pod mode", which then collides on :11434
+# with the host Ollama the user actually has -- exactly the #330
+# failure mode. Fail fast instead of degrading. See #330 review thread.
+if ! have curl; then
+  cat >&2 <<'EOF'
+✗ curl is required but not installed.
+
+  install.sh uses curl to:
+    - probe the host Ollama at :11434 (auto-detection of #330's
+      "ollama already running" case)
+    - poll /api/tags during pod bring-up
+    - fall back to /api/pull if no `ollama` CLI is on PATH
+  Without curl, host-Ollama auto-detection silently misfires and you
+  get the same :11434 conflict #330 was filed about.
+
+  Install curl and re-run:
+    Linux:  sudo apt-get install -y curl   (or dnf/pacman/zypper equivalent)
+    macOS:  brew install curl              (or use the system curl)
+EOF
+  exit 1
+fi
 
 # ---------- OS detection ----------
 
@@ -186,6 +235,46 @@ claude_config_path() {
   return 1
 }
 
+# Parse the JSON body returned by GET /api/version into a bare version
+# string. Falls back to a regex when jq is missing so the plan output
+# never displays raw `{"version":"..."}` to the user. See #330 review.
+parse_ollama_version() {
+  local body="${1:-}"
+  [[ -z "$body" ]] && { echo ""; return 0; }
+  if have jq; then
+    local v
+    v="$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null || true)"
+    [[ -n "$v" ]] && { echo "$v"; return 0; }
+  fi
+  # Fallback: extract the first "version":"x.y.z" occurrence.
+  local v
+  v="$(printf '%s' "$body" | tr -d '\n\r' \
+       | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+       | head -1)"
+  [[ -n "$v" ]] && { echo "$v"; return 0; }
+  echo ""
+}
+
+# Best-effort: detect whether port 11434 is held by *our own* pod's
+# ollama-service container, vs. some other listener (the host Ollama
+# the user is asking us to reuse). Returns 0 if our pod owns it.
+#
+# Without this check, auto-detect on a re-run would mistake the
+# previous run's in-pod ollama-service for a new "host ollama" and
+# silently flip `USE_HOST_OLLAMA=1` -- which would then tear the pod
+# down and re-create it WITHOUT publishing :11434, breaking the next
+# re-run when the in-pod ollama is no longer there to answer the probe.
+# Steady-state behaviour of repeated invocations would not be
+# idempotent. See #330 review thread on idempotency.
+host_ollama_is_our_pod() {
+  have podman || return 1
+  podman pod exists "$POD_NAME" 2>/dev/null || return 1
+  # `podman port <pod> 11434` prints the host:port mapping if the pod
+  # publishes :11434, exits non-zero otherwise. That's a precise signal
+  # that *this* pod is the listener.
+  podman port "$POD_NAME" 11434 >/dev/null 2>&1
+}
+
 audit_system() {
   AUDIT_PODMAN=no
   AUDIT_PODMAN_VERSION=""
@@ -195,6 +284,7 @@ audit_system() {
   AUDIT_PORT_11434_HOLDER=""
   AUDIT_HOST_OLLAMA_REACHABLE=no
   AUDIT_HOST_OLLAMA_VERSION=""
+  AUDIT_HOST_OLLAMA_IS_OUR_POD=no
   AUDIT_HARNESS_LOADED=no
   AUDIT_OLLAMA_LOADED=no
   AUDIT_CLAUDE_CONFIG=""
@@ -225,10 +315,14 @@ audit_system() {
   AUDIT_HARNESS_PORT_HOLDER="$(port_in_use_by "$HARNESS_PORT")"
   AUDIT_PORT_11434_HOLDER="$(port_in_use_by 11434)"
 
-  # Probe host Ollama. A *real* Ollama answers /api/version with a JSON
-  # blob; a random process on :11434 won't, so this is a sharper signal
-  # than just "port is open". See #330.
-  if have curl; then
+  # Probe host Ollama only when the user hasn't pinned the tri-state.
+  # When --use-host-ollama or --no-use-host-ollama is passed explicitly,
+  # the curl probe is just a cosmetic "we noticed Ollama is/isn't there"
+  # plan-line; skipping it here removes a 2s delay on re-runs that pin
+  # the choice. A *real* Ollama answers /api/version with a JSON blob;
+  # a random process on :11434 won't, so this is a sharper signal than
+  # just "port is open". See #330.
+  if [[ -z "$USE_HOST_OLLAMA" ]]; then
     local body
     body="$(curl -fsS --max-time 2 http://localhost:11434/api/version 2>/dev/null || true)"
     if [[ -n "$body" ]]; then
@@ -237,9 +331,20 @@ audit_system() {
     fi
   fi
 
+  # Re-entrancy guard: the probe can't tell our own pod's ollama-service
+  # apart from a real host Ollama. If our pod owns :11434, the listener
+  # is *us*, not the user's external Ollama, and auto-flipping to host
+  # mode would tear the pod down. Treat this as "in-pod" regardless of
+  # what /api/version said. See #330 idempotency thread.
+  if [[ "$AUDIT_HOST_OLLAMA_REACHABLE" == yes ]] && host_ollama_is_our_pod; then
+    AUDIT_HOST_OLLAMA_IS_OUR_POD=yes
+    AUDIT_HOST_OLLAMA_REACHABLE=no
+    AUDIT_HOST_OLLAMA_VERSION=""
+  fi
+
   # Resolve the host-ollama tri-state. If the user didn't pin it, default
-  # to "yes" iff a real Ollama answered. Otherwise honour the explicit
-  # 0/1 from CLI/env.
+  # to "yes" iff a real Ollama answered AND it isn't our own pod.
+  # Otherwise honour the explicit 0/1 from CLI/env.
   if [[ -z "$USE_HOST_OLLAMA" ]]; then
     if [[ "$AUDIT_HOST_OLLAMA_REACHABLE" == yes ]]; then
       USE_HOST_OLLAMA=1
@@ -287,14 +392,14 @@ print_plan() {
     printf '  %s!%s existing pod %s detected (will be replaced for a clean start)\n' \
       "$C_YELLOW" "$C_RESET" "$POD_NAME"
   fi
+  if [[ "$AUDIT_HOST_OLLAMA_IS_OUR_POD" == yes ]]; then
+    printf '  %si%s :11434 is held by the existing %s (in-pod ollama-service); not treating it as a host Ollama\n' \
+      "$C_BLUE" "$C_RESET" "$POD_NAME"
+  fi
   if [[ "$AUDIT_HOST_OLLAMA_REACHABLE" == yes ]]; then
     local _v
-    # /api/version returns {"version":"X.Y.Z"}; show it if jq is around,
-    # otherwise just dump the raw line. Best-effort.
-    if have jq; then
-      _v="$(printf '%s' "$AUDIT_HOST_OLLAMA_VERSION" | jq -r '.version // empty' 2>/dev/null || true)"
-    fi
-    [[ -z "${_v:-}" ]] && _v="${AUDIT_HOST_OLLAMA_VERSION//[$'\n\r']/}"
+    _v="$(parse_ollama_version "$AUDIT_HOST_OLLAMA_VERSION")"
+    [[ -z "$_v" ]] && _v="(unparseable)"
     if [[ "$USE_HOST_OLLAMA" == 1 ]]; then
       printf '  %s✓%s host Ollama detected on :11434 (%s) — re-using it (skipping in-pod ollama)\n' \
         "$C_GREEN" "$C_RESET" "$_v"
@@ -760,11 +865,38 @@ pull_model() {
       log "pulling model $MODEL via host ollama CLI (this is the multi-GB step)..."
       ollama pull "$MODEL"
     else
+      # Stream progress via stream:true + line-buffered jq (or grep
+      # fallback). The previous implementation passed stream:false +
+      # --max-time 86400, which buffered the entire multi-GB response
+      # and emitted zero output until the pull finished -- visually
+      # indistinguishable from a hang, so users would kill the
+      # installer at the 30-min mark and report it as broken. See #330
+      # review thread.
       log "pulling model $MODEL via host ollama HTTP API (no \`ollama\` binary on PATH; this is the multi-GB step)..."
-      curl -fsS --max-time 86400 -X POST http://localhost:11434/api/pull \
-        -H 'Content-Type: application/json' \
-        -d "{\"name\":\"${MODEL}\",\"stream\":false}" >/dev/null \
-        || die "ollama HTTP pull of $MODEL failed."
+      warn "no \`ollama\` CLI found; using HTTP fallback. Progress lines below come from /api/pull."
+      # No --max-time: a multi-GB pull on a slow link can legitimately
+      # exceed any fixed bound; killing the connection after N seconds
+      # truncates the model and corrupts ollama's blob cache. Failure
+      # comes from the server side via the connection closing, which
+      # curl + the pipefail-protected pipeline below surface correctly.
+      # `set -o pipefail` is already enabled at the top of the script
+      # (set -euo pipefail), so the pipeline's exit status is the
+      # rightmost non-zero status -- which is what we want here.
+      if have jq; then
+        if ! curl -fsS -N -X POST http://localhost:11434/api/pull \
+              -H 'Content-Type: application/json' \
+              -d "{\"name\":\"${MODEL}\",\"stream\":true}" \
+            | jq -r '[.status, (.completed // empty | tostring), (.total // empty | tostring)] | map(select(. != "")) | join(" ")'; then
+          die "ollama HTTP pull of $MODEL failed."
+        fi
+      else
+        if ! curl -fsS -N -X POST http://localhost:11434/api/pull \
+              -H 'Content-Type: application/json' \
+              -d "{\"name\":\"${MODEL}\",\"stream\":true}" \
+            | grep --line-buffered -o '"status":"[^"]*"'; then
+          die "ollama HTTP pull of $MODEL failed."
+        fi
+      fi
     fi
     ok "model $MODEL ready (via host ollama)"
     return 0
