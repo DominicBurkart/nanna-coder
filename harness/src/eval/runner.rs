@@ -1083,6 +1083,348 @@ mod tests {
     }
 
     #[test]
+    fn agent_outcome_in_process_helpers() {
+        use crate::agent::AgentState;
+        let r = AgentRunResult {
+            final_state: AgentState::Completed,
+            iterations: 7,
+            task_completed: true,
+            result_summary: "ok".to_string(),
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            token_usage: Some(TokenUsage {
+                prompt_tokens: 5,
+                completion_tokens: 6,
+                total_tokens: 11,
+            }),
+        };
+        let out = AgentOutcome::InProcess(r);
+        assert_eq!(out.iterations(), 7);
+        assert!(out.task_completed());
+        assert_eq!(out.token_usage().unwrap().total_tokens, 11);
+        assert!(out.as_in_process().is_some());
+    }
+
+    #[test]
+    fn agent_outcome_token_usage_none_paths() {
+        use crate::agent::{AgentRunReport, AgentState, SCHEMA_VERSION};
+
+        let r = AgentRunResult {
+            final_state: AgentState::Completed,
+            iterations: 0,
+            task_completed: false,
+            result_summary: String::new(),
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            token_usage: None,
+        };
+        assert!(AgentOutcome::InProcess(r).token_usage().is_none());
+
+        let report = AgentRunReport {
+            schema_version: SCHEMA_VERSION,
+            task_completed: false,
+            iterations: 0,
+            final_state: "Completed".to_string(),
+            result_summary: String::new(),
+            token_usage: None,
+            tool_calls: vec![],
+        };
+        assert!(AgentOutcome::Subprocess(report).token_usage().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    fn locate_nanna_binary_via_env_var_pointing_at_extant_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin_path = dir.path().join("fake-nanna");
+        std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let key = "NANNA_HARNESS_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, &bin_path);
+        let resolved = locate_nanna_binary();
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        assert_eq!(resolved.unwrap(), bin_path);
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    fn locate_nanna_binary_rejects_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = "NANNA_HARNESS_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, dir.path());
+        let result = locate_nanna_binary();
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    fn locate_nanna_binary_rejects_missing_path() {
+        let key = "NANNA_HARNESS_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "/var/tmp/nanna-must-not-exist-zzzz-12345");
+        let result = locate_nanna_binary();
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
+    }
+
+    #[test]
+    fn eval_runner_error_display_covers_new_subprocess_variants() {
+        let e = EvalRunnerError::BinaryNotFound;
+        assert!(e.to_string().contains("nanna"));
+
+        let e =
+            EvalRunnerError::SubprocessSpawn("could not spawn /bin/x: no such file".to_string());
+        assert!(e.to_string().contains("subprocess spawn failed"));
+
+        let e = EvalRunnerError::SubprocessNoOutput(
+            std::path::PathBuf::from("/tmp/r.json"),
+            "exit-0 but no JSON".to_string(),
+        );
+        let s = e.to_string();
+        assert!(s.contains("/tmp/r.json"));
+        assert!(s.contains("exit-0"));
+    }
+
+    fn write_fake_nanna(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("fake-nanna.sh");
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn make_swebench_case(id: &str) -> EvalCase {
+        let toml = format!(
+            r#"
+[case]
+id = "{id}"
+name = "test"
+description = "subprocess unit test"
+
+[task]
+prompt = "do nothing"
+
+[metadata]
+timeout_secs = 30
+tags = ["{tag}"]
+"#,
+            tag = SWEBENCH_TAG
+        );
+        EvalCase::from_toml_str(&toml).unwrap()
+    }
+
+    fn fake_report_writer_script() -> &'static str {
+        r#"#!/usr/bin/env bash
+set -e
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-json) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$out" ]] || { echo "no --output-json" >&2; exit 1; }
+cat > "$out" <<'JSON'
+{
+  "schema_version": 1,
+  "task_completed": true,
+  "iterations": 4,
+  "final_state": "Completed",
+  "result_summary": "fake done",
+  "token_usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+  "tool_calls": []
+}
+JSON
+"#
+    }
+
+    async fn with_nanna_bin<F, Fut, T>(bin: &std::path::Path, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let key = "NANNA_HARNESS_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, bin);
+        let result = f().await;
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_reads_fake_report() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work_dir = dir.path();
+        let bin = write_fake_nanna(work_dir, fake_report_writer_script());
+        let case = make_swebench_case("swebench-fake-001");
+        let config = EvalRunnerConfig::default()
+            .with_max_iterations(3)
+            .with_base_url("http://127.0.0.1:1");
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(work_dir, &case, &config, Duration::from_secs(10))
+        })
+        .await;
+
+        let outcome = result.unwrap().unwrap();
+        assert_eq!(outcome.iterations(), 4);
+        assert!(outcome.task_completed());
+        assert_eq!(outcome.token_usage().unwrap().total_tokens, 3);
+        assert!(outcome.as_in_process().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_soft_errors_on_non_zero_exit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = write_fake_nanna(
+            dir.path(),
+            "#!/usr/bin/env bash\necho 'fake nanna error' >&2\nexit 2\n",
+        );
+        let case = make_swebench_case("swebench-fake-002");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(10))
+        })
+        .await;
+
+        let msg = result.unwrap().unwrap_err();
+        assert!(msg.contains("fake nanna error"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_soft_error_with_empty_stderr() {
+        // Cover the (no stderr) branch where the binary exits non-zero
+        // without writing anything to stderr.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = write_fake_nanna(dir.path(), "#!/usr/bin/env bash\nexit 7\n");
+        let case = make_swebench_case("swebench-fake-005");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(10))
+        })
+        .await;
+
+        let msg = result.unwrap().unwrap_err();
+        assert!(msg.contains("(no stderr)"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_hard_errors_when_exit_zero_no_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = write_fake_nanna(dir.path(), "#!/usr/bin/env bash\nexit 0\n");
+        let case = make_swebench_case("swebench-fake-003");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(10))
+        })
+        .await;
+
+        match result.unwrap_err() {
+            EvalRunnerError::SubprocessNoOutput(path, why) => {
+                assert!(path.to_string_lossy().contains("__nanna_agent_report.json"));
+                assert!(why.contains("exit-0"));
+            }
+            other => panic!("expected SubprocessNoOutput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_hard_errors_when_json_invalid() {
+        // Cover the JSON parse failure branch in
+        // AgentRunReport::read_from_path → SubprocessNoOutput map_err.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = write_fake_nanna(
+            dir.path(),
+            r#"#!/usr/bin/env bash
+set -e
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-json) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "this is not json" > "$out"
+"#,
+        );
+        let case = make_swebench_case("swebench-fake-006");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(10))
+        })
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            EvalRunnerError::SubprocessNoOutput(_, _)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_times_out() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = write_fake_nanna(dir.path(), "#!/usr/bin/env bash\nsleep 30\n");
+        let case = make_swebench_case("swebench-fake-004");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_millis(50))
+        })
+        .await;
+
+        assert!(matches!(result.unwrap_err(), EvalRunnerError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_propagates_binary_not_found() {
+        let case = make_swebench_case("swebench-fake-007");
+        let config = EvalRunnerConfig::default();
+
+        let key = "NANNA_HARNESS_BIN";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "/var/tmp/nanna-totally-missing-xyz");
+        let dir = tempfile::TempDir::new().unwrap();
+        let result =
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(10)).await;
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        assert!(matches!(
+            result.unwrap_err(),
+            EvalRunnerError::BinaryNotFound
+        ));
+    }
+
+    #[test]
     fn test_verification_all_passed() {
         let v = VerificationResult {
             build_passed: Some(true),

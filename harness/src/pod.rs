@@ -346,7 +346,10 @@ mod tests {
             url: "http://x/y".to_string(),
         };
         let s = format!("{err}");
-        assert!(s.contains("scripts/install.sh"), "missing install hint: {s}");
+        assert!(
+            s.contains("scripts/install.sh"),
+            "missing install hint: {s}"
+        );
         assert!(s.contains("--no-ensure-pod"), "missing skip hint: {s}");
     }
 }
