@@ -164,6 +164,7 @@
           binaryCacheUtils = cache.binaryCacheUtils;
           devUtils = scripts.devUtils;
           cacheUtils = scripts.cacheUtils;
+          buildScripts = scripts.buildScripts;
           vllmImage = containers.vllmImage { };
           vllmImageMimo = containers.vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
           vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
