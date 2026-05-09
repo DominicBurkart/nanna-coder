@@ -562,11 +562,7 @@ mod tests {
         }
 
         git_must(["init", "--quiet"], work_path, &[]);
-        git_must(
-            ["config", "user.email", "test@example.com"],
-            work_path,
-            &[],
-        );
+        git_must(["config", "user.email", "test@example.com"], work_path, &[]);
         git_must(["config", "user.name", "Test"], work_path, &[]);
         git_must(["config", "commit.gpgsign", "false"], work_path, &[]);
 
@@ -602,7 +598,13 @@ mod tests {
 
         // Clone as a bare repo that materialize_from_url can fetch from.
         git_must(
-            ["clone", "--bare", "--quiet", work_path.to_str().unwrap(), bare_path.to_str().unwrap()],
+            [
+                "clone",
+                "--bare",
+                "--quiet",
+                work_path.to_str().unwrap(),
+                bare_path.to_str().unwrap(),
+            ],
             work_path,
             &[],
         );
