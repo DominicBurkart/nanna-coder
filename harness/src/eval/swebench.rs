@@ -185,7 +185,14 @@ pub(crate) fn extract_changed_files(patch: &str) -> Vec<String> {
 /// Network required. For tests, call `materialize_from_url` with a local
 /// file:// URL instead.
 pub fn materialize(task: &SWEBenchTask, workspace: &Path) -> Result<(), SWEBenchError> {
-    let url = format!("https://github.com/{}.git", task.repo);
+    // Test seam: integration tests can point materialize at a local bare
+    // repo (file://… or absolute path) instead of forcing an actual clone
+    // of github.com/<owner>/<name>.git. Production never sets this env
+    // var, so the default branch is the only one users hit.
+    let url = match std::env::var("NANNA_SWEBENCH_TEST_REPO_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => format!("https://github.com/{}.git", task.repo),
+    };
     materialize_from_url(&url, &task.base_commit, &task.test_patch, workspace)
 }
 

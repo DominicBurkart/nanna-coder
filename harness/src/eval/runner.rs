@@ -1419,6 +1419,305 @@ echo "this is not json" > "$out"
         assert!(matches!(result.unwrap_err(), EvalRunnerError::Timeout(_)));
     }
 
+    /// Build a tiny local bare git repo + return (bare_path, head_oid).
+    /// Mirrors the pattern in `eval::swebench::tests::init_local_fixture`
+    /// so we can exercise `materialize` without a network round-trip.
+    #[cfg(unix)]
+    fn init_local_bare_repo(seed: &std::path::Path, bare: &std::path::Path) -> String {
+        fn git_must<I, S>(args: I, cwd: &std::path::Path)
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<std::ffi::OsStr>,
+        {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("HOME", cwd);
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        git_must(["init", "--quiet"], seed);
+        git_must(["config", "user.email", "t@t"], seed);
+        git_must(["config", "user.name", "t"], seed);
+        git_must(["config", "commit.gpgsign", "false"], seed);
+        std::fs::write(seed.join("hello.py"), "print('hi')\n").unwrap();
+        git_must(["add", "hello.py"], seed);
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"])
+            .current_dir(seed)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", seed)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        assert!(cmd.output().unwrap().status.success());
+        let oid = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(seed)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git_must(
+            [
+                "clone",
+                "--bare",
+                "--quiet",
+                seed.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            seed,
+        );
+        oid
+    }
+
+    #[cfg(unix)]
+    fn fake_nanna_that_writes_changes() -> &'static str {
+        // The fake nanna writes a small file in the work-dir AND emits an
+        // AgentRunReport. The mutation matters because the eval-runner's
+        // finish_swebench path runs `git add -A && git diff <base>` against
+        // work_dir; without a mutation the captured patch is empty and the
+        // BroughtUp assertions become vacuous.
+        r#"#!/usr/bin/env bash
+set -e
+work_dir=""
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --work-dir) work_dir="$2"; shift 2 ;;
+    --output-json) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "fake-nanna-was-here" > "$work_dir/__fake_marker"
+cat > "$out" <<'JSON'
+{
+  "schema_version": 1,
+  "task_completed": true,
+  "iterations": 2,
+  "final_state": "Completed",
+  "result_summary": "fake done",
+  "token_usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+  "tool_calls": []
+}
+JSON
+"#
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_eval_swebench_end_to_end_with_local_repo_and_fake_nanna() {
+        // Cover run_eval's SWE-bench branch end-to-end without network: a
+        // local bare git repo replaces the github.com clone, a shell-script
+        // fake nanna replaces the LLM-driven binary, and we set
+        // swebench_skip_verify so the upstream Python harness isn't on the
+        // path. The signal we're after is patch-coverage: this single test
+        // exercises run_eval body, is_swebench_case, load_swebench_task,
+        // materialize, run_agent_subprocess, and finish_swebench's
+        // skip-verify branch including capture_swebench_patch.
+
+        // 1. Local bare repo.
+        let seed = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let oid = init_local_bare_repo(seed.path(), bare.path());
+
+        // 2. SWE-bench JSONL pointing at a placeholder repo (the real URL
+        // is overridden via env to point at our local bare repo).
+        let dataset_dir = tempfile::tempdir().unwrap();
+        let dataset_path = dataset_dir.path().join("dataset.jsonl");
+        let task_json = serde_json::json!({
+            "instance_id": "test-instance-001",
+            "repo": "fake-owner/fake-repo",
+            "base_commit": oid,
+            "patch": "",
+            "test_patch": "",
+            "problem_statement": "irrelevant for this test",
+            "FAIL_TO_PASS": [],
+            "PASS_TO_PASS": [],
+        });
+        std::fs::write(&dataset_path, format!("{}\n", task_json)).unwrap();
+
+        // 3. Fake nanna binary.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_nanna(bin_dir.path(), fake_nanna_that_writes_changes());
+
+        // 4. EvalCase with the swebench-verified tag.
+        let case_toml = format!(
+            r#"
+[case]
+id = "swebench-test-instance-001"
+name = "swebench end-to-end test"
+description = "exercise run_eval's swebench branch"
+
+[task]
+prompt = "do nothing"
+language = "python"
+
+[metadata]
+timeout_secs = 30
+tags = ["{tag}"]
+"#,
+            tag = SWEBENCH_TAG
+        );
+        let case = EvalCase::from_toml_str(&case_toml).unwrap();
+
+        // 5. Wire up env: NANNA_SWEBENCH_DATASET (dataset path),
+        //    NANNA_SWEBENCH_TEST_REPO_URL (local bare repo override),
+        //    NANNA_HARNESS_BIN (fake nanna).
+        let env_keys = [
+            ("NANNA_SWEBENCH_DATASET", dataset_path.to_str().unwrap()),
+            (
+                "NANNA_SWEBENCH_TEST_REPO_URL",
+                bare.path().to_str().unwrap(),
+            ),
+            ("NANNA_HARNESS_BIN", bin.to_str().unwrap()),
+        ];
+        let saved: Vec<(&str, Option<String>)> = env_keys
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in &env_keys {
+            std::env::set_var(k, v);
+        }
+
+        let case_dir = tempfile::tempdir().unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_max_iterations(2)
+            .with_swebench_skip_verify(true);
+
+        let result = run_eval(&case, case_dir.path(), &config).await;
+
+        // Restore env.
+        for (k, v) in saved {
+            match v {
+                Some(s) => std::env::set_var(k, s),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let result = result.expect("run_eval should succeed structurally");
+        assert_eq!(result.case_id, "swebench-test-instance-001");
+        // skip_verify pushes "verifier skipped" into failures — that's
+        // documented behaviour. We're checking shape, not verdict.
+        assert!(result
+            .failures
+            .iter()
+            .any(|f| f.contains("verifier skipped")));
+        assert!(
+            result.swebench_patch.is_some(),
+            "swebench branch should populate swebench_patch"
+        );
+        // Iteration count from the fake report.
+        assert_eq!(result.iterations, 2);
+        // Token usage flowed through.
+        assert_eq!(result.token_usage.total_tokens, 12);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_eval_swebench_handles_subprocess_soft_error() {
+        // Same harness as above, but the fake nanna exits non-zero. The
+        // run_eval body should fall through to finish_swebench(None, ...)
+        // and still produce an EvalRunResult with the agent error in
+        // `failures`. Covers the Ok(Err(soft)) → swebench-task branch.
+        let seed = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let oid = init_local_bare_repo(seed.path(), bare.path());
+
+        let dataset_dir = tempfile::tempdir().unwrap();
+        let dataset_path = dataset_dir.path().join("dataset.jsonl");
+        let task_json = serde_json::json!({
+            "instance_id": "test-instance-002",
+            "repo": "fake/repo",
+            "base_commit": oid,
+            "patch": "",
+            "test_patch": "",
+            "problem_statement": "x",
+            "FAIL_TO_PASS": [],
+            "PASS_TO_PASS": [],
+        });
+        std::fs::write(&dataset_path, format!("{}\n", task_json)).unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = write_fake_nanna(
+            bin_dir.path(),
+            "#!/usr/bin/env bash\necho 'fake error' >&2\nexit 7\n",
+        );
+
+        let case = EvalCase::from_toml_str(&format!(
+            r#"
+[case]
+id = "swebench-test-instance-002"
+name = "swebench soft-error test"
+description = ""
+
+[task]
+prompt = "x"
+language = "python"
+
+[metadata]
+timeout_secs = 30
+tags = ["{tag}"]
+"#,
+            tag = SWEBENCH_TAG
+        ))
+        .unwrap();
+
+        let env_keys = [
+            ("NANNA_SWEBENCH_DATASET", dataset_path.to_str().unwrap()),
+            (
+                "NANNA_SWEBENCH_TEST_REPO_URL",
+                bare.path().to_str().unwrap(),
+            ),
+            ("NANNA_HARNESS_BIN", bin.to_str().unwrap()),
+        ];
+        let saved: Vec<(&str, Option<String>)> = env_keys
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in &env_keys {
+            std::env::set_var(k, v);
+        }
+
+        let case_dir = tempfile::tempdir().unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_max_iterations(2)
+            .with_swebench_skip_verify(true);
+        let result = run_eval(&case, case_dir.path(), &config).await;
+
+        for (k, v) in saved {
+            match v {
+                Some(s) => std::env::set_var(k, s),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let result = result.expect("run_eval should still produce a structured result");
+        assert!(!result.success);
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.contains("Agent error") && f.contains("fake error")),
+            "expected an Agent error failure, got {:?}",
+            result.failures
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
