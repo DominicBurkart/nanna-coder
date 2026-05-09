@@ -409,6 +409,88 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_pod_config_env)]
+    async fn bring_up_command_picks_podman_fallback_when_pod_config_set() {
+        // When `nix` is unavailable OR no flake.nix is present in the
+        // lookup dir, but `podman` is installed AND NANNA_POD_CONFIG is
+        // set, bring_up_command must return the podman fallback. This
+        // skips when podman isn't on PATH so non-podman dev hosts don't
+        // false-fail.
+        if which::which("podman").is_err() {
+            eprintln!("podman not on PATH; skipping podman-fallback test");
+            return;
+        }
+        let no_flake_dir = std::env::temp_dir().join("nanna_no_flake_for_podman_test");
+        let key = "NANNA_POD_CONFIG";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "/dev/null");
+        let cmd = bring_up_command(&no_flake_dir);
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        let (bin, args) = cmd.expect("podman fallback should kick in");
+        assert_eq!(bin, "podman");
+        assert_eq!(
+            args,
+            vec![
+                "play".to_string(),
+                "kube".to_string(),
+                "/dev/null".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_pod_config_env)]
+    async fn ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
+        // Drive the full bring-up branch with a real `podman play kube`
+        // call against /dev/null. podman will fail to parse the empty
+        // file, surfacing as PodError::BringUpFailed. This exercises the
+        // ensure_running path from probe-fail through Command spawn,
+        // status check, and the BringUpFailed branch.
+        if which::which("podman").is_err() {
+            eprintln!("podman not on PATH; skipping bring-up failure test");
+            return;
+        }
+        // Make sure the nix branch is NOT chosen.
+        let no_flake_dir = std::env::temp_dir().join("nanna_no_flake_for_bring_up_fail");
+        std::fs::create_dir_all(&no_flake_dir).ok();
+        let cfg = EnsureConfig {
+            probe_url: "http://127.0.0.1:1/api/tags".to_string(),
+            health_wait_budget: Duration::from_millis(50),
+            flake_lookup_dir: Some(no_flake_dir),
+            ..EnsureConfig::default()
+        };
+        let key = "NANNA_POD_CONFIG";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "/dev/null");
+        let result = ensure_running(&cfg).await;
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+
+        match result {
+            Err(PodError::BringUpFailed { cmd, .. }) => {
+                assert!(cmd.contains("podman"), "expected podman in cmd: {cmd}");
+            }
+            // Acceptable on weird CI hosts: bring-up SUCCEEDED but probe
+            // never came up → HealthTimeout (the budget is tiny). We
+            // assert the path went through ensure_running's bring-up
+            // branch, not which exact failure we got.
+            Err(PodError::HealthTimeout { .. }) => {}
+            // Acceptable if running inside a container: skipped.
+            Ok(EnsureOutcome::Skipped(SkipReason::InsideContainer)) => {}
+            other => panic!(
+                "expected BringUpFailed or HealthTimeout or InsideContainer, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_pod_config_env)]
     async fn ensure_running_health_times_out_when_bring_up_succeeds_but_probe_keeps_failing() {
         // Force the bring-up path: probe an unreachable URL, set up
         // NANNA_POD_CONFIG so bring_up_command picks the podman fallback,
