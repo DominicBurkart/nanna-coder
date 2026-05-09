@@ -1949,6 +1949,42 @@ timeout_secs = 5
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_returns_subprocess_spawn_error() {
+        // Cover the `Ok(Err(e))` branch of run_agent_subprocess where
+        // `Command::output()` itself fails — typically a non-executable
+        // file that passed the locate_nanna_binary `is_file()` gate.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("not-executable");
+        std::fs::write(&bin, b"not actually a script").unwrap();
+        // No exec perms.
+
+        let case = make_swebench_case("swebench-spawn-fail-001");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(dir.path(), &case, &config, Duration::from_secs(5))
+        })
+        .await;
+
+        match result {
+            Err(EvalRunnerError::SubprocessSpawn(msg)) => {
+                assert!(
+                    msg.contains("not-executable") || msg.contains("could not spawn"),
+                    "got: {msg}"
+                );
+            }
+            // Some platforms return a non-zero exit instead of a spawn
+            // error; accept either as long as we didn't crash.
+            Ok(Err(msg)) => {
+                eprintln!("non-spawn-error path; got soft error: {msg}");
+            }
+            other => panic!("expected SubprocessSpawn or soft error, got {:?}", other),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_propagates_binary_not_found() {
         let case = make_swebench_case("swebench-fake-007");
         let config = EvalRunnerConfig::default();
