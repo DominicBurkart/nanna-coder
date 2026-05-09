@@ -1718,6 +1718,59 @@ tags = ["{tag}"]
         );
     }
 
+    #[tokio::test]
+    async fn run_eval_non_swebench_records_agent_error_when_ollama_is_unreachable() {
+        // Cover run_eval's non-SWE-bench branch (else of `is_swebench`):
+        // copy_dir_recursive shortcut when there's no `repo` subdir,
+        // run_agent_in_process body up to the chat-call failure,
+        // soft-error capture in `failures`, the verification + return
+        // shape. The agent-loop will hit a TCP-refused on :1, which
+        // surfaces as an agent error rather than a timeout.
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-no-ollama"
+name = "fixture without ollama"
+description = "exercise non-swebench branch with unreachable provider"
+
+[task]
+prompt = "say hi"
+language = "rust"
+
+[expected]
+build_must_pass = false
+
+[metadata]
+timeout_secs = 5
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_model("qwen3:0.6b")
+            .with_base_url("http://127.0.0.1:1")
+            .with_max_iterations(1);
+
+        let result = run_eval(&case, case_dir.path(), &config)
+            .await
+            .expect("run_eval should produce a structured result, not crash");
+
+        assert_eq!(result.case_id, "fixture-no-ollama");
+        assert!(!result.success);
+        // Either an "Agent error" was captured (agent failed before
+        // timeout) or the runner returned a Timeout that bubbled — but
+        // since we ran with timeout >= the immediate-fail path,
+        // we expect the soft path. Be permissive on the exact
+        // failure message.
+        assert!(
+            !result.failures.is_empty(),
+            "expected at least one failure, got: {:?}",
+            result.failures
+        );
+        assert!(result.swebench_patch.is_none());
+        assert!(result.agent_result.is_none());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
