@@ -1888,6 +1888,80 @@ timeout_secs = 3
         url
     }
 
+    /// Spawn a tokio TcpListener that accepts connections but never
+    /// responds. The OllamaProvider will hang on `send().await` until its
+    /// own timeout, but the per-case timeout in run_eval should fire
+    /// first.
+    async fn start_hanging_ollama() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                // Hold the socket open without reading or writing — the
+                // client will hang on send().await.
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1];
+                    // Read forever (blocks until peer closes).
+                    let _ = socket.read_exact(&mut buf).await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn run_eval_non_swebench_returns_timeout_when_ollama_hangs() {
+        // Cover run_agent_in_process's timeout branch (line 433) and
+        // run_eval's `Err(hard) => return Err(hard)` arm (line 335).
+        let ollama_url = start_hanging_ollama().await;
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-hanging-ollama"
+name = "fixture against a hanging server"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = false
+
+[metadata]
+timeout_secs = 1
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url(&ollama_url)
+            .with_max_iterations(5);
+        let result = run_eval(&case, case_dir.path(), &config).await;
+        // We expect Timeout (the per-case 1s budget firing first). If
+        // OllamaProvider's own timeout fires first instead, the agent
+        // returns a soft error, which lands as a structured EvalRunResult
+        // with `failures` populated. Either covers the hard-vs-soft
+        // arms in run_eval, but the test is named for the timeout path.
+        match result {
+            Err(EvalRunnerError::Timeout(_)) => {}
+            Ok(r) if !r.failures.is_empty() => {
+                eprintln!(
+                    "OllamaProvider timeout fired before per-case budget; \
+                     failures: {:?}",
+                    r.failures
+                );
+            }
+            other => panic!("expected Timeout or soft-failure result, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn run_eval_non_swebench_succeeds_against_fake_ollama() {
         // Cover run_eval's non-SWE-bench success return path
