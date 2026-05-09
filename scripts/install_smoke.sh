@@ -102,10 +102,18 @@ fi
 #   - mapfile / readarray
 #   - declare -A (associative arrays)
 #   - [[ -v VAR ]]
+#   - ${var^^} / ${var,,} / ${var^} / ${var,}  (case-conversion expansions)
+#   - coproc
 # Hard-fail if any of these slip in.
-if grep -nE 'mapfile|readarray|declare -A|\[\[ -v ' "$INSTALL_SH" >/dev/null 2>&1; then
-  printf '  [FAIL] install.sh uses bash 4+ features (mapfile/readarray/declare -A/[[ -v ]])\n'
-  grep -nE 'mapfile|readarray|declare -A|\[\[ -v ' "$INSTALL_SH" | sed 's/^/         /' >&2
+#
+# The case-conversion patterns are matched literally on the parameter
+# expansion form. We avoid false positives on `^^=` shell ops (none in
+# practice) and on the `^` start-of-pattern in regexes by anchoring on
+# the `${...}` opener.
+BAD_PATTERNS='mapfile|readarray|declare -A|\[\[ -v |\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,|\^\^|,|\^)\}|^[[:space:]]*coproc[[:space:]]'
+if grep -nE "$BAD_PATTERNS" "$INSTALL_SH" >/dev/null 2>&1; then
+  printf '  [FAIL] install.sh uses bash 4+ features (mapfile/readarray/declare -A/[[ -v ]]/${var^^}/${var,,}/coproc)\n'
+  grep -nE "$BAD_PATTERNS" "$INSTALL_SH" | sed 's/^/         /' >&2
   FAILED=$((FAILED + 1))
   FAILURES="${FAILURES}bash 4+ feature in install.sh"$'\n'
 else
@@ -121,6 +129,28 @@ check_grep "macOS branch present"             "Darwin\\*\\) OS=macos"     grep -
 check_grep "install_podman_macos defined"     "install_podman_macos\\(\\)" grep -F "install_podman_macos()" "$INSTALL_SH"
 check_grep "ensure_podman_machine_macos defined" "ensure_podman_machine_macos\\(\\)" grep -F "ensure_podman_machine_macos()" "$INSTALL_SH"
 check_grep "NANNA_SKIP_PODMAN_MACHINE escape hatch present" "NANNA_SKIP_PODMAN_MACHINE" grep -F "NANNA_SKIP_PODMAN_MACHINE" "$INSTALL_SH"
+
+# --- 7. WSL2 contract assertion ---
+# install-test.yml's windows-bringup gate enforces that install.sh
+# fails on WSL2 (is_wsl() detects /proc/version, prints the error
+# block, exits non-zero). If is_wsl() is removed or renamed, the
+# Windows lane silently flips from "expected fail" to "unexpected
+# pass" and the gate's warning fires. Catch that drift here too.
+check_grep "is_wsl() defined" "is_wsl\\(\\)" grep -F "is_wsl()" "$INSTALL_SH"
+
+# --- 8. --dry-run exercises audit + plan code paths ---
+# --help only slices a comment block. --dry-run forces the script
+# through arg parsing -> OS detection -> audit_system -> print_plan
+# without invoking podman or sudo. This is the deepest static-only
+# code-path coverage we can get on a free hosted runner with no
+# container runtime. Run with NANNA_SKIP_PODMAN_MACHINE=1 so the
+# macOS branch doesn't probe `podman machine list` (which would be
+# a no-op without podman, but keep the env explicit).
+check_grep "--dry-run prints plan banner" "Nanna Coder installer" \
+  env NANNA_SKIP_PODMAN_MACHINE=1 bash "$INSTALL_SH" --dry-run --yes
+
+check_grep "--dry-run reports nothing executed" "nothing executed" \
+  env NANNA_SKIP_PODMAN_MACHINE=1 bash "$INSTALL_SH" --dry-run --yes
 
 printf '\n'
 printf 'install_smoke: %d passed, %d failed\n' "$PASSED" "$FAILED"
