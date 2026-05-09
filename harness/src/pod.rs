@@ -330,6 +330,29 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(container_env_var)]
+    fn is_inside_container_returns_true_when_container_env_set() {
+        // Cover the `container` env-var branch of is_inside_container
+        // (lines 105-106 of pod.rs).
+        let key = "container";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, "podman");
+        let inside = is_inside_container();
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        // Only assert when neither `.containerenv` nor `.dockerenv` exists,
+        // otherwise the earlier branches short-circuit. On most CI runners
+        // and dev hosts neither file is present.
+        if !std::path::Path::new("/run/.containerenv").exists()
+            && !std::path::Path::new("/.dockerenv").exists()
+        {
+            assert!(inside);
+        }
+    }
+
+    #[test]
     fn pod_error_display_includes_url_and_budget() {
         let err = PodError::HealthTimeout {
             url: "http://example/api/tags".to_string(),
