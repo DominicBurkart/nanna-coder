@@ -31,7 +31,7 @@ let
     };
 
     config = {
-      Cmd = [ "${harness}/bin/harness" ];
+      Cmd = [ "${harness}/bin/nanna" ];
       Env = [
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "RUST_LOG=info"

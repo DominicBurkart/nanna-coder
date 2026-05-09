@@ -8,7 +8,7 @@ description = "Test harness and CLI for nanna-coder AI assistant"
 repository.workspace = true
 
 [[bin]]
-name = "harness"
+name = "nanna"
 path = "src/main.rs"
 
 [[bin]]

@@ -52,25 +52,30 @@ let
     };
   };
 
-  # Individual workspace member builds for granular container images
-  harness = craneLib.buildPackage {
+  # Individual workspace member build for granular container images.
+  # Crate name is `harness`, binary is `nanna` (renamed from `harness`).
+  nanna = craneLib.buildPackage {
     inherit src cargoArtifacts;
     buildInputs = commonBuildInputs;
     nativeBuildInputs = commonNativeBuildInputs;
 
-    cargoBuildCommand = "cargo build --release --bin harness";
-    cargoCheckCommand = "cargo check --bin harness";
+    cargoBuildCommand = "cargo build --release --bin nanna";
+    cargoCheckCommand = "cargo check --bin nanna";
     cargoTestCommand = "cargo test --package harness";
 
-    # Install only the harness binary
+    # Install only the nanna binary
     installPhase = ''
       mkdir -p $out/bin
-      cp target/release/harness $out/bin/
+      cp target/release/nanna $out/bin/
     '';
   };
 
+  # Backwards-compat alias so anyone calling `nix build .#harness` still
+  # gets a working binary during the rename's grace period.
+  harness = nanna;
+
 in
 {
-  inherit nanna-coder harness;
+  inherit nanna-coder nanna harness;
   inherit cargoArtifacts commonBuildInputs commonNativeBuildInputs;
 }

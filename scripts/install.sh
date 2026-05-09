@@ -405,7 +405,7 @@ register_claude_mcp() {
     --arg model "$MODEL" \
     '{
       command: "podman",
-      args: ["run","--rm","-i","--pod",$pod,$img,"/bin/harness","mcp-serve","--model",$model]
+      args: ["run","--rm","-i","--pod",$pod,$img,"/bin/nanna","mcp-serve","--model",$model]
     }')
 
   # Idempotent: if an entry with the same content already exists, skip.
@@ -436,7 +436,7 @@ register_claude_mcp() {
   fi
   mv "$tmp" "$AUDIT_CLAUDE_CONFIG"
   ok "registered nanna-coder as MCP server in $AUDIT_CLAUDE_CONFIG"
-  log "  command:  podman run --rm -i --pod $POD_NAME $HARNESS_IMAGE /bin/harness mcp-serve --model $MODEL"
+  log "  command:  podman run --rm -i --pod $POD_NAME $HARNESS_IMAGE /bin/nanna mcp-serve --model $MODEL"
 }
 
 audit_system
@@ -581,7 +581,7 @@ start_pod() {
   # The harness binary is a CLI, not a long-running daemon, so we don't keep a
   # harness-service container running. Invoke it on-demand against the pod:
   #   podman run --rm --pod $POD_NAME -e OLLAMA_URL=http://localhost:11434 \
-  #     $HARNESS_IMAGE /bin/harness <subcommand> ...
+  #     $HARNESS_IMAGE /bin/nanna <subcommand> ...
 }
 
 dump_ollama_logs() {
@@ -651,5 +651,5 @@ Common commands:
 Run the harness CLI against the running pod (one-shot):
   podman run --rm --pod $POD_NAME \\
     -e OLLAMA_URL=http://localhost:11434 \\
-    $HARNESS_IMAGE /bin/harness models
+    $HARNESS_IMAGE /bin/nanna models
 EOF

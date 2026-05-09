@@ -19,12 +19,18 @@
 {
   default = flake-utils.lib.mkApp {
     drv = harness;
-    exePath = "/bin/harness";
+    exePath = "/bin/nanna";
   };
 
+  nanna = flake-utils.lib.mkApp {
+    drv = harness;
+    exePath = "/bin/nanna";
+  };
+
+  # Backwards-compat alias during the harness → nanna grace period.
   harness = flake-utils.lib.mkApp {
     drv = harness;
-    exePath = "/bin/harness";
+    exePath = "/bin/nanna";
   };
 
   # CI/CD utilities
