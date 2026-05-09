@@ -48,10 +48,12 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Provider implementation for Anthropic's Messages API.
 ///
 /// Constructed once and reused across requests; the underlying
-/// [`reqwest::Client`] holds a connection pool.
+/// [`reqwest::Client`] holds a connection pool. The API key is validated
+/// once at construction (must be ASCII-printable so it can become an HTTP
+/// header value); subsequent requests cannot panic on header assembly.
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: reqwest::header::HeaderValue,
     base_url: String,
 }
 
@@ -62,17 +64,28 @@ impl AnthropicProvider {
             std::env::var("ANTHROPIC_API_KEY").map_err(|_| ModelError::InvalidConfig {
                 message: "ANTHROPIC_API_KEY env var not set".to_string(),
             })?;
-        Ok(Self::with_api_key(api_key))
+        Self::with_api_key(api_key)
     }
 
     /// Construct with an explicit API key. Use [`AnthropicProvider::from_env`]
-    /// for the common case.
-    pub fn with_api_key(api_key: impl Into<String>) -> Self {
-        Self {
+    /// for the common case. Returns [`ModelError::InvalidConfig`] if the
+    /// key contains characters that cannot appear in an HTTP header value
+    /// (e.g. a stray BOM, newline, or non-ASCII byte).
+    pub fn with_api_key(api_key: impl Into<String>) -> ModelResult<Self> {
+        let raw = api_key.into();
+        let mut header = reqwest::header::HeaderValue::from_str(&raw).map_err(|_| {
+            ModelError::InvalidConfig {
+                message: "ANTHROPIC_API_KEY contains characters that cannot be sent as an HTTP \
+                          header value (non-ASCII / control / BOM)"
+                    .to_string(),
+            }
+        })?;
+        header.set_sensitive(true);
+        Ok(Self {
             client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key: header,
             base_url: DEFAULT_BASE_URL.to_string(),
-        }
+        })
     }
 
     /// Override the base URL, e.g. for tests or proxies.
@@ -83,11 +96,7 @@ impl AnthropicProvider {
 
     fn auth_headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert(
-            "x-api-key",
-            reqwest::header::HeaderValue::from_str(&self.api_key)
-                .expect("api key is ascii printable"),
-        );
+        h.insert("x-api-key", self.api_key.clone());
         h.insert(
             "anthropic-version",
             reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
@@ -376,8 +385,15 @@ fn translate_request(request: ChatRequest) -> AnthropicRequest {
         });
     }
 
-    let tools = tools.map(|defs| defs.into_iter().map(tool_definition_to_anthropic).collect());
-    let tool_choice = tool_choice.map(tool_choice_to_value);
+    let tools: Option<Vec<AnthropicTool>> =
+        tools.map(|defs| defs.into_iter().map(tool_definition_to_anthropic).collect());
+    // Anthropic returns 400 if `tool_choice` is set but `tools` is absent.
+    // Drop a stale `tool_choice` rather than emitting an invalid payload.
+    let tool_choice = if tools.is_some() {
+        tool_choice.map(tool_choice_to_value)
+    } else {
+        None
+    };
 
     AnthropicRequest {
         model,
@@ -419,13 +435,25 @@ fn message_to_blocks(msg: ChatMessage) -> Vec<AnthropicContent> {
         MessageRole::Tool => {
             // OpenAI-style: Tool message has tool_call_id + content. Map
             // to Anthropic's tool_result block, which lives inside a user
-            // message.
-            let tool_use_id = msg.tool_call_id.unwrap_or_default();
-            let content = msg.content.unwrap_or_default();
-            out.push(AnthropicContent::ToolResult {
-                tool_use_id,
-                content,
-            });
+            // message. A missing tool_call_id is a programming error
+            // (Tool messages should always be paired with a prior
+            // tool_use); emitting an empty tool_use_id would cause
+            // Anthropic to 400, so we drop the message and warn instead
+            // — surfacing the upstream bug rather than masking it.
+            match msg.tool_call_id {
+                Some(tool_use_id) if !tool_use_id.is_empty() => {
+                    out.push(AnthropicContent::ToolResult {
+                        tool_use_id,
+                        content: msg.content.unwrap_or_default(),
+                    });
+                }
+                _ => {
+                    tracing::warn!(
+                        "dropping Tool-role message with missing/empty tool_call_id; \
+                         this is a programming error in the caller"
+                    );
+                }
+            }
         }
         MessageRole::System => {}
     }
@@ -717,10 +745,20 @@ mod tests {
         assert_eq!(out.messages[0].content.len(), 1);
     }
 
+    fn fake_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("a fake {name}"),
+                parameters: schema_object_with(vec![], vec![]),
+            },
+        }
+    }
+
     #[test]
     fn translate_tool_choice_required_maps_to_any() {
-        let req = ChatRequest::new("claude-opus-4-7", vec![ChatMessage::user("Hi.")]);
-        let mut req = req;
+        let mut req = ChatRequest::new("claude-opus-4-7", vec![ChatMessage::user("Hi.")])
+            .with_tools(vec![fake_tool("noop")]);
         req.tool_choice = Some(ToolChoice::Required);
         let out = translate_request(req);
         assert_eq!(out.tool_choice, Some(json!({"type": "any"})));
@@ -728,14 +766,106 @@ mod tests {
 
     #[test]
     fn translate_tool_choice_specific_includes_name() {
-        let req = ChatRequest::new("claude-opus-4-7", vec![ChatMessage::user("Hi.")]);
-        let mut req = req;
+        let mut req = ChatRequest::new("claude-opus-4-7", vec![ChatMessage::user("Hi.")])
+            .with_tools(vec![fake_tool("read_file")]);
         req.tool_choice = Some(ToolChoice::Specific("read_file".to_string()));
         let out = translate_request(req);
         assert_eq!(
             out.tool_choice,
             Some(json!({"type": "tool", "name": "read_file"}))
         );
+    }
+
+    #[test]
+    fn translate_drops_tool_choice_when_tools_absent() {
+        // Bug fix: Anthropic returns 400 if `tool_choice` is set without
+        // `tools`. The translator must silently drop the choice rather
+        // than emit an invalid payload.
+        let mut req = ChatRequest::new("claude-opus-4-7", vec![ChatMessage::user("Hi.")]);
+        req.tool_choice = Some(ToolChoice::Required);
+        let out = translate_request(req);
+        assert!(out.tools.is_none());
+        assert!(out.tool_choice.is_none());
+    }
+
+    #[test]
+    fn translate_drops_tool_message_with_missing_tool_call_id() {
+        // Bug fix: a Tool-role message without `tool_call_id` produced an
+        // empty `tool_use_id` which Anthropic rejects. The translator now
+        // drops the message and warns; the assistant-side tool_use survives.
+        let req = ChatRequest::new(
+            "claude-opus-4-7",
+            vec![
+                ChatMessage::assistant_with_tools(
+                    None,
+                    vec![ToolCall {
+                        id: "toolu_1".to_string(),
+                        function: FunctionCall {
+                            name: "f".to_string(),
+                            arguments: json!({}),
+                        },
+                    }],
+                ),
+                // Tool message with no tool_call_id — caller bug.
+                ChatMessage {
+                    role: crate::types::MessageRole::Tool,
+                    content: Some("oops".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage::user("continue"),
+            ],
+        );
+        let out = translate_request(req);
+        // Expected: assistant (tool_use) → user (text "continue").
+        // The malformed Tool message contributes nothing.
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(out.messages[0].role, "assistant");
+        assert_eq!(out.messages[1].role, "user");
+        assert_eq!(out.messages[1].content.len(), 1);
+        match &out.messages[1].content[0] {
+            AnthropicContent::Text { text } => assert_eq!(text, "continue"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_drops_tool_message_with_empty_tool_call_id() {
+        // Same bug as above, with an explicit empty string.
+        let req = ChatRequest::new(
+            "claude-opus-4-7",
+            vec![ChatMessage {
+                role: crate::types::MessageRole::Tool,
+                content: Some("oops".to_string()),
+                tool_calls: None,
+                tool_call_id: Some(String::new()),
+            }],
+        );
+        let out = translate_request(req);
+        assert!(out.messages.is_empty());
+    }
+
+    #[test]
+    fn with_api_key_rejects_control_chars() {
+        // A NUL byte (or any 0x00–0x1F control char other than tab) cannot
+        // become a header value. Validation happens at construction so
+        // chat() never panics on header assembly.
+        let r = AnthropicProvider::with_api_key("sk-test\0bad");
+        assert!(matches!(r, Err(ModelError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn with_api_key_rejects_newline_in_key() {
+        // A trailing newline (common copy-paste mistake) is a control
+        // character and would have panicked in the old `.expect()` path.
+        let r = AnthropicProvider::with_api_key("sk-test\nbadline");
+        assert!(matches!(r, Err(ModelError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn with_api_key_accepts_normal_key() {
+        let r = AnthropicProvider::with_api_key("sk-ant-fake-key-001");
+        assert!(r.is_ok());
     }
 
     #[test]
