@@ -25,13 +25,20 @@
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
 use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
+use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, SWEBenchTask};
+use crate::eval::swebench_verify::{
+    verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
+};
 use crate::tools::create_tool_registry;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+const SWEBENCH_TAG: &str = "swebench-verified";
+const DEFAULT_SWEBENCH_DATASET_REL: &str = "datasets/swebench-verified-sample.jsonl";
 
 /// Errors that can occur when running an eval case.
 #[derive(Debug, Error)]
@@ -46,6 +53,16 @@ pub enum EvalRunnerError {
     ModelProvider(String),
     #[error("Timeout after {0:?}")]
     Timeout(Duration),
+    #[error("SWE-bench dataset not found at {0}")]
+    SwebenchDatasetMissing(PathBuf),
+    #[error("SWE-bench instance {0} not present in dataset")]
+    SwebenchInstanceMissing(String),
+    #[error("SWE-bench materialize failed: {0}")]
+    SwebenchMaterialize(#[from] SWEBenchError),
+    #[error("SWE-bench verify failed: {0}")]
+    SwebenchVerify(#[from] VerifyError),
+    #[error("git diff capture failed: {0}")]
+    GitDiff(String),
 }
 
 /// Configuration for the eval runner.
@@ -59,15 +76,37 @@ pub struct EvalRunnerConfig {
     pub verbose: bool,
     /// Maximum iterations for the agent loop.
     pub max_iterations: usize,
+    /// Override path to the SWE-bench dataset JSONL. When `None`, swebench
+    /// cases resolve `<case_dir>/../../datasets/swebench-verified-sample.jsonl`.
+    pub swebench_dataset_path: Option<PathBuf>,
+    /// HuggingFace dataset name passed through to the upstream Python
+    /// harness for swebench cases.
+    pub swebench_hf_dataset: String,
+    /// Run-id label used by the upstream harness output tree. Defaults to
+    /// the wall-clock seconds at config-construction time.
+    pub swebench_run_id: String,
+    /// When `true`, the runner captures the agent's patch but skips the
+    /// upstream Python harness call. Used by batched scoring (`harness-score`)
+    /// where verification happens once across all instances after every
+    /// agent has run, rather than per-instance.
+    pub swebench_skip_verify: bool,
 }
 
 impl Default for EvalRunnerConfig {
     fn default() -> Self {
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| format!("nanna-{}", d.as_secs()))
+            .unwrap_or_else(|_| "nanna-run".to_string());
         Self {
             model_name: "qwen3:0.6b".to_string(),
             model_base_url: None,
             verbose: false,
             max_iterations: 100,
+            swebench_dataset_path: None,
+            swebench_hf_dataset: "princeton-nlp/SWE-bench_Verified".to_string(),
+            swebench_run_id: run_id,
+            swebench_skip_verify: false,
         }
     }
 }
@@ -90,6 +129,11 @@ impl EvalRunnerConfig {
 
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    pub fn with_swebench_skip_verify(mut self, skip: bool) -> Self {
+        self.swebench_skip_verify = skip;
         self
     }
 }
@@ -151,13 +195,21 @@ pub struct EvalRunResult {
     pub failures: Vec<String>,
     /// The underlying agent result, if the agent ran successfully.
     pub agent_result: Option<AgentRunResult>,
+    /// Unified-diff patch the agent produced against the materialized repo.
+    /// Populated only for SWE-bench cases (`swebench-verified` tag); `None`
+    /// for happy-path fixtures. Set whether or not `swebench_skip_verify`
+    /// is enabled, so callers can persist or batch-verify the patch later.
+    pub swebench_patch: Option<String>,
 }
 
 /// Run a single eval case end-to-end.
 ///
-/// 1. Copies the fixture repo into an isolated temporary directory.
+/// 1. Copies the fixture repo (or for SWE-bench cases, clones the upstream
+///    repo at `base_commit`) into an isolated temporary directory.
 /// 2. Initialises and runs the [`AgentLoop`] with the task prompt.
-/// 3. Runs post-completion verification checks.
+/// 3. For SWE-bench cases, captures the agent's diff and shells out to the
+///    upstream Python harness for the verdict. For other cases, runs the
+///    in-tree `cargo build`/`cargo test`/file/symbol checks.
 /// 4. Returns structured metrics.
 pub async fn run_eval(
     eval_case: &EvalCase,
@@ -165,14 +217,22 @@ pub async fn run_eval(
     config: &EvalRunnerConfig,
 ) -> Result<EvalRunResult, EvalRunnerError> {
     let start = Instant::now();
+    let is_swebench = is_swebench_case(eval_case);
 
-    // --- 1. Isolate: copy fixture repo into a temp dir ---
+    // --- 1. Isolate: copy fixture repo (or materialize swebench repo) into a temp dir ---
     let tmp_dir = tempfile::TempDir::new()?;
-    let repo_src = case_dir.join("repo");
-    if repo_src.is_dir() {
-        copy_dir_recursive(&repo_src, tmp_dir.path())?;
-    }
     let work_dir = tmp_dir.path();
+    let swebench_task: Option<SWEBenchTask> = if is_swebench {
+        let task = load_swebench_task(eval_case, case_dir, config)?;
+        materialize(&task, work_dir)?;
+        Some(task)
+    } else {
+        let repo_src = case_dir.join("repo");
+        if repo_src.is_dir() {
+            copy_dir_recursive(&repo_src, work_dir)?;
+        }
+        None
+    };
 
     // --- 2. Build and run agent ---
     let agent_config = AgentConfig {
@@ -215,6 +275,9 @@ pub async fn run_eval(
         }
         Ok(Err(e)) => {
             let mut f = vec![format!("Agent error: {e}")];
+            if let Some(task) = &swebench_task {
+                return finish_swebench(eval_case, task, work_dir, config, start, None, f).await;
+            }
             // Still run verification even on agent error
             let verification =
                 run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
@@ -232,12 +295,26 @@ pub async fn run_eval(
                 verification,
                 failures: f,
                 agent_result: None,
+                swebench_patch: None,
             });
         }
         Err(_elapsed) => {
             return Err(EvalRunnerError::Timeout(timeout));
         }
     };
+
+    if let Some(task) = &swebench_task {
+        return finish_swebench(
+            eval_case,
+            task,
+            work_dir,
+            config,
+            start,
+            agent_result,
+            failures,
+        )
+        .await;
+    }
 
     // --- 3. Verification ---
     let verification =
@@ -271,6 +348,169 @@ pub async fn run_eval(
         verification,
         failures,
         agent_result,
+        swebench_patch: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SWE-bench helpers
+// ---------------------------------------------------------------------------
+
+fn is_swebench_case(case: &EvalCase) -> bool {
+    case.metadata.tags.iter().any(|t| t == SWEBENCH_TAG)
+}
+
+fn resolve_swebench_dataset_path(
+    case_dir: &Path,
+    config: &EvalRunnerConfig,
+) -> Result<PathBuf, EvalRunnerError> {
+    if let Some(p) = &config.swebench_dataset_path {
+        return Ok(p.clone());
+    }
+    if let Ok(env) = std::env::var("NANNA_SWEBENCH_DATASET") {
+        return Ok(PathBuf::from(env));
+    }
+    let mut anc = case_dir.ancestors();
+    anc.next();
+    let cases_dir = anc
+        .next()
+        .ok_or_else(|| EvalRunnerError::SwebenchDatasetMissing(case_dir.to_path_buf()))?;
+    let evals_dir = anc
+        .next()
+        .ok_or_else(|| EvalRunnerError::SwebenchDatasetMissing(cases_dir.to_path_buf()))?;
+    Ok(evals_dir.join(DEFAULT_SWEBENCH_DATASET_REL))
+}
+
+fn load_swebench_task(
+    eval_case: &EvalCase,
+    case_dir: &Path,
+    config: &EvalRunnerConfig,
+) -> Result<SWEBenchTask, EvalRunnerError> {
+    let dataset_path = resolve_swebench_dataset_path(case_dir, config)?;
+    if !dataset_path.is_file() {
+        return Err(EvalRunnerError::SwebenchDatasetMissing(dataset_path));
+    }
+    let tasks = load_swebench_dataset(&dataset_path)?;
+    let needle = eval_case
+        .case
+        .id
+        .strip_prefix("swebench-")
+        .unwrap_or(eval_case.case.id.as_str());
+    tasks
+        .into_iter()
+        .find(|t| t.instance_id == needle)
+        .ok_or_else(|| EvalRunnerError::SwebenchInstanceMissing(needle.to_string()))
+}
+
+async fn capture_swebench_patch(
+    work_dir: &Path,
+    base_commit: &str,
+) -> Result<String, EvalRunnerError> {
+    let add = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(work_dir)
+        .output()
+        .await
+        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git add: {e}")))?;
+    if !add.status.success() {
+        return Err(EvalRunnerError::GitDiff(format!(
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        )));
+    }
+    let diff = tokio::process::Command::new("git")
+        .args(["diff", base_commit, "--binary"])
+        .current_dir(work_dir)
+        .output()
+        .await
+        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git diff: {e}")))?;
+    if !diff.status.success() {
+        return Err(EvalRunnerError::GitDiff(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&diff.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&diff.stdout).into_owned())
+}
+
+async fn finish_swebench(
+    eval_case: &EvalCase,
+    task: &SWEBenchTask,
+    work_dir: &Path,
+    config: &EvalRunnerConfig,
+    start: Instant,
+    agent_result: Option<AgentRunResult>,
+    mut failures: Vec<String>,
+) -> Result<EvalRunResult, EvalRunnerError> {
+    let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
+
+    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
+    if !task_completed {
+        failures.push("Agent did not complete the task".to_string());
+    }
+    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
+    let token_usage = agent_result
+        .as_ref()
+        .and_then(|r| r.token_usage.clone())
+        .unwrap_or_else(default_token_usage);
+
+    let resolved = if config.swebench_skip_verify {
+        failures.push("verifier skipped — score-mode batched run".to_string());
+        false
+    } else {
+        let verify_dir = work_dir.join("__nanna_verify");
+        std::fs::create_dir_all(&verify_dir)?;
+        let verify_config = VerifyConfig {
+            dataset_name: config.swebench_hf_dataset.clone(),
+            model_name_or_path: format!("nanna__{}", config.model_name.replace([':', '/'], "-")),
+            run_id: config.swebench_run_id.clone(),
+            work_dir: verify_dir,
+            max_workers: 1,
+        };
+        let predictions = vec![Prediction {
+            instance_id: task.instance_id.clone(),
+            model_patch: model_patch.clone(),
+        }];
+        let verdicts = verify_predictions(&predictions, &verify_config).await?;
+        let verdict: Option<&InstanceVerdict> =
+            verdicts.iter().find(|v| v.instance_id == task.instance_id);
+        if let Some(v) = verdict {
+            if let Some(err) = &v.error {
+                failures.push(format!("SWE-bench verifier: {err}"));
+            }
+            if !v.resolved && v.error.is_none() {
+                failures.push("SWE-bench verdict: not resolved".to_string());
+            }
+            v.resolved
+        } else {
+            failures.push(format!(
+                "SWE-bench verdict missing for instance {}",
+                task.instance_id
+            ));
+            false
+        }
+    };
+
+    let success = resolved && task_completed;
+    let execution_time = start.elapsed();
+
+    Ok(EvalRunResult {
+        case_id: eval_case.case.id.clone(),
+        success,
+        execution_time,
+        iterations,
+        token_usage,
+        verification: VerificationResult {
+            build_passed: None,
+            tests_passed: None,
+            files_found: Vec::new(),
+            missing_files: Vec::new(),
+            symbols_found: Vec::new(),
+            missing_symbols: Vec::new(),
+        },
+        failures,
+        agent_result,
+        swebench_patch: Some(model_patch),
     })
 }
 
@@ -1049,6 +1289,7 @@ mod tests {
             },
             failures: vec![],
             agent_result: None,
+            swebench_patch: None,
         };
         assert_eq!(result.case_id, "test-001");
         assert!(result.success);
@@ -1056,6 +1297,22 @@ mod tests {
         assert_eq!(result.token_usage.total_tokens, 0);
         assert!(result.failures.is_empty());
         assert!(result.agent_result.is_none());
+        assert!(result.swebench_patch.is_none());
+    }
+
+    #[test]
+    fn test_config_default_swebench_skip_verify_off() {
+        let config = EvalRunnerConfig::default();
+        assert!(
+            !config.swebench_skip_verify,
+            "default must preserve current per-instance verify behaviour"
+        );
+    }
+
+    #[test]
+    fn test_config_with_swebench_skip_verify() {
+        let config = EvalRunnerConfig::default().with_swebench_skip_verify(true);
+        assert!(config.swebench_skip_verify);
     }
 
     #[test]
@@ -1131,6 +1388,59 @@ mod tests {
         let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn test_is_swebench_case_detects_tag() {
+        let mut case = sample_eval_case();
+        case.metadata.tags = vec!["other".to_string(), SWEBENCH_TAG.to_string()];
+        assert!(is_swebench_case(&case));
+    }
+
+    #[test]
+    fn test_is_swebench_case_rejects_missing_tag() {
+        let mut case = sample_eval_case();
+        case.metadata.tags = vec!["other".to_string()];
+        assert!(!is_swebench_case(&case));
+    }
+
+    #[test]
+    fn test_resolve_swebench_dataset_path_explicit() {
+        let case_dir = Path::new("/tmp/evals/cases/swebench-x");
+        let config = EvalRunnerConfig {
+            swebench_dataset_path: Some(PathBuf::from("/custom/dataset.jsonl")),
+            ..EvalRunnerConfig::default()
+        };
+        let resolved = resolve_swebench_dataset_path(case_dir, &config).unwrap();
+        assert_eq!(resolved, PathBuf::from("/custom/dataset.jsonl"));
+    }
+
+    #[test]
+    fn test_resolve_swebench_dataset_path_default_layout() {
+        let case_dir = Path::new("/tmp/evals/cases/swebench-x");
+        let config = EvalRunnerConfig::default();
+        let resolved = resolve_swebench_dataset_path(case_dir, &config).unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/evals/datasets/swebench-verified-sample.jsonl")
+        );
+    }
+
+    fn sample_eval_case() -> EvalCase {
+        use crate::agent::eval_case::{CaseInfo, CaseMetadata, ExpectedResult, TaskSpec};
+        EvalCase {
+            case: CaseInfo {
+                id: "swebench-django__django-11099".to_string(),
+                name: "django__django-11099".to_string(),
+                description: String::new(),
+            },
+            task: TaskSpec {
+                prompt: String::new(),
+                language: "python".to_string(),
+            },
+            expected: ExpectedResult::default(),
+            metadata: CaseMetadata::default(),
+        }
     }
 
     #[cfg(unix)]
