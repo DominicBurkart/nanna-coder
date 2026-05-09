@@ -38,8 +38,8 @@ pub use tools::{
 
 // Export agent types
 pub use agent::{
-    AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
-    AgentState,
+    AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunReport,
+    AgentRunResult, AgentState, TokenUsageDto, ToolCallSummary,
 };
 
 // Export eval types
