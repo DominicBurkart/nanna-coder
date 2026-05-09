@@ -1197,6 +1197,14 @@ mod tests {
         assert!(s.contains("exit-0"));
     }
 
+    // The subprocess tests below rely on a shebang-executable shell script
+    // that mirrors the `nanna agent --output-json` binary's shape. Windows
+    // (and any future non-unix CI target) doesn't honour `#!/usr/bin/env
+    // bash` shebang dispatch, so the script-based test fixtures are
+    // gated. The runner is feature-equivalent across platforms (it just
+    // shells out via tokio::process::Command) so coverage is not
+    // platform-specific from a correctness standpoint.
+    #[cfg(unix)]
     fn write_fake_nanna(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let path = dir.join("fake-nanna.sh");
         std::fs::write(&path, body).unwrap();
@@ -1207,6 +1215,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn make_swebench_case(id: &str) -> EvalCase {
         let toml = format!(
             r#"
@@ -1227,6 +1236,7 @@ tags = ["{tag}"]
         EvalCase::from_toml_str(&toml).unwrap()
     }
 
+    #[cfg(unix)]
     fn fake_report_writer_script() -> &'static str {
         r#"#!/usr/bin/env bash
 set -e
@@ -1252,6 +1262,7 @@ JSON
 "#
     }
 
+    #[cfg(unix)]
     async fn with_nanna_bin<F, Fut, T>(bin: &std::path::Path, f: F) -> T
     where
         F: FnOnce() -> Fut,
@@ -1268,6 +1279,7 @@ JSON
         result
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_reads_fake_report() {
@@ -1291,6 +1303,7 @@ JSON
         assert!(outcome.as_in_process().is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_soft_errors_on_non_zero_exit() {
@@ -1311,6 +1324,7 @@ JSON
         assert!(msg.contains("fake nanna error"), "got: {msg}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_soft_error_with_empty_stderr() {
@@ -1330,6 +1344,7 @@ JSON
         assert!(msg.contains("(no stderr)"), "got: {msg}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_hard_errors_when_exit_zero_no_json() {
@@ -1352,6 +1367,7 @@ JSON
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_hard_errors_when_json_invalid() {
@@ -1386,6 +1402,7 @@ echo "this is not json" > "$out"
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_times_out() {
@@ -1402,6 +1419,7 @@ echo "this is not json" > "$out"
         assert!(matches!(result.unwrap_err(), EvalRunnerError::Timeout(_)));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(nanna_harness_bin_env)]
     async fn run_agent_subprocess_propagates_binary_not_found() {
