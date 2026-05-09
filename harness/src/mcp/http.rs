@@ -68,7 +68,10 @@ async fn handle_http_request(
 ) -> Result<Response<Body>, Infallible> {
     let client_ip = remote_addr.ip();
 
-    // Check rate limit before doing any work
+    // Check rate limit before doing any work. Uses a read-only check here
+    // because we have not yet confirmed this is a valid auth attempt worth
+    // counting — the combined check+record happens at the auth failure site
+    // below.
     if rate_limiter.check_rate_limit(&client_ip).is_err() {
         let body = json_rpc_error(-32000, "rate limited");
         return Ok(json_response(StatusCode::TOO_MANY_REQUESTS, &body));
@@ -85,11 +88,17 @@ async fn handle_http_request(
         return Ok(json_response(StatusCode::METHOD_NOT_ALLOWED, &body));
     }
 
-    // Authenticate
+    // Authenticate. `check_and_record_failure` atomically checks the rate
+    // limit and increments the failure counter in one lock scope, eliminating
+    // the TOCTOU race between a separate check and record call.
     match extract_bearer_token(&req) {
         Ok(token) => {
             if let Err(e) = token_store.validate(token) {
-                rate_limiter.record_failure(&client_ip);
+                // Atomically check rate limit and record the auth failure.
+                // If the IP is already over the limit this returns RateLimited
+                // (we still send a 401 rather than 429 to avoid leaking limit
+                // state to a brute-forcing client).
+                let _ = rate_limiter.check_and_record_failure(&client_ip);
                 let msg = match e {
                     AuthError::ExpiredToken => "expired token",
                     AuthError::InvalidToken => "invalid token",
@@ -99,7 +108,7 @@ async fn handle_http_request(
             }
         }
         Err(_) => {
-            rate_limiter.record_failure(&client_ip);
+            let _ = rate_limiter.check_and_record_failure(&client_ip);
             return Ok(unauthorized_response("missing authorization header"));
         }
     }

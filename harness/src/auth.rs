@@ -28,7 +28,7 @@ pub enum AuthError {
     EmptyTokenFile,
     #[error(
         "token has invalid format (expected 64 lowercase hex characters); \
-         check NANNA_AUTH_TOKEN / --token-file contents"
+         check NANNA_TOKEN / --token-file contents"
     )]
     InvalidTokenFormat,
     #[error(
@@ -64,7 +64,7 @@ impl AuthToken {
     }
 
     /// Validated constructor: requires 64 lowercase hex characters.
-    /// This makes malformed `NANNA_AUTH_TOKEN` / token-file contents fail loudly
+    /// This makes malformed `NANNA_TOKEN` / token-file contents fail loudly
     /// at startup rather than silently rejecting every subsequent request with
     /// `InvalidToken`. It also makes length-based timing leaks unreachable for
     /// caller-supplied input because every accepted token has the same length.
@@ -168,6 +168,10 @@ pub fn validate_bind_address(addr: &SocketAddr) -> Result<(), AuthError> {
 /// Read a bearer token from a file, validating that the file has restrictive
 /// permissions (0600 on Unix) to prevent other users from reading the token.
 ///
+/// The file descriptor is opened once and both the permission check (fstat)
+/// and the read are performed on the same fd to eliminate the TOCTOU race
+/// that exists when `metadata()` and `read_to_string()` are separate syscalls.
+///
 /// Non-Unix platforms are rejected outright: we have no portable ACL check,
 /// and silently skipping permission enforcement on Windows would let any
 /// local user read a token file that is supposed to be secret. Operators on
@@ -182,14 +186,24 @@ pub fn read_token_file(path: &Path) -> Result<AuthToken, AuthError> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(path)?;
-        let mode = metadata.permissions().mode() & 0o777;
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        // Open the file once. All subsequent operations (stat + read) go
+        // through this single fd, closing the TOCTOU window that would exist
+        // if we called `fs::metadata(path)` and `fs::read_to_string(path)`
+        // as two independent syscalls.
+        let mut file = std::fs::File::open(path)?;
+
+        // fstat via the open fd — not a re-stat of the path.
+        let metadata = file.metadata()?;
+        let mode = metadata.mode() & 0o777;
         if mode != 0o600 {
             return Err(AuthError::InsecureFilePermissions);
         }
 
-        let contents = std::fs::read_to_string(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
         let token = contents.trim().to_string();
         if token.is_empty() {
             return Err(AuthError::EmptyTokenFile);
@@ -234,7 +248,43 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// Atomically check whether the given IP is rate-limited **and**, if not,
+    /// record a failure — all within a single lock acquisition.
+    ///
+    /// This eliminates the TOCTOU window that exists when `check_rate_limit`
+    /// and `record_failure` are called as two separate methods: under concurrent
+    /// load a second goroutine could pass the check between the two calls and
+    /// both would then record a failure without either being blocked.
+    ///
+    /// Returns `Err(AuthError::RateLimited)` if the IP has exhausted its
+    /// failure budget within the current window, `Ok(())` otherwise (failure
+    /// has been recorded).
+    pub fn check_and_record_failure(&self, ip: &IpAddr) -> Result<(), AuthError> {
+        let mut state = self.state.lock().expect("rate limiter lock poisoned");
+        if let Some(entry) = state.get_mut(ip) {
+            if entry.1.elapsed() >= self.window {
+                // Window expired — reset to 1 failure.
+                *entry = (1, Instant::now());
+                return Ok(());
+            }
+            if entry.0 >= self.max_failures {
+                return Err(AuthError::RateLimited);
+            }
+            // saturating_add prevents wrap-to-zero in release builds and
+            // overflow panic in debug builds.
+            entry.0 = entry.0.saturating_add(1);
+        } else {
+            state.insert(*ip, (1, Instant::now()));
+        }
+        Ok(())
+    }
+
     /// Record a failed authentication attempt for the given IP.
+    ///
+    /// Prefer `check_and_record_failure` when you need to atomically check
+    /// the limit and record in one step. Use this method only when you want
+    /// to record a failure unconditionally (e.g. bad HTTP method) without
+    /// needing the rate-limit check result.
     pub fn record_failure(&self, ip: &IpAddr) {
         let mut state = self.state.lock().expect("rate limiter lock poisoned");
         let entry = state.entry(*ip).or_insert((0, Instant::now()));
@@ -458,6 +508,38 @@ mod tests {
         assert!(
             limiter.check_rate_limit(&ip).is_ok(),
             "counter must have been reset to 1 after window expiry, not accumulated"
+        );
+    }
+
+    /// check_and_record_failure must atomically enforce the limit and increment
+    /// the counter in a single lock scope, preventing TOCTOU under concurrency.
+    #[test]
+    fn test_check_and_record_failure_blocks_at_threshold() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        // First three calls succeed (record failures 1, 2, 3).
+        assert!(limiter.check_and_record_failure(&ip).is_ok());
+        assert!(limiter.check_and_record_failure(&ip).is_ok());
+        assert!(limiter.check_and_record_failure(&ip).is_ok());
+        // Fourth call should be blocked (count=3 >= max_failures=3).
+        assert!(limiter.check_and_record_failure(&ip).is_err());
+    }
+
+    /// check_and_record_failure must reset the counter (to 1) and allow the
+    /// request when the window has expired, not block on a stale counter.
+    #[test]
+    fn test_check_and_record_failure_resets_on_expired_window() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(0));
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        // Saturate the counter.
+        let _ = limiter.check_and_record_failure(&ip);
+        let _ = limiter.check_and_record_failure(&ip);
+        // Wait for the window to expire.
+        std::thread::sleep(Duration::from_millis(1));
+        // After expiry the call must succeed (counter reset to 1).
+        assert!(
+            limiter.check_and_record_failure(&ip).is_ok(),
+            "expired window must reset counter and allow the request"
         );
     }
 
