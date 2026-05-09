@@ -12,4 +12,4 @@ The earlier multi-tier framing (Cachix + Magic Nix Cache + local) no longer refl
 | Migration history & rationale | [cachix-migration.md](./cachix-migration.md) |
 | Maintainer push setup | [../CACHIX_SETUP.md](../CACHIX_SETUP.md) |
 | Flake-level cache config | [`nix/cache.nix`](../nix/cache.nix) |
-| Cache priorities (current) | `binaryCacheConfig.cacheKeyPriority` in [`nix/cache.nix`](../nix/cache.nix#L21) |
+| Cache priorities (current) | `binaryCacheConfig.cacheKeyPriority` in [`nix/cache.nix`](../nix/cache.nix#L22) |
