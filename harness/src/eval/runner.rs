@@ -1719,6 +1719,89 @@ tags = ["{tag}"]
     }
 
     #[tokio::test]
+    async fn run_eval_non_swebench_copies_existing_repo_dir_into_workspace() {
+        // Covers the `if repo_src.is_dir() { copy_dir_recursive(...) }`
+        // branch in run_eval (lines 287-291). We expect the agent run to
+        // fail (no Ollama) but the copy step must execute first, so we
+        // assert on the failure shape — not on whether the file made it
+        // into the temp workspace (that's torn down before we can see).
+        let case_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(case_dir.path().join("repo")).unwrap();
+        std::fs::write(case_dir.path().join("repo/marker.txt"), "hi").unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-with-repo"
+name = "fixture with repo subdir"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = false
+
+[metadata]
+timeout_secs = 3
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url("http://127.0.0.1:1")
+            .with_max_iterations(1);
+        let result = run_eval(&case, case_dir.path(), &config)
+            .await
+            .expect("should produce structured result");
+        assert_eq!(result.case_id, "fixture-with-repo");
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn run_eval_non_swebench_pushes_verification_failures() {
+        // Covers `failures.extend(verification_failures(&verification))`
+        // in run_eval's non-SWE-bench soft-error path. With
+        // build_must_pass=true and a workspace lacking Cargo.toml,
+        // verify_build returns false, all_passed() is false, and the
+        // verification_failures get appended to `failures`.
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-build-required"
+name = "fixture requiring build"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = true
+
+[metadata]
+timeout_secs = 3
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url("http://127.0.0.1:1")
+            .with_max_iterations(1);
+        let result = run_eval(&case, case_dir.path(), &config)
+            .await
+            .expect("should produce structured result");
+        assert!(!result.success);
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.to_lowercase().contains("build")),
+            "expected a build-related failure, got {:?}",
+            result.failures
+        );
+    }
+
+    #[tokio::test]
     async fn run_eval_non_swebench_records_agent_error_when_ollama_is_unreachable() {
         // Cover run_eval's non-SWE-bench branch (else of `is_swebench`):
         // copy_dir_recursive shortcut when there's no `repo` subdir,
