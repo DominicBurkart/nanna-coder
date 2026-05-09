@@ -24,7 +24,7 @@
 //! ```
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
-use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
+use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunReport, AgentRunResult};
 use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, SWEBenchTask};
 use crate::eval::swebench_verify::{
     verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{info, warn};
 
 const SWEBENCH_TAG: &str = "swebench-verified";
 const DEFAULT_SWEBENCH_DATASET_REL: &str = "datasets/swebench-verified-sample.jsonl";
@@ -63,6 +64,61 @@ pub enum EvalRunnerError {
     SwebenchVerify(#[from] VerifyError),
     #[error("git diff capture failed: {0}")]
     GitDiff(String),
+    #[error(
+        "could not locate the `nanna` binary. Set NANNA_HARNESS_BIN to an \
+         absolute path, or `cargo install --path harness`, or \
+         `nix profile install .#nanna`."
+    )]
+    BinaryNotFound,
+    #[error("nanna subprocess spawn failed: {0}")]
+    SubprocessSpawn(String),
+    #[error("nanna subprocess wrote no output JSON to {0}: {1}")]
+    SubprocessNoOutput(PathBuf, String),
+    #[error("nanna subprocess exited {status}: {stderr}")]
+    SubprocessNonZero { status: String, stderr: String },
+}
+
+/// The agent execution outcome — either captured in-process (fixture
+/// cases) or read back from the `nanna agent --output-json` subprocess
+/// (SWE-bench cases).
+#[derive(Debug, Clone)]
+pub enum AgentOutcome {
+    InProcess(AgentRunResult),
+    Subprocess(AgentRunReport),
+}
+
+impl AgentOutcome {
+    pub fn iterations(&self) -> usize {
+        match self {
+            AgentOutcome::InProcess(r) => r.iterations,
+            AgentOutcome::Subprocess(r) => r.iterations,
+        }
+    }
+
+    pub fn task_completed(&self) -> bool {
+        match self {
+            AgentOutcome::InProcess(r) => r.task_completed,
+            AgentOutcome::Subprocess(r) => r.task_completed,
+        }
+    }
+
+    pub fn token_usage(&self) -> Option<TokenUsage> {
+        match self {
+            AgentOutcome::InProcess(r) => r.token_usage.clone(),
+            AgentOutcome::Subprocess(r) => r.token_usage.as_ref().map(|t| TokenUsage {
+                prompt_tokens: t.prompt_tokens,
+                completion_tokens: t.completion_tokens,
+                total_tokens: t.total_tokens,
+            }),
+        }
+    }
+
+    pub fn as_in_process(&self) -> Option<&AgentRunResult> {
+        match self {
+            AgentOutcome::InProcess(r) => Some(r),
+            AgentOutcome::Subprocess(_) => None,
+        }
+    }
 }
 
 /// Configuration for the eval runner.
@@ -193,8 +249,11 @@ pub struct EvalRunResult {
     pub verification: VerificationResult,
     /// Failure descriptions (empty when `success` is true).
     pub failures: Vec<String>,
-    /// The underlying agent result, if the agent ran successfully.
-    pub agent_result: Option<AgentRunResult>,
+    /// The underlying agent outcome, if the agent ran successfully. For
+    /// SWE-bench cases this is [`AgentOutcome::Subprocess`] (returned by
+    /// the `nanna agent --output-json` subprocess); for fixtures it is
+    /// [`AgentOutcome::InProcess`] (the in-process `AgentLoop` result).
+    pub agent_result: Option<AgentOutcome>,
     /// Unified-diff patch the agent produced against the materialized repo.
     /// Populated only for SWE-bench cases (`swebench-verified` tag); `None`
     /// for happy-path fixtures. Set whether or not `swebench_skip_verify`
@@ -234,7 +293,113 @@ pub async fn run_eval(
         None
     };
 
-    // --- 2. Build and run agent ---
+    // --- 2. Run agent ---
+    //
+    // SWE-bench cases drive the installed `nanna` binary as a subprocess so
+    // the score reflects nanna-as-deployed (pod, observability, MCP wiring,
+    // and any future container-only surface) rather than the agent loop
+    // excised from it. Fixture cases keep the in-process path so existing
+    // happy-path tests stay fast and don't require an installed binary.
+    let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
+    let agent_attempt = if is_swebench {
+        run_agent_subprocess(work_dir, eval_case, config, timeout).await
+    } else {
+        run_agent_in_process(work_dir, eval_case, config, timeout).await
+    };
+
+    let (agent_result, mut failures) = match agent_attempt {
+        Ok(Ok(outcome)) => (Some(outcome), Vec::new()),
+        Ok(Err(soft)) => {
+            let f = vec![format!("Agent error: {soft}")];
+            if let Some(task) = &swebench_task {
+                return finish_swebench(eval_case, task, work_dir, config, start, None, f).await;
+            }
+            let verification =
+                run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
+            let execution_time = start.elapsed();
+            let success = false;
+            let mut f = f;
+            if !verification.all_passed() {
+                f.extend(verification_failures(&verification));
+            }
+            return Ok(EvalRunResult {
+                case_id: eval_case.case.id.clone(),
+                success,
+                execution_time,
+                iterations: 0,
+                token_usage: default_token_usage(),
+                verification,
+                failures: f,
+                agent_result: None,
+                swebench_patch: None,
+            });
+        }
+        Err(hard) => return Err(hard),
+    };
+
+    if let Some(task) = &swebench_task {
+        return finish_swebench(
+            eval_case,
+            task,
+            work_dir,
+            config,
+            start,
+            agent_result,
+            failures,
+        )
+        .await;
+    }
+
+    // --- 3. Verification ---
+    let verification =
+        run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
+
+    // --- 4. Collect metrics ---
+    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations());
+    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed());
+
+    if !task_completed {
+        failures.push("Agent did not complete the task".to_string());
+    }
+    if !verification.all_passed() {
+        failures.extend(verification_failures(&verification));
+    }
+
+    let success = failures.is_empty();
+    let execution_time = start.elapsed();
+
+    let token_usage = agent_result
+        .as_ref()
+        .and_then(|r| r.token_usage())
+        .unwrap_or_else(default_token_usage);
+
+    Ok(EvalRunResult {
+        case_id: eval_case.case.id.clone(),
+        success,
+        execution_time,
+        iterations,
+        token_usage,
+        verification,
+        failures,
+        agent_result,
+        swebench_patch: None,
+    })
+}
+
+/// Run the agent in-process for fixture (non-SWE-bench) cases.
+///
+/// Returns:
+/// - `Ok(Ok(outcome))` on success.
+/// - `Ok(Err(msg))` on soft agent errors — the eval records the message in
+///   `failures` and continues to verification.
+/// - `Err(EvalRunnerError)` on hard infrastructure errors (timeout, model
+///   provider construction failure).
+async fn run_agent_in_process(
+    work_dir: &Path,
+    eval_case: &EvalCase,
+    config: &EvalRunnerConfig,
+    timeout: Duration,
+) -> Result<Result<AgentOutcome, String>, EvalRunnerError> {
     let agent_config = AgentConfig {
         max_iterations: config.max_iterations,
         verbose: config.verbose,
@@ -264,92 +429,101 @@ pub async fn run_eval(
         app_state_id: format!("eval_{}", eval_case.case.id),
     };
 
-    let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
+    match tokio::time::timeout(timeout, agent.run_tool_loop(context)).await {
+        Ok(Ok(result)) => Ok(Ok(AgentOutcome::InProcess(result))),
+        Ok(Err(e)) => Ok(Err(e.to_string())),
+        Err(_elapsed) => Err(EvalRunnerError::Timeout(timeout)),
+    }
+}
 
-    let agent_outcome = tokio::time::timeout(timeout, agent.run_tool_loop(context)).await;
+/// Drive the installed `nanna` binary as a subprocess for SWE-bench cases.
+///
+/// Same return shape as [`run_agent_in_process`]: hard infrastructure
+/// errors (binary missing, timeout, JSON shape unexpected) propagate as
+/// `Err(EvalRunnerError)`; binary-side soft failures (agent loop error
+/// surfaced as exit-non-zero with `Agent error: ...` on stderr) come back
+/// as `Ok(Err(msg))` so the caller can record them in `failures` without
+/// failing the whole run.
+async fn run_agent_subprocess(
+    work_dir: &Path,
+    eval_case: &EvalCase,
+    config: &EvalRunnerConfig,
+    timeout: Duration,
+) -> Result<Result<AgentOutcome, String>, EvalRunnerError> {
+    let bin = locate_nanna_binary()?;
+    let report_path = work_dir.join("__nanna_agent_report.json");
+    let max_iter = config.max_iterations.to_string();
 
-    let (agent_result, mut failures) = match agent_outcome {
-        Ok(Ok(result)) => {
-            let f = Vec::new();
-            (Some(result), f)
-        }
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("agent")
+        .arg("--prompt")
+        .arg(&eval_case.task.prompt)
+        .arg("--model")
+        .arg(&config.model_name)
+        .arg("--max-iterations")
+        .arg(&max_iter)
+        .arg("--work-dir")
+        .arg(work_dir)
+        .arg("--output-json")
+        .arg(&report_path)
+        .arg("--tools");
+    if let Some(url) = &config.model_base_url {
+        cmd.arg("--ollama-url").arg(url);
+    }
+    cmd.kill_on_drop(true);
+
+    info!(
+        binary = %bin.display(),
+        instance_id = %eval_case.case.id,
+        "spawning nanna agent subprocess"
+    );
+
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(o)) => o,
         Ok(Err(e)) => {
-            let mut f = vec![format!("Agent error: {e}")];
-            if let Some(task) = &swebench_task {
-                return finish_swebench(eval_case, task, work_dir, config, start, None, f).await;
-            }
-            // Still run verification even on agent error
-            let verification =
-                run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
-            let execution_time = start.elapsed();
-            let success = false;
-            if !verification.all_passed() {
-                f.extend(verification_failures(&verification));
-            }
-            return Ok(EvalRunResult {
-                case_id: eval_case.case.id.clone(),
-                success,
-                execution_time,
-                iterations: 0,
-                token_usage: default_token_usage(),
-                verification,
-                failures: f,
-                agent_result: None,
-                swebench_patch: None,
-            });
+            return Err(EvalRunnerError::SubprocessSpawn(format!(
+                "could not spawn `{}`: {e}",
+                bin.display()
+            )));
         }
-        Err(_elapsed) => {
-            return Err(EvalRunnerError::Timeout(timeout));
-        }
+        Err(_elapsed) => return Err(EvalRunnerError::Timeout(timeout)),
     };
 
-    if let Some(task) = &swebench_task {
-        return finish_swebench(
-            eval_case,
-            task,
-            work_dir,
-            config,
-            start,
-            agent_result,
-            failures,
-        )
-        .await;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        warn!(status = %output.status, stderr = %stderr, "nanna subprocess non-zero exit");
+        return Ok(Err(format!(
+            "nanna exited {}: {}",
+            output.status,
+            if stderr.is_empty() {
+                "(no stderr)"
+            } else {
+                &stderr
+            }
+        )));
     }
 
-    // --- 3. Verification ---
-    let verification =
-        run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
-
-    // --- 4. Collect metrics ---
-    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
-    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
-
-    if !task_completed {
-        failures.push("Agent did not complete the task".to_string());
-    }
-    if !verification.all_passed() {
-        failures.extend(verification_failures(&verification));
+    if !report_path.exists() {
+        return Err(EvalRunnerError::SubprocessNoOutput(
+            report_path,
+            "exit-0 but no JSON".to_string(),
+        ));
     }
 
-    let success = failures.is_empty();
-    let execution_time = start.elapsed();
+    let report = AgentRunReport::read_from_path(&report_path)
+        .map_err(|e| EvalRunnerError::SubprocessNoOutput(report_path.clone(), e.to_string()))?;
+    Ok(Ok(AgentOutcome::Subprocess(report)))
+}
 
-    let token_usage = agent_result
-        .as_ref()
-        .and_then(|r| r.token_usage.clone())
-        .unwrap_or_else(default_token_usage);
-
-    Ok(EvalRunResult {
-        case_id: eval_case.case.id.clone(),
-        success,
-        execution_time,
-        iterations,
-        token_usage,
-        verification,
-        failures,
-        agent_result,
-        swebench_patch: None,
-    })
+fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
+    if let Ok(p) = std::env::var("NANNA_HARNESS_BIN") {
+        let path = PathBuf::from(p);
+        if !path.exists() {
+            return Err(EvalRunnerError::BinaryNotFound);
+        }
+        return Ok(path);
+    }
+    which::which("nanna").map_err(|_| EvalRunnerError::BinaryNotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -439,19 +613,19 @@ async fn finish_swebench(
     work_dir: &Path,
     config: &EvalRunnerConfig,
     start: Instant,
-    agent_result: Option<AgentRunResult>,
+    agent_result: Option<AgentOutcome>,
     mut failures: Vec<String>,
 ) -> Result<EvalRunResult, EvalRunnerError> {
     let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
 
-    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed);
+    let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed());
     if !task_completed {
         failures.push("Agent did not complete the task".to_string());
     }
-    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations);
+    let iterations = agent_result.as_ref().map_or(0, |r| r.iterations());
     let token_usage = agent_result
         .as_ref()
-        .and_then(|r| r.token_usage.clone())
+        .and_then(|r| r.token_usage())
         .unwrap_or_else(default_token_usage);
 
     let resolved = if config.swebench_skip_verify {
