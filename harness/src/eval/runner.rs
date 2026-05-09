@@ -74,8 +74,6 @@ pub enum EvalRunnerError {
     SubprocessSpawn(String),
     #[error("nanna subprocess wrote no output JSON to {0}: {1}")]
     SubprocessNoOutput(PathBuf, String),
-    #[error("nanna subprocess exited {status}: {stderr}")]
-    SubprocessNonZero { status: String, stderr: String },
 }
 
 /// The agent execution outcome — either captured in-process (fixture
@@ -466,6 +464,11 @@ async fn run_agent_subprocess(
         .arg(work_dir)
         .arg("--output-json")
         .arg(&report_path)
+        // `--tools` is unconditional for SWE-bench subprocess runs: a
+        // toolless agent has no way to mutate the materialized repo, so
+        // any patch we'd capture would be empty by construction. The
+        // CLI's `tools: bool` flag stays user-facing for `nanna agent`
+        // human use.
         .arg("--tools");
     if let Some(url) = &config.model_base_url {
         cmd.arg("--ollama-url").arg(url);
@@ -518,7 +521,12 @@ async fn run_agent_subprocess(
 fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
     if let Ok(p) = std::env::var("NANNA_HARNESS_BIN") {
         let path = PathBuf::from(p);
-        if !path.exists() {
+        // Reject directories: `path.exists()` alone matches a bare dir,
+        // and the subsequent `cmd.output()` would then fail with a cryptic
+        // OS-level "is a directory" rather than the structured
+        // `BinaryNotFound`. See the "[Bug / confusing error]
+        // locate_nanna_binary accepts a directory path" review note.
+        if !path.is_file() {
             return Err(EvalRunnerError::BinaryNotFound);
         }
         return Ok(path);
@@ -1041,6 +1049,37 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn agent_outcome_subprocess_token_usage_propagates() {
+        // Cover the AgentOutcome::Subprocess branch of token_usage() /
+        // iterations() / task_completed() so the patch diff has more than
+        // the single in-process path exercised. The subprocess runner is
+        // integration-tested separately (see
+        // harness/tests/nanna_subprocess_smoke.rs).
+        use crate::agent::{TokenUsageDto, SCHEMA_VERSION};
+        let report = AgentRunReport {
+            schema_version: SCHEMA_VERSION,
+            task_completed: true,
+            iterations: 4,
+            final_state: "Completed".to_string(),
+            result_summary: "ok".to_string(),
+            token_usage: Some(TokenUsageDto {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            }),
+            tool_calls: Vec::new(),
+        };
+        let outcome = AgentOutcome::Subprocess(report);
+        assert_eq!(outcome.iterations(), 4);
+        assert!(outcome.task_completed());
+        let usage = outcome.token_usage().expect("expected usage");
+        assert_eq!(usage.prompt_tokens, 1);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.total_tokens, 3);
+        assert!(outcome.as_in_process().is_none());
     }
 
     #[test]
