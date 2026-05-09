@@ -1632,7 +1632,7 @@ mod tests {
         );
 
         println!(
-            "✅ MVP Test passed: Agent completed control loop with {} git entities",
+            "\u{2705} MVP Test passed: Agent completed control loop with {} git entities",
             git_entities.len()
         );
     }
@@ -1832,7 +1832,7 @@ mod tests {
         assert!(agent.plan_cache.is_some(), "LLM should have created a plan");
 
         println!(
-            "✅ LLM Agent Test passed with plan: {:?}",
+            "\u{2705} LLM Agent Test passed with plan: {:?}",
             agent.plan_cache.as_ref().unwrap()
         );
     }
@@ -1878,7 +1878,7 @@ mod tests {
             "MVP mode should not populate plan_cache"
         );
 
-        println!("✅ MVP mode backward compatibility verified");
+        println!("\u{2705} MVP mode backward compatibility verified");
     }
 
     #[tokio::test]
@@ -1923,7 +1923,7 @@ mod tests {
         assert!(run_result.task_completed, "Task should complete");
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        println!("✅ Agent loop with Ollama and tools completed successfully");
+        println!("\u{2705} Agent loop with Ollama and tools completed successfully");
         println!(
             "   Conversation history: {} messages",
             agent.conversation_history.len()
@@ -2623,6 +2623,162 @@ mod tests {
             "expected no-tool-registry diagnostic, got: {msg}"
         );
     }
+
+    // --- New tests targeting previously-uncovered code paths ---
+
+    #[test]
+    fn test_agent_error_state_error_diagnostics() {
+        let err = AgentError::StateError {
+            message: "bad state".to_string(),
+            iterations_completed: 7,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PlanningEntityModification,
+        };
+        let (calls, conv, iters, state) = err.diagnostics();
+        assert_eq!(iters, 7);
+        assert_eq!(state, &AgentState::PlanningEntityModification);
+        assert!(calls.is_empty());
+        assert!(conv.is_empty());
+    }
+
+    #[test]
+    fn test_agent_error_task_check_failed_diagnostics() {
+        let err = AgentError::TaskCheckFailed {
+            message: "check failed".to_string(),
+            iterations_completed: 3,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::CheckingTaskCompletion,
+        };
+        let (calls, conv, iters, state) = err.diagnostics();
+        assert_eq!(iters, 3);
+        assert_eq!(state, &AgentState::CheckingTaskCompletion);
+        assert!(calls.is_empty());
+        assert!(conv.is_empty());
+    }
+
+    #[test]
+    fn test_with_entity_store_initialises_correctly() {
+        let store = InMemoryEntityStore::new();
+        let config = AgentConfig {
+            max_iterations: 42,
+            ..Default::default()
+        };
+        let agent = AgentLoop::with_entity_store(config, store);
+        assert_eq!(agent.state(), &AgentState::EnrichingEntities);
+        assert_eq!(agent.config.max_iterations, 42);
+        assert!(agent.state_history().is_empty());
+        assert!(agent.conversation_history().is_empty());
+    }
+
+    #[test]
+    fn test_entity_store_accessor() {
+        let store = InMemoryEntityStore::new();
+        let agent = AgentLoop::with_entity_store(AgentConfig::default(), store);
+        let _store_ref = agent.entity_store();
+    }
+
+    #[test]
+    fn test_entity_store_mut_accessor() {
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_entity_store(AgentConfig::default(), store);
+        let _store_mut = agent.entity_store_mut();
+    }
+
+    #[tokio::test]
+    async fn test_state_history_populated_after_run() {
+        let provider = MockProvider::new(vec![plain_response("COMPLETE - done")]);
+        let mut agent = AgentLoop::with_llm(
+            AgentConfig::default(),
+            InMemoryEntityStore::new(),
+            provider,
+        );
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "s".to_string(),
+        };
+        agent.run(context).await.unwrap();
+        assert!(
+            !agent.state_history().is_empty(),
+            "state transitions should be recorded in state_history"
+        );
+    }
+
+    #[test]
+    fn test_validate_llm_response_empty_is_false() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(!agent.validate_llm_response("", &[]));
+        assert!(!agent.validate_llm_response("   ", &[]));
+    }
+
+    #[test]
+    fn test_validate_llm_response_too_long_is_false() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        let long = "x".repeat(super::MAX_LLM_RESPONSE_LENGTH + 1);
+        assert!(!agent.validate_llm_response(&long, &[]));
+    }
+
+    #[test]
+    fn test_validate_llm_response_no_keywords_passes() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.validate_llm_response("a reasonable response", &[]));
+    }
+
+    #[test]
+    fn test_validate_llm_response_keyword_match_and_mismatch() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        // Keyword present (case-insensitive)
+        assert!(agent.validate_llm_response("YES we should do it", &["YES", "NO"]));
+        assert!(agent.validate_llm_response("yes we should do it", &["YES"]));
+        // No keyword match
+        assert!(!agent.validate_llm_response("maybe", &["YES", "NO"]));
+    }
+
+    #[test]
+    fn test_extract_response_content_empty_choices_returns_empty() {
+        let response = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        assert_eq!(AgentLoop::<InMemoryEntityStore>::extract_response_content(&response), "");
+    }
+
+    #[test]
+    fn test_extract_response_content_none_content_returns_empty() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        assert_eq!(AgentLoop::<InMemoryEntityStore>::extract_response_content(&response), "");
+    }
+
+    #[test]
+    fn test_extract_response_content_returns_content() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("hello world".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: None,
+        };
+        assert_eq!(AgentLoop::<InMemoryEntityStore>::extract_response_content(&response), "hello world");
+    }
+
 }
 
 #[cfg(kani)]
