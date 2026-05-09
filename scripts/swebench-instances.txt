@@ -1,0 +1,12 @@
+# SWE-bench Verified instances for nanna-coder evaluation
+# One instance ID per line
+django__django-16379
+django__django-16527
+sympy__sympy-23824
+flask__flask-4992
+scikit-learn__scikit-learn-25638
+matplotlib__matplotlib-25311
+astropy__astropy-14995
+requests__requests-6028
+pytest-dev__pytest-11143
+sphinx-doc__sphinx-11445
