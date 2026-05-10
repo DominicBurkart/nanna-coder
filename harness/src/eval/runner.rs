@@ -1670,6 +1670,82 @@ tags = ["{tag}"]
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn locate_nanna_binary_falls_back_to_which_when_env_unset() {
+        let key = "NANNA_HARNESS_BIN";
+        let saved_bin = std::env::var(key).ok();
+        std::env::remove_var(key);
+        let saved_path = std::env::var("PATH").ok();
+        let empty_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PATH", empty_dir.path());
+        let result = locate_nanna_binary();
+        match saved_bin {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match saved_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
+    }
+
+    #[test]
+    fn load_swebench_task_errors_when_dataset_path_is_not_a_file() {
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(&format!(
+            r#"
+[case]
+id = "missing-dataset-001"
+name = "missing dataset case"
+description = ""
+
+[task]
+prompt = "x"
+
+[metadata]
+tags = ["{}"]
+"#,
+            SWEBENCH_TAG
+        ))
+        .unwrap();
+        let config = EvalRunnerConfig {
+            swebench_dataset_path: Some(std::path::PathBuf::from(
+                "/var/tmp/nanna-no-such-dataset.jsonl",
+            )),
+            ..EvalRunnerConfig::default()
+        };
+        let result = load_swebench_task(&case, case_dir.path(), &config);
+        assert!(matches!(
+            result,
+            Err(EvalRunnerError::SwebenchDatasetMissing(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn capture_swebench_patch_errors_when_work_dir_is_not_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = capture_swebench_patch(dir.path(), "deadbeef").await;
+        assert!(matches!(result, Err(EvalRunnerError::GitDiff(_))));
+    }
+
+    #[tokio::test]
+    async fn capture_swebench_patch_errors_when_base_commit_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", dir.path())
+            .status()
+            .unwrap();
+        let result =
+            capture_swebench_patch(dir.path(), "0000000000000000000000000000000000000000").await;
+        assert!(matches!(result, Err(EvalRunnerError::GitDiff(_))));
+    }
+
+    #[tokio::test]
     async fn verify_with_cmd_returns_false_when_binary_is_missing() {
         // Cover the `Err(e)` arm of verify_build/verify_tests when the
         // command isn't on PATH. We pass a name that's vanishingly
