@@ -8,15 +8,96 @@
 //! Pure logic only: filesystem I/O is delegated to the binary so the
 //! state-machine transitions can be unit-tested against in-memory values.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::eval::swebench_verify::InstanceVerdict;
 
-/// Schema version for both [`InstanceState`] and [`Scorecard`]. Bump on
-/// any breaking change so downstream consumers can detect drift.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema version for [`InstanceState`] state files. Bump on any breaking
+/// change to the on-disk per-instance JSON.
+pub const INSTANCE_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for [`Scorecard`] rows in `evals/scorecards/index.jsonl`.
+///
+/// v2 (2026-05) introduced [`ScorecardCategory`], `orchestrator_model`, and
+/// `worker_model` so that nanna-solo, claude-solo, and the two MCP-delegated
+/// claude variants can coexist as distinct rows in the same metric file.
+pub const SCORECARD_SCHEMA_VERSION: u32 = 2;
+
+/// Discriminator that names which evaluation track a [`Scorecard`] row
+/// belongs to.
+///
+/// Each variant corresponds to one of the four categories the repo records
+/// SWE-bench Lite scores against:
+///
+/// - `nanna_solo`: nanna's agent loop driving a local Ollama model.
+/// - `claude_solo`: Claude as the agent loop, no delegation.
+/// - `claude_mcp_claude`: Claude orchestrator delegating subtasks to a
+///   Claude worker via nanna's MCP interface.
+/// - `claude_mcp_nanna_gemma4`: Claude orchestrator delegating subtasks to
+///   a gemma4-backed nanna worker via the same MCP interface.
+///
+/// Serialised as the snake_case form of the variant. Unknown strings are
+/// rejected at parse time — a typo in `--category` is a hard error rather
+/// than a silently-accepted new category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScorecardCategory {
+    NannaSolo,
+    ClaudeSolo,
+    ClaudeMcpClaude,
+    ClaudeMcpNannaGemma4,
+}
+
+impl ScorecardCategory {
+    /// All variants in declaration order.
+    pub const ALL: [ScorecardCategory; 4] = [
+        ScorecardCategory::NannaSolo,
+        ScorecardCategory::ClaudeSolo,
+        ScorecardCategory::ClaudeMcpClaude,
+        ScorecardCategory::ClaudeMcpNannaGemma4,
+    ];
+
+    /// Stable snake_case label that matches the JSON serialisation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NannaSolo => "nanna_solo",
+            Self::ClaudeSolo => "claude_solo",
+            Self::ClaudeMcpClaude => "claude_mcp_claude",
+            Self::ClaudeMcpNannaGemma4 => "claude_mcp_nanna_gemma4",
+        }
+    }
+}
+
+impl fmt::Display for ScorecardCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ScorecardCategory {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "nanna_solo" => Ok(Self::NannaSolo),
+            "claude_solo" => Ok(Self::ClaudeSolo),
+            "claude_mcp_claude" => Ok(Self::ClaudeMcpClaude),
+            "claude_mcp_nanna_gemma4" => Ok(Self::ClaudeMcpNannaGemma4),
+            other => Err(format!(
+                "unknown scorecard category {other:?}; expected one of {}",
+                Self::ALL
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
 
 /// Status field of a single instance's state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +174,7 @@ impl InstanceState {
         agent_metrics: AgentMetrics,
     ) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: INSTANCE_STATE_SCHEMA_VERSION,
             instance_id: instance_id.into(),
             status: InstanceStatus::CompletedDiff,
             diff_path: Some(diff_path.into()),
@@ -109,7 +190,7 @@ impl InstanceState {
         error: impl Into<String>,
     ) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: INSTANCE_STATE_SCHEMA_VERSION,
             instance_id: instance_id.into(),
             status: InstanceStatus::AgentError,
             diff_path: None,
@@ -121,7 +202,7 @@ impl InstanceState {
 
     pub fn materialize_error(instance_id: impl Into<String>, error: impl Into<String>) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: INSTANCE_STATE_SCHEMA_VERSION,
             instance_id: instance_id.into(),
             status: InstanceStatus::MaterializeError,
             diff_path: None,
@@ -140,6 +221,15 @@ impl InstanceState {
 
 /// One row of `evals/scorecards/index.jsonl`. The git history of that
 /// file is the time-series metric.
+///
+/// Schema v2 (2026-05) added `category`, `orchestrator_model`, and
+/// `worker_model` so that the four eval tracks (nanna-solo, claude-solo,
+/// and the two MCP-delegated claude variants) can coexist in the same
+/// JSONL without colliding on `(model, dataset, date)`.
+///
+/// `model` is retained as a duplicate of `orchestrator_model` so external
+/// consumers reading older code paths still see the field they expect; new
+/// code should read `orchestrator_model`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scorecard {
     pub schema_version: u32,
@@ -148,6 +238,16 @@ pub struct Scorecard {
     pub commit: String,
     pub branch: Option<String>,
     pub pr: Option<u64>,
+    /// Eval-track discriminator. Required since schema v2.
+    pub category: ScorecardCategory,
+    /// Foundational model driving the agent loop / orchestrator.
+    /// Required since schema v2.
+    pub orchestrator_model: String,
+    /// Worker-side model when an MCP-delegated track is being scored.
+    /// `None` for solo tracks.
+    pub worker_model: Option<String>,
+    /// Duplicate of `orchestrator_model`, retained for compatibility with
+    /// readers built against schema v1.
     pub model: String,
     pub dataset: String,
     pub instances_total: usize,
@@ -184,12 +284,15 @@ pub fn aggregate_scorecard(
         (resolved as f64) * 100.0 / (instances_total as f64)
     };
     Scorecard {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SCORECARD_SCHEMA_VERSION,
         date: metadata.date.to_string(),
         commit: metadata.commit.to_string(),
         branch: metadata.branch.map(str::to_string),
         pr: metadata.pr,
-        model: metadata.model.to_string(),
+        category: metadata.category,
+        orchestrator_model: metadata.orchestrator_model.to_string(),
+        worker_model: metadata.worker_model.map(str::to_string),
+        model: metadata.orchestrator_model.to_string(),
         dataset: metadata.dataset.to_string(),
         instances_total,
         instances_attempted: attempted,
@@ -204,15 +307,18 @@ pub fn aggregate_scorecard(
     }
 }
 
-/// Bag of metadata that the binary collects (UTC clock, `git rev-parse`)
-/// and feeds into [`aggregate_scorecard`].
+/// Bag of metadata that the binary collects (UTC clock, `git rev-parse`,
+/// `--category`/`--orchestrator-model`/`--worker-model` CLI flags) and
+/// feeds into [`aggregate_scorecard`].
 #[derive(Debug, Clone, Copy)]
 pub struct ScorecardMetadata<'a> {
     pub date: &'a str,
     pub commit: &'a str,
     pub branch: Option<&'a str>,
     pub pr: Option<u64>,
-    pub model: &'a str,
+    pub category: ScorecardCategory,
+    pub orchestrator_model: &'a str,
+    pub worker_model: Option<&'a str>,
     pub dataset: &'a str,
     pub state_dir: &'a str,
 }
@@ -428,7 +534,9 @@ mod tests {
             commit: "abc1234",
             branch: Some("feat/score"),
             pr: None,
-            model: "gemma4:e4b",
+            category: ScorecardCategory::NannaSolo,
+            orchestrator_model: "gemma4:e4b",
+            worker_model: None,
             dataset: "princeton-nlp/SWE-bench_Lite",
             state_dir: "evals/scorecards/state/local-1",
         }
@@ -786,5 +894,119 @@ mod tests {
         assert_eq!(state.status, InstanceStatus::AgentError);
         assert_eq!(state.agent_metrics.wall_secs, 33);
         assert_eq!(state.error.as_deref(), Some("timeout"));
+    }
+
+    // ---------------- ScorecardCategory + v2 schema ----------------
+
+    #[test]
+    fn category_serialises_to_snake_case() {
+        for cat in ScorecardCategory::ALL {
+            let json = serde_json::to_string(&cat).unwrap();
+            // Round-trip via serde to confirm the `rename_all = "snake_case"`
+            // shape matches `as_str()`.
+            assert_eq!(json, format!("\"{}\"", cat.as_str()));
+            let parsed: ScorecardCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, cat);
+        }
+    }
+
+    #[test]
+    fn category_from_str_matches_serialised_form() {
+        for cat in ScorecardCategory::ALL {
+            assert_eq!(ScorecardCategory::from_str(cat.as_str()).unwrap(), cat);
+        }
+    }
+
+    #[test]
+    fn category_from_str_rejects_typos_and_unknown() {
+        let err = ScorecardCategory::from_str("nanna-solo").unwrap_err();
+        assert!(err.contains("nanna-solo"), "error mentions the bad input");
+        assert!(err.contains("nanna_solo"), "error lists valid options");
+        assert!(ScorecardCategory::from_str("").is_err());
+        assert!(ScorecardCategory::from_str("Nanna_Solo").is_err());
+    }
+
+    #[test]
+    fn deserialise_rejects_unknown_category_string() {
+        let bad = "\"claude_solo_typo\"";
+        assert!(serde_json::from_str::<ScorecardCategory>(bad).is_err());
+    }
+
+    #[test]
+    fn scorecard_v2_round_trips_with_category_and_models() {
+        let states =
+            vec![
+                InstanceState::completed_diff("a", "predictions/a.diff", AgentMetrics::default())
+                    .with_verdict(verdict(true)),
+            ];
+        let m = ScorecardMetadata {
+            category: ScorecardCategory::ClaudeMcpClaude,
+            orchestrator_model: "claude-opus-4-7",
+            worker_model: Some("claude-opus-4-7"),
+            ..meta()
+        };
+        let card = aggregate_scorecard(&states, 1, m);
+        assert_eq!(card.schema_version, SCORECARD_SCHEMA_VERSION);
+        assert_eq!(card.category, ScorecardCategory::ClaudeMcpClaude);
+        assert_eq!(card.orchestrator_model, "claude-opus-4-7");
+        assert_eq!(card.worker_model.as_deref(), Some("claude-opus-4-7"));
+        // `model` is the v1-compat duplicate of orchestrator_model.
+        assert_eq!(card.model, card.orchestrator_model);
+
+        let json = serde_json::to_string(&card).unwrap();
+        let parsed: Scorecard = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, card);
+    }
+
+    #[test]
+    fn scorecard_solo_track_has_no_worker_model() {
+        let states =
+            vec![
+                InstanceState::completed_diff("a", "predictions/a.diff", AgentMetrics::default())
+                    .with_verdict(verdict(true)),
+            ];
+        let m = ScorecardMetadata {
+            category: ScorecardCategory::ClaudeSolo,
+            orchestrator_model: "claude-opus-4-7",
+            worker_model: None,
+            ..meta()
+        };
+        let card = aggregate_scorecard(&states, 1, m);
+        assert_eq!(card.category, ScorecardCategory::ClaudeSolo);
+        assert!(card.worker_model.is_none());
+
+        // JSON should serialise `worker_model` as null (or omit if None
+        // — serde_json default emits `"worker_model":null`); a v2 reader
+        // must accept both shapes.
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(
+            json.contains("\"worker_model\":null"),
+            "expected explicit null in JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn scorecard_v1_payload_is_rejected_under_v2_struct() {
+        // A v1-shaped JSON line lacks `category` / `orchestrator_model`
+        // and must therefore fail to parse as a [`Scorecard`]. This is
+        // the *intended* breakage: pause-the-loop coordination notes in
+        // the dev plan exist precisely so no v1 row ever gets written.
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "date": "2026-05-08T08:30:00Z",
+            "commit": "abc1234",
+            "branch": "feat/score",
+            "pr": null,
+            "model": "gemma4:e4b",
+            "dataset": "princeton-nlp/SWE-bench_Lite",
+            "instances_total": 1,
+            "instances_attempted": 1,
+            "instances_resolved": 1,
+            "score_pct": 100.0,
+            "is_complete": true,
+            "state_dir": "evals/scorecards/state/local-1"
+        });
+        let r: Result<Scorecard, _> = serde_json::from_value(v1);
+        assert!(r.is_err(), "v1 row must not deserialise as v2 Scorecard");
     }
 }
