@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Parser;
@@ -16,10 +17,14 @@ use harness::eval::scoring::{
     aggregate_scorecard, append_line, instance_state_from_outcome, load_all_states,
     outcome_from_run_eval, predictions_dir, read_state, resolve_model, sanitize_model_for_path,
     should_attempt, state_path, states_dir, write_state, InstanceState, InstanceStatus, Scorecard,
-    ScorecardMetadata, StoredVerdict,
+    ScorecardCategory, ScorecardMetadata, StoredVerdict,
 };
 use harness::eval::swebench::{adapt_to_eval_case, load_swebench_dataset, SWEBenchTask};
 use harness::eval::swebench_verify::{verify_predictions, Prediction, VerifyConfig};
+
+fn parse_category(s: &str) -> Result<ScorecardCategory, String> {
+    ScorecardCategory::from_str(s)
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +38,27 @@ struct Args {
     #[arg(long)]
     state_dir: PathBuf,
 
+    /// Eval-track discriminator. Required so the scorecard row written to
+    /// `evals/scorecards/index.jsonl` is unambiguously attributable to one
+    /// of the four categories (nanna_solo, claude_solo, claude_mcp_claude,
+    /// claude_mcp_nanna_gemma4).
+    #[arg(long, value_parser = parse_category)]
+    category: ScorecardCategory,
+
+    /// Foundational model that drives the agent loop / orchestrator.
+    /// Takes precedence over the deprecated `--model` flag and over the
+    /// `NANNA_EVAL_MODEL` / `MODEL` env vars.
+    #[arg(long)]
+    orchestrator_model: Option<String>,
+
+    /// Worker-side model when running an MCP-delegated category. Recorded
+    /// on the scorecard row but not yet wired through to a worker provider
+    /// (that lands in the runner-mode PR).
+    #[arg(long)]
+    worker_model: Option<String>,
+
+    /// Deprecated alias for `--orchestrator-model`. Retained so resumed
+    /// runs from before schema v2 do not break.
     #[arg(long)]
     model: Option<String>,
 
@@ -87,7 +113,10 @@ fn git_capture(args: &[&str]) -> Option<String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    let model = resolve_model(args.model.as_deref(), "qwen3:0.6b");
+    // `--orchestrator-model` is canonical; `--model` is the back-compat
+    // alias, used only when the new flag is absent.
+    let cli_model = args.orchestrator_model.as_deref().or(args.model.as_deref());
+    let model = resolve_model(cli_model, "qwen3:0.6b");
     let run_id = args.run_id.clone().unwrap_or_else(run_id_default);
 
     if let Err(e) = std::fs::create_dir_all(predictions_dir(&args.state_dir)) {
@@ -252,7 +281,11 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
         }
         let verify_config = VerifyConfig {
             dataset_name: args.dataset_name.clone(),
-            model_name_or_path: format!("nanna__{}", sanitize_model_for_path(model)),
+            model_name_or_path: format!(
+                "{}__{}",
+                args.category.as_str(),
+                sanitize_model_for_path(model)
+            ),
             run_id: run_id.to_string(),
             work_dir: verify_dir,
             max_workers: args.max_workers,
@@ -315,7 +348,9 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
         commit: &commit,
         branch: branch.as_deref(),
         pr: None,
-        model,
+        category: args.category,
+        orchestrator_model: model,
+        worker_model: args.worker_model.as_deref(),
         dataset: &args.dataset_name,
         state_dir: &state_dir_label,
     };
@@ -341,17 +376,21 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
 fn print_summary(card: &Scorecard) {
     println!();
     println!("=== Scorecard ===");
-    println!("dataset:    {}", card.dataset);
-    println!("model:      {}", card.model);
+    println!("category:           {}", card.category);
+    println!("dataset:            {}", card.dataset);
+    println!("orchestrator_model: {}", card.orchestrator_model);
+    if let Some(w) = card.worker_model.as_deref() {
+        println!("worker_model:       {w}");
+    }
     println!(
-        "instances:  attempted={}, resolved={}, total={}",
+        "instances:          attempted={}, resolved={}, total={}",
         card.instances_attempted, card.instances_resolved, card.instances_total
     );
-    println!("score_pct:  {:.2}", card.score_pct);
+    println!("score_pct:          {:.2}", card.score_pct);
     println!(
-        "is_complete: {} (only true rows are leaderboard-comparable)",
+        "is_complete:        {} (only true rows are leaderboard-comparable)",
         card.is_complete
     );
-    println!("commit:     {}", card.commit);
+    println!("commit:             {}", card.commit);
     println!("appended to evals/scorecards/index.jsonl");
 }
