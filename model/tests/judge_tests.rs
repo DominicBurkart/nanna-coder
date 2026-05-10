@@ -936,3 +936,65 @@ async fn comprehensive_mixed_pass_fail_results_are_ordered_correctly() {
     );
     assert!(results[1].is_failure(), "index 1 should be quality failure");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MockModelJudge – cover previously-uncovered code paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calling list_models and health_check on the mock exercises those
+/// ModelProvider method bodies (previously uncovered).
+#[tokio::test]
+async fn mock_provider_list_models_and_health_check() {
+    let judge = MockModelJudge::all_success();
+    let models = judge.list_models().await.expect("list_models should succeed");
+    assert!(models.is_empty());
+    judge
+        .health_check()
+        .await
+        .expect("health_check should succeed");
+    assert_eq!(judge.provider_name(), "mock");
+}
+
+/// When a field is None the ok_or_else closure executes and returns Err.
+/// This covers the error arms that were previously dead code.
+#[tokio::test]
+async fn mock_judge_returns_err_when_result_is_none() {
+    // Build a judge with all fields explicitly None.
+    let judge = MockModelJudge {
+        config: JudgeConfig::default(),
+        responsiveness_result: None,
+        quality_result: None,
+        tool_result: None,
+        consistency_result: None,
+    };
+
+    // validate_api_responsiveness -> Err
+    assert!(
+        judge
+            .validate_api_responsiveness(Duration::from_secs(1))
+            .await
+            .is_err(),
+        "expected Err when responsiveness_result is None"
+    );
+
+    // validate_response_quality -> Err
+    assert!(
+        judge
+            .validate_response_quality("prompt", &ValidationCriteria::default())
+            .await
+            .is_err(),
+        "expected Err when quality_result is None"
+    );
+
+    // validate_tool_calling -> Err
+    assert!(
+        judge.validate_tool_calling(&[]).await.is_err(),
+        "expected Err when tool_result is None"
+    );
+
+    // validate_consistency -> Err
+    assert!(
+        judge.validate_consistency(&[], 1).await.is_err(),
+        "expected Err when consistency_result is None"
+    );
+}
