@@ -2252,6 +2252,44 @@ timeout_secs = 1
     }
 
     #[tokio::test]
+    async fn run_eval_returns_model_provider_error_when_base_url_is_invalid() {
+        // Cover line 419: the OllamaProvider::new map_err arm. Passing a
+        // base URL that doesn't start with http:// or https:// makes
+        // OllamaConfig::validate() return Err, which OllamaProvider::new
+        // surfaces as a ModelError, which run_agent_in_process maps into
+        // EvalRunnerError::ModelProvider — a hard error that run_eval
+        // returns via the `Err(hard) => return Err(hard)` arm (line 335).
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-bad-url"
+name = "fixture with invalid base URL"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = false
+
+[metadata]
+timeout_secs = 5
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url("ftp://nope")
+            .with_max_iterations(1);
+        let result = run_eval(&case, case_dir.path(), &config).await;
+        match result {
+            Err(EvalRunnerError::ModelProvider(_)) => {}
+            other => panic!("expected ModelProvider error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn run_eval_non_swebench_pushes_failures_after_agent_success_when_verification_fails() {
         // Drive an agent success against fake Ollama AND have verification
         // fail (build_must_pass=true with no Cargo.toml). The success path
