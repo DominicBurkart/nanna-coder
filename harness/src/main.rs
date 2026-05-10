@@ -3,14 +3,14 @@ use harness::cli::{classify_handler_error, create_provider, emit, install_ctrlc_
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
-use harness::mcp::handlers;
+use harness::mcp::handlers::{self, AssignTaskArgs};
 use harness::output::{ExitCode, OutputFormat};
 use harness::task::TaskManager;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -57,10 +57,10 @@ enum Commands {
         /// Task ID returned by assign-task
         #[arg(short, long)]
         task_id: String,
-        /// Block until the task reaches a terminal state
+        /// Block until the task finishes
         #[arg(long)]
         wait: bool,
-        /// Timeout in seconds for --wait (no timeout if omitted)
+        /// Optional timeout in seconds when --wait is set
         #[arg(long)]
         wait_timeout: Option<u64>,
     },
@@ -165,11 +165,6 @@ async fn main() -> std::process::ExitCode {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Install Ctrl+C handler so we can return exit code 130.
-    // Uses Ordering::Acquire internally for signal safety.
-    let json_mode = Arc::new(AtomicBool::new(false));
-    install_ctrlc_handler(json_mode.clone());
-
     let cli = Cli::parse();
     let fmt = if cli.json {
         OutputFormat::Json
@@ -177,8 +172,15 @@ async fn main() -> std::process::ExitCode {
         OutputFormat::Human
     };
 
-    // Store whether JSON mode is active for the Ctrl+C handler.
-    json_mode.store(cli.json, std::sync::atomic::Ordering::SeqCst);
+    // Install Ctrl+C handler AFTER Cli::parse() and after storing the JSON
+    // mode flag.  This closes the TOCTOU window: if SIGINT arrives during arg
+    // parsing the handler was not yet registered, so process::exit(130) will
+    // not be called until we are past the parse boundary.  The store uses
+    // Ordering::Release and the handler load uses Ordering::Acquire to
+    // establish the required happens-before.
+    let json_mode = Arc::new(AtomicBool::new(false));
+    json_mode.store(cli.json, Ordering::Release);
+    install_ctrlc_handler(json_mode);
 
     match cli.command {
         // ── 6 MVP subcommands ─────────────────────────────────────────────
@@ -196,22 +198,17 @@ async fn main() -> std::process::ExitCode {
                 }
             };
             let task_manager = Arc::new(TaskManager::default());
-            let params = serde_json::json!({
-                "description": description,
-                "repo_path": repo_path.to_string_lossy(),
-                "branch": branch,
-                "model": model,
-                "max_iterations": max_iterations,
-            });
-            match handlers::handle_assign_task(
-                &params,
-                &task_manager,
-                &provider,
-                &model,
+            // Pass typed args directly — avoids a lossy serde_json round-trip
+            // (e.g. non-UTF8 paths via to_string_lossy) and removes redundant
+            // allocations.
+            let args = AssignTaskArgs {
+                description: &description,
+                repo_path,
+                branch: &branch,
+                model: &model,
                 max_iterations,
-            )
-            .await
-            {
+            };
+            match handlers::handle_assign_task_typed(args, &task_manager, &provider).await {
                 Ok(data) => emit(fmt, ExitCode::Success, data),
                 Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
             }
@@ -227,14 +224,18 @@ async fn main() -> std::process::ExitCode {
             let params = serde_json::json!({ "task_id": task_id });
 
             if wait {
-                // --wait: block until terminal state or timeout
+                // --wait: block until terminal state or timeout.
+                // Polls every 500 ms (foreground CLI; no jitter needed).
                 let deadline = wait_timeout
                     .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
                 loop {
                     match handlers::handle_poll_task(&params, &task_manager).await {
                         Ok(data) => {
                             let status = data["status"].as_str().unwrap_or("");
-                            if status == "Completed" || status == "Failed" {
+                            if status == "Completed"
+                                || status == "Failed"
+                                || status == "Cancelled"
+                            {
                                 return emit(fmt, ExitCode::Success, data);
                             }
                             if let Some(dl) = deadline {
@@ -249,14 +250,18 @@ async fn main() -> std::process::ExitCode {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                         Err(e) => {
-                            return emit(fmt, ExitCode::StateError, serde_json::json!(e));
+                            return emit(
+                                fmt,
+                                classify_handler_error(&e),
+                                serde_json::json!(e),
+                            );
                         }
                     }
                 }
             } else {
                 match handlers::handle_poll_task(&params, &task_manager).await {
                     Ok(data) => emit(fmt, ExitCode::Success, data),
-                    Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+                    Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
                 }
             }
         }
@@ -266,7 +271,7 @@ async fn main() -> std::process::ExitCode {
             let params = serde_json::json!({ "task_id": task_id });
             match handlers::handle_get_result(&params, &task_manager).await {
                 Ok(data) => emit(fmt, ExitCode::Success, data),
-                Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+                Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
             }
         }
 
@@ -283,7 +288,7 @@ async fn main() -> std::process::ExitCode {
             let params = serde_json::json!({ "task_id": task_id });
             match handlers::handle_cancel_task(&params, &task_manager).await {
                 Ok(data) => emit(fmt, ExitCode::Success, data),
-                Err(e) => emit(fmt, ExitCode::StateError, serde_json::json!(e)),
+                Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
             }
         }
 
@@ -347,6 +352,8 @@ async fn main() -> std::process::ExitCode {
                     return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             }
+            // Mirror the `return emit(...)` pattern used by every other arm so
+            // that future insertions here cannot silently swallow errors.
             emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
@@ -360,14 +367,19 @@ async fn main() -> std::process::ExitCode {
             if let Err(e) = list_models(&*provider).await {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
             }
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
         Commands::Tools => {
-            let workspace_root = std::env::current_dir().unwrap_or_default();
+            let workspace_root = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+                }
+            };
             let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
         Commands::Health => {
@@ -380,7 +392,7 @@ async fn main() -> std::process::ExitCode {
             if let Err(e) = health_check(&*provider).await {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
             }
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
         Commands::Agent {
@@ -390,7 +402,12 @@ async fn main() -> std::process::ExitCode {
             verbose,
             tools,
         } => {
-            let workspace_root = std::env::current_dir().unwrap_or_default();
+            let workspace_root = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
+                }
+            };
             if let Err(e) = run_agent(
                 &prompt,
                 &model,
@@ -403,7 +420,7 @@ async fn main() -> std::process::ExitCode {
             {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
             }
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
         Commands::Mcp {
@@ -416,7 +433,7 @@ async fn main() -> std::process::ExitCode {
             if let Err(e) = run_mcp_server(&model, max_iterations).await {
                 return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
             }
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
         Commands::SweBenchReport {
             input,

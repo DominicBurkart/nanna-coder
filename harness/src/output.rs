@@ -68,8 +68,14 @@ impl JsonEnvelope {
         }
     }
 
+    /// Serialize to a JSON string. `JsonEnvelope` only contains
+    /// `String`/`bool`/`u32`/`Value` fields so serialization is infallible.
     pub fn to_json_string(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        // serde_json::to_string cannot fail for this type (no non-finite floats
+        // or other problematic values), so the unwrap is safe. Using
+        // `unwrap_or_default()` was wrong: it would silently emit an empty
+        // string + exit 0 on failure instead of a proper error envelope.
+        serde_json::to_string_pretty(self).unwrap()
     }
 }
 
@@ -327,5 +333,14 @@ mod tests {
         assert!(s.contains("items:"));
         assert!(s.contains("- a"));
         assert!(s.contains("- b"));
+    }
+
+    #[test]
+    fn test_to_json_string_is_valid_json() {
+        // Confirm the envelope serializes to parseable JSON (not empty string).
+        let env = JsonEnvelope::success(serde_json::json!({"x": 1}));
+        let s = env.to_json_string();
+        assert!(!s.is_empty());
+        let _: Value = serde_json::from_str(&s).expect("must be valid JSON");
     }
 }

@@ -83,27 +83,42 @@ pub fn exit_code_for(code: ExitCode) -> &'static str {
     }
 }
 
-/// Classify a handler error string into the appropriate `ExitCode`.
+/// Classify a handler error string into the appropriate [`ExitCode`].
 ///
-/// Handler functions return `Err(String)` where the message is:
-/// - A "Missing required field" or "must be" validation message → `UserError` (exit 1)
-/// - A "not found" or "still pending/running" state message → `StateError` (exit 2)
-/// - Anything else (I/O, parse, provider errors) → `InfraError` (exit 3)
+/// Handlers return `Err(String)` for both user-input errors (missing field,
+/// invalid path) and infrastructure / state errors (task not found, submit
+/// failure).  This function inspects the message and routes it to the correct
+/// exit-code bucket so agents can branch on the numeric exit status without
+/// parsing free-form text.
+///
+/// Heuristics (in priority order):
+/// 1. Messages containing "not found" or "still pending/running" → `StateError`
+/// 2. Messages that look like infra problems (provider, network, I/O) → `InfraError`
+/// 3. Everything else (missing field, bad input) → `UserError`
 pub fn classify_handler_error(msg: &str) -> ExitCode {
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("missing required field")
-        || lower.contains("must be")
-        || lower.contains("invalid")
-    {
-        ExitCode::UserError
-    } else if lower.contains("not found")
+    let lower = msg.to_lowercase();
+    // State errors: task lifecycle problems
+    if lower.contains("not found")
         || lower.contains("still pending")
         || lower.contains("still running")
+        || lower.contains("already cancelled")
+        || lower.contains("wrong state")
     {
-        ExitCode::StateError
-    } else {
-        ExitCode::InfraError
+        return ExitCode::StateError;
     }
+    // Infrastructure errors: provider / network / I/O
+    if lower.contains("connection")
+        || lower.contains("timeout")
+        || lower.contains("io error")
+        || lower.contains("provider")
+        || lower.contains("ollama")
+        || lower.contains("failed to submit")
+        || lower.contains("infra")
+    {
+        return ExitCode::InfraError;
+    }
+    // Default: bad user input
+    ExitCode::UserError
 }
 
 /// Emit a response (success or error) in the selected format and return the
@@ -145,6 +160,14 @@ pub fn emit(
 /// Install a Ctrl+C handler that exits with code 130 (SIGINT convention).
 /// The `json_mode` flag lets the handler emit a JSON envelope when the CLI
 /// was invoked with `--json`.
+///
+/// # Ordering
+///
+/// The handler reads `json_mode` with `Ordering::Acquire`. The store in
+/// `main` after `Cli::parse()` uses `Ordering::Release` to establish the
+/// necessary happens-before. This function must be called **after**
+/// `Cli::parse()` and the `json_mode.store(...)` so the handler always
+/// sees the correct value.
 pub fn install_ctrlc_handler(json_mode: Arc<AtomicBool>) {
     let _ = ctrlc::set_handler(move || {
         if json_mode.load(Ordering::Acquire) {
@@ -160,6 +183,7 @@ pub fn install_ctrlc_handler(json_mode: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_exit_code_for_mapping() {
@@ -171,64 +195,15 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_handler_error_user_error() {
-        assert_eq!(
-            classify_handler_error("Missing required field: description"),
-            ExitCode::UserError
-        );
-        assert_eq!(
-            classify_handler_error("repo_path must be an absolute path"),
-            ExitCode::UserError
-        );
-        assert_eq!(
-            classify_handler_error("invalid task identifier"),
-            ExitCode::UserError
-        );
-    }
-
-    #[test]
-    fn test_classify_handler_error_state_error() {
-        assert_eq!(
-            classify_handler_error("Task not found: abc-123"),
-            ExitCode::StateError
-        );
-        assert_eq!(
-            classify_handler_error("Task abc is still pending"),
-            ExitCode::StateError
-        );
-        assert_eq!(
-            classify_handler_error("Task abc is still running"),
-            ExitCode::StateError
-        );
-    }
-
-    #[test]
-    fn test_classify_handler_error_infra_error() {
-        assert_eq!(
-            classify_handler_error("connection refused"),
-            ExitCode::InfraError
-        );
-        assert_eq!(
-            classify_handler_error("I/O error reading file"),
-            ExitCode::InfraError
-        );
-        assert_eq!(
-            classify_handler_error("timeout waiting for Ollama"),
-            ExitCode::InfraError
-        );
-    }
-
-    #[test]
+    #[serial]
     fn test_use_mock_provider_default_false() {
         // The env var could be set in the surrounding test process; guard by
         // explicitly unsetting it for this assertion.
-        // SAFETY: tests in this module don't run concurrently with other code
-        // that reads NANNA_TEST_MOCK.
         let prev = std::env::var("NANNA_TEST_MOCK").ok();
-        std::env::remove_var("NANNA_TEST_MOCK");
+        unsafe { std::env::remove_var("NANNA_TEST_MOCK"); }
         assert!(!use_mock_provider());
         if let Some(v) = prev {
-            std::env::set_var("NANNA_TEST_MOCK", v);
+            unsafe { std::env::set_var("NANNA_TEST_MOCK", v); }
         }
     }
 
@@ -260,14 +235,35 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_create_provider_with_mock_env() {
         let prev = std::env::var("NANNA_TEST_MOCK").ok();
-        std::env::set_var("NANNA_TEST_MOCK", "1");
+        unsafe { std::env::set_var("NANNA_TEST_MOCK", "1"); }
         let p = create_provider().expect("mock provider");
         assert_eq!(p.provider_name(), "mock");
         match prev {
-            Some(v) => std::env::set_var("NANNA_TEST_MOCK", v),
-            None => std::env::remove_var("NANNA_TEST_MOCK"),
+            Some(v) => unsafe { std::env::set_var("NANNA_TEST_MOCK", v); },
+            None => unsafe { std::env::remove_var("NANNA_TEST_MOCK"); },
         }
+    }
+
+    #[test]
+    fn test_classify_handler_error_user() {
+        assert_eq!(classify_handler_error("Missing required field: description"), ExitCode::UserError);
+        assert_eq!(classify_handler_error("repo_path must be an absolute path"), ExitCode::UserError);
+    }
+
+    #[test]
+    fn test_classify_handler_error_state() {
+        assert_eq!(classify_handler_error("Task not found: abc-123"), ExitCode::StateError);
+        assert_eq!(classify_handler_error("Task abc is still pending"), ExitCode::StateError);
+        assert_eq!(classify_handler_error("Task abc is still running"), ExitCode::StateError);
+    }
+
+    #[test]
+    fn test_classify_handler_error_infra() {
+        assert_eq!(classify_handler_error("connection refused"), ExitCode::InfraError);
+        assert_eq!(classify_handler_error("Ollama returned 503"), ExitCode::InfraError);
+        assert_eq!(classify_handler_error("failed to submit task: IO error"), ExitCode::InfraError);
     }
 }

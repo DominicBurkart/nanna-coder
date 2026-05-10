@@ -41,7 +41,7 @@ pub async fn handle_cancel_task(
     task_manager.cancel(&task_id).await?;
 
     Ok(serde_json::json!({
-        "task_id": task_id_str,
+        "task_id": &task_id.0,
         "status": "Cancelled",
         "message": "Task has been cancelled"
     }))
@@ -102,6 +102,42 @@ pub async fn handle_assign_task(
     }))
 }
 
+/// Typed parameters for `assign-task`, used by the CLI dispatch path to avoid
+/// round-tripping through `serde_json::Value`.
+pub struct AssignTaskArgs<'a> {
+    pub description: &'a str,
+    pub repo_path: PathBuf,
+    pub branch: &'a str,
+    pub model: &'a str,
+    pub max_iterations: usize,
+}
+
+/// Typed entry-point for the CLI `assign-task` subcommand. Accepts validated
+/// clap arguments directly instead of a `serde_json::Value`, avoiding the
+/// lossless round-trip through string serialization (e.g. non-UTF8 path
+/// truncation via `to_string_lossy`).
+pub async fn handle_assign_task_typed(
+    args: AssignTaskArgs<'_>,
+    task_manager: &Arc<TaskManager>,
+    provider: &Arc<dyn ModelProvider>,
+) -> Result<Value, String> {
+    let task_id = task_manager
+        .submit(
+            args.description.to_string(),
+            args.repo_path,
+            args.branch.to_string(),
+            args.model.to_string(),
+            args.max_iterations,
+            Arc::clone(provider),
+        )
+        .await;
+
+    Ok(serde_json::json!({
+        "task_id": task_id.0,
+        "status": "Pending"
+    }))
+}
+
 pub async fn handle_poll_task(
     params: &Value,
     task_manager: &Arc<TaskManager>,
@@ -125,6 +161,13 @@ pub async fn handle_poll_task(
             started_at,
         } => ("Running", Some(*iterations), Some(started_at.to_rfc3339())),
         TaskStatus::Completed { .. } => ("Completed", None, None),
+        // Distinguish a cancelled task from a genuinely failed one so that
+        // agents inspecting `status` get the correct signal.
+        TaskStatus::Failed { diagnostics, .. }
+            if diagnostics.error_type.as_deref() == Some("Cancelled") =>
+        {
+            ("Cancelled", None, None)
+        }
         TaskStatus::Failed { .. } => ("Failed", None, None),
     };
 
@@ -317,6 +360,24 @@ mod tests {
             "repo_path": "/tmp"
         });
         let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert!(val["task_id"].is_string());
+        assert_eq!(val["status"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn test_handle_assign_task_typed_returns_task_id() {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let args = AssignTaskArgs {
+            description: "Test task",
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD",
+            model: "qwen3:0.6b",
+            max_iterations: 10,
+        };
+        let result = handle_assign_task_typed(args, &manager, &provider).await;
         assert!(result.is_ok());
         let val = result.unwrap();
         assert!(val["task_id"].is_string());
