@@ -16,46 +16,6 @@ use uuid::Uuid;
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 
-/// Default system prompt used for task-dispatched agent runs.
-///
-/// Kept in lock-step with `DEFAULT_SESSION_SYSTEM_PROMPT` in `main.rs`. They
-/// are duplicated on purpose: `main.rs` is a `bin` target and cannot be
-/// imported from here.
-const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
-
-/// Build the system prompt for a task run, appending any repo-level guidance
-/// discovered under the task's workspace path (closes #231).
-///
-/// Precedence: `AGENTS.md` over `CLAUDE.md` (see
-/// [`crate::agent::agents_md::load`]). Missing files produce no injection;
-/// read errors are logged and swallowed so a broken guidance file never blocks
-/// a task from starting.
-fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
-    match crate::agent::agents_md::load(workspace_path) {
-        Ok(Some(doc)) => {
-            tracing::info!(
-                path = %doc.path.display(),
-                source = doc.source.filename(),
-                truncated = doc.truncated,
-                "Loaded repo-level agent guidance into task system prompt"
-            );
-            format!(
-                "{}\n\n{}",
-                DEFAULT_TASK_SYSTEM_PROMPT,
-                crate::agent::agents_md::format_system_prompt_fragment(&doc)
-            )
-        }
-        Ok(None) => DEFAULT_TASK_SYSTEM_PROMPT.to_string(),
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
-            );
-            DEFAULT_TASK_SYSTEM_PROMPT.to_string()
-        }
-    }
-}
-
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
@@ -406,7 +366,9 @@ impl TaskManager {
                     let agent_config = AgentConfig {
                         max_iterations,
                         verbose: false,
-                        system_prompt: build_task_system_prompt(&workspace.workspace_path),
+                        system_prompt: crate::agent::agents_md::build_system_prompt(
+                            &workspace.workspace_path,
+                        ),
                         model_name: model.clone(),
                     };
                     let context = AgentContext {
@@ -1172,13 +1134,19 @@ mod tests {
         assert!(cache_read.get(&canonical).is_none());
     }
 
-    // ---- build_task_system_prompt unit tests ----
+    // ---- system-prompt builder integration ----
+    //
+    // The pure prompt-builder logic lives in
+    // `crate::agent::agents_md::build_system_prompt` and is exhaustively
+    // unit-tested in that module (no-guidance default, AGENTS.md injection,
+    // CLAUDE.md fallback, error swallowing). The `task.rs` integration is
+    // covered end-to-end by `test_submit_injects_agents_md_into_task_prompt`
+    // below, which dispatches a real `TaskManager::submit` call against a
+    // workspace containing an AGENTS.md and asserts the task completes.
 
     /// Install a process-global tracing subscriber once so the info/error
-    /// macro bodies in `build_task_system_prompt` actually execute under
-    /// coverage. Without a subscriber at a live level the tracing crate
-    /// short-circuits before evaluating the field expressions, leaving lines
-    /// inside the macro uncovered.
+    /// macro bodies inside `build_system_prompt` actually execute under
+    /// coverage when invoked indirectly via `TaskManager::submit`.
     fn ensure_tracing_subscriber() {
         use std::sync::Once;
         static INIT: Once = Once::new();
@@ -1188,37 +1156,6 @@ mod tests {
                 .with_max_level(tracing::Level::TRACE)
                 .try_init();
         });
-    }
-
-    #[test]
-    fn test_build_task_system_prompt_no_guidance_returns_default() {
-        ensure_tracing_subscriber();
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = build_task_system_prompt(dir.path());
-        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
-    }
-
-    #[test]
-    fn test_build_task_system_prompt_appends_agents_md() {
-        ensure_tracing_subscriber();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
-        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
-        assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
-        assert!(prompt.contains("Use nextest."));
-        assert!(prompt.contains("</repo-guidance>"));
-    }
-
-    #[test]
-    fn test_build_task_system_prompt_appends_claude_md_fallback() {
-        ensure_tracing_subscriber();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
-        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
-        assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
-        assert!(prompt.contains("legacy rules"));
     }
 
     /// Initialise a temporary directory as a git repo with a single initial
@@ -1308,18 +1245,6 @@ mod tests {
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
-    }
-
-    #[test]
-    fn test_build_task_system_prompt_swallows_read_errors() {
-        // Non-UTF8 AGENTS.md makes the loader return Err; the prompt builder
-        // must log and fall back to the default system prompt without
-        // propagating the error.
-        ensure_tracing_subscriber();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
-        let prompt = build_task_system_prompt(dir.path());
-        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     #[tokio::test]
