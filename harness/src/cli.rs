@@ -4,7 +4,8 @@
 //! The binary entry-point (`main.rs`) is excluded from coverage via
 //! `codecov.yml`; everything in this module (`emit`, `create_provider`,
 //! `use_mock_provider`, `MockCliProvider`, `install_ctrlc_handler`,
-//! `format_from`, `exit_code_for`) is covered by unit tests below.
+//! `format_from`, `exit_code_for`, `classify_handler_error`) is covered by
+//! unit tests below.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,6 +83,29 @@ pub fn exit_code_for(code: ExitCode) -> &'static str {
     }
 }
 
+/// Classify a handler error string into the appropriate `ExitCode`.
+///
+/// Handler functions return `Err(String)` where the message is:
+/// - A "Missing required field" or "must be" validation message → `UserError` (exit 1)
+/// - A "not found" or "still pending/running" state message → `StateError` (exit 2)
+/// - Anything else (I/O, parse, provider errors) → `InfraError` (exit 3)
+pub fn classify_handler_error(msg: &str) -> ExitCode {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("missing required field")
+        || lower.contains("must be")
+        || lower.contains("invalid")
+    {
+        ExitCode::UserError
+    } else if lower.contains("not found")
+        || lower.contains("still pending")
+        || lower.contains("still running")
+    {
+        ExitCode::StateError
+    } else {
+        ExitCode::InfraError
+    }
+}
+
 /// Emit a response (success or error) in the selected format and return the
 /// corresponding process exit code.
 pub fn emit(
@@ -144,6 +168,54 @@ mod tests {
         assert_eq!(exit_code_for(ExitCode::StateError), "STATE_ERROR");
         assert_eq!(exit_code_for(ExitCode::InfraError), "INFRA_ERROR");
         assert_eq!(exit_code_for(ExitCode::Interrupted), "INTERRUPTED");
+    }
+
+    #[test]
+    fn test_classify_handler_error_user_error() {
+        assert_eq!(
+            classify_handler_error("Missing required field: description"),
+            ExitCode::UserError
+        );
+        assert_eq!(
+            classify_handler_error("repo_path must be an absolute path"),
+            ExitCode::UserError
+        );
+        assert_eq!(
+            classify_handler_error("invalid task identifier"),
+            ExitCode::UserError
+        );
+    }
+
+    #[test]
+    fn test_classify_handler_error_state_error() {
+        assert_eq!(
+            classify_handler_error("Task not found: abc-123"),
+            ExitCode::StateError
+        );
+        assert_eq!(
+            classify_handler_error("Task abc is still pending"),
+            ExitCode::StateError
+        );
+        assert_eq!(
+            classify_handler_error("Task abc is still running"),
+            ExitCode::StateError
+        );
+    }
+
+    #[test]
+    fn test_classify_handler_error_infra_error() {
+        assert_eq!(
+            classify_handler_error("connection refused"),
+            ExitCode::InfraError
+        );
+        assert_eq!(
+            classify_handler_error("I/O error reading file"),
+            ExitCode::InfraError
+        );
+        assert_eq!(
+            classify_handler_error("timeout waiting for Ollama"),
+            ExitCode::InfraError
+        );
     }
 
     #[test]

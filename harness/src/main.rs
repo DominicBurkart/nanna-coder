@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use harness::cli::{create_provider, emit, install_ctrlc_handler};
+use harness::cli::{classify_handler_error, create_provider, emit, install_ctrlc_handler};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
@@ -57,9 +57,12 @@ enum Commands {
         /// Task ID returned by assign-task
         #[arg(short, long)]
         task_id: String,
-        /// Block until the task finishes (with optional timeout in seconds)
-        #[arg(short, long)]
-        wait: Option<Option<u64>>,
+        /// Block until the task reaches a terminal state
+        #[arg(long)]
+        wait: bool,
+        /// Timeout in seconds for --wait (no timeout if omitted)
+        #[arg(long)]
+        wait_timeout: Option<u64>,
     },
     /// Retrieve the final result of a completed/failed task
     GetResult {
@@ -210,18 +213,22 @@ async fn main() -> std::process::ExitCode {
             .await
             {
                 Ok(data) => emit(fmt, ExitCode::Success, data),
-                Err(e) => emit(fmt, ExitCode::UserError, serde_json::json!(e)),
+                Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
             }
         }
 
-        Commands::PollTask { task_id, wait } => {
+        Commands::PollTask {
+            task_id,
+            wait,
+            wait_timeout,
+        } => {
             // poll-task does not need a model provider.
             let task_manager = Arc::new(TaskManager::default());
             let params = serde_json::json!({ "task_id": task_id });
 
-            if let Some(timeout_secs) = wait {
+            if wait {
                 // --wait: block until terminal state or timeout
-                let deadline = timeout_secs
+                let deadline = wait_timeout
                     .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
                 loop {
                     match handlers::handle_poll_task(&params, &task_manager).await {
@@ -285,7 +292,7 @@ async fn main() -> std::process::ExitCode {
                 serde_json::json!({ "repo_path": repo_path.to_string_lossy().to_string() });
             match handlers::handle_onboard_repo(&params).await {
                 Ok(data) => emit(fmt, ExitCode::Success, data),
-                Err(e) => emit(fmt, ExitCode::UserError, serde_json::json!(e)),
+                Err(e) => emit(fmt, classify_handler_error(&e), serde_json::json!(e)),
             }
         }
 
@@ -340,7 +347,7 @@ async fn main() -> std::process::ExitCode {
                     return emit(fmt, ExitCode::InfraError, serde_json::json!(e.to_string()));
                 }
             }
-            ExitCode::Success.process_exit()
+            emit(fmt, ExitCode::Success, serde_json::json!(null))
         }
 
         Commands::Models => {
