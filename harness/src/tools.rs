@@ -60,3 +60,5 @@ fn opt_bool(args: &Value, name: &str, default: bool) -> bool {
 fn opt_u64_or(args: &Value, name: &str, default: u64) -> u64 {
     args.get(name).and_then(|v| v.as_u64()).unwrap_or(default)
 }
+
+PLACEHOLDER_TOOLS_CONTENT_TOO_LARGE_FOR_INLINE
