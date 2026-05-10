@@ -8,6 +8,8 @@
 //! types, while [`runner`] bridges [`crate::agent::eval_case::EvalCase`] with
 //! the [`crate::agent::AgentLoop`].
 
+#[cfg(feature = "eval-runner")]
+pub mod claude_cli;
 pub mod report;
 #[cfg(feature = "eval-runner")]
 pub mod runner;
@@ -30,6 +32,8 @@ pub use swebench_results::{
 };
 
 // Re-export runner types (only available with the eval-runner feature)
+#[cfg(feature = "eval-runner")]
+pub use claude_cli::{ClaudeCodeError, ClaudeCodeRun, ClaudeCodeRunner};
 #[cfg(feature = "eval-runner")]
 pub use runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
 #[cfg(feature = "eval-runner")]
