@@ -622,8 +622,47 @@ async fn finish_swebench(
     config: &EvalRunnerConfig,
     start: Instant,
     agent_result: Option<AgentOutcome>,
-    mut failures: Vec<String>,
+    failures: Vec<String>,
 ) -> Result<EvalRunResult, EvalRunnerError> {
+    finish_swebench_with_verifier(
+        eval_case,
+        task,
+        work_dir,
+        config,
+        start,
+        agent_result,
+        failures,
+        |preds, cfg| Box::pin(verify_predictions(preds, cfg)),
+    )
+    .await
+}
+
+/// Test seam: production calls `finish_swebench` which dispatches to
+/// this with `verify_predictions` as the verifier. Tests pass a fake
+/// closure that returns canned verdicts so the verdict-classification
+/// branches (`resolved` / `error` / `missing-instance`) can be
+/// exercised without Python infrastructure.
+#[allow(clippy::too_many_arguments)]
+async fn finish_swebench_with_verifier<V>(
+    eval_case: &EvalCase,
+    task: &SWEBenchTask,
+    work_dir: &Path,
+    config: &EvalRunnerConfig,
+    start: Instant,
+    agent_result: Option<AgentOutcome>,
+    mut failures: Vec<String>,
+    verifier: V,
+) -> Result<EvalRunResult, EvalRunnerError>
+where
+    V: for<'a> FnOnce(
+        &'a [Prediction],
+        &'a VerifyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<InstanceVerdict>, VerifyError>> + Send + 'a,
+        >,
+    >,
+{
     let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
 
     let task_completed = agent_result.as_ref().is_some_and(|r| r.task_completed());
@@ -653,24 +692,10 @@ async fn finish_swebench(
             instance_id: task.instance_id.clone(),
             model_patch: model_patch.clone(),
         }];
-        let verdicts = verify_predictions(&predictions, &verify_config).await?;
-        let verdict: Option<&InstanceVerdict> =
-            verdicts.iter().find(|v| v.instance_id == task.instance_id);
-        if let Some(v) = verdict {
-            if let Some(err) = &v.error {
-                failures.push(format!("SWE-bench verifier: {err}"));
-            }
-            if !v.resolved && v.error.is_none() {
-                failures.push("SWE-bench verdict: not resolved".to_string());
-            }
-            v.resolved
-        } else {
-            failures.push(format!(
-                "SWE-bench verdict missing for instance {}",
-                task.instance_id
-            ));
-            false
-        }
+        let verdicts = verifier(&predictions, &verify_config).await?;
+        let (r, mut verdict_failures) = classify_swebench_verdict(&verdicts, &task.instance_id);
+        failures.append(&mut verdict_failures);
+        r
     };
 
     let success = resolved && task_completed;
@@ -694,6 +719,37 @@ async fn finish_swebench(
         agent_result,
         swebench_patch: Some(model_patch),
     })
+}
+
+/// Map a verdict slice for `instance_id` to (resolved, failures-to-append).
+///
+/// Pure and trivially unit-testable. Three cases:
+/// - found + resolved + no error → resolved=true, no failures
+/// - found + resolved=false + error.is_some() → only the verifier error
+/// - found + resolved=false + error.is_none() → "not resolved" failure
+/// - found + resolved=true + error.is_some() → both resolved and error msg
+/// - missing instance → "verdict missing" failure, resolved=false
+fn classify_swebench_verdict(
+    verdicts: &[InstanceVerdict],
+    instance_id: &str,
+) -> (bool, Vec<String>) {
+    let mut failures = Vec::new();
+    let verdict = verdicts.iter().find(|v| v.instance_id == instance_id);
+    let resolved = if let Some(v) = verdict {
+        if let Some(err) = &v.error {
+            failures.push(format!("SWE-bench verifier: {err}"));
+        }
+        if !v.resolved && v.error.is_none() {
+            failures.push("SWE-bench verdict: not resolved".to_string());
+        }
+        v.resolved
+    } else {
+        failures.push(format!(
+            "SWE-bench verdict missing for instance {instance_id}"
+        ));
+        false
+    };
+    (resolved, failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -732,31 +788,18 @@ async fn run_verification(
 }
 
 async fn verify_build(work_dir: &Path) -> bool {
-    let output = tokio::process::Command::new("cargo")
-        .arg("build")
-        .current_dir(work_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
-    match output {
-        Ok(o) => {
-            if !o.status.success() {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!("Build verification failed:\n{stderr}");
-            }
-            o.status.success()
-        }
-        Err(e) => {
-            tracing::warn!("Build verification could not run: {e}");
-            false
-        }
-    }
+    verify_with_cmd(work_dir, "cargo", "build", "Build").await
 }
 
 async fn verify_tests(work_dir: &Path) -> bool {
-    let output = tokio::process::Command::new("cargo")
-        .arg("test")
+    verify_with_cmd(work_dir, "cargo", "test", "Test").await
+}
+
+/// Test seam: production calls with cmd="cargo"; tests pass a missing
+/// binary name to drive the `Err(e)` arm of `Command::output`.
+async fn verify_with_cmd(work_dir: &Path, cmd: &str, sub: &str, label: &str) -> bool {
+    let output = tokio::process::Command::new(cmd)
+        .arg(sub)
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -766,12 +809,12 @@ async fn verify_tests(work_dir: &Path) -> bool {
         Ok(o) => {
             if !o.status.success() {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!("Test verification failed:\n{stderr}");
+                tracing::warn!("{label} verification failed:\n{stderr}");
             }
             o.status.success()
         }
         Err(e) => {
-            tracing::warn!("Test verification could not run: {e}");
+            tracing::warn!("{label} verification could not run: {e}");
             false
         }
     }
@@ -1624,6 +1667,176 @@ tags = ["{tag}"]
         assert_eq!(result.iterations, 2);
         // Token usage flowed through.
         assert_eq!(result.token_usage.total_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn verify_with_cmd_returns_false_when_binary_is_missing() {
+        // Cover the `Err(e)` arm of verify_build/verify_tests when the
+        // command isn't on PATH. We pass a name that's vanishingly
+        // unlikely to exist; tokio::process::Command::output returns Err.
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            verify_with_cmd(dir.path(), "nanna-no-such-binary-xyz-12345", "test", "Test").await;
+        assert!(!result);
+    }
+
+    fn make_verdict(instance_id: &str, resolved: bool, error: Option<&str>) -> InstanceVerdict {
+        InstanceVerdict {
+            instance_id: instance_id.to_string(),
+            resolved,
+            error: error.map(String::from),
+        }
+    }
+
+    #[test]
+    fn classify_verdict_resolved_with_no_error() {
+        let verdicts = vec![make_verdict("alpha", true, None)];
+        let (resolved, failures) = classify_swebench_verdict(&verdicts, "alpha");
+        assert!(resolved);
+        assert!(failures.is_empty(), "got: {failures:?}");
+    }
+
+    #[test]
+    fn classify_verdict_unresolved_no_error() {
+        let verdicts = vec![make_verdict("beta", false, None)];
+        let (resolved, failures) = classify_swebench_verdict(&verdicts, "beta");
+        assert!(!resolved);
+        assert!(failures.iter().any(|f| f.contains("not resolved")));
+    }
+
+    #[test]
+    fn classify_verdict_with_error_passes_through() {
+        let verdicts = vec![make_verdict("gamma", false, Some("apply failed"))];
+        let (resolved, failures) = classify_swebench_verdict(&verdicts, "gamma");
+        assert!(!resolved);
+        assert!(failures.iter().any(|f| f.contains("apply failed")));
+        assert!(!failures.iter().any(|f| f.contains("not resolved")));
+    }
+
+    #[test]
+    fn classify_verdict_resolved_with_error_keeps_both() {
+        let verdicts = vec![make_verdict("delta", true, Some("warning"))];
+        let (resolved, failures) = classify_swebench_verdict(&verdicts, "delta");
+        assert!(resolved);
+        assert!(failures.iter().any(|f| f.contains("warning")));
+    }
+
+    #[test]
+    fn classify_verdict_missing_instance() {
+        let verdicts = vec![make_verdict("other", true, None)];
+        let (resolved, failures) = classify_swebench_verdict(&verdicts, "missing-id");
+        assert!(!resolved);
+        assert!(failures
+            .iter()
+            .any(|f| f.contains("missing") && f.contains("missing-id")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn finish_swebench_with_fake_verifier_resolved() {
+        let seed = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let oid = init_local_bare_repo(seed.path(), bare.path());
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let repo_dir = work_dir.path().join("repo");
+        crate::eval::swebench::materialize_from_url(
+            bare.path().to_str().unwrap(),
+            &oid,
+            "",
+            &repo_dir,
+        )
+        .unwrap();
+
+        let task = SWEBenchTask {
+            instance_id: "verifier-fake-001".to_string(),
+            repo: "fake/repo".to_string(),
+            base_commit: oid.clone(),
+            patch: String::new(),
+            test_patch: String::new(),
+            problem_statement: String::new(),
+            hints_text: String::new(),
+            version: String::new(),
+            fail_to_pass: vec![],
+            pass_to_pass: vec![],
+            environment_setup_commit: None,
+        };
+        let case = make_swebench_case("swebench-verifier-fake-001");
+        let config = EvalRunnerConfig::default();
+        let result = super::finish_swebench_with_verifier(
+            &case,
+            &task,
+            &repo_dir,
+            &config,
+            Instant::now(),
+            None,
+            Vec::new(),
+            |preds: &[Prediction], _cfg: &VerifyConfig| {
+                let id = preds[0].instance_id.clone();
+                Box::pin(async move { Ok(vec![make_verdict(&id, true, None)]) })
+            },
+        )
+        .await
+        .expect("finish_swebench should produce a result");
+        assert_eq!(result.case_id, "swebench-verifier-fake-001");
+        assert!(result.swebench_patch.is_some());
+        assert!(!result.success);
+        assert!(result
+            .failures
+            .iter()
+            .any(|f| f.contains("Agent did not complete")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn finish_swebench_with_fake_verifier_unresolved_with_error() {
+        let seed = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let oid = init_local_bare_repo(seed.path(), bare.path());
+        let work_dir = tempfile::tempdir().unwrap();
+        let repo_dir = work_dir.path().join("repo");
+        crate::eval::swebench::materialize_from_url(
+            bare.path().to_str().unwrap(),
+            &oid,
+            "",
+            &repo_dir,
+        )
+        .unwrap();
+
+        let task = SWEBenchTask {
+            instance_id: "verifier-fake-002".to_string(),
+            repo: "fake/repo".to_string(),
+            base_commit: oid.clone(),
+            patch: String::new(),
+            test_patch: String::new(),
+            problem_statement: String::new(),
+            hints_text: String::new(),
+            version: String::new(),
+            fail_to_pass: vec![],
+            pass_to_pass: vec![],
+            environment_setup_commit: None,
+        };
+        let case = make_swebench_case("swebench-verifier-fake-002");
+        let config = EvalRunnerConfig::default();
+        let result = super::finish_swebench_with_verifier(
+            &case,
+            &task,
+            &repo_dir,
+            &config,
+            Instant::now(),
+            None,
+            Vec::new(),
+            |preds: &[Prediction], _cfg: &VerifyConfig| {
+                let id = preds[0].instance_id.clone();
+                Box::pin(async move { Ok(vec![make_verdict(&id, false, Some("apply failed"))]) })
+            },
+        )
+        .await
+        .expect("finish_swebench should produce a result");
+        assert!(!result.success);
+        assert!(result.failures.iter().any(|f| f.contains("apply failed")));
     }
 
     #[cfg(unix)]
