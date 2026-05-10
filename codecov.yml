@@ -10,3 +10,4 @@ coverage:
 
 ignore:
   - "harness/src/main.rs"
+  - "harness/tests/smoke_mcp_install.rs"

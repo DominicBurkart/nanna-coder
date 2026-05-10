@@ -98,8 +98,8 @@ impl NannaMcpServer {
             // used by the existing unit tests.
             //
             // Framing mode is selected per-message based on the first line of
-            // each loop iteration: a `Content-Length:` prefix → framed body; any
-            // other line → treated as a complete JSON-RPC line. Mixed framing
+            // each loop iteration: a `Content-Length:` prefix -> framed body; any
+            // other line -> treated as a complete JSON-RPC line. Mixed framing
             // within a single message is not supported; a malformed
             // `Content-Length` header terminates the connection rather than
             // silently desyncing.
@@ -578,5 +578,161 @@ mod tests {
             .await
             .unwrap();
         assert!(output.is_empty());
+    }
+
+    // ── Content-Length framing tests ─────────────────────────────────────────
+    //
+    // The tests below exercise the Content-Length detection branch in serve()
+    // and the process_framed() helper directly, which were the 38 lines
+    // uncovered by the codecov/patch check.
+
+    /// Build a Content-Length framed message as raw bytes.
+    fn framed(body: &str) -> Vec<u8> {
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut v = header.into_bytes();
+        v.extend_from_slice(body.as_bytes());
+        v
+    }
+
+    /// Parse a Content-Length framed response and return the JSON body.
+    fn parse_framed_response(bytes: &[u8]) -> serde_json::Value {
+        let s = std::str::from_utf8(bytes).expect("response must be UTF-8");
+        // Find end of headers (\r\n\r\n)
+        let sep = s.find("\r\n\r\n").expect("response must contain \\r\\n\\r\\n");
+        let header_section = &s[..sep];
+        let body = &s[sep + 4..];
+        // Verify Content-Length header present
+        assert!(
+            header_section
+                .to_ascii_lowercase()
+                .contains("content-length:"),
+            "framed response must contain Content-Length header, got: {header_section:?}"
+        );
+        serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("framed response body not valid JSON: {e}\nbody={body:?}"))
+    }
+
+    #[tokio::test]
+    async fn test_process_framed_initialize_returns_content_length_response() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"}}}"}"#;
+        // The body above has a stray trailing `"` — use a clean one:
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"}}}"}"#;
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+        let bytes = make_server()
+            .process_framed(body)
+            .await
+            .unwrap()
+            .expect("process_framed should return Some for initialize");
+        let v = parse_framed_response(&bytes);
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert!(v["result"]["serverInfo"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_process_framed_blank_returns_none() {
+        assert!(make_server().process_framed("").await.unwrap().is_none());
+        assert!(make_server()
+            .process_framed("   \n  ")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_framed_notification_returns_none() {
+        // notifications/initialized has no id and no error -> None
+        let body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}";
+        let out = make_server().process_framed(body).await.unwrap();
+        assert!(out.is_none(), "notification must produce no response");
+    }
+
+    #[tokio::test]
+    async fn test_process_framed_invalid_json_returns_parse_error() {
+        let body = "this is not json";
+        let bytes = make_server()
+            .process_framed(body)
+            .await
+            .unwrap()
+            .expect("invalid JSON should produce an error response");
+        let v = parse_framed_response(&bytes);
+        assert_eq!(v["error"]["code"], -32700);
+        assert!(v["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_serve_content_length_framed_initialize() {
+        // Build input: one Content-Length framed initialize request.
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+        let input = framed(body);
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .await
+            .unwrap();
+        let v = parse_framed_response(&output);
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[tokio::test]
+    async fn test_serve_content_length_framed_two_messages() {
+        // Two framed messages back-to-back: initialize then tools/list.
+        let body1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+        let body2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+        let notif = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}";
+        let mut input = framed(body1);
+        // notification — no response expected
+        input.extend_from_slice(&framed(notif));
+        input.extend_from_slice(&framed(body2));
+
+        let mut output: Vec<u8> = Vec::new();
+        make_server()
+            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .await
+            .unwrap();
+
+        // The output is two Content-Length framed responses concatenated.
+        // Split by scanning for \r\n\r\n + Content-Length body pairs.
+        let s = std::str::from_utf8(&output).unwrap();
+        // Quick check: both ids appear in the output.
+        assert!(s.contains("\"id\":1"), "response 1 missing: {s}");
+        assert!(s.contains("\"id\":2"), "response 2 missing: {s}");
+        assert!(s.contains("protocolVersion"), "initialize result missing: {s}");
+        assert!(s.contains("tools"), "tools/list result missing: {s}");
+    }
+
+    #[tokio::test]
+    async fn test_serve_content_length_framed_eof_mid_headers() {
+        // Truncated: Content-Length header with no following blank line or body.
+        // serve() should return Ok(()) cleanly when EOF occurs while draining
+        // headers (the inner loop's `if n == 0 { return Ok(()) }` branch).
+        let input = b"Content-Length: 42\r\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let result = make_server()
+            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .await;
+        assert!(result.is_ok(), "EOF mid-headers must not error: {result:?}");
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_serve_content_length_malformed_returns_error() {
+        // A Content-Length header with a non-numeric value must cause serve()
+        // to return Err (not panic or silently desync).
+        let input = b"Content-Length: not-a-number\r\n\r\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let result = make_server()
+            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .await;
+        assert!(
+            result.is_err(),
+            "malformed Content-Length must return Err, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("malformed Content-Length"),
+            "error message should describe the problem: {msg}"
+        );
     }
 }
