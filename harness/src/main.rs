@@ -514,11 +514,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -576,8 +576,7 @@ async fn run_agent(
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = Arc::new(make_ollama_provider()?);
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -644,8 +643,9 @@ async fn run_mcp_server(
     use harness::task::TaskManager;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    // Use the shared make_ollama_provider() helper so construction is in one
+    // place and cannot silently diverge if OllamaConfig changes.
+    let provider = Arc::new(make_ollama_provider()?);
     let task_manager = Arc::new(TaskManager::default());
 
     info!(

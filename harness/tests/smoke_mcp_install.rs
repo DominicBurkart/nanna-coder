@@ -408,9 +408,9 @@ fn test_mcp_stdio_tools_call_list_tasks() {
 /// Live MCP task roundtrip smoke test.
 ///
 /// Submits a trivial task via `handle_assign_task` with a real
-/// `OllamaProvider` (qwen3:0.6b), polls with `handle_poll_task` until a
-/// terminal state (`Completed` or `Failed`) is reached, then calls
-/// `handle_get_result` and asserts a well-formed response.
+/// `OllamaProvider` (qwen3:0.6b), polls until a terminal state
+/// (`Completed` or `Failed`) is reached, then calls `handle_get_result`
+/// and asserts a well-formed response.
 ///
 /// Uses a retry loop (MAX_ATTEMPTS = 3) and treats timeouts as soft
 /// failures that trigger a retry, following the pattern in
@@ -467,17 +467,33 @@ async fn run_live_task_attempt() -> Result<(), String> {
 
     let task_manager = Arc::new(TaskManager::default());
 
-    // Use /tmp as repo_path — the workspace creation will fail quickly
-    // (no git repo), which is acceptable: we only need to prove the handlers
-    // complete a full assign -> poll -> get_result round-trip and return
-    // a well-formed terminal-state response.
-    // `model` is provided via the positional `default_model` arg below;
-    // omitting it from the JSON params keeps a single source of truth so the
-    // test cannot silently diverge if `LIVE_MODEL` is changed in only one
-    // place.
+    // Initialise a throwaway git repo in a tempdir so the agent loop can
+    // actually start and potentially reach Completed rather than always
+    // failing immediately due to a missing git repo (which /tmp would cause).
+    // This ensures the `if status == "Completed"` assertion branch is
+    // exercisable by the live test.
+    let repo_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo_dir.path())
+        .output()
+        .map_err(|e| format!("git init failed: {e}"))?;
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .env("GIT_AUTHOR_NAME", "smoke")
+        .env("GIT_AUTHOR_EMAIL", "smoke@test")
+        .env("GIT_COMMITTER_NAME", "smoke")
+        .env("GIT_COMMITTER_EMAIL", "smoke@test")
+        .current_dir(repo_dir.path())
+        .output()
+        .map_err(|e| format!("git commit failed: {e}"))?;
+
+    // `model` is provided via the positional `default_model` arg; omitting it
+    // from the JSON params keeps a single source of truth so the test cannot
+    // silently diverge if `LIVE_MODEL` is changed in only one place.
     let assign_params = serde_json::json!({
         "description": "Print hello world",
-        "repo_path": "/tmp",
+        "repo_path": repo_dir.path().to_string_lossy(),
         "max_iterations": 3
     });
 
