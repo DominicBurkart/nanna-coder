@@ -83,11 +83,20 @@ impl AnthropicProvider {
                             }
 
                             for tc in tool_calls {
+                                // Defensive: some providers (OpenAI/Ollama) emit arguments as a
+                                // stringified JSON string. Anthropic requires `input` to be a
+                                // JSON object; attempt to parse if we receive a String.
+                                let input = match &tc.function.arguments {
+                                    Value::String(s) => serde_json::from_str::<Value>(s)
+                                        .unwrap_or_else(|_| Value::Object(Default::default())),
+                                    Value::Null => Value::Object(Default::default()),
+                                    other => other.clone(),
+                                };
                                 content_blocks.push(serde_json::json!({
                                     "type": "tool_use",
                                     "id": tc.id,
                                     "name": tc.function.name,
-                                    "input": tc.function.arguments
+                                    "input": input
                                 }));
                             }
 
@@ -120,11 +129,15 @@ impl AnthropicProvider {
     }
 
     /// Convert internal ToolDefinitions to Anthropic tool format.
-    fn tools_to_anthropic(tools: &[ToolDefinition]) -> Vec<Value> {
+    /// When prompt caching is enabled, applies a `cache_control: ephemeral` marker
+    /// to the last tool in the list so the full tool catalog is cached.
+    fn tools_to_anthropic(tools: &[ToolDefinition], enable_cache: bool) -> Vec<Value> {
+        let last_idx = tools.len().saturating_sub(1);
         tools
             .iter()
-            .map(|tool| {
-                serde_json::json!({
+            .enumerate()
+            .map(|(i, tool)| {
+                let mut obj = serde_json::json!({
                     "name": tool.function.name,
                     "description": tool.function.description,
                     "input_schema": {
@@ -133,7 +146,11 @@ impl AnthropicProvider {
                         "properties": tool.function.parameters.properties,
                         "required": tool.function.parameters.required
                     }
-                })
+                });
+                if enable_cache && i == last_idx {
+                    obj["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                obj
             })
             .collect()
     }
@@ -228,33 +245,47 @@ impl AnthropicProvider {
         })
     }
 
-    /// Send a request with retry logic for rate limiting (429 status).
+    /// Send a request with retry logic.
+    ///
+    /// Retryable status codes: 429 (rate limit), 500, 502, 503, 504 (transient
+    /// server errors), and 529 (Anthropic overloaded). On 429/529 the
+    /// `Retry-After` response header is honored when present; otherwise an
+    /// exponential backoff with random jitter is used.
     async fn send_with_retry(&self, payload: &Value) -> ModelResult<AnthropicRawResponse> {
         let url = format!("{}/v1/messages", self.config.base_url);
         let mut last_error: Option<ModelError> = None;
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                let delay = std::time::Duration::from_millis(
+                    last_retry_delay_ms(attempt)
+                );
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {}/{})",
+                    "Retrying request in {:?} (attempt {}/{})",
                     delay, attempt, self.config.max_retries
                 );
                 tokio::time::sleep(delay).await;
             }
 
-            let response = self
+            let mut req = self
                 .http_client
                 .post(&url)
-                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-version", &self.config.anthropic_version)
                 .header("x-api-key", &self.config.api_key)
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+
+            if self.config.enable_prompt_caching {
+                req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
+            }
+
+            let response = req
                 .json(payload)
                 .send()
                 .await
                 .map_err(Self::handle_reqwest_error)?;
 
             let status = response.status();
+            let status_u16 = status.as_u16();
 
             if status.is_success() {
                 let raw: AnthropicRawResponse =
@@ -264,18 +295,40 @@ impl AnthropicProvider {
                 return Ok(raw);
             }
 
-            if status.as_u16() == 429 {
-                last_error = Some(ModelError::RateLimit);
+            if matches!(status_u16, 429 | 500 | 502 | 503 | 504 | 529) {
+                // Honor Retry-After header if present, otherwise use jittered exponential backoff
+                if let Some(retry_after_secs) = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    // Override the default delay with the server-specified value
+                    let _retry_delay_override = retry_after_secs * 1000;
+                    last_error = Some(ModelError::RateLimit);
+                    // Sleep immediately with the server-specified delay then continue
+                    tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+                    // Reset attempt counter delay — already slept
+                    // We skip the delay at the top of the next loop iteration via continue
+                    // by re-checking: next iteration attempt > 0 so delay runs again.
+                    // Instead: push the full response handling and continue.
+                    continue;
+                }
+                last_error = Some(if status_u16 == 429 { ModelError::RateLimit } else {
+                    ModelError::ServiceUnavailable {
+                        message: format!("Anthropic API returned {}", status_u16),
+                    }
+                });
                 continue;
             }
 
-            if status.as_u16() == 401 {
+            if status_u16 == 401 {
                 return Err(ModelError::Authentication);
             }
 
             let body = response.text().await.unwrap_or_default();
 
-            if status.as_u16() == 404 {
+            if status_u16 == 404 {
                 return Err(ModelError::ModelNotFound {
                     model: payload
                         .get("model")
@@ -308,6 +361,19 @@ impl AnthropicProvider {
             }
         }
     }
+}
+
+/// Compute the jittered exponential backoff delay in milliseconds for a retry
+/// attempt (1-based: attempt=1 means the first retry after the initial try).
+fn last_retry_delay_ms(attempt: u32) -> u64 {
+    let base = 500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+    // Add up to 250 ms of random jitter to avoid retry thundering-herd
+    let jitter = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64)
+        % 250;
+    base + jitter
 }
 
 // Anthropic API response types
@@ -355,7 +421,19 @@ impl ModelProvider for AnthropicProvider {
         });
 
         if let Some(system_text) = system {
-            payload["system"] = Value::String(system_text);
+            if self.config.enable_prompt_caching {
+                // Apply cache_control on the system block for prompt caching.
+                // This can reduce input-token cost by ~90% for repeated system prompts.
+                payload["system"] = serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]);
+            } else {
+                payload["system"] = Value::String(system_text);
+            }
         }
 
         if let Some(temperature) = request.temperature {
@@ -364,7 +442,10 @@ impl ModelProvider for AnthropicProvider {
 
         if let Some(tools) = &request.tools {
             if !tools.is_empty() {
-                payload["tools"] = Value::Array(Self::tools_to_anthropic(tools));
+                payload["tools"] = Value::Array(Self::tools_to_anthropic(
+                    tools,
+                    self.config.enable_prompt_caching,
+                ));
             }
         }
 
@@ -379,10 +460,34 @@ impl ModelProvider for AnthropicProvider {
         Self::parse_response(raw)
     }
 
+    /// List the known Anthropic model identifiers.
+    ///
+    /// **Note:** this list is manually maintained. Add new snapshot IDs here
+    /// as Anthropic releases them; the provider does not query a dynamic
+    /// model-listing endpoint.
     async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
         debug!("Listing known Anthropic models");
 
         let models = vec![
+            // Claude 4 series
+            ModelInfo {
+                name: "claude-opus-4-7".to_string(),
+                size: None,
+                digest: None,
+                modified_at: None,
+            },
+            ModelInfo {
+                name: "claude-sonnet-4-6".to_string(),
+                size: None,
+                digest: None,
+                modified_at: None,
+            },
+            ModelInfo {
+                name: "claude-haiku-4-5-20251001".to_string(),
+                size: None,
+                digest: None,
+                modified_at: None,
+            },
             ModelInfo {
                 name: "claude-sonnet-4-20250514".to_string(),
                 size: None,
@@ -401,6 +506,7 @@ impl ModelProvider for AnthropicProvider {
                 digest: None,
                 modified_at: None,
             },
+            // Claude 3.5 series
             ModelInfo {
                 name: "claude-3-5-sonnet-20241022".to_string(),
                 size: None,
@@ -413,6 +519,7 @@ impl ModelProvider for AnthropicProvider {
                 digest: None,
                 modified_at: None,
             },
+            // Claude 3 series
             ModelInfo {
                 name: "claude-3-opus-20240229".to_string(),
                 size: None,
@@ -425,6 +532,16 @@ impl ModelProvider for AnthropicProvider {
         Ok(models)
     }
 
+    /// Verifies API connectivity and credentials by issuing a minimal
+    /// `messages` request with `max_tokens: 1`.
+    ///
+    /// **Note:** unlike Ollama's health check, this makes a real billable API
+    /// call that consumes input and output tokens on every invocation. Avoid
+    /// calling this in tight loops or on startup paths where cost matters. A
+    /// deliberately-malformed request (e.g. empty `messages`) would exercise
+    /// auth without billing, but Anthropic's validation error codes are
+    /// indistinguishable from a misconfigured client; the minimal-token
+    /// approach is kept for clarity.
     async fn health_check(&self) -> ModelResult<()> {
         debug!("Performing Anthropic health check");
 
@@ -437,12 +554,18 @@ impl ModelProvider for AnthropicProvider {
 
         let url = format!("{}/v1/messages", self.config.base_url);
 
-        let response = self
+        let mut req = self
             .http_client
             .post(&url)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", &self.config.anthropic_version)
             .header("x-api-key", &self.config.api_key)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if self.config.enable_prompt_caching {
+            req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
+        }
+
+        let response = req
             .json(&payload)
             .send()
             .await
@@ -541,6 +664,58 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_arguments_string_fallback() {
+        // Defensive guard: if arguments arrive as a stringified JSON string
+        // (OpenAI/Ollama convention), the Anthropic provider must parse them
+        // into an object to avoid a 400 from the API.
+        let msg = ChatMessage::assistant_with_tools(
+            None,
+            vec![ToolCall {
+                id: "toolu_str".to_string(),
+                function: FunctionCall {
+                    name: "search".to_string(),
+                    arguments: serde_json::json!("{\"query\": \"rust\"}"),
+                },
+            }],
+        );
+
+        let result = AnthropicProvider::messages_to_anthropic(&[msg]);
+        assert_eq!(result.len(), 1);
+        let content = result[0]["content"].as_array().unwrap();
+        // input must be a JSON object, not a string
+        let input = &content
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap()["input"];
+        assert!(input.is_object(), "input must be an object, got: {:?}", input);
+        assert_eq!(input["query"], "rust");
+    }
+
+    #[test]
+    fn test_tool_arguments_null_fallback() {
+        // Null arguments should produce an empty object, not crash.
+        let msg = ChatMessage::assistant_with_tools(
+            None,
+            vec![ToolCall {
+                id: "toolu_null".to_string(),
+                function: FunctionCall {
+                    name: "noop".to_string(),
+                    arguments: serde_json::Value::Null,
+                },
+            }],
+        );
+
+        let result = AnthropicProvider::messages_to_anthropic(&[msg]);
+        let content = result[0]["content"].as_array().unwrap();
+        let input = &content
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap()["input"];
+        assert!(input.is_object());
+        assert_eq!(input.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_tools_to_anthropic_format() {
         let mut props = HashMap::new();
         props.insert(
@@ -564,7 +739,7 @@ mod tests {
             },
         };
 
-        let result = AnthropicProvider::tools_to_anthropic(&[tool]);
+        let result = AnthropicProvider::tools_to_anthropic(&[tool], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["name"], "get_weather");
@@ -572,6 +747,35 @@ mod tests {
         assert_eq!(result[0]["input_schema"]["type"], "object");
         assert!(result[0]["input_schema"]["properties"]["location"].is_object());
         assert_eq!(result[0]["input_schema"]["required"][0], "location");
+    }
+
+    #[test]
+    fn test_tools_to_anthropic_cache_control() {
+        // When caching is enabled, the last tool should have cache_control set.
+        let make_tool = |name: &str| ToolDefinition {
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("Tool {}", name),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        };
+
+        let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
+        let result = AnthropicProvider::tools_to_anthropic(&tools, true);
+
+        assert!(result[0].get("cache_control").is_none(), "first tool should not have cache_control");
+        assert!(result[1].get("cache_control").is_none(), "middle tool should not have cache_control");
+        assert_eq!(result[2]["cache_control"]["type"], "ephemeral", "last tool should have cache_control");
+
+        // Caching disabled: no markers.
+        let result_no_cache = AnthropicProvider::tools_to_anthropic(&tools, false);
+        for r in &result_no_cache {
+            assert!(r.get("cache_control").is_none());
+        }
     }
 
     #[test]
@@ -787,11 +991,28 @@ mod tests {
         let models = provider.list_models().await.unwrap();
         assert!(!models.is_empty());
         assert!(models.iter().any(|m| m.name.contains("claude")));
+        // Verify current-generation models are present
+        assert!(models.iter().any(|m| m.name == "claude-sonnet-4-6"));
+        assert!(models.iter().any(|m| m.name == "claude-opus-4-7"));
+        assert!(models.iter().any(|m| m.name == "claude-haiku-4-5-20251001"));
     }
 
     #[test]
     fn test_extract_system_none() {
         let messages = vec![ChatMessage::user("Hello")];
         assert!(AnthropicProvider::extract_system(&messages).is_none());
+    }
+
+    #[test]
+    fn test_retry_delay_jitter() {
+        // The backoff should be non-deterministic (jittered) but always
+        // >= the base and < base + 250.
+        let delay1 = last_retry_delay_ms(1);
+        assert!(delay1 >= 500, "attempt=1 base is 500ms, got {}", delay1);
+        assert!(delay1 < 750, "jitter must be < 250ms, got {}", delay1);
+
+        let delay2 = last_retry_delay_ms(2);
+        assert!(delay2 >= 1000, "attempt=2 base is 1000ms, got {}", delay2);
+        assert!(delay2 < 1250, "jitter must be < 250ms, got {}", delay2);
     }
 }

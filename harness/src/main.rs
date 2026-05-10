@@ -17,6 +17,9 @@ use tracing::{error, info};
 #[command(name = "harness")]
 #[command(about = "A CLI tool for interacting with language models")]
 struct Cli {
+    /// Provider to use (ollama or anthropic)
+    #[arg(long, global = true, default_value = "ollama")]
+    provider: String,
     #[command(subcommand)]
     command: Commands,
 }
@@ -37,24 +40,13 @@ enum Commands {
         /// Temperature setting (0.0 to 2.0)
         #[arg(long, default_value = "0.7")]
         temperature: f32,
-        /// Provider to use (ollama or anthropic)
-        #[arg(long, default_value = "ollama")]
-        provider: String,
     },
     /// List available models
-    Models {
-        /// Provider to use (ollama or anthropic)
-        #[arg(long, default_value = "ollama")]
-        provider: String,
-    },
+    Models,
     /// List available tools
     Tools,
     /// Health check
-    Health {
-        /// Provider to use (ollama or anthropic)
-        #[arg(long, default_value = "ollama")]
-        provider: String,
-    },
+    Health,
     /// Run the autonomous agent with a prompt
     Agent {
         /// The prompt for the agent
@@ -72,9 +64,6 @@ enum Commands {
         /// Enable tool calling
         #[arg(short, long)]
         tools: bool,
-        /// Provider to use (ollama or anthropic)
-        #[arg(long, default_value = "ollama")]
-        provider: String,
     },
     /// Run as an MCP server over stdio
     McpServe {
@@ -84,9 +73,6 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
-        /// Provider to use (ollama or anthropic)
-        #[arg(long, default_value = "ollama")]
-        provider: String,
     },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
@@ -114,6 +100,15 @@ fn create_provider(
         }
         #[cfg(feature = "anthropic")]
         "anthropic" => {
+            if std::env::var("ANTHROPIC_API_KEY")
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+            {
+                return Err(
+                    "ANTHROPIC_API_KEY is not set. Export it before using --provider anthropic."
+                        .into(),
+                );
+            }
             let config = model::AnthropicConfig::default();
             Ok(Arc::new(model::AnthropicProvider::new(config)?))
         }
@@ -132,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let provider_name = cli.provider;
 
     let workspace_root = std::env::current_dir()?;
     let tool_registry = create_tool_registry(&workspace_root);
@@ -142,7 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             tools,
             temperature,
-            provider: provider_name,
         } => {
             let provider = create_provider(&provider_name)?;
             let entity_store = initialize_workspace(&workspace_root).await;
@@ -169,18 +164,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
         }
-        Commands::Models {
-            provider: provider_name,
-        } => {
+        Commands::Models => {
             let provider = create_provider(&provider_name)?;
             list_models(provider.as_ref()).await?;
         }
         Commands::Tools => {
             list_tools(&tool_registry);
         }
-        Commands::Health {
-            provider: provider_name,
-        } => {
+        Commands::Health => {
             let provider = create_provider(&provider_name)?;
             health_check(provider.as_ref()).await?;
         }
@@ -190,7 +181,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             verbose,
             tools,
-            provider: provider_name,
         } => {
             run_agent(
                 &prompt,
@@ -206,7 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::McpServe {
             model,
             max_iterations,
-            provider: provider_name,
         } => {
             run_mcp_server(&model, max_iterations, &provider_name).await?;
         }
@@ -552,13 +541,13 @@ async fn health_check(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::e
     match provider.health_check().await {
         Ok(()) => {
             println!(
-                "✓ Health check passed. {} is running and accessible.",
+                "\u{2713} Health check passed. {} is running and accessible.",
                 provider.provider_name()
             );
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
