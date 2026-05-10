@@ -2122,6 +2122,153 @@ mod tests {
         );
     }
 
+    fn assistant_tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: None,
+            tool_calls: Some(
+                calls
+                    .into_iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: args,
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+        }
+    }
+
+    /// `extract_tool_calls_from_history` pairs each assistant tool call with
+    /// its matching `MessageRole::Tool` response by `tool_call_id`, even when
+    /// the response arrives several messages later or interleaved with other
+    /// assistant turns.
+    #[test]
+    fn extract_tool_calls_pairs_calls_with_their_responses() {
+        let history = vec![
+            ChatMessage::user("do two things"),
+            assistant_tool_calls(vec![
+                ("call_a", "echo", serde_json::json!({"msg": "hello"})),
+                ("call_b", "calc", serde_json::json!({"x": 2})),
+            ]),
+            ChatMessage::tool_response("call_b", "4"),
+            ChatMessage::tool_response("call_a", "hello"),
+            ChatMessage::assistant("done"),
+        ];
+
+        let mut records = extract_tool_calls_from_history(&history);
+        records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].call_id, "call_a");
+        assert_eq!(records[0].tool_name, "echo");
+        assert_eq!(records[0].result, "hello");
+        assert_eq!(records[1].call_id, "call_b");
+        assert_eq!(records[1].tool_name, "calc");
+        assert_eq!(records[1].result, "4");
+    }
+
+    /// A tool call without a matching response (model crashed or response
+    /// truncated) yields a record with an empty `result` rather than dropping
+    /// the call. This preserves the diagnostic trail when surfacing errors.
+    #[test]
+    fn extract_tool_calls_keeps_unanswered_calls_with_empty_result() {
+        let history = vec![
+            assistant_tool_calls(vec![("orphan", "search", serde_json::json!({"q": "x"}))]),
+            // No tool response for "orphan".
+        ];
+
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call_id, "orphan");
+        assert_eq!(records[0].result, "");
+    }
+
+    /// Tool responses whose `tool_call_id` was never emitted by an assistant
+    /// turn are ignored — we only ever surface records that originated from a
+    /// real tool call.
+    #[test]
+    fn extract_tool_calls_ignores_orphan_tool_responses() {
+        let history = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::tool_response("never_called", "stale"),
+            ChatMessage::assistant("ok"),
+        ];
+
+        assert!(extract_tool_calls_from_history(&history).is_empty());
+    }
+
+    /// `extract_result_summary` returns the most recent assistant message
+    /// whose `tool_calls` is `None`. Assistant turns that emit tool calls are
+    /// transient orchestration steps and must not be treated as the final
+    /// answer.
+    #[test]
+    fn extract_result_summary_skips_assistant_messages_with_tool_calls() {
+        let history = vec![
+            ChatMessage::user("ask"),
+            assistant_tool_calls(vec![("c1", "search", serde_json::json!({}))]),
+            ChatMessage::tool_response("c1", "42"),
+            ChatMessage::assistant("the answer is 42"),
+        ];
+
+        assert_eq!(extract_result_summary(&history), "the answer is 42");
+    }
+
+    /// With no plain assistant message at all, the summary is empty rather
+    /// than panicking or returning the latest tool-calling assistant turn.
+    #[test]
+    fn extract_result_summary_empty_when_no_plain_assistant_turn() {
+        let history = vec![
+            ChatMessage::user("ask"),
+            assistant_tool_calls(vec![("c1", "noop", serde_json::json!({}))]),
+        ];
+        assert_eq!(extract_result_summary(&history), "");
+    }
+
+    /// Regression guard for the `with_llm` / `with_tools` constructors that
+    /// chain through `with_entity_store` via struct update syntax. All four
+    /// entry points must produce an agent in `EnrichingEntities`, with zero
+    /// counters, an empty conversation, and no plan cache, regardless of
+    /// which LLM/tool dependencies are wired in.
+    #[test]
+    fn all_constructors_initialize_to_a_clean_enriching_state() {
+        let configs = [AgentConfig::default(), AgentConfig::default()];
+        let providers: Vec<Arc<dyn ModelProvider>> = vec![MockProvider::new(vec![])];
+
+        let agents: Vec<Box<dyn std::any::Any>> = vec![
+            Box::new(AgentLoop::new(configs[0].clone())),
+            Box::new(AgentLoop::with_entity_store(
+                configs[1].clone(),
+                InMemoryEntityStore::new(),
+            )),
+            Box::new(AgentLoop::with_llm(
+                AgentConfig::default(),
+                InMemoryEntityStore::new(),
+                providers[0].clone(),
+            )),
+            Box::new(AgentLoop::with_tools(
+                AgentConfig::default(),
+                InMemoryEntityStore::new(),
+                providers[0].clone(),
+                ToolRegistry::new(),
+            )),
+        ];
+
+        for boxed in agents {
+            // Each agent has the default in-memory store concrete type.
+            let agent: &AgentLoop<InMemoryEntityStore> = boxed.downcast_ref().unwrap();
+            assert_eq!(agent.state(), &AgentState::EnrichingEntities);
+            assert_eq!(agent.iterations, 0);
+            assert_eq!(agent.performed_actions, 0);
+            assert!(agent.plan_cache.is_none());
+            assert!(agent.conversation_history.is_empty());
+            assert!(agent.state_history().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn test_tool_loop_single_stop_counts_one_iteration() {
         let provider = MockProvider::new(vec![plain_response("Done")]);
