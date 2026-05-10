@@ -68,3 +68,13 @@ result-*
 # produced on demand by `harness::eval::swebench::materialize`. Only the
 # `task.toml` files under swebench-*/ are checked in.
 evals/cases/swebench-*/repo/
+
+# `harness-score` per-run state (cloned repos, predictions, per-instance
+# state files, upstream report.json trees). Only the aggregated scorecard
+# at evals/scorecards/index.jsonl is checked in.
+evals/scorecards/state/
+
+# Locally-exported SWE-bench datasets. Pulled on demand from HuggingFace
+# via `~/.venvs/swebench/bin/python -c 'datasets.load_dataset(...)'`.
+evals/datasets/swebench-lite.jsonl
+evals/datasets/swebench-verified.jsonl

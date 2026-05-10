@@ -250,6 +250,16 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
             eprintln!("::error::failed to create verify dir: {e}");
             return ExitCode::from(2);
         }
+        // Canonicalise: the upstream Python harness sets its CWD to
+        // `work_dir` and then re-opens the predictions path relative to
+        // that CWD. If we pass a relative path, it double-nests.
+        let verify_dir = match verify_dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("::error::failed to canonicalize verify dir: {e}");
+                return ExitCode::from(2);
+            }
+        };
         let verify_config = VerifyConfig {
             dataset_name: args.dataset_name.clone(),
             model_name_or_path: format!("nanna__{}", sanitize_model_for_path(model)),
@@ -328,17 +338,22 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
         }
     };
 
-    let index_path = std::path::Path::new("evals/scorecards/index.jsonl");
-    if let Err(e) = append_line(index_path, &line) {
-        eprintln!("::error::failed to append scorecard: {e}");
-        return ExitCode::from(2);
-    }
+    let appended = if card.is_complete {
+        let index_path = std::path::Path::new("evals/scorecards/index.jsonl");
+        if let Err(e) = append_line(index_path, &line) {
+            eprintln!("::error::failed to append scorecard: {e}");
+            return ExitCode::from(2);
+        }
+        true
+    } else {
+        false
+    };
 
-    print_summary(&card);
+    print_summary(&card, appended);
     ExitCode::SUCCESS
 }
 
-fn print_summary(card: &Scorecard) {
+fn print_summary(card: &Scorecard, appended: bool) {
     println!();
     println!("=== Scorecard ===");
     println!("dataset:    {}", card.dataset);
@@ -353,5 +368,15 @@ fn print_summary(card: &Scorecard) {
         card.is_complete
     );
     println!("commit:     {}", card.commit);
-    println!("appended to evals/scorecards/index.jsonl");
+    if appended {
+        println!("appended to evals/scorecards/index.jsonl");
+    } else {
+        println!(
+            "NOT appended to evals/scorecards/index.jsonl — \
+             {}/{} instances attempted; only full-dataset runs are \
+             leaderboard-comparable. Re-run without --max-instances \
+             until every instance reaches a terminal status, then re-finalize.",
+            card.instances_attempted, card.instances_total
+        );
+    }
 }
