@@ -2252,6 +2252,47 @@ timeout_secs = 1
     }
 
     #[tokio::test]
+    async fn run_eval_non_swebench_pushes_failures_after_agent_success_when_verification_fails() {
+        // Drive an agent success against fake Ollama AND have verification
+        // fail (build_must_pass=true with no Cargo.toml). The success path
+        // through run_eval should land at lines 360 and/or 363, pushing
+        // either "Agent did not complete the task" and/or
+        // verification_failures into the result's `failures`.
+        let ollama_url = start_fake_ollama().await;
+        let case_dir = tempfile::tempdir().unwrap();
+        let case = EvalCase::from_toml_str(
+            r#"
+[case]
+id = "fixture-success-but-verify-fails"
+name = "agent ok, verification fails"
+description = ""
+
+[task]
+prompt = "x"
+language = "rust"
+
+[expected]
+build_must_pass = true
+
+[metadata]
+timeout_secs = 10
+"#,
+        )
+        .unwrap();
+        let config = EvalRunnerConfig::default()
+            .with_base_url(&ollama_url)
+            .with_max_iterations(1);
+        let result = run_eval(&case, case_dir.path(), &config)
+            .await
+            .expect("structured result expected");
+        assert!(!result.success);
+        assert!(
+            !result.failures.is_empty(),
+            "expected failures (verification or agent-completion), got success"
+        );
+    }
+
+    #[tokio::test]
     async fn run_eval_non_swebench_succeeds_against_fake_ollama() {
         // Cover run_eval's non-SWE-bench success return path
         // (lines ~352-383 of runner.rs) plus run_agent_in_process body
