@@ -490,6 +490,21 @@ mod tests {
         assert_eq!(r.model, "claude-haiku-4-5");
     }
 
+    #[test]
+    fn default_matches_new() {
+        // `Default::default()` must produce the same baseline as
+        // `new()`. Test exists so both code paths are covered and so
+        // a future divergence between them is loud.
+        let a = ClaudeCodeRunner::default();
+        let b = ClaudeCodeRunner::new();
+        assert_eq!(a.claude_bin, b.claude_bin);
+        assert_eq!(a.model, b.model);
+        assert_eq!(a.max_budget_usd, b.max_budget_usd);
+        assert_eq!(a.allowed_tools, b.allowed_tools);
+        assert_eq!(a.bare, b.bare);
+        assert_eq!(a.permission_mode, b.permission_mode);
+    }
+
     // ---------------- subprocess via stub `claude` shim ---------------
 
     /// Build a stub claude binary that emits a fixed JSON blob and
@@ -572,6 +587,32 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let err = runner.run("hello", repo.path()).await.unwrap_err();
         assert!(matches!(err, ClaudeCodeError::Spawn(_)));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_with_zero_exit_but_malformed_output_returns_parse_error() {
+        // The (Err(parse), true) branch in `run`: subprocess exits 0
+        // but stdout doesn't parse as the expected JSON shape. We
+        // surface a `ParseOutput` so the caller sees the upstream
+        // contract violation rather than a silent zero-token success.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude");
+        std::fs::write(
+            &path,
+            "#!/usr/bin/env bash\nprintf '%s' 'this is not json'\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let runner = ClaudeCodeRunner::new().with_claude_bin(&path);
+        let repo = tempfile::tempdir().unwrap();
+        let err = runner.run("hello", repo.path()).await.unwrap_err();
+        assert!(matches!(err, ClaudeCodeError::ParseOutput(_)));
     }
 
     #[tokio::test]
