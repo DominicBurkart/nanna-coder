@@ -614,9 +614,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_framed_initialize_returns_content_length_response() {
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"}}}"}"#;
-        // The body above has a stray trailing `"` — use a clean one:
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"}}}"}"#;
         let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
         let bytes = make_server()
             .process_framed(body)
