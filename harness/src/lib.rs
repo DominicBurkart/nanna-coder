@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auth;
 pub mod container;
 pub mod entities;
 pub mod eval;
