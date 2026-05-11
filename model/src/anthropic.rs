@@ -257,9 +257,7 @@ impl AnthropicProvider {
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                let delay = std::time::Duration::from_millis(
-                    last_retry_delay_ms(attempt)
-                );
+                let delay = std::time::Duration::from_millis(last_retry_delay_ms(attempt));
                 warn!(
                     "Retrying request in {:?} (attempt {}/{})",
                     delay, attempt, self.config.max_retries
@@ -303,18 +301,13 @@ impl AnthropicProvider {
                     .and_then(|h| h.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                 {
-                    // Override the default delay with the server-specified value
-                    let _retry_delay_override = retry_after_secs * 1000;
                     last_error = Some(ModelError::RateLimit);
-                    // Sleep immediately with the server-specified delay then continue
                     tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
-                    // Reset attempt counter delay — already slept
-                    // We skip the delay at the top of the next loop iteration via continue
-                    // by re-checking: next iteration attempt > 0 so delay runs again.
-                    // Instead: push the full response handling and continue.
                     continue;
                 }
-                last_error = Some(if status_u16 == 429 { ModelError::RateLimit } else {
+                last_error = Some(if status_u16 == 429 {
+                    ModelError::RateLimit
+                } else {
                     ModelError::ServiceUnavailable {
                         message: format!("Anthropic API returned {}", status_u16),
                     }
@@ -767,9 +760,19 @@ mod tests {
         let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
         let result = AnthropicProvider::tools_to_anthropic(&tools, true);
 
-        assert!(result[0].get("cache_control").is_none(), "first tool should not have cache_control");
-        assert!(result[1].get("cache_control").is_none(), "middle tool should not have cache_control");
-        assert_eq!(result[2]["cache_control"]["type"], "ephemeral", "last tool should have cache_control");
+        assert!(
+            result[0].get("cache_control").is_none(),
+            "first tool should not have cache_control"
+        );
+        assert!(
+            result[1].get("cache_control").is_none(),
+            "middle tool should not have cache_control"
+        );
+        assert_eq!(
+            result[2]["cache_control"]["type"],
+            "ephemeral",
+            "last tool should have cache_control"
+        );
 
         // Caching disabled: no markers.
         let result_no_cache = AnthropicProvider::tools_to_anthropic(&tools, false);
