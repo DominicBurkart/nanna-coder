@@ -1242,4 +1242,323 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    // ---------------------------------------------------------------------
+    // Invariant-focused tests for the metrics + alerting subsystem.
+    //
+    // These cover behaviours that the existing happy-path tests in this
+    // module skip over: latency-percentile ordering, error-rate accounting,
+    // alert lifecycle (history + ack of unknown ids), reset semantics, and
+    // health-status classification. Each test asserts an invariant rather
+    // than a fixed-snapshot value, so a regression that breaks the ordering
+    // or the accounting will be caught regardless of input shape.
+    // ---------------------------------------------------------------------
+
+    /// Invariant: for any non-empty latency sample, the calculated metrics
+    /// satisfy `min <= avg <= max`, `min <= p95 <= max`, and `p95 <= p99`.
+    /// Also: `request_count` matches the input length.
+    #[tokio::test]
+    async fn latency_percentiles_are_ordered_for_non_empty_input() {
+        let collector = DefaultMetricsCollector::new();
+        // Mixed samples — deliberately unsorted to exercise the internal sort.
+        let samples_ms = [50_u64, 1, 100, 10, 500, 25, 9_999, 7, 200, 3];
+        let latencies: Vec<Duration> = samples_ms.iter().map(|&m| Duration::from_millis(m)).collect();
+
+        let metrics = collector.calculate_latency_metrics(&latencies);
+
+        assert_eq!(metrics.request_count, samples_ms.len() as u64);
+        assert_eq!(metrics.min_latency_ms, 1.0);
+        assert_eq!(metrics.max_latency_ms, 9_999.0);
+        assert!(
+            metrics.min_latency_ms <= metrics.avg_latency_ms,
+            "min ({}) > avg ({})",
+            metrics.min_latency_ms,
+            metrics.avg_latency_ms
+        );
+        assert!(
+            metrics.avg_latency_ms <= metrics.max_latency_ms,
+            "avg ({}) > max ({})",
+            metrics.avg_latency_ms,
+            metrics.max_latency_ms
+        );
+        assert!(
+            metrics.min_latency_ms <= metrics.p95_latency_ms
+                && metrics.p95_latency_ms <= metrics.max_latency_ms,
+            "p95 ({}) outside [min, max]",
+            metrics.p95_latency_ms
+        );
+        assert!(
+            metrics.p95_latency_ms <= metrics.p99_latency_ms,
+            "p95 ({}) > p99 ({})",
+            metrics.p95_latency_ms,
+            metrics.p99_latency_ms
+        );
+    }
+
+    /// Invariant: empty latency input yields all-zero metrics — never NaN
+    /// (which would poison downstream serialization / threshold checks).
+    #[tokio::test]
+    async fn latency_percentiles_zero_for_empty_input() {
+        let collector = DefaultMetricsCollector::new();
+        let m = collector.calculate_latency_metrics(&[]);
+        assert_eq!(m.request_count, 0);
+        assert_eq!(m.avg_latency_ms, 0.0);
+        assert_eq!(m.p95_latency_ms, 0.0);
+        assert_eq!(m.p99_latency_ms, 0.0);
+        assert_eq!(m.min_latency_ms, 0.0);
+        assert_eq!(m.max_latency_ms, 0.0);
+        assert_eq!(m.requests_per_second, 0.0);
+        assert!(!m.avg_latency_ms.is_nan());
+    }
+
+    /// Invariant: cache hit_rate == hits / (hits + misses); == 0.0 when no
+    /// traffic has been recorded (rather than NaN from 0/0).
+    #[tokio::test]
+    async fn cache_hit_rate_matches_hits_over_total() {
+        let mut collector = DefaultMetricsCollector::new();
+        // Empty case first.
+        let m0 = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m0.cache_metrics.hit_rate, 0.0);
+        assert!(!m0.cache_metrics.hit_rate.is_nan());
+
+        for _ in 0..3 {
+            collector.record_cache_hit("k").await;
+        }
+        for _ in 0..7 {
+            collector.record_cache_miss("k").await;
+        }
+
+        let m = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m.cache_metrics.hits, 3);
+        assert_eq!(m.cache_metrics.misses, 7);
+        assert!((m.cache_metrics.hit_rate - 0.3).abs() < 1e-9);
+    }
+
+    /// Invariants on error accounting:
+    /// * `total_errors` equals the number of `record_error` calls,
+    /// * `errors_by_type` counts sum to `total_errors`,
+    /// * `recent_errors` is capped at 10 and ordered most-recent-first,
+    /// * `error_rate` == total_errors / total_requests.
+    #[tokio::test]
+    async fn error_accounting_is_internally_consistent() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        // 8 timeouts + 5 io errors = 13 total, capped at 10 in recent_errors.
+        for i in 0..8 {
+            collector
+                .record_error(ErrorEvent {
+                    timestamp: Utc::now(),
+                    error_type: "timeout".to_string(),
+                    message: format!("t-{i}"),
+                    component: "ollama".to_string(),
+                    severity: ErrorSeverity::Warning,
+                })
+                .await;
+        }
+        for i in 0..5 {
+            collector
+                .record_error(ErrorEvent {
+                    timestamp: Utc::now(),
+                    error_type: "io".to_string(),
+                    message: format!("io-{i}"),
+                    component: "fs".to_string(),
+                    severity: ErrorSeverity::Error,
+                })
+                .await;
+        }
+
+        // 4 latency samples => 4 "requests" for the rate denominator.
+        for ms in [10_u64, 20, 30, 40] {
+            collector
+                .record_request_latency("svc", Duration::from_millis(ms))
+                .await;
+        }
+
+        let m = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m.error_metrics.total_errors, 13);
+        let by_type_sum: u64 = m.error_metrics.errors_by_type.values().sum();
+        assert_eq!(by_type_sum, m.error_metrics.total_errors);
+        assert_eq!(m.error_metrics.errors_by_type.get("timeout"), Some(&8));
+        assert_eq!(m.error_metrics.errors_by_type.get("io"), Some(&5));
+
+        // Recent errors capped at 10 and ordered most-recent-first: the
+        // last io error we pushed must be at index 0.
+        assert_eq!(m.error_metrics.recent_errors.len(), 10);
+        assert_eq!(m.error_metrics.recent_errors[0].error_type, "io");
+        assert_eq!(m.error_metrics.recent_errors[0].message, "io-4");
+
+        // error_rate = 13 errors / 4 requests
+        assert!((m.error_metrics.error_rate - (13.0 / 4.0)).abs() < 1e-9);
+    }
+
+    /// Invariant: `reset_metrics` clears latencies, cache counters, errors,
+    /// and model metrics — not just a subset.
+    #[tokio::test]
+    async fn reset_metrics_clears_all_state() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+        collector.record_cache_hit("k").await;
+        collector.record_cache_miss("k").await;
+        collector
+            .record_error(ErrorEvent {
+                timestamp: Utc::now(),
+                error_type: "boom".to_string(),
+                message: "x".to_string(),
+                component: "c".to_string(),
+                severity: ErrorSeverity::Error,
+            })
+            .await;
+
+        collector.reset_metrics().await;
+
+        let m = collector.get_current_metrics().await.unwrap();
+        assert!(m.request_latencies.is_empty());
+        assert_eq!(m.cache_metrics.hits, 0);
+        assert_eq!(m.cache_metrics.misses, 0);
+        assert_eq!(m.cache_metrics.hit_rate, 0.0);
+        assert_eq!(m.error_metrics.total_errors, 0);
+        assert!(m.error_metrics.errors_by_type.is_empty());
+        assert!(m.error_metrics.recent_errors.is_empty());
+    }
+
+    /// Invariant: alert ids are unique across `send_alert` calls within a
+    /// single manager (so the counter actually advances).
+    #[tokio::test]
+    async fn alert_ids_are_unique_per_manager() {
+        let manager = DefaultAlertManager::new();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = manager
+                .send_alert(&format!("title-{i}"), "desc", AlertSeverity::Info)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate alert ids: {ids:?}");
+    }
+
+    /// Invariant: acknowledging an unknown alert id returns
+    /// `AlertSendFailed`, never silently succeeds. Acked alerts disappear
+    /// from `get_active_alerts` but remain in `get_alert_history`.
+    #[tokio::test]
+    async fn alert_lifecycle_history_and_ack_errors() {
+        let manager = DefaultAlertManager::new();
+
+        // Ack of a never-existed id must error.
+        let bogus = manager.acknowledge_alert("nope").await;
+        assert!(bogus.is_err(), "ack of unknown id should fail");
+
+        // Send three alerts, ack the middle one.
+        let id_a = manager
+            .send_alert("a", "1", AlertSeverity::Info)
+            .await
+            .unwrap();
+        let id_b = manager
+            .send_alert("b", "2", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        let id_c = manager
+            .send_alert("c", "3", AlertSeverity::Error)
+            .await
+            .unwrap();
+        manager.acknowledge_alert(&id_b).await.unwrap();
+
+        let active = manager.get_active_alerts().await.unwrap();
+        let active_ids: Vec<_> = active.iter().map(|a| a.id.as_str()).collect();
+        assert!(active_ids.contains(&id_a.as_str()));
+        assert!(active_ids.contains(&id_c.as_str()));
+        assert!(!active_ids.contains(&id_b.as_str()));
+
+        // History keeps acked alerts; limit caps the result; ordering is
+        // most-recent-first (the last alert we sent appears first).
+        let hist_all = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(hist_all.len(), 3);
+        assert_eq!(hist_all[0].id, id_c);
+
+        let hist_one = manager.get_alert_history(1).await.unwrap();
+        assert_eq!(hist_one.len(), 1);
+        assert_eq!(hist_one[0].id, id_c);
+    }
+
+    /// Invariant: `HealthStatus::is_healthy` and
+    /// `HealthStatus::requires_attention` partition the variants — every
+    /// variant is in exactly one bucket (or in neither, for `Unknown`).
+    /// Specifically: `Healthy` => is_healthy && !requires_attention,
+    /// `Warning|Degraded|Unhealthy` => requires_attention && !is_healthy,
+    /// `Unknown` => neither.
+    #[test]
+    fn health_status_classification_is_partitioned() {
+        for status in [
+            HealthStatus::Healthy,
+            HealthStatus::Warning,
+            HealthStatus::Degraded,
+            HealthStatus::Unhealthy,
+            HealthStatus::Unknown,
+        ] {
+            let healthy = status.is_healthy();
+            let attention = status.requires_attention();
+            assert!(
+                !(healthy && attention),
+                "{status:?} is both healthy and requires_attention"
+            );
+            match status {
+                HealthStatus::Healthy => assert!(healthy && !attention),
+                HealthStatus::Warning | HealthStatus::Degraded | HealthStatus::Unhealthy => {
+                    assert!(!healthy && attention, "{status:?} should require attention")
+                }
+                HealthStatus::Unknown => assert!(!healthy && !attention),
+            }
+        }
+    }
+
+    /// Invariant: Prometheus export emits the `# HELP` / `# TYPE` headers
+    /// and the `cache_hits_total` counter value reflects the recorded hits.
+    /// JSON export round-trips into a `SystemMetrics` value.
+    #[tokio::test]
+    async fn prometheus_and_json_exports_reflect_recorded_state() {
+        let mut collector = DefaultMetricsCollector::new();
+        for _ in 0..4 {
+            collector.record_cache_hit("k").await;
+        }
+        collector.record_cache_miss("k").await;
+        collector
+            .record_request_latency("svc", Duration::from_millis(10))
+            .await;
+
+        let prom = collector
+            .export_metrics(MetricsFormat::Prometheus)
+            .await
+            .unwrap();
+        assert!(prom.contains("# HELP cache_hits_total"));
+        assert!(prom.contains("# TYPE cache_hits_total counter"));
+        assert!(
+            prom.contains("cache_hits_total 4"),
+            "expected counter==4, got:\n{prom}"
+        );
+        assert!(prom.contains("# HELP cache_hit_rate"));
+
+        let json = collector.export_metrics(MetricsFormat::Json).await.unwrap();
+        let parsed: SystemMetrics = serde_json::from_str(&json).expect("JSON export round-trips");
+        assert_eq!(parsed.cache_metrics.hits, 4);
+        assert_eq!(parsed.cache_metrics.misses, 1);
+    }
+
+    /// Invariant: the `Custom` metrics format is explicitly unsupported —
+    /// it must fail rather than silently fall back to JSON.
+    #[tokio::test]
+    async fn custom_metrics_format_is_rejected() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("yaml".to_string()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(MonitoringError::MetricsCollectionFailed { .. })
+        ));
+    }
 }

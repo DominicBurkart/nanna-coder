@@ -1,28 +1,27 @@
 # Agent Evaluation Patterns
 
-## Overview
-
-This document describes the comprehensive agent evaluation framework for testing the full nanna-coder agent system with all running subcontainers.
+Agent evaluation framework for the nanna-coder system. Implementation:
+[`harness/src/agent/eval.rs`](../harness/src/agent/eval.rs).
 
 ## Architecture
 
-The evaluation framework operates at three distinct levels:
+Three evaluation levels:
 
-### Level 1: Unit Evaluations
+### Level 1: Unit evaluations
 Tests individual agent components in isolation:
 - State transitions (Planning → Deciding → Performing → Checking)
 - RAG query quality and relevance scoring
 - Entity creation and modification
 - Decision-making logic
 
-### Level 2: Integration Evaluations
+### Level 2: Integration evaluations
 Tests interaction between agent subsystems:
 - Complete agent control loop execution
 - LLM-agent interaction patterns
 - Multi-entity workflow coordination
 - Entity relationship management
 
-### Level 3: System Evaluations
+### Level 3: System evaluations
 Tests the full containerized system:
 - Model provider integration (Ollama/vLLM)
 - Observability and telemetry collection
@@ -284,40 +283,27 @@ cargo run --bin evaluate-agent -- \
 5. **Multi-Model Comparison**: Evaluate same scenarios across different LLMs
 6. **Distributed Evaluation**: Run evaluations across multiple containers in parallel
 
-## Best Practices
+## Best practices
 
-1. **Start Simple**: Begin with unit-level scenarios before system-level tests
-2. **Incremental Thresholds**: Gradually increase quality thresholds as agent improves
-3. **Document Failures**: When scenarios fail, document why and adjust expectations
-4. **Version Scenarios**: Track scenario definitions alongside code changes
-5. **Monitor Trends**: Watch for metric degradation over time
-6. **Test Edge Cases**: Include scenarios for error handling and boundary conditions
+1. Start with unit-level scenarios before system-level tests.
+2. Raise quality thresholds gradually as the agent improves.
+3. When a scenario fails, document why and adjust expectations.
+4. Version scenarios alongside code changes.
+5. Watch for metric degradation over time.
+6. Cover error handling and boundary conditions explicitly.
 
 ## Troubleshooting
 
-### Evaluation Timeouts
-- Increase `timeout` in `EvaluationConfig`
-- Check container startup time
-- Verify model availability
+| Symptom | Try |
+|---------|-----|
+| Evaluation timeout | Increase `timeout` in `EvaluationConfig`; verify container startup + model availability |
+| Low decision quality | Check `max_iterations`; review state transitions in logs; compare expected vs. actual final state |
+| Low RAG relevance | Verify entity content matches query terms; confirm initial entities created; review RAG query impl |
+| Observability errors | Initialize tracing subscriber once; set `collect_observability: false` for simple tests; check metric-collection permissions |
 
-### Low Decision Quality
-- Check `max_iterations` - may be too restrictive
-- Review agent state transitions in logs
-- Examine expected vs. actual final state
+## Related
 
-### Low RAG Relevance
-- Verify entity content matches query terms
-- Check that initial entities are created properly
-- Review RAG query implementation
-
-### Observability Errors
-- Ensure tracing subscriber is initialized only once
-- Set `collect_observability: false` for simple tests
-- Check system permissions for metric collection
-
-## Related Documentation
-
-- [AGENTS.md](../AGENTS.md) - Agent control flow architecture
-- [ARCHITECTURE.md](../ARCHITECTURE.md) - System architecture overview
-- [TESTING.md](../TESTING.md) - General testing strategy
-- [harness/src/agent/eval.rs](../harness/src/agent/eval.rs) - Implementation
+- [../AGENTS.md](../AGENTS.md) — agent control flow
+- [../ARCHITECTURE.md](../ARCHITECTURE.md) — system architecture
+- [../TESTING.md](../TESTING.md) — testing strategy
+- [`harness/src/agent/eval.rs`](../harness/src/agent/eval.rs) — implementation

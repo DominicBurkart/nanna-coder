@@ -31,7 +31,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 /// Cap on the number of bytes read from an AGENTS.md / CLAUDE.md file.
 ///
@@ -155,6 +155,45 @@ pub fn format_system_prompt_fragment(doc: &AgentsMdDoc) -> String {
         doc.source.filename(),
         doc.body.trim_end()
     )
+}
+
+/// Default system prompt used when no repo-level guidance is found.
+///
+/// Single source of truth for both the interactive `agent` CLI session and the
+/// background task-dispatch path (`crate::task`).
+pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
+
+/// Build a system prompt for an agent run rooted at `workspace_root`.
+///
+/// Starts from [`DEFAULT_AGENT_SYSTEM_PROMPT`] and appends any repo-level
+/// guidance discovered by [`load`] (`AGENTS.md` preferred, `CLAUDE.md`
+/// fallback; see #231). Missing files produce no injection. Read errors are
+/// logged and swallowed so a broken guidance file never blocks an agent from
+/// starting.
+pub fn build_system_prompt(workspace_root: &Path) -> String {
+    match load(workspace_root) {
+        Ok(Some(doc)) => {
+            info!(
+                path = %doc.path.display(),
+                source = doc.source.filename(),
+                truncated = doc.truncated,
+                "Loaded repo-level agent guidance into system prompt"
+            );
+            format!(
+                "{}\n\n{}",
+                DEFAULT_AGENT_SYSTEM_PROMPT,
+                format_system_prompt_fragment(&doc)
+            )
+        }
+        Ok(None) => DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to read AGENTS.md / CLAUDE.md; continuing without repo guidance"
+            );
+            DEFAULT_AGENT_SYSTEM_PROMPT.to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +349,52 @@ mod tests {
 
         let err = load(dir.path()).expect_err("symlink loop must surface as error");
         assert_ne!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn build_system_prompt_no_guidance_returns_default() {
+        ensure_tracing_subscriber();
+        let dir = tempdir().unwrap();
+        let prompt = build_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_AGENT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn build_system_prompt_appends_agents_md() {
+        ensure_tracing_subscriber();
+        let dir = tempdir().unwrap();
+        write_file(
+            dir.path(),
+            AGENTS_MD_FILENAME,
+            b"# Repo rules\nUse nextest.\n",
+        );
+        let prompt = build_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_AGENT_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
+        assert!(prompt.contains("Use nextest."));
+        assert!(prompt.contains("</repo-guidance>"));
+    }
+
+    #[test]
+    fn build_system_prompt_appends_claude_md_fallback() {
+        ensure_tracing_subscriber();
+        let dir = tempdir().unwrap();
+        write_file(dir.path(), CLAUDE_MD_FILENAME, b"legacy rules");
+        let prompt = build_system_prompt(dir.path());
+        assert!(prompt.starts_with(DEFAULT_AGENT_SYSTEM_PROMPT));
+        assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
+        assert!(prompt.contains("legacy rules"));
+    }
+
+    #[test]
+    fn build_system_prompt_swallows_read_errors() {
+        // Non-UTF8 AGENTS.md makes the loader return Err; the builder must log
+        // and fall back to the default rather than propagate.
+        ensure_tracing_subscriber();
+        let dir = tempdir().unwrap();
+        write_file(dir.path(), AGENTS_MD_FILENAME, &[0x48u8, 0xFFu8, 0x49u8]);
+        let prompt = build_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_AGENT_SYSTEM_PROMPT);
     }
 
     #[test]
