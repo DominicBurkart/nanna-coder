@@ -515,6 +515,10 @@ async fn run_agent_subprocess(
 
     let report = AgentRunReport::read_from_path(&report_path)
         .map_err(|e| EvalRunnerError::SubprocessNoOutput(report_path.clone(), e.to_string()))?;
+    // Remove the report from work_dir before capture_swebench_patch runs
+    // `git add -A`; leaving it would include this harness artefact in the
+    // SWE-bench patch. `let _` silently tolerates races / already-missing.
+    let _ = std::fs::remove_file(&report_path);
     Ok(Ok(AgentOutcome::Subprocess(report)))
 }
 
@@ -1659,9 +1663,13 @@ tags = ["{tag}"]
             .failures
             .iter()
             .any(|f| f.contains("verifier skipped")));
+        let patch = result.swebench_patch.as_deref().expect("swebench_patch");
+        // Regression guard: the harness's report JSON must not appear in
+        // the captured SWE-bench patch — leaving it would pollute the
+        // diff submitted to the upstream verifier.
         assert!(
-            result.swebench_patch.is_some(),
-            "swebench branch should populate swebench_patch"
+            !patch.contains("__nanna_agent_report"),
+            "swebench_patch leaked the report JSON file:\n{patch}"
         );
         // Iteration count from the fake report.
         assert_eq!(result.iterations, 2);
