@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 /// Integration-level unit tests for `model::judge`.
 ///
 /// All tests here are pure (no network / no Ollama) and use an in-process
@@ -6,6 +5,7 @@ use async_trait::async_trait;
 /// The goal is to exercise every observable behaviour of the types and the two
 /// public pure functions (`calculate_coherence_score`,
 /// `calculate_relevance_score`) without touching any LLM.
+use async_trait::async_trait;
 use model::judge::{
     calculate_coherence_score, calculate_relevance_score, JudgeConfig, ModelJudge,
     ValidationCriteria, ValidationMetrics, ValidationResult,
