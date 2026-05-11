@@ -3,6 +3,7 @@ use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
+use harness::ui::{AnimationPolicy, MoonSpinner, SpinnerAwareMakeWriter};
 use model::prelude::*;
 use std::io::{self, Write};
 use tracing::{error, info};
@@ -16,6 +17,11 @@ use tracing::{error, info};
 #[command(name = "harness")]
 #[command(about = "A CLI tool for interacting with language models")]
 struct Cli {
+    /// Disable the moon-phase loading animation.  Also off when stderr is
+    /// piped, `TERM=dumb`, `NO_COLOR` is set, or the subcommand is `mcp-serve`.
+    #[arg(long, global = true)]
+    no_animation: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -88,11 +94,19 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install a spinner-aware writer so that tracing log lines do not
+    // splatter on top of an in-progress moon-phase frame on stderr.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(SpinnerAwareMakeWriter::new())
         .init();
 
     let cli = Cli::parse();
+
+    // Resolve the animation policy once at startup.  Hard-off when serving
+    // MCP because the parent may capture stderr alongside stdout.
+    let mcp_mode = matches!(cli.command, Commands::McpServe { .. });
+    let policy = AnimationPolicy::resolve(cli.no_animation, mcp_mode);
 
     let config = OllamaConfig::default();
     let provider = OllamaProvider::new(config)?;
@@ -117,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &initial_prompt,
                     tools,
                     temperature,
+                    policy,
                 )
                 .await?;
             } else {
@@ -127,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tools,
                     temperature,
                     entity_store,
+                    policy,
                 )
                 .await?;
             }
@@ -154,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                policy,
             )
             .await?;
         }
@@ -300,6 +317,7 @@ async fn single_chat(
     prompt: &str,
     enable_tools: bool,
     temperature: f32,
+    policy: AnimationPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut messages = vec![ChatMessage::user(prompt)];
 
@@ -311,7 +329,10 @@ async fn single_chat(
             request = request.with_tools(tool_definitions);
         }
 
-        let response = provider.chat(request).await?;
+        let response = {
+            let _g = MoonSpinner::start(format!("calling {model}"), policy);
+            provider.chat(request).await?
+        };
         let choice = &response.choices[0];
 
         if let Some(content) = &choice.message.content {
@@ -326,13 +347,17 @@ async fn single_chat(
                     tool_call.function.name, tool_call.function.arguments
                 );
 
-                match tool_registry
-                    .execute(
-                        &tool_call.function.name,
-                        tool_call.function.arguments.clone(),
-                    )
-                    .await
-                {
+                let exec_result = {
+                    let _g =
+                        MoonSpinner::start(format!("running {}", tool_call.function.name), policy);
+                    tool_registry
+                        .execute(
+                            &tool_call.function.name,
+                            tool_call.function.arguments.clone(),
+                        )
+                        .await
+                };
+                match exec_result {
                     Ok(result) => {
                         println!("  Result: {}", result);
                         messages.push(choice.message.clone());
@@ -368,6 +393,7 @@ async fn interactive_chat<S: EntityStore + Send>(
     enable_tools: bool,
     temperature: f32,
     entity_store: S,
+    policy: AnimationPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entity_count = entity_store
         .query(&harness::entities::EntityQuery::default())
@@ -409,7 +435,10 @@ async fn interactive_chat<S: EntityStore + Send>(
                 request = request.with_tools(tool_definitions);
             }
 
-            let response = provider.chat(request).await?;
+            let response = {
+                let _g = MoonSpinner::start(format!("calling {model}"), policy);
+                provider.chat(request).await?
+            };
             let choice = &response.choices[0];
 
             if let Some(content) = &choice.message.content {
@@ -424,13 +453,19 @@ async fn interactive_chat<S: EntityStore + Send>(
                         tool_call.function.name, tool_call.function.arguments
                     );
 
-                    match tool_registry
-                        .execute(
-                            &tool_call.function.name,
-                            tool_call.function.arguments.clone(),
-                        )
-                        .await
-                    {
+                    let exec_result = {
+                        let _g = MoonSpinner::start(
+                            format!("running {}", tool_call.function.name),
+                            policy,
+                        );
+                        tool_registry
+                            .execute(
+                                &tool_call.function.name,
+                                tool_call.function.arguments.clone(),
+                            )
+                            .await
+                    };
+                    match exec_result {
                         Ok(result) => {
                             println!("  -> {}", result);
                             messages.push(choice.message.clone());
@@ -562,6 +597,7 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    policy: AnimationPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
     use std::sync::Arc;
@@ -575,6 +611,7 @@ async fn run_agent(
         verbose,
         system_prompt: build_session_system_prompt(workspace_root),
         model_name: model.to_string(),
+        animation_policy: policy,
     };
 
     let context = AgentContext {
@@ -597,7 +634,10 @@ async fn run_agent(
         AgentLoop::with_llm(agent_config, entity_store, provider)
     };
 
-    let result = agent.run(context).await?;
+    let result = {
+        let _g = MoonSpinner::start(format!("agent: {model}"), policy);
+        agent.run(context).await?
+    };
 
     println!("\n--- Agent Result ---");
     println!("Completed: {}", result.task_completed);

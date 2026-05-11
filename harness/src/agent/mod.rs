@@ -187,6 +187,10 @@ pub struct AgentConfig {
     pub verbose: bool,
     pub system_prompt: String,
     pub model_name: String,
+    /// How the moon-phase spinner should behave when this agent awaits
+    /// long-running work.  Defaults to [`crate::ui::AnimationPolicy::Off`] so
+    /// non-CLI callers (tests, MCP server) never accidentally render.
+    pub animation_policy: crate::ui::AnimationPolicy,
 }
 
 impl Default for AgentConfig {
@@ -196,6 +200,7 @@ impl Default for AgentConfig {
             verbose: false,
             system_prompt: String::new(),
             model_name: DEFAULT_MODEL.to_string(),
+            animation_policy: crate::ui::AnimationPolicy::Off,
         }
     }
 }
@@ -597,6 +602,16 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         let judge_config = JudgeConfig::default();
 
         for attempt in 0..judge_config.max_retries {
+            // Per-attempt spinner so the user can see the retry delay and the
+            // actual chat await as separate animations.  Nested-spinner
+            // protection inside `MoonSpinner::start` keeps this safe even if
+            // an outer scope already owns one.
+            let label = if attempt == 0 {
+                format!("llm {operation}")
+            } else {
+                format!("llm {operation} (retry {attempt})")
+            };
+            let _attempt_guard = crate::ui::MoonSpinner::start(label, self.config.animation_policy);
             match provider.chat(request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
@@ -611,6 +626,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                                 e
                             );
                         }
+                        // Drop the attempt guard before sleeping so the
+                        // spinner frame does not hold a stale attempt label.
+                        drop(_attempt_guard);
                         tokio::time::sleep(delay).await;
                     } else {
                         return Err(bare_state_error(format!(
@@ -983,9 +1001,15 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 None => return Err(self.enrich_error(bare_state_error("No provider configured"))),
             };
 
-            let response = provider.chat(request).await.map_err(|e| {
-                self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
-            })?;
+            let response = {
+                let _g = crate::ui::MoonSpinner::start(
+                    format!("llm {}", self.config.model_name),
+                    self.config.animation_policy,
+                );
+                provider.chat(request).await.map_err(|e| {
+                    self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
+                })?
+            };
 
             if response.choices.is_empty() {
                 return Err(self.enrich_error(bare_state_error("Empty response from model")));
@@ -1068,9 +1092,15 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 Some(r) => r,
                 None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
             };
-            let response_content = match registry.execute(&name, args).await {
-                Ok(v) => v.to_string(),
-                Err(e) => format!("Error: {}", e),
+            let response_content = {
+                let _g = crate::ui::MoonSpinner::start(
+                    format!("running {name}"),
+                    self.config.animation_policy,
+                );
+                match registry.execute(&name, args).await {
+                    Ok(v) => v.to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
             };
             self.conversation_history
                 .push(ChatMessage::tool_response(call_id, response_content));

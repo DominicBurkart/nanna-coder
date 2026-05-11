@@ -1477,6 +1477,7 @@ async fn test_agent_loop_tool_call_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -1545,6 +1546,7 @@ async fn test_agent_loop_multi_tool_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -1603,6 +1605,7 @@ async fn test_agent_loop_error_recovery_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -1658,6 +1661,7 @@ async fn test_context_entity_stored_after_agent_run() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -1803,6 +1807,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         verbose: true,
         system_prompt: "You are a helpful assistant. Use the echo tool when asked to echo something. After using the tool, respond with a brief summary.".to_string(),
         model_name: E2E_MODEL.to_string(),
+    animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -2172,6 +2177,7 @@ async fn test_state_machine_follows_architecture_with_tools() {
         verbose: true,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -2247,6 +2253,7 @@ async fn test_state_machine_query_loop() {
         verbose: true,
         system_prompt: String::new(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {
@@ -2303,6 +2310,7 @@ async fn test_state_machine_multi_perform_iterations() {
         verbose: true,
         system_prompt: String::new(),
         model_name: "test-model".to_string(),
+        animation_policy: harness::ui::AnimationPolicy::Off,
     };
 
     let context = AgentContext {

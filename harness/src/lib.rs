@@ -9,6 +9,7 @@ pub mod onboarding;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
+pub mod ui;
 pub mod workspace;
 
 pub use container::{

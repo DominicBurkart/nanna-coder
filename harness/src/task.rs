@@ -408,6 +408,7 @@ impl TaskManager {
                         verbose: false,
                         system_prompt: build_task_system_prompt(&workspace.workspace_path),
                         model_name: model.clone(),
+                        animation_policy: crate::ui::AnimationPolicy::Off,
                     };
                     let context = AgentContext {
                         user_prompt: description.clone(),

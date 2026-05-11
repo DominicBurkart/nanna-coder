@@ -240,6 +240,7 @@ pub async fn run_eval(
         verbose: config.verbose,
         system_prompt: String::new(),
         model_name: config.model_name.clone(),
+        animation_policy: crate::ui::AnimationPolicy::Off,
     };
 
     let tool_registry = create_tool_registry(work_dir);
