@@ -17,9 +17,9 @@ use model::types::{
 use std::collections::HashMap;
 use std::time::Duration;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // Minimal mock that satisfies both ModelProvider and ModelJudge
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 struct MockModelJudge {
     config: JudgeConfig,
@@ -145,9 +145,9 @@ impl ModelJudge for MockModelJudge {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // calculate_coherence_score
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn coherence_empty_string_is_zero() {
@@ -217,25 +217,27 @@ fn coherence_high_word_variety_boosts_score() {
 
 #[test]
 fn coherence_very_long_text_does_not_get_length_bonus() {
-    // Texts outside [50, 5000] chars lose the length bonus. Build something
-    // just over 5000 chars and compare to the same text truncated to < 5000.
-    let base = "word ".repeat(1100); // ~5500 chars
-    let short = "word ".repeat(900); // ~4500 chars
-    let long_score = calculate_coherence_score(&base);
+    // The length bonus (+0.10) only applies to text in the range (50, 5000) chars.
+    // Build two texts with identical word-variety (all the same word) so that
+    // only the length signal differs.  The long text (> 5000 chars) must not
+    // score more than 0.05 above the short text (< 5000 chars) — a tolerance
+    // narrower than the 0.10 bonus itself, which would fire if the cap is removed.
+    let short = "word ".repeat(900);  // ~4500 chars — inside the bonus range
+    let long  = "word ".repeat(1100); // ~5500 chars — outside the bonus range
     let short_score = calculate_coherence_score(&short);
-    // Both scores are valid floats in [0,1]; the long one should not be higher
-    // due to the length penalty.
+    let long_score  = calculate_coherence_score(&long);
     assert!(
-        long_score <= short_score + 0.15,
-        "long text score ({}) should not greatly exceed short text score ({})",
+        long_score <= short_score + 0.05,
+        "long text score ({}) must not exceed short text score ({}) by more than 0.05 \
+         (tolerance is intentionally narrower than the 0.10 length bonus)",
         long_score,
         short_score
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // calculate_relevance_score
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 fn default_criteria_no_keywords() -> ValidationCriteria {
     ValidationCriteria {
@@ -405,9 +407,9 @@ fn relevance_prompt_term_overlap_boosts_score() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // ValidationCriteria
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn criteria_default_has_sensible_values() {
@@ -454,9 +456,9 @@ fn criteria_with_forbidden_keywords_replaces_list() {
     assert_eq!(c.forbidden_keywords, kw);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // ValidationResult helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 fn make_success() -> ValidationResult {
     ValidationResult::Success {
@@ -538,14 +540,24 @@ fn result_metrics_some_for_failure_with_metrics() {
 
 #[test]
 fn result_display_contains_variant_marker() {
-    assert!(format!("{}", make_success()).contains("SUCCESS"));
+    // Assert on the full emoji+word token so a regression that drops the emoji
+    // is caught (the existing in-module test already checks "\u{2705} SUCCESS").
+    assert!(format!("{}", make_success()).contains("\u{2705} SUCCESS"));
+    assert!(format!("{}", make_failure()).contains("\u{274c} FAILURE"));
+    // WARNING uses a multi-codepoint sequence; assert on the label+colon form
+    // that the Display impl emits.
     assert!(format!("{}", make_warning()).contains("WARNING"));
-    assert!(format!("{}", make_failure()).contains("FAILURE"));
+    let warning_str = format!("{}", make_warning());
+    assert!(
+        warning_str.contains('\u{26a0}'),
+        "WARNING display should contain the warning emoji (\u{26a0}), got: {}",
+        warning_str
+    );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // ValidationMetrics
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn metrics_default_has_zero_duration_and_no_optionals() {
@@ -604,7 +616,14 @@ fn metrics_display_includes_all_populated_fields() {
         custom_metrics: HashMap::new(),
     };
     let s = format!("{}", m);
-    assert!(s.contains("500ms"), "expected duration, got: {}", s);
+    // Duration::Debug format is not stable across Rust versions ("500ms" vs "0.5s").
+    // Verify the duration field is present by checking the numeric millis value.
+    assert!(
+        s.contains(&m.duration.as_millis().to_string()),
+        "expected duration millis ({}) in display, got: {}",
+        m.duration.as_millis(),
+        s
+    );
     assert!(s.contains("retries: 2"), "expected retries, got: {}", s);
     assert!(s.contains("length: 100"), "expected length, got: {}", s);
     assert!(
@@ -635,9 +654,9 @@ fn metrics_display_omits_zero_retry_count() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // JudgeConfig
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn config_defaults_are_correct() {
@@ -711,6 +730,31 @@ fn config_retry_delay_is_capped_at_max_delay() {
     );
 }
 
+/// Regression test: attempt >= 32 previously caused u32::pow to panic in debug
+/// or silently overflow in release.  With the fix (saturating u64 arithmetic)
+/// the result must simply be capped at max_delay_ms without any panic.
+#[test]
+fn config_retry_delay_large_attempt_does_not_overflow() {
+    let c = JudgeConfig {
+        jitter_factor: 0.0,
+        base_delay_ms: 100,
+        max_delay_ms: 5000,
+        ..JudgeConfig::default()
+    };
+
+    // All values >= 32 are saturated to max_delay_ms.
+    for attempt in [32_u32, 33, 63, 64, 100, u32::MAX] {
+        let delay = c.calculate_retry_delay(attempt);
+        assert_eq!(
+            delay,
+            Duration::from_millis(5000),
+            "attempt={}: expected cap at max_delay_ms, got {:?}",
+            attempt,
+            delay
+        );
+    }
+}
+
 #[test]
 fn config_retry_delay_with_jitter_is_at_least_base() {
     let c = JudgeConfig {
@@ -720,21 +764,29 @@ fn config_retry_delay_with_jitter_is_at_least_base() {
         ..JudgeConfig::default()
     };
 
-    // Jitter only adds, never subtracts, so the delay must be >= the no-jitter value.
-    let no_jitter = Duration::from_millis(100); // attempt 0 without jitter
+    // Jitter range for attempt 0 is 0.0..=0.5 of the base delay (100ms),
+    // so the result must be in [100ms, 150ms].  The lower bound confirms jitter
+    // is additive-only; the upper bound confirms the jitter factor is respected.
+    let no_jitter = Duration::from_millis(100);
+    let max_jitter = Duration::from_millis(150); // 100ms + 50% of 100ms
     for _ in 0..20 {
         let d = c.calculate_retry_delay(0);
         assert!(
             d >= no_jitter,
-            "jitter must not reduce the delay below the base, got {:?}",
+            "jitter must not reduce the delay below base, got {:?}",
+            d
+        );
+        assert!(
+            d <= max_jitter,
+            "jitter must not exceed base + jitter_factor * base = 150ms, got {:?}",
             d
         );
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 // validate_comprehensive – via MockModelJudge
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn comprehensive_with_no_tools_and_no_prompts_returns_two_results() {
@@ -862,13 +914,17 @@ async fn comprehensive_failure_injection_preserved_in_results() {
         .await
         .expect("validate_comprehensive itself should not Err");
 
+    // Index 0 = responsiveness (always the first call in validate_comprehensive).
+    // Index 1 = quality       (always the second call).
+    // This positional coupling is intentional: if the call order in
+    // validate_comprehensive changes, these assertions must be updated too.
     assert!(
         results[0].is_failure(),
-        "first result should be the injected failure"
+        "index 0 (responsiveness) should be the injected failure"
     );
     assert!(
         results[1].is_success(),
-        "second result (quality) should still be success"
+        "index 1 (quality) should still be success"
     );
 }
 
@@ -937,9 +993,47 @@ async fn comprehensive_mixed_pass_fail_results_are_ordered_correctly() {
     assert!(results[1].is_failure(), "index 1 should be quality failure");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+/// Exercises the Err-to-Failure conversion path inside validate_comprehensive.
+/// When a sub-validator returns Err (because the corresponding field is None),
+/// validate_comprehensive must convert it into a ValidationResult::Failure and
+/// continue rather than propagating the error.
+#[tokio::test]
+async fn comprehensive_converts_model_err_into_failure_result() {
+    // responsiveness_result = None => validate_api_responsiveness returns Err
+    // quality_result        = Some => validate_response_quality returns Ok
+    let judge = MockModelJudge {
+        config: JudgeConfig::default(),
+        responsiveness_result: None, // triggers ModelError::Unknown
+        quality_result: Some(ValidationResult::Success {
+            message: "ok".into(),
+            metrics: ValidationMetrics::default(),
+        }),
+        tool_result: None,
+        consistency_result: None,
+    };
+
+    let results = judge
+        .validate_comprehensive(Duration::from_secs(1), &ValidationCriteria::default(), &[], &[], 1)
+        .await
+        .expect("validate_comprehensive should not propagate Err");
+
+    // Only two sub-calls are made (responsiveness + quality; no tools, no prompts).
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].is_failure(),
+        "ModelError from responsiveness should become Failure, got {:?}",
+        results[0]
+    );
+    assert!(
+        results[1].is_success(),
+        "quality Ok should remain Success, got {:?}",
+        results[1]
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
 // MockModelJudge – cover previously-uncovered code paths
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────
 
 /// Calling list_models and health_check on the mock exercises those
 /// ModelProvider method bodies (previously uncovered).
