@@ -1632,7 +1632,7 @@ mod tests {
         );
 
         println!(
-            "✅ MVP Test passed: Agent completed control loop with {} git entities",
+            "\u{2705} MVP Test passed: Agent completed control loop with {} git entities",
             git_entities.len()
         );
     }
@@ -1832,7 +1832,7 @@ mod tests {
         assert!(agent.plan_cache.is_some(), "LLM should have created a plan");
 
         println!(
-            "✅ LLM Agent Test passed with plan: {:?}",
+            "\u{2705} LLM Agent Test passed with plan: {:?}",
             agent.plan_cache.as_ref().unwrap()
         );
     }
@@ -1878,7 +1878,7 @@ mod tests {
             "MVP mode should not populate plan_cache"
         );
 
-        println!("✅ MVP mode backward compatibility verified");
+        println!("\u{2705} MVP mode backward compatibility verified");
     }
 
     #[tokio::test]
@@ -1923,7 +1923,7 @@ mod tests {
         assert!(run_result.task_completed, "Task should complete");
         assert_eq!(run_result.final_state, AgentState::Completed);
 
-        println!("✅ Agent loop with Ollama and tools completed successfully");
+        println!("\u{2705} Agent loop with Ollama and tools completed successfully");
         println!(
             "   Conversation history: {} messages",
             agent.conversation_history.len()
