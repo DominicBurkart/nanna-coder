@@ -53,7 +53,7 @@ flowchart TD
 
 # API
 
-The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface.
+The harness exposes seven CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, `health`, and `swe-bench-report`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface. The `swe-bench-report` subcommand is an offline utility that renders a Markdown report from a SWE-bench JSON results file (optionally comparing two runs); it does not start a server or talk to a model.
 
 The six MCP tools form a complete task-delegation surface:
 
@@ -78,6 +78,7 @@ flowchart LR
         models
         tools
         health
+        swebenchreport["swe-bench-report"]
     end
     subgraph MCP["MCP (stdio, via mcp-serve)"]
         assign_task
@@ -90,7 +91,7 @@ flowchart LR
     mcpserve --> MCP
     classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,mcpserve,models,tools,health cli
+    class chat,agent,mcpserve,models,tools,health,swebenchreport cli
     class assign_task,poll_task,get_result,list_tasks,cancel_task,onboard_repo mcp
 ```
 
