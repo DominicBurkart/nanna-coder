@@ -169,8 +169,10 @@ jobs:
           echo "⚠️ Skipping cargo audit due to CVSS 4.0 incompatibility"
           echo "⚠️ Skipping cargo deny due to CVSS 4.0 incompatibility"
           # Increased timeout from 600s to 1800s (30 min) to accommodate E2E containerized tests
-          # which run slower under tarpaulin instrumentation
-          nix develop --command cargo tarpaulin --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800 --all-features
+          # which run slower under tarpaulin instrumentation. `--all-features` ensures
+          # feature-gated modules (e.g. `model::anthropic`) are compiled and exercised
+          # so codecov sees their tests; otherwise their diff coverage reads as 0%.
+          nix develop --command cargo tarpaulin --workspace --all-features --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
