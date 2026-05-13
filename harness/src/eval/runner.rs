@@ -3185,10 +3185,31 @@ timeout_secs = 5
 
     #[test]
     #[serial_test::serial(nanna_swebench_dataset_env)]
-    fn test_resolve_swebench_dataset_path_errs_when_case_dir_has_no_parent_evals_root() {
-        // case_dir has only two ancestors (the file path "foo" → cases_dir
-        // "", evals_dir = None). The second `.ok_or_else(...)?` must fire,
-        // producing SwebenchDatasetMissing rather than a Some(dataset).
+    fn test_resolve_swebench_dataset_path_errs_on_root_case_dir_with_no_parents() {
+        // ancestors("/") yields a single entry then None. After
+        // `anc.next()` (the skip), the FIRST `.next().ok_or_else(...)?`
+        // must fire and produce SwebenchDatasetMissing.
+        let key = "NANNA_SWEBENCH_DATASET";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        let case_dir = Path::new("/");
+        let config = EvalRunnerConfig::default();
+        let err = resolve_swebench_dataset_path(case_dir, &config).unwrap_err();
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match err {
+            EvalRunnerError::SwebenchDatasetMissing(_) => {}
+            other => panic!("expected SwebenchDatasetMissing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_swebench_dataset_env)]
+    fn test_resolve_swebench_dataset_path_errs_on_two_component_case_dir() {
+        // ancestors("foo") yields ["foo", ""] then None. The SECOND
+        // `.next().ok_or_else(...)?` (using cases_dir = "") must fire.
         let key = "NANNA_SWEBENCH_DATASET";
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
