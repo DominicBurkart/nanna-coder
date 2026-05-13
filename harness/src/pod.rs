@@ -23,6 +23,10 @@ pub struct EnsureConfig {
     pub disabled: bool,
     pub probe_url: String,
     pub health_wait_budget: Duration,
+    /// Sleep between health-probes during `wait_for_ollama`. Production
+    /// uses 2s; tests pass shorter durations so the sleep arm of the loop
+    /// is exercised without making the suite slow.
+    pub health_wait_interval: Duration,
     /// Optional override of the working directory used to look for
     /// `flake.nix`. Defaults to the process cwd when `None`. Tests use this
     /// to assert the flake-presence guard without mutating global state.
@@ -35,6 +39,7 @@ impl Default for EnsureConfig {
             disabled: false,
             probe_url: OLLAMA_PROBE_URL.to_string(),
             health_wait_budget: HEALTH_WAIT_BUDGET,
+            health_wait_interval: HEALTH_WAIT_INTERVAL,
             flake_lookup_dir: None,
         }
     }
@@ -154,7 +159,7 @@ fn bring_up_command(flake_lookup_dir: &Path) -> Option<(String, Vec<String>)> {
     None
 }
 
-async fn wait_for_ollama(url: &str, budget: Duration) -> Result<(), PodError> {
+async fn wait_for_ollama(url: &str, budget: Duration, interval: Duration) -> Result<(), PodError> {
     let start = Instant::now();
     loop {
         if probe_ollama(url).await {
@@ -166,7 +171,7 @@ async fn wait_for_ollama(url: &str, budget: Duration) -> Result<(), PodError> {
                 budget,
             });
         }
-        tokio::time::sleep(HEALTH_WAIT_INTERVAL).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -237,7 +242,12 @@ async fn ensure_running_inner(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    wait_for_ollama(&cfg.probe_url, cfg.health_wait_budget).await?;
+    wait_for_ollama(
+        &cfg.probe_url,
+        cfg.health_wait_budget,
+        cfg.health_wait_interval,
+    )
+    .await?;
     info!("pod ensure: ollama healthy at {}", cfg.probe_url);
     Ok(EnsureOutcome::BroughtUp)
 }
@@ -435,7 +445,7 @@ mod tests {
     async fn wait_for_ollama_returns_ok_immediately_when_probe_succeeds() {
         // Cover wait_for_ollama's success-return branch (`return Ok(())`).
         let url = start_ok_http_server().await;
-        let r = wait_for_ollama(&url, Duration::from_secs(2)).await;
+        let r = wait_for_ollama(&url, Duration::from_secs(2), Duration::from_millis(10)).await;
         assert!(r.is_ok(), "wait_for_ollama against ok server should be Ok");
     }
 
@@ -475,8 +485,12 @@ mod tests {
         // Sub-budget timeout against a guaranteed-unreachable endpoint
         // should produce HealthTimeout, not block forever.
         let started = Instant::now();
-        let result =
-            wait_for_ollama("http://127.0.0.1:1/api/tags", Duration::from_millis(50)).await;
+        let result = wait_for_ollama(
+            "http://127.0.0.1:1/api/tags",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .await;
         let elapsed = started.elapsed();
         match result {
             Err(PodError::HealthTimeout { .. }) => {}
@@ -608,10 +622,82 @@ mod tests {
         url
     }
 
+    /// Counting HTTP server: returns `503 Service Unavailable` for the
+    /// first `fail_count` accepted connections, then `200 OK` afterwards.
+    /// Lets tests drive a deterministic "probe fails, then succeeds" cycle
+    /// without relying on race-y socket-bind timing.
+    async fn start_counting_http_server(fail_count: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/api/tags", addr);
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let c = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let resp = if n < fail_count {
+                        b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n" as &[u8]
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+                    };
+                    let _ = socket.write_all(resp).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
     #[tokio::test]
     async fn probe_ollama_returns_true_against_local_ok_server() {
         let url = start_ok_http_server().await;
         assert!(probe_ollama(&url).await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    async fn ensure_running_inner_brings_up_and_health_succeeds_after_sleep() {
+        // Drive the post-bring-up success path with a server that returns
+        // 503 for the first 2 probes (one inside ensure_running_inner, one
+        // first iteration of wait_for_ollama → triggers the sleep arm),
+        // then 200 thereafter. Validates lines: bring-up branch entry,
+        // sleep tick in wait_for_ollama, info!/Ok(BroughtUp) finalisation.
+        let true_bin = match which::which("true") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("`true` not on PATH; skipping bring-up sleep test");
+                return;
+            }
+        };
+        let url = start_counting_http_server(2).await;
+        let no_flake_dir = std::env::temp_dir().join("nanna_pod_no_flake_bring_up_sleep");
+        let cfg = EnsureConfig {
+            probe_url: url,
+            health_wait_budget: Duration::from_secs(5),
+            health_wait_interval: Duration::from_millis(20),
+            flake_lookup_dir: Some(no_flake_dir),
+            ..EnsureConfig::default()
+        };
+        let key = "NANNA_TEST_BRING_UP_CMD";
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, true_bin.as_os_str());
+        let result = ensure_running_inner(&cfg, false).await;
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match result {
+            Ok(EnsureOutcome::BroughtUp) => {}
+            other => panic!("expected BroughtUp after sleep cycle, got {:?}", other),
+        }
     }
 
     #[tokio::test]
