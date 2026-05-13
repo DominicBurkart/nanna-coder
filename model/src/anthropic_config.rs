@@ -32,7 +32,7 @@ impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
             api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             timeout: Duration::from_secs(120),
             max_retries: 3,
@@ -115,7 +115,7 @@ mod tests {
     fn test_config_builder() {
         let config = AnthropicConfig::new()
             .with_api_key("sk-test-key")
-            .with_model("claude-sonnet-4-6")
+            .with_model("claude-sonnet-4-5")
             .with_base_url("https://api.anthropic.com")
             .with_timeout(Duration::from_secs(60))
             .with_max_retries(5)
@@ -123,7 +123,7 @@ mod tests {
             .with_prompt_caching(false);
 
         assert_eq!(config.api_key, "sk-test-key");
-        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.model, "claude-sonnet-4-5");
         assert_eq!(config.base_url, "https://api.anthropic.com");
         assert_eq!(config.timeout, Duration::from_secs(60));
         assert_eq!(config.max_retries, 5);
@@ -136,7 +136,7 @@ mod tests {
     fn test_config_from_env() {
         // Default reads from env; without the env var set, api_key will be empty
         let config = AnthropicConfig::default();
-        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.model, "claude-sonnet-4-5");
         assert_eq!(config.base_url, "https://api.anthropic.com");
         assert_eq!(config.timeout, Duration::from_secs(120));
         assert_eq!(config.max_retries, 3);

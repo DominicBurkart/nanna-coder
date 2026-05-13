@@ -254,9 +254,12 @@ impl AnthropicProvider {
     async fn send_with_retry(&self, payload: &Value) -> ModelResult<AnthropicRawResponse> {
         let url = format!("{}/v1/messages", self.config.base_url);
         let mut last_error: Option<ModelError> = None;
+        // When a Retry-After sleep was already performed inside the loop body,
+        // skip the top-of-loop jitter sleep to avoid double-sleeping.
+        let mut skip_initial_delay = false;
 
         for attempt in 0..=self.config.max_retries {
-            if attempt > 0 {
+            if attempt > 0 && !skip_initial_delay {
                 let delay = std::time::Duration::from_millis(last_retry_delay_ms(attempt));
                 warn!(
                     "Retrying request in {:?} (attempt {}/{})",
@@ -264,6 +267,7 @@ impl AnthropicProvider {
                 );
                 tokio::time::sleep(delay).await;
             }
+            skip_initial_delay = false;
 
             let mut req = self
                 .http_client
@@ -302,7 +306,14 @@ impl AnthropicProvider {
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     last_error = Some(ModelError::RateLimit);
+                    warn!(
+                        "Honoring Retry-After: sleeping {}s (attempt {}/{})",
+                        retry_after_secs, attempt, self.config.max_retries
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+                    // Signal the next iteration to skip its own delay since we
+                    // already slept here.
+                    skip_initial_delay = true;
                     continue;
                 }
                 last_error = Some(if status_u16 == 429 {
@@ -388,10 +399,21 @@ struct ContentBlock {
     input: Option<Value>,
 }
 
+/// Usage counts returned by the Anthropic API.
+/// When prompt caching is active, `cache_creation_input_tokens` and
+/// `cache_read_input_tokens` reflect the tokens written to / read from the
+/// cache on this request. Both fields default to 0 when absent (i.e. when
+/// caching is disabled or the cache was not hit/populated).
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Tokens written to the prompt cache on this request (cache miss path).
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    /// Tokens read from the prompt cache on this request (cache hit path).
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 #[async_trait]
@@ -448,6 +470,13 @@ impl ModelProvider for AnthropicProvider {
 
         let raw = self.send_with_retry(&payload).await?;
 
+        if raw.usage.cache_read_input_tokens > 0 || raw.usage.cache_creation_input_tokens > 0 {
+            debug!(
+                "Anthropic cache usage: {} read tokens, {} creation tokens",
+                raw.usage.cache_read_input_tokens, raw.usage.cache_creation_input_tokens
+            );
+        }
+
         info!("Anthropic chat request completed successfully");
 
         Self::parse_response(raw)
@@ -462,15 +491,15 @@ impl ModelProvider for AnthropicProvider {
         debug!("Listing known Anthropic models");
 
         let models = vec![
-            // Claude 4 series
+            // Claude 4 series — unversioned aliases (always point to latest patch)
             ModelInfo {
-                name: "claude-opus-4-7".to_string(),
+                name: "claude-opus-4-5".to_string(),
                 size: None,
                 digest: None,
                 modified_at: None,
             },
             ModelInfo {
-                name: "claude-sonnet-4-6".to_string(),
+                name: "claude-sonnet-4-5".to_string(),
                 size: None,
                 digest: None,
                 modified_at: None,
@@ -795,6 +824,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 8,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         };
 
@@ -832,6 +863,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 15,
                 output_tokens: 25,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         };
 
@@ -868,6 +901,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         };
 
@@ -877,6 +912,34 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn test_parse_response_cache_tokens_deserialized() {
+        // Verify that cache token counts are deserialized correctly when present
+        // (as they will be on every agent-loop response when caching is active).
+        let json = serde_json::json!({
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "cache_creation_input_tokens": 2048,
+            "cache_read_input_tokens": 1900
+        });
+        let usage: AnthropicUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cache_creation_input_tokens, 2048);
+        assert_eq!(usage.cache_read_input_tokens, 1900);
+    }
+
+    #[test]
+    fn test_parse_response_cache_tokens_default_when_absent() {
+        // When the fields are absent (caching disabled or cold start),
+        // they should default to 0 rather than failing deserialization.
+        let json = serde_json::json!({
+            "input_tokens": 50,
+            "output_tokens": 10
+        });
+        let usage: AnthropicUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
     }
 
     #[test]
@@ -908,7 +971,7 @@ mod tests {
     fn test_config_from_env() {
         let config = AnthropicConfig::default();
         // Without ANTHROPIC_API_KEY set, it defaults to empty string
-        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.model, "claude-sonnet-4-5");
         assert_eq!(config.base_url, "https://api.anthropic.com");
     }
 
@@ -994,9 +1057,9 @@ mod tests {
         let models = provider.list_models().await.unwrap();
         assert!(!models.is_empty());
         assert!(models.iter().any(|m| m.name.contains("claude")));
-        // Verify current-generation models are present
-        assert!(models.iter().any(|m| m.name == "claude-sonnet-4-6"));
-        assert!(models.iter().any(|m| m.name == "claude-opus-4-7"));
+        // Verify current-generation models are present using valid Anthropic alias IDs
+        assert!(models.iter().any(|m| m.name == "claude-sonnet-4-5"));
+        assert!(models.iter().any(|m| m.name == "claude-opus-4-5"));
         assert!(models.iter().any(|m| m.name == "claude-haiku-4-5-20251001"));
     }
 
