@@ -299,6 +299,40 @@ fn build_provider_arc(
     Ok(gateway.build_provider()?)
 }
 
+fn generate_swebench_report(
+    input: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+    compare: Option<&std::path::Path>,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), Box<dyn std::error::Error>> {
+    use harness::eval::swebench_report::SweBenchReport;
+    use harness::eval::swebench_results::SweBenchRunResult;
+
+    let json = std::fs::read_to_string(input)?;
+    let run_result: SweBenchRunResult = serde_json::from_str(&json)?;
+
+    let owned_default;
+    let base_dir: &std::path::Path = match output_dir {
+        Some(p) => p,
+        None => {
+            owned_default = std::env::current_dir()?.join("results");
+            owned_default.as_path()
+        }
+    };
+
+    let report = SweBenchReport::new("SWE-bench Report", run_result);
+    let report_path = report.write_to_directory(base_dir)?;
+
+    let comparison_path = if let Some(compare_path) = compare {
+        let compare_json = std::fs::read_to_string(compare_path)?;
+        let compare_result: SweBenchRunResult = serde_json::from_str(&compare_json)?;
+        Some(report.write_comparison_to_directory(&compare_result, base_dir)?)
+    } else {
+        None
+    };
+
+    Ok((report_path, comparison_path))
+}
+
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     harness::tools::create_tool_registry(workspace_root)
 }
@@ -590,11 +624,11 @@ async fn health_check(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::e
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. {} is running and accessible.", name);
+            println!("\u{2713} Health check passed. {} is running and accessible.", name);
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
