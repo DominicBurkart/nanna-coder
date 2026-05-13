@@ -82,9 +82,8 @@ impl AgentRunReport {
     }
 
     pub fn write_to_path(&self, path: &Path) -> io::Result<()> {
-        let json = self
-            .to_json_pretty()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string_pretty(self)
+            .expect("AgentRunReport: standard-type DTO cannot fail to serialize");
         std::fs::write(path, json)
     }
 

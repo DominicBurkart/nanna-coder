@@ -43,14 +43,16 @@ impl Default for EnsureConfig {
 impl EnsureConfig {
     /// Honour `--no-ensure-pod` and `NANNA_NO_ENSURE_POD=1`.
     pub fn from_env_and_flag(no_ensure_pod_flag: bool) -> Self {
-        let env_disabled = std::env::var("NANNA_NO_ENSURE_POD")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let env_disabled = parse_env_disabled(std::env::var("NANNA_NO_ENSURE_POD").ok().as_deref());
         Self {
             disabled: no_ensure_pod_flag || env_disabled,
             ..Self::default()
         }
     }
+}
+
+fn parse_env_disabled(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,18 +96,18 @@ pub enum PodError {
     NoBringUpCommand { url: String },
 }
 
+/// Detect whether the current process is running inside a container, given
+/// the set of marker file paths and the env-var presence flag. Pure helper
+/// for testability; production callers pass [`/run/.containerenv`,
+/// `/.dockerenv`] and `std::env::var_os("container").is_some()`.
+fn is_inside_container_from_signals(marker_paths: &[&Path], container_env_set: bool) -> bool {
+    marker_paths.iter().any(|p| p.exists()) || container_env_set
+}
+
 /// Detect whether the current process is running inside a container.
 fn is_inside_container() -> bool {
-    if Path::new("/run/.containerenv").exists() {
-        return true;
-    }
-    if Path::new("/.dockerenv").exists() {
-        return true;
-    }
-    if std::env::var_os("container").is_some() {
-        return true;
-    }
-    false
+    let markers: [&Path; 2] = [Path::new("/run/.containerenv"), Path::new("/.dockerenv")];
+    is_inside_container_from_signals(&markers, std::env::var_os("container").is_some())
 }
 
 /// Probe Ollama's `/api/tags` endpoint with a short timeout.
@@ -113,18 +115,12 @@ fn is_inside_container() -> bool {
 /// `async` so the surrounding `ensure_running` does not block the Tokio
 /// executor. Uses the `reqwest` async client.
 async fn probe_ollama(url: &str) -> bool {
-    let client = match reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    match client.get(url).send().await {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
-    }
+        .expect("reqwest::Client::builder() with default rustls cannot fail here");
+    matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
 /// Choose a bring-up command. Prefer `nix run .#start-pod` *only when a
@@ -233,6 +229,44 @@ mod tests {
     fn config_flag_disables() {
         let cfg = EnsureConfig::from_env_and_flag(true);
         assert!(cfg.disabled);
+    }
+
+    #[test]
+    fn parse_env_disabled_matches_documented_truthy_values() {
+        assert!(parse_env_disabled(Some("1")));
+        assert!(parse_env_disabled(Some("true")));
+        assert!(parse_env_disabled(Some("TRUE")));
+        assert!(parse_env_disabled(Some("True")));
+        assert!(!parse_env_disabled(Some("0")));
+        assert!(!parse_env_disabled(Some("")));
+        assert!(!parse_env_disabled(Some("yes")));
+        assert!(!parse_env_disabled(None));
+    }
+
+    #[test]
+    fn is_inside_container_from_signals_returns_false_when_no_signals() {
+        assert!(!is_inside_container_from_signals(&[], false));
+    }
+
+    #[test]
+    fn is_inside_container_from_signals_true_when_marker_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("containerenv");
+        std::fs::write(&marker, "").unwrap();
+        assert!(is_inside_container_from_signals(&[&marker], false));
+    }
+
+    #[test]
+    fn is_inside_container_from_signals_true_when_env_flag_set() {
+        // No marker files exist, but env_set=true is sufficient.
+        let nowhere = std::env::temp_dir().join("nanna_pod_test_definitely_no_marker_xyz");
+        assert!(is_inside_container_from_signals(&[&nowhere], true));
+    }
+
+    #[test]
+    fn is_inside_container_from_signals_false_when_only_missing_marker() {
+        let nowhere = std::env::temp_dir().join("nanna_pod_test_definitely_no_marker_xyz_2");
+        assert!(!is_inside_container_from_signals(&[&nowhere], false));
     }
 
     #[tokio::test]

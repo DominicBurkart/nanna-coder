@@ -146,12 +146,15 @@ pub struct EvalRunnerConfig {
     pub swebench_skip_verify: bool,
 }
 
+fn default_run_id_from(now: std::time::SystemTime) -> String {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("nanna-{}", d.as_secs()))
+        .unwrap_or_else(|_| "nanna-run".to_string())
+}
+
 impl Default for EvalRunnerConfig {
     fn default() -> Self {
-        let run_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| format!("nanna-{}", d.as_secs()))
-            .unwrap_or_else(|_| "nanna-run".to_string());
+        let run_id = default_run_id_from(std::time::SystemTime::now());
         Self {
             model_name: "qwen3:0.6b".to_string(),
             model_base_url: None,
@@ -3161,6 +3164,45 @@ timeout_secs = 5
         let mut case = sample_eval_case();
         case.metadata.tags = vec!["other".to_string()];
         assert!(!is_swebench_case(&case));
+    }
+
+    #[test]
+    fn default_run_id_from_post_epoch_uses_seconds_format() {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let id = default_run_id_from(when);
+        assert_eq!(id, "nanna-1700000000");
+    }
+
+    #[test]
+    fn default_run_id_from_pre_epoch_falls_back_to_static_string() {
+        // SystemTime::duration_since(UNIX_EPOCH) returns Err iff the
+        // supplied time is *before* UNIX_EPOCH. Forge a pre-epoch instant
+        // and assert we land on the documented fallback rather than panicking.
+        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let id = default_run_id_from(pre_epoch);
+        assert_eq!(id, "nanna-run");
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_swebench_dataset_env)]
+    fn test_resolve_swebench_dataset_path_errs_when_case_dir_has_no_parent_evals_root() {
+        // case_dir has only two ancestors (the file path "foo" → cases_dir
+        // "", evals_dir = None). The second `.ok_or_else(...)?` must fire,
+        // producing SwebenchDatasetMissing rather than a Some(dataset).
+        let key = "NANNA_SWEBENCH_DATASET";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        let case_dir = Path::new("foo");
+        let config = EvalRunnerConfig::default();
+        let err = resolve_swebench_dataset_path(case_dir, &config).unwrap_err();
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match err {
+            EvalRunnerError::SwebenchDatasetMissing(_) => {}
+            other => panic!("expected SwebenchDatasetMissing, got {:?}", other),
+        }
     }
 
     #[test]
