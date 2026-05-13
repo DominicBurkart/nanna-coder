@@ -103,11 +103,8 @@ impl NannaMcpServer {
             // within a single message is not supported; a malformed
             // `Content-Length` header terminates the connection rather than
             // silently desyncing.
-            let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
-            if trimmed_hdr
-                .to_ascii_lowercase()
-                .starts_with("content-length:")
-            {
+            let trimmed_hdr = line.trim_end_matches(['\'r', '\'n']);
+            if trimmed_hdr.to_ascii_lowercase().starts_with("content-length:") {
                 let content_length: usize = match trimmed_hdr
                     .split_once(':')
                     .and_then(|(_, v)| v.trim().parse::<usize>().ok())
@@ -128,7 +125,7 @@ impl NannaMcpServer {
                     if n == 0 {
                         return Ok(());
                     }
-                    if line.trim_end_matches(['\r', '\n']).is_empty() {
+                    if line.trim_end_matches(['\'r', '\'n']).is_empty() {
                         break;
                     }
                 }

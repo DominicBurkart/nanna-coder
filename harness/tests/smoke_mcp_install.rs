@@ -62,7 +62,7 @@ fn send_and_recv(
     // Parse Content-Length from response header. A missing or malformed header
     // is a framing bug — fail loudly rather than silently treating it as 0.
     let header_str =
-        String::from_utf8(header_bytes.clone()).expect("MCP response header is not valid UTF-8");
+        String::from_utf8(header_bytes).expect("MCP response header is not valid UTF-8");
     let content_length: usize = header_str
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
