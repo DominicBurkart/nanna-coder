@@ -138,9 +138,9 @@ let
         # Default model: ${model}
         MODEL="''${1:-${model}}"
         
-        echo "🚀 Starting vLLM server with model: $MODEL"
-        echo "📦 Using vllm/vllm-openai:latest"
-        echo "🌐 API will be available on http://localhost:8000"
+        echo "Starting vLLM server with model: $MODEL"
+        echo "Using vllm/vllm-openai:latest"
+        echo "API will be available on http://localhost:8000"
         echo ""
         
         # Check if using docker or podman
@@ -149,7 +149,7 @@ let
         elif command -v podman &> /dev/null; then
           CONTAINER_CMD=podman
         else
-          echo "❌ Error: Neither docker nor podman found"
+          echo "Error: Neither docker nor podman found"
           exit 1
         fi
         
@@ -165,10 +165,10 @@ let
           --trust-remote-code \
           ${lib.concatStringsSep " " extraArgs}
         
-        echo "✅ vLLM container started"
-        echo "📊 Monitor logs with: $CONTAINER_CMD logs -f nanna-coder-vllm"
-        echo "🔍 Check health: curl http://localhost:8000/health"
-        echo "📚 List models: curl http://localhost:8000/v1/models"
+        echo "vLLM container started"
+        echo "Monitor logs with: $CONTAINER_CMD logs -f nanna-coder-vllm"
+        echo "Check health: curl http://localhost:8000/health"
+        echo "List models: curl http://localhost:8000/v1/models"
       '';
     };
 
@@ -235,7 +235,7 @@ let
         nativeBuildInputs = with pkgs; [ ollama curl cacert ];
         # Development mode - no fixed hash
       } ''
-        echo "🔄 Creating development model stub for ${modelInfo.name}..."
+        echo "Creating development model stub for ${modelInfo.name}..."
         mkdir -p $out/models
         echo "${modelInfo.name}" > $out/models/model.info
         echo "Development mode - model will be downloaded on first use" > $out/models/README
@@ -260,7 +260,7 @@ let
           platforms = platforms.linux;
         };
       } ''
-      echo "🔄 Setting up ${modelInfo.name} model download (reproducible)..."
+      echo "Setting up ${modelInfo.name} model download (reproducible)..."
 
       # Create output directory structure
       mkdir -p $out/models
@@ -271,44 +271,44 @@ let
       export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
 
       # Start ollama server in isolated environment
-      echo "🚀 Starting temporary Ollama server..."
+      echo "Starting temporary Ollama server..."
       ollama serve > ollama.log 2>&1 &
       OLLAMA_PID=$!
 
       # Function to cleanup on exit
       cleanup() {
-        echo "🧹 Cleaning up Ollama server..."
+        echo "Cleaning up Ollama server..."
         kill $OLLAMA_PID 2>/dev/null || true
         wait $OLLAMA_PID 2>/dev/null || true
       }
       trap cleanup EXIT
 
       # Wait for ollama to be ready
-      echo "⏳ Waiting for Ollama server..."
+      echo "Waiting for Ollama server..."
       for i in {1..30}; do
         if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-          echo "✅ Ollama server ready"
+          echo "Ollama server ready"
           break
         fi
         sleep 2
         if [ $i -eq 30 ]; then
-          echo "❌ Ollama server failed to start"
+          echo "Ollama server failed to start"
           cat ollama.log
           exit 1
         fi
       done
 
       # Download the model
-      echo "📥 Downloading ${modelInfo.name} model (${modelInfo.size} - will be cached by hash)..."
+      echo "Downloading ${modelInfo.name} model (${modelInfo.size} - will be cached by hash)..."
       if ! ollama pull ${modelInfo.name}; then
-        echo "❌ Failed to download ${modelInfo.name}"
+        echo "Failed to download ${modelInfo.name}"
         cat ollama.log
         exit 1
       fi
 
       # Verify download
       if ! ollama list | grep -q "${modelInfo.name}"; then
-        echo "❌ Model verification failed"
+        echo "Model verification failed"
         ollama list
         exit 1
       fi
@@ -316,8 +316,8 @@ let
       # Stop ollama (cleanup will handle this too)
       cleanup
 
-      echo "✅ ${modelInfo.name} model cached at $out/models"
-      echo "📊 Model cache contents:"
+      echo "${modelInfo.name} model cached at $out/models"
+      echo "Model cache contents:"
       find $out/models -type f -exec ls -lh {} \; | head -5
     '';
 

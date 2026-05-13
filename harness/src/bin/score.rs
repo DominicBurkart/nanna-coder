@@ -282,7 +282,7 @@ async fn finalize(args: &Args, model: &str, run_id: &str) -> ExitCode {
         let verify_config = VerifyConfig {
             dataset_name: args.dataset_name.clone(),
             model_name_or_path: format!(
-                "{}__{}",
+                "{}_{}_",
                 args.category.as_str(),
                 sanitize_model_for_path(model)
             ),
