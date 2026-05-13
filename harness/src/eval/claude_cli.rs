@@ -281,8 +281,6 @@ fn parse_output(stdout: &str) -> Result<ClaudeCodeRun, ClaudeCodeError> {
         return Err(ClaudeCodeError::ParseOutput("empty stdout".to_string()));
     }
     let raw: RawOutput = serde_json::from_str(trimmed).map_err(|e| {
-        // Surface a useful error: the parse error + the first line of
-        // stdout so we can see what shape we got.
         let preview: String = trimmed.lines().take(3).collect::<Vec<_>>().join(" / ");
         ClaudeCodeError::ParseOutput(format!("{e}; stdout preview: {preview}"))
     })?;
@@ -301,10 +299,6 @@ fn parse_output(stdout: &str) -> Result<ClaudeCodeRun, ClaudeCodeError> {
         exit_status: 0,
     })
 }
-
-// -----------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -346,15 +340,11 @@ mod tests {
         let run = parse_output(json).unwrap();
         assert_eq!(run.cache_creation_input_tokens, 3);
         assert_eq!(run.cache_read_input_tokens, 100);
-        // total_tokens still tracks input+output only; cache fields are
-        // additional metadata, not double-counted.
         assert_eq!(run.total_tokens, 15);
     }
 
     #[test]
     fn parse_output_is_error_payload() {
-        // Budget-exceeded: Claude Code emits is_error=true with a
-        // result body explaining the failure.
         let json = r#"{
             "result": "Error: budget of $0.01 exceeded",
             "session_id": "abc-123",
@@ -370,8 +360,6 @@ mod tests {
 
     #[test]
     fn parse_output_tolerates_unknown_fields() {
-        // Future Claude Code releases may add fields; we should not
-        // break on them.
         let json = r#"{
             "result": "ok",
             "session_id": "x",
@@ -387,8 +375,6 @@ mod tests {
 
     #[test]
     fn parse_output_missing_usage_is_error() {
-        // `usage` is required; without it we cannot do scorecard
-        // accounting and must surface the failure.
         let json = r#"{ "result": "ok", "is_error": false }"#;
         let r = parse_output(json);
         assert!(matches!(r, Err(ClaudeCodeError::ParseOutput(_))));
@@ -410,14 +396,10 @@ mod tests {
         assert!(msg.contains("not json"));
     }
 
-    // ---------------- argv construction (no subprocess) ---------------
-
     #[test]
     fn build_args_default_runner_emits_expected_flags() {
         let r = ClaudeCodeRunner::new();
         let args = r.build_args("solve x", Path::new("/tmp/repo"));
-        // Sanity-check key flags. We don't golden-file the full vec to
-        // avoid brittleness — just confirm the contract.
         let joined: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -492,9 +474,6 @@ mod tests {
 
     #[test]
     fn default_matches_new() {
-        // `Default::default()` must produce the same baseline as
-        // `new()`. Test exists so both code paths are covered and so
-        // a future divergence between them is loud.
         let a = ClaudeCodeRunner::default();
         let b = ClaudeCodeRunner::new();
         assert_eq!(a.claude_bin, b.claude_bin);
@@ -505,14 +484,10 @@ mod tests {
         assert_eq!(a.permission_mode, b.permission_mode);
     }
 
-    // ---------------- subprocess via stub `claude` shim ---------------
-
-    /// Build a stub claude binary that emits a fixed JSON blob and
-    /// exits 0. Returns a temp dir whose `claude` script is on disk.
     fn stub_claude_emitting(json_blob: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
-        let escaped = json_blob.replace('\'', "'\\''");
+        let escaped = json_blob.replace('\'', "'\\''" );
         let script = format!("#!/usr/bin/env bash\nprintf '%s' '{}'\nexit 0\n", escaped);
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
@@ -524,11 +499,6 @@ mod tests {
         }
         dir
     }
-
-    // The four subprocess tests below must run sequentially: parallel
-    // `posix_spawn` calls inherit each other's writable fds to stub
-    // binaries, producing ETXTBSY when those still-open-for-write fds
-    // collide with a sibling's exec. Serialising avoids the race.
 
     #[tokio::test]
     #[cfg(unix)]
@@ -593,10 +563,6 @@ mod tests {
     #[cfg(unix)]
     #[serial_test::serial]
     async fn run_with_zero_exit_but_malformed_output_returns_parse_error() {
-        // The (Err(parse), true) branch in `run`: subprocess exits 0
-        // but stdout doesn't parse as the expected JSON shape. We
-        // surface a `ParseOutput` so the caller sees the upstream
-        // contract violation rather than a silent zero-token success.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
         std::fs::write(
@@ -619,14 +585,10 @@ mod tests {
     #[cfg(unix)]
     #[serial_test::serial]
     async fn run_with_is_error_payload_returns_ok_with_flag() {
-        // A non-zero exit *with* a parseable is_error payload (e.g.
-        // budget exceeded) is *not* a hard error from our caller's
-        // perspective — we want the partial token usage. Use a stub
-        // that prints the payload then exits 1.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
         let payload = r#"{"result":"budget exceeded","session_id":"x","usage":{"input_tokens":50,"output_tokens":0},"total_cost_usd":0.011,"is_error":true}"#;
-        let escaped = payload.replace('\'', "'\\''");
+        let escaped = payload.replace('\'', "'\\''" );
         std::fs::write(
             &path,
             format!("#!/usr/bin/env bash\nprintf '%s' '{}'\nexit 1\n", escaped),
