@@ -222,10 +222,10 @@ fn coherence_very_long_text_does_not_get_length_bonus() {
     // only the length signal differs.  The long text (> 5000 chars) must not
     // score more than 0.05 above the short text (< 5000 chars) — a tolerance
     // narrower than the 0.10 bonus itself, which would fire if the cap is removed.
-    let short = "word ".repeat(900);  // ~4500 chars — inside the bonus range
-    let long  = "word ".repeat(1100); // ~5500 chars — outside the bonus range
+    let short = "word ".repeat(900); // ~4500 chars — inside the bonus range
+    let long = "word ".repeat(1100); // ~5500 chars — outside the bonus range
     let short_score = calculate_coherence_score(&short);
-    let long_score  = calculate_coherence_score(&long);
+    let long_score = calculate_coherence_score(&long);
     assert!(
         long_score <= short_score + 0.05,
         "long text score ({}) must not exceed short text score ({}) by more than 0.05 \
@@ -1013,7 +1013,13 @@ async fn comprehensive_converts_model_err_into_failure_result() {
     };
 
     let results = judge
-        .validate_comprehensive(Duration::from_secs(1), &ValidationCriteria::default(), &[], &[], 1)
+        .validate_comprehensive(
+            Duration::from_secs(1),
+            &ValidationCriteria::default(),
+            &[],
+            &[],
+            1,
+        )
         .await
         .expect("validate_comprehensive should not propagate Err");
 
