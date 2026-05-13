@@ -1565,7 +1565,7 @@ JSON
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(nanna_harness_bin_env)]
+    #[serial_test::serial(nanna_harness_bin_env, nanna_swebench_dataset_env)]
     async fn run_eval_swebench_end_to_end_with_local_repo_and_fake_nanna() {
         // Cover run_eval's SWE-bench branch end-to-end without network: a
         // local bare git repo replaces the github.com clone, a shell-script
@@ -1979,7 +1979,7 @@ tags = ["{}"]
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial(nanna_harness_bin_env)]
+    #[serial_test::serial(nanna_harness_bin_env, nanna_swebench_dataset_env)]
     async fn run_eval_swebench_handles_subprocess_soft_error() {
         // Same harness as above, but the fake nanna exits non-zero. The
         // run_eval body should fall through to finish_swebench(None, ...)
@@ -3175,10 +3175,18 @@ timeout_secs = 5
     }
 
     #[test]
+    #[serial_test::serial(nanna_swebench_dataset_env)]
     fn test_resolve_swebench_dataset_path_default_layout() {
+        let key = "NANNA_SWEBENCH_DATASET";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
         let case_dir = Path::new("/tmp/evals/cases/swebench-x");
         let config = EvalRunnerConfig::default();
         let resolved = resolve_swebench_dataset_path(case_dir, &config).unwrap();
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
         assert_eq!(
             resolved,
             PathBuf::from("/tmp/evals/datasets/swebench-verified-sample.jsonl")
