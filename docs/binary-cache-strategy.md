@@ -1,6 +1,8 @@
 # Binary Cache Strategy for CI/CD
 
 > For the operational cache setup (keys, workflow wiring, troubleshooting), see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md). This document focuses on the high-level architecture and priorities.
+>
+> **Note:** The "Magic Nix Cache" tier referenced below is historical (deprecated Feb 2025). The project now uses Cachix only — see [cachix-migration.md](./cachix-migration.md).
 
 ## Overview
 
@@ -19,10 +21,9 @@ This document outlines the binary cache strategy used to optimize CI/CD performa
 │         - Persistent storage with configurable retention   │
 │         - Optimized for frequent access patterns           │
 ├─────────────────────────────────────────────────────────────┤
-│ Tier 2: Magic Nix Cache (GitHub Actions)                  │
-│         - Per-job temporary caching                        │
-│         - Automatic cache warming and optimization         │
-│         - Zero-configuration setup                         │
+│ Tier 2: Magic Nix Cache (historical, removed Feb 2025)    │
+│         - Was per-job temporary GitHub Actions caching     │
+│         - Replaced by Cachix-only setup                    │
 ├─────────────────────────────────────────────────────────────┤
 │ Tier 3: Local Development Cache                           │
 │         - Developer machine cache                          │
@@ -75,7 +76,7 @@ Each CI job includes:
 
 ```yaml
 - name: Configure Cachix (Binary Cache)
-  uses: cachix/cachix-action@v12
+  uses: cachix/cachix-action@v15
   with:
     name: nanna-coder
     authToken: ${{ secrets.CACHIX_AUTH }}

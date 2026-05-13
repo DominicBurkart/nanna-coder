@@ -79,10 +79,9 @@ ollama serve
 
 ### Running the Agent
 
-```bash
-# Enter development environment
-nix develop
+From inside `nix develop`:
 
+```bash
 # Run the agent with tools enabled (recommended)
 cargo run --bin harness -- agent --prompt "Your task description" --tools
 
