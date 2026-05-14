@@ -670,12 +670,12 @@ mod tests {
             instances: vec![SweBenchInstanceResult {
                 instance_id: "django__django-11099".to_string(),
                 resolved: true,
-                claude_token_usage: TokenUsage {
+                orchestrator_token_usage: TokenUsage {
                     prompt_tokens: 100,
                     completion_tokens: 50,
                     total_tokens: 150,
                 },
-                nanna_token_usage: None,
+                worker_token_usage: None,
                 wall_time_secs: 12.0,
                 error: None,
             }],
