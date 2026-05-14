@@ -1,10 +1,10 @@
-/// Integration-level unit tests for `model::judge`.
-///
-/// All tests here are pure (no network / no Ollama) and use an in-process
-/// `MockModelJudge` that implements `ModelJudge` by returning canned results.
-/// The goal is to exercise every observable behaviour of the types and the two
-/// public pure functions (`calculate_coherence_score`,
-/// `calculate_relevance_score`) without touching any LLM.
+//! Integration-level unit tests for `model::judge`.
+//!
+//! All tests here are pure (no network / no Ollama) and use an in-process
+//! `MockModelJudge` that implements `ModelJudge` by returning canned results.
+//! The goal is to exercise every observable behaviour of the types and the two
+//! public pure functions (`calculate_coherence_score`,
+//! `calculate_relevance_score`) without touching any LLM.
 use async_trait::async_trait;
 use model::judge::{
     calculate_coherence_score, calculate_relevance_score, JudgeConfig, ModelJudge,
@@ -544,13 +544,13 @@ fn result_display_contains_variant_marker() {
     // is caught (the existing in-module test already checks "\u{2705} SUCCESS").
     assert!(format!("{}", make_success()).contains("\u{2705} SUCCESS"));
     assert!(format!("{}", make_failure()).contains("\u{274c} FAILURE"));
-    // WARNING uses a multi-codepoint sequence; assert on the label+colon form
-    // that the Display impl emits.
-    assert!(format!("{}", make_warning()).contains("WARNING"));
+    // WARNING uses a multi-codepoint emoji sequence; assert on the exact compound
+    // token that the Display impl emits so the test catches regressions where
+    // the emoji is moved or dropped, and is consistent with SUCCESS/FAILURE above.
     let warning_str = format!("{}", make_warning());
     assert!(
-        warning_str.contains('\u{26a0}'),
-        "WARNING display should contain the warning emoji (\u{26a0}), got: {}",
+        warning_str.contains("\u{26a0}\u{fe0f}  WARNING"),
+        "WARNING display should contain '\u{26a0}\u{fe0f}  WARNING', got: {}",
         warning_str
     );
 }
@@ -616,11 +616,14 @@ fn metrics_display_includes_all_populated_fields() {
         custom_metrics: HashMap::new(),
     };
     let s = format!("{}", m);
-    // Duration::Debug format is not stable across Rust versions ("500ms" vs "0.5s").
-    // Verify the duration field is present by checking the numeric millis value.
+    // The Display impl uses `format!("duration: {:?}", self.duration)` which
+    // emits the label "duration: " followed by the Debug representation.
+    // Assert on both the label and the numeric millis value so that the test
+    // fails if the duration field is absent (guards against false-pass when
+    // "500" happens to appear in another field such as response_length).
     assert!(
-        s.contains(&m.duration.as_millis().to_string()),
-        "expected duration millis ({}) in display, got: {}",
+        s.contains("duration:") && s.contains(&m.duration.as_millis().to_string()),
+        "expected 'duration:' label with {} millis in display, got: {}",
         m.duration.as_millis(),
         s
     );
