@@ -30,16 +30,27 @@ pub struct TokenUsage {
 }
 
 /// Result of a single SWE-bench instance evaluation.
+///
+/// The token-usage fields are split into orchestrator (the foundational
+/// model driving the agent loop) and worker (the model serving delegated
+/// subtasks via MCP, when applicable). Old field names
+/// `claude_token_usage` / `nanna_token_usage` are accepted on
+/// deserialisation for compatibility with locally-saved JSON predating
+/// the rename.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweBenchInstanceResult {
     /// Instance identifier, e.g. "django__django-16379"
     pub instance_id: String,
     /// Whether the instance was resolved (tests pass after patch)
     pub resolved: bool,
-    /// Token usage from the Claude model
-    pub claude_token_usage: TokenUsage,
-    /// Token usage from the nanna orchestrator model, if any
-    pub nanna_token_usage: Option<TokenUsage>,
+    /// Token usage from the orchestrator (foundational) model.
+    #[serde(alias = "claude_token_usage")]
+    pub orchestrator_token_usage: TokenUsage,
+    /// Token usage from the worker model when running an MCP-delegated
+    /// category (`claude_mcp_claude` / `claude_mcp_nanna_gemma4`); `None`
+    /// for solo categories.
+    #[serde(alias = "nanna_token_usage")]
+    pub worker_token_usage: Option<TokenUsage>,
     /// Wall-clock time in seconds
     pub wall_time_secs: f64,
     /// Error message if the instance failed with an error
@@ -74,16 +85,33 @@ impl SweBenchRunResult {
         self.resolved_count() as f64 / self.total_count() as f64
     }
 
-    /// Sum of all Claude token usage across instances.
+    /// Sum of all orchestrator token usage across instances.
     ///
-    /// `nanna_token_usage` is intentionally excluded — this metric tracks
-    /// only the foundational-model (Claude) cost, which is the comparable
-    /// quantity across `claude_only` / `claude_plus_nanna` scenarios.
-    pub fn total_claude_tokens(&self) -> u64 {
+    /// `worker_token_usage` is intentionally excluded — this metric tracks
+    /// only the orchestrator-side spend, which is the comparable quantity
+    /// across solo (`claude_solo`, `nanna_solo`) and delegated
+    /// (`claude_mcp_*`) categories.
+    pub fn total_orchestrator_tokens(&self) -> u64 {
         self.instances
             .iter()
-            .map(|i| i.claude_token_usage.total_tokens)
+            .map(|i| i.orchestrator_token_usage.total_tokens)
             .sum()
+    }
+
+    /// Sum of all worker token usage across instances. Returns 0 when no
+    /// instance carries worker-side usage (e.g. for solo categories).
+    pub fn total_worker_tokens(&self) -> u64 {
+        self.instances
+            .iter()
+            .filter_map(|i| i.worker_token_usage.as_ref().map(|u| u.total_tokens))
+            .sum()
+    }
+
+    /// Sum of orchestrator + worker tokens. Use this when both sides run
+    /// on the same foundational provider (e.g. `claude_mcp_claude`) and
+    /// the comparable quantity is "total foundational-model spend."
+    pub fn total_foundational_tokens(&self) -> u64 {
+        self.total_orchestrator_tokens() + self.total_worker_tokens()
     }
 
     /// Average wall-clock time across instances. Returns 0.0 for empty runs.
@@ -95,18 +123,19 @@ impl SweBenchRunResult {
         total / self.instances.len() as f64
     }
 
-    /// Integer-truncated average Claude tokens per resolved instance.
+    /// Integer-truncated average orchestrator tokens per resolved instance.
     ///
-    /// The result is `total_claude_tokens / resolved_count` using integer
-    /// division — fractional remainders are dropped. Returns 0 if none
-    /// resolved. For higher-precision reporting, compute
-    /// `total_claude_tokens() as f64 / resolved_count() as f64` directly.
+    /// The result is `total_orchestrator_tokens / resolved_count` using
+    /// integer division — fractional remainders are dropped. Returns 0 if
+    /// none resolved. For higher-precision reporting, compute
+    /// `total_orchestrator_tokens() as f64 / resolved_count() as f64`
+    /// directly.
     pub fn tokens_per_resolved(&self) -> u64 {
         let resolved = self.resolved_count();
         if resolved == 0 {
             return 0;
         }
-        self.total_claude_tokens() / resolved as u64
+        self.total_orchestrator_tokens() / resolved as u64
     }
 }
 
@@ -123,12 +152,12 @@ mod tests {
         SweBenchInstanceResult {
             instance_id: id.to_string(),
             resolved,
-            claude_token_usage: TokenUsage {
+            orchestrator_token_usage: TokenUsage {
                 prompt_tokens: tokens / 2,
                 completion_tokens: tokens / 2,
                 total_tokens: tokens,
             },
-            nanna_token_usage: None,
+            worker_token_usage: None,
             wall_time_secs: wall_time,
             error: if resolved {
                 None
@@ -163,7 +192,7 @@ mod tests {
         assert_eq!(run.resolved_count(), 3);
         assert_eq!(run.total_count(), 4);
         assert!((run.resolve_rate() - 0.75).abs() < f64::EPSILON);
-        assert_eq!(run.total_claude_tokens(), 5700);
+        assert_eq!(run.total_orchestrator_tokens(), 5700);
         assert!((run.avg_wall_time() - 14.25).abs() < f64::EPSILON);
         assert_eq!(run.tokens_per_resolved(), 1900);
     }
@@ -192,26 +221,42 @@ mod tests {
     }
 
     #[test]
-    fn test_total_claude_tokens_excludes_nanna_usage() {
-        // Construct an instance with nanna_token_usage populated and confirm
-        // `total_claude_tokens` does not sum it. This is the metric contract:
-        // only the foundational-model spend is comparable across scenarios.
+    fn test_total_orchestrator_tokens_excludes_worker_usage() {
+        // Construct an instance with worker_token_usage populated and
+        // confirm `total_orchestrator_tokens` does not sum it. This is
+        // the metric contract: orchestrator-side spend is the comparable
+        // quantity across solo and delegated categories.
         let mut a = make_instance("a", true, 1000, 10.0);
-        a.nanna_token_usage = Some(TokenUsage {
+        a.worker_token_usage = Some(TokenUsage {
             prompt_tokens: 500,
             completion_tokens: 500,
             total_tokens: 1000,
         });
         let mut b = make_instance("b", true, 2000, 20.0);
-        b.nanna_token_usage = Some(TokenUsage {
+        b.worker_token_usage = Some(TokenUsage {
             prompt_tokens: 1000,
             completion_tokens: 1000,
             total_tokens: 2000,
         });
         let run = make_run(vec![a, b]);
 
-        assert_eq!(run.total_claude_tokens(), 3000);
+        assert_eq!(run.total_orchestrator_tokens(), 3000);
+        assert_eq!(run.total_worker_tokens(), 3000);
+        assert_eq!(run.total_foundational_tokens(), 6000);
         assert_eq!(run.tokens_per_resolved(), 1500);
+    }
+
+    #[test]
+    fn test_total_worker_tokens_zero_when_solo() {
+        let run = make_run(vec![
+            make_instance("a", true, 1000, 10.0),
+            make_instance("b", true, 2000, 20.0),
+        ]);
+        assert_eq!(run.total_worker_tokens(), 0);
+        assert_eq!(
+            run.total_foundational_tokens(),
+            run.total_orchestrator_tokens()
+        );
     }
 
     #[test]
@@ -234,6 +279,43 @@ mod tests {
         assert_eq!(deserialized.config.commit_sha, "abc123");
         assert_eq!(deserialized.config.bench_name, "swebench_verified");
         assert_eq!(deserialized.resolved_count(), 1);
-        assert_eq!(deserialized.total_claude_tokens(), 13000);
+        assert_eq!(deserialized.total_orchestrator_tokens(), 13000);
+    }
+
+    #[test]
+    fn legacy_field_names_still_deserialise() {
+        // External callers of `harness swebench-report --input <file>` may
+        // have local JSON files written before the rename. The serde
+        // aliases on `orchestrator_token_usage` / `worker_token_usage`
+        // keep those files readable.
+        let legacy = serde_json::json!({
+            "config": {
+                "commit_sha": "abc123",
+                "bench_name": "swebench_verified",
+                "scenario": "claude_only",
+                "model_name": "claude-opus-4-7",
+                "timestamp": "2026-05-09T00:00:00Z"
+            },
+            "instances": [{
+                "instance_id": "django__django-16379",
+                "resolved": true,
+                "claude_token_usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "total_tokens": 150
+                },
+                "nanna_token_usage": null,
+                "wall_time_secs": 12.5,
+                "error": null
+            }]
+        });
+        let parsed: SweBenchRunResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.instances.len(), 1);
+        assert_eq!(
+            parsed.instances[0].orchestrator_token_usage.total_tokens,
+            150
+        );
+        assert!(parsed.instances[0].worker_token_usage.is_none());
+        assert_eq!(parsed.total_orchestrator_tokens(), 150);
     }
 }
