@@ -103,7 +103,7 @@ impl NannaMcpServer {
             // within a single message is not supported; a malformed
             // `Content-Length` header terminates the connection rather than
             // silently desyncing.
-            let trimmed_hdr = line.trim_end_matches(['\'r', '\'n']);
+            let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
             if trimmed_hdr.to_ascii_lowercase().starts_with("content-length:") {
                 let content_length: usize = match trimmed_hdr
                     .split_once(':')
@@ -125,7 +125,7 @@ impl NannaMcpServer {
                     if n == 0 {
                         return Ok(());
                     }
-                    if line.trim_end_matches(['\'r', '\'n']).is_empty() {
+                    if line.trim_end_matches(['\r', '\n']).is_empty() {
                         break;
                     }
                 }
@@ -577,7 +577,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
-    // ── Content-Length framing tests ─────────────────────────────────────────
+    // ── Content-Length framing tests ─────────────────────────────────────────────
     //
     // The tests below exercise the Content-Length detection branch in serve()
     // and the process_framed() helper directly, which were the 38 lines
