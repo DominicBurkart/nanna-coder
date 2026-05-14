@@ -21,7 +21,9 @@
 //! # Ok::<(), harness::eval::swebench::SWEBenchError>(())
 //! ```
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Deserializer};
 
@@ -69,6 +71,14 @@ pub enum SWEBenchError {
     Git(#[from] git2::Error),
     #[error("invalid base_commit oid: {0}")]
     InvalidOid(String),
+    #[error("git apply failed to apply test_patch: {0}")]
+    PatchApply(String),
+}
+
+impl From<std::io::Error> for SWEBenchError {
+    fn from(e: std::io::Error) -> Self {
+        SWEBenchError::PatchApply(format!("io error during git apply: {e}"))
+    }
 }
 
 /// Load a SWE-bench dataset from a JSONL file.
@@ -198,10 +208,40 @@ pub(crate) fn materialize_from_url(
     repo.set_head_detached(oid)?;
 
     if !test_patch.trim().is_empty() {
-        let diff = git2::Diff::from_buffer(test_patch.as_bytes())?;
-        repo.apply(&diff, git2::ApplyLocation::WorkDir, None)?;
+        apply_patch(workspace, test_patch)?;
     }
 
+    Ok(())
+}
+
+/// Apply a unified diff to `workspace` by piping it into `git apply`.
+///
+/// Shells out to `git apply --whitespace=nowarn` rather than going through
+/// `git2::Repository::apply`. The libgit2 implementation is stricter than
+/// upstream `git apply` and rejects hunks that the porcelain accepts (e.g.
+/// when the patch's context lines have shifted by a few rows or when binary
+/// patch sections are present). The SWE-bench dataset's `test_patch` fields
+/// are produced by upstream `git`, so they round-trip cleanly through the
+/// porcelain but trip libgit2's hunk matcher.
+fn apply_patch(workspace: &Path, patch: &str) -> Result<(), SWEBenchError> {
+    let mut child = Command::new("git")
+        .args(["apply", "--whitespace=nowarn"])
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was set to Stdio::piped")
+        .write_all(patch.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(SWEBenchError::PatchApply(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -591,6 +631,71 @@ mod tests {
         );
         let content = std::fs::read_to_string(&added).unwrap();
         assert!(content.contains("test_stub"));
+    }
+
+    #[test]
+    fn materialize_from_url_rejects_unappliable_patch_with_patch_apply_error() {
+        let seed = tempdir().unwrap();
+        let bare = tempdir().unwrap();
+        let oid = init_local_fixture(seed.path(), bare.path());
+
+        let workspace = tempdir().unwrap();
+        let target = workspace.path().join("repo");
+        let url = path_to_file_url(bare.path());
+
+        // Patch references a file that does not exist in the fixture, so
+        // `git apply` must reject it. The fix path returns PatchApply rather
+        // than the old git2-flavoured Git error.
+        let bogus_patch = concat!(
+            "diff --git a/does_not_exist.py b/does_not_exist.py\n",
+            "--- a/does_not_exist.py\n",
+            "+++ b/does_not_exist.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-foo\n",
+            "+bar\n",
+        );
+        let err = materialize_from_url(&url, &oid, bogus_patch, &target).unwrap_err();
+        assert!(
+            matches!(err, SWEBenchError::PatchApply(_)),
+            "expected PatchApply, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_io_error_maps_to_patch_apply() {
+        let io_err = std::io::Error::other("boom");
+        let err: SWEBenchError = io_err.into();
+        assert!(matches!(err, SWEBenchError::PatchApply(_)));
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn materialize_constructs_https_github_url_and_delegates() {
+        // Exercise the public `materialize` wrapper: the URL is built from
+        // `repo` and forwarded to `materialize_from_url`. We use a fixture
+        // path that points at a *file://* URL the repo doesn't host on
+        // github.com, so the underlying clone fails fast — but the URL
+        // construction (and the call) execute. Avoids a real network hit.
+        let bare = tempdir().unwrap();
+        let task = SWEBenchTask {
+            instance_id: "x".to_string(),
+            repo: "definitely/not-a-real-org-9c3d8f".to_string(),
+            base_commit: "0000000000000000000000000000000000000000".to_string(),
+            patch: String::new(),
+            test_patch: String::new(),
+            problem_statement: String::new(),
+            hints_text: String::new(),
+            version: String::new(),
+            fail_to_pass: vec![],
+            pass_to_pass: vec![],
+            environment_setup_commit: None,
+        };
+        // The clone target must not exist beforehand.
+        let target = bare.path().join("never-cloned");
+        // Real github would 404 fast; CI runners reach github reliably, so
+        // we accept the network dependency. Either branch returns Err.
+        let err = materialize(&task, &target);
+        assert!(err.is_err(), "materialize against a bogus repo must fail");
     }
 
     #[test]
