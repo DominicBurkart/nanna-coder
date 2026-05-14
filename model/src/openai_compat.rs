@@ -286,7 +286,11 @@ impl ModelProvider for OpenAICompatProvider {
             let body = response.text().await.unwrap_or_default();
             // Truncate to avoid leaking large or sensitive response bodies
             // (some gateways reflect authentication context in error payloads).
-            let body = if body.len() > 512 { &body[..512] } else { &body };
+            let body = if body.len() > 512 {
+                &body[..512]
+            } else {
+                &body
+            };
             return Err(ModelError::Unknown {
                 message: format!("OpenAI-compat API error {}: {}", status, body),
             });

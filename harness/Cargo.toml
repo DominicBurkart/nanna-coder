@@ -29,7 +29,7 @@ eval-runner = ["tempfile"]
 
 [dependencies]
 async-trait = "0.1"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
 image-builder = { path = "../image-builder" }
 model = { path = "../model", features = ["openai-compat"] }
 serde = { version = "1.0", features = ["derive"] }

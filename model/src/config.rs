@@ -383,7 +383,10 @@ mod tests {
         // Ensure config files using "openai_compat" (underscore) are accepted
         let json = r#"{"provider":"openai_compat","base_url":"http://localhost:8080","default_model":"default","timeout":{"secs":30,"nanos":0}}"#;
         let result: Result<GatewayConfig, _> = serde_json::from_str(json);
-        assert!(result.is_ok(), "openai_compat underscore alias should be accepted");
+        assert!(
+            result.is_ok(),
+            "openai_compat underscore alias should be accepted"
+        );
         assert!(matches!(result.unwrap(), GatewayConfig::OpenaiCompat(_)));
     }
 
@@ -412,8 +415,14 @@ mod tests {
             timeout: Duration::from_secs(30),
         };
         let debug_str = format!("{:?}", cfg);
-        assert!(!debug_str.contains("sk-super-secret"), "api_key must be redacted in Debug output");
-        assert!(debug_str.contains("REDACTED"), "Debug output should contain [REDACTED]");
+        assert!(
+            !debug_str.contains("sk-super-secret"),
+            "api_key must be redacted in Debug output"
+        );
+        assert!(
+            debug_str.contains("REDACTED"),
+            "Debug output should contain [REDACTED]"
+        );
     }
 
     #[test]
@@ -425,7 +434,13 @@ mod tests {
             timeout: Duration::from_secs(30),
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(!json.contains("sk-super-secret"), "api_key must not appear in serialized output");
-        assert!(!json.contains("api_key"), "api_key field must be omitted from serialized output");
+        assert!(
+            !json.contains("sk-super-secret"),
+            "api_key must not appear in serialized output"
+        );
+        assert!(
+            !json.contains("api_key"),
+            "api_key field must be omitted from serialized output"
+        );
     }
 }
