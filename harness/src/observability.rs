@@ -1396,8 +1396,7 @@ mod tests {
             context: HashMap::new(),
             acknowledged: false,
         };
-        let actions =
-            system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
         assert!(!actions.is_empty());
         assert!(actions.iter().any(|a| a.to_lowercase().contains("container")));
     }
