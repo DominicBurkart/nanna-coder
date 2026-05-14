@@ -24,6 +24,22 @@
 .PARAMETER Distro
     WSL distro name (default: Ubuntu).
 
+.PARAMETER HarnessPort
+    Host port to publish the harness on (default unset; install.sh defaults
+    to 18080). Forwarded to install.sh as --harness-port. See #330: the
+    in-WSL port collides with the same :8080 frontend-dev stacks the Linux
+    path is moving away from, so this parameter must reach the bash side.
+
+.PARAMETER UseHostOllama
+    Skip the in-pod ollama container; reuse the Ollama already running on
+    the host (inside WSL) at http://localhost:11434. Forwarded to install.sh
+    as --use-host-ollama. See #330.
+
+.PARAMETER NoUseHostOllama
+    Force the installer to start its own ollama container even if one is
+    already running on the host. Forwarded to install.sh as
+    --no-use-host-ollama. See #330.
+
 .PARAMETER Yes
     Don't prompt; assume yes for elevation notices.
 
@@ -39,10 +55,21 @@ param(
     [switch]$NoStart,
     [string]$Branch = 'main',
     [string]$Distro = 'Ubuntu',
+    [int]$HarnessPort = 0,
+    [switch]$UseHostOllama,
+    [switch]$NoUseHostOllama,
     [switch]$Yes
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Sanity-check mutually exclusive flags before we start a 5-min WSL setup.
+if ($UseHostOllama -and $NoUseHostOllama) {
+    throw "-UseHostOllama and -NoUseHostOllama are mutually exclusive"
+}
+if ($HarnessPort -ne 0 -and ($HarnessPort -lt 1 -or $HarnessPort -gt 65535)) {
+    throw "-HarnessPort must be in 1..65535 (got $HarnessPort)"
+}
 
 function Write-Info  { param($m) Write-Host "==> $m" -ForegroundColor Blue }
 function Write-Ok    { param($m) Write-Host "[OK] $m" -ForegroundColor Green }
@@ -78,6 +105,9 @@ Write-Host "  branch:        $Branch"
 Write-Host "  distro:        $Distro"
 Write-Host "  skip model:    $([bool]$SkipModelPull)"
 Write-Host "  start pod:     $(-not [bool]$NoStart)"
+if ($HarnessPort -ne 0) { Write-Host "  harness port:  $HarnessPort" }
+if ($UseHostOllama)     { Write-Host '  ollama:        host (WSL-side)' }
+if ($NoUseHostOllama)   { Write-Host '  ollama:        in-pod (forced)' }
 Write-Host ''
 Write-Host 'On Windows, Nanna Coder runs inside WSL2. This installer will:'
 Write-Host '  1. Enable WSL2 + the Virtual Machine Platform (Administrator)'
@@ -109,9 +139,12 @@ if (-not (Test-WslReady) -or -not (Test-DistroInstalled $Distro)) {
     if (-not (Test-Admin)) {
         Write-Warn 'Re-launching as Administrator...'
         $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath)
-        if ($SkipModelPull) { $argList += '-SkipModelPull' }
-        if ($NoStart)       { $argList += '-NoStart' }
-        if ($Yes)           { $argList += '-Yes' }
+        if ($SkipModelPull)   { $argList += '-SkipModelPull' }
+        if ($NoStart)         { $argList += '-NoStart' }
+        if ($Yes)             { $argList += '-Yes' }
+        if ($UseHostOllama)   { $argList += '-UseHostOllama' }
+        if ($NoUseHostOllama) { $argList += '-NoUseHostOllama' }
+        if ($HarnessPort -ne 0) { $argList += @('-HarnessPort',[string]$HarnessPort) }
         $argList += @('-Branch',$Branch,'-Distro',$Distro)
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait
         exit $LASTEXITCODE
@@ -139,9 +172,14 @@ Write-Ok "WSL2 + $Distro ready"
 $rawBase = "https://raw.githubusercontent.com/DominicBurkart/nanna-coder/$Branch/scripts/install.sh"
 
 $bashFlags = @()
-if ($SkipModelPull) { $bashFlags += '--skip-model-pull' }
-if ($NoStart)       { $bashFlags += '--no-start' }
-if ($Yes)           { $bashFlags += '--yes' }
+if ($SkipModelPull)   { $bashFlags += '--skip-model-pull' }
+if ($NoStart)         { $bashFlags += '--no-start' }
+if ($Yes)             { $bashFlags += '--yes' }
+if ($UseHostOllama)   { $bashFlags += '--use-host-ollama' }
+if ($NoUseHostOllama) { $bashFlags += '--no-use-host-ollama' }
+if ($HarnessPort -ne 0) { $bashFlags += @('--harness-port', [string]$HarnessPort) }
+# install.sh accepts and ignores --branch (kept for parity with this
+# Windows path's -Branch passthrough). See install.sh's --branch entry.
 $bashFlags += @('--branch', $Branch)
 $bashArgs = ($bashFlags -join ' ')
 
