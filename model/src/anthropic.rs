@@ -371,12 +371,14 @@ impl AnthropicProvider {
 /// attempt (1-based: attempt=1 means the first retry after the initial try).
 fn last_retry_delay_ms(attempt: u32) -> u64 {
     let base = 500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
-    // Add up to 250 ms of random jitter to avoid retry thundering-herd
-    let jitter = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64)
-        % 250;
+    // Add up to 250 ms of random jitter to avoid retry thundering-herd.
+    // subsec_nanos() returns u32; use u64::from() for a lossless widening.
+    let jitter = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    ) % 250;
     base + jitter
 }
 
