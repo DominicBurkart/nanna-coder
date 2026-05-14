@@ -25,8 +25,9 @@ struct Cli {
     #[arg(long)]
     api_base: Option<String>,
 
-    /// API key for authentication (openai-compat only)
-    #[arg(long)]
+    /// API key for authentication (openai-compat only).
+    /// Prefer setting NANNA_API_KEY in the environment to avoid shell history exposure.
+    #[arg(long, env = "NANNA_API_KEY")]
     api_key: Option<String>,
 
     #[command(subcommand)]
@@ -239,35 +240,7 @@ fn generate_swebench_report(
 fn build_provider_from_cli(
     cli: &Cli,
 ) -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
-    let gateway = match cli.provider.as_str() {
-        "ollama" => {
-            let mut cfg = OllamaConfig::default();
-            if let Some(base) = &cli.api_base {
-                cfg = cfg.with_base_url(base);
-            }
-            GatewayConfig::Ollama(cfg)
-        }
-        "openai-compat" => {
-            let base_url = cli
-                .api_base
-                .clone()
-                .unwrap_or_else(|| "http://localhost:8080".to_string());
-            GatewayConfig::OpenaiCompat(OpenAICompatConfig {
-                base_url,
-                api_key: cli.api_key.clone(),
-                default_model: "default".to_string(),
-                timeout: std::time::Duration::from_secs(30),
-            })
-        }
-        other => {
-            return Err(format!(
-                "Unknown provider: {}. Use 'ollama' or 'openai-compat'.",
-                other
-            )
-            .into());
-        }
-    };
-    Ok(gateway.build_provider()?)
+    build_provider_arc(cli.provider.as_str(), cli.api_base.as_deref(), cli.api_key.as_deref())
 }
 
 fn build_provider_arc(

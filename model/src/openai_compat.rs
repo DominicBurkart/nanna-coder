@@ -135,6 +135,9 @@ impl OpenAICompatProvider {
                         .collect()
                 });
 
+                // `finish_reason` may be absent (null) or carry an unrecognised value from a
+                // non-standard endpoint. Both map to `Stop` as a safe default. This behaviour
+                // is explicitly tested by `test_response_finish_reason_null_becomes_stop`.
                 let finish_reason = match c.finish_reason.as_deref() {
                     Some("tool_calls") => Some(FinishReason::ToolCalls),
                     Some("length") => Some(FinishReason::Length),
@@ -281,6 +284,9 @@ impl ModelProvider for OpenAICompatProvider {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            // Truncate to avoid leaking large or sensitive response bodies
+            // (some gateways reflect authentication context in error payloads).
+            let body = if body.len() > 512 { &body[..512] } else { &body };
             return Err(ModelError::Unknown {
                 message: format!("OpenAI-compat API error {}: {}", status, body),
             });
@@ -525,5 +531,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provider.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_response_finish_reason_null_becomes_stop() {
+        // Documents intentional behaviour: absent/null finish_reason maps to Stop.
+        // Update this assertion if the mapping changes in future.
+        let raw_json = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":null}],"usage":null}"#;
+        let raw: OpenAIRawResponse = serde_json::from_str(raw_json).unwrap();
+        let resp = OpenAICompatProvider::parse_response(raw).unwrap();
+        assert_eq!(resp.choices[0].finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn test_response_finish_reason_unknown_string_becomes_stop() {
+        // An unrecognised finish_reason from a non-standard endpoint also maps to Stop.
+        let raw_json = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"unknown_future_value"}],"usage":null}"#;
+        let raw: OpenAIRawResponse = serde_json::from_str(raw_json).unwrap();
+        let resp = OpenAICompatProvider::parse_response(raw).unwrap();
+        assert_eq!(resp.choices[0].finish_reason, Some(FinishReason::Stop));
     }
 }

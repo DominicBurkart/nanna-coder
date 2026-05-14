@@ -169,12 +169,31 @@ mod kani_proofs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configuration for an OpenAI-compatible provider endpoint.
+///
+/// **Security note:** `api_key` is intentionally excluded from `Serialize` so
+/// it is never written to config files, audit logs, or other serialised
+/// representations. Supply the key at runtime via the `NANNA_API_KEY`
+/// environment variable.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAICompatConfig {
     pub base_url: String,
+    /// API key for bearer-auth. Not serialised; supply at runtime.
+    #[serde(skip_serializing, default)]
     pub api_key: Option<String>,
     pub default_model: String,
     pub timeout: Duration,
+}
+
+impl std::fmt::Debug for OpenAICompatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAICompatConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("default_model", &self.default_model)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Default for OpenAICompatConfig {
@@ -211,6 +230,7 @@ impl OpenAICompatConfig {
 #[serde(tag = "provider", rename_all = "kebab-case")]
 pub enum GatewayConfig {
     Ollama(OllamaConfig),
+    #[serde(rename = "openai-compat", alias = "openai_compat")]
     OpenaiCompat(OpenAICompatConfig),
 }
 
@@ -350,11 +370,21 @@ mod tests {
         match deserialized {
             GatewayConfig::OpenaiCompat(c) => {
                 assert_eq!(c.base_url, "https://api.example.com");
-                assert_eq!(c.api_key, Some("sk-test".to_string()));
+                // api_key is not serialised; it must be supplied at runtime
+                assert_eq!(c.api_key, None);
                 assert_eq!(c.default_model, "gpt-4");
             }
             _ => panic!("Expected OpenaiCompat variant"),
         }
+    }
+
+    #[test]
+    fn test_gateway_config_serde_accepts_underscore_alias() {
+        // Ensure config files using "openai_compat" (underscore) are accepted
+        let json = r#"{"provider":"openai_compat","base_url":"http://localhost:8080","default_model":"default","timeout":{"secs":30,"nanos":0}}"#;
+        let result: Result<GatewayConfig, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "openai_compat underscore alias should be accepted");
+        assert!(matches!(result.unwrap(), GatewayConfig::OpenaiCompat(_)));
     }
 
     #[test]
@@ -371,5 +401,31 @@ mod tests {
         cfg.base_url = "http://localhost:8080".to_string();
         cfg.default_model = "".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_openai_compat_config_debug_redacts_key() {
+        let cfg = OpenAICompatConfig {
+            base_url: "http://localhost:8080".to_string(),
+            api_key: Some("sk-super-secret".to_string()),
+            default_model: "gpt-4".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let debug_str = format!("{:?}", cfg);
+        assert!(!debug_str.contains("sk-super-secret"), "api_key must be redacted in Debug output");
+        assert!(debug_str.contains("REDACTED"), "Debug output should contain [REDACTED]");
+    }
+
+    #[test]
+    fn test_openai_compat_config_serialize_omits_key() {
+        let cfg = OpenAICompatConfig {
+            base_url: "http://localhost:8080".to_string(),
+            api_key: Some("sk-super-secret".to_string()),
+            default_model: "default".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("sk-super-secret"), "api_key must not appear in serialized output");
+        assert!(!json.contains("api_key"), "api_key field must be omitted from serialized output");
     }
 }
