@@ -74,6 +74,16 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
+    /// The JSON arguments for the function call.
+    ///
+    /// Provider contract: this should be a [`serde_json::Value::Object`] when
+    /// the call is forwarded to a provider that requires structured input
+    /// (notably Anthropic, which rejects requests with `400` if `input` is not
+    /// a JSON object). Some upstream providers (OpenAI/Ollama) historically
+    /// emit `arguments` as a stringified JSON object; callers that produce
+    /// `FunctionCall` from those sources must parse the string into an object
+    /// before forwarding. The Anthropic provider applies a defensive
+    /// [`serde_json::from_str`] fallback for `Value::String` to mitigate this.
     pub arguments: serde_json::Value,
 }
 

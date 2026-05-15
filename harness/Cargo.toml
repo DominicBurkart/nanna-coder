@@ -26,6 +26,7 @@ required-features = ["eval-runner"]
 # production builds (the harness binary, container images) do not pull in
 # tempfile unless explicitly requested.
 eval-runner = ["tempfile"]
+anthropic = ["model/anthropic"]
 
 [dependencies]
 async-trait = "0.1"
