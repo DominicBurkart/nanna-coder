@@ -55,8 +55,21 @@ pub struct TaskWorkspace {
 }
 
 impl TaskWorkspace {
-    pub fn create(source_repo: &Path, task_id: &str, branch: &str) -> Result<Self, WorkspaceError> {
-        let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
+    /// Compute the temp-dir worktree path used for a given `task_id`. Centralised
+    /// here so `create`, `create_with_container_using`, and tests stay in sync.
+    fn worktree_path_for(task_id: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("nanna-task-{}", task_id))
+    }
+
+    /// Run `git worktree add <workspace_path> <branch>` from `source_repo`,
+    /// returning a `GitWorktreeCreateFailed` error if git rejects it. Shared by
+    /// both the bare and containerised constructors so their worktree
+    /// invocation cannot drift.
+    fn add_worktree(
+        source_repo: &Path,
+        workspace_path: &Path,
+        branch: &str,
+    ) -> Result<(), WorkspaceError> {
         let output = git_cmd(source_repo)
             .args([
                 "worktree",
@@ -69,6 +82,12 @@ impl TaskWorkspace {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
+        Ok(())
+    }
+
+    pub fn create(source_repo: &Path, task_id: &str, branch: &str) -> Result<Self, WorkspaceError> {
+        let workspace_path = Self::worktree_path_for(task_id);
+        Self::add_worktree(source_repo, &workspace_path, branch)?;
         Ok(Self {
             workspace_path,
             source_repo: source_repo.to_path_buf(),
@@ -117,19 +136,8 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
-        let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
-        let output = git_cmd(source_repo)
-            .args([
-                "worktree",
-                "add",
-                workspace_path.to_str().expect("non-UTF8 path"),
-                branch,
-            ])
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
-        }
+        let workspace_path = Self::worktree_path_for(task_id);
+        Self::add_worktree(source_repo, &workspace_path, branch)?;
 
         let cleanup_worktree = || {
             let _ = git_cmd(source_repo)
