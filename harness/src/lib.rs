@@ -52,3 +52,5 @@ pub use entities::{
     Entity, EntityError, EntityId, EntityMetadata, EntityQuery, EntityRelationship, EntityResult,
     EntityStore, EntityType, InMemoryEntityStore, QueryResult, RelationshipType, TimeRange,
 };
+
+// ci: retrigger CI via git push (trigger pull_request event)
