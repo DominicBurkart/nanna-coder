@@ -304,16 +304,16 @@ impl ClaudeCodeRunner {
 
         // Collect stderr after stdout drains (subprocess will have
         // exited or be about to). `wait_with_output` is not usable
-        // because we already took stdout, so wait manually + drain
-        // stderr.
-        let stderr_text = if let Some(mut stderr) = stderr_pipe {
-            use tokio::io::AsyncReadExt as _;
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).into_owned()
-        } else {
-            String::new()
-        };
+        // because we already took stdout, so wait manually.
+        // `stderr_pipe` is always `Some` because we configured
+        // `Stdio::piped()` above; `unwrap_or_default` avoids a
+        // dead `else` branch while keeping the type uniform.
+        use tokio::io::AsyncReadExt as _;
+        let mut stderr_buf = Vec::new();
+        if let Some(mut stderr) = stderr_pipe {
+            let _ = stderr.read_to_end(&mut stderr_buf).await;
+        }
+        let stderr_text = String::from_utf8_lossy(&stderr_buf).into_owned();
         let status = child
             .wait()
             .await
@@ -965,5 +965,99 @@ mod tests {
         let run = runner.run("hi", repo.path()).await.unwrap();
         assert!(nested.is_dir(), "log_dir parents should be auto-created");
         assert!(run.log_path.is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_returns_spawn_error_when_log_dir_parent_is_a_file() {
+        // Trigger the `create log_dir` error path: point log_dir at a
+        // sub-path of a regular *file* so that `create_dir_all` fails
+        // with ENOTDIR.
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"result","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}"#,
+        ]);
+        let base = tempfile::tempdir().unwrap();
+        // Write a regular file then try to make a child directory of it.
+        let blocker = base.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let bad_log_dir = blocker.join("child");
+        let runner = ClaudeCodeRunner::new()
+            .with_claude_bin(stub_dir.path().join("claude"))
+            .with_log_dir(&bad_log_dir);
+        let repo = tempfile::tempdir().unwrap();
+        let err = runner.run("hi", repo.path()).await.unwrap_err();
+        match err {
+            ClaudeCodeError::Spawn(msg) => {
+                assert!(
+                    msg.contains("create log_dir"),
+                    "expected 'create log_dir' in error, got: {msg}"
+                );
+            }
+            other => panic!("expected Spawn error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_returns_spawn_error_when_log_file_cannot_be_created() {
+        // Trigger the `open log file` error path: set log_dir to `/proc`
+        // whose parent already exists (so `create_dir_all` succeeds) but
+        // which rejects new file creation even as root (ENOENT from the
+        // procfs VFS layer). This exercises the `File::create` error arm.
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"result","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}"#,
+        ]);
+        let runner = ClaudeCodeRunner::new()
+            .with_claude_bin(stub_dir.path().join("claude"))
+            .with_log_dir("/proc");
+        let repo = tempfile::tempdir().unwrap();
+        let err = runner.run("hi", repo.path()).await.unwrap_err();
+        match err {
+            ClaudeCodeError::Spawn(msg) => {
+                assert!(
+                    msg.contains("open log file"),
+                    "expected 'open log file' in error, got: {msg}"
+                );
+            }
+            other => panic!("expected Spawn error, got {other:?}"),
+        }
+    }
+
+    /// Test that tee write-failure warn paths are hit but do NOT abort
+    /// the run: on Linux, `/dev/full` opens successfully for writing but
+    /// every `write()` syscall returns ENOSPC — perfect for exercising
+    /// the best-effort warn paths without aborting the run.
+    ///
+    /// The trick: we create a symlink inside a tempdir that points to
+    /// `/dev/full`, so `create_dir_all(parent)` and `File::create` both
+    /// succeed (the log_path resolves to `/dev/full`), but the subsequent
+    /// `write_all` calls fail.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    async fn run_continues_after_tee_write_failure() {
+        if !std::path::Path::new("/dev/full").exists() {
+            return; // Skip on kernels without /dev/full (some containers).
+        }
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"result","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}"#,
+        ]);
+        let log_dir = tempfile::tempdir().unwrap();
+        // Symlink: <log_dir>/failing.ndjson → /dev/full
+        // File::create follows symlinks on open, so writes go to /dev/full.
+        let symlink_path = log_dir.path().join("failing.ndjson");
+        std::os::unix::fs::symlink("/dev/full", &symlink_path).unwrap();
+        let runner = ClaudeCodeRunner::new()
+            .with_claude_bin(stub_dir.path().join("claude"))
+            .with_log_dir(log_dir.path())
+            .with_log_file_name("failing");
+        let repo = tempfile::tempdir().unwrap();
+        // write_all fails → tracing::warn!, but run() still returns Ok.
+        let run = runner.run("hi", repo.path()).await.unwrap();
+        assert_eq!(run.result.as_deref(), Some("ok"));
+        assert_eq!(run.total_tokens, 2);
     }
 }
