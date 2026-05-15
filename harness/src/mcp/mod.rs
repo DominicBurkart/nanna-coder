@@ -104,7 +104,10 @@ impl NannaMcpServer {
             // `Content-Length` header terminates the connection rather than
             // silently desyncing.
             let trimmed_hdr = line.trim_end_matches(['\r', '\n']);
-            if trimmed_hdr.to_ascii_lowercase().starts_with("content-length:") {
+            if trimmed_hdr
+                .to_ascii_lowercase()
+                .starts_with("content-length:")
+            {
                 let content_length: usize = match trimmed_hdr
                     .split_once(':')
                     .and_then(|(_, v)| v.trim().parse::<usize>().ok())
@@ -595,7 +598,9 @@ mod tests {
     fn parse_framed_response(bytes: &[u8]) -> serde_json::Value {
         let s = std::str::from_utf8(bytes).expect("response must be UTF-8");
         // Find end of headers (\r\n\r\n)
-        let sep = s.find("\r\n\r\n").expect("response must contain \\r\\n\\r\\n");
+        let sep = s
+            .find("\r\n\r\n")
+            .expect("response must contain \\r\\n\\r\\n");
         let header_section = &s[..sep];
         let body = &s[sep + 4..];
         // Verify Content-Length header present
@@ -661,7 +666,10 @@ mod tests {
         let input = framed(body);
         let mut output: Vec<u8> = Vec::new();
         make_server()
-            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .serve(
+                tokio::io::BufReader::new(std::io::Cursor::new(input)),
+                &mut output,
+            )
             .await
             .unwrap();
         let v = parse_framed_response(&output);
@@ -682,7 +690,10 @@ mod tests {
 
         let mut output: Vec<u8> = Vec::new();
         make_server()
-            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .serve(
+                tokio::io::BufReader::new(std::io::Cursor::new(input)),
+                &mut output,
+            )
             .await
             .unwrap();
 
@@ -692,7 +703,10 @@ mod tests {
         // Quick check: both ids appear in the output.
         assert!(s.contains("\"id\":1"), "response 1 missing: {s}");
         assert!(s.contains("\"id\":2"), "response 2 missing: {s}");
-        assert!(s.contains("protocolVersion"), "initialize result missing: {s}");
+        assert!(
+            s.contains("protocolVersion"),
+            "initialize result missing: {s}"
+        );
         assert!(s.contains("tools"), "tools/list result missing: {s}");
     }
 
@@ -704,7 +718,10 @@ mod tests {
         let input = b"Content-Length: 42\r\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
         let result = make_server()
-            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .serve(
+                tokio::io::BufReader::new(std::io::Cursor::new(input)),
+                &mut output,
+            )
             .await;
         assert!(result.is_ok(), "EOF mid-headers must not error: {result:?}");
         assert!(output.is_empty());
@@ -717,7 +734,10 @@ mod tests {
         let input = b"Content-Length: not-a-number\r\n\r\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
         let result = make_server()
-            .serve(tokio::io::BufReader::new(std::io::Cursor::new(input)), &mut output)
+            .serve(
+                tokio::io::BufReader::new(std::io::Cursor::new(input)),
+                &mut output,
+            )
             .await;
         assert!(
             result.is_err(),
