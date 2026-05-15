@@ -4,15 +4,15 @@ Thank you for your interest in contributing!
 
 ## Dev Setup
 
-See [README.md](./README.md#quick-start). Detailed contributor setup is tracked in [#175](https://github.com/DominicBurkart/nanna-coder/issues/175).
+See [README.md](README.md#quick-start). Detailed contributor setup is tracked in [#175](https://github.com/dominicburkart/nanna-coder/issues/175).
 
 ## Testing
 
-See [TESTING.md](./TESTING.md).
+See [TESTING.md](TESTING.md).
 
 ## License
 
-All contributions fall under the [project license](./LICENSE).
+All contributions fall under the project licenses: [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
 
 ## GitHub Issues
 
@@ -20,4 +20,4 @@ If a PR *entirely* completes an issue, include `Closes #<issue number>` in the P
 
 ## Architectural Changes
 
-Changes to the architecture documented in [ARCHITECTURE.md](./ARCHITECTURE.md) must be introduced via an approved GitHub Issue. Incidental architectural changes (for example, to unblock a feature PR) should be flagged during review.
+Changes to the architecture documented in [ARCHITECTURE.md](ARCHITECTURE.md) must be introduced via an approved GitHub Issue. Incidental architectural changes (for example, to unblock a feature PR) should be flagged during review.
