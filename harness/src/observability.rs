@@ -1134,70 +1134,104 @@ mod tests {
     fn test_determine_alert_category_container() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("some alert", "my-container-01", AlertSeverity::Warning);
-        assert_eq!(sys.determine_alert_category(&alert), AlertCategory::ContainerHealth);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
     }
 
     #[test]
     fn test_determine_alert_category_model() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("some alert", "model:qwen3", AlertSeverity::Warning);
-        assert_eq!(sys.determine_alert_category(&alert), AlertCategory::ModelQuality);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
     }
 
     #[test]
     fn test_determine_alert_category_performance_from_title() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("Performance degraded", "system", AlertSeverity::Warning);
-        assert_eq!(sys.determine_alert_category(&alert), AlertCategory::Performance);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
     }
 
     #[test]
     fn test_determine_alert_category_resource_from_title() {
         let sys = ObservabilitySystem::new();
-        let alert = make_test_alert("Resource exhaustion detected", "system", AlertSeverity::Error);
-        assert_eq!(sys.determine_alert_category(&alert), AlertCategory::Resources);
+        let alert = make_test_alert(
+            "Resource exhaustion detected",
+            "system",
+            AlertSeverity::Error,
+        );
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
     }
 
     #[test]
     fn test_determine_alert_category_availability_fallback() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("Some unknown issue", "system", AlertSeverity::Info);
-        assert_eq!(sys.determine_alert_category(&alert), AlertCategory::Availability);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
     }
 
     #[test]
     fn test_calculate_priority_score_critical_availability() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("t", "s", AlertSeverity::Critical);
-        assert_eq!(sys.calculate_priority_score(&alert, &AlertCategory::Availability), 100);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Availability),
+            100
+        );
     }
 
     #[test]
     fn test_calculate_priority_score_warning_availability() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("t", "s", AlertSeverity::Warning);
-        assert_eq!(sys.calculate_priority_score(&alert, &AlertCategory::Availability), 70);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Availability),
+            70
+        );
     }
 
     #[test]
     fn test_calculate_priority_score_info_performance() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("t", "s", AlertSeverity::Info);
-        assert_eq!(sys.calculate_priority_score(&alert, &AlertCategory::Performance), 35);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Performance),
+            35
+        );
     }
 
     #[test]
     fn test_calculate_priority_score_error_resources() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("t", "s", AlertSeverity::Error);
-        assert_eq!(sys.calculate_priority_score(&alert, &AlertCategory::Resources), 75);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Resources),
+            75
+        );
     }
 
     #[test]
     fn test_calculate_priority_score_security_bonus() {
         let sys = ObservabilitySystem::new();
         let alert = make_test_alert("t", "s", AlertSeverity::Warning);
-        assert_eq!(sys.calculate_priority_score(&alert, &AlertCategory::Security), 80);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Security),
+            80
+        );
     }
 
     #[test]
