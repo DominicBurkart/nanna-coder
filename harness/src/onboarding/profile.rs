@@ -109,6 +109,77 @@ mod tests {
         .is_err());
     }
 
+    /// Every token in `COMMAND_BLOCKLIST` must be rejected. The earlier
+    /// regression only covered `publish`/`deploy`/`push`/`rm -rf`, leaving
+    /// `drop`/`delete`/`destroy` untested even though they are the highest-risk
+    /// entries (data-loss verbs). A typo in any blocklist literal would silently
+    /// pass through.
+    ///
+    /// The invariant under test: for every entry in `COMMAND_BLOCKLIST`, a
+    /// command whose whitespace-tokenized form contains that entry as a
+    /// contiguous window must produce a `BlocklistedCommand` error.
+    #[test]
+    fn tool_spec_rejects_every_blocklist_entry() {
+        for blocked in COMMAND_BLOCKLIST {
+            // Pad with a benign prefix so we exercise the windowing logic
+            // (not just exact-string equality).
+            let command = format!("sh -c {blocked} target");
+            let result = ToolSpec::new(
+                "dangerous",
+                &command,
+                "should be rejected",
+                ToolCategory::Build,
+            );
+            match result {
+                Err(ProfileError::BlocklistedCommand(c)) => {
+                    assert_eq!(c, command, "error must echo the offending command");
+                }
+                other => panic!("expected BlocklistedCommand for entry {blocked:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The destructive verbs `drop`, `delete`, `destroy` are the most
+    /// dangerous entries and historically had no targeted coverage. Pin them
+    /// in their own test so a future blocklist edit that drops them
+    /// (deliberately or accidentally) fails loudly with the specific token.
+    #[test]
+    fn tool_spec_rejects_destructive_verbs_individually() {
+        for verb in ["drop", "delete", "destroy"] {
+            let command = format!("db {verb} --all");
+            assert!(
+                matches!(
+                    ToolSpec::new("danger", &command, "destructive", ToolCategory::Build),
+                    Err(ProfileError::BlocklistedCommand(_))
+                ),
+                "blocklist must reject destructive verb {verb:?}"
+            );
+        }
+    }
+
+    /// `rm -rf` is a *multi-token* blocklist entry: the windowing logic must
+    /// match it as two consecutive tokens, not as the single-word substring
+    /// `"rm-rf"`. This pins the multi-token branch of `windows(window_size)`
+    /// which the existing `tool_spec_allows_blocklist_substring_within_word`
+    /// only covers for single-token entries.
+    #[test]
+    fn tool_spec_multi_token_blocklist_requires_adjacent_tokens() {
+        // Two-token match: must reject.
+        assert!(matches!(
+            ToolSpec::new("nuke", "rm -rf /tmp/x", "nuke tmp", ToolCategory::Build),
+            Err(ProfileError::BlocklistedCommand(_))
+        ));
+        // Same tokens but separated by an unrelated token: must NOT match
+        // `rm -rf` because the window is non-adjacent.
+        assert!(ToolSpec::new(
+            "safer",
+            "rm --interactive -rf /tmp/x",
+            "interactive remove",
+            ToolCategory::Build
+        )
+        .is_ok());
+    }
+
     #[test]
     fn tool_spec_accepts_valid_commands() {
         assert!(ToolSpec::new(
