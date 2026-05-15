@@ -169,10 +169,17 @@ jobs:
           echo "⚠️ Skipping cargo audit due to CVSS 4.0 incompatibility"
           echo "⚠️ Skipping cargo deny due to CVSS 4.0 incompatibility"
           # Increased timeout from 600s to 1800s (30 min) to accommodate E2E containerized tests
-          # which run slower under tarpaulin instrumentation. `--all-features` ensures
-          # feature-gated modules (e.g. `model::anthropic`) are compiled and exercised
-          # so codecov sees their tests; otherwise their diff coverage reads as 0%.
-          nix develop --command cargo tarpaulin --workspace --all-features --skip-clean --ignore-tests --out Lcov --output-dir . --timeout 1800
+          # which run slower under tarpaulin instrumentation. `--workspace --all-features`
+          # ensures feature-gated modules (e.g. `model::anthropic`, `eval-runner`) are
+          # compiled and exercised so codecov sees their tests; otherwise their diff
+          # coverage reads as 0%. `--ignore-tests` was previously passed but caused
+          # codecov/patch to count #[cfg(test)] mod blocks added in a PR as uncovered
+          # (they were absent from the LCOV report, so codecov treated them as missed).
+          # Without the flag, tarpaulin instruments test bodies; the test functions
+          # that run mark their own lines as covered, which is what codecov's patch
+          # metric rewards. `#[ignore]` tests still surface as uncovered, which is the
+          # correct signal — they're explicitly opt-in.
+          nix develop --command cargo tarpaulin --workspace --all-features --skip-clean --out Lcov --output-dir . --timeout 1800
         else
           echo "⚠️ Security checks skipped on ${{ runner.os }}"
         fi
@@ -299,20 +306,24 @@ jobs:
       run: |
         mkdir -p artifacts
 
-        # Determine the expected binary path based on cross-compilation
+        # Determine the expected binary path based on cross-compilation.
+        # Binary was renamed `harness` -> `nanna` (Cargo.toml [[bin]]
+        # name); release artifacts keep the historical `harness-`
+        # filename prefix to avoid breaking any consumers that
+        # auto-download by name.
         if [ "${{ matrix.cross }}" = "true" ]; then
-          BINARY_PATH="target/aarch64-apple-darwin/release/harness"
+          BINARY_PATH="target/aarch64-apple-darwin/release/nanna"
           TARGET_NAME="harness-${{ matrix.target }}"
         else
-          BINARY_PATH="target/release/harness"
+          BINARY_PATH="target/release/nanna"
           TARGET_NAME="harness-${{ matrix.target }}"
         fi
         if [ ! -f "$BINARY_PATH" ]; then
           echo "Expected binary not found at $BINARY_PATH"
-          find target -name "harness" -type f 2>/dev/null || true
+          find target -name "nanna" -type f 2>/dev/null || true
           exit 1
         fi
-        cp "$BINARY_PATH" "artifacts/harness-${{ matrix.target }}"
+        cp "$BINARY_PATH" "artifacts/$TARGET_NAME"
         ls -lah artifacts/
 
         echo "🔍 Looking for binary at: $BINARY_PATH"
@@ -323,7 +334,7 @@ jobs:
           echo "Build may have failed or produced output in unexpected location"
           echo ""
           echo "📂 Contents of target directory:"
-          find target -name "harness" -type f 2>/dev/null || echo "No harness binary found in target/"
+          find target -name "nanna" -type f 2>/dev/null || echo "No nanna binary found in target/"
           exit 1
         fi
 
@@ -569,7 +580,10 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         nix build .#packages.${{ matrix.target }}.nanna-coder
-        cp result/bin/harness harness-${{ matrix.target }}
+        # Binary is now `nanna` (renamed from `harness`); release asset
+        # filename keeps the `harness-` prefix to preserve the historical
+        # download URL pattern.
+        cp result/bin/nanna harness-${{ matrix.target }}
 
     - name: Build release artifact (macOS)
       if: runner.os == 'macOS'
@@ -577,10 +591,10 @@ jobs:
         if [ "${{ matrix.target }}" = "aarch64-darwin" ]; then
           rustup target add aarch64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
-          cp target/aarch64-apple-darwin/release/harness harness-${{ matrix.target }}
+          cp target/aarch64-apple-darwin/release/nanna harness-${{ matrix.target }}
         else
           cargo build --release
-          cp target/release/harness harness-${{ matrix.target }}
+          cp target/release/nanna harness-${{ matrix.target }}
         fi
 
     - name: Upload release artifact
