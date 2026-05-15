@@ -94,12 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
     let workspace_root = std::env::current_dir()?;
     let tool_registry = create_tool_registry(&workspace_root);
 
+    // NOTE: `OllamaProvider::new` is constructed per-arm rather than at the
+    // top of `main` so that subcommands which do not talk to Ollama (`Tools`,
+    // `McpServe` — the latter builds its own provider inside
+    // `run_mcp_server`) do not fail at startup when Ollama is unreachable.
+    // This unblocks hermetic smoke tests for `mcp-serve` that run without a
+    // live Ollama in CI.
     match cli.command {
         Commands::Chat {
             model,
@@ -107,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tools,
             temperature,
         } => {
+            let provider = make_ollama_provider()?;
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -132,12 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
+            let provider = make_ollama_provider()?;
             list_models(&provider).await?;
         }
         Commands::Tools => {
             list_tools(&tool_registry);
         }
         Commands::Health => {
+            let provider = make_ollama_provider()?;
             health_check(&provider).await?;
         }
         Commands::Agent {
@@ -216,6 +222,10 @@ fn generate_swebench_report(
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     harness::tools::create_tool_registry(workspace_root)
+}
+
+fn make_ollama_provider() -> Result<OllamaProvider, model::ModelError> {
+    OllamaProvider::new(OllamaConfig::default())
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
@@ -504,11 +514,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -566,8 +576,7 @@ async fn run_agent(
     use harness::agent::{AgentConfig, AgentContext, AgentLoop};
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = Arc::new(make_ollama_provider()?);
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -634,8 +643,9 @@ async fn run_mcp_server(
     use harness::task::TaskManager;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    // Use the shared make_ollama_provider() helper so construction is in one
+    // place and cannot silently diverge if OllamaConfig changes.
+    let provider = Arc::new(make_ollama_provider()?);
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
