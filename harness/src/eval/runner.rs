@@ -722,12 +722,11 @@ where
     };
 
     let success = resolved && task_completed;
-    let execution_time = start.elapsed();
 
     Ok(EvalRunResult {
         case_id: eval_case.case.id.clone(),
         success,
-        execution_time,
+        execution_time: start.elapsed(),
         iterations,
         token_usage,
         verification: VerificationResult {
