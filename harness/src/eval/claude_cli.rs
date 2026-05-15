@@ -487,7 +487,7 @@ mod tests {
     fn stub_claude_emitting(json_blob: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
-        let escaped = json_blob.replace('\'', "'\\''" );
+        let escaped = json_blob.replace('\'', "'\\''");
         let script = format!("#!/usr/bin/env bash\nprintf '%s' '{}'\nexit 0\n", escaped);
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
@@ -588,7 +588,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude");
         let payload = r#"{"result":"budget exceeded","session_id":"x","usage":{"input_tokens":50,"output_tokens":0},"total_cost_usd":0.011,"is_error":true}"#;
-        let escaped = payload.replace('\'', "'\\''" );
+        let escaped = payload.replace('\'', "'\\''");
         std::fs::write(
             &path,
             format!("#!/usr/bin/env bash\nprintf '%s' '{}'\nexit 1\n", escaped),
