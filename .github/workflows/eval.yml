@@ -80,6 +80,11 @@ jobs:
         MODEL: ${{ inputs.model }}
         NANNA_EVAL_MODEL: ${{ inputs.model }}
         CASE_FILTER: ${{ inputs.case_filter }}
+        # SWE-bench cases shell out to the installed `nanna` binary; point
+        # the eval-runner at the workspace-built artefact rather than
+        # whatever happens to be on PATH. The Build step above produces
+        # this via `cargo build --release --workspace --all-features`.
+        NANNA_HARNESS_BIN: ${{ github.workspace }}/target/release/nanna
       run: |
         echo "## Eval Results" > eval-results.md
         echo "" >> eval-results.md
