@@ -25,6 +25,7 @@
 
 use crate::agent::eval_case::{EvalCase, EvalCaseError};
 use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunResult};
+use crate::eval::claude_cli::{ClaudeCodeError, ClaudeCodeRunner};
 use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, SWEBenchTask};
 use crate::eval::swebench_verify::{
     verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
@@ -63,6 +64,32 @@ pub enum EvalRunnerError {
     SwebenchVerify(#[from] VerifyError),
     #[error("git diff capture failed: {0}")]
     GitDiff(String),
+    #[error("claude -p subprocess failed: {0}")]
+    ClaudeCli(#[from] ClaudeCodeError),
+}
+
+/// Which agent loop drives a single eval invocation.
+///
+/// `AgentLoop` is the existing nanna path (used by `nanna_solo` /
+/// `claude_mcp_nanna_gemma4`). `ClaudeCodeDirect` short-circuits to a
+/// `claude -p` subprocess with file/bash tools, used for the `claude_solo`
+/// scorecard category — the cat 1 baseline against which cat 2's
+/// MCP-mediated delegation overhead is measured.
+#[derive(Debug, Clone, Default)]
+pub enum RunnerMode {
+    /// Drive nanna's [`AgentLoop`] with the configured Ollama model.
+    #[default]
+    AgentLoop,
+    /// Spawn `claude -p` (Claude Code in headless mode) per instance.
+    /// `model` overrides the default `claude-opus-4-7`. `max_budget_usd`
+    /// caps per-instance API spend (forwarded to `--max-budget-usd`).
+    /// `allowed_tools` overrides the default Read/Edit/Write/Bash/Glob/Grep
+    /// surface; an empty vec leaves the flag unset (Claude Code default).
+    ClaudeCodeDirect {
+        model: String,
+        max_budget_usd: Option<f64>,
+        allowed_tools: Vec<String>,
+    },
 }
 
 /// Configuration for the eval runner.
@@ -90,6 +117,10 @@ pub struct EvalRunnerConfig {
     /// where verification happens once across all instances after every
     /// agent has run, rather than per-instance.
     pub swebench_skip_verify: bool,
+    /// Which agent loop to drive. Defaults to [`RunnerMode::AgentLoop`]
+    /// (nanna). Set to [`RunnerMode::ClaudeCodeDirect`] for the cat 1
+    /// `claude_solo` scorecard track.
+    pub mode: RunnerMode,
 }
 
 impl Default for EvalRunnerConfig {
@@ -107,6 +138,7 @@ impl Default for EvalRunnerConfig {
             swebench_hf_dataset: "princeton-nlp/SWE-bench_Verified".to_string(),
             swebench_run_id: run_id,
             swebench_skip_verify: false,
+            mode: RunnerMode::default(),
         }
     }
 }
@@ -134,6 +166,11 @@ impl EvalRunnerConfig {
 
     pub fn with_swebench_skip_verify(mut self, skip: bool) -> Self {
         self.swebench_skip_verify = skip;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: RunnerMode) -> Self {
+        self.mode = mode;
         self
     }
 }
@@ -233,6 +270,27 @@ pub async fn run_eval(
         }
         None
     };
+
+    // Branch on `RunnerMode`. ClaudeCodeDirect short-circuits the
+    // AgentLoop entirely — `claude -p` is the agent loop in that mode.
+    if let RunnerMode::ClaudeCodeDirect {
+        model,
+        max_budget_usd,
+        allowed_tools,
+    } = &config.mode
+    {
+        return run_claude_code_direct(
+            eval_case,
+            work_dir,
+            swebench_task.as_ref(),
+            config,
+            model,
+            *max_budget_usd,
+            allowed_tools,
+            start,
+        )
+        .await;
+    }
 
     // --- 2. Build and run agent ---
     let agent_config = AgentConfig {
@@ -511,6 +569,142 @@ async fn finish_swebench(
         failures,
         agent_result,
         swebench_patch: Some(model_patch),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ClaudeCodeDirect — `claude -p` as the agent loop
+// ---------------------------------------------------------------------------
+
+/// Translate a [`crate::eval::claude_cli::ClaudeCodeRun`]'s u64 token
+/// counters into the workspace's u32 [`TokenUsage`] shape, saturating at
+/// [`u32::MAX`] for the (extremely unlikely) overflow case.
+fn token_usage_from_claude_run(run: &crate::eval::claude_cli::ClaudeCodeRun) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: u32::try_from(run.prompt_tokens).unwrap_or(u32::MAX),
+        completion_tokens: u32::try_from(run.completion_tokens).unwrap_or(u32::MAX),
+        total_tokens: u32::try_from(run.total_tokens).unwrap_or(u32::MAX),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_claude_code_direct(
+    eval_case: &EvalCase,
+    work_dir: &Path,
+    swebench_task: Option<&SWEBenchTask>,
+    config: &EvalRunnerConfig,
+    model: &str,
+    max_budget_usd: Option<f64>,
+    allowed_tools: &[String],
+    start: Instant,
+) -> Result<EvalRunResult, EvalRunnerError> {
+    let mut runner = ClaudeCodeRunner::new().with_model(model);
+    if let Some(b) = max_budget_usd {
+        runner = runner.with_max_budget_usd(b);
+    }
+    if !allowed_tools.is_empty() {
+        runner = runner.with_allowed_tools(allowed_tools.iter().cloned());
+    }
+    if let Ok(bin) = std::env::var("NANNA_CLAUDE_BIN") {
+        runner = runner.with_claude_bin(bin);
+    }
+
+    let task_prompt = &eval_case.task.prompt;
+    let timeout = Duration::from_secs(eval_case.metadata.timeout_secs);
+    let claude_run = match tokio::time::timeout(timeout, runner.run(task_prompt, work_dir)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(EvalRunnerError::ClaudeCli(e)),
+        Err(_) => return Err(EvalRunnerError::Timeout(timeout)),
+    };
+
+    let token_usage = token_usage_from_claude_run(&claude_run);
+    let mut failures: Vec<String> = Vec::new();
+    if claude_run.is_error {
+        failures.push(format!(
+            "claude -p reported is_error=true: {}",
+            claude_run.result.as_deref().unwrap_or("(no result body)")
+        ));
+    }
+
+    if let Some(task) = swebench_task {
+        // SWE-bench branch: capture diff + (optionally) run upstream verifier.
+        let model_patch = capture_swebench_patch(work_dir, &task.base_commit).await?;
+
+        let resolved = if config.swebench_skip_verify {
+            failures.push("verifier skipped — score-mode batched run".to_string());
+            false
+        } else {
+            let verify_dir = work_dir.join("__nanna_verify");
+            std::fs::create_dir_all(&verify_dir)?;
+            let verify_config = VerifyConfig {
+                dataset_name: config.swebench_hf_dataset.clone(),
+                model_name_or_path: format!("claude_solo__{}", model.replace([':', '/'], "-")),
+                run_id: config.swebench_run_id.clone(),
+                work_dir: verify_dir,
+                max_workers: 1,
+            };
+            let predictions = vec![Prediction {
+                instance_id: task.instance_id.clone(),
+                model_patch: model_patch.clone(),
+            }];
+            let verdicts = verify_predictions(&predictions, &verify_config).await?;
+            let verdict: Option<&InstanceVerdict> =
+                verdicts.iter().find(|v| v.instance_id == task.instance_id);
+            if let Some(v) = verdict {
+                if let Some(err) = &v.error {
+                    failures.push(format!("SWE-bench verifier: {err}"));
+                }
+                if !v.resolved && v.error.is_none() {
+                    failures.push("SWE-bench verdict: not resolved".to_string());
+                }
+                v.resolved
+            } else {
+                failures.push(format!(
+                    "SWE-bench verdict missing for instance {}",
+                    task.instance_id
+                ));
+                false
+            }
+        };
+
+        return Ok(EvalRunResult {
+            case_id: eval_case.case.id.clone(),
+            success: resolved && !claude_run.is_error,
+            execution_time: start.elapsed(),
+            iterations: 1,
+            token_usage,
+            verification: VerificationResult {
+                build_passed: None,
+                tests_passed: None,
+                files_found: Vec::new(),
+                missing_files: Vec::new(),
+                symbols_found: Vec::new(),
+                missing_symbols: Vec::new(),
+            },
+            failures,
+            agent_result: None,
+            swebench_patch: Some(model_patch),
+        });
+    }
+
+    // Non-SWE-bench branch: run the in-tree build/test/file/symbol checks
+    // against whatever the subprocess wrote into work_dir.
+    let verification =
+        run_verification(work_dir, &eval_case.expected, &eval_case.task.language).await;
+    if !verification.all_passed() {
+        failures.extend(verification_failures(&verification));
+    }
+    let success = failures.is_empty();
+    Ok(EvalRunResult {
+        case_id: eval_case.case.id.clone(),
+        success,
+        execution_time: start.elapsed(),
+        iterations: 1,
+        token_usage,
+        verification,
+        failures,
+        agent_result: None,
+        swebench_patch: None,
     })
 }
 
@@ -1461,5 +1655,183 @@ mod tests {
         let content = collect_source_content(dir.path(), &["rs"]);
         assert!(content.contains("inside_fn"));
         assert!(!content.contains("outside_fn"));
+    }
+
+    // ----------------- ClaudeCodeDirect runner mode -----------------
+
+    #[test]
+    fn runner_mode_default_is_agent_loop() {
+        let m = RunnerMode::default();
+        assert!(matches!(m, RunnerMode::AgentLoop));
+    }
+
+    #[test]
+    fn config_with_mode_sets_claude_code_direct() {
+        let cfg = EvalRunnerConfig::default().with_mode(RunnerMode::ClaudeCodeDirect {
+            model: "claude-haiku-4-5".to_string(),
+            max_budget_usd: Some(0.25),
+            allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+        });
+        match cfg.mode {
+            RunnerMode::ClaudeCodeDirect {
+                model,
+                max_budget_usd,
+                allowed_tools,
+            } => {
+                assert_eq!(model, "claude-haiku-4-5");
+                assert_eq!(max_budget_usd, Some(0.25));
+                assert_eq!(allowed_tools, vec!["Read", "Edit"]);
+            }
+            other => panic!("expected ClaudeCodeDirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_usage_from_claude_run_saturates_at_u32_max() {
+        use crate::eval::claude_cli::ClaudeCodeRun;
+        let r = ClaudeCodeRun {
+            result: None,
+            session_id: None,
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            total_tokens: u64::MAX,
+            total_cost_usd: 0.0,
+            is_error: false,
+            stderr: String::new(),
+            exit_status: 0,
+        };
+        let u = token_usage_from_claude_run(&r);
+        assert_eq!(u.prompt_tokens, u32::MAX);
+        assert_eq!(u.completion_tokens, u32::MAX);
+        assert_eq!(u.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn token_usage_from_claude_run_normal_values() {
+        use crate::eval::claude_cli::ClaudeCodeRun;
+        let r = ClaudeCodeRun {
+            result: None,
+            session_id: None,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            total_tokens: 150,
+            total_cost_usd: 0.0,
+            is_error: false,
+            stderr: String::new(),
+            exit_status: 0,
+        };
+        let u = token_usage_from_claude_run(&r);
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+    }
+
+    /// Build a stub `claude` binary that:
+    /// - parses `--add-dir <DIR>` from its argv;
+    /// - writes `<DIR>/<file_to_create>` with `<file_contents>`;
+    /// - prints a fixed JSON-success blob and exits 0.
+    #[cfg(unix)]
+    fn write_stub_claude_creating(
+        bin_dir: &Path,
+        file_to_create: &str,
+        file_contents: &str,
+    ) -> PathBuf {
+        let path = bin_dir.join("claude");
+        let escaped_contents = file_contents.replace('\'', "'\\''");
+        let escaped_file = file_to_create.replace('\'', "'\\''");
+        let json = r#"{"result":"ok","session_id":"sid","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.0,"is_error":false}"#;
+        let escaped_json = json.replace('\'', "'\\''");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -e\nADD_DIR=\"\"\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --add-dir) shift; ADD_DIR=\"$1\";;\n  esac\n  shift || true\ndone\nmkdir -p \"$(dirname \"$ADD_DIR/{}\")\"\nprintf '%s' '{}' > \"$ADD_DIR/{}\"\nprintf '%s' '{}'\n",
+            escaped_file, escaped_contents, escaped_file, escaped_json
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_eval_in_claude_code_direct_mode_picks_up_subprocess_changes() {
+        // Set up a non-swebench eval case whose expected outcome is
+        // creation of `extra.rs` containing the symbol `extra`. The
+        // stub `claude` shim writes that file when invoked, so the
+        // verification block (file presence + symbol search) passes.
+        let case_root = tempfile::tempdir().unwrap();
+        let repo_src = case_root.path().join("repo");
+        std::fs::create_dir_all(repo_src.join("src")).unwrap();
+        std::fs::write(repo_src.join("src/lib.rs"), "// stub crate\n").unwrap();
+        std::fs::write(
+            repo_src.join("Cargo.toml"),
+            "[package]\nname = \"stub\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+
+        let toml_str = r#"
+[case]
+id = "claude-cli-smoke"
+name = "ClaudeCodeDirect smoke"
+description = "Verify claude -p subprocess wiring"
+
+[task]
+prompt = "create extra.rs"
+language = "rust"
+
+[expected]
+files_changed = ["src/extra.rs"]
+required_symbols = ["extra"]
+
+[metadata]
+timeout_secs = 30
+"#;
+        let case = EvalCase::from_toml_str(toml_str).unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let stub = write_stub_claude_creating(
+            bin_dir.path(),
+            "src/extra.rs",
+            "pub fn extra() -> &'static str { \"hi\" }\n",
+        );
+        // Hand the stub to the runner via NANNA_CLAUDE_BIN.
+        std::env::set_var("NANNA_CLAUDE_BIN", &stub);
+
+        let config = EvalRunnerConfig::default().with_mode(RunnerMode::ClaudeCodeDirect {
+            model: "claude-haiku-4-5".to_string(),
+            max_budget_usd: Some(0.05),
+            allowed_tools: vec![],
+        });
+
+        let result = run_eval(&case, case_root.path(), &config).await.unwrap();
+        std::env::remove_var("NANNA_CLAUDE_BIN");
+
+        assert_eq!(result.case_id, "claude-cli-smoke");
+        assert_eq!(result.iterations, 1, "claude -p counts as one iteration");
+        assert_eq!(result.token_usage.prompt_tokens, 10);
+        assert_eq!(result.token_usage.completion_tokens, 5);
+        assert!(result.agent_result.is_none(), "no AgentLoop in this mode");
+        assert!(
+            result
+                .verification
+                .files_found
+                .contains(&"src/extra.rs".to_string()),
+            "verification should find the file the stub created; got {:?}",
+            result.verification.files_found
+        );
+        assert!(
+            result
+                .verification
+                .symbols_found
+                .contains(&"extra".to_string()),
+            "verification should find the `extra` symbol; got {:?}",
+            result.verification.symbols_found
+        );
     }
 }

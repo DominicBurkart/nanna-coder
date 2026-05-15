@@ -12,7 +12,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Parser;
-use harness::eval::runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
+use harness::eval::runner::{
+    run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError, RunnerMode,
+};
 use harness::eval::scoring::{
     aggregate_scorecard, append_line, instance_state_from_outcome, load_all_states,
     outcome_from_run_eval, predictions_dir, read_state, resolve_model, sanitize_model_for_path,
@@ -24,6 +26,19 @@ use harness::eval::swebench_verify::{verify_predictions, Prediction, VerifyConfi
 
 fn parse_category(s: &str) -> Result<ScorecardCategory, String> {
     ScorecardCategory::from_str(s)
+}
+
+/// Allowed values for the `--mode` flag. Drives which runner path
+/// `run_eval` takes per instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CliMode {
+    /// Default. Drive nanna's `AgentLoop` (with the configured Ollama
+    /// model) — the `nanna_solo` / `claude_mcp_nanna_gemma4` worker path.
+    #[clap(name = "swebench")]
+    Swebench,
+    /// Spawn `claude -p` per instance — the `claude_solo` (cat 1) path.
+    #[clap(name = "claude-code-direct")]
+    ClaudeCodeDirect,
 }
 
 #[derive(Parser, Debug)]
@@ -61,6 +76,28 @@ struct Args {
     /// runs from before schema v2 do not break.
     #[arg(long)]
     model: Option<String>,
+
+    /// Which runner path drives each eval instance.
+    ///
+    /// * `swebench` (default) — drive nanna's `AgentLoop` with the
+    ///   configured Ollama model. Used for `nanna_solo` and the
+    ///   `claude_mcp_nanna_gemma4` worker.
+    /// * `claude-code-direct` — spawn `claude -p` per instance. Used for
+    ///   the `claude_solo` (cat 1) scorecard track.
+    #[arg(long, value_enum, default_value_t = CliMode::Swebench)]
+    mode: CliMode,
+
+    /// Per-instance USD spending cap, forwarded to `claude -p
+    /// --max-budget-usd`. Only honoured when `--mode claude-code-direct`.
+    /// `None` means no cap.
+    #[arg(long)]
+    max_budget_usd: Option<f64>,
+
+    /// Comma-separated `--allowed-tools` for `claude -p`. Empty leaves
+    /// the wrapper's default set (Read, Edit, Write, Bash, Glob, Grep).
+    /// Only honoured when `--mode claude-code-direct`.
+    #[arg(long, value_delimiter = ',')]
+    allowed_tools: Vec<String>,
 
     #[arg(long)]
     max_instances: Option<usize>,
@@ -215,6 +252,13 @@ async fn attempt_instance(
     config.swebench_dataset_path = Some(args.dataset.clone());
     config.swebench_hf_dataset = args.dataset_name.clone();
     config.swebench_run_id = run_id.to_string();
+    if matches!(args.mode, CliMode::ClaudeCodeDirect) {
+        config = config.with_mode(RunnerMode::ClaudeCodeDirect {
+            model: model.to_string(),
+            max_budget_usd: args.max_budget_usd,
+            allowed_tools: args.allowed_tools.clone(),
+        });
+    }
 
     let case_dir = args
         .dataset
