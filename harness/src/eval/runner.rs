@@ -2267,17 +2267,18 @@ timeout_secs = 3
         let url = format!("http://{}", addr);
         tokio::spawn(async move {
             loop {
-                let (mut socket, _) = match listener.accept().await {
+                let (socket, _) = match listener.accept().await {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                // Hold the socket open without reading or writing — the
-                // client will hang on send().await.
+                // Hold the socket open forever — never read, never write,
+                // never close. The HTTP client connects, sends its
+                // request (buffered by the kernel), then blocks on the
+                // response read. The per-case tokio::time::timeout is the
+                // only thing that breaks the hang.
                 tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = [0u8; 1];
-                    // Read forever (blocks until peer closes).
-                    let _ = socket.read_exact(&mut buf).await;
+                    let _kept = socket;
+                    std::future::pending::<()>().await;
                 });
             }
         });
