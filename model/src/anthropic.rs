@@ -707,11 +707,12 @@ mod tests {
         assert_eq!(result.len(), 1);
         let content = result[0]["content"].as_array().unwrap();
         // input must be a JSON object, not a string
-        let input = &content
-            .iter()
-            .find(|b| b["type"] == "tool_use")
-            .unwrap()["input"];
-        assert!(input.is_object(), "input must be an object, got: {:?}", input);
+        let input = &content.iter().find(|b| b["type"] == "tool_use").unwrap()["input"];
+        assert!(
+            input.is_object(),
+            "input must be an object, got: {:?}",
+            input
+        );
         assert_eq!(input["query"], "rust");
     }
 
@@ -731,10 +732,7 @@ mod tests {
 
         let result = AnthropicProvider::messages_to_anthropic(&[msg]);
         let content = result[0]["content"].as_array().unwrap();
-        let input = &content
-            .iter()
-            .find(|b| b["type"] == "tool_use")
-            .unwrap()["input"];
+        let input = &content.iter().find(|b| b["type"] == "tool_use").unwrap()["input"];
         assert!(input.is_object());
         assert_eq!(input.as_object().unwrap().len(), 0);
     }
@@ -800,8 +798,7 @@ mod tests {
             "middle tool should not have cache_control"
         );
         assert_eq!(
-            result[2]["cache_control"]["type"],
-            "ephemeral",
+            result[2]["cache_control"]["type"], "ephemeral",
             "last tool should have cache_control"
         );
 
