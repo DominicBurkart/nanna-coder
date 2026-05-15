@@ -1058,7 +1058,10 @@ async fn comprehensive_converts_model_err_into_failure_result() {
 #[tokio::test]
 async fn mock_provider_list_models_and_health_check() {
     let judge = MockModelJudge::all_success();
-    let models = judge.list_models().await.expect("list_models should succeed");
+    let models = judge
+        .list_models()
+        .await
+        .expect("list_models should succeed");
     assert!(models.is_empty());
     judge
         .health_check()
