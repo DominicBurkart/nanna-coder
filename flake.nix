@@ -164,6 +164,7 @@
           binaryCacheUtils = cache.binaryCacheUtils;
           devUtils = scripts.devUtils;
           cacheUtils = scripts.cacheUtils;
+          buildScripts = scripts.buildScripts;
           vllmImage = containers.vllmImage { };
           vllmImageMimo = containers.vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
           vllmImageQwen = containers.vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };
@@ -173,7 +174,7 @@
       {
         packages = {
           default = packages.nanna-coder;
-          inherit (packages) nanna-coder harness;
+          inherit (packages) nanna-coder nanna harness;
 
           # Container images (production)
           inherit (containers) harnessImage ollamaImage devContainerImage;
@@ -323,12 +324,12 @@
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
-            cargoBuildCommand = "cargo build --release --bin harness";
-            cargoCheckCommand = "cargo check --bin harness";
+            cargoBuildCommand = "cargo build --release --bin nanna";
+            cargoCheckCommand = "cargo check --bin nanna";
             cargoTestCommand = "cargo test --package harness";
             installPhase = ''
               mkdir -p $out/bin
-              cp target/release/harness $out/bin/
+              cp target/release/nanna $out/bin/
             '';
           };
 
@@ -344,10 +345,10 @@
                     inherit src cargoArtifacts;
                     buildInputs = commonBuildInputs;
                     nativeBuildInputs = commonNativeBuildInputs;
-                    cargoBuildCommand = "cargo build --release --bin harness";
+                    cargoBuildCommand = "cargo build --release --bin nanna";
                     installPhase = ''
                       mkdir -p $out/bin
-                      cp target/release/harness $out/bin/
+                      cp target/release/nanna $out/bin/
                     '';
                   })
                   pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils
@@ -355,7 +356,7 @@
                 pathsToLink = [ "/bin" "/etc" "/share" ];
               };
               config = {
-                Cmd = [ "/bin/harness" ];
+                Cmd = [ "/bin/nanna" ];
                 Env = [
                   "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                   "RUST_LOG=info"
@@ -400,10 +401,10 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
+              cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
-                cp target/release/harness $out/bin/
+                cp target/release/nanna $out/bin/
               '';
             });
           }).vllmImage { };
@@ -415,10 +416,10 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
+              cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
-                cp target/release/harness $out/bin/
+                cp target/release/nanna $out/bin/
               '';
             });
           }).vllmImage { model = "XiaomiMiMo/MiMo-V2-Flash"; };
@@ -430,10 +431,10 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
-              cargoBuildCommand = "cargo build --release --bin harness";
+              cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
-                cp target/release/harness $out/bin/
+                cp target/release/nanna $out/bin/
               '';
             });
           }).vllmImage { model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"; };

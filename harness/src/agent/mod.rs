@@ -19,6 +19,9 @@ pub mod project_detect;
 pub mod project_prompt;
 pub mod prompts;
 pub mod rag;
+pub mod report;
+
+pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
@@ -209,7 +212,7 @@ pub struct AgentContext {
 }
 
 /// Result of running the agent
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
     /// Final state of the agent
     pub final_state: AgentState,

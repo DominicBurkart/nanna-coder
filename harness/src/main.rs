@@ -13,7 +13,7 @@ use tracing::{error, info};
 // will introduce `PersistentEntityStore` and swap the binding here.
 
 #[derive(Parser)]
-#[command(name = "harness")]
+#[command(name = "nanna")]
 #[command(about = "A CLI tool for interacting with language models")]
 struct Cli {
     #[command(subcommand)]
@@ -36,13 +36,20 @@ enum Commands {
         /// Temperature setting (0.0 to 2.0)
         #[arg(long, default_value = "0.7")]
         temperature: f32,
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
     },
     /// List available models
     Models,
     /// List available tools
     Tools,
     /// Health check
-    Health,
+    Health {
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
+    },
     /// Run the autonomous agent with a prompt
     Agent {
         /// The prompt for the agent
@@ -60,6 +67,20 @@ enum Commands {
         /// Enable tool calling
         #[arg(short, long)]
         tools: bool,
+        /// Workspace root the agent operates against. Defaults to cwd.
+        #[arg(long)]
+        work_dir: Option<std::path::PathBuf>,
+        /// Write the structured AgentRunReport JSON here. When set, the
+        /// human-readable summary is suppressed and the eval-shape JSON is
+        /// the sole output artifact.
+        #[arg(long)]
+        output_json: Option<std::path::PathBuf>,
+        /// Override the Ollama endpoint (default http://localhost:11434).
+        #[arg(long)]
+        ollama_url: Option<String>,
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
     },
     /// Run as an MCP server over stdio
     McpServe {
@@ -94,19 +115,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
-    let workspace_root = std::env::current_dir()?;
-    let tool_registry = create_tool_registry(&workspace_root);
-
     match cli.command {
         Commands::Chat {
             model,
             prompt,
             tools,
             temperature,
+            no_ensure_pod,
         } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let workspace_root = std::env::current_dir()?;
+            let tool_registry = create_tool_registry(&workspace_root);
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -132,12 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             list_models(&provider).await?;
         }
         Commands::Tools => {
+            let workspace_root = std::env::current_dir()?;
+            let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
         }
-        Commands::Health => {
+        Commands::Health { no_ensure_pod } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             health_check(&provider).await?;
         }
         Commands::Agent {
@@ -146,7 +171,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             verbose,
             tools,
+            work_dir,
+            output_json,
+            ollama_url,
+            no_ensure_pod,
         } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let workspace_root = match work_dir {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
             run_agent(
                 &prompt,
                 &model,
@@ -154,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                output_json.as_deref(),
+                ollama_url.as_deref(),
             )
             .await?;
         }
@@ -555,6 +591,26 @@ fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
     }
 }
 
+/// Run `pod::ensure_running`; on failure, print to stderr and exit with
+/// code 3 so the eval-side caller (or a CI step) can distinguish pod
+/// bring-up failures from agent-loop failures.
+///
+/// `async` to match `pod::ensure_running` — the probe and post-bring-up
+/// health wait both run on the Tokio executor. The previous sync wrapper
+/// used `std::thread::sleep` inside `wait_for_ollama` and stalled the
+/// runtime for up to 60s.
+async fn ensure_pod_or_exit(no_ensure_pod_flag: bool) {
+    let cfg = harness::pod::EnsureConfig::from_env_and_flag(no_ensure_pod_flag);
+    match harness::pod::ensure_running(&cfg).await {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("nanna: pod ensure failed: {e}");
+            std::process::exit(3);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_agent(
     prompt: &str,
     model: &str,
@@ -562,11 +618,16 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    output_json: Option<&std::path::Path>,
+    ollama_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::agent::{AgentConfig, AgentContext, AgentLoop};
+    use harness::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunReport};
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
+    let mut config = OllamaConfig::default();
+    if let Some(url) = ollama_url {
+        config = config.with_base_url(url.to_string());
+    }
     let provider = Arc::new(OllamaProvider::new(config)?);
     let entity_store = initialize_workspace(workspace_root).await;
 
@@ -577,17 +638,20 @@ async fn run_agent(
         model_name: model.to_string(),
     };
 
+    // Match the eval-runner shape: prompt enters via `user_prompt`, not via
+    // pre-seeded `conversation_history`. `run_tool_loop` builds the user
+    // message from `user_prompt` itself.
     let context = AgentContext {
         user_prompt: prompt.to_string(),
-        conversation_history: vec![ChatMessage::user(prompt)],
+        conversation_history: vec![],
         app_state_id: "cli".to_string(),
     };
 
     if verbose {
-        println!("Starting agent with model: {}", model);
-        println!("Prompt: {}", prompt);
-        println!("Max iterations: {}", max_iterations);
-        println!("Tools enabled: {}", tools);
+        eprintln!("Starting agent with model: {}", model);
+        eprintln!("Prompt: {}", prompt);
+        eprintln!("Max iterations: {}", max_iterations);
+        eprintln!("Tools enabled: {}", tools);
     }
 
     let mut agent = if tools {
@@ -597,7 +661,19 @@ async fn run_agent(
         AgentLoop::with_llm(agent_config, entity_store, provider)
     };
 
-    let result = agent.run(context).await?;
+    let result = match agent.run_tool_loop(context).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("nanna: agent error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if let Some(path) = output_json {
+        let report = AgentRunReport::from(&result);
+        report.write_to_path(path)?;
+        return Ok(());
+    }
 
     println!("\n--- Agent Result ---");
     println!("Completed: {}", result.task_completed);
