@@ -1,21 +1,35 @@
-//! `ClaudeCodeRunner` — headless `claude -p` subprocess wrapper.
+//! `ClaudeCodeRunner` — headless `claude -p` subprocess wrapper with
+//! NDJSON event capture.
 //!
 //! Spawns the Claude Code CLI in non-interactive print mode with
-//! `--output-format json` and parses the single JSON object from stdout.
-//! The wrapper is *pure*: it spawns the subprocess, captures stdout,
-//! parses, and returns. The caller is responsible for setting up the
-//! repo state (`materialize`) before invocation and for capturing
-//! `git diff` after the subprocess exits.
+//! `--output-format stream-json --verbose`, streams every NDJSON event
+//! from stdout, optionally tees the stream to a per-invocation log
+//! file, and parses the final-result envelope for token/cost summary.
+//!
+//! The on-disk NDJSON log is the canonical "complete verbose logs"
+//! record: it captures every assistant message, every `tool_use` /
+//! `tool_result`, and the final summary, regardless of whether the
+//! result-envelope parser handles a future schema change.
+//!
+//! The wrapper is otherwise *pure*: it spawns the subprocess,
+//! captures stdout/stderr, parses, and returns. The caller is
+//! responsible for setting up the repo state (`materialize`) before
+//! invocation and for capturing `git diff` after the subprocess
+//! exits.
 //!
 //! Used by:
 //! - The cat 1 (`claude_solo`) eval-runner mode (`ClaudeCodeDirect`).
 //! - The cat 2 (`claude_mcp_claude`) worker dispatch inside the
 //!   nanna MCP server's `assign_task` handler.
 //!
-//! The `claude -p --output-format json` schema this module pins to:
+//! ## Final-result envelope schema
+//!
+//! In `--output-format stream-json`, the *last* NDJSON line is expected
+//! to be a result event with the shape:
 //!
 //! ```json
 //! {
+//!   "type": "result",
 //!   "result": "...",
 //!   "session_id": "...",
 //!   "usage": { "input_tokens": N, "output_tokens": N,
@@ -26,10 +40,16 @@
 //! }
 //! ```
 //!
-//! Source: <https://code.claude.com/docs/en/headless.md>. The schema may
-//! drift across Claude Code releases; the parser tolerates unknown
-//! fields but asserts on the required ones (`result`, `usage`,
-//! `is_error`).
+//! [`parse_output`] is schema-defensive: it scans lines from the end
+//! and returns the first one that deserialises as a result envelope.
+//! Intermediate `message_start` / `message_delta` events that also
+//! carry partial `usage` fields are skipped in favour of the final
+//! cumulative result line. If Claude Code adds new event types or
+//! reorders fields, the on-disk log remains intact and the parser
+//! can be adapted in a follow-up.
+//!
+//! Source: <https://code.claude.com/docs/en/headless.md>,
+//! <https://code.claude.com/docs/en/agent-sdk/streaming-output>.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -37,6 +57,7 @@ use std::process::Stdio;
 
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// Default model when [`ClaudeCodeRunner::model`] is not overridden.
@@ -72,6 +93,17 @@ pub struct ClaudeCodeRunner {
     pub permission_mode: String,
     /// `--mcp-config` path. Used by the cat-2 orchestrator runner mode.
     pub mcp_config: Option<PathBuf>,
+    /// When set, every NDJSON event from `claude -p --output-format
+    /// stream-json` is teed to a file at `<log_dir>/<log_file_name>.ndjson`.
+    /// Caller is responsible for ensuring the directory exists. `None`
+    /// disables log capture entirely (suitable for unit tests that only
+    /// care about the final summary).
+    pub log_dir: Option<PathBuf>,
+    /// Base name of the NDJSON log file written under [`log_dir`]. The
+    /// `.ndjson` suffix is added automatically. Defaults to `claude_p`
+    /// when unset; callers running multiple invocations (orchestrator +
+    /// workers) should set this to a unique tag per invocation.
+    pub log_file_name: String,
     /// Extra args appended after the standard ones, for forward-compat.
     pub extra_args: Vec<OsString>,
 }
@@ -98,8 +130,20 @@ impl ClaudeCodeRunner {
             bare: true,
             permission_mode: "bypassPermissions".to_string(),
             mcp_config: None,
+            log_dir: None,
+            log_file_name: "claude_p".to_string(),
             extra_args: Vec::new(),
         }
+    }
+
+    pub fn with_log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.log_dir = Some(dir.into());
+        self
+    }
+
+    pub fn with_log_file_name(mut self, name: impl Into<String>) -> Self {
+        self.log_file_name = name.into();
+        self
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -139,7 +183,13 @@ impl ClaudeCodeRunner {
         args.push("-p".into());
         args.push(task_description.into());
         args.push("--output-format".into());
-        args.push("json".into());
+        // stream-json: one NDJSON event per line. Captures every
+        // message, tool_use, and tool_result that `claude -p` emits,
+        // so the per-instance log file is a complete transcript.
+        args.push("stream-json".into());
+        // stream-json + --print requires --verbose; the CLI errors out
+        // otherwise. (See `claude --help` under --output-format.)
+        args.push("--verbose".into());
         args.push("--no-session-persistence".into());
         args.push("--permission-mode".into());
         args.push(self.permission_mode.as_str().into());
@@ -173,6 +223,13 @@ impl ClaudeCodeRunner {
     /// `repo_path` is passed to `--add-dir` *and* used as the
     /// subprocess `cwd` so any tool-emitted relative paths resolve
     /// against the repo.
+    ///
+    /// Stdout is read line-by-line. When `log_dir` is set, every NDJSON
+    /// event is teed to a file at `<log_dir>/<log_file_name>.ndjson`
+    /// before being collected for result parsing. The log file is the
+    /// authoritative source for "complete verbose logs" telemetry —
+    /// even if [`parse_output`] cannot identify a final-result line,
+    /// the on-disk transcript is intact.
     pub async fn run(
         &self,
         task_description: &str,
@@ -185,27 +242,98 @@ impl ClaudeCodeRunner {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
-            .await
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ClaudeCodeError::Spawn(format!("{}: {e}", self.claude_bin.display())))?;
+        let stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| ClaudeCodeError::Spawn("stdout pipe missing".to_string()))?;
+        let stderr_pipe = child.stderr.take();
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
+        // Set up optional log-file tee.
+        let log_path = self
+            .log_dir
+            .as_ref()
+            .map(|d| d.join(format!("{}.ndjson", self.log_file_name)));
+        let mut log_file = match log_path.as_ref() {
+            Some(p) => {
+                if let Some(parent) = p.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        return Err(ClaudeCodeError::Spawn(format!(
+                            "create log_dir {}: {e}",
+                            parent.display()
+                        )));
+                    }
+                }
+                Some(tokio::fs::File::create(p).await.map_err(|e| {
+                    ClaudeCodeError::Spawn(format!("open log file {}: {e}", p.display()))
+                })?)
+            }
+            None => None,
+        };
 
-        // `claude -p` may exit non-zero with a structured JSON body
-        // describing the failure (e.g. budget-exceeded, is_error=true).
+        // Stream stdout: each line is one NDJSON event. Tee to log
+        // file (if configured) and accumulate in memory for the
+        // result parser. Per-line latency is paid by the parser only;
+        // log-file writes are best-effort (a failed write is logged
+        // but does not abort the run, since the subprocess is still
+        // generating useful data).
+        let mut lines: Vec<String> = Vec::new();
+        let mut reader = BufReader::new(stdout_pipe).lines();
+        while let Some(line) = reader
+            .next_line()
+            .await
+            .map_err(|e| ClaudeCodeError::Spawn(format!("read claude stdout: {e}")))?
+        {
+            if let Some(f) = log_file.as_mut() {
+                use tokio::io::AsyncWriteExt as _;
+                if let Err(e) = f.write_all(line.as_bytes()).await {
+                    tracing::warn!("tee to log file failed: {e}");
+                }
+                if let Err(e) = f.write_all(b"\n").await {
+                    tracing::warn!("tee newline to log file failed: {e}");
+                }
+            }
+            lines.push(line);
+        }
+        if let Some(mut f) = log_file {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = f.flush().await;
+        }
+
+        // Collect stderr after stdout drains (subprocess will have
+        // exited or be about to). `wait_with_output` is not usable
+        // because we already took stdout, so wait manually + drain
+        // stderr.
+        let stderr_text = if let Some(mut stderr) = stderr_pipe {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
+        } else {
+            String::new()
+        };
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ClaudeCodeError::Spawn(format!("wait claude: {e}")))?;
+
         // Try to parse first; only surface a NonZeroExit if parse fails.
-        let parsed = parse_output(&stdout);
-        match (parsed, output.status.success()) {
+        // Claude Code may exit non-zero with a structured JSON body
+        // describing in-band failure (e.g. budget-exceeded), and we
+        // want the partial token usage even then.
+        let parsed = parse_output(&lines.join("\n"));
+        match (parsed, status.success()) {
             (Ok(run), _) => Ok(ClaudeCodeRun {
                 stderr: stderr_text,
-                exit_status: output.status.code().unwrap_or(-1),
+                exit_status: status.code().unwrap_or(-1),
+                log_path,
                 ..run
             }),
             (Err(e), true) => Err(e),
             (Err(_), false) => Err(ClaudeCodeError::NonZeroExit {
-                code: output.status.code().unwrap_or(-1),
+                code: status.code().unwrap_or(-1),
                 stderr: stderr_text,
             }),
         }
@@ -231,6 +359,9 @@ pub struct ClaudeCodeRun {
     pub is_error: bool,
     pub stderr: String,
     pub exit_status: i32,
+    /// Path to the per-invocation NDJSON log file when `log_dir` was
+    /// configured on the runner. `None` means logs were not captured.
+    pub log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -272,20 +403,55 @@ struct RawUsage {
     cache_read_input_tokens: u64,
 }
 
-/// Parse the single-JSON-object output produced by `claude -p
-/// --output-format json`. Tolerates unknown top-level fields (the
-/// schema may add fields in future Claude Code releases).
+/// Parse the result envelope from a `claude -p` stdout dump.
+///
+/// Handles both legacy `--output-format json` (a single top-level JSON
+/// object on stdout) and `--output-format stream-json` (NDJSON of
+/// per-event objects, with a final summary object on the last line)
+/// by scanning lines from the end and returning the first that
+/// deserialises as a [`RawOutput`] (i.e. carries a `usage` field).
+///
+/// Schema-defensive: future Claude Code releases may add or rename
+/// intermediate event types, but as long as *some* line still carries
+/// the `result` / `usage` / `is_error` shape, this parser keeps
+/// working. The on-disk log file remains the canonical record of
+/// every event regardless.
 fn parse_output(stdout: &str) -> Result<ClaudeCodeRun, ClaudeCodeError> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Err(ClaudeCodeError::ParseOutput("empty stdout".to_string()));
     }
-    let raw: RawOutput = serde_json::from_str(trimmed).map_err(|e| {
-        // Surface a useful error: the parse error + the first line of
-        // stdout so we can see what shape we got.
-        let preview: String = trimmed.lines().take(3).collect::<Vec<_>>().join(" / ");
-        ClaudeCodeError::ParseOutput(format!("{e}; stdout preview: {preview}"))
-    })?;
+    // Two valid shapes:
+    //   (a) `--output-format json` — one top-level JSON object on
+    //       stdout (possibly spanning many lines).
+    //   (b) `--output-format stream-json` — NDJSON: one event per
+    //       line, with the final summary object on the last line.
+    //
+    // Try shape (a) first by parsing the entire stdout as a single
+    // JSON value. If that fails, fall back to shape (b) and scan
+    // lines from the end.
+    let parsed_whole = serde_json::from_str::<RawOutput>(trimmed).ok();
+    let parsed_line = parsed_whole.or_else(|| {
+        trimmed
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .find_map(|line| serde_json::from_str::<RawOutput>(line.trim()).ok())
+    });
+    let raw = match parsed_line {
+        Some(r) => r,
+        None => {
+            let preview: String = trimmed
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            return Err(ClaudeCodeError::ParseOutput(format!(
+                "no line on stdout deserialised as a result envelope (expected fields: usage{{input_tokens, output_tokens}}, optional result/session_id/total_cost_usd/is_error); last lines: {preview}"
+            )));
+        }
+    };
     let total_tokens = raw.usage.input_tokens + raw.usage.output_tokens;
     Ok(ClaudeCodeRun {
         result: raw.result,
@@ -299,6 +465,7 @@ fn parse_output(stdout: &str) -> Result<ClaudeCodeRun, ClaudeCodeError> {
         is_error: raw.is_error,
         stderr: String::new(),
         exit_status: 0,
+        log_path: None,
     })
 }
 
@@ -403,10 +570,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_output_picks_final_line_from_stream_json() {
+        // stream-json shape: many event lines, final line is the
+        // result envelope. The parser must skip non-matching lines
+        // (e.g. message_start / content_block_delta) and pick the
+        // last one that deserialises as a result envelope.
+        let stream = "\
+{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"abc\"}
+{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}
+{\"type\":\"result\",\"result\":\"hi\",\"session_id\":\"abc\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3},\"total_cost_usd\":0.0002,\"is_error\":false}
+";
+        let run = parse_output(stream).unwrap();
+        assert_eq!(run.result.as_deref(), Some("hi"));
+        assert_eq!(run.session_id.as_deref(), Some("abc"));
+        assert_eq!(run.prompt_tokens, 12);
+        assert_eq!(run.completion_tokens, 3);
+        assert_eq!(run.total_tokens, 15);
+        assert!((run.total_cost_usd - 0.0002).abs() < 1e-12);
+        assert!(!run.is_error);
+    }
+
+    #[test]
+    fn parse_output_picks_last_result_line_when_multiple_have_usage() {
+        // If both `message_start` and the final `result` line have a
+        // `usage` field, the parser scans from the end and prefers
+        // the final result (which has cumulative tokens), not the
+        // intermediate event's partial usage.
+        let stream = "\
+{\"type\":\"message_start\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}
+{\"type\":\"result\",\"result\":\"done\",\"usage\":{\"input_tokens\":50,\"output_tokens\":20},\"total_cost_usd\":0.001,\"is_error\":false}
+";
+        let run = parse_output(stream).unwrap();
+        assert_eq!(run.prompt_tokens, 50);
+        assert_eq!(run.completion_tokens, 20);
+        assert_eq!(run.result.as_deref(), Some("done"));
+    }
+
+    #[test]
     fn parse_output_invalid_json_surfaces_preview() {
         let r = parse_output("not json {").unwrap_err();
         let msg = format!("{r}");
-        assert!(msg.contains("preview"), "error includes stdout preview");
+        // Error message must surface enough of stdout to debug a
+        // schema mismatch — the trailing tail of stdout in our case.
+        assert!(
+            msg.contains("last lines:"),
+            "error should include the 'last lines:' preview marker; got: {msg}"
+        );
         assert!(msg.contains("not json"));
     }
 
@@ -426,7 +635,10 @@ mod tests {
         assert_eq!(joined[1], "solve x");
         assert!(joined.contains(&"--output-format".to_string()));
         let i = joined.iter().position(|a| a == "--output-format").unwrap();
-        assert_eq!(joined[i + 1], "json");
+        assert_eq!(joined[i + 1], "stream-json");
+        // stream-json + --print requires --verbose; the CLI refuses
+        // otherwise.
+        assert!(joined.contains(&"--verbose".to_string()));
         assert!(joined.contains(&"--bare".to_string()));
         assert!(joined.contains(&"--no-session-persistence".to_string()));
         let p = joined
@@ -503,6 +715,21 @@ mod tests {
         assert_eq!(a.allowed_tools, b.allowed_tools);
         assert_eq!(a.bare, b.bare);
         assert_eq!(a.permission_mode, b.permission_mode);
+        assert_eq!(a.log_dir, b.log_dir);
+        assert_eq!(a.log_file_name, b.log_file_name);
+    }
+
+    #[test]
+    fn with_log_dir_sets_field_and_keeps_default_file_name() {
+        let r = ClaudeCodeRunner::new().with_log_dir("/tmp/eval-logs");
+        assert_eq!(r.log_dir.as_deref(), Some(Path::new("/tmp/eval-logs")));
+        assert_eq!(r.log_file_name, "claude_p");
+    }
+
+    #[test]
+    fn with_log_file_name_overrides_default() {
+        let r = ClaudeCodeRunner::new().with_log_file_name("orchestrator__instance_42");
+        assert_eq!(r.log_file_name, "orchestrator__instance_42");
     }
 
     // ---------------- subprocess via stub `claude` shim ---------------
@@ -645,5 +872,98 @@ mod tests {
         assert!(run.is_error);
         assert_eq!(run.prompt_tokens, 50);
         assert_eq!(run.exit_status, 1);
+    }
+
+    /// Build a stub `claude` binary that emits multiple NDJSON lines
+    /// (mimicking `--output-format stream-json`) and exits 0.
+    #[cfg(unix)]
+    fn stub_claude_streaming(lines: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude");
+        let body = lines.join("\n");
+        let escaped = body.replace('\'', "'\\''");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' '{}'\nexit 0\n",
+            escaped
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_writes_log_when_log_dir_set() {
+        // With `log_dir` configured, every NDJSON line from the
+        // subprocess is teed to `<log_dir>/<log_file_name>.ndjson`.
+        // The log file is the canonical record for verbose telemetry
+        // even if the result parser later cannot identify the final
+        // envelope.
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"system","subtype":"init","session_id":"sid"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"result","result":"hi","session_id":"sid","usage":{"input_tokens":7,"output_tokens":1},"total_cost_usd":0.0,"is_error":false}"#,
+        ]);
+        let log_dir = tempfile::tempdir().unwrap();
+        let runner = ClaudeCodeRunner::new()
+            .with_claude_bin(stub_dir.path().join("claude"))
+            .with_log_dir(log_dir.path())
+            .with_log_file_name("smoke");
+        let repo = tempfile::tempdir().unwrap();
+        let run = runner.run("hello", repo.path()).await.unwrap();
+
+        let expected_log = log_dir.path().join("smoke.ndjson");
+        assert_eq!(run.log_path.as_deref(), Some(expected_log.as_path()));
+        assert!(expected_log.is_file(), "log file should exist");
+        let body = std::fs::read_to_string(&expected_log).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        // 3 NDJSON events written by the stub.
+        assert_eq!(lines.len(), 3, "expected 3 NDJSON lines, got {body:?}");
+        assert!(lines[0].contains("\"type\":\"system\""));
+        assert!(lines[2].contains("\"type\":\"result\""));
+
+        // The result parser still finds the final envelope.
+        assert_eq!(run.result.as_deref(), Some("hi"));
+        assert_eq!(run.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_does_not_write_log_when_log_dir_unset() {
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"result","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}"#,
+        ]);
+        let runner = ClaudeCodeRunner::new().with_claude_bin(stub_dir.path().join("claude"));
+        let repo = tempfile::tempdir().unwrap();
+        let run = runner.run("hello", repo.path()).await.unwrap();
+        assert!(
+            run.log_path.is_none(),
+            "no log path expected when log_dir unset"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn run_creates_missing_log_dir_parents() {
+        let stub_dir = stub_claude_streaming(&[
+            r#"{"type":"result","result":"ok","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}"#,
+        ]);
+        let base = tempfile::tempdir().unwrap();
+        // Nested path that doesn't exist yet.
+        let nested = base.path().join("nested/deeply/eval-logs");
+        let runner = ClaudeCodeRunner::new()
+            .with_claude_bin(stub_dir.path().join("claude"))
+            .with_log_dir(&nested)
+            .with_log_file_name("auto-mkdir");
+        let repo = tempfile::tempdir().unwrap();
+        let run = runner.run("hi", repo.path()).await.unwrap();
+        assert!(nested.is_dir(), "log_dir parents should be auto-created");
+        assert!(run.log_path.is_some());
     }
 }
