@@ -1,10 +1,10 @@
-/// Integration-level unit tests for `model::judge`.
-///
-/// All tests here are pure (no network / no Ollama) and use an in-process
-/// `MockModelJudge` that implements `ModelJudge` by returning canned results.
-/// The goal is to exercise every observable behaviour of the types and the two
-/// public pure functions (`calculate_coherence_score`,
-/// `calculate_relevance_score`) without touching any LLM.
+//! Integration-level unit tests for `model::judge`.
+//!
+//! All tests here are pure (no network / no Ollama) and use an in-process
+//! `MockModelJudge` that implements `ModelJudge` by returning canned results.
+//! The goal is to exercise every observable behaviour of the types and the two
+//! public pure functions (`calculate_coherence_score`,
+//! `calculate_relevance_score`) without touching any LLM.
 use async_trait::async_trait;
 use model::judge::{
     calculate_coherence_score, calculate_relevance_score, JudgeConfig, ModelJudge,
@@ -556,13 +556,13 @@ fn result_display_contains_variant_marker() {
     // is caught (the existing in-module test already checks "\u{2705} SUCCESS").
     assert!(format!("{}", make_success()).contains("\u{2705} SUCCESS"));
     assert!(format!("{}", make_failure()).contains("\u{274c} FAILURE"));
-    // WARNING uses a multi-codepoint sequence; assert on the label+colon form
-    // that the Display impl emits.
-    assert!(format!("{}", make_warning()).contains("WARNING"));
+    // WARNING uses a multi-codepoint sequence (\u{26a0}\u{fe0f}); assert on the
+    // compound emoji+label form that the Display impl emits so the test catches
+    // both a missing emoji and a reordered output (emoji after word).
     let warning_str = format!("{}", make_warning());
     assert!(
-        warning_str.contains('\u{26a0}'),
-        "WARNING display should contain the warning emoji (\u{26a0}), got: {}",
+        warning_str.contains("\u{26a0}\u{fe0f}  WARNING"),
+        "WARNING display should contain '\u{26a0}\u{fe0f}  WARNING', got: {}",
         warning_str
     );
 }
@@ -629,11 +629,11 @@ fn metrics_display_includes_all_populated_fields() {
     };
     let s = format!("{}", m);
     // Duration::Debug format is not stable across Rust versions ("500ms" vs "0.5s").
-    // Verify the duration field is present by checking the numeric millis value.
+    // Anchor the check to the "duration:" label so the assertion cannot pass
+    // if the duration field is absent but "500" appears in another field.
     assert!(
-        s.contains(&m.duration.as_millis().to_string()),
-        "expected duration millis ({}) in display, got: {}",
-        m.duration.as_millis(),
+        s.contains("duration:") && s.contains(&m.duration.as_millis().to_string()),
+        "expected 'duration: ...500...' in display, got: {}",
         s
     );
     assert!(s.contains("retries: 2"), "expected retries, got: {}", s);
