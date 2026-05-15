@@ -28,6 +28,39 @@ pub enum ToolError {
 
 pub type ToolResult<T> = Result<T, ToolError>;
 
+/// Extract a required string parameter from JSON args.
+fn require_str<'a>(args: &'a Value, name: &str) -> ToolResult<&'a str> {
+    args.get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("Missing or invalid '{}' parameter", name),
+        })
+}
+
+/// Extract a required f64 parameter from JSON args.
+fn require_f64(args: &Value, name: &str) -> ToolResult<f64> {
+    args.get(name)
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("Missing or invalid '{}' parameter", name),
+        })
+}
+
+/// Extract an optional string parameter with a default value.
+fn opt_str<'a>(args: &'a Value, name: &str, default: &'a str) -> &'a str {
+    args.get(name).and_then(|v| v.as_str()).unwrap_or(default)
+}
+
+/// Extract an optional bool parameter with a default value.
+fn opt_bool(args: &Value, name: &str, default: bool) -> bool {
+    args.get(name).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+/// Extract an optional u64 parameter with a default value.
+fn opt_u64_or(args: &Value, name: &str, default: u64) -> u64 {
+    args.get(name).and_then(|v| v.as_u64()).unwrap_or(default)
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
@@ -203,26 +236,9 @@ impl Tool for CalculatorTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let operation = args
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'operation' parameter".to_string(),
-            })?;
-
-        let a =
-            args.get("a")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| ToolError::InvalidArguments {
-                    message: "Missing or invalid 'a' parameter".to_string(),
-                })?;
-
-        let b =
-            args.get("b")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| ToolError::InvalidArguments {
-                    message: "Missing or invalid 'b' parameter".to_string(),
-                })?;
+        let operation = require_str(&args, "operation")?;
+        let a = require_f64(&args, "a")?;
+        let b = require_f64(&args, "b")?;
 
         let result = match operation {
             "add" => a + b,
@@ -390,11 +406,7 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolError::InvalidArguments {
-                message: "Missing or invalid 'path' parameter".to_string(),
-            }
-        })?;
+        let path_str = require_str(&args, "path")?;
 
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
@@ -481,18 +493,8 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolError::InvalidArguments {
-                message: "Missing or invalid 'path' parameter".to_string(),
-            }
-        })?;
-
-        let content = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'content' parameter".to_string(),
-            })?;
+        let path_str = require_str(&args, "path")?;
+        let content = require_str(&args, "content")?;
 
         let path = Path::new(path_str);
         let safe_path = validate_path_for_write(path, &self.workspace_root)?;
@@ -620,15 +622,12 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path_str = opt_str(&args, "path", ".");
 
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
 
-        let recursive = args
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let recursive = opt_bool(&args, "recursive", false);
 
         let pattern = args.get("pattern").and_then(|v| v.as_str());
 
@@ -805,26 +804,18 @@ impl Tool for SearchTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let pattern_str = args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments {
-                message: "Missing or invalid 'pattern' parameter".to_string(),
-            })?;
+        let pattern_str = require_str(&args, "pattern")?;
 
         let regex = regex::Regex::new(pattern_str).map_err(|e| ToolError::InvalidArguments {
             message: format!("Invalid regex pattern: {}", e),
         })?;
 
-        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path_str = opt_str(&args, "path", ".");
         let path = Path::new(path_str);
         let safe_path = validate_path_within_workspace(path, &self.workspace_root)?;
 
         let file_pattern = args.get("file_pattern").and_then(|v| v.as_str());
-        let max_results = args
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50) as usize;
+        let max_results = opt_u64_or(&args, "max_results", 50) as usize;
 
         let mut results = Vec::new();
         self.search_recursive(&safe_path, &regex, file_pattern, max_results, &mut results)?;
@@ -945,10 +936,7 @@ impl Tool for GitDiffTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let path = args.get("path").and_then(|v| v.as_str());
-        let staged = args
-            .get("staged")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let staged = opt_bool(&args, "staged", false);
 
         let mut cmd = std::process::Command::new("git");
         cmd.current_dir(&self.workspace_root);
@@ -1793,7 +1781,7 @@ impl Tool for GitHubPrStatusTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
-        let level = args.get("level").and_then(|v| v.as_str()).unwrap_or("l0");
+        let level = opt_str(&args, "level", "l0");
 
         let data = collect_pr_status(&self.workspace_root)?;
         let github_connected = data.github_status == GitHubStatus::Connected;
@@ -2483,6 +2471,64 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
+    }
+
+    // --- new helper unit tests ---
+
+    #[test]
+    fn test_require_str_missing() {
+        let args = serde_json::json!({});
+        let err = require_str(&args, "key").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn test_require_f64_missing() {
+        let args = serde_json::json!({});
+        let err = require_f64(&args, "val").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn test_require_f64_present() {
+        let args = serde_json::json!({ "val": 1.5 });
+        assert!((require_f64(&args, "val").unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_opt_str_default() {
+        let args = serde_json::json!({});
+        assert_eq!(opt_str(&args, "key", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn test_opt_str_present() {
+        let args = serde_json::json!({ "key": "hello" });
+        assert_eq!(opt_str(&args, "key", "fallback"), "hello");
+    }
+
+    #[test]
+    fn test_opt_bool_default() {
+        let args = serde_json::json!({});
+        assert!(!opt_bool(&args, "flag", false));
+    }
+
+    #[test]
+    fn test_opt_bool_present() {
+        let args = serde_json::json!({ "flag": true });
+        assert!(opt_bool(&args, "flag", false));
+    }
+
+    #[test]
+    fn test_opt_u64_or_default() {
+        let args = serde_json::json!({});
+        assert_eq!(opt_u64_or(&args, "n", 42), 42);
+    }
+
+    #[test]
+    fn test_opt_u64_or_present() {
+        let args = serde_json::json!({ "n": 99u64 });
+        assert_eq!(opt_u64_or(&args, "n", 42), 99);
     }
 }
 

@@ -175,6 +175,35 @@ pub trait Entity: Send + Sync {
     }
 }
 
+/// Implement the [`Entity`] trait for one or more `Serialize` types whose
+/// `EntityMetadata` lives in a field called `metadata`.
+///
+/// Accepts a comma-separated list, e.g.
+/// `impl_entity!(GitRepository, GitBranch, GitCommit);`
+#[macro_export]
+macro_rules! impl_entity {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            #[async_trait::async_trait]
+            impl $crate::entities::Entity for $ty {
+                fn metadata(&self) -> &$crate::entities::EntityMetadata {
+                    &self.metadata
+                }
+
+                fn metadata_mut(&mut self) -> &mut $crate::entities::EntityMetadata {
+                    &mut self.metadata
+                }
+
+                fn to_json(&self) -> $crate::entities::EntityResult<String> {
+                    serde_json::to_string(self).map_err(|e| {
+                        $crate::entities::EntityError::SerializationError(e.to_string())
+                    })
+                }
+            }
+        )+
+    };
+}
+
 /// Relationship between entities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityRelationship {
@@ -749,6 +778,25 @@ mod tests {
     }
 
     #[test]
+    fn test_impl_entity_macro_methods() {
+        use crate::entities::env::types::EnvEntity;
+        use crate::entities::{Entity, EntityType};
+
+        let mut entity = EnvEntity::new();
+
+        // metadata() -- covers the macro-generated method
+        assert_eq!(entity.metadata().entity_type, EntityType::Env);
+
+        // metadata_mut() -- covers the macro-generated method
+        entity.metadata_mut().version = 2;
+        assert_eq!(entity.metadata().version, 2);
+
+        // to_json() -- covers the macro-generated method
+        let json = entity.to_json().expect("serialization should succeed");
+        assert!(json.len() > 2); // valid non-empty JSON object
+    }
+
+    #[test]
     fn test_entity_metadata_new() {
         let before = chrono::Utc::now();
         let mut metadata = EntityMetadata::new(EntityType::Ast);
@@ -758,7 +806,7 @@ mod tests {
         assert_eq!(metadata.entity_type, EntityType::Ast);
         assert!(metadata.created_at >= before && metadata.created_at <= after);
         assert!(metadata.tags.is_empty());
-        // ID must be a valid UUID v4 ("random") — rejects v1, v3, v5, and nil UUIDs.
+        // ID must be a valid UUID v4 ("random") -- rejects v1, v3, v5, and nil UUIDs.
         let parsed = uuid::Uuid::parse_str(&metadata.id).expect("should be valid UUID");
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random)); // v4
         metadata.updated_at = chrono::Utc::now();
@@ -788,7 +836,7 @@ mod tests {
     /// `match` so that adding a new variant to `EntityType` without updating
     /// this helper produces a **compile error** rather than a silent test gap.
     fn all_entity_type_variants() -> Vec<EntityType> {
-        // Compiler error here if a variant is missing — no runtime surprise.
+        // Compiler error here if a variant is missing -- no runtime surprise.
         let _exhaustive_check = |v: &EntityType| match v {
             EntityType::Git
             | EntityType::Ast
