@@ -3,14 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # Separate, more recent nixpkgs pin for ollama only. The main nixpkgs
-    # input is kept conservative because rust-overlay's rust-docs-1.87.0
-    # build chokes on newer stdenvs ("do not know how to unpack source
-    # archive"). Bumping the entire toolchain to chase ollama's release
-    # cadence is too much churn for a server we just need a recent
-    # version of. This input is consumed via an overlay that replaces
-    # `pkgs.ollama` only; everything else stays on the main pin.
-    nixpkgs-ollama.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
