@@ -1102,11 +1102,7 @@ mod tests {
     // Helper to build a valid SystemMetrics for reuse in multiple tests
     // ---------------------------------------------------------------------------
 
-    fn make_metrics(
-        avg_latency_ms: f64,
-        error_rate: f64,
-        cache_hit_rate: f64,
-    ) -> SystemMetrics {
+    fn make_metrics(avg_latency_ms: f64, error_rate: f64, cache_hit_rate: f64) -> SystemMetrics {
         use crate::monitoring::{
             CacheMetrics, ErrorMetrics, LatencyMetrics, SystemResourceMetrics,
         };
@@ -1246,20 +1242,15 @@ mod tests {
 
     #[test]
     fn test_sla_compliance_breached_threshold() {
-        // 98.5 < 99.0 → Breached
+        // 98.5 < 99.0, so status is Breached
         let compliance = SlaCompliance {
             target_availability: 99.9,
             current_availability: 98.5,
-            status: if 98.5 >= 99.9 {
-                SlaStatus::Compliant
-            } else if 98.5 >= 99.0 {
-                SlaStatus::AtRisk
-            } else {
-                SlaStatus::Breached
-            },
+            status: SlaStatus::Breached,
             time_to_breach: None,
         };
         assert_eq!(compliance.status, SlaStatus::Breached);
+        assert!(compliance.current_availability < 99.0);
     }
 
     // ---------------------------------------------------------------------------
@@ -1322,7 +1313,11 @@ mod tests {
     // determine_alert_category and calculate_priority_score
     // ---------------------------------------------------------------------------
 
-    fn make_alert(title: &str, component: &str, severity: AlertSeverity) -> crate::monitoring::Alert {
+    fn make_alert(
+        title: &str,
+        component: &str,
+        severity: AlertSeverity,
+    ) -> crate::monitoring::Alert {
         crate::monitoring::Alert {
             id: "test-id".to_string(),
             title: title.to_string(),
@@ -1354,7 +1349,11 @@ mod tests {
     #[test]
     fn test_determine_alert_category_performance() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("High latency performance issue", "api", AlertSeverity::Warning);
+        let alert = make_alert(
+            "High latency performance issue",
+            "api",
+            AlertSeverity::Warning,
+        );
         let category = system.determine_alert_category(&alert);
         assert_eq!(category, AlertCategory::Performance);
     }
@@ -1362,7 +1361,11 @@ mod tests {
     #[test]
     fn test_determine_alert_category_resources() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("Resource exhaustion detected", "disk", AlertSeverity::Critical);
+        let alert = make_alert(
+            "Resource exhaustion detected",
+            "disk",
+            AlertSeverity::Critical,
+        );
         let category = system.determine_alert_category(&alert);
         assert_eq!(category, AlertCategory::Resources);
     }
@@ -1425,7 +1428,9 @@ mod tests {
         let alert = make_alert("Container down", "container-1", AlertSeverity::Error);
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
         assert!(!actions.is_empty());
-        assert!(actions.iter().any(|a| a.to_lowercase().contains("container") || a.to_lowercase().contains("log")));
+        assert!(actions
+            .iter()
+            .any(|a| a.to_lowercase().contains("container") || a.to_lowercase().contains("log")));
     }
 
     #[test]
