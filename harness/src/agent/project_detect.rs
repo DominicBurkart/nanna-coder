@@ -667,4 +667,155 @@ tokio = "1"
         assert!(profile.frameworks.is_empty());
         assert!(profile.ci_expectations.is_empty());
     }
+
+    // ---------------------------------------------------------------------------
+    // detect_package_json — mocha and malformed JSON
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn package_json_malformed_still_flags_node() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", "{ not valid json !");
+        let signals = detect_package_json(dir.path());
+        assert!(signals.contains(&Signal::Language(Language::Node)));
+    }
+
+    #[test]
+    fn package_json_mocha_in_devdependencies() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"devDependencies": {"mocha": "^10"}}"#,
+        );
+        let signals = detect_package_json(dir.path());
+        assert!(signals.contains(&Signal::Framework(Framework::Mocha)));
+    }
+
+    #[test]
+    fn package_json_playwright_in_devdependencies() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"devDependencies": {"@playwright/test": "^1"}}"#,
+        );
+        let signals = detect_package_json(dir.path());
+        assert!(signals.contains(&Signal::Framework(Framework::Playwright)));
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_pyproject_toml — malformed file
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn pyproject_toml_malformed_still_flags_python() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "this = = is invalid toml!!!");
+        let signals = detect_pyproject_toml(dir.path());
+        assert!(signals.contains(&Signal::Language(Language::Python)));
+    }
+
+    #[test]
+    fn pyproject_toml_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(detect_pyproject_toml(dir.path()).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_requirements_txt — missing file
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn requirements_txt_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(detect_requirements_txt(dir.path()).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_go_mod — missing file
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn go_mod_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(detect_go_mod(dir.path()).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Deduplication in detect()
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn detect_deduplicates_signals() {
+        // A workspace with both Cargo.toml and pyproject.toml, each
+        // contributing tokio / Rust / Python signals — none should appear twice.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\n[dependencies]\ntokio=\"1\"\n",
+        );
+        write(dir.path(), "pyproject.toml", "[tool.pytest.ini_options]\n");
+
+        let profile = detect(dir.path());
+
+        let rust_count = profile
+            .languages
+            .iter()
+            .filter(|l| **l == Language::Rust)
+            .count();
+        assert_eq!(rust_count, 1, "Rust should appear exactly once");
+
+        let python_count = profile
+            .languages
+            .iter()
+            .filter(|l| **l == Language::Python)
+            .count();
+        assert_eq!(python_count, 1, "Python should appear exactly once");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Signal enum equality
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn signal_language_equality() {
+        assert_eq!(Signal::Language(Language::Rust), Signal::Language(Language::Rust));
+        assert_ne!(Signal::Language(Language::Rust), Signal::Language(Language::Go));
+        assert_ne!(
+            Signal::Language(Language::Python),
+            Signal::Framework(Framework::Pytest)
+        );
+    }
+
+    #[test]
+    fn signal_ci_expectation_equality() {
+        assert_eq!(
+            Signal::CiExpectation("a".to_string()),
+            Signal::CiExpectation("a".to_string()),
+        );
+        assert_ne!(
+            Signal::CiExpectation("a".to_string()),
+            Signal::CiExpectation("b".to_string()),
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // github_workflows — cargo deny detection
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn github_workflows_detects_cargo_deny() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            ".github/workflows/ci.yml",
+            "jobs:\n  t:\n    steps:\n      - run: cargo deny check\n",
+        );
+        let signals = detect_github_workflows(dir.path());
+        assert!(signals
+            .iter()
+            .any(|s| matches!(s, Signal::CiExpectation(m) if m.contains("deny"))));
+    }
 }
