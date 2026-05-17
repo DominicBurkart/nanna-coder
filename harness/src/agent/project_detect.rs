@@ -781,8 +781,14 @@ tokio = "1"
 
     #[test]
     fn signal_language_equality() {
-        assert_eq!(Signal::Language(Language::Rust), Signal::Language(Language::Rust));
-        assert_ne!(Signal::Language(Language::Rust), Signal::Language(Language::Go));
+        assert_eq!(
+            Signal::Language(Language::Rust),
+            Signal::Language(Language::Rust)
+        );
+        assert_ne!(
+            Signal::Language(Language::Rust),
+            Signal::Language(Language::Go)
+        );
         assert_ne!(
             Signal::Language(Language::Python),
             Signal::Framework(Framework::Pytest)

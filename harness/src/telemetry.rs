@@ -1452,7 +1452,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prometheus_exporter_export_system_metrics() {
-        use crate::monitoring::{CacheMetrics, ErrorMetrics, LatencyMetrics, SystemResourceMetrics};
+        use crate::monitoring::{
+            CacheMetrics, ErrorMetrics, LatencyMetrics, SystemResourceMetrics,
+        };
         let exporter = PrometheusExporter::new(None);
 
         let mut latencies = HashMap::new();
@@ -1556,10 +1558,7 @@ mod tests {
         let ts = TelemetrySystem::new();
         let mut guard = TraceGuard::new(&ts, ts.start_trace("err_op"));
         guard.record_error("something failed");
-        assert_eq!(
-            guard.trace().unwrap().status,
-            SpanStatus::Error
-        );
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
     }
 
     #[tokio::test]
@@ -1567,10 +1566,7 @@ mod tests {
         let ts = TelemetrySystem::new();
         let mut guard = TraceGuard::new(&ts, ts.start_trace("status_op"));
         guard.set_status(SpanStatus::Cancelled);
-        assert_eq!(
-            guard.trace().unwrap().status,
-            SpanStatus::Cancelled
-        );
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
     }
 
     // ---------------------------------------------------------------------------
