@@ -1300,7 +1300,10 @@ mod tests {
 
         let metrics = collector.get_current_metrics().await.unwrap();
         assert_eq!(metrics.error_metrics.total_errors, 1);
-        assert!(metrics.error_metrics.errors_by_type.contains_key("TestError"));
+        assert!(metrics
+            .error_metrics
+            .errors_by_type
+            .contains_key("TestError"));
         assert_eq!(metrics.error_metrics.recent_errors.len(), 1);
     }
 
