@@ -1044,4 +1044,137 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_trace_context_with_attribute() {
+        let trace = TraceContext::new("op")
+            .with_attribute("key1", "val1")
+            .with_attribute("key2", "val2");
+        assert_eq!(trace.attributes.get("key1"), Some(&"val1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"val2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("op");
+        assert_eq!(trace.status, SpanStatus::InProgress);
+        trace.set_status(SpanStatus::Ok);
+        assert_eq!(trace.status, SpanStatus::Ok);
+        trace.set_status(SpanStatus::Error);
+        assert_eq!(trace.status, SpanStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "m".to_string(),
+            metric_type: MetricType::Counter,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+        exporter.add_metric(metric);
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(!output.is_empty());
+        exporter.clear_buffer();
+        let output_after = exporter.export_prometheus().await.unwrap();
+        assert!(output_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_builder_methods() {
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("svc")
+            .with_version("2.0")
+            .with_environment("staging")
+            .with_global_attribute("region", "us-east-1");
+
+        assert_eq!(telemetry.config.service.name, "svc");
+        assert_eq!(telemetry.config.service.version, "2.0");
+        assert_eq!(telemetry.config.service.environment, "staging");
+        assert_eq!(
+            telemetry.config.global_attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_default() {
+        let t = TelemetrySystem::default();
+        assert_eq!(t.get_buffered_metrics_count(), 0);
+        assert_eq!(t.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_uptime() {
+        let t = TelemetrySystem::new();
+        let uptime = t.get_uptime();
+        assert!(uptime.as_nanos() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_export_all_clears_buffers() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.record_gauge("g", 2.0, vec![]);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 2);
+
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_with_config() {
+        let config = TelemetryConfig::default();
+        let t = TelemetrySystem::new().with_config(config.clone());
+        assert_eq!(t.config.log_level, config.log_level);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_drop_finishes_trace() {
+        let telemetry = TelemetrySystem::new();
+        {
+            let trace = telemetry.start_trace("guarded_op");
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+            let _guard = TraceGuard::new(&telemetry, trace);
+        }
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.record_error("oops");
+        let t = guard.trace().unwrap();
+        assert_eq!(t.status, SpanStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.set_status(SpanStatus::Ok);
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_trace_accessor() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("my_op");
+        let guard = TraceGuard::new(&telemetry, trace);
+        let t = guard.trace().unwrap();
+        assert_eq!(t.operation_name, "my_op");
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_prometheus_exporter_none() {
+        let t = TelemetrySystem::new();
+        assert!(t.get_prometheus_exporter().is_none());
+    }
 }

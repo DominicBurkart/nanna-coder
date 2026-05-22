@@ -1097,4 +1097,57 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_default() {
+        let system = ObservabilitySystem::default();
+        let uptime = system.get_uptime();
+        assert!(uptime.as_nanos() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_service_name() {
+        let system = ObservabilitySystem::new().with_service_name("my-svc");
+        assert_eq!(system.service_name, "my-svc");
+    }
+
+    #[tokio::test]
+    async fn test_with_alert_policy_immediate() {
+        let policy = AlertPolicy::immediate_critical();
+        let system = ObservabilitySystem::new().with_alert_policy(policy);
+        assert!(!system.alert_policy.escalation_rules.is_empty());
+        assert!(system.alert_policy.grouping_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_with_health_thresholds() {
+        let mut thresholds = HealthThreshold::default();
+        thresholds.cpu_threshold = 95.0;
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        assert_eq!(system.health_thresholds.cpu_threshold, 95.0);
+    }
+
+    #[tokio::test]
+    async fn test_with_health_check_interval() {
+        let system = ObservabilitySystem::new()
+            .with_health_check_interval(Duration::from_secs(5));
+        assert_eq!(system.health_check_interval, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_get_uptime_positive() {
+        let system = ObservabilitySystem::new();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(system.get_uptime().as_nanos() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = ObservabilitySystem::new()
+            .with_health_check_interval(Duration::from_secs(3600));
+        system.start_monitoring().await.unwrap();
+        assert!(system.monitoring_task.is_some());
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }
