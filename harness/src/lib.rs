@@ -17,6 +17,10 @@ pub use container::{
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
+pub use monitoring::ci_metrics::{
+    parse as parse_ci_metrics, to_prometheus as ci_metrics_to_prometheus, CiMetric,
+    Error as CiMetricsError,
+};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
