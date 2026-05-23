@@ -12,6 +12,7 @@ repository.workspace = true
 [features]
 default = ["ollama"]
 ollama = ["dep:ollama-rs"]
+openai-compat = []
 
 [dependencies]
 async-trait = "0.1"
@@ -31,3 +32,4 @@ workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock = "0.6"
