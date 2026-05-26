@@ -2484,6 +2484,36 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    #[tokio::test]
+    async fn test_run_command_tool_missing_command_via_registry() {
+        use std::sync::Arc;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+        let result = registry.execute("run_command", json!({})).await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_no_runtime_via_registry() {
+        use std::sync::Arc;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+        let result = registry.execute("run_command", json!({ "command": "echo hello" })).await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed { .. })));
+    }
 }
 
 #[cfg(kani)]
