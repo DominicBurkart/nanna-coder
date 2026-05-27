@@ -1097,4 +1097,84 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_system_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime.as_nanos() >= 0);
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_stop_monitoring_when_not_started() {
+        let mut system = ObservabilitySystem::new();
+        // Stopping when not started must not panic.
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_observability_start_then_stop() {
+        let mut system = ObservabilitySystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_performance_trends_degraded() {
+        // Drive trends into degraded state by exceeding every threshold.
+        let system = ObservabilitySystem::new().with_health_thresholds(HealthThreshold {
+            max_latency_ms: 10,       // very tight — any latency above 10 ms degrades
+            min_cache_hit_rate: 0.99, // almost impossible to satisfy
+            max_error_rate: 0.001,    // very tight
+            ..HealthThreshold::default()
+        });
+
+        let latency = crate::monitoring::LatencyMetrics {
+            avg_latency_ms: 9999.0, // way above threshold
+            p95_latency_ms: 9999.0,
+            p99_latency_ms: 9999.0,
+            max_latency_ms: 9999.0,
+            min_latency_ms: 100.0,
+            request_count: 100,
+            requests_per_second: 10.0,
+        };
+
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::from([("svc".to_string(), latency)]),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 1,
+                misses: 99,
+                hit_rate: 0.01, // well below threshold
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 95.0,
+                total_memory_bytes: 8589934592,
+                used_memory_bytes: 8589934592,
+                memory_usage_percent: 100.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 214748364800,
+                disk_usage_percent: 100.0,
+                load_average: [15.0, 15.0, 15.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 50,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.5, // well above threshold
+                recent_errors: Vec::new(),
+            },
+        };
+
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.latency_trend, TrendDirection::Degrading);
+        assert_eq!(trends.error_rate_trend, TrendDirection::Degrading);
+        assert_eq!(trends.cache_performance_trend, TrendDirection::Degrading);
+        // Score should be reduced from 100 due to degraded trends.
+        assert!(trends.performance_score < 100.0);
+    }
 }
