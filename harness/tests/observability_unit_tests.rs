@@ -16,8 +16,7 @@ fn builder_with_alert_policy_does_not_panic() {
 
 #[test]
 fn builder_with_health_check_interval_does_not_panic() {
-    let _system =
-        ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(5));
+    let _system = ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(5));
 }
 
 #[test]

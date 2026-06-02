@@ -157,7 +157,9 @@ async fn alert_history_returns_all_and_respects_limit() {
 #[tokio::test]
 async fn configure_thresholds_succeeds_without_error() {
     let mut manager = DefaultAlertManager::new();
-    let result = manager.configure_thresholds(AlertThresholds::default()).await;
+    let result = manager
+        .configure_thresholds(AlertThresholds::default())
+        .await;
     assert!(result.is_ok());
 }
 
