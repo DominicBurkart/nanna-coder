@@ -62,7 +62,7 @@ async fn comprehensive_status_performance_score_below_100_with_degrading_cache()
     let _ = system.initialize().await;
     let status = system.get_comprehensive_status().await.unwrap();
     let score = status.performance_trends.performance_score;
-    assert!(score >= 0.0 && score < 100.0);
+    assert!((0.0..100.0).contains(&score));
 }
 
 #[tokio::test]
