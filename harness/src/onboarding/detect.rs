@@ -512,4 +512,70 @@ members = ["crate-a"]
         let manifest = signals.cargo_toml.unwrap();
         assert_eq!(manifest.name, dir_name);
     }
+
+    #[test]
+    fn scan_detects_makefile() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "Makefile", "");
+        let signals = scan_project(dir.path()).unwrap();
+        assert!(signals.has_makefile);
+    }
+
+    #[test]
+    fn scan_detects_makefile_lowercase() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "makefile", "");
+        let signals = scan_project(dir.path()).unwrap();
+        assert!(signals.has_makefile);
+    }
+
+    #[test]
+    fn scan_detects_justfile() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "justfile", "");
+        let signals = scan_project(dir.path()).unwrap();
+        assert!(signals.has_makefile);
+    }
+
+    #[test]
+    fn parse_cargo_toml_invalid_toml_returns_error() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "Cargo.toml", "this is not valid toml =[[[");
+        let result = scan_project(dir.path());
+        assert!(matches!(result, Err(OnboardingError::ParseError(_))));
+    }
+
+    #[test]
+    fn parse_cargo_toml_missing_package_name_returns_error() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[package]
+version = "0.1.0"
+"#,
+        );
+        let result = scan_project(dir.path());
+        assert!(matches!(result, Err(OnboardingError::ParseError(_))));
+    }
+
+    #[test]
+    fn workspace_edition_is_parsed() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            r#"
+[workspace]
+members = []
+
+[workspace.package]
+edition = "2021"
+"#,
+        );
+        let signals = scan_project(dir.path()).unwrap();
+        let manifest = signals.cargo_toml.unwrap();
+        assert_eq!(manifest.edition, Some("2021".to_string()));
+    }
 }
