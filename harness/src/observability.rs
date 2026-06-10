@@ -1115,7 +1115,11 @@ mod tests {
         }
     }
 
-    fn make_metrics(avg_latency_ms: Option<f64>, error_rate: f64, cache_hit_rate: f64) -> SystemMetrics {
+    fn make_metrics(
+        avg_latency_ms: Option<f64>,
+        error_rate: f64,
+        cache_hit_rate: f64,
+    ) -> SystemMetrics {
         let mut request_latencies = HashMap::new();
         if let Some(lat) = avg_latency_ms {
             request_latencies.insert(
@@ -1167,35 +1171,54 @@ mod tests {
     fn test_determine_alert_category_container() {
         let system = ObservabilitySystem::new();
         let alert = make_alert("container-main", "Some alert", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ContainerHealth);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
     }
 
     #[test]
     fn test_determine_alert_category_model() {
         let system = ObservabilitySystem::new();
         let alert = make_alert("model-gpt4", "Some alert", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ModelQuality);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
     }
 
     #[test]
     fn test_determine_alert_category_performance() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("api", "Performance degradation detected", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Performance);
+        let alert = make_alert(
+            "api",
+            "Performance degradation detected",
+            AlertSeverity::Warning,
+        );
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
     }
 
     #[test]
     fn test_determine_alert_category_resource() {
         let system = ObservabilitySystem::new();
         let alert = make_alert("api", "Resource limit reached", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Resources);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
     }
 
     #[test]
     fn test_determine_alert_category_availability() {
         let system = ObservabilitySystem::new();
         let alert = make_alert("api", "Service unavailable", AlertSeverity::Error);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Availability);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
     }
 
     #[test]
@@ -1271,7 +1294,11 @@ mod tests {
         let alerts = vec![
             make_alert("container-main", "High CPU", AlertSeverity::Critical),
             make_alert("model-gpt4", "Quality drop", AlertSeverity::Error),
-            make_alert("api", "Performance degradation detected", AlertSeverity::Warning),
+            make_alert(
+                "api",
+                "Performance degradation detected",
+                AlertSeverity::Warning,
+            ),
             make_alert("disk", "Resource limit reached", AlertSeverity::Warning),
             make_alert("service", "Service unavailable", AlertSeverity::Error),
         ];
@@ -1293,8 +1320,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_and_stop_monitoring() {
-        let mut system = ObservabilitySystem::new()
-            .with_health_check_interval(Duration::from_secs(3600));
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(3600));
         system.start_monitoring().await.unwrap();
         system.stop_monitoring().await;
     }
@@ -1337,7 +1364,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze_performance_trends_static() {
-        ObservabilitySystem::analyze_performance_trends().await.unwrap();
+        ObservabilitySystem::analyze_performance_trends()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1347,7 +1376,10 @@ mod tests {
 
     #[test]
     fn test_with_health_thresholds_builder() {
-        let thresholds = HealthThreshold { max_latency_ms: 100, ..HealthThreshold::default() };
+        let thresholds = HealthThreshold {
+            max_latency_ms: 100,
+            ..HealthThreshold::default()
+        };
         let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         let metrics = make_metrics(Some(500.0), 0.0, 0.9);
         let trends = system.analyze_current_trends(&metrics).unwrap();
@@ -1356,8 +1388,8 @@ mod tests {
 
     #[test]
     fn test_with_alert_policy_builder() {
-        let system = ObservabilitySystem::new()
-            .with_alert_policy(AlertPolicy::immediate_critical());
+        let system =
+            ObservabilitySystem::new().with_alert_policy(AlertPolicy::immediate_critical());
         assert!(system.get_uptime() < Duration::from_secs(5));
     }
 
@@ -1396,7 +1428,10 @@ mod tests {
 
     #[test]
     fn test_analyze_current_trends_degrading_latency() {
-        let thresholds = HealthThreshold { max_latency_ms: 100, ..HealthThreshold::default() };
+        let thresholds = HealthThreshold {
+            max_latency_ms: 100,
+            ..HealthThreshold::default()
+        };
         let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         let metrics = make_metrics(Some(500.0), 0.0, 0.9);
         let trends = system.analyze_current_trends(&metrics).unwrap();
