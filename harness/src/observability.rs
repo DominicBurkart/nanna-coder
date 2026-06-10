@@ -1347,8 +1347,7 @@ mod tests {
 
     #[test]
     fn test_with_health_thresholds_builder() {
-        let mut thresholds = HealthThreshold::default();
-        thresholds.max_latency_ms = 100;
+        let thresholds = HealthThreshold { max_latency_ms: 100, ..HealthThreshold::default() };
         let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         let metrics = make_metrics(Some(500.0), 0.0, 0.9);
         let trends = system.analyze_current_trends(&metrics).unwrap();
@@ -1397,8 +1396,7 @@ mod tests {
 
     #[test]
     fn test_analyze_current_trends_degrading_latency() {
-        let mut thresholds = HealthThreshold::default();
-        thresholds.max_latency_ms = 100;
+        let thresholds = HealthThreshold { max_latency_ms: 100, ..HealthThreshold::default() };
         let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         let metrics = make_metrics(Some(500.0), 0.0, 0.9);
         let trends = system.analyze_current_trends(&metrics).unwrap();
