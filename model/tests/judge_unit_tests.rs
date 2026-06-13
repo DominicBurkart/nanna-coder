@@ -302,3 +302,101 @@ fn creative_writing_criteria_more_lenient() {
     assert!(!creative.require_factual_accuracy);
     assert!(creative.max_response_length > default.max_response_length);
 }
+
+// ---------------------------------------------------------------------------
+// JudgeConfig builder methods
+// ---------------------------------------------------------------------------
+
+#[test]
+fn judge_config_with_retries() {
+    let config = JudgeConfig::with_retries(5, 200);
+    assert_eq!(config.max_retries, 5);
+    assert_eq!(config.base_delay_ms, 200);
+    assert_eq!(config.max_delay_ms, JudgeConfig::default().max_delay_ms);
+}
+
+#[test]
+fn judge_config_with_verbose_logging() {
+    let config = JudgeConfig::default().with_verbose_logging();
+    assert!(config.verbose_logging);
+}
+
+#[test]
+fn judge_config_with_timeout() {
+    let config = JudgeConfig::default().with_timeout(Duration::from_secs(60));
+    assert_eq!(config.default_timeout, Duration::from_secs(60));
+}
+
+// ---------------------------------------------------------------------------
+// ValidationResult boolean accessors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validation_result_is_success() {
+    let success = ValidationResult::Success {
+        message: "ok".into(),
+        metrics: ValidationMetrics::default(),
+    };
+    assert!(success.is_success());
+    assert!(!success.is_warning());
+    assert!(!success.is_failure());
+}
+
+#[test]
+fn validation_result_is_warning() {
+    let warning = ValidationResult::Warning {
+        message: "slow".into(),
+        suggestions: vec![],
+        metrics: ValidationMetrics::default(),
+    };
+    assert!(!warning.is_success());
+    assert!(warning.is_warning());
+    assert!(!warning.is_failure());
+}
+
+#[test]
+fn validation_result_is_failure() {
+    let failure = ValidationResult::Failure {
+        message: "bad".into(),
+        error_details: "err".into(),
+        suggestions: vec![],
+        metrics: None,
+    };
+    assert!(!failure.is_success());
+    assert!(!failure.is_warning());
+    assert!(failure.is_failure());
+}
+
+// ---------------------------------------------------------------------------
+// ValidationMetrics additional builders
+// ---------------------------------------------------------------------------
+
+#[test]
+fn metrics_with_response_length() {
+    let m = ValidationMetrics::default().with_response_length(42);
+    assert_eq!(m.response_length, Some(42));
+}
+
+#[test]
+fn metrics_add_custom_metric() {
+    let mut m = ValidationMetrics::default();
+    m.add_custom_metric("latency_p99".into(), 0.123);
+    assert_eq!(m.custom_metrics.get("latency_p99"), Some(&0.123));
+}
+
+#[test]
+fn metrics_display_includes_all_fields() {
+    let mut m = ValidationMetrics::with_duration(Duration::from_secs(1))
+        .with_response_length(100)
+        .with_coherence_score(0.8)
+        .with_relevance_score(0.9);
+    m.retry_count = 2;
+    m.success_rate = Some(0.95);
+    let s = format!("{}", m);
+    assert!(s.contains("duration"));
+    assert!(s.contains("retries"));
+    assert!(s.contains("length"));
+    assert!(s.contains("coherence"));
+    assert!(s.contains("relevance"));
+    assert!(s.contains("success_rate"));
+}
