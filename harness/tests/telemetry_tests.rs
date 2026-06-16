@@ -1,10 +1,8 @@
 use chrono::Utc;
+use harness::monitoring::{CacheMetrics, ErrorMetrics, SystemMetrics, SystemResourceMetrics};
 use harness::telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryExporter,
     TelemetrySystem, TraceContext, TraceGuard,
-};
-use harness::monitoring::{
-    CacheMetrics, ErrorMetrics, SystemMetrics, SystemResourceMetrics,
 };
 use std::collections::HashMap;
 use std::time::Duration;

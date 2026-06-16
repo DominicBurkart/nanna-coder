@@ -137,11 +137,7 @@ async fn test_get_alert_history_limit() {
     // Send 5 alerts
     for i in 0..5 {
         manager
-            .send_alert(
-                &format!("Alert {i}"),
-                "desc",
-                AlertSeverity::Info,
-            )
+            .send_alert(&format!("Alert {i}"), "desc", AlertSeverity::Info)
             .await
             .unwrap();
     }

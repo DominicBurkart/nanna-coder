@@ -1,6 +1,6 @@
+use chrono::Utc;
 use harness::entities::context::types::ToolCallRecord;
 use harness::task::{FailureDiagnostics, TaskId, TaskResult, TaskStatus};
-use chrono::Utc;
 
 // ──────────────────────────────────────────────
 // TaskId
@@ -178,7 +178,10 @@ fn test_task_status_running_serde() {
     assert_eq!(json["iterations"], 7);
 
     let roundtrip: TaskStatus = serde_json::from_value(json).unwrap();
-    assert!(matches!(roundtrip, TaskStatus::Running { iterations: 7, .. }));
+    assert!(matches!(
+        roundtrip,
+        TaskStatus::Running { iterations: 7, .. }
+    ));
 }
 
 #[test]
