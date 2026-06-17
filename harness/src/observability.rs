@@ -1118,7 +1118,11 @@ mod tests {
     #[test]
     fn test_alert_category_container() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("container-123", "error", crate::monitoring::AlertSeverity::Error);
+        let alert = make_alert(
+            "container-123",
+            "error",
+            crate::monitoring::AlertSeverity::Error,
+        );
         assert_eq!(
             system.determine_alert_category(&alert),
             AlertCategory::ContainerHealth
@@ -1128,7 +1132,11 @@ mod tests {
     #[test]
     fn test_alert_category_model() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("model-llm", "error", crate::monitoring::AlertSeverity::Error);
+        let alert = make_alert(
+            "model-llm",
+            "error",
+            crate::monitoring::AlertSeverity::Error,
+        );
         assert_eq!(
             system.determine_alert_category(&alert),
             AlertCategory::ModelQuality
@@ -1166,7 +1174,11 @@ mod tests {
     #[test]
     fn test_alert_category_availability() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("api", "service down", crate::monitoring::AlertSeverity::Critical);
+        let alert = make_alert(
+            "api",
+            "service down",
+            crate::monitoring::AlertSeverity::Critical,
+        );
         assert_eq!(
             system.determine_alert_category(&alert),
             AlertCategory::Availability
@@ -1198,7 +1210,11 @@ mod tests {
     #[test]
     fn test_priority_score_error_container_health() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("container", "unhealthy", crate::monitoring::AlertSeverity::Error);
+        let alert = make_alert(
+            "container",
+            "unhealthy",
+            crate::monitoring::AlertSeverity::Error,
+        );
         // Error (75) + ContainerHealth (+20) = 95
         assert_eq!(
             system.calculate_priority_score(&alert, &AlertCategory::ContainerHealth),
@@ -1253,10 +1269,16 @@ mod tests {
     #[test]
     fn test_recommended_actions_container_health() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("container", "error", crate::monitoring::AlertSeverity::Error);
+        let alert = make_alert(
+            "container",
+            "error",
+            crate::monitoring::AlertSeverity::Error,
+        );
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
         assert!(!actions.is_empty());
-        assert!(actions.iter().any(|a| a.to_lowercase().contains("container")));
+        assert!(actions
+            .iter()
+            .any(|a| a.to_lowercase().contains("container")));
     }
 
     #[test]
@@ -1265,13 +1287,19 @@ mod tests {
         let alert = make_alert("api", "slow", crate::monitoring::AlertSeverity::Warning);
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
         assert!(!actions.is_empty());
-        assert!(actions.iter().any(|a| a.to_lowercase().contains("resource")));
+        assert!(actions
+            .iter()
+            .any(|a| a.to_lowercase().contains("resource")));
     }
 
     #[test]
     fn test_recommended_actions_model_quality() {
         let system = ObservabilitySystem::new();
-        let alert = make_alert("model", "low quality", crate::monitoring::AlertSeverity::Warning);
+        let alert = make_alert(
+            "model",
+            "low quality",
+            crate::monitoring::AlertSeverity::Warning,
+        );
         let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
         assert!(!actions.is_empty());
         assert!(actions.iter().any(|a| a.to_lowercase().contains("model")));
@@ -1334,8 +1362,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_and_stop_monitoring() {
-        let mut system = ObservabilitySystem::new()
-            .with_health_check_interval(Duration::from_secs(3600));
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(3600));
         system.start_monitoring().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         system.stop_monitoring().await;
