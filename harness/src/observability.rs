@@ -1102,7 +1102,7 @@ mod tests {
     async fn test_observability_system_get_uptime() {
         let system = ObservabilitySystem::new();
         let uptime = system.get_uptime();
-        assert!(uptime.as_nanos() >= 0);
+        let _ = uptime; // uptime is a Duration; just verify it doesn't panic
     }
 
     #[tokio::test]
