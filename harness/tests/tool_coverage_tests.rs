@@ -266,7 +266,10 @@ fn tool_registry_list_tools_returns_registered_names() {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(CalculatorTool::new()));
     let names = registry.list_tools();
-    assert!(names.contains(&"calculate"), "expected calculate in list, got: {names:?}");
+    assert!(
+        names.contains(&"calculate"),
+        "expected calculate in list, got: {names:?}"
+    );
 }
 
 #[test]
@@ -349,7 +352,10 @@ fn pr_status_l0_zero_staleness_not_shown() {
         ..Default::default()
     };
     let l0 = data.to_l0();
-    assert!(!l0.contains('d'), "zero staleness days must not appear in: {l0}");
+    assert!(
+        !l0.contains('d'),
+        "zero staleness days must not appear in: {l0}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +369,10 @@ fn pr_status_l1_github_connected() {
         ..Default::default()
     };
     let detail = data.to_l1("github").unwrap();
-    assert!(detail.contains("connected"), "expected 'connected' in: {detail}");
+    assert!(
+        detail.contains("connected"),
+        "expected 'connected' in: {detail}"
+    );
 }
 
 #[test]
@@ -386,7 +395,10 @@ fn pr_status_l1_github_api_error() {
         ..Default::default()
     };
     let detail = data.to_l1("github").unwrap();
-    assert!(detail.contains("timeout"), "expected error message in: {detail}");
+    assert!(
+        detail.contains("timeout"),
+        "expected error message in: {detail}"
+    );
 }
 
 #[test]
@@ -415,8 +427,14 @@ fn pr_status_l1_diff_with_stats_no_files() {
         ..Default::default()
     };
     let detail = data.to_l1("diff").unwrap();
-    assert!(detail.contains("+10/-5"), "expected diff stats in: {detail}");
-    assert!(!detail.contains("Changed files"), "no file list when changed_files is empty");
+    assert!(
+        detail.contains("+10/-5"),
+        "expected diff stats in: {detail}"
+    );
+    assert!(
+        !detail.contains("Changed files"),
+        "no file list when changed_files is empty"
+    );
 }
 
 #[test]
@@ -427,7 +445,10 @@ fn pr_status_l1_ci_none_status_shows_unknown() {
         ..Default::default()
     };
     let detail = data.to_l1("ci").unwrap();
-    assert!(detail.contains("unknown"), "expected 'unknown' for None ci_status, got: {detail}");
+    assert!(
+        detail.contains("unknown"),
+        "expected 'unknown' for None ci_status, got: {detail}"
+    );
 }
 
 // ---------------------------------------------------------------------------
