@@ -1195,8 +1195,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_all_with_metrics_and_events() {
-        let telemetry = TelemetrySystem::new()
-            .add_exporter(Box::new(PrometheusExporter::new(None)));
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
 
         telemetry.record_counter("requests_total", 5.0, vec![("service", "api")]);
         telemetry.record_event(
