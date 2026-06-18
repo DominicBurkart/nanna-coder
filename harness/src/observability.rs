@@ -1121,8 +1121,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_health_thresholds() {
-        let mut thresholds = HealthThreshold::default();
-        thresholds.cpu_threshold = 95.0;
+        let thresholds = HealthThreshold {
+            cpu_threshold: 95.0,
+            ..HealthThreshold::default()
+        };
         let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         assert_eq!(system.health_thresholds.cpu_threshold, 95.0);
     }
