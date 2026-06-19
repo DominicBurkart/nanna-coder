@@ -1345,6 +1345,9 @@ mod tests {
         let metrics = system.calculate_availability_metrics().unwrap();
         // Default availability is 99.5 which is at risk (< 99.9 target)
         assert_eq!(metrics.sla_compliance.status, SlaStatus::AtRisk);
-        assert!(metrics.sla_compliance.current_availability < metrics.sla_compliance.target_availability);
+        assert!(
+            metrics.sla_compliance.current_availability
+                < metrics.sla_compliance.target_availability
+        );
     }
 }
