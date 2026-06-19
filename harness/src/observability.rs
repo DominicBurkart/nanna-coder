@@ -1097,4 +1097,254 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[test]
+    fn test_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_stop_monitoring_when_not_started() {
+        let mut system = ObservabilitySystem::new();
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+        assert!(system.monitoring_task.is_none());
+        system.start_monitoring().await.unwrap();
+        assert!(system.monitoring_task.is_some());
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
+
+    #[test]
+    fn test_determine_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a1".to_string(),
+            title: "Container down".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Error,
+            component: "container:test".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a2".to_string(),
+            title: "Quality degraded".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "model:qwen3".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a3".to_string(),
+            title: "Performance degraded".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_default_is_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a4".to_string(),
+            title: "Something wrong".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Info,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_critical_capped() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a5".to_string(),
+            title: "Down".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Availability);
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_info_configuration() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a6".to_string(),
+            title: "Info".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Info,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Configuration);
+        assert_eq!(score, 25);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_error_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a7".to_string(),
+            title: "Slow".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Error,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Performance);
+        assert_eq!(score, 85);
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_container() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a8".to_string(),
+            title: "Container unhealthy".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Error,
+            component: "container:test".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions =
+            system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].contains("logs"));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a9".to_string(),
+            title: "Slow".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "system".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_model_quality() {
+        let system = ObservabilitySystem::new();
+        let alert = crate::monitoring::Alert {
+            id: "a10".to_string(),
+            title: "Poor quality".to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "model:test".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn test_trend_direction_equality() {
+        assert_eq!(TrendDirection::Improving, TrendDirection::Improving);
+        assert_eq!(TrendDirection::Stable, TrendDirection::Stable);
+        assert_eq!(TrendDirection::Degrading, TrendDirection::Degrading);
+        assert_eq!(TrendDirection::Unknown, TrendDirection::Unknown);
+        assert_ne!(TrendDirection::Improving, TrendDirection::Degrading);
+        assert_ne!(TrendDirection::Stable, TrendDirection::Unknown);
+    }
+
+    #[test]
+    fn test_sla_status_equality() {
+        assert_eq!(SlaStatus::Compliant, SlaStatus::Compliant);
+        assert_eq!(SlaStatus::AtRisk, SlaStatus::AtRisk);
+        assert_eq!(SlaStatus::Breached, SlaStatus::Breached);
+        assert_ne!(SlaStatus::Compliant, SlaStatus::Breached);
+        assert_ne!(SlaStatus::AtRisk, SlaStatus::Breached);
+    }
+
+    #[test]
+    fn test_escalation_status_equality() {
+        assert_eq!(EscalationStatus::New, EscalationStatus::New);
+        assert_eq!(EscalationStatus::Resolved, EscalationStatus::Resolved);
+        assert_eq!(EscalationStatus::Escalated, EscalationStatus::Escalated);
+        assert_ne!(EscalationStatus::New, EscalationStatus::Resolved);
+        assert_ne!(EscalationStatus::Escalated, EscalationStatus::HighlyEscalated);
+        assert_ne!(EscalationStatus::UnderInvestigation, EscalationStatus::New);
+    }
+
+    #[test]
+    fn test_alert_category_equality() {
+        assert_eq!(AlertCategory::Performance, AlertCategory::Performance);
+        assert_eq!(AlertCategory::ContainerHealth, AlertCategory::ContainerHealth);
+        assert_ne!(AlertCategory::Performance, AlertCategory::Security);
+        assert_ne!(AlertCategory::ModelQuality, AlertCategory::Resources);
+        assert_ne!(AlertCategory::Availability, AlertCategory::Configuration);
+    }
+
+    #[test]
+    fn test_availability_metrics_sla_at_risk() {
+        let system = ObservabilitySystem::new();
+        let metrics = system.calculate_availability_metrics().unwrap();
+        // Default availability is 99.5 which is at risk (< 99.9 target)
+        assert_eq!(metrics.sla_compliance.status, SlaStatus::AtRisk);
+        assert!(metrics.sla_compliance.current_availability < metrics.sla_compliance.target_availability);
+    }
 }
