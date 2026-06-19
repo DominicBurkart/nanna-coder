@@ -1063,6 +1063,421 @@ impl Tool for RunCommandTool {
     }
 }
 
+pub fn cargo_build_args(package: Option<&str>, release: bool) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "build".to_string()];
+    if let Some(pkg) = package {
+        args.push("--package".to_string());
+        args.push(pkg.to_string());
+    }
+    if release {
+        args.push("--release".to_string());
+    }
+    args
+}
+
+pub fn cargo_test_args(package: Option<&str>, test_filter: Option<&str>) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "test".to_string()];
+    if let Some(pkg) = package {
+        args.push("--package".to_string());
+        args.push(pkg.to_string());
+    }
+    if let Some(filter) = test_filter {
+        args.push(filter.to_string());
+    }
+    args
+}
+
+pub fn cargo_check_args(package: Option<&str>) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "check".to_string()];
+    if let Some(pkg) = package {
+        args.push("--package".to_string());
+        args.push(pkg.to_string());
+    }
+    args
+}
+
+pub fn cargo_bench_args(package: Option<&str>, bench_filter: Option<&str>) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "bench".to_string()];
+    if let Some(pkg) = package {
+        args.push("--package".to_string());
+        args.push(pkg.to_string());
+    }
+    if let Some(filter) = bench_filter {
+        args.push(filter.to_string());
+    }
+    args
+}
+
+pub fn cargo_run_args(
+    package: Option<&str>,
+    bin: Option<&str>,
+    extra_args: &[String],
+) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "run".to_string()];
+    if let Some(pkg) = package {
+        args.push("--package".to_string());
+        args.push(pkg.to_string());
+    }
+    if let Some(b) = bin {
+        args.push("--bin".to_string());
+        args.push(b.to_string());
+    }
+    if !extra_args.is_empty() {
+        args.push("--".to_string());
+        args.extend_from_slice(extra_args);
+    }
+    args
+}
+
+pub struct CargoBuildTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+}
+
+impl CargoBuildTool {
+    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
+        Self { container_handle }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoBuildTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_build".to_string(),
+                description: "Build the cargo project inside the dev container.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "package".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Package to build (omit for entire workspace)".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "release".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Set to 'true' to build in release mode".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+        let argv = cargo_build_args(package, release);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_build"
+    }
+}
+
+pub struct CargoTestTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+}
+
+impl CargoTestTool {
+    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
+        Self { container_handle }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoTestTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_test".to_string(),
+                description: "Run cargo tests inside the dev container.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "package".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Package to test (omit for entire workspace)".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "test_filter".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("Test name filter (substring match)".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        let test_filter = args.get("test_filter").and_then(|v| v.as_str());
+        let argv = cargo_test_args(package, test_filter);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_test"
+    }
+}
+
+pub struct CargoCheckTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+}
+
+impl CargoCheckTool {
+    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
+        Self { container_handle }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoCheckTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_check".to_string(),
+                description: "Run cargo check (type and borrow checking without compilation) inside the dev container.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "package".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("Package to check (omit for entire workspace)".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        let argv = cargo_check_args(package);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_check"
+    }
+}
+
+pub struct CargoBenchTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+}
+
+impl CargoBenchTool {
+    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
+        Self { container_handle }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoBenchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_bench".to_string(),
+                description: "Run cargo benchmarks inside the dev container.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "package".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Package to benchmark (omit for entire workspace)".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "bench_filter".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Benchmark name filter (substring match)".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        let bench_filter = args.get("bench_filter").and_then(|v| v.as_str());
+        let argv = cargo_bench_args(package, bench_filter);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_bench"
+    }
+}
+
+pub struct CargoRunTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+}
+
+impl CargoRunTool {
+    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
+        Self { container_handle }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoRunTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_run".to_string(),
+                description: "Run a cargo binary inside the dev container.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "package".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("Package containing the binary".to_string()),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "bin".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Binary name to run (omit if package has only one binary)"
+                                        .to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "args".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Space-separated arguments to pass to the binary".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        let bin = args.get("bin").and_then(|v| v.as_str());
+        let extra_args: Vec<String> = args
+            .get("args")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        let argv = cargo_run_args(package, bin, &extra_args);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_run"
+    }
+}
+
 /// GitHub API connection status for transparent degradation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum GitHubStatus {
@@ -1852,6 +2267,21 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
+pub fn create_tool_registry_with_container(
+    workspace_root: &std::path::Path,
+    container: std::sync::Arc<crate::container::ContainerHandle>,
+) -> ToolRegistry {
+    let mut registry = create_tool_registry(workspace_root);
+    if workspace_root.join("Cargo.toml").exists() {
+        registry.register(Box::new(CargoBuildTool::new(container.clone())));
+        registry.register(Box::new(CargoTestTool::new(container.clone())));
+        registry.register(Box::new(CargoCheckTool::new(container.clone())));
+        registry.register(Box::new(CargoBenchTool::new(container.clone())));
+        registry.register(Box::new(CargoRunTool::new(container)));
+    }
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2441,5 +2871,269 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
+    }
+
+    #[test]
+    fn cargo_build_args_no_options() {
+        let args = cargo_build_args(None, false);
+        assert_eq!(args, vec!["cargo", "build"]);
+    }
+
+    #[test]
+    fn cargo_build_args_with_package() {
+        let args = cargo_build_args(Some("my-crate"), false);
+        assert_eq!(args, vec!["cargo", "build", "--package", "my-crate"]);
+    }
+
+    #[test]
+    fn cargo_build_args_release() {
+        let args = cargo_build_args(None, true);
+        assert_eq!(args, vec!["cargo", "build", "--release"]);
+    }
+
+    #[test]
+    fn cargo_build_args_package_and_release() {
+        let args = cargo_build_args(Some("my-crate"), true);
+        assert_eq!(
+            args,
+            vec!["cargo", "build", "--package", "my-crate", "--release"]
+        );
+    }
+
+    #[test]
+    fn cargo_test_args_no_options() {
+        let args = cargo_test_args(None, None);
+        assert_eq!(args, vec!["cargo", "test"]);
+    }
+
+    #[test]
+    fn cargo_test_args_with_package() {
+        let args = cargo_test_args(Some("my-crate"), None);
+        assert_eq!(args, vec!["cargo", "test", "--package", "my-crate"]);
+    }
+
+    #[test]
+    fn cargo_test_args_with_filter() {
+        let args = cargo_test_args(None, Some("my_test"));
+        assert_eq!(args, vec!["cargo", "test", "my_test"]);
+    }
+
+    #[test]
+    fn cargo_test_args_package_and_filter() {
+        let args = cargo_test_args(Some("my-crate"), Some("integration"));
+        assert_eq!(
+            args,
+            vec!["cargo", "test", "--package", "my-crate", "integration"]
+        );
+    }
+
+    #[test]
+    fn cargo_check_args_no_options() {
+        let args = cargo_check_args(None);
+        assert_eq!(args, vec!["cargo", "check"]);
+    }
+
+    #[test]
+    fn cargo_check_args_with_package() {
+        let args = cargo_check_args(Some("my-crate"));
+        assert_eq!(args, vec!["cargo", "check", "--package", "my-crate"]);
+    }
+
+    #[test]
+    fn cargo_bench_args_no_options() {
+        let args = cargo_bench_args(None, None);
+        assert_eq!(args, vec!["cargo", "bench"]);
+    }
+
+    #[test]
+    fn cargo_bench_args_with_package() {
+        let args = cargo_bench_args(Some("my-crate"), None);
+        assert_eq!(args, vec!["cargo", "bench", "--package", "my-crate"]);
+    }
+
+    #[test]
+    fn cargo_bench_args_with_filter() {
+        let args = cargo_bench_args(None, Some("throughput"));
+        assert_eq!(args, vec!["cargo", "bench", "throughput"]);
+    }
+
+    #[test]
+    fn cargo_bench_args_package_and_filter() {
+        let args = cargo_bench_args(Some("my-crate"), Some("throughput"));
+        assert_eq!(
+            args,
+            vec!["cargo", "bench", "--package", "my-crate", "throughput"]
+        );
+    }
+
+    #[test]
+    fn cargo_run_args_no_options() {
+        let args = cargo_run_args(None, None, &[]);
+        assert_eq!(args, vec!["cargo", "run"]);
+    }
+
+    #[test]
+    fn cargo_run_args_with_package() {
+        let args = cargo_run_args(Some("my-crate"), None, &[]);
+        assert_eq!(args, vec!["cargo", "run", "--package", "my-crate"]);
+    }
+
+    #[test]
+    fn cargo_run_args_with_bin() {
+        let args = cargo_run_args(None, Some("my-bin"), &[]);
+        assert_eq!(args, vec!["cargo", "run", "--bin", "my-bin"]);
+    }
+
+    #[test]
+    fn cargo_run_args_with_extra_args() {
+        let extra = vec!["--port".to_string(), "8080".to_string()];
+        let args = cargo_run_args(None, None, &extra);
+        assert_eq!(args, vec!["cargo", "run", "--", "--port", "8080"]);
+    }
+
+    #[test]
+    fn cargo_run_args_all_options() {
+        let extra = vec!["--verbose".to_string()];
+        let args = cargo_run_args(Some("my-crate"), Some("my-bin"), &extra);
+        assert_eq!(
+            args,
+            vec![
+                "cargo",
+                "run",
+                "--package",
+                "my-crate",
+                "--bin",
+                "my-bin",
+                "--",
+                "--verbose"
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_tool_definitions_have_correct_names() {
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        assert_eq!(CargoBuildTool::new(handle.clone()).name(), "cargo_build");
+        assert_eq!(CargoTestTool::new(handle.clone()).name(), "cargo_test");
+        assert_eq!(CargoCheckTool::new(handle.clone()).name(), "cargo_check");
+        assert_eq!(CargoBenchTool::new(handle.clone()).name(), "cargo_bench");
+        assert_eq!(CargoRunTool::new(handle.clone()).name(), "cargo_run");
+    }
+
+    #[test]
+    fn cargo_tool_definitions_have_correct_function_names() {
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        assert_eq!(
+            CargoBuildTool::new(handle.clone())
+                .definition()
+                .function
+                .name,
+            "cargo_build"
+        );
+        assert_eq!(
+            CargoTestTool::new(handle.clone())
+                .definition()
+                .function
+                .name,
+            "cargo_test"
+        );
+        assert_eq!(
+            CargoCheckTool::new(handle.clone())
+                .definition()
+                .function
+                .name,
+            "cargo_check"
+        );
+        assert_eq!(
+            CargoBenchTool::new(handle.clone())
+                .definition()
+                .function
+                .name,
+            "cargo_bench"
+        );
+        assert_eq!(
+            CargoRunTool::new(handle).definition().function.name,
+            "cargo_run"
+        );
+    }
+
+    #[test]
+    fn create_tool_registry_with_container_registers_cargo_tools_when_cargo_toml_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = create_tool_registry_with_container(dir.path(), handle);
+        assert!(registry.get_tool("cargo_build").is_some());
+        assert!(registry.get_tool("cargo_test").is_some());
+        assert!(registry.get_tool("cargo_check").is_some());
+        assert!(registry.get_tool("cargo_bench").is_some());
+        assert!(registry.get_tool("cargo_run").is_some());
+    }
+
+    #[test]
+    fn create_tool_registry_with_container_omits_cargo_tools_without_cargo_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = create_tool_registry_with_container(dir.path(), handle);
+        assert!(registry.get_tool("cargo_build").is_none());
+        assert!(registry.get_tool("cargo_test").is_none());
+        assert!(registry.get_tool("cargo_check").is_none());
+        assert!(registry.get_tool("cargo_bench").is_none());
+        assert!(registry.get_tool("cargo_run").is_none());
+    }
+
+    #[test]
+    fn create_tool_registry_with_container_always_has_base_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = create_tool_registry_with_container(dir.path(), handle);
+        assert!(registry.get_tool("echo").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("git_status").is_some());
+    }
+
+    #[test]
+    fn create_tool_registry_without_container_never_has_cargo_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let registry = create_tool_registry(dir.path());
+        assert!(registry.get_tool("cargo_build").is_none());
+        assert!(registry.get_tool("cargo_test").is_none());
+        assert!(registry.get_tool("cargo_check").is_none());
+        assert!(registry.get_tool("cargo_bench").is_none());
+        assert!(registry.get_tool("cargo_run").is_none());
     }
 }

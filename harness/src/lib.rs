@@ -30,9 +30,11 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_tool_registry, CalculatorTool, EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus,
-    GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
-    ToolError, ToolRegistry, ToolResult, WriteFileTool,
+    cargo_bench_args, cargo_build_args, cargo_check_args, cargo_run_args, cargo_test_args,
+    create_tool_registry, create_tool_registry_with_container, CalculatorTool, CargoBenchTool,
+    CargoBuildTool, CargoCheckTool, CargoRunTool, CargoTestTool, EchoTool, GitDiffTool,
+    GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool, PrStatusData, ReadFileTool,
+    RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool,
 };
 
 // Export agent types
