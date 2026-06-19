@@ -1261,8 +1261,7 @@ mod tests {
             context: HashMap::new(),
             acknowledged: false,
         };
-        let actions =
-            system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
         assert_eq!(actions.len(), 3);
         assert!(actions[0].contains("logs"));
     }
@@ -1326,14 +1325,20 @@ mod tests {
         assert_eq!(EscalationStatus::Resolved, EscalationStatus::Resolved);
         assert_eq!(EscalationStatus::Escalated, EscalationStatus::Escalated);
         assert_ne!(EscalationStatus::New, EscalationStatus::Resolved);
-        assert_ne!(EscalationStatus::Escalated, EscalationStatus::HighlyEscalated);
+        assert_ne!(
+            EscalationStatus::Escalated,
+            EscalationStatus::HighlyEscalated
+        );
         assert_ne!(EscalationStatus::UnderInvestigation, EscalationStatus::New);
     }
 
     #[test]
     fn test_alert_category_equality() {
         assert_eq!(AlertCategory::Performance, AlertCategory::Performance);
-        assert_eq!(AlertCategory::ContainerHealth, AlertCategory::ContainerHealth);
+        assert_eq!(
+            AlertCategory::ContainerHealth,
+            AlertCategory::ContainerHealth
+        );
         assert_ne!(AlertCategory::Performance, AlertCategory::Security);
         assert_ne!(AlertCategory::ModelQuality, AlertCategory::Resources);
         assert_ne!(AlertCategory::Availability, AlertCategory::Configuration);
