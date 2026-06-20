@@ -487,3 +487,108 @@ async fn cargo_audit_tool_definition_name_matches_execute_name() {
     let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
     assert_eq!(tool.name(), tool.definition().function.name);
 }
+
+// ---------------------------------------------------------------------------
+// Execute error paths — cover arg-parsing and map_err lines without a container
+//
+// ContainerRuntime::None makes exec_in_container return NoRuntimeAvailable,
+// so every execute body up to and including the `?` operator is exercised.
+// The Ok(json!{...}) success branch is covered by the #[ignore] container
+// integration tests in dev_container_integration.rs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cargo_build_execute_error_path_covered() {
+    use harness::tools::CargoBuildTool;
+    let handle = test_container_handle();
+    let tool = CargoBuildTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"package": "harness", "release": "true"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_test_execute_error_path_covered() {
+    use harness::tools::CargoTestTool;
+    let handle = test_container_handle();
+    let tool = CargoTestTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"package": "harness", "test_filter": "my_test"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_check_execute_error_path_covered() {
+    use harness::tools::CargoCheckTool;
+    let handle = test_container_handle();
+    let tool = CargoCheckTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_bench_execute_error_path_covered() {
+    use harness::tools::CargoBenchTool;
+    let handle = test_container_handle();
+    let tool = CargoBenchTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"bench_filter": "bench_foo"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_run_execute_error_path_covered() {
+    use harness::tools::CargoRunTool;
+    let handle = test_container_handle();
+    let tool = CargoRunTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"bin": "harness", "args": "--help"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_error_path_covered() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"check": "advisories"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_audit_execute_error_path_covered() {
+    use harness::tools::CargoAuditTool;
+    let handle = test_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_no_check_arg_error_path() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
