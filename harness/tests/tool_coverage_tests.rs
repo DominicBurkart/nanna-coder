@@ -8,10 +8,18 @@
 //! - `ReadFileTool`: IO error on missing file; `start_line`-only (no `end_line`); line-number
 //!   prefix format in returned content
 //! - `TaskId`: `Display` / `fmt` implementation
+//! - Capability catalog: detection, uniqueness, registry gating
+//! - Arg builders: `cargo_deny_args`, `cargo_audit_args`
 
+use harness::capabilities::{detect_capabilities, find_capability, CARGO_CAPABILITIES};
+use harness::container::{ContainerHandle, ContainerRuntime};
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    cargo_audit_args, cargo_deny_args, create_container_tool_registry, CalculatorTool,
+    ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+};
 use serde_json::json;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // CalculatorTool – missing arithmetic operations
@@ -256,4 +264,226 @@ fn task_id_new_display_is_non_empty() {
     assert!(!s.is_empty(), "TaskId display must not be empty");
     // UUID v4 is 36 chars (with hyphens)
     assert_eq!(s.len(), 36, "UUID v4 should be 36 chars, got: {s}");
+}
+
+// ---------------------------------------------------------------------------
+// Capability catalog – static correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capability_catalog_ids_are_unique() {
+    let mut ids: Vec<&str> = CARGO_CAPABILITIES.iter().map(|c| c.id).collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(before, ids.len(), "capability ids must be unique");
+}
+
+#[test]
+fn capability_catalog_entries_are_non_empty() {
+    for cap in CARGO_CAPABILITIES {
+        assert!(!cap.id.is_empty());
+        assert!(!cap.subcommand.is_empty());
+        assert!(!cap.description.is_empty());
+    }
+}
+
+#[test]
+fn capability_descriptions_contain_example_and_returns() {
+    for cap in CARGO_CAPABILITIES {
+        assert!(
+            cap.description.contains("Example"),
+            "capability '{}' description missing Example",
+            cap.id
+        );
+        assert!(
+            cap.description.contains("Returns"),
+            "capability '{}' description missing Returns",
+            cap.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability detection – filesystem signals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deny_tool_detected_when_deny_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("deny.toml"), "").unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        caps.iter().any(|c| c.id == "cargo_deny"),
+        "cargo_deny must be detected when deny.toml is present"
+    );
+}
+
+#[test]
+fn deny_tool_absent_without_deny_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        !caps.iter().any(|c| c.id == "cargo_deny"),
+        "cargo_deny must not be detected without deny.toml"
+    );
+}
+
+#[test]
+fn audit_tool_detected_when_audit_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("audit.toml"), "").unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        caps.iter().any(|c| c.id == "cargo_audit"),
+        "cargo_audit must be detected when audit.toml is present"
+    );
+}
+
+#[test]
+fn find_capability_cargo_deny_returns_correct_nix_pkg() {
+    let cap = find_capability("cargo_deny").expect("cargo_deny must exist");
+    assert_eq!(cap.nix_package, Some("pkgs.cargo-deny"));
+}
+
+// ---------------------------------------------------------------------------
+// Arg builders for new cargo tools
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cargo_deny_args_no_category() {
+    let args = cargo_deny_args(None);
+    assert_eq!(args, vec!["cargo", "deny", "check"]);
+}
+
+#[test]
+fn cargo_deny_args_with_category() {
+    let args = cargo_deny_args(Some("advisories"));
+    assert_eq!(args, vec!["cargo", "deny", "check", "advisories"]);
+}
+
+#[test]
+fn cargo_audit_args_baseline() {
+    let args = cargo_audit_args();
+    assert_eq!(args, vec!["cargo", "audit"]);
+}
+
+// ---------------------------------------------------------------------------
+// Registry gating – signal-based tool registration
+// ---------------------------------------------------------------------------
+
+fn test_container_handle() -> Arc<ContainerHandle> {
+    Arc::new(ContainerHandle {
+        name: "test-container".to_string(),
+        runtime: ContainerRuntime::None,
+        port: None,
+        needs_cleanup: false,
+    })
+}
+
+#[test]
+fn cargo_deny_registered_when_deny_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(dir.path().join("deny.toml"), "").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_deny").is_some(),
+        "cargo_deny tool must be registered when deny.toml is present"
+    );
+}
+
+#[test]
+fn cargo_deny_absent_without_deny_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_deny").is_none(),
+        "cargo_deny tool must not be registered without deny.toml"
+    );
+}
+
+#[test]
+fn cargo_audit_registered_when_audit_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(dir.path().join("audit.toml"), "").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_audit").is_some(),
+        "cargo_audit tool must be registered when audit.toml is present"
+    );
+}
+
+#[test]
+fn cargo_audit_absent_without_audit_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_audit").is_none(),
+        "cargo_audit tool must not be registered without audit.toml"
+    );
+}
+
+#[test]
+fn no_cargo_tools_registered_without_cargo_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    for tool_name in &[
+        "cargo_build",
+        "cargo_test",
+        "cargo_check",
+        "cargo_bench",
+        "cargo_run",
+        "cargo_deny",
+        "cargo_audit",
+    ] {
+        assert!(
+            registry.get_tool(tool_name).is_none(),
+            "{tool_name} must not be registered without Cargo.toml"
+        );
+    }
+}
+
+#[test]
+fn core_cargo_tools_always_registered_with_cargo_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    for tool_name in &[
+        "cargo_build",
+        "cargo_test",
+        "cargo_check",
+        "cargo_bench",
+        "cargo_run",
+    ] {
+        assert!(
+            registry.get_tool(tool_name).is_some(),
+            "{tool_name} must be registered when Cargo.toml is present"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cargo_deny_tool_definition_name_matches_execute_name() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    assert_eq!(tool.name(), tool.definition().function.name);
+}
+
+#[tokio::test]
+async fn cargo_audit_tool_definition_name_matches_execute_name() {
+    use harness::tools::CargoAuditTool;
+    let handle = test_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    assert_eq!(tool.name(), tool.definition().function.name);
 }

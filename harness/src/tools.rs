@@ -1063,6 +1063,18 @@ impl Tool for RunCommandTool {
     }
 }
 
+pub fn cargo_deny_args(check: Option<&str>) -> Vec<String> {
+    let mut args = vec!["cargo".to_string(), "deny".to_string(), "check".to_string()];
+    if let Some(category) = check {
+        args.push(category.to_string());
+    }
+    args
+}
+
+pub fn cargo_audit_args() -> Vec<String> {
+    vec!["cargo".to_string(), "audit".to_string()]
+}
+
 pub fn cargo_build_args(package: Option<&str>, release: bool) -> Vec<String> {
     let mut args = vec!["cargo".to_string(), "build".to_string()];
     if let Some(pkg) = package {
@@ -1530,6 +1542,146 @@ impl Tool for CargoRunTool {
 
     fn name(&self) -> &str {
         "cargo_run"
+    }
+}
+
+pub struct CargoDenyTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl CargoDenyTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoDenyTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_deny".to_string(),
+                description: "Check dependencies for license violations and security advisories. \
+                              Reads deny.toml for policy. \
+                              Example: call with {} to run all checks, \
+                              or {\"check\": \"advisories\"} to run one category. \
+                              Returns { stdout, stderr, success, command }."
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "check".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Category to check: advisories, bans, licenses, or sources. \
+                                     Omit to check all."
+                                        .to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let check = args.get("check").and_then(|v| v.as_str());
+        let argv = cargo_deny_args(check);
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_deny"
+    }
+}
+
+pub struct CargoAuditTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl CargoAuditTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CargoAuditTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "cargo_audit".to_string(),
+                description: "Audit Cargo.lock for known security vulnerabilities. \
+                              Example: call with {} to audit all dependencies. \
+                              Returns { stdout, stderr, success, command }."
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some(HashMap::new()),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, _args: Value) -> ToolResult<Value> {
+        let argv = cargo_audit_args();
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "cargo_audit"
     }
 }
 
@@ -2356,7 +2508,24 @@ pub fn create_container_tool_registry(
             container_handle.clone(),
             wd.clone(),
         )));
-        registry.register(Box::new(CargoRunTool::new(container_handle, wd)));
+        registry.register(Box::new(CargoRunTool::new(
+            container_handle.clone(),
+            wd.clone(),
+        )));
+        let detected = crate::capabilities::detect_capabilities(workspace_root);
+        for cap in detected {
+            match cap.id {
+                "cargo_deny" => registry.register(Box::new(CargoDenyTool::new(
+                    container_handle.clone(),
+                    wd.clone(),
+                ))),
+                "cargo_audit" => registry.register(Box::new(CargoAuditTool::new(
+                    container_handle.clone(),
+                    wd.clone(),
+                ))),
+                _ => {}
+            }
+        }
     }
     registry
 }
