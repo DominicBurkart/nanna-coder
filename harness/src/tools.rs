@@ -1131,11 +1131,18 @@ pub fn cargo_run_args(
 
 pub struct CargoBuildTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
 }
 
 impl CargoBuildTool {
-    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
-        Self { container_handle }
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
     }
 }
 
@@ -1183,10 +1190,14 @@ impl Tool for CargoBuildTool {
         let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
         let argv = cargo_build_args(package, release);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: e.to_string(),
-            })?;
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
         Ok(json!({
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -1201,11 +1212,18 @@ impl Tool for CargoBuildTool {
 
 pub struct CargoTestTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
 }
 
 impl CargoTestTool {
-    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
-        Self { container_handle }
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
     }
 }
 
@@ -1251,10 +1269,14 @@ impl Tool for CargoTestTool {
         let test_filter = args.get("test_filter").and_then(|v| v.as_str());
         let argv = cargo_test_args(package, test_filter);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: e.to_string(),
-            })?;
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
         Ok(json!({
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -1269,11 +1291,18 @@ impl Tool for CargoTestTool {
 
 pub struct CargoCheckTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
 }
 
 impl CargoCheckTool {
-    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
-        Self { container_handle }
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
     }
 }
 
@@ -1308,10 +1337,14 @@ impl Tool for CargoCheckTool {
         let package = args.get("package").and_then(|v| v.as_str());
         let argv = cargo_check_args(package);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: e.to_string(),
-            })?;
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
         Ok(json!({
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -1326,11 +1359,18 @@ impl Tool for CargoCheckTool {
 
 pub struct CargoBenchTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
 }
 
 impl CargoBenchTool {
-    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
-        Self { container_handle }
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
     }
 }
 
@@ -1378,10 +1418,14 @@ impl Tool for CargoBenchTool {
         let bench_filter = args.get("bench_filter").and_then(|v| v.as_str());
         let argv = cargo_bench_args(package, bench_filter);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: e.to_string(),
-            })?;
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
         Ok(json!({
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -1396,11 +1440,18 @@ impl Tool for CargoBenchTool {
 
 pub struct CargoRunTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
 }
 
 impl CargoRunTool {
-    pub fn new(container_handle: std::sync::Arc<crate::container::ContainerHandle>) -> Self {
-        Self { container_handle }
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
     }
 }
 
@@ -1462,10 +1513,14 @@ impl Tool for CargoRunTool {
             .unwrap_or_default();
         let argv = cargo_run_args(package, bin, &extra_args);
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(&self.container_handle, &argv_refs, None)
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: e.to_string(),
-            })?;
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
         Ok(json!({
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -2267,17 +2322,41 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
     registry
 }
 
-pub fn create_tool_registry_with_container(
+/// The working directory inside the dev container where the worktree is mounted.
+pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
+
+pub fn create_container_tool_registry(
     workspace_root: &std::path::Path,
-    container: std::sync::Arc<crate::container::ContainerHandle>,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
 ) -> ToolRegistry {
     let mut registry = create_tool_registry(workspace_root);
+    // Deliberately overrides any `run_command` entry from `create_tool_registry`
+    // with a container-bound version; if `create_tool_registry` ever adds a
+    // `run_command` tool, this override is intentional and expected.
+    registry.register(Box::new(RunCommandTool::new(
+        container_handle.clone(),
+        Some(container_working_dir.to_string()),
+    )));
     if workspace_root.join("Cargo.toml").exists() {
-        registry.register(Box::new(CargoBuildTool::new(container.clone())));
-        registry.register(Box::new(CargoTestTool::new(container.clone())));
-        registry.register(Box::new(CargoCheckTool::new(container.clone())));
-        registry.register(Box::new(CargoBenchTool::new(container.clone())));
-        registry.register(Box::new(CargoRunTool::new(container)));
+        let wd = Some(container_working_dir.to_string());
+        registry.register(Box::new(CargoBuildTool::new(
+            container_handle.clone(),
+            wd.clone(),
+        )));
+        registry.register(Box::new(CargoTestTool::new(
+            container_handle.clone(),
+            wd.clone(),
+        )));
+        registry.register(Box::new(CargoCheckTool::new(
+            container_handle.clone(),
+            wd.clone(),
+        )));
+        registry.register(Box::new(CargoBenchTool::new(
+            container_handle.clone(),
+            wd.clone(),
+        )));
+        registry.register(Box::new(CargoRunTool::new(container_handle, wd)));
     }
     registry
 }
@@ -2481,6 +2560,29 @@ mod tests {
             assert!(diff.get("diff").is_some());
             assert!(diff.get("has_changes").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_container_tool_registry_includes_run_command() {
+        use std::sync::Arc;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+
+        let registry =
+            create_container_tool_registry(temp_dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+        assert!(registry.get_tool("run_command").is_some());
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("list_directory").is_some());
+        assert!(registry.get_tool("search").is_some());
+        assert!(registry.get_tool("git_status").is_some());
+        assert!(registry.get_tool("git_diff").is_some());
     }
 
     // -- PrStatusData unit tests --
@@ -3018,11 +3120,23 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        assert_eq!(CargoBuildTool::new(handle.clone()).name(), "cargo_build");
-        assert_eq!(CargoTestTool::new(handle.clone()).name(), "cargo_test");
-        assert_eq!(CargoCheckTool::new(handle.clone()).name(), "cargo_check");
-        assert_eq!(CargoBenchTool::new(handle.clone()).name(), "cargo_bench");
-        assert_eq!(CargoRunTool::new(handle.clone()).name(), "cargo_run");
+        assert_eq!(
+            CargoBuildTool::new(handle.clone(), None).name(),
+            "cargo_build"
+        );
+        assert_eq!(
+            CargoTestTool::new(handle.clone(), None).name(),
+            "cargo_test"
+        );
+        assert_eq!(
+            CargoCheckTool::new(handle.clone(), None).name(),
+            "cargo_check"
+        );
+        assert_eq!(
+            CargoBenchTool::new(handle.clone(), None).name(),
+            "cargo_bench"
+        );
+        assert_eq!(CargoRunTool::new(handle.clone(), None).name(), "cargo_run");
     }
 
     #[test]
@@ -3034,41 +3148,41 @@ mod tests {
             needs_cleanup: false,
         });
         assert_eq!(
-            CargoBuildTool::new(handle.clone())
+            CargoBuildTool::new(handle.clone(), None)
                 .definition()
                 .function
                 .name,
             "cargo_build"
         );
         assert_eq!(
-            CargoTestTool::new(handle.clone())
+            CargoTestTool::new(handle.clone(), None)
                 .definition()
                 .function
                 .name,
             "cargo_test"
         );
         assert_eq!(
-            CargoCheckTool::new(handle.clone())
+            CargoCheckTool::new(handle.clone(), None)
                 .definition()
                 .function
                 .name,
             "cargo_check"
         );
         assert_eq!(
-            CargoBenchTool::new(handle.clone())
+            CargoBenchTool::new(handle.clone(), None)
                 .definition()
                 .function
                 .name,
             "cargo_bench"
         );
         assert_eq!(
-            CargoRunTool::new(handle).definition().function.name,
+            CargoRunTool::new(handle, None).definition().function.name,
             "cargo_run"
         );
     }
 
     #[test]
-    fn create_tool_registry_with_container_registers_cargo_tools_when_cargo_toml_present() {
+    fn container_registry_registers_cargo_tools_when_cargo_toml_present() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -3081,7 +3195,7 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let registry = create_tool_registry_with_container(dir.path(), handle);
+        let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
         assert!(registry.get_tool("cargo_build").is_some());
         assert!(registry.get_tool("cargo_test").is_some());
         assert!(registry.get_tool("cargo_check").is_some());
@@ -3090,7 +3204,7 @@ mod tests {
     }
 
     #[test]
-    fn create_tool_registry_with_container_omits_cargo_tools_without_cargo_toml() {
+    fn container_registry_omits_cargo_tools_without_cargo_toml() {
         let dir = tempfile::TempDir::new().unwrap();
         let handle = std::sync::Arc::new(crate::container::ContainerHandle {
             name: "test-container".to_string(),
@@ -3098,7 +3212,7 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let registry = create_tool_registry_with_container(dir.path(), handle);
+        let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
         assert!(registry.get_tool("cargo_build").is_none());
         assert!(registry.get_tool("cargo_test").is_none());
         assert!(registry.get_tool("cargo_check").is_none());
@@ -3107,7 +3221,7 @@ mod tests {
     }
 
     #[test]
-    fn create_tool_registry_with_container_always_has_base_tools() {
+    fn container_registry_always_has_base_tools() {
         let dir = tempfile::TempDir::new().unwrap();
         let handle = std::sync::Arc::new(crate::container::ContainerHandle {
             name: "test-container".to_string(),
@@ -3115,10 +3229,11 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let registry = create_tool_registry_with_container(dir.path(), handle);
+        let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
         assert!(registry.get_tool("echo").is_some());
         assert!(registry.get_tool("read_file").is_some());
         assert!(registry.get_tool("git_status").is_some());
+        assert!(registry.get_tool("run_command").is_some());
     }
 
     #[test]
@@ -3135,5 +3250,72 @@ mod tests {
         assert!(registry.get_tool("cargo_check").is_none());
         assert!(registry.get_tool("cargo_bench").is_none());
         assert!(registry.get_tool("cargo_run").is_none());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use std::collections::HashMap;
+
+    /// Model ToolRegistry::register as a pure HashMap insert.
+    ///
+    /// The real `register()` calls `HashMap::insert(name, tool)` which
+    /// silently overwrites any previous entry with the same key. This
+    /// harness verifies that property: after two inserts with the same
+    /// key, only the last value survives and the collection size is 1.
+    #[kani::proof]
+    fn register_overwrites_duplicate_key() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let val1: u8 = kani::any();
+        let val2: u8 = kani::any();
+
+        map.insert(key, val1);
+        assert_eq!(map.len(), 1);
+
+        // Second insert with the same key silently overwrites
+        let old = map.insert(key, val2);
+        assert_eq!(old, Some(val1));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], val2);
+    }
+
+    /// When different keys are used, both entries are preserved.
+    #[kani::proof]
+    fn register_distinct_keys_preserved() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
+        kani::assume(k1 != k2);
+
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(k1, v1);
+        map.insert(k2, v2);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&k1], v1);
+        assert_eq!(map[&k2], v2);
+    }
+
+    /// After removing a key and re-registering, the new value is present.
+    #[kani::proof]
+    fn register_after_remove_succeeds() {
+        let mut map: HashMap<u8, u8> = HashMap::new();
+
+        let key: u8 = kani::any();
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+
+        map.insert(key, v1);
+        map.remove(&key);
+        assert!(map.is_empty());
+
+        map.insert(key, v2);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&key], v2);
     }
 }

@@ -12,11 +12,16 @@
 //! 8. Decision → **Query Entities (RAG)** → back to Decision
 //! 9. Decision → **Plan Entity Modification** (loop)
 
-pub mod decision;
+pub mod agents_md;
 pub mod eval;
 pub mod eval_case;
+pub mod project_detect;
+pub mod project_prompt;
 pub mod prompts;
 pub mod rag;
+pub mod report;
+
+pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
@@ -28,7 +33,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use model::provider::ModelProvider;
-use model::types::{ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole};
+use model::types::{
+    ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, ToolCall, Usage,
+};
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
 const DEFAULT_PLANNING_RAG_LIMIT: usize = 10;
@@ -205,7 +212,7 @@ pub struct AgentContext {
 }
 
 /// Result of running the agent
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
     /// Final state of the agent
     pub final_state: AgentState,
@@ -219,6 +226,9 @@ pub struct AgentRunResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Snapshot of the full conversation
     pub conversation_snapshot: Vec<ChatMessage>,
+    /// Aggregated token usage across all LLM calls. `None` when the
+    /// entity-based loop ran without an LLM provider.
+    pub token_usage: Option<Usage>,
 }
 
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
@@ -269,11 +279,17 @@ fn extract_result_summary(history: &[ChatMessage]) -> String {
         .to_string()
 }
 
-pub struct AgentLoop {
+/// Agent control loop.
+///
+/// Generic over the backing entity store so that downstream callers can plug
+/// in either the default [`InMemoryEntityStore`] or future persistent
+/// backends (see issue #193). The default type parameter keeps the common
+/// call sites unchanged.
+pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
     state: AgentState,
     config: AgentConfig,
     iterations: usize,
-    entity_store: InMemoryEntityStore,
+    entity_store: S,
     performed_actions: usize,
     llm_provider: Option<Arc<dyn ModelProvider>>,
     plan_cache: Option<String>,
@@ -283,26 +299,16 @@ pub struct AgentLoop {
     state_history: Vec<AgentState>,
 }
 
-impl AgentLoop {
-    /// Create a new agent loop with default entity store
+impl AgentLoop<InMemoryEntityStore> {
+    /// Create a new agent loop with the default in-memory entity store.
     pub fn new(config: AgentConfig) -> Self {
-        Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store: InMemoryEntityStore::new(),
-            performed_actions: 0,
-            llm_provider: None,
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
-        }
+        Self::with_entity_store(config, InMemoryEntityStore::new())
     }
+}
 
+impl<S: EntityStore + Send> AgentLoop<S> {
     /// Create a new agent loop with a provided entity store
-    pub fn with_entity_store(config: AgentConfig, entity_store: InMemoryEntityStore) -> Self {
+    pub fn with_entity_store(config: AgentConfig, entity_store: S) -> Self {
         Self {
             state: AgentState::EnrichingEntities,
             config,
@@ -321,48 +327,35 @@ impl AgentLoop {
     /// Create a new agent loop with entity store and LLM provider
     pub fn with_llm(
         config: AgentConfig,
-        entity_store: InMemoryEntityStore,
+        entity_store: S,
         llm_provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
             llm_provider: Some(llm_provider),
-            plan_cache: None,
-            tool_registry: None,
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_entity_store(config, entity_store)
         }
     }
 
     /// Create a new agent loop with entity store, LLM provider, and tool registry
     pub fn with_tools(
         config: AgentConfig,
-        entity_store: InMemoryEntityStore,
+        entity_store: S,
         llm_provider: Arc<dyn ModelProvider>,
         tool_registry: ToolRegistry,
     ) -> Self {
         Self {
-            state: AgentState::EnrichingEntities,
-            config,
-            iterations: 0,
-            entity_store,
-            performed_actions: 0,
-            llm_provider: Some(llm_provider),
-            plan_cache: None,
             tool_registry: Some(tool_registry),
-            conversation_history: Vec::new(),
-            progress_counter: None,
-            state_history: Vec::new(),
+            ..Self::with_llm(config, entity_store, llm_provider)
         }
     }
 
     pub fn set_progress_counter(&mut self, counter: Arc<AtomicUsize>) {
         self.progress_counter = Some(counter);
+    }
+
+    /// Attach a tool registry to the agent loop.
+    pub fn set_tool_registry(&mut self, registry: ToolRegistry) {
+        self.tool_registry = Some(registry);
     }
 
     pub fn conversation_history(&self) -> &[ChatMessage] {
@@ -375,12 +368,12 @@ impl AgentLoop {
     }
 
     /// Get reference to entity store
-    pub fn entity_store(&self) -> &InMemoryEntityStore {
+    pub fn entity_store(&self) -> &S {
         &self.entity_store
     }
 
     /// Get mutable reference to entity store
-    pub fn entity_store_mut(&mut self) -> &mut InMemoryEntityStore {
+    pub fn entity_store_mut(&mut self) -> &mut S {
         &mut self.entity_store
     }
 
@@ -436,8 +429,10 @@ impl AgentLoop {
 
     /// Run the agent loop with the given context.
     ///
-    /// All agents flow through the architectural state machine:
+    /// Flows through the architectural state machine:
     /// Planning → CheckingCompletion → Deciding → Querying/Performing → loop
+    /// When both a tool registry and LLM provider are present, the
+    /// `PerformingEntityModification` state dispatches to `run_tool_loop`.
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
@@ -484,6 +479,7 @@ impl AgentLoop {
                     result_summary,
                     tool_calls_made,
                     conversation_snapshot: conversation,
+                    token_usage: None,
                 });
             }
 
@@ -548,11 +544,48 @@ impl AgentLoop {
 
     /// Transition to a new state
     fn transition_to(&mut self, new_state: AgentState) {
+        debug_assert!(
+            Self::is_legal_transition(&self.state, &new_state),
+            "illegal state transition: {:?} -> {:?}",
+            self.state,
+            new_state
+        );
         if self.config.verbose {
             tracing::debug!("State transition: {:?} → {:?}", self.state, new_state);
         }
         self.state_history.push(new_state.clone());
         self.state = new_state;
+    }
+
+    /// Check whether a state transition is legal according to ARCHITECTURE.md.
+    ///
+    /// ```text
+    /// EnrichingEntities           → PlanningEntityModification
+    /// PlanningEntityModification  → PerformingEntityModification
+    /// PerformingEntityModification→ UpdatingEntities
+    /// UpdatingEntities            → CheckingTaskCompletion
+    /// CheckingTaskCompletion      → Completed | EntityModificationDecision
+    /// EntityModificationDecision  → QueryingEntities | PlanningEntityModification
+    /// QueryingEntities            → EntityModificationDecision
+    /// ```
+    ///
+    /// Enforced at runtime in debug builds via `debug_assert!` in
+    /// `transition_to`, and verified exhaustively by Kani in `kani_proofs`.
+    fn is_legal_transition(from: &AgentState, to: &AgentState) -> bool {
+        use AgentState::*;
+        matches!(
+            (from, to),
+            (EnrichingEntities, PlanningEntityModification)
+                | (PlanningEntityModification, PerformingEntityModification)
+                | (PerformingEntityModification, UpdatingEntities)
+                | (UpdatingEntities, CheckingTaskCompletion)
+                | (CheckingTaskCompletion, Completed)
+                | (CheckingTaskCompletion, EntityModificationDecision)
+                | (EntityModificationDecision, QueryingEntities)
+                | (EntityModificationDecision, PlanningEntityModification)
+                | (QueryingEntities, EntityModificationDecision)
+                | (_, Error(_))
+        )
     }
 
     /// Call LLM with retry logic and exponential backoff
@@ -666,7 +699,7 @@ impl AgentLoop {
         }
 
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let entity_count = self
                 .entity_store
@@ -713,7 +746,7 @@ impl AgentLoop {
     /// request has been fully satisfied.
     async fn check_task_completion(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let entities = self
                 .entity_store
@@ -777,7 +810,7 @@ impl AgentLoop {
     /// query for more context (true) or proceed to plan (false).
     async fn entity_modification_decision(&self, context: &AgentContext) -> AgentResult<bool> {
         if let Some(provider) = &self.llm_provider {
-            use crate::entities::{EntityQuery, EntityStore};
+            use crate::entities::EntityQuery;
 
             let plan = self.plan_cache.as_deref().unwrap_or("No plan yet");
             let entity_count = self
@@ -890,7 +923,7 @@ impl AgentLoop {
     /// the Performing state instead.
     #[deprecated(note = "Use with_tools constructor for LLM-driven performing")]
     async fn perform_entity_modification_mvp(&mut self, context: &AgentContext) -> AgentResult<()> {
-        use crate::entities::{git::types::GitRepository, EntityStore};
+        use crate::entities::git::types::GitRepository;
 
         self.performed_actions += 1;
 
@@ -915,11 +948,11 @@ impl AgentLoop {
 
     /// Full tool-calling run loop — formerly used when tool_registry is set.
     ///
-    /// Deprecated: The state machine `run()` method now handles tools via
-    /// `perform_entity_modification_with_tools()` in the Performing state, following the architecture.
-    #[deprecated(note = "run() now handles tools via the state machine")]
-    #[allow(dead_code)]
-    async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
+    /// Drive the agent via direct LLM tool-calling, bypassing the state machine.
+    ///
+    /// Used by the eval runner and tests that need to measure raw LLM iteration
+    /// counts and token usage without the planning/completion-check overhead.
+    pub async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
 
         if !self.config.system_prompt.is_empty() {
@@ -927,32 +960,30 @@ impl AgentLoop {
             self.conversation_history.push(ChatMessage::system(&sp));
         }
 
-        for msg in context.conversation_history {
+        for msg in context.conversation_history.iter().cloned() {
             self.conversation_history.push(msg);
         }
 
-        let tool_defs = self
-            .tool_registry
-            .as_ref()
-            .map(|r| r.get_definitions())
-            .unwrap_or_default();
+        let tool_defs = match self.tool_registry.as_ref() {
+            Some(r) => r.get_definitions(),
+            None => Vec::new(),
+        };
 
         self.iterations = 0;
+        let mut total_usage = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
 
-        loop {
-            if self.iterations >= self.config.max_iterations {
-                return Err(self.enrich_error(bare_max_iterations(self.iterations)));
-            }
-
+        while self.iterations < self.config.max_iterations {
             let model_name = self.config.model_name.clone();
             let messages = self.conversation_history.clone();
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
             let provider = match self.llm_provider.clone() {
                 Some(p) => p,
-                None => {
-                    return Err(self.enrich_error(bare_state_error("No provider configured")));
-                }
+                None => return Err(self.enrich_error(bare_state_error("No provider configured"))),
             };
 
             let response = provider.chat(request).await.map_err(|e| {
@@ -963,78 +994,91 @@ impl AgentLoop {
                 return Err(self.enrich_error(bare_state_error("Empty response from model")));
             }
 
+            if let Some(ref u) = response.usage {
+                total_usage.prompt_tokens += u.prompt_tokens;
+                total_usage.completion_tokens += u.completion_tokens;
+                total_usage.total_tokens += u.total_tokens;
+            }
+
             let choice = response.choices.into_iter().next().unwrap();
             let finish_reason = choice.finish_reason.clone();
             let tool_calls = choice.message.tool_calls.clone();
             self.conversation_history.push(choice.message);
 
-            match finish_reason {
-                Some(FinishReason::Stop) | None => {
-                    self.transition_to(AgentState::Completed);
-                    let task_description = context.user_prompt.clone();
-                    let conversation = self.conversation_history.clone();
-                    let tool_calls_made = extract_tool_calls_from_history(&conversation);
-                    let result_summary = extract_result_summary(&conversation);
-                    let model_used = self.config.model_name.clone();
-                    let entity = ContextEntity::new(
-                        task_description,
-                        conversation.clone(),
-                        tool_calls_made.clone(),
-                        result_summary.clone(),
-                        model_used,
-                    );
-                    if let Err(e) = self.entity_store.store(Box::new(entity)).await {
-                        tracing::warn!("Failed to store context entity: {}", e);
-                    }
-                    return Ok(AgentRunResult {
-                        final_state: AgentState::Completed,
-                        iterations: self.iterations,
-                        task_completed: true,
-                        result_summary,
-                        tool_calls_made,
-                        conversation_snapshot: conversation,
-                    });
-                }
-                Some(FinishReason::ToolCalls) => {
-                    if let Some(calls) = tool_calls {
-                        for tool_call in &calls {
-                            let name = tool_call.function.name.clone();
-                            let args = tool_call.function.arguments.clone();
-                            let call_id = tool_call.id.clone();
-
-                            let response_content = {
-                                let registry = self.tool_registry.as_ref();
-                                match registry {
-                                    None => {
-                                        return Err(
-                                            self.enrich_error(bare_state_error("No tool registry"))
-                                        );
-                                    }
-                                    Some(r) => {
-                                        let result = r.execute(&name, args).await;
-                                        match result {
-                                            Ok(v) => v.to_string(),
-                                            Err(e) => format!("Error: {}", e),
-                                        }
-                                    }
-                                }
-                            };
-
-                            self.conversation_history
-                                .push(ChatMessage::tool_response(call_id, response_content));
-                        }
-                    }
-                }
-                Some(_) => {
-                    return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
-                }
-            }
-
             self.iterations += 1;
             if let Some(ref counter) = self.progress_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
+
+            let is_stop = matches!(finish_reason, Some(FinishReason::Stop) | None);
+            let is_tool_calls = matches!(finish_reason, Some(FinishReason::ToolCalls));
+
+            if is_stop {
+                return Ok(self.complete_tool_loop(&context, total_usage).await);
+            }
+            if !is_tool_calls {
+                return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
+            }
+            self.dispatch_tool_calls(tool_calls).await?;
         }
+
+        Err(self.enrich_error(bare_max_iterations(self.iterations)))
+    }
+
+    async fn complete_tool_loop(
+        &mut self,
+        context: &AgentContext,
+        total_usage: Usage,
+    ) -> AgentRunResult {
+        self.state_history.push(AgentState::Completed);
+        self.state = AgentState::Completed;
+        let task_description = context.user_prompt.clone();
+        let conversation = self.conversation_history.clone();
+        let tool_calls_made = extract_tool_calls_from_history(&conversation);
+        let result_summary = extract_result_summary(&conversation);
+        let model_used = self.config.model_name.clone();
+        let entity = ContextEntity::new(
+            task_description,
+            conversation.clone(),
+            tool_calls_made.clone(),
+            result_summary.clone(),
+            model_used,
+        );
+        if let Err(e) = self.entity_store.store(Box::new(entity)).await {
+            tracing::warn!("Failed to store context entity: {}", e);
+        }
+        AgentRunResult {
+            final_state: AgentState::Completed,
+            iterations: self.iterations,
+            task_completed: true,
+            result_summary,
+            tool_calls_made,
+            conversation_snapshot: conversation,
+            token_usage: Some(total_usage),
+        }
+    }
+
+    async fn dispatch_tool_calls(&mut self, tool_calls: Option<Vec<ToolCall>>) -> AgentResult<()> {
+        let calls = match tool_calls {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        for tool_call in &calls {
+            let name = tool_call.function.name.clone();
+            let args = tool_call.function.arguments.clone();
+            let call_id = tool_call.id.clone();
+            let registry = match self.tool_registry.as_ref() {
+                Some(r) => r,
+                None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
+            };
+            let response_content = match registry.execute(&name, args).await {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("Error: {}", e),
+            };
+            self.conversation_history
+                .push(ChatMessage::tool_response(call_id, response_content));
+        }
+        Ok(())
     }
 
     /// Tool-calling perform helper: inner loop for the state-machine
@@ -1135,7 +1179,7 @@ mod tests {
     use crate::tools::{EchoTool, ToolRegistry};
     use model::provider::{ModelError, ModelResult};
     use model::types::{
-        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall,
+        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall, Usage,
     };
     use std::sync::Mutex;
 
@@ -2079,5 +2123,763 @@ mod tests {
             !by_summary.is_empty(),
             "Entity should contain result_summary"
         );
+    }
+
+    fn assistant_tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: None,
+            tool_calls: Some(
+                calls
+                    .into_iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: args,
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+        }
+    }
+
+    /// `extract_tool_calls_from_history` pairs each assistant tool call with
+    /// its matching `MessageRole::Tool` response by `tool_call_id`, even when
+    /// the response arrives several messages later or interleaved with other
+    /// assistant turns.
+    #[test]
+    fn extract_tool_calls_pairs_calls_with_their_responses() {
+        let history = vec![
+            ChatMessage::user("do two things"),
+            assistant_tool_calls(vec![
+                ("call_a", "echo", serde_json::json!({"msg": "hello"})),
+                ("call_b", "calc", serde_json::json!({"x": 2})),
+            ]),
+            ChatMessage::tool_response("call_b", "4"),
+            ChatMessage::tool_response("call_a", "hello"),
+            ChatMessage::assistant("done"),
+        ];
+
+        let mut records = extract_tool_calls_from_history(&history);
+        records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].call_id, "call_a");
+        assert_eq!(records[0].tool_name, "echo");
+        assert_eq!(records[0].result, "hello");
+        assert_eq!(records[1].call_id, "call_b");
+        assert_eq!(records[1].tool_name, "calc");
+        assert_eq!(records[1].result, "4");
+    }
+
+    /// A tool call without a matching response (model crashed or response
+    /// truncated) yields a record with an empty `result` rather than dropping
+    /// the call. This preserves the diagnostic trail when surfacing errors.
+    #[test]
+    fn extract_tool_calls_keeps_unanswered_calls_with_empty_result() {
+        let history = vec![
+            assistant_tool_calls(vec![("orphan", "search", serde_json::json!({"q": "x"}))]),
+            // No tool response for "orphan".
+        ];
+
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].call_id, "orphan");
+        assert_eq!(records[0].result, "");
+    }
+
+    /// Tool responses whose `tool_call_id` was never emitted by an assistant
+    /// turn are ignored — we only ever surface records that originated from a
+    /// real tool call.
+    #[test]
+    fn extract_tool_calls_ignores_orphan_tool_responses() {
+        let history = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::tool_response("never_called", "stale"),
+            ChatMessage::assistant("ok"),
+        ];
+
+        assert!(extract_tool_calls_from_history(&history).is_empty());
+    }
+
+    /// `extract_result_summary` returns the most recent assistant message
+    /// whose `tool_calls` is `None`. Assistant turns that emit tool calls are
+    /// transient orchestration steps and must not be treated as the final
+    /// answer.
+    #[test]
+    fn extract_result_summary_skips_assistant_messages_with_tool_calls() {
+        let history = vec![
+            ChatMessage::user("ask"),
+            assistant_tool_calls(vec![("c1", "search", serde_json::json!({}))]),
+            ChatMessage::tool_response("c1", "42"),
+            ChatMessage::assistant("the answer is 42"),
+        ];
+
+        assert_eq!(extract_result_summary(&history), "the answer is 42");
+    }
+
+    /// With no plain assistant message at all, the summary is empty rather
+    /// than panicking or returning the latest tool-calling assistant turn.
+    #[test]
+    fn extract_result_summary_empty_when_no_plain_assistant_turn() {
+        let history = vec![
+            ChatMessage::user("ask"),
+            assistant_tool_calls(vec![("c1", "noop", serde_json::json!({}))]),
+        ];
+        assert_eq!(extract_result_summary(&history), "");
+    }
+
+    /// Regression guard for the `with_llm` / `with_tools` constructors that
+    /// chain through `with_entity_store` via struct update syntax. All four
+    /// entry points must produce an agent in `EnrichingEntities`, with zero
+    /// counters, an empty conversation, and no plan cache, regardless of
+    /// which LLM/tool dependencies are wired in.
+    #[test]
+    fn all_constructors_initialize_to_a_clean_enriching_state() {
+        let configs = [AgentConfig::default(), AgentConfig::default()];
+        let providers: Vec<Arc<dyn ModelProvider>> = vec![MockProvider::new(vec![])];
+
+        let agents: Vec<Box<dyn std::any::Any>> = vec![
+            Box::new(AgentLoop::new(configs[0].clone())),
+            Box::new(AgentLoop::with_entity_store(
+                configs[1].clone(),
+                InMemoryEntityStore::new(),
+            )),
+            Box::new(AgentLoop::with_llm(
+                AgentConfig::default(),
+                InMemoryEntityStore::new(),
+                providers[0].clone(),
+            )),
+            Box::new(AgentLoop::with_tools(
+                AgentConfig::default(),
+                InMemoryEntityStore::new(),
+                providers[0].clone(),
+                ToolRegistry::new(),
+            )),
+        ];
+
+        for boxed in agents {
+            // Each agent has the default in-memory store concrete type.
+            let agent: &AgentLoop<InMemoryEntityStore> = boxed.downcast_ref().unwrap();
+            assert_eq!(agent.state(), &AgentState::EnrichingEntities);
+            assert_eq!(agent.iterations, 0);
+            assert_eq!(agent.performed_actions, 0);
+            assert!(agent.plan_cache.is_none());
+            assert!(agent.conversation_history.is_empty());
+            assert!(agent.state_history().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_single_stop_counts_one_iteration() {
+        let provider = MockProvider::new(vec![plain_response("Done")]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 1,
+            "Stop on first call should count as 1 iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_tool_call_then_stop_counts_two_iterations() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hello"})),
+            plain_response("All done."),
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "echo hello".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            result.iterations, 2,
+            "One tool call then stop should count as 2 iterations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_accumulates_token_usage() {
+        let provider = MockProvider::new(vec![
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                }),
+                ..tool_call_response("echo", serde_json::json!({"message": "hi"}))
+            },
+            ChatResponse {
+                usage: Some(Usage {
+                    prompt_tokens: 200,
+                    completion_tokens: 80,
+                    total_tokens: 280,
+                }),
+                ..plain_response("Done")
+            },
+        ]);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "test usage".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        let usage = result
+            .token_usage
+            .expect("tool loop should return Some(usage)");
+        assert_eq!(usage.prompt_tokens, 300);
+        assert_eq!(usage.completion_tokens, 130);
+        assert_eq!(usage.total_tokens, 430);
+    }
+
+    #[test]
+    fn test_set_tool_registry_attaches_registry() {
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.tool_registry().is_none());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        agent.set_tool_registry(registry);
+
+        assert!(agent.tool_registry().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_when_no_provider_configured() {
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        agent.set_tool_registry(registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("no provider should produce an error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No provider configured"),
+            "expected provider-missing diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_propagates_llm_call_failure() {
+        let provider = MockProvider::new(vec![]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let agent_config = AgentConfig::default();
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(agent_config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("empty mock should error on chat()");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LLM call failed"),
+            "expected LLM-call-failed diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_on_empty_choices() {
+        let empty_choices = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![empty_choices]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("empty choices should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Empty response from model"),
+            "expected empty-response diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_max_iterations_exceeded() {
+        let provider = MockProvider::new(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"message": "loop forever"}),
+        )]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig {
+            max_iterations: 0,
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "loop".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("max_iterations=0 must trip the cap immediately");
+        assert!(matches!(err, AgentError::MaxIterationsExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_seeds_system_prompt_and_history() {
+        let provider = MockProvider::new(vec![plain_response("ack")]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+
+        let config = AgentConfig {
+            system_prompt: "you are a Rust assistant".to_string(),
+            ..Default::default()
+        };
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "ignored".to_string(),
+            conversation_history: vec![ChatMessage::user("seed message")],
+            app_state_id: "t".to_string(),
+        };
+
+        agent.run_tool_loop(context).await.unwrap();
+
+        let history = &agent.conversation_history;
+        let has_system = history.iter().any(|m| {
+            matches!(m.role, MessageRole::System)
+                && matches!(m.content.as_deref(), Some(c) if c.contains("Rust assistant"))
+        });
+        let has_seed = history.iter().any(|m| {
+            matches!(m.role, MessageRole::User)
+                && matches!(m.content.as_deref(), Some(c) if c.contains("seed message"))
+        });
+
+        assert!(has_system, "system prompt should be seeded into history");
+        assert!(has_seed, "context conversation_history should be appended");
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_increments_progress_counter() {
+        use std::sync::atomic::AtomicUsize;
+        let provider = MockProvider::new(vec![
+            tool_call_response("echo", serde_json::json!({"message": "hi"})),
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+        let counter = Arc::new(AtomicUsize::new(0));
+        agent.set_progress_counter(counter.clone());
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        agent.run_tool_loop(context).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "progress counter should track each LLM round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_formats_tool_execution_error_into_response() {
+        let provider = MockProvider::new(vec![
+            tool_call_response("nonexistent_tool", serde_json::json!({})),
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        let saw_error_response = agent.conversation_history.iter().any(|m| {
+            matches!(m.role, MessageRole::Tool)
+                && matches!(m.content.as_deref(), Some(c) if c.starts_with("Error:"))
+        });
+        assert!(
+            saw_error_response,
+            "registry execute Err must be formatted as a tool response"
+        );
+        assert!(result.task_completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_tolerates_entity_store_failure() {
+        use crate::entities::{
+            Entity, EntityError, EntityId, EntityRelationship, EntityResult, EntityType,
+            QueryResult, RelationshipType,
+        };
+
+        struct FailingStore;
+        #[async_trait]
+        impl EntityStore for FailingStore {
+            async fn store(&mut self, _entity: Box<dyn Entity>) -> EntityResult<EntityId> {
+                Err(EntityError::StorageError("simulated".to_string()))
+            }
+            async fn exists(&self, _id: &str) -> bool {
+                false
+            }
+            async fn update(&mut self, _entity: Box<dyn Entity>) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn delete(&mut self, _id: &str) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn query(&self, _query: &EntityQuery) -> EntityResult<Vec<QueryResult>> {
+                Ok(vec![])
+            }
+            async fn get_relationships(&self, _id: &str) -> EntityResult<Vec<EntityRelationship>> {
+                Ok(vec![])
+            }
+            async fn create_relationship(
+                &mut self,
+                _relationship: EntityRelationship,
+            ) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn delete_relationship(
+                &mut self,
+                _from: &str,
+                _to: &str,
+                _relationship_type: RelationshipType,
+            ) -> EntityResult<()> {
+                Ok(())
+            }
+            async fn list_by_kind(&self, _kind: EntityType) -> EntityResult<Vec<EntityId>> {
+                Ok(vec![])
+            }
+        }
+
+        let provider = MockProvider::new(vec![plain_response("done")]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let mut agent =
+            AgentLoop::with_tools(AgentConfig::default(), FailingStore, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent
+            .run_tool_loop(context)
+            .await
+            .expect("entity store failure must be tolerated, not propagated");
+        assert!(result.task_completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_on_unexpected_finish_reason() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("trimmed".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Length),
+            }],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![response]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("unexpected finish_reason must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Unexpected finish reason"),
+            "expected unexpected-finish-reason diagnostic, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_treats_no_finish_reason_as_stop() {
+        let response_with_none_finish = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let provider = MockProvider::new(vec![response_with_none_finish]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.final_state, AgentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_handles_tool_calls_finish_with_no_calls() {
+        let provider = MockProvider::new(vec![
+            ChatResponse {
+                choices: vec![Choice {
+                    message: ChatMessage {
+                        role: MessageRole::Assistant,
+                        content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some(FinishReason::ToolCalls),
+                }],
+                usage: None,
+            },
+            plain_response("done"),
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool::new()));
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(AgentConfig::default(), store, provider, registry);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(
+            result.iterations, 2,
+            "ToolCalls finish with no calls should still advance an iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_errors_when_tool_call_without_registry() {
+        let provider = MockProvider::new(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"message": "x"}),
+        )]);
+        let mut agent = AgentLoop::new(AgentConfig::default());
+        agent.llm_provider = Some(provider);
+
+        let context = AgentContext {
+            user_prompt: "x".to_string(),
+            conversation_history: vec![],
+            app_state_id: "t".to_string(),
+        };
+
+        let err = agent
+            .run_tool_loop(context)
+            .await
+            .expect_err("tool_calls finish reason without registry must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No tool registry"),
+            "expected no-tool-registry diagnostic, got: {msg}"
+        );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Encode the legal transitions from ARCHITECTURE.md as a numeric table
+    /// so kani can exhaustively verify that is_legal_transition accepts
+    /// exactly the correct pairs and rejects everything else.
+    fn state_index(s: &AgentState) -> u8 {
+        match s {
+            AgentState::EnrichingEntities => 0,
+            AgentState::PlanningEntityModification => 1,
+            AgentState::PerformingEntityModification => 2,
+            AgentState::UpdatingEntities => 3,
+            AgentState::CheckingTaskCompletion => 4,
+            AgentState::EntityModificationDecision => 5,
+            AgentState::QueryingEntities => 6,
+            AgentState::Completed => 7,
+            AgentState::Error(_) => 8,
+        }
+    }
+
+    fn state_from_index(i: u8) -> AgentState {
+        match i {
+            0 => AgentState::EnrichingEntities,
+            1 => AgentState::PlanningEntityModification,
+            2 => AgentState::PerformingEntityModification,
+            3 => AgentState::UpdatingEntities,
+            4 => AgentState::CheckingTaskCompletion,
+            5 => AgentState::EntityModificationDecision,
+            6 => AgentState::QueryingEntities,
+            7 => AgentState::Completed,
+            _ => AgentState::Error("test".to_string()),
+        }
+    }
+
+    /// The allowed non-error edges (from_index, to_index).
+    const LEGAL_EDGES: [(u8, u8); 8] = [
+        (0, 1), // EnrichingEntities → PlanningEntityModification
+        (1, 2), // PlanningEntityModification → PerformingEntityModification
+        (2, 3), // PerformingEntityModification → UpdatingEntities
+        (3, 4), // UpdatingEntities → CheckingTaskCompletion
+        (4, 7), // CheckingTaskCompletion → Completed
+        (4, 5), // CheckingTaskCompletion → EntityModificationDecision
+        (5, 6), // EntityModificationDecision → QueryingEntities
+        (5, 1), // EntityModificationDecision → PlanningEntityModification
+    ];
+
+    /// Verify that is_legal_transition is consistent with the architecture
+    /// diagram for all non-error state pairs.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn legal_transitions_match_architecture() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7); // don't generate Error as target (tested separately)
+
+        let from = state_from_index(from_idx);
+        let to = state_from_index(to_idx);
+
+        let result = AgentLoop::is_legal_transition(&from, &to);
+
+        // Any state can transition to Error
+        // For non-error targets, only LEGAL_EDGES are allowed
+        let expected = LEGAL_EDGES
+            .iter()
+            .any(|&(f, t)| f == from_idx && t == to_idx);
+        assert_eq!(result, expected, "Mismatch for ({from_idx} -> {to_idx})");
+    }
+
+    /// Any state may transition to Error.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn any_state_can_error() {
+        let from_idx: u8 = kani::any();
+        kani::assume(from_idx <= 8);
+        let from = state_from_index(from_idx);
+        let to = AgentState::Error("fail".to_string());
+        assert!(AgentLoop::is_legal_transition(&from, &to));
+    }
+
+    /// Completed and Error are terminal: no legal non-error successor.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn completed_is_terminal() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::Completed;
+        assert!(
+            !AgentLoop::is_legal_transition(&from, &to),
+            "Completed should have no non-error successors"
+        );
+    }
+
+    /// QueryingEntities can only go back to EntityModificationDecision.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn querying_only_returns_to_decision() {
+        let to_idx: u8 = kani::any();
+        kani::assume(to_idx <= 7);
+        let to = state_from_index(to_idx);
+        let from = AgentState::QueryingEntities;
+        let result = AgentLoop::is_legal_transition(&from, &to);
+        let expected = to_idx == 5; // EntityModificationDecision
+        assert_eq!(result, expected);
     }
 }

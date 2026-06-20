@@ -1,8 +1,10 @@
 # Binary Cache Strategy for CI/CD
 
+> For the operational cache setup (keys, workflow wiring, troubleshooting), see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md). This document focuses on the high-level architecture and priorities.
+
 ## Overview
 
-This document outlines the comprehensive binary cache strategy implemented for the Nanna Coder project to optimize CI/CD performance and reduce build times.
+This document outlines the binary cache strategy used to optimize CI/CD performance and reduce build times.
 
 ## Architecture
 

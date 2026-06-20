@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
+pub mod pod;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
@@ -31,20 +32,23 @@ pub use telemetry::{
 };
 pub use tools::{
     cargo_bench_args, cargo_build_args, cargo_check_args, cargo_run_args, cargo_test_args,
-    create_tool_registry, create_tool_registry_with_container, CalculatorTool, CargoBenchTool,
+    create_container_tool_registry, create_tool_registry, CalculatorTool, CargoBenchTool,
     CargoBuildTool, CargoCheckTool, CargoRunTool, CargoTestTool, EchoTool, GitDiffTool,
     GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool, PrStatusData, ReadFileTool,
     RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool,
+    CONTAINER_WORKSPACE_DIR,
 };
 
 // Export agent types
 pub use agent::{
-    AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunResult,
-    AgentState,
+    AgentComponent, AgentConfig, AgentContext, AgentError, AgentLoop, AgentResult, AgentRunReport,
+    AgentRunResult, AgentState, TokenUsageDto, ToolCallSummary,
 };
 
-// Export eval report types
+// Export eval types
 pub use eval::report::EvalReport;
+#[cfg(feature = "eval-runner")]
+pub use eval::runner::{run_eval, EvalRunResult, EvalRunnerConfig, EvalRunnerError};
 
 // Export entity types
 pub use entities::{
