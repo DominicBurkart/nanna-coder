@@ -6,8 +6,8 @@ use harness::container::{
 use harness::entities::InMemoryEntityStore;
 use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
 use harness::tools::{
-    ListDirTool, ReadFileTool, RunCommandTool, SearchTool, ToolRegistry, WriteFileTool,
-    CONTAINER_WORKSPACE_DIR,
+    create_container_tool_registry, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
+    ToolRegistry, WriteFileTool, CONTAINER_WORKSPACE_DIR,
 };
 use image_builder::build_dev_container;
 use model::prelude::*;
@@ -251,6 +251,186 @@ async fn test_task_manager_submit_with_dev_container() {
             }
         }
     }
+}
+
+fn nanna_workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Verify that `create_container_tool_registry` registers `cargo_deny` when
+/// pointed at nanna-coder's own workspace (which has `deny.toml`).
+///
+/// This test builds a real dev container from the nanna workspace and starts
+/// it, so it requires a container runtime and the Nix build toolchain.
+#[tokio::test]
+#[ignore]
+async fn cargo_deny_tool_registered_for_nanna_workspace() {
+    let root = nanna_workspace_root();
+    assert!(
+        root.join("deny.toml").exists(),
+        "deny.toml must exist at nanna workspace root"
+    );
+
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+
+    let image_path = build_dev_container(&root).expect("failed to build nanna dev container image");
+    let image_ref =
+        load_image_from_path(&runtime, &image_path).expect("failed to load dev container image");
+
+    let container_name = format!("nanna-cargo-deny-test-{}", uuid::Uuid::new_v4());
+    let additional_args = vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display())];
+
+    let config = ContainerConfig {
+        base_image: image_ref.clone(),
+        test_image: None,
+        container_name,
+        port_mapping: None,
+        model_to_pull: None,
+        startup_timeout: Duration::from_secs(5),
+        health_check_timeout: Duration::from_secs(5),
+        env_vars: vec![],
+        additional_args,
+    };
+
+    let handle = Arc::new(
+        start_container_with_fallback(&config)
+            .await
+            .expect("container start failed"),
+    );
+
+    let registry =
+        create_container_tool_registry(&root, Arc::clone(&handle), CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_deny").is_some(),
+        "cargo_deny must be registered for nanna workspace (deny.toml is present)"
+    );
+    assert!(
+        registry.get_tool("cargo_build").is_some(),
+        "cargo_build must be registered for nanna workspace"
+    );
+}
+
+/// Execute `CargoDenyTool` inside a real nanna dev container and verify the
+/// output shape: `success`, `stdout`, `stderr`, and `command` fields present,
+/// and `command` == `"cargo deny check"`.
+#[tokio::test]
+#[ignore]
+async fn cargo_deny_tool_output_has_command_field() {
+    let root = nanna_workspace_root();
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+
+    let image_path = build_dev_container(&root).expect("failed to build dev container");
+    let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
+
+    let container_name = format!("nanna-cargo-deny-cmd-test-{}", uuid::Uuid::new_v4());
+    let additional_args = vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display())];
+
+    let config = ContainerConfig {
+        base_image: image_ref,
+        test_image: None,
+        container_name,
+        port_mapping: None,
+        model_to_pull: None,
+        startup_timeout: Duration::from_secs(5),
+        health_check_timeout: Duration::from_secs(5),
+        env_vars: vec![],
+        additional_args,
+    };
+
+    let handle = Arc::new(
+        start_container_with_fallback(&config)
+            .await
+            .expect("container start failed"),
+    );
+
+    let registry =
+        create_container_tool_registry(&root, Arc::clone(&handle), CONTAINER_WORKSPACE_DIR);
+    let result = registry
+        .execute("cargo_deny", serde_json::json!({}))
+        .await
+        .expect("cargo_deny tool must execute without error");
+
+    assert!(
+        result.get("command").is_some(),
+        "output must contain 'command' field, got: {result}"
+    );
+    assert_eq!(
+        result["command"].as_str().unwrap(),
+        "cargo deny check",
+        "command field must be 'cargo deny check'"
+    );
+    assert!(
+        result.get("stdout").is_some(),
+        "output must contain 'stdout'"
+    );
+    assert!(
+        result.get("stderr").is_some(),
+        "output must contain 'stderr'"
+    );
+    assert!(
+        result.get("success").is_some(),
+        "output must contain 'success'"
+    );
+}
+
+/// Execute `CargoCheckTool` inside a real nanna dev container.
+#[tokio::test]
+#[ignore]
+async fn cargo_check_tool_succeeds_in_nanna_container() {
+    let root = nanna_workspace_root();
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+
+    let image_path = build_dev_container(&root).expect("failed to build dev container");
+    let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
+
+    let container_name = format!("nanna-cargo-check-test-{}", uuid::Uuid::new_v4());
+    let additional_args = vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display())];
+
+    let config = ContainerConfig {
+        base_image: image_ref,
+        test_image: None,
+        container_name,
+        port_mapping: None,
+        model_to_pull: None,
+        startup_timeout: Duration::from_secs(5),
+        health_check_timeout: Duration::from_secs(5),
+        env_vars: vec![],
+        additional_args,
+    };
+
+    let handle = Arc::new(
+        start_container_with_fallback(&config)
+            .await
+            .expect("container start failed"),
+    );
+
+    let registry =
+        create_container_tool_registry(&root, Arc::clone(&handle), CONTAINER_WORKSPACE_DIR);
+    let result = registry
+        .execute("cargo_check", serde_json::json!({}))
+        .await
+        .expect("cargo_check must execute");
+
+    assert!(
+        result["success"].as_bool().unwrap_or(false),
+        "cargo check must succeed in nanna container. stderr: {}",
+        result["stderr"].as_str().unwrap_or("")
+    );
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
