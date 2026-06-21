@@ -381,6 +381,15 @@ fn test_container_handle() -> Arc<ContainerHandle> {
     })
 }
 
+fn stub_container_handle() -> Arc<ContainerHandle> {
+    Arc::new(ContainerHandle {
+        name: "stub-container".to_string(),
+        runtime: ContainerRuntime::Stub,
+        port: None,
+        needs_cleanup: false,
+    })
+}
+
 #[test]
 fn cargo_deny_registered_when_deny_toml_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -591,4 +600,114 @@ async fn cargo_deny_execute_no_check_arg_error_path() {
         .await
         .expect_err("execute must fail with None runtime");
     assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Success path coverage — ContainerRuntime::Stub bypasses exec and returns an
+// empty Ok result so the Ok(json!{...}) branch in each tool's execute() is hit.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cargo_build_execute_success_path_covered() {
+    use harness::tools::CargoBuildTool;
+    let handle = stub_container_handle();
+    let tool = CargoBuildTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"package": "harness", "release": "true"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_test_execute_success_path_covered() {
+    use harness::tools::CargoTestTool;
+    let handle = stub_container_handle();
+    let tool = CargoTestTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"test_filter": "my_test"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_check_execute_success_path_covered() {
+    use harness::tools::CargoCheckTool;
+    let handle = stub_container_handle();
+    let tool = CargoCheckTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_bench_execute_success_path_covered() {
+    use harness::tools::CargoBenchTool;
+    let handle = stub_container_handle();
+    let tool = CargoBenchTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"bench_filter": "bench_foo"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_run_execute_success_path_covered() {
+    use harness::tools::CargoRunTool;
+    let handle = stub_container_handle();
+    let tool = CargoRunTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"bin": "nanna", "args": "--help"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_success_path_covered() {
+    use harness::tools::CargoDenyTool;
+    let handle = stub_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"check": "advisories"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+    assert!(result.get("command").is_some());
+    assert_eq!(
+        result["command"].as_str().unwrap(),
+        "cargo deny check advisories"
+    );
+}
+
+#[tokio::test]
+async fn cargo_audit_execute_success_path_covered() {
+    use harness::tools::CargoAuditTool;
+    let handle = stub_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+    assert!(result.get("command").is_some());
+    assert_eq!(result["command"].as_str().unwrap(), "cargo audit");
 }

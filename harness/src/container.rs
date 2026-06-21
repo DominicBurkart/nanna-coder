@@ -24,6 +24,9 @@ pub enum ContainerRuntime {
     Docker,
     /// No container runtime available
     None,
+    /// Fake runtime that makes exec_in_container return an empty success result.
+    /// Use this in unit tests to exercise the success path without a real container.
+    Stub,
 }
 
 impl ContainerRuntime {
@@ -32,7 +35,7 @@ impl ContainerRuntime {
         match self {
             ContainerRuntime::Podman => "podman",
             ContainerRuntime::Docker => "docker",
-            ContainerRuntime::None => "",
+            ContainerRuntime::None | ContainerRuntime::Stub => "",
         }
     }
 
@@ -253,7 +256,9 @@ pub fn load_image_from_path(
         let dest = match runtime {
             ContainerRuntime::Podman => format!("containers-storage:{}", image_ref),
             ContainerRuntime::Docker => format!("docker-daemon:{}", image_ref),
-            ContainerRuntime::None => return Err(ContainerError::NoRuntimeAvailable),
+            ContainerRuntime::None | ContainerRuntime::Stub => {
+                return Err(ContainerError::NoRuntimeAvailable)
+            }
         };
 
         let output = Command::new("skopeo")
@@ -557,6 +562,13 @@ pub fn exec_in_container(
     command: &[&str],
     working_dir: Option<&str>,
 ) -> Result<CommandOutput, ContainerError> {
+    if matches!(handle.runtime, ContainerRuntime::Stub) {
+        return Ok(CommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+        });
+    }
     if !handle.runtime.is_available() {
         return Err(ContainerError::NoRuntimeAvailable);
     }
@@ -706,7 +718,10 @@ mod tests {
         // We can't predict what will be available in test environment
         // Just ensure it returns a valid enum variant
         match runtime {
-            ContainerRuntime::Podman | ContainerRuntime::Docker | ContainerRuntime::None => {}
+            ContainerRuntime::Podman
+            | ContainerRuntime::Docker
+            | ContainerRuntime::None
+            | ContainerRuntime::Stub => {}
         }
     }
 

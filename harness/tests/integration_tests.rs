@@ -539,7 +539,7 @@ async fn test_container_runtime_detection() {
             println!("✅ Docker detected - full container support available");
             test_docker_specific_features().await;
         }
-        ContainerRuntime::None => {
+        ContainerRuntime::None | ContainerRuntime::Stub => {
             println!("⚠️  No container runtime detected - using mock implementations");
             test_no_runtime_fallback().await;
         }

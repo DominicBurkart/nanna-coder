@@ -260,6 +260,16 @@ fn nanna_workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn nanna_workspace_root_resolves_to_repo_root() {
+    let root = nanna_workspace_root();
+    assert!(
+        root.join("Cargo.toml").exists(),
+        "workspace root must contain Cargo.toml; got: {:?}",
+        root
+    );
+}
+
 /// Verify that `create_container_tool_registry` registers `cargo_deny` when
 /// pointed at nanna-coder's own workspace (which has `deny.toml`).
 ///
