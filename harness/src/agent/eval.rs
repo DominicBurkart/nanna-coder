@@ -1059,7 +1059,6 @@ mod tests {
         };
         let evaluator = AgentEvaluator::new(config).await.unwrap();
         let scenario = EvaluationScenario::simple_entity_creation(); // max_iterations = 10
-        // iterations > max_iterations -> ratio > 1.0 -> .max(0.0) clips to 0.0
         let run_result = make_run_result(AgentState::Completed, 20, true);
         let quality = evaluator.calculate_decision_quality(&run_result, &scenario);
         // Completion 0.5 + efficiency clamped to 0.0 + state matches 0.2 = 0.7
