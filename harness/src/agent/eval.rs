@@ -957,4 +957,195 @@ mod tests {
             );
         }
     }
+
+    fn make_run_result(
+        final_state: AgentState,
+        iterations: usize,
+        task_completed: bool,
+    ) -> crate::agent::AgentRunResult {
+        crate::agent::AgentRunResult {
+            final_state,
+            iterations,
+            task_completed,
+            result_summary: String::new(),
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            token_usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculate_entity_accuracy_no_expected_types() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let mut scenario = EvaluationScenario::simple_entity_creation();
+        scenario.expected_outcomes.expected_entity_types = vec![];
+        let acc = evaluator.calculate_entity_accuracy(&scenario, &[]);
+        assert_eq!(acc, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculate_entity_accuracy_partial_match() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let mut scenario = EvaluationScenario::simple_entity_creation();
+        scenario.expected_outcomes.expected_entity_types = vec![EntityType::Git, EntityType::Test];
+
+        let entities = vec![crate::entities::QueryResult {
+            entity_id: "g1".to_string(),
+            entity_type: EntityType::Git,
+            relevance: 1.0,
+            snippet: None,
+        }];
+        let acc = evaluator.calculate_entity_accuracy(&scenario, &entities);
+        assert!((acc - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_calculate_decision_quality_task_not_completed() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let scenario = EvaluationScenario::simple_entity_creation(); // max_iterations = 10
+        let run_result = make_run_result(AgentState::Completed, 5, false);
+        let quality = evaluator.calculate_decision_quality(&run_result, &scenario);
+        // No 0.5 completion bonus; state matches expected Completed → +0.2
+        assert!(quality < 0.5, "got {quality}");
+        assert!(quality > 0.0, "got {quality}");
+    }
+
+    #[tokio::test]
+    async fn test_calculate_decision_quality_no_expected_state() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let mut scenario = EvaluationScenario::simple_entity_creation();
+        scenario.expected_outcomes.final_state = None;
+        let run_result = make_run_result(AgentState::EnrichingEntities, 2, true);
+        let quality = evaluator.calculate_decision_quality(&run_result, &scenario);
+        // Completion 0.5 + efficiency (1-0.2)*0.3=0.24 + no-state-check +0.2 = 0.94
+        assert!(quality > 0.5, "got {quality}");
+    }
+
+    #[tokio::test]
+    async fn test_calculate_decision_quality_wrong_state() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let scenario = EvaluationScenario::simple_entity_creation(); // expects Completed
+        let run_result = make_run_result(AgentState::EnrichingEntities, 1, true);
+        let quality = evaluator.calculate_decision_quality(&run_result, &scenario);
+        // Completion 0.5, efficiency high, state mismatch → no +0.2
+        assert!(quality < 0.9, "got {quality}");
+    }
+
+    #[tokio::test]
+    async fn test_calculate_decision_quality_over_budget() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let scenario = EvaluationScenario::simple_entity_creation(); // max_iterations = 10
+        // iterations > max_iterations → ratio > 1.0 → .max(0.0) clips to 0.0
+        let run_result = make_run_result(AgentState::Completed, 20, true);
+        let quality = evaluator.calculate_decision_quality(&run_result, &scenario);
+        // Completion 0.5 + efficiency clamped to 0.0 + state matches 0.2 = 0.7
+        assert!((quality - 0.7).abs() < 1e-9, "got {quality}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_outcomes_failures_and_warnings() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let scenario = EvaluationScenario::simple_entity_creation();
+        // should_complete=true, min_entities=1, max_allowed=15, min_decision_quality=0.6,
+        // min_rag_relevance=0.0, final_state=Some(Completed)
+        let metrics = EvaluationMetrics {
+            entities_created: 0,     // below min_entities (1) → failure
+            iterations_executed: 20, // above max_allowed (15) → warning
+            decision_quality: 0.1,   // below min (0.6) → failure
+            rag_relevance: 1.0,
+            ..Default::default()
+        };
+        let run_result = make_run_result(
+            AgentState::EnrichingEntities, // wrong final state → failure
+            20,
+            false, // should_complete=true → failure
+        );
+        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
+        evaluator
+            .validate_outcomes(&scenario, &metrics, &run_result, &mut failures, &mut warnings)
+            .unwrap();
+        assert!(!failures.is_empty(), "expected failures: {failures:?}");
+        assert!(!warnings.is_empty(), "expected iteration warning: {warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_outcomes_rag_relevance_failure() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let scenario = EvaluationScenario::rag_retrieval_accuracy(); // min_rag_relevance=0.7
+        let metrics = EvaluationMetrics {
+            entities_created: 5,
+            iterations_executed: 1,
+            decision_quality: 0.9,
+            rag_relevance: 0.1, // below 0.7 → failure
+            ..Default::default()
+        };
+        let run_result = make_run_result(AgentState::Completed, 1, true);
+        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
+        evaluator
+            .validate_outcomes(&scenario, &metrics, &run_result, &mut failures, &mut warnings)
+            .unwrap();
+        assert!(
+            failures.iter().any(|f| f.contains("RAG relevance")),
+            "expected RAG relevance failure: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_outcomes_no_expected_final_state() {
+        let config = EvaluationConfig {
+            collect_observability: false,
+            ..Default::default()
+        };
+        let evaluator = AgentEvaluator::new(config).await.unwrap();
+        let mut scenario = EvaluationScenario::simple_entity_creation();
+        scenario.expected_outcomes.final_state = None;
+        let metrics = EvaluationMetrics {
+            entities_created: 1,
+            iterations_executed: 1,
+            decision_quality: 0.9,
+            rag_relevance: 1.0,
+            ..Default::default()
+        };
+        let run_result = make_run_result(AgentState::Completed, 1, true);
+        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
+        evaluator
+            .validate_outcomes(&scenario, &metrics, &run_result, &mut failures, &mut warnings)
+            .unwrap();
+        assert!(failures.is_empty(), "expected no failures: {failures:?}");
+    }
 }
