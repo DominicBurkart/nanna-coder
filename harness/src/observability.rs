@@ -1343,9 +1343,7 @@ mod tests {
 
     #[test]
     fn test_get_model_summary_no_models() {
-        use crate::monitoring::{
-            CacheMetrics, ErrorMetrics, SystemResourceMetrics,
-        };
+        use crate::monitoring::{CacheMetrics, ErrorMetrics, SystemResourceMetrics};
         let system = ObservabilitySystem::new();
         let metrics = SystemMetrics {
             timestamp: Utc::now(),
