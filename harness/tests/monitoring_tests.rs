@@ -1,5 +1,7 @@
 use chrono::Utc;
-use harness::monitoring::{ErrorEvent, ErrorSeverity, ModelMetrics, ModelResourceUsage, QualityMetrics};
+use harness::monitoring::{
+    ErrorEvent, ErrorSeverity, ModelMetrics, ModelResourceUsage, QualityMetrics,
+};
 use harness::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
