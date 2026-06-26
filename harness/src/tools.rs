@@ -2484,6 +2484,94 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "subtract", "a": 10.0, "b": 3.0 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "multiply", "a": 4.0, "b": 5.0 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "power", "a": 2.0, "b": 3.0 });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("Unknown operation"));
+            }
+            _ => panic!("expected InvalidArguments error"),
+        }
+    }
+
+    #[test]
+    fn test_pr_status_l0_no_token() {
+        let data = PrStatusData {
+            pr_number: Some(5),
+            has_upstream: true,
+            additions: Some(10),
+            deletions: Some(2),
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:unconfigured]"), "got: {}", l0);
+    }
+
+    #[test]
+    fn test_pr_status_l0_api_error() {
+        let data = PrStatusData {
+            pr_number: Some(7),
+            has_upstream: true,
+            additions: Some(3),
+            deletions: Some(1),
+            github_status: GitHubStatus::ApiError("rate limited".to_string()),
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:error]"), "got: {}", l0);
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https() {
+        let result = parse_github_remote("https://github.com/owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_no_git_suffix() {
+        let result = parse_github_remote("https://github.com/owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_non_github() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_github_remote_empty() {
+        let result = parse_github_remote("");
+        assert_eq!(result, None);
+    }
 }
 
 #[cfg(kani)]
