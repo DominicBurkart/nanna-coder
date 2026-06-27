@@ -2773,6 +2773,128 @@ mod tests {
             "expected no-tool-registry diagnostic, got: {msg}"
         );
     }
+
+    // --- validate_llm_response unit tests ---
+
+    #[test]
+    fn validate_llm_response_empty_string_is_invalid() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(!agent.validate_llm_response("", &[]));
+    }
+
+    #[test]
+    fn validate_llm_response_whitespace_only_is_invalid() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(!agent.validate_llm_response("   \n\t  ", &[]));
+    }
+
+    #[test]
+    fn validate_llm_response_too_long_is_invalid() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        let long_response = "x".repeat(MAX_LLM_RESPONSE_LENGTH + 1);
+        assert!(!agent.validate_llm_response(&long_response, &[]));
+    }
+
+    #[test]
+    fn validate_llm_response_exactly_max_length_is_valid_with_no_keywords() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        let at_limit = "x".repeat(MAX_LLM_RESPONSE_LENGTH);
+        assert!(agent.validate_llm_response(&at_limit, &[]));
+    }
+
+    #[test]
+    fn validate_llm_response_no_keywords_returns_true_for_valid_response() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.validate_llm_response("some valid response", &[]));
+    }
+
+    #[test]
+    fn validate_llm_response_keyword_match_case_insensitive() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.validate_llm_response("Task COMPLETE", &["complete"]));
+        assert!(agent.validate_llm_response("task complete", &["COMPLETE"]));
+    }
+
+    #[test]
+    fn validate_llm_response_missing_keyword_returns_false() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(!agent.validate_llm_response("all done here", &["complete", "yes"]));
+    }
+
+    #[test]
+    fn validate_llm_response_any_keyword_match_suffices() {
+        let agent = AgentLoop::new(AgentConfig::default());
+        assert!(agent.validate_llm_response("yes I agree", &["complete", "yes"]));
+    }
+
+    // --- extract_response_content unit tests ---
+
+    #[test]
+    fn extract_response_content_returns_text_when_present() {
+        let response = plain_response("hello world");
+        assert_eq!(
+            AgentLoop::<InMemoryEntityStore>::extract_response_content(&response),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn extract_response_content_returns_empty_when_content_is_none() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: None,
+        };
+        assert_eq!(
+            AgentLoop::<InMemoryEntityStore>::extract_response_content(&response),
+            ""
+        );
+    }
+
+    #[test]
+    fn extract_response_content_returns_empty_when_choices_empty() {
+        let response = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        assert_eq!(
+            AgentLoop::<InMemoryEntityStore>::extract_response_content(&response),
+            ""
+        );
+    }
+
+    // --- extract_result_summary additional branch coverage ---
+
+    #[test]
+    fn extract_result_summary_empty_history_returns_empty() {
+        assert_eq!(extract_result_summary(&[]), "");
+    }
+
+    #[test]
+    fn extract_result_summary_only_user_messages_returns_empty() {
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::user("world"),
+        ];
+        assert_eq!(extract_result_summary(&history), "");
+    }
+
+    #[test]
+    fn extract_result_summary_returns_last_plain_assistant_message() {
+        let history = vec![
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("follow-up"),
+            ChatMessage::assistant("second answer"),
+        ];
+        assert_eq!(extract_result_summary(&history), "second answer");
+    }
 }
 
 #[cfg(kani)]
