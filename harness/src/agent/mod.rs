@@ -2879,10 +2879,7 @@ mod tests {
 
     #[test]
     fn extract_result_summary_only_user_messages_returns_empty() {
-        let history = vec![
-            ChatMessage::user("hello"),
-            ChatMessage::user("world"),
-        ];
+        let history = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
         assert_eq!(extract_result_summary(&history), "");
     }
 
