@@ -233,4 +233,39 @@ mod tests {
             deserialized.default_context_length
         );
     }
+
+    #[test]
+    fn test_with_max_tokens_builder() {
+        let config = OllamaConfig::new().with_max_tokens(4096);
+        assert_eq!(config.default_max_tokens, Some(4096));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_max_tokens() {
+        let config = OllamaConfig {
+            default_max_tokens: Some(0),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("Max tokens"));
+    }
+
+    #[test]
+    fn test_model_defaults_default() {
+        let defaults = ModelDefaults::default();
+        assert_eq!(defaults.temperature, 0.7);
+        assert!(defaults.max_tokens.is_none());
+        assert_eq!(defaults.context_length, 110_000);
+    }
+
+    #[test]
+    fn test_model_defaults_serialization() {
+        let defaults = ModelDefaults::default();
+        let json = serde_json::to_string(&defaults).unwrap();
+        let back: ModelDefaults = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.temperature, defaults.temperature);
+        assert_eq!(back.context_length, defaults.context_length);
+        assert_eq!(back.max_tokens, defaults.max_tokens);
+    }
 }
