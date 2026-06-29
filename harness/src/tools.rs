@@ -1988,9 +1988,7 @@ mod tests {
     #[tokio::test]
     async fn test_calculator_missing_operands() {
         let tool = CalculatorTool::new();
-        let result = tool
-            .execute(json!({ "operation": "add", "a": 1.0 }))
-            .await;
+        let result = tool.execute(json!({ "operation": "add", "a": 1.0 })).await;
         assert!(result.is_err());
     }
 

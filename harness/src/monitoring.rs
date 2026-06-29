@@ -1276,10 +1276,7 @@ mod tests {
         let metrics = collector.get_current_metrics().await.unwrap();
         assert_eq!(metrics.error_metrics.total_errors, 1);
         assert_eq!(metrics.error_metrics.recent_errors.len(), 1);
-        assert_eq!(
-            metrics.error_metrics.recent_errors[0].error_type,
-            "timeout"
-        );
+        assert_eq!(metrics.error_metrics.recent_errors[0].error_type, "timeout");
     }
 
     #[tokio::test]
@@ -1318,11 +1315,7 @@ mod tests {
 
         for i in 0..5 {
             manager
-                .send_alert(
-                    &format!("Alert {}", i),
-                    "description",
-                    AlertSeverity::Info,
-                )
+                .send_alert(&format!("Alert {}", i), "description", AlertSeverity::Info)
                 .await
                 .unwrap();
         }
@@ -1375,10 +1368,7 @@ mod tests {
             max_memory_usage: 0.85,
             health_check_timeout: Duration::from_secs(10),
         };
-        manager
-            .configure_thresholds(new_thresholds)
-            .await
-            .unwrap();
+        manager.configure_thresholds(new_thresholds).await.unwrap();
     }
 
     #[tokio::test]
