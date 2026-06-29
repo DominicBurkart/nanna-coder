@@ -13,7 +13,7 @@ behind the split.
 |------|---------|---------|
 | `ci.yml` | push to `main`/`develop`, PR to `main`, releases | Primary gate. Runs the full test/build/container matrix and the `all-checks` aggregator. |
 | `ci-integration.yml` | PRs touching CI infra, weekly cron, manual | Self-tests for the CI itself (container loading, cold-cache fallback, negative test). |
-| `ci-metrics.yml` | every workflow_run completion on `ci.yml` | Aggregates build durations and cache outcomes into the workflow summary. Tracks issue #5. |
+| `ci-metrics.yml` _(seed: [`metrics.md`](metrics.md))_ | every workflow_run completion on `ci.yml` | Aggregates build durations and cache outcomes into the workflow summary. Tracks issue #5. |
 | `codecov-guard.yml` | PR/push touching `codecov.yml` | Rejects silent relaxations of coverage targets (lowered `target:`, new `ignore:` entries, numeric → `auto`). |
 | `cache-warming.yml` | push to `main` touching lock files; manual | Pre-populates Cachix so PR builds start warm. |
 | `eval.yml` | manual (`workflow_dispatch`) | Runs the LLM eval suite against a chosen model. |
@@ -91,3 +91,4 @@ Everything else is informational.
 - [`performance.md`](performance.md) — performance tuning
 - [`security.md`](security.md) — secrets and supply-chain practices
 - [`integration-tests.md`](integration-tests.md) — CI self-tests
+- [`metrics.md`](metrics.md) — seed `ci-metrics.yml` workflow (issue #5)
