@@ -162,3 +162,62 @@ flowchart TD
     C -- Can compile binary for --> n2(["Sandbox"])
     n2 -- Can be promoted to --> n3(["Release"])
 ```
+
+# Entity Classes
+
+Entity management is where Nanna's domain complexity lives: what context it
+surfaces to the model and how it lets the model reason about the relationships
+between pieces of that context. The classes below partition that surface so
+each one can be implemented and evolved as an independent module. Each class
+has (or will have) its own sub-issue tracking deeper implementation work.
+
+### Version Control
+
+Repo, branch, staged/unstaged files, and the scope of what is and isn't
+tracked (driven by `.gitignore` and bundled environment information). Nanna
+manages feature branches per prompt and follows a **microcommit strategy**:
+every modification to the dev environment produces a new commit, so the inner
+dev loop has a granular, queryable history. The version-control entity is the
+backbone other entities pivot around — most state is keyed by the current
+`HEAD`.
+
+### Dev Container State (at current HEAD)
+
+Two complementary views of the working tree:
+
+- **Queryable AST**: a structured, navigable view of the source. A
+  limited-parameter model should be able to traverse it with only a few
+  sentences of domain prompting, which implies free-text search plus graph
+  relationships down to specific line segments. First-class languages: Rust,
+  YAML, TOML, JSON, CSV, Python, JS/TS, Dockerfile, Nix, Makefile, CMake,
+  shell (POSIX/bash/zsh), Java. Plain text falls back to a per-line view
+  (with line + character counts) and binaries surface through a base64 layer.
+- **Static analysis and tests**: complete results from every test, lint, and
+  eval the harness runs after each modification. These results are bound to
+  the git HEAD they were produced against, so the model can reason about
+  cause/effect across commits.
+
+### Sandbox Telemetry and Deployed State
+
+**TODO** — per-project configuration gives this the largest scope of any
+entity class, so its design is deferred. The goal is to surface runtime
+behavior of sandboxed builds and any deployed artifacts back to the model.
+
+### Environment / Deployment
+
+The container graph above (Harness → Dev Container → Sandbox → Release) is
+governed by **principle of least privilege**. Effects management for
+sandbox/release candidates must be visible and modifiable by the model, but
+**changes to system effects are a "big deal"** — they involve a human in the
+loop rather than happening implicitly.
+
+### Current Dev Project
+
+User prompts, project scope changes, and progress markers. These are stored
+in git commit descriptions so they share a single timeline with the
+version-control entity and inherit its history semantics for free.
+
+---
+
+Architectural bias: implementation should be **autonomous, concurrent, and
+modular**. Each entity class above should be replaceable in isolation.
