@@ -1463,7 +1463,9 @@ mod tests {
                 gpu_utilization_percent: None,
             },
         };
-        collector.record_model_inference("qwen3:0.6b", model_m).await;
+        collector
+            .record_model_inference("qwen3:0.6b", model_m)
+            .await;
         let m = collector.get_current_metrics().await.unwrap();
         assert!(m.model_metrics.contains_key("qwen3:0.6b"));
         assert_eq!(m.model_metrics["qwen3:0.6b"].inference_count, 5);
