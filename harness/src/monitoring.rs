@@ -1499,11 +1499,9 @@ mod tests {
         let metrics = collector.get_current_metrics().await.unwrap();
         // 1 error against 1 request → 100% error rate
         assert_eq!(metrics.error_metrics.error_rate, 1.0);
-        assert!(
-            metrics
-                .error_metrics
-                .errors_by_type
-                .contains_key("SomeError")
-        );
+        assert!(metrics
+            .error_metrics
+            .errors_by_type
+            .contains_key("SomeError"));
     }
 }

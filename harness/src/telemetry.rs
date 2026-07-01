@@ -1092,16 +1092,18 @@ mod tests {
             Some(&"us-east-1".to_string())
         );
 
-        let mut config = TelemetryConfig::default();
-        config.log_level = "debug".to_string();
+        let config = TelemetryConfig {
+            log_level: "debug".to_string(),
+            ..Default::default()
+        };
         let system2 = TelemetrySystem::new().with_config(config);
         assert_eq!(system2.config.log_level, "debug");
     }
 
     #[tokio::test]
     async fn test_add_exporter_and_export_all() {
-        let telemetry = TelemetrySystem::new()
-            .add_exporter(Box::new(PrometheusExporter::new(None)));
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
         // With no finished traces/metrics/events, export_all should succeed and be a no-op
         telemetry.export_all().await.unwrap();
     }
@@ -1177,8 +1179,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_all_with_metrics_and_events() {
-        let telemetry = TelemetrySystem::new()
-            .add_exporter(Box::new(PrometheusExporter::new(None)));
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
 
         telemetry.record_counter("req", 1.0, vec![("svc", "auth")]);
         telemetry.record_gauge("mem", 512.0, vec![]);
