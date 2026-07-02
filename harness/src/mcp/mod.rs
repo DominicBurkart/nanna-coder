@@ -495,4 +495,34 @@ mod tests {
             .unwrap();
         assert!(output.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_handle_request_invalid_jsonrpc_version() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".to_string(),
+            id: Some(serde_json::json!(99)),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_missing_name_returns_error() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(5)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "arguments": {}
+            })),
+        };
+        let resp = server.handle_request(req).await;
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
 }

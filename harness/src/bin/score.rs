@@ -394,3 +394,72 @@ fn print_summary(card: &Scorecard) {
     println!("commit:             {}", card.commit);
     println!("appended to evals/scorecards/index.jsonl");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_category_nanna_solo() {
+        assert_eq!(
+            parse_category("nanna_solo").unwrap(),
+            ScorecardCategory::NannaSolo
+        );
+    }
+
+    #[test]
+    fn parse_category_claude_solo() {
+        assert_eq!(
+            parse_category("claude_solo").unwrap(),
+            ScorecardCategory::ClaudeSolo
+        );
+    }
+
+    #[test]
+    fn parse_category_claude_mcp_claude() {
+        assert_eq!(
+            parse_category("claude_mcp_claude").unwrap(),
+            ScorecardCategory::ClaudeMcpClaude
+        );
+    }
+
+    #[test]
+    fn parse_category_claude_mcp_nanna_gemma4() {
+        assert_eq!(
+            parse_category("claude_mcp_nanna_gemma4").unwrap(),
+            ScorecardCategory::ClaudeMcpNannaGemma4
+        );
+    }
+
+    #[test]
+    fn parse_category_unknown_returns_err() {
+        assert!(parse_category("not_a_real_category").is_err());
+    }
+
+    #[test]
+    fn iso_now_returns_nonempty_iso8601() {
+        let s = iso_now();
+        assert!(!s.is_empty());
+        assert!(s.len() == 20, "expected YYYY-MM-DDTHH:MM:SSZ (20 chars), got {s:?}");
+        assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn run_id_default_starts_with_nanna() {
+        let id = run_id_default();
+        assert!(id.starts_with("nanna-"), "expected 'nanna-' prefix, got {id:?}");
+    }
+
+    #[test]
+    fn git_capture_version_returns_some() {
+        let out = git_capture(&["--version"]);
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("git"));
+    }
+
+    #[test]
+    fn git_capture_bad_subcommand_returns_none() {
+        let out = git_capture(&["__no_such_subcommand__"]);
+        assert!(out.is_none());
+    }
+}

@@ -154,3 +154,42 @@ async fn main() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_matches_no_filter_always_true() {
+        assert!(case_matches("any-case-id", &None));
+    }
+
+    #[test]
+    fn case_matches_empty_filter_always_true() {
+        assert!(case_matches("any-case-id", &Some(String::new())));
+    }
+
+    #[test]
+    fn case_matches_needle_found() {
+        assert!(case_matches("repo__fix-login-bug", &Some("login".to_string())));
+    }
+
+    #[test]
+    fn case_matches_needle_not_found() {
+        assert!(!case_matches("repo__fix-login-bug", &Some("perf".to_string())));
+    }
+
+    #[test]
+    fn resolve_model_cli_arg_wins() {
+        assert_eq!(
+            resolve_model(Some("my-custom-model".to_string())),
+            "my-custom-model"
+        );
+    }
+
+    #[test]
+    fn resolve_model_none_returns_nonempty() {
+        let model = resolve_model(None);
+        assert!(!model.is_empty());
+    }
+}
