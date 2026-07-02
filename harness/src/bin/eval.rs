@@ -171,12 +171,18 @@ mod tests {
 
     #[test]
     fn case_matches_needle_found() {
-        assert!(case_matches("repo__fix-login-bug", &Some("login".to_string())));
+        assert!(case_matches(
+            "repo__fix-login-bug",
+            &Some("login".to_string())
+        ));
     }
 
     #[test]
     fn case_matches_needle_not_found() {
-        assert!(!case_matches("repo__fix-login-bug", &Some("perf".to_string())));
+        assert!(!case_matches(
+            "repo__fix-login-bug",
+            &Some("perf".to_string())
+        ));
     }
 
     #[test]

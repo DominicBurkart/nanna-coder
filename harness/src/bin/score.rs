@@ -440,14 +440,20 @@ mod tests {
     fn iso_now_returns_nonempty_iso8601() {
         let s = iso_now();
         assert!(!s.is_empty());
-        assert!(s.len() == 20, "expected YYYY-MM-DDTHH:MM:SSZ (20 chars), got {s:?}");
+        assert!(
+            s.len() == 20,
+            "expected YYYY-MM-DDTHH:MM:SSZ (20 chars), got {s:?}"
+        );
         assert!(s.ends_with('Z'));
     }
 
     #[test]
     fn run_id_default_starts_with_nanna() {
         let id = run_id_default();
-        assert!(id.starts_with("nanna-"), "expected 'nanna-' prefix, got {id:?}");
+        assert!(
+            id.starts_with("nanna-"),
+            "expected 'nanna-' prefix, got {id:?}"
+        );
     }
 
     #[test]

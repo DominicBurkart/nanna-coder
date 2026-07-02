@@ -1,5 +1,5 @@
-use harness::entities::{Entity, EntityType};
 use harness::entities::test::types::TestEntity;
+use harness::entities::{Entity, EntityType};
 
 #[test]
 fn test_entity_new_has_correct_type() {
