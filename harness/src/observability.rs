@@ -1100,11 +1100,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_health_thresholds() {
-        let mut custom = HealthThreshold::default();
-        custom.cpu_threshold = 95.0;
-        custom.max_latency_ms = 500;
+        let custom = HealthThreshold {
+            cpu_threshold: 95.0,
+            max_latency_ms: 500,
+            ..HealthThreshold::default()
+        };
 
-        let system = ObservabilitySystem::new().with_health_thresholds(custom.clone());
+        let system = ObservabilitySystem::new().with_health_thresholds(custom);
         assert_eq!(system.health_thresholds.cpu_threshold, 95.0);
         assert_eq!(system.health_thresholds.max_latency_ms, 500);
     }
