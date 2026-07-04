@@ -1073,8 +1073,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_exporter_and_export_all() {
-        let telemetry = TelemetrySystem::new()
-            .add_exporter(Box::new(PrometheusExporter::new(None)));
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
 
         telemetry.record_counter("test_count", 5.0, vec![]);
         telemetry.record_event("test_event", "test_cat", serde_json::json!({"k": "v"}));
