@@ -44,3 +44,42 @@ impl Default for TestEntity {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_test_entity_with_correct_type() {
+        let entity = TestEntity::new();
+        assert_eq!(entity.metadata().entity_type, EntityType::Test);
+    }
+
+    #[test]
+    fn default_equals_new() {
+        let a = TestEntity::new();
+        let b = TestEntity::default();
+        assert_eq!(a.metadata().entity_type, b.metadata().entity_type);
+    }
+
+    #[test]
+    fn to_json_round_trips() {
+        let entity = TestEntity::new();
+        let json = entity.to_json().expect("serialize");
+        let decoded: TestEntity = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.metadata().entity_type, EntityType::Test);
+    }
+
+    #[tokio::test]
+    async fn metadata_mut_allows_tag_update() {
+        let mut entity = TestEntity::new();
+        entity.metadata_mut().tags.push("smoke".to_string());
+        assert_eq!(entity.metadata().tags, vec!["smoke"]);
+    }
+
+    #[test]
+    fn entity_type_helper_returns_test() {
+        let entity = TestEntity::new();
+        assert_eq!(entity.entity_type(), EntityType::Test);
+    }
+}
