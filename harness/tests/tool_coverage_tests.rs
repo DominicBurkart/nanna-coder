@@ -4,13 +4,22 @@
 //! - `CalculatorTool`: subtract, multiply, and unknown-operation error (previously only add +
 //!   divide-by-zero were tested)
 //! - `ToolRegistry::execute`: `ToolError::NotFound` path when the tool name is unknown
-//! - `WriteFileTool`: path-traversal security rejection via `..` components
+//! - `WriteFileTool`: path-traversal security rejection via `..` components; missing parameters
 //! - `ReadFileTool`: IO error on missing file; `start_line`-only (no `end_line`); line-number
-//!   prefix format in returned content
+//!   prefix format in returned content; missing path parameter
 //! - `TaskId`: `Display` / `fmt` implementation
+//! - `EchoTool`: missing message parameter error path
+//! - `ListDirTool`: recursive directory listing via `list_recursive`
+//! - `SearchTool`: invalid regex error; max_results cap
+//! - `PrStatusData::to_l0`: `GitHubStatus::NoToken` and `GitHubStatus::ApiError` branches
+//! - `PrStatusData::to_l1`: "github" field (all three connection states); "staleness" with `None`;
+//!   "diff" with empty changed_files list
 
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    CalculatorTool, EchoTool, GitHubStatus, ListDirTool, PrStatusData, ReadFileTool, SearchTool,
+    Tool, ToolError, ToolRegistry, WriteFileTool,
+};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -256,4 +265,215 @@ fn task_id_new_display_is_non_empty() {
     assert!(!s.is_empty(), "TaskId display must not be empty");
     // UUID v4 is 36 chars (with hyphens)
     assert_eq!(s.len(), 36, "UUID v4 should be 36 chars, got: {s}");
+}
+
+// ---------------------------------------------------------------------------
+// EchoTool – error path for missing message
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn echo_missing_message_returns_invalid_arguments_error() {
+    let tool = EchoTool::new();
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("missing message must be an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments, got {:?}",
+        err
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WriteFileTool – missing parameter error paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn write_file_missing_path_returns_invalid_arguments_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let tool = WriteFileTool::new(temp_dir.path().to_path_buf());
+
+    let err = tool
+        .execute(json!({ "content": "some content" }))
+        .await
+        .expect_err("missing path must be an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn write_file_missing_content_returns_invalid_arguments_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let tool = WriteFileTool::new(temp_dir.path().to_path_buf());
+
+    let err = tool
+        .execute(json!({ "path": "output.txt" }))
+        .await
+        .expect_err("missing content must be an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments, got {:?}",
+        err
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ListDirTool – recursive directory listing
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_dir_recursive_finds_nested_files() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sub = temp_dir.path().join("subdir");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("nested.txt"), "content").unwrap();
+    std::fs::write(temp_dir.path().join("root.txt"), "root").unwrap();
+
+    let tool = ListDirTool::new(temp_dir.path().to_path_buf());
+    let result = tool
+        .execute(json!({ "recursive": true }))
+        .await
+        .expect("recursive list must succeed");
+
+    assert_eq!(
+        result["count"], 2,
+        "recursive listing should find both files"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SearchTool – invalid regex and max_results cap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_invalid_regex_returns_invalid_arguments_error() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let tool = SearchTool::new(temp_dir.path().to_path_buf());
+
+    let err = tool
+        .execute(json!({ "pattern": "[invalid regex" }))
+        .await
+        .expect_err("invalid regex must be an error");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn search_max_results_limits_output() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let content: String = (1..=10).map(|i| format!("match line {i}\n")).collect();
+    std::fs::write(temp_dir.path().join("data.txt"), content).unwrap();
+
+    let tool = SearchTool::new(temp_dir.path().to_path_buf());
+    let result = tool
+        .execute(json!({ "pattern": "match line", "max_results": 3 }))
+        .await
+        .expect("search with max_results must succeed");
+
+    assert_eq!(result["count"], 3, "max_results should cap results at 3");
+}
+
+// ---------------------------------------------------------------------------
+// PrStatusData – uncovered to_l0 and to_l1 branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pr_status_l0_github_no_token() {
+    let data = PrStatusData {
+        has_upstream: true,
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:unconfigured]"),
+        "NoToken should surface as [github:unconfigured], got: {l0}"
+    );
+}
+
+#[test]
+fn pr_status_l0_github_api_error() {
+    let data = PrStatusData {
+        has_upstream: true,
+        github_status: GitHubStatus::ApiError("rate limited".to_string()),
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:error]"),
+        "ApiError should surface as [github:error], got: {l0}"
+    );
+}
+
+#[test]
+fn pr_status_l1_github_connected() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("connected"),
+        "Connected state must say 'connected', got: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_github_no_token() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("not configured"),
+        "NoToken must say 'not configured', got: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_github_api_error_message() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::ApiError("timeout".to_string()),
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("error"),
+        "ApiError must say 'error', got: {detail}"
+    );
+    assert!(
+        detail.contains("timeout"),
+        "ApiError must include error message, got: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_staleness_none_says_not_available() {
+    let data = PrStatusData::default();
+    let detail = data.to_l1("staleness").unwrap();
+    assert_eq!(detail, "Staleness data not available.");
+}
+
+#[test]
+fn pr_status_l1_diff_empty_changed_files() {
+    let data = PrStatusData {
+        additions: Some(10),
+        deletions: Some(5),
+        changed_files: vec![],
+        ..Default::default()
+    };
+    let detail = data.to_l1("diff").unwrap();
+    assert!(detail.contains("+10/-5"), "got: {detail}");
+    assert!(
+        !detail.contains("Changed files"),
+        "empty file list should not print header, got: {detail}"
+    );
 }
