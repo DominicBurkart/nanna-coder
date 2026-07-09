@@ -995,4 +995,139 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
     }
+
+    #[test]
+    fn test_coherence_score_short_text_no_sentence() {
+        // Text without a period and under 50 chars gets no sentence/paragraph/length bonus
+        let score = calculate_coherence_score("hi");
+        // Base 0.5, word_variety = 1.0/1.0 * 0.1 = 0.1, total = 0.6
+        assert!(score > 0.0 && score <= 1.0);
+        assert!(score < 0.9); // Should not be high without structure
+    }
+
+    #[test]
+    fn test_coherence_score_single_word() {
+        let score = calculate_coherence_score("word");
+        // word_variety = 1.0 (1 unique / 1 total), no sentence, no paragraph, not long
+        assert!(score > 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_coherence_score_clamped_to_one() {
+        // Well-structured text should not exceed 1.0
+        let text = "First sentence. Second sentence. Third.\n\nAnother paragraph here. More text. Even more variety and unique words that differ from each other significantly.";
+        let score = calculate_coherence_score(text);
+        assert!(score <= 1.0);
+        assert!(score > 0.5);
+    }
+
+    #[test]
+    fn test_relevance_score_empty_text() {
+        let criteria = ValidationCriteria::default();
+        let score = calculate_relevance_score("", "some prompt", &criteria);
+        // Empty text is below min_response_length, should be penalized
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_relevance_score_no_required_keywords() {
+        let criteria = ValidationCriteria {
+            required_keywords: vec![],
+            forbidden_keywords: vec![],
+            min_response_length: 5,
+            max_response_length: 1000,
+            ..Default::default()
+        };
+        let response = "This is a valid response with enough content.";
+        let score = calculate_relevance_score(response, "prompt", &criteria);
+        // Gets base 0.5 for no required keywords, length bonus, and prompt overlap
+        assert!(score > 0.5);
+    }
+
+    #[test]
+    fn test_relevance_score_exceeds_max_length() {
+        let criteria = ValidationCriteria {
+            min_response_length: 5,
+            max_response_length: 10,
+            required_keywords: vec![],
+            forbidden_keywords: vec![],
+            ..Default::default()
+        };
+        let long_response = "This response is much longer than the maximum allowed length.";
+        let score = calculate_relevance_score(long_response, "test", &criteria);
+        // Gets -0.1 penalty for too long
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_relevance_score_below_min_length() {
+        let criteria = ValidationCriteria {
+            min_response_length: 100,
+            max_response_length: 1000,
+            required_keywords: vec![],
+            forbidden_keywords: vec![],
+            ..Default::default()
+        };
+        let short_response = "Short.";
+        let normal_response = "This is a longer response that meets the minimum length requirement and has enough content to be useful in a real scenario.";
+        let short_score = calculate_relevance_score(short_response, "test", &criteria);
+        let normal_score = calculate_relevance_score(normal_response, "test", &criteria);
+        assert!(short_score < normal_score);
+    }
+
+    #[test]
+    fn test_retry_delay_no_jitter() {
+        let config = JudgeConfig {
+            jitter_factor: 0.0,
+            base_delay_ms: 100,
+            max_delay_ms: 5000,
+            ..Default::default()
+        };
+        let delay_0 = config.calculate_retry_delay(0);
+        let delay_1 = config.calculate_retry_delay(1);
+        let delay_2 = config.calculate_retry_delay(2);
+        // Without jitter, delays are strictly deterministic
+        assert_eq!(delay_0, Duration::from_millis(100));
+        assert_eq!(delay_1, Duration::from_millis(200));
+        assert_eq!(delay_2, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn test_retry_delay_caps_at_max() {
+        let config = JudgeConfig {
+            jitter_factor: 0.0,
+            base_delay_ms: 1000,
+            max_delay_ms: 2000,
+            ..Default::default()
+        };
+        // 1000 * 2^10 = 1_024_000ms >> 2000ms cap
+        let delay = config.calculate_retry_delay(10);
+        assert_eq!(delay, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_validation_result_failure_display() {
+        let failure = ValidationResult::Failure {
+            message: "Critical failure".to_string(),
+            error_details: "Timeout after 30s".to_string(),
+            suggestions: vec!["Retry".to_string(), "Check network".to_string()],
+            metrics: None,
+        };
+        let display = format!("{}", failure);
+        assert!(display.contains("❌ FAILURE"));
+        assert!(display.contains("Critical failure"));
+    }
+
+    #[test]
+    fn test_validation_result_warning_display() {
+        let metrics = ValidationMetrics::default();
+        let warning = ValidationResult::Warning {
+            message: "Slow response".to_string(),
+            suggestions: vec!["Optimize query".to_string()],
+            metrics,
+        };
+        let display = format!("{}", warning);
+        assert!(display.contains("⚠️"));
+        assert!(display.contains("Slow response"));
+    }
 }
