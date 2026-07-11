@@ -2484,6 +2484,209 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // -- parse_github_remote unit tests --
+
+    #[test]
+    fn parse_github_remote_ssh_with_dot_git() {
+        let result = parse_github_remote("git@github.com:owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn parse_github_remote_ssh_without_dot_git() {
+        let result = parse_github_remote("git@github.com:owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn parse_github_remote_https_with_dot_git() {
+        let result = parse_github_remote("https://github.com/owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn parse_github_remote_https_without_dot_git() {
+        let result = parse_github_remote("https://github.com/owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn parse_github_remote_non_github_returns_none() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert!(result.is_none());
+    }
+
+    // -- PrStatusData::to_l0 missing branch coverage --
+
+    #[test]
+    fn test_pr_status_l0_github_no_token() {
+        let data = PrStatusData {
+            head_sha: Some("abc123".to_string()),
+            has_upstream: false,
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:unconfigured]"), "got: {l0}");
+    }
+
+    #[test]
+    fn test_pr_status_l0_github_api_error() {
+        let data = PrStatusData {
+            head_sha: Some("abc123".to_string()),
+            has_upstream: false,
+            github_status: GitHubStatus::ApiError("rate limited".to_string()),
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:error]"), "got: {l0}");
+    }
+
+    #[test]
+    fn test_pr_status_l0_closed_pr() {
+        let data = PrStatusData {
+            pr_number: Some(10),
+            pr_status: Some("closed".to_string()),
+            has_upstream: true,
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("closed"), "got: {l0}");
+    }
+
+    #[test]
+    fn test_pr_status_l0_review_required_not_shown() {
+        // "review-required" hits the `_ => {}` arm in to_l0 and does not appear
+        let data = PrStatusData {
+            pr_number: Some(1),
+            pr_status: Some("ready".to_string()),
+            review_state: Some("review-required".to_string()),
+            has_upstream: true,
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(!l0.contains("review-required"), "got: {l0}");
+        assert!(l0.contains("ready"), "got: {l0}");
+    }
+
+    #[test]
+    fn test_pr_status_l0_staleness_zero_not_shown() {
+        let data = PrStatusData {
+            head_sha: Some("abc".to_string()),
+            has_upstream: false,
+            staleness_days: Some(0),
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(!l0.contains("0d"), "staleness=0 must not appear: {l0}");
+    }
+
+    // -- PrStatusData::to_l1 missing branch coverage --
+
+    #[test]
+    fn test_pr_status_l1_staleness_none() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("staleness").unwrap();
+        assert_eq!(detail, "Staleness data not available.");
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_connected() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("connected"), "got: {detail}");
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_no_token() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("not configured"), "got: {detail}");
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_api_error() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::ApiError("timeout".to_string()),
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("timeout"), "got: {detail}");
+    }
+
+    #[test]
+    fn test_pr_status_l1_diff_no_data() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("diff").unwrap();
+        assert!(detail.contains("no diff data"), "got: {detail}");
+    }
+
+    #[test]
+    fn test_pr_status_l1_diff_data_no_changed_files() {
+        let data = PrStatusData {
+            additions: Some(10),
+            deletions: Some(5),
+            changed_files: vec![],
+            ..Default::default()
+        };
+        let detail = data.to_l1("diff").unwrap();
+        assert!(detail.contains("+10/-5"), "got: {detail}");
+        assert!(!detail.contains("Changed files"), "got: {detail}");
+    }
+
+    // -- ListDirTool recursive listing --
+
+    #[tokio::test]
+    async fn test_list_directory_recursive() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_list_recursive");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("root.rs"), "").unwrap();
+        let subdir = temp_dir.join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("child.rs"), "").unwrap();
+        std::fs::write(subdir.join("other.txt"), "").unwrap();
+
+        let tool = ListDirTool::new(temp_dir.clone());
+        let result = tool
+            .execute(serde_json::json!({ "recursive": true }))
+            .await
+            .unwrap();
+        // root.rs + child.rs + other.txt = 3 files
+        assert_eq!(result["count"], 3, "recursive listing should find 3 files");
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_recursive_with_pattern() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_list_recursive_pattern");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("root.rs"), "").unwrap();
+        let subdir = temp_dir.join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("child.rs"), "").unwrap();
+        std::fs::write(subdir.join("other.txt"), "").unwrap();
+
+        let tool = ListDirTool::new(temp_dir.clone());
+        let result = tool
+            .execute(serde_json::json!({ "recursive": true, "pattern": "*.rs" }))
+            .await
+            .unwrap();
+        // Only root.rs and child.rs match *.rs
+        assert_eq!(result["count"], 2, "recursive *.rs should find 2 files");
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 }
 
 #[cfg(kani)]
