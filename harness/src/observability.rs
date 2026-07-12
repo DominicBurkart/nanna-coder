@@ -1119,15 +1119,26 @@ mod tests {
     async fn test_enhance_alerts_covers_all_categories() {
         let system = ObservabilitySystem::new();
         let alerts = vec![
-            make_alert("container-main", "Container health degraded", AlertSeverity::Critical),
+            make_alert(
+                "container-main",
+                "Container health degraded",
+                AlertSeverity::Critical,
+            ),
             make_alert("model-llm", "Model quality drop", AlertSeverity::Error),
-            make_alert("api", "performance degradation detected", AlertSeverity::Warning),
+            make_alert(
+                "api",
+                "performance degradation detected",
+                AlertSeverity::Warning,
+            ),
             make_alert("system", "resource exhaustion", AlertSeverity::Warning),
             make_alert("gateway", "service down", AlertSeverity::Info),
         ];
         let enhanced = system.enhance_alerts(alerts).await.unwrap();
         assert_eq!(enhanced.len(), 5);
-        assert!(matches!(enhanced[0].category, AlertCategory::ContainerHealth));
+        assert!(matches!(
+            enhanced[0].category,
+            AlertCategory::ContainerHealth
+        ));
         assert!(matches!(enhanced[1].category, AlertCategory::ModelQuality));
         assert!(matches!(enhanced[2].category, AlertCategory::Performance));
         assert!(matches!(enhanced[3].category, AlertCategory::Resources));
@@ -1170,8 +1181,7 @@ mod tests {
             system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
         assert!(!container_actions.is_empty());
 
-        let perf_actions =
-            system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        let perf_actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
         assert!(!perf_actions.is_empty());
 
         let model_actions =
@@ -1189,8 +1199,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_and_stop_monitoring() {
-        let mut system = ObservabilitySystem::new()
-            .with_health_check_interval(Duration::from_secs(3600));
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(3600));
         let _ = system.initialize().await;
         system.start_monitoring().await.unwrap();
         assert!(system.monitoring_task.is_some());
