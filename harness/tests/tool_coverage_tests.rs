@@ -373,14 +373,20 @@ fn pr_status_l1_diff_no_changed_files() {
     };
     let detail = data.to_l1("diff").unwrap();
     assert!(detail.contains("+3/-1"), "expected diff stats in: {detail}");
-    assert!(!detail.contains("Changed files"), "should not list files: {detail}");
+    assert!(
+        !detail.contains("Changed files"),
+        "should not list files: {detail}"
+    );
 }
 
 #[test]
 fn pr_status_l1_diff_no_data() {
     let data = PrStatusData::default();
     let detail = data.to_l1("diff").unwrap();
-    assert!(detail.contains("no diff data"), "expected fallback in: {detail}");
+    assert!(
+        detail.contains("no diff data"),
+        "expected fallback in: {detail}"
+    );
 }
 
 // ---------------------------------------------------------------------------
