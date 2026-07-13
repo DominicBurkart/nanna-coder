@@ -8,10 +8,19 @@
 //! - `ReadFileTool`: IO error on missing file; `start_line`-only (no `end_line`); line-number
 //!   prefix format in returned content
 //! - `TaskId`: `Display` / `fmt` implementation
+//! - `PrStatusData::to_l0`: `GitHubStatus::NoToken`, `ApiError`, `closed` status, `ahead > 0`
+//! - `PrStatusData::to_l1`: `github` field (all three variants), `staleness` with None,
+//!   `diff` with no files, `diff` with no data
+//! - `RunCommandTool::execute`: missing-command error, no-runtime error
 
+use harness::container::{ContainerHandle, ContainerRuntime};
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    CalculatorTool, GitHubStatus, PrStatusData, ReadFileTool, RunCommandTool, Tool, ToolError,
+    ToolRegistry, WriteFileTool,
+};
 use serde_json::json;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // CalculatorTool – missing arithmetic operations
@@ -256,4 +265,164 @@ fn task_id_new_display_is_non_empty() {
     assert!(!s.is_empty(), "TaskId display must not be empty");
     // UUID v4 is 36 chars (with hyphens)
     assert_eq!(s.len(), 36, "UUID v4 should be 36 chars, got: {s}");
+}
+
+// ---------------------------------------------------------------------------
+// PrStatusData::to_l0 – untested GitHubStatus and status branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pr_status_l0_github_no_token() {
+    let data = PrStatusData {
+        has_upstream: true,
+        head_sha: Some("abc123".to_string()),
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("[github:unconfigured]"), "got: {l0}");
+}
+
+#[test]
+fn pr_status_l0_github_api_error() {
+    let data = PrStatusData {
+        has_upstream: true,
+        head_sha: Some("abc123".to_string()),
+        github_status: GitHubStatus::ApiError("rate limit".to_string()),
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("[github:error]"), "got: {l0}");
+}
+
+#[test]
+fn pr_status_l0_closed() {
+    let data = PrStatusData {
+        pr_number: Some(7),
+        pr_status: Some("closed".to_string()),
+        has_upstream: true,
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("closed"), "expected 'closed' in: {l0}");
+}
+
+#[test]
+fn pr_status_l0_ahead() {
+    let data = PrStatusData {
+        pr_number: Some(1),
+        has_upstream: true,
+        ahead: Some(4),
+        behind: Some(0),
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("ahead:4"), "expected 'ahead:4' in: {l0}");
+}
+
+// ---------------------------------------------------------------------------
+// PrStatusData::to_l1 – untested "github", staleness=None, diff variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pr_status_l1_staleness_none() {
+    let data = PrStatusData::default();
+    let detail = data.to_l1("staleness").unwrap();
+    assert_eq!(detail, "Staleness data not available.");
+}
+
+#[test]
+fn pr_status_l1_github_connected() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(detail.contains("connected"), "got: {detail}");
+}
+
+#[test]
+fn pr_status_l1_github_no_token() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(detail.contains("GITHUB_TOKEN"), "got: {detail}");
+}
+
+#[test]
+fn pr_status_l1_github_api_error() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::ApiError("timeout".to_string()),
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(detail.contains("timeout"), "got: {detail}");
+}
+
+#[test]
+fn pr_status_l1_diff_no_changed_files() {
+    let data = PrStatusData {
+        additions: Some(3),
+        deletions: Some(1),
+        changed_files: vec![],
+        ..Default::default()
+    };
+    let detail = data.to_l1("diff").unwrap();
+    assert!(detail.contains("+3/-1"), "expected diff stats in: {detail}");
+    assert!(!detail.contains("Changed files"), "should not list files: {detail}");
+}
+
+#[test]
+fn pr_status_l1_diff_no_data() {
+    let data = PrStatusData::default();
+    let detail = data.to_l1("diff").unwrap();
+    assert!(detail.contains("no diff data"), "expected fallback in: {detail}");
+}
+
+// ---------------------------------------------------------------------------
+// RunCommandTool::execute – error paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_command_missing_command_returns_invalid_arguments() {
+    let handle = Arc::new(ContainerHandle {
+        name: "test".to_string(),
+        runtime: ContainerRuntime::None,
+        port: None,
+        needs_cleanup: false,
+    });
+    let tool = RunCommandTool::new(handle, None);
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("missing command must fail");
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "expected InvalidArguments, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn run_command_no_runtime_returns_execution_failed() {
+    let handle = Arc::new(ContainerHandle {
+        name: "test".to_string(),
+        runtime: ContainerRuntime::None,
+        port: None,
+        needs_cleanup: false,
+    });
+    let tool = RunCommandTool::new(handle, None);
+    let err = tool
+        .execute(json!({ "command": "echo hello" }))
+        .await
+        .expect_err("no-runtime must fail");
+    assert!(
+        matches!(err, ToolError::ExecutionFailed { .. }),
+        "expected ExecutionFailed, got {:?}",
+        err
+    );
 }
