@@ -2484,6 +2484,244 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // -- parse_github_remote unit tests --
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_no_git_suffix() {
+        let result = parse_github_remote("git@github.com:owner/myrepo");
+        assert_eq!(result, Some(("owner".to_string(), "myrepo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https() {
+        let result = parse_github_remote("https://github.com/owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_no_git_suffix() {
+        let result = parse_github_remote("https://github.com/owner/myrepo");
+        assert_eq!(result, Some(("owner".to_string(), "myrepo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_non_github() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_github_remote_empty() {
+        let result = parse_github_remote("");
+        assert_eq!(result, None);
+    }
+
+    // -- GitHubStatus coverage for to_l0 and to_l1 --
+
+    #[test]
+    fn test_pr_status_l0_no_token() {
+        let data = PrStatusData {
+            head_sha: Some("abc123".to_string()),
+            has_upstream: false,
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:unconfigured]"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_api_error() {
+        let data = PrStatusData {
+            head_sha: Some("abc123".to_string()),
+            has_upstream: false,
+            github_status: GitHubStatus::ApiError("timeout".to_string()),
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("[github:error]"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_staleness_zero() {
+        let data = PrStatusData {
+            head_sha: Some("abc123".to_string()),
+            has_upstream: false,
+            staleness_days: Some(0),
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(!l0.contains('d'));
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_no_token() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::NoToken,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("not configured"));
+        assert!(detail.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_api_error() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::ApiError("rate limited".to_string()),
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("rate limited"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_github_connected() {
+        let data = PrStatusData {
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let detail = data.to_l1("github").unwrap();
+        assert!(detail.contains("connected"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_diff_no_data() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("diff").unwrap();
+        assert!(detail.contains("no diff data"));
+    }
+
+    #[test]
+    fn test_pr_status_l1_staleness_none() {
+        let data = PrStatusData::default();
+        let detail = data.to_l1("staleness").unwrap();
+        assert!(detail.contains("not available"));
+    }
+
+    #[test]
+    fn test_pr_status_l0_ahead_nonzero() {
+        let data = PrStatusData {
+            pr_number: Some(1),
+            has_upstream: true,
+            ahead: Some(5),
+            behind: Some(0),
+            github_status: GitHubStatus::Connected,
+            ..Default::default()
+        };
+        let l0 = data.to_l0();
+        assert!(l0.contains("ahead:5"));
+    }
+
+    #[test]
+    fn test_tool_error_not_found() {
+        let err = ToolError::NotFound {
+            name: "missing_tool".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_not_found() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("nonexistent", json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::NotFound { name }) => assert_eq!(name, "nonexistent"),
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "subtract", "a": 10.0, "b": 3.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "multiply", "a": 4.0, "b": 5.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "modulo", "a": 10.0, "b": 3.0 }))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("modulo"));
+            }
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_file_path_traversal_rejected() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_security");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tool = WriteFileTool::new(temp_dir.clone());
+        let result = tool
+            .execute(json!({ "path": "../escape.txt", "content": "bad" }))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::PathSecurityViolation { .. }) => {}
+            _ => panic!("Expected PathSecurityViolation"),
+        }
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_recursive() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_list_recursive");
+        std::fs::create_dir_all(temp_dir.join("subdir")).unwrap();
+        std::fs::write(temp_dir.join("root.rs"), "").unwrap();
+        std::fs::write(temp_dir.join("subdir/nested.rs"), "").unwrap();
+
+        let tool = ListDirTool::new(temp_dir.clone());
+        let result = tool
+            .execute(json!({ "recursive": true }))
+            .await
+            .unwrap();
+        assert!(result["count"].as_u64().unwrap() >= 2);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_tool_invalid_regex() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_search_regex");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tool = SearchTool::new(temp_dir.clone());
+        let result = tool.execute(json!({ "pattern": "[invalid" })).await;
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 }
 
 #[cfg(kani)]
