@@ -1160,15 +1160,9 @@ mod tests {
         let mut guard = TraceGuard::new(&telemetry, trace);
 
         guard.record_error("something failed");
-        assert_eq!(
-            guard.trace().unwrap().status,
-            SpanStatus::Error
-        );
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
 
         guard.set_status(SpanStatus::Cancelled);
-        assert_eq!(
-            guard.trace().unwrap().status,
-            SpanStatus::Cancelled
-        );
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
     }
 }
