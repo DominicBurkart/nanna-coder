@@ -302,4 +302,81 @@ mod tests {
         let err = client.get("x").await.unwrap_err();
         assert!(matches!(err, McpClientError::UnexpectedEof));
     }
+
+    /// Build a client whose reader replays canned response bytes (and whose
+    /// writes are discarded) — for exercising response-parsing branches.
+    fn canned_client(
+        bytes: &'static [u8],
+    ) -> NannaMcpClient<tokio::io::BufReader<&'static [u8]>, tokio::io::Sink> {
+        NannaMcpClient::new(tokio::io::BufReader::new(bytes), tokio::io::sink())
+    }
+
+    #[tokio::test]
+    async fn test_client_skips_unrelated_message_then_returns_match() {
+        // A stray notification (no id) precedes the real id=1 response; the
+        // client skips it and returns the matching result.
+        let mut client = canned_client(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/x\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"status\":\"working\"}}\n",
+        );
+        let r = client.get("t").await.unwrap();
+        assert_eq!(r["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn test_client_response_without_result_or_error_is_protocol_error() {
+        let mut client = canned_client(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+        let err = client.get("t").await.unwrap_err();
+        assert!(matches!(err, McpClientError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn test_client_submit_missing_task_id_is_protocol_error() {
+        // Also exercises the no-ttl (None) submit path.
+        let mut client =
+            canned_client(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{}}}\n");
+        let err = client
+            .submit_task(serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpClientError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn test_client_wait_result_polls_until_terminal() {
+        use crate::task::TaskId;
+        // Zero permits: the task stays `working`, so wait_result takes the
+        // poll-then-sleep path at least once before we cancel it out of band.
+        let manager = Arc::new(TaskManager::new(0));
+        let server = Arc::new(NannaMcpServer::new(
+            Arc::clone(&manager),
+            Arc::new(NoopProvider),
+            "m".to_string(),
+            10,
+        ));
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_side);
+        tokio::spawn(async move {
+            let _ = server.serve(tokio::io::BufReader::new(sr), sw).await;
+        });
+        let (cr, cw) = tokio::io::split(client_side);
+        let mut client = NannaMcpClient::new(tokio::io::BufReader::new(cr), cw);
+        client.initialize().await.unwrap();
+        let task_id = client
+            .submit_task(
+                serde_json::json!({ "description": "d", "repo_path": "/tmp" }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let m = Arc::clone(&manager);
+        let tid = TaskId(task_id.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = m.cancel(&tid).await;
+        });
+
+        let result = client.wait_result(&task_id).await.unwrap();
+        assert_eq!(result["isError"], true);
+    }
 }

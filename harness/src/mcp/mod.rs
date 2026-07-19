@@ -244,17 +244,9 @@ impl NannaMcpServer {
                 )
                 .await
                 {
-                    Ok(task_id) => match self.task_manager.poll(&task_id).await {
-                        Some(task) => JsonRpcResponse::success(
-                            id,
-                            serde_json::json!({ "task": handlers::task_to_wire(&task) }),
-                        ),
-                        None => JsonRpcResponse::error(
-                            id,
-                            -32603,
-                            "Task vanished immediately after creation".to_string(),
-                        ),
-                    },
+                    Ok(task_wire) => {
+                        JsonRpcResponse::success(id, serde_json::json!({ "task": task_wire }))
+                    }
                     Err(msg) => JsonRpcResponse::error(id, -32602, msg),
                 }
             }
@@ -321,17 +313,13 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
-        if self.task_manager.wait_terminal(&task_id).await.is_none() {
-            return JsonRpcResponse::error(
+        // wait_terminal returns the terminal status directly (or None for an
+        // unknown task id), so no second lookup is needed.
+        match self.task_manager.wait_terminal(&task_id).await {
+            Some(status) => JsonRpcResponse::success(
                 id,
-                -32602,
-                format!("Failed to retrieve task: Task not found: {}", task_id),
-            );
-        }
-        match self.task_manager.poll(&task_id).await {
-            Some(task) => {
-                JsonRpcResponse::success(id, handlers::task_result_to_call_tool_result(&task))
-            }
+                handlers::task_result_to_call_tool_result(&task_id.0, &status),
+            ),
             None => JsonRpcResponse::error(
                 id,
                 -32602,
@@ -666,6 +654,64 @@ mod tests {
             .handle_request(tools_call(13, serde_json::json!({ "arguments": {} })))
             .await;
         assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_with_task_but_missing_args_is_invalid_params() {
+        let server = make_server();
+        let resp = server
+            .handle_request(tools_call(
+                26,
+                serde_json::json!({
+                    "name": "assign_task",
+                    "arguments": {},
+                    "task": {}
+                }),
+            ))
+            .await;
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_onboard_repo_success_through_tools_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let server = make_server();
+        let resp = server
+            .handle_request(tools_call(
+                27,
+                serde_json::json!({
+                    "name": "onboard_repo",
+                    "arguments": { "repo_path": dir.path().to_str().unwrap() }
+                }),
+            ))
+            .await;
+        assert!(resp.error.is_none());
+        let body = resp.result.unwrap();
+        assert_eq!(body["isError"], false);
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("demo"));
+    }
+
+    #[tokio::test]
+    async fn test_onboard_repo_error_through_tools_call() {
+        let server = make_server();
+        let resp = server
+            .handle_request(tools_call(
+                28,
+                serde_json::json!({
+                    "name": "onboard_repo",
+                    "arguments": { "repo_path": "relative/path" }
+                }),
+            ))
+            .await;
+        assert_eq!(resp.error.unwrap().code, -32603);
     }
 
     #[tokio::test]

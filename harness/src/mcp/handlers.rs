@@ -7,7 +7,7 @@
 
 use crate::onboarding::DeterministicOnboarder;
 use crate::onboarding::Onboarder;
-use crate::task::{Task, TaskId, TaskManager, TaskStatus};
+use crate::task::{Task, TaskManager, TaskStatus};
 use model::provider::ModelProvider;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -21,11 +21,11 @@ pub const POLL_INTERVAL_MS: u64 = 2000;
 /// `ttl` values are clamped to this. 24 hours.
 pub const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Parse `assign_task` arguments, submit the task, and record its TTL.
+/// Parse `assign_task` arguments, submit the task, record its TTL, and return
+/// the `CreateTaskResult` task object.
 ///
-/// Returns the new [`TaskId`]; the caller wraps it in a `CreateTaskResult`.
 /// `ttl_ms` is the client-requested lifetime (from the request's `task`
-/// field), already extracted by the caller and clamped here.
+/// field), clamped to [`MAX_TTL_MS`] here.
 pub async fn handle_assign_task(
     params: &Value,
     task_manager: &Arc<TaskManager>,
@@ -33,7 +33,7 @@ pub async fn handle_assign_task(
     default_model: &str,
     default_max_iterations: usize,
     ttl_ms: Option<u64>,
-) -> Result<TaskId, String> {
+) -> Result<Value, String> {
     let description = params
         .get("description")
         .and_then(|v| v.as_str())
@@ -64,6 +64,7 @@ pub async fn handle_assign_task(
         .map(|v| v as usize)
         .unwrap_or(default_max_iterations);
 
+    let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
     let task_id = task_manager
         .submit(
             description,
@@ -75,11 +76,27 @@ pub async fn handle_assign_task(
         )
         .await;
 
-    task_manager
-        .set_ttl(&task_id, ttl_ms.map(|t| t.min(MAX_TTL_MS)))
-        .await;
+    task_manager.set_ttl(&task_id, ttl).await;
 
-    Ok(task_id)
+    // The task is freshly created and always in the initial `working` state,
+    // so the CreateTaskResult body is built directly rather than re-reading
+    // the task (which would introduce an unreachable not-found branch).
+    Ok(initial_task_wire(&task_id.0, ttl))
+}
+
+/// Build the MCP Tasks `Task` object returned inside a `CreateTaskResult` for a
+/// just-submitted task (always initial `working` state).
+pub fn initial_task_wire(task_id: &str, ttl_ms: Option<u64>) -> Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": "Task is queued.",
+        "createdAt": now,
+        "lastUpdatedAt": now,
+        "ttl": ttl_ms,
+        "pollInterval": POLL_INTERVAL_MS,
+    })
 }
 
 /// Run the synchronous `onboard_repo` tool and return its (non-task) result
@@ -158,11 +175,11 @@ pub fn task_to_wire(task: &Task) -> Value {
 /// terminal task. Includes the required `io.modelcontextprotocol/related-task`
 /// metadata. For non-terminal input the caller is expected to have awaited a
 /// terminal state first; a defensive `isError` result is returned regardless.
-pub fn task_result_to_call_tool_result(task: &Task) -> Value {
+pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Value {
     let related = serde_json::json!({
-        "io.modelcontextprotocol/related-task": { "taskId": task.id.0 }
+        "io.modelcontextprotocol/related-task": { "taskId": task_id }
     });
-    match &task.status {
+    match status {
         TaskStatus::Completed { result, .. } => serde_json::json!({
             "content": [{
                 "type": "text",
@@ -207,7 +224,7 @@ pub fn task_result_to_call_tool_result(task: &Task) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{FailureDiagnostics, TaskManager, TaskResult};
+    use crate::task::{FailureDiagnostics, TaskId, TaskManager, TaskResult};
     use async_trait::async_trait;
     use chrono::Utc;
     use model::provider::{ModelError, ModelResult};
@@ -337,12 +354,14 @@ mod tests {
             "description": "Test task",
             "repo_path": "/tmp"
         });
-        let task_id =
-            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, Some(5000))
-                .await
-                .unwrap();
-        let task = manager.poll(&task_id).await.unwrap();
-        assert_eq!(task.ttl_ms, Some(5000));
+        let wire = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, Some(5000))
+            .await
+            .unwrap();
+        assert_eq!(wire["status"], "working");
+        assert_eq!(wire["ttl"], 5000);
+        // The TTL is also persisted so tasks/get echoes it.
+        let tid = TaskId(wire["taskId"].as_str().unwrap().to_string());
+        assert_eq!(manager.poll(&tid).await.unwrap().ttl_ms, Some(5000));
     }
 
     #[tokio::test]
@@ -350,7 +369,7 @@ mod tests {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
         let params = serde_json::json!({"description": "t", "repo_path": "/tmp"});
-        let task_id = handle_assign_task(
+        let wire = handle_assign_task(
             &params,
             &manager,
             &provider,
@@ -360,8 +379,26 @@ mod tests {
         )
         .await
         .unwrap();
-        let task = manager.poll(&task_id).await.unwrap();
-        assert_eq!(task.ttl_ms, Some(MAX_TTL_MS));
+        assert_eq!(wire["ttl"], MAX_TTL_MS);
+    }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let params = serde_json::json!({ "repo_path": dir.path().to_str().unwrap() });
+        let result = handle_onboard_repo(&params).await.unwrap();
+        assert_eq!(result["project_name"], "demo");
+        assert!(result["flake_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("flake.nix"));
+        assert!(result["nix_packages"].is_array());
+        assert!(result["tools"].is_array());
     }
 
     #[tokio::test]
@@ -428,10 +465,13 @@ mod tests {
 
     #[test]
     fn test_task_result_completed_is_not_error() {
-        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Completed {
-            finished_at: Utc::now(),
-            result: sample_result(),
-        }));
+        let r = task_result_to_call_tool_result(
+            "wire-test",
+            &TaskStatus::Completed {
+                finished_at: Utc::now(),
+                result: sample_result(),
+            },
+        );
         assert_eq!(r["isError"], false);
         assert_eq!(
             r["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
@@ -445,21 +485,27 @@ mod tests {
 
     #[test]
     fn test_task_result_failed_is_error() {
-        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Failed {
-            finished_at: Utc::now(),
-            error: "boom".to_string(),
-            diagnostics: sample_diagnostics(),
-        }));
+        let r = task_result_to_call_tool_result(
+            "wire-test",
+            &TaskStatus::Failed {
+                finished_at: Utc::now(),
+                error: "boom".to_string(),
+                diagnostics: sample_diagnostics(),
+            },
+        );
         assert_eq!(r["isError"], true);
         assert!(r["content"][0]["text"].as_str().unwrap().contains("boom"));
     }
 
     #[test]
     fn test_task_result_cancelled_is_error() {
-        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Cancelled {
-            finished_at: Utc::now(),
-            iterations_completed: 4,
-        }));
+        let r = task_result_to_call_tool_result(
+            "wire-test",
+            &TaskStatus::Cancelled {
+                finished_at: Utc::now(),
+                iterations_completed: 4,
+            },
+        );
         assert_eq!(r["isError"], true);
         assert!(r["content"][0]["text"]
             .as_str()
@@ -469,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_task_result_non_terminal_is_defensive_error() {
-        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Pending));
+        let r = task_result_to_call_tool_result("wire-test", &TaskStatus::Pending);
         assert_eq!(r["isError"], true);
         assert!(r["content"][0]["text"]
             .as_str()
