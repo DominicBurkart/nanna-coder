@@ -1,59 +1,39 @@
+//! Business-logic helpers behind the MCP Tasks surface.
+//!
+//! The wire dispatch (method routing, `CreateTaskResult` / `tasks/*` framing)
+//! lives in [`super`]; this module holds the argument parsing, the delegated
+//! work (`assign_task`, `onboard_repo`), and the mappers that turn an internal
+//! [`Task`] into its MCP Tasks wire representation.
+
 use crate::onboarding::DeterministicOnboarder;
 use crate::onboarding::Onboarder;
-use crate::task::{TaskId, TaskManager, TaskStatus};
+use crate::task::{Task, TaskId, TaskManager, TaskStatus};
 use model::provider::ModelProvider;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub async fn handle_list_tasks(task_manager: &Arc<TaskManager>) -> Result<Value, String> {
-    let tasks = task_manager.list().await;
-    let summaries: Vec<Value> = tasks
-        .into_iter()
-        .map(|t| {
-            let status_str = match &t.status {
-                TaskStatus::Pending => "Pending",
-                TaskStatus::Running { .. } => "Running",
-                TaskStatus::Completed { .. } => "Completed",
-                TaskStatus::Failed { .. } => "Failed",
-            };
-            serde_json::json!({
-                "id": t.id.0,
-                "status": status_str,
-                "description": t.description,
-                "created_at": t.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(serde_json::json!(summaries))
-}
+/// Suggested client polling interval (milliseconds) advertised in task
+/// responses via `pollInterval`.
+pub const POLL_INTERVAL_MS: u64 = 2000;
 
-pub async fn handle_cancel_task(
-    params: &Value,
-    task_manager: &Arc<TaskManager>,
-) -> Result<Value, String> {
-    let task_id_str = params
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: task_id".to_string())?;
+/// Maximum task lifetime (milliseconds) the server will honor; requested
+/// `ttl` values are clamped to this. 24 hours.
+pub const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
-    let task_id = TaskId(task_id_str.to_string());
-    task_manager.cancel(&task_id).await?;
-
-    Ok(serde_json::json!({
-        "task_id": task_id_str,
-        "status": "Cancelled",
-        "message": "Task has been cancelled"
-    }))
-}
-
+/// Parse `assign_task` arguments, submit the task, and record its TTL.
+///
+/// Returns the new [`TaskId`]; the caller wraps it in a `CreateTaskResult`.
+/// `ttl_ms` is the client-requested lifetime (from the request's `task`
+/// field), already extracted by the caller and clamped here.
 pub async fn handle_assign_task(
     params: &Value,
     task_manager: &Arc<TaskManager>,
     provider: &Arc<dyn ModelProvider>,
     default_model: &str,
     default_max_iterations: usize,
-) -> Result<Value, String> {
+    ttl_ms: Option<u64>,
+) -> Result<TaskId, String> {
     let description = params
         .get("description")
         .and_then(|v| v.as_str())
@@ -95,98 +75,15 @@ pub async fn handle_assign_task(
         )
         .await;
 
-    Ok(serde_json::json!({
-        "task_id": task_id.0,
-        "status": "Pending"
-    }))
+    task_manager
+        .set_ttl(&task_id, ttl_ms.map(|t| t.min(MAX_TTL_MS)))
+        .await;
+
+    Ok(task_id)
 }
 
-pub async fn handle_poll_task(
-    params: &Value,
-    task_manager: &Arc<TaskManager>,
-) -> Result<Value, String> {
-    let task_id_str = params
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: task_id".to_string())?;
-
-    let task_id = TaskId(task_id_str.to_string());
-    let task = task_manager
-        .poll(&task_id)
-        .await
-        .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
-
-    let (status_str, iterations, started_at) = match &task.status {
-        TaskStatus::Pending => ("Pending", None, None),
-        TaskStatus::Running {
-            iterations,
-            started_at,
-        } => ("Running", Some(*iterations), Some(started_at.to_rfc3339())),
-        TaskStatus::Completed { .. } => ("Completed", None, None),
-        TaskStatus::Failed { .. } => ("Failed", None, None),
-    };
-
-    let mut response = serde_json::json!({
-        "task_id": task_id_str,
-        "status": status_str,
-        "description": task.description,
-    });
-
-    if let Some(iters) = iterations {
-        response["iterations"] = serde_json::json!(iters);
-    }
-    if let Some(started) = started_at {
-        response["started_at"] = serde_json::json!(started);
-    }
-
-    Ok(response)
-}
-
-pub async fn handle_get_result(
-    params: &Value,
-    task_manager: &Arc<TaskManager>,
-) -> Result<Value, String> {
-    let task_id_str = params
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing required field: task_id".to_string())?;
-
-    let task_id = TaskId(task_id_str.to_string());
-    let task = task_manager
-        .poll(&task_id)
-        .await
-        .ok_or_else(|| format!("Task not found: {}", task_id_str))?;
-
-    match task.status {
-        TaskStatus::Completed {
-            result,
-            finished_at,
-        } => Ok(serde_json::json!({
-            "task_id": task_id_str,
-            "status": "Completed",
-            "finished_at": finished_at.to_rfc3339(),
-            "result_summary": result.result_summary,
-            "changes_patch": result.changes_patch,
-            "files_modified": result.files_modified,
-            "iterations": result.iterations,
-            "model_used": result.model_used,
-        })),
-        TaskStatus::Failed {
-            error,
-            diagnostics,
-            finished_at,
-        } => Ok(serde_json::json!({
-            "task_id": task_id_str,
-            "status": "Failed",
-            "finished_at": finished_at.to_rfc3339(),
-            "error": error,
-            "diagnostics": diagnostics.to_json(),
-        })),
-        TaskStatus::Pending => Err(format!("Task {} is still pending", task_id_str)),
-        TaskStatus::Running { .. } => Err(format!("Task {} is still running", task_id_str)),
-    }
-}
-
+/// Run the synchronous `onboard_repo` tool and return its (non-task) result
+/// payload. This tool does not support task augmentation.
 pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
     let repo_path = params
         .get("repo_path")
@@ -221,11 +118,98 @@ pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
     }))
 }
 
+/// Map an internal [`TaskStatus`] to the MCP Tasks wire status string and an
+/// optional human-readable `statusMessage`.
+fn wire_status(status: &TaskStatus) -> (&'static str, Option<String>) {
+    match status {
+        TaskStatus::Pending => ("working", Some("Task is queued.".to_string())),
+        TaskStatus::Running { iterations, .. } => (
+            "working",
+            Some(format!("Working ({} iterations completed).", iterations)),
+        ),
+        TaskStatus::Completed { .. } => ("completed", None),
+        TaskStatus::Failed { error, .. } => ("failed", Some(error.clone())),
+        TaskStatus::Cancelled { .. } => (
+            "cancelled",
+            Some("The task was cancelled by request.".to_string()),
+        ),
+    }
+}
+
+/// Build the MCP Tasks `Task` wire object for `tasks/get`, `tasks/list`,
+/// `tasks/cancel`, and the `CreateTaskResult` body.
+pub fn task_to_wire(task: &Task) -> Value {
+    let (status, status_message) = wire_status(&task.status);
+    let mut obj = serde_json::json!({
+        "taskId": task.id.0,
+        "status": status,
+        "createdAt": task.created_at.to_rfc3339(),
+        "lastUpdatedAt": task.last_updated_at.to_rfc3339(),
+        "ttl": task.ttl_ms,
+        "pollInterval": POLL_INTERVAL_MS,
+    });
+    if let Some(msg) = status_message {
+        obj["statusMessage"] = serde_json::json!(msg);
+    }
+    obj
+}
+
+/// Build the underlying `CallToolResult` returned by `tasks/result` for a
+/// terminal task. Includes the required `io.modelcontextprotocol/related-task`
+/// metadata. For non-terminal input the caller is expected to have awaited a
+/// terminal state first; a defensive `isError` result is returned regardless.
+pub fn task_result_to_call_tool_result(task: &Task) -> Value {
+    let related = serde_json::json!({
+        "io.modelcontextprotocol/related-task": { "taskId": task.id.0 }
+    });
+    match &task.status {
+        TaskStatus::Completed { result, .. } => serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&result.to_json()).unwrap_or_default()
+            }],
+            "isError": false,
+            "_meta": related,
+        }),
+        TaskStatus::Failed {
+            error, diagnostics, ..
+        } => serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "{}\n\n{}",
+                    error,
+                    serde_json::to_string_pretty(&diagnostics.to_json()).unwrap_or_default()
+                )
+            }],
+            "isError": true,
+            "_meta": related,
+        }),
+        TaskStatus::Cancelled {
+            iterations_completed,
+            ..
+        } => serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": format!("Task was cancelled after {} iterations.", iterations_completed)
+            }],
+            "isError": true,
+            "_meta": related,
+        }),
+        TaskStatus::Pending | TaskStatus::Running { .. } => serde_json::json!({
+            "content": [{ "type": "text", "text": "Task has not reached a terminal state." }],
+            "isError": true,
+            "_meta": related,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::TaskManager;
+    use crate::task::{FailureDiagnostics, TaskManager, TaskResult};
     use async_trait::async_trait;
+    use chrono::Utc;
     use model::provider::{ModelError, ModelResult};
     use model::types::{
         ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole, ModelInfo,
@@ -284,12 +268,52 @@ mod tests {
         }
     }
 
+    fn task_with_status(status: TaskStatus) -> Task {
+        let now = Utc::now();
+        Task {
+            id: TaskId("wire-test".to_string()),
+            description: "d".to_string(),
+            repo_path: PathBuf::from("/tmp"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status,
+            created_at: now,
+            last_updated_at: now,
+            ttl_ms: Some(60000),
+        }
+    }
+
+    fn sample_result() -> TaskResult {
+        TaskResult {
+            result_summary: "did the thing".to_string(),
+            changes_patch: Some("diff".to_string()),
+            format_patch: None,
+            files_modified: vec!["a.rs".to_string()],
+            tool_calls_made: vec![],
+            iterations: 3,
+            model_used: "mock".to_string(),
+        }
+    }
+
+    fn sample_diagnostics() -> FailureDiagnostics {
+        FailureDiagnostics {
+            error_type: "MaxIterationsExceeded".to_string(),
+            iterations_completed: 5,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_assign_task_missing_description() {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let params = serde_json::json!({"repo_path": "/tmp"});
-        let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
+        let result =
+            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("description"));
     }
@@ -299,92 +323,45 @@ mod tests {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let params = serde_json::json!({"description": "Do something"});
-        let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
+        let result =
+            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("repo_path"));
     }
 
     #[tokio::test]
-    async fn test_handle_assign_task_returns_task_id() {
+    async fn test_handle_assign_task_returns_task_id_and_sets_ttl() {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
         let params = serde_json::json!({
             "description": "Test task",
             "repo_path": "/tmp"
         });
-        let result = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100).await;
-        assert!(result.is_ok());
-        let val = result.unwrap();
-        assert!(val["task_id"].is_string());
-        assert_eq!(val["status"], "Pending");
+        let task_id =
+            handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, Some(5000))
+                .await
+                .unwrap();
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.ttl_ms, Some(5000));
     }
 
     #[tokio::test]
-    async fn test_handle_poll_task_invalid_id() {
+    async fn test_handle_assign_task_clamps_ttl() {
         let manager = Arc::new(TaskManager::default());
-        let params = serde_json::json!({"task_id": "nonexistent-id"});
-        let result = handle_poll_task(&params, &manager).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_get_result_invalid_id() {
-        let manager = Arc::new(TaskManager::default());
-        let params = serde_json::json!({"task_id": "nonexistent-id"});
-        let result = handle_get_result(&params, &manager).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_poll_task_missing_task_id() {
-        let manager = Arc::new(TaskManager::default());
-        let params = serde_json::json!({});
-        let result = handle_poll_task(&params, &manager).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("task_id"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_list_tasks_empty() {
-        let manager = Arc::new(TaskManager::default());
-        let result = handle_list_tasks(&manager).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_handle_list_tasks_after_submit() {
-        let manager = Arc::new(TaskManager::default());
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
-        let params = serde_json::json!({
-            "description": "Test task",
-            "repo_path": "/tmp"
-        });
-        handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100)
-            .await
-            .unwrap();
-
-        let result = handle_list_tasks(&manager).await.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["description"], "Test task");
-    }
-
-    #[tokio::test]
-    async fn test_handle_cancel_task_missing_task_id() {
-        let manager = Arc::new(TaskManager::default());
-        let params = serde_json::json!({});
-        let result = handle_cancel_task(&params, &manager).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("task_id"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_cancel_task_nonexistent() {
-        let manager = Arc::new(TaskManager::default());
-        let params = serde_json::json!({"task_id": "nonexistent"});
-        let result = handle_cancel_task(&params, &manager).await;
-        assert!(result.is_err());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let params = serde_json::json!({"description": "t", "repo_path": "/tmp"});
+        let task_id = handle_assign_task(
+            &params,
+            &manager,
+            &provider,
+            "qwen3:0.6b",
+            100,
+            Some(u64::MAX),
+        )
+        .await
+        .unwrap();
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.ttl_ms, Some(MAX_TTL_MS));
     }
 
     #[tokio::test]
@@ -393,5 +370,110 @@ mod tests {
         let result = handle_onboard_repo(&params).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_onboard_repo_missing_path() {
+        let params = serde_json::json!({});
+        let result = handle_onboard_repo(&params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("repo_path"));
+    }
+
+    #[test]
+    fn test_task_to_wire_working_for_pending_and_running() {
+        let w = task_to_wire(&task_with_status(TaskStatus::Pending));
+        assert_eq!(w["status"], "working");
+        assert_eq!(w["taskId"], "wire-test");
+        assert_eq!(w["ttl"], 60000);
+        assert_eq!(w["pollInterval"], POLL_INTERVAL_MS);
+        assert!(w["createdAt"].is_string());
+        assert!(w["lastUpdatedAt"].is_string());
+        assert!(w["statusMessage"].is_string());
+
+        let running = task_to_wire(&task_with_status(TaskStatus::Running {
+            started_at: Utc::now(),
+            iterations: 2,
+        }));
+        assert_eq!(running["status"], "working");
+        assert!(running["statusMessage"]
+            .as_str()
+            .unwrap()
+            .contains("2 iterations"));
+    }
+
+    #[test]
+    fn test_task_to_wire_terminal_statuses() {
+        let completed = task_to_wire(&task_with_status(TaskStatus::Completed {
+            finished_at: Utc::now(),
+            result: sample_result(),
+        }));
+        assert_eq!(completed["status"], "completed");
+        assert!(completed.get("statusMessage").is_none());
+
+        let failed = task_to_wire(&task_with_status(TaskStatus::Failed {
+            finished_at: Utc::now(),
+            error: "boom".to_string(),
+            diagnostics: sample_diagnostics(),
+        }));
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["statusMessage"], "boom");
+
+        let cancelled = task_to_wire(&task_with_status(TaskStatus::Cancelled {
+            finished_at: Utc::now(),
+            iterations_completed: 1,
+        }));
+        assert_eq!(cancelled["status"], "cancelled");
+    }
+
+    #[test]
+    fn test_task_result_completed_is_not_error() {
+        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Completed {
+            finished_at: Utc::now(),
+            result: sample_result(),
+        }));
+        assert_eq!(r["isError"], false);
+        assert_eq!(
+            r["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
+            "wire-test"
+        );
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("did the thing"));
+    }
+
+    #[test]
+    fn test_task_result_failed_is_error() {
+        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Failed {
+            finished_at: Utc::now(),
+            error: "boom".to_string(),
+            diagnostics: sample_diagnostics(),
+        }));
+        assert_eq!(r["isError"], true);
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn test_task_result_cancelled_is_error() {
+        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Cancelled {
+            finished_at: Utc::now(),
+            iterations_completed: 4,
+        }));
+        assert_eq!(r["isError"], true);
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled after 4"));
+    }
+
+    #[test]
+    fn test_task_result_non_terminal_is_defensive_error() {
+        let r = task_result_to_call_tool_result(&task_with_status(TaskStatus::Pending));
+        assert_eq!(r["isError"], true);
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("terminal"));
     }
 }
