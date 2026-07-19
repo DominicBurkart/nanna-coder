@@ -6,8 +6,7 @@ use harness::container::{
 };
 use harness::entities::InMemoryEntityStore;
 use harness::entities::{EntityQuery, EntityStore, EntityType};
-use harness::mcp::handlers::{handle_assign_task, handle_get_result, handle_poll_task};
-use harness::task::TaskManager;
+use harness::task::{TaskManager, TaskStatus};
 use harness::tools::{CalculatorTool, EchoTool, Tool, ToolRegistry};
 use model::judge::{
     JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult,
@@ -1906,7 +1905,7 @@ fn init_test_git_repo(dir: &Path) {
 }
 
 #[tokio::test]
-async fn test_e2e_mcp_assign_poll_get_result_success() {
+async fn test_e2e_task_lifecycle_success() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
@@ -1915,133 +1914,106 @@ async fn test_e2e_mcp_assign_poll_get_result_success() {
         wrap_with_state_machine_responses(vec![make_stop_response("Task completed successfully")]),
     ));
 
-    let assign_params = json!({
-        "description": "Echo hello world",
-        "repo_path": repo_dir.path().to_str().unwrap(),
-        "max_iterations": 10,
-        "model": "test-model"
-    });
-    let assign_result = handle_assign_task(&assign_params, &manager, &provider, "test-model", 10)
+    let task_id = manager
+        .submit(
+            "Echo hello world".to_string(),
+            repo_dir.path().to_path_buf(),
+            "HEAD".to_string(),
+            "test-model".to_string(),
+            10,
+            Arc::clone(&provider),
+        )
+        .await;
+
+    let final_status = timeout(Duration::from_secs(10), manager.wait_terminal(&task_id))
         .await
-        .unwrap();
+        .expect("Task did not reach terminal state within timeout")
+        .expect("task should exist");
 
-    assert_eq!(assign_result["status"], "Pending");
-    let task_id = assign_result["task_id"].as_str().unwrap().to_string();
-
-    let poll_params = json!({"task_id": task_id});
-    let deadline = Duration::from_secs(10);
-    let final_status = timeout(deadline, async {
-        loop {
-            let poll = handle_poll_task(&poll_params, &manager).await.unwrap();
-            let status = poll["status"].as_str().unwrap().to_string();
-            if status != "Pending" && status != "Running" {
-                return status;
-            }
-            sleep(Duration::from_millis(100)).await;
+    match final_status {
+        TaskStatus::Completed { result, .. } => {
+            assert_eq!(result.model_used, "test-model");
+            assert!(result
+                .result_summary
+                .contains("Task completed successfully"));
         }
-    })
-    .await
-    .expect("Task did not reach terminal state within timeout");
-
-    assert_eq!(final_status, "Completed");
-
-    let get_params = json!({"task_id": task_id});
-    let result = handle_get_result(&get_params, &manager).await.unwrap();
-
-    assert_eq!(result["status"], "Completed");
-    assert_eq!(result["task_id"], task_id.as_str());
-    assert_eq!(result["model_used"], "test-model");
-    assert!(result["iterations"].is_number());
-    assert!(result["result_summary"]
-        .as_str()
-        .unwrap()
-        .contains("Task completed successfully"));
+        other => panic!("expected Completed, got {:?}", other),
+    }
 }
 
 #[tokio::test]
-async fn test_e2e_mcp_assign_poll_get_result_failure() {
+async fn test_e2e_task_lifecycle_failure() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
     let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(vec![]));
 
-    let assign_params = json!({
-        "description": "A task that will fail",
-        "repo_path": repo_dir.path().to_str().unwrap(),
-        "max_iterations": 0,
-        "model": "test-model"
-    });
-    let assign_result = handle_assign_task(&assign_params, &manager, &provider, "test-model", 0)
-        .await
-        .unwrap();
-    let task_id = assign_result["task_id"].as_str().unwrap().to_string();
+    let task_id = manager
+        .submit(
+            "A task that will fail".to_string(),
+            repo_dir.path().to_path_buf(),
+            "HEAD".to_string(),
+            "test-model".to_string(),
+            0,
+            Arc::clone(&provider),
+        )
+        .await;
 
-    let poll_params = json!({"task_id": task_id});
-    let final_status = timeout(Duration::from_secs(10), async {
-        loop {
-            let poll = handle_poll_task(&poll_params, &manager).await.unwrap();
-            let status = poll["status"].as_str().unwrap().to_string();
-            if status != "Pending" && status != "Running" {
-                return status;
-            }
-            sleep(Duration::from_millis(100)).await;
+    let final_status = timeout(Duration::from_secs(10), manager.wait_terminal(&task_id))
+        .await
+        .expect("Task did not reach terminal state within timeout")
+        .expect("task should exist");
+
+    match final_status {
+        TaskStatus::Failed {
+            error, diagnostics, ..
+        } => {
+            assert!(!error.is_empty());
+            assert!(!diagnostics.error_type.is_empty());
         }
-    })
-    .await
-    .expect("Task did not reach terminal state within timeout");
-
-    assert_eq!(final_status, "Failed");
-
-    let get_params = json!({"task_id": task_id});
-    let result = handle_get_result(&get_params, &manager).await.unwrap();
-
-    assert_eq!(result["status"], "Failed");
-    assert!(result["error"].as_str().is_some_and(|e| !e.is_empty()));
-    assert!(result["diagnostics"].is_object());
-}
-
-#[tokio::test]
-async fn test_e2e_mcp_get_result_while_pending_returns_error() {
-    let repo_dir = tempfile::TempDir::new().unwrap();
-    init_test_git_repo(repo_dir.path());
-
-    let manager = Arc::new(TaskManager::default());
-    let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
-        wrap_with_state_machine_responses(vec![make_stop_response("done")]),
-    ));
-
-    let assign_params = json!({
-        "description": "Immediate get_result test",
-        "repo_path": repo_dir.path().to_str().unwrap(),
-        "max_iterations": 10
-    });
-    let assign_result = handle_assign_task(&assign_params, &manager, &provider, "test-model", 10)
-        .await
-        .unwrap();
-    let task_id = assign_result["task_id"].as_str().unwrap().to_string();
-
-    let poll = handle_poll_task(&json!({"task_id": task_id}), &manager)
-        .await
-        .unwrap();
-    let status = poll["status"].as_str().unwrap();
-    if status == "Pending" || status == "Running" {
-        let get_result = handle_get_result(&json!({"task_id": task_id}), &manager).await;
-        assert!(
-            get_result.is_err(),
-            "get_result on a non-completed task should return Err"
-        );
-        let err = get_result.unwrap_err();
-        assert!(
-            err.contains("pending") || err.contains("running"),
-            "error should mention task state, got: {}",
-            err
-        );
+        other => panic!("expected Failed, got {:?}", other),
     }
 }
 
 #[tokio::test]
-async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
+async fn test_e2e_task_working_before_terminal_then_result() {
+    let repo_dir = tempfile::TempDir::new().unwrap();
+    init_test_git_repo(repo_dir.path());
+
+    // A single-permit manager so the task stays queued (Pending) until we
+    // observe its non-terminal state, mirroring a `tasks/get` -> "working".
+    let manager = Arc::new(TaskManager::new(0));
+    let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
+        wrap_with_state_machine_responses(vec![make_stop_response("done")]),
+    ));
+
+    let task_id = manager
+        .submit(
+            "Queued task".to_string(),
+            repo_dir.path().to_path_buf(),
+            "HEAD".to_string(),
+            "test-model".to_string(),
+            10,
+            Arc::clone(&provider),
+        )
+        .await;
+
+    // With zero permits the worker cannot run: the task is non-terminal.
+    let task = manager.poll(&task_id).await.expect("task should exist");
+    assert!(
+        !task.status.is_terminal(),
+        "task should not be terminal while queued, got {:?}",
+        task.status
+    );
+
+    // An unknown task id has no terminal state to await.
+    let unknown = harness::task::TaskId("does-not-exist".to_string());
+    assert!(manager.wait_terminal(&unknown).await.is_none());
+}
+
+#[tokio::test]
+async fn test_e2e_multiple_concurrent_tasks_complete_independently() {
     let repo_dir = tempfile::TempDir::new().unwrap();
     init_test_git_repo(repo_dir.path());
 
@@ -2053,83 +2025,50 @@ async fn test_e2e_mcp_multiple_concurrent_tasks_complete_independently() {
         wrap_with_state_machine_responses(vec![make_stop_response("Result for task B")]),
     ));
 
-    let repo_path = repo_dir.path().to_str().unwrap();
-    let assign_a = handle_assign_task(
-        &json!({"description": "Task A", "repo_path": repo_path, "max_iterations": 10}),
-        &manager,
-        &provider_a,
-        "test-model",
-        10,
-    )
-    .await
-    .unwrap();
-    let assign_b = handle_assign_task(
-        &json!({"description": "Task B", "repo_path": repo_path, "max_iterations": 10}),
-        &manager,
-        &provider_b,
-        "test-model",
-        10,
-    )
-    .await
-    .unwrap();
+    let repo_path = repo_dir.path().to_path_buf();
+    let task_id_a = manager
+        .submit(
+            "Task A".to_string(),
+            repo_path.clone(),
+            "HEAD".to_string(),
+            "test-model".to_string(),
+            10,
+            Arc::clone(&provider_a),
+        )
+        .await;
+    let task_id_b = manager
+        .submit(
+            "Task B".to_string(),
+            repo_path,
+            "HEAD".to_string(),
+            "test-model".to_string(),
+            10,
+            Arc::clone(&provider_b),
+        )
+        .await;
 
-    let task_id_a = assign_a["task_id"].as_str().unwrap().to_string();
-    let task_id_b = assign_b["task_id"].as_str().unwrap().to_string();
     assert_ne!(task_id_a, task_id_b);
 
-    let manager_a = Arc::clone(&manager);
-    let manager_b = Arc::clone(&manager);
-    let id_a = task_id_a.clone();
-    let id_b = task_id_b.clone();
-
     let (status_a, status_b) = timeout(Duration::from_secs(15), async {
-        let wait_a = async move {
-            loop {
-                let poll = handle_poll_task(&json!({"task_id": id_a}), &manager_a)
-                    .await
-                    .unwrap();
-                let s = poll["status"].as_str().unwrap().to_string();
-                if s != "Pending" && s != "Running" {
-                    return s;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        };
-        let wait_b = async move {
-            loop {
-                let poll = handle_poll_task(&json!({"task_id": id_b}), &manager_b)
-                    .await
-                    .unwrap();
-                let s = poll["status"].as_str().unwrap().to_string();
-                if s != "Pending" && s != "Running" {
-                    return s;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        };
-        tokio::join!(wait_a, wait_b)
+        tokio::join!(
+            manager.wait_terminal(&task_id_a),
+            manager.wait_terminal(&task_id_b)
+        )
     })
     .await
     .expect("Tasks did not complete within timeout");
 
-    assert_eq!(status_a, "Completed");
-    assert_eq!(status_b, "Completed");
+    let summary_a = match status_a.expect("task A exists") {
+        TaskStatus::Completed { result, .. } => result.result_summary,
+        other => panic!("expected Completed for A, got {:?}", other),
+    };
+    let summary_b = match status_b.expect("task B exists") {
+        TaskStatus::Completed { result, .. } => result.result_summary,
+        other => panic!("expected Completed for B, got {:?}", other),
+    };
 
-    let result_a = handle_get_result(&json!({"task_id": task_id_a}), &manager)
-        .await
-        .unwrap();
-    let result_b = handle_get_result(&json!({"task_id": task_id_b}), &manager)
-        .await
-        .unwrap();
-
-    assert!(result_a["result_summary"]
-        .as_str()
-        .unwrap()
-        .contains("Result for task A"));
-    assert!(result_b["result_summary"]
-        .as_str()
-        .unwrap()
-        .contains("Result for task B"));
+    assert!(summary_a.contains("Result for task A"));
+    assert!(summary_b.contains("Result for task B"));
 }
 
 // ============================================================================
