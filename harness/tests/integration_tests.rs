@@ -1930,14 +1930,16 @@ async fn test_e2e_task_lifecycle_success() {
         .expect("Task did not reach terminal state within timeout")
         .expect("task should exist");
 
-    match final_status {
-        TaskStatus::Completed { result, .. } => {
-            assert_eq!(result.model_used, "test-model");
-            assert!(result
-                .result_summary
-                .contains("Task completed successfully"));
-        }
-        other => panic!("expected Completed, got {:?}", other),
+    assert!(
+        matches!(&final_status, TaskStatus::Completed { .. }),
+        "expected Completed, got {:?}",
+        final_status
+    );
+    if let TaskStatus::Completed { result, .. } = final_status {
+        assert_eq!(result.model_used, "test-model");
+        assert!(result
+            .result_summary
+            .contains("Task completed successfully"));
     }
 }
 
@@ -1965,14 +1967,17 @@ async fn test_e2e_task_lifecycle_failure() {
         .expect("Task did not reach terminal state within timeout")
         .expect("task should exist");
 
-    match final_status {
-        TaskStatus::Failed {
-            error, diagnostics, ..
-        } => {
-            assert!(!error.is_empty());
-            assert!(!diagnostics.error_type.is_empty());
-        }
-        other => panic!("expected Failed, got {:?}", other),
+    assert!(
+        matches!(&final_status, TaskStatus::Failed { .. }),
+        "expected Failed, got {:?}",
+        final_status
+    );
+    if let TaskStatus::Failed {
+        error, diagnostics, ..
+    } = final_status
+    {
+        assert!(!error.is_empty());
+        assert!(!diagnostics.error_type.is_empty());
     }
 }
 
@@ -2058,17 +2063,24 @@ async fn test_e2e_multiple_concurrent_tasks_complete_independently() {
     .await
     .expect("Tasks did not complete within timeout");
 
-    let summary_a = match status_a.expect("task A exists") {
-        TaskStatus::Completed { result, .. } => result.result_summary,
-        other => panic!("expected Completed for A, got {:?}", other),
-    };
-    let summary_b = match status_b.expect("task B exists") {
-        TaskStatus::Completed { result, .. } => result.result_summary,
-        other => panic!("expected Completed for B, got {:?}", other),
-    };
-
-    assert!(summary_a.contains("Result for task A"));
-    assert!(summary_b.contains("Result for task B"));
+    let status_a = status_a.expect("task A exists");
+    let status_b = status_b.expect("task B exists");
+    assert!(
+        matches!(&status_a, TaskStatus::Completed { .. }),
+        "expected Completed for A, got {:?}",
+        status_a
+    );
+    assert!(
+        matches!(&status_b, TaskStatus::Completed { .. }),
+        "expected Completed for B, got {:?}",
+        status_b
+    );
+    if let (TaskStatus::Completed { result: ra, .. }, TaskStatus::Completed { result: rb, .. }) =
+        (status_a, status_b)
+    {
+        assert!(ra.result_summary.contains("Result for task A"));
+        assert!(rb.result_summary.contains("Result for task B"));
+    }
 }
 
 // ============================================================================

@@ -59,12 +59,9 @@ impl NannaMcpServer {
         });
 
         let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                break;
-            }
+        line.clear();
+        // Loop exits when read_line returns 0 (EOF); no explicit break needed.
+        while reader.read_line(&mut line).await? != 0 {
             let this = Arc::clone(&self);
             let tx = tx.clone();
             let owned = line.clone();
@@ -73,6 +70,7 @@ impl NannaMcpServer {
                     let _ = tx.send(response_bytes);
                 }
             });
+            line.clear();
         }
 
         drop(tx);
@@ -760,6 +758,37 @@ mod tests {
             ))
             .await;
         assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_tasks_result_missing_task_id_is_invalid_params() {
+        let server = make_server();
+        let resp = server
+            .handle_request(method_call(30, "tasks/result", serde_json::json!({})))
+            .await;
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_tasks_cancel_missing_task_id_is_invalid_params() {
+        let server = make_server();
+        let resp = server
+            .handle_request(method_call(31, "tasks/cancel", serde_json::json!({})))
+            .await;
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_jsonrpc_version_is_invalid_request() {
+        let server = make_server();
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".to_string(),
+            id: Some(serde_json::json!(32)),
+            method: "initialize".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req).await;
+        assert_eq!(resp.error.unwrap().code, -32600);
     }
 
     #[tokio::test]
