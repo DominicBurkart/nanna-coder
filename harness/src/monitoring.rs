@@ -1242,4 +1242,132 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_health_status_methods() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_all_levels() {
+        let manager = DefaultAlertManager::new();
+
+        let id_info = manager
+            .send_alert("Info", "Info message", AlertSeverity::Info)
+            .await
+            .unwrap();
+        let id_error = manager
+            .send_alert("Error", "Error message", AlertSeverity::Error)
+            .await
+            .unwrap();
+        let id_critical = manager
+            .send_alert("Critical", "Critical message", AlertSeverity::Critical)
+            .await
+            .unwrap();
+
+        let alerts = manager.get_active_alerts().await.unwrap();
+        assert_eq!(alerts.len(), 3);
+
+        manager.acknowledge_alert(&id_info).await.unwrap();
+        manager.acknowledge_alert(&id_error).await.unwrap();
+        manager.acknowledge_alert(&id_critical).await.unwrap();
+
+        let alerts = manager.get_active_alerts().await.unwrap();
+        assert!(alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_collector_error_and_model() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let error = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "NetworkError".to_string(),
+            message: "Connection refused".to_string(),
+            component: "ollama-client".to_string(),
+            severity: ErrorSeverity::High,
+        };
+        collector.record_error(error).await;
+
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3:0.6b".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 250.0,
+            tokens_per_second: 40.0,
+            success_rate: 0.95,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.85,
+                avg_relevance: 0.9,
+                consistency: 0.88,
+                accuracy_rate: 0.92,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 45.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("qwen3:0.6b", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
+
+        collector.reset_metrics().await;
+        let metrics_after_reset = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics_after_reset.error_metrics.total_errors, 0);
+        assert!(metrics_after_reset.model_metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_custom_format_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Custom format 'xml' not implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_start_stop() {
+        let mut system = MonitoringSystem::new();
+        let result = system.start_monitoring().await;
+        assert!(result.is_ok());
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_model_and_comprehensive() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+
+        let model_health = monitor.check_model_health("qwen3:0.6b").await.unwrap();
+        assert_eq!(model_health.status, HealthStatus::Healthy);
+        assert!(model_health.component.contains("model:"));
+
+        let results = monitor.comprehensive_health_check().await.unwrap();
+        assert!(!results.is_empty());
+    }
 }

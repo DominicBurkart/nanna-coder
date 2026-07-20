@@ -1097,4 +1097,132 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_trend_direction_variants() {
+        let directions = [
+            TrendDirection::Improving,
+            TrendDirection::Stable,
+            TrendDirection::Degrading,
+            TrendDirection::Unknown,
+        ];
+        for dir in &directions {
+            let _ = format!("{:?}", dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sla_status_variants() {
+        let statuses = [SlaStatus::Compliant, SlaStatus::AtRisk, SlaStatus::Breached];
+        for s in &statuses {
+            let _ = format!("{:?}", s);
+        }
+        assert_ne!(SlaStatus::Compliant, SlaStatus::AtRisk);
+        assert_ne!(SlaStatus::AtRisk, SlaStatus::Breached);
+    }
+
+    #[tokio::test]
+    async fn test_escalation_status_variants() {
+        let statuses = [
+            EscalationStatus::New,
+            EscalationStatus::Escalated,
+            EscalationStatus::HighlyEscalated,
+            EscalationStatus::UnderInvestigation,
+            EscalationStatus::Resolved,
+        ];
+        for s in &statuses {
+            let _ = format!("{:?}", s);
+        }
+        assert_ne!(EscalationStatus::New, EscalationStatus::Resolved);
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_variants() {
+        let categories = [
+            AlertCategory::Performance,
+            AlertCategory::Availability,
+            AlertCategory::Security,
+            AlertCategory::Resources,
+            AlertCategory::Configuration,
+            AlertCategory::ModelQuality,
+            AlertCategory::ContainerHealth,
+        ];
+        for cat in &categories {
+            let _ = format!("{:?}", cat);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_channel_type_variants() {
+        let channels = [
+            ChannelType::Email,
+            ChannelType::Slack,
+            ChannelType::Discord,
+            ChannelType::Webhook,
+            ChannelType::LogFile,
+            ChannelType::Console,
+        ];
+        for ch in &channels {
+            let _ = format!("{:?}", ch);
+        }
+        assert_ne!(ChannelType::Email, ChannelType::Slack);
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_builder_methods() {
+        let policy = AlertPolicy::immediate_critical();
+        let thresholds = HealthThreshold::default();
+        let system = ObservabilitySystem::new()
+            .with_service_name("test-svc")
+            .with_alert_policy(policy)
+            .with_health_thresholds(thresholds)
+            .with_health_check_interval(Duration::from_secs(60));
+        let _ = format!("{:?}", system.get_uptime());
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_start_stop() {
+        let mut system = ObservabilitySystem::new();
+        let result = system.start_monitoring().await;
+        assert!(result.is_ok());
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_performance_trends_degrading() {
+        let system = ObservabilitySystem::new();
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 10,
+                misses: 90,
+                hit_rate: 0.1,
+                size_bytes: 512,
+                item_count: 10,
+                evictions: 50,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 95.0,
+                total_memory_bytes: 8589934592,
+                used_memory_bytes: 8000000000,
+                memory_usage_percent: 93.0,
+                available_disk_bytes: 1073741824,
+                total_disk_bytes: 214748364800,
+                disk_usage_percent: 99.0,
+                load_average: [10.0, 12.0, 11.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 100,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.5,
+                recent_errors: Vec::new(),
+            },
+        };
+
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
+    }
 }
