@@ -333,40 +333,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_wait_result_polls_until_terminal() {
-        use crate::task::TaskId;
-        // Zero permits: the task stays `working`, so wait_result takes the
-        // poll-then-sleep path at least once before we cancel it out of band.
-        let manager = Arc::new(TaskManager::new(0));
-        let server = Arc::new(NannaMcpServer::new(
-            Arc::clone(&manager),
-            Arc::new(NoopProvider),
-            "m".to_string(),
-            10,
-        ));
-        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-        let (sr, sw) = tokio::io::split(server_side);
-        tokio::spawn(async move {
-            let _ = server.serve(tokio::io::BufReader::new(sr), sw).await;
-        });
-        let (cr, cw) = tokio::io::split(client_side);
-        let mut client = NannaMcpClient::new(tokio::io::BufReader::new(cr), cw);
-        client.initialize().await.unwrap();
-        let task_id = client
-            .submit_task(
-                serde_json::json!({ "description": "d", "repo_path": "/tmp" }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let m = Arc::clone(&manager);
-        let tid = TaskId(task_id.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let _ = m.cancel(&tid).await;
-        });
-
-        let result = client.wait_result(&task_id).await.unwrap();
-        assert_eq!(result["isError"], true);
+        // Canned responses drive wait_result deterministically through the
+        // poll-then-sleep branch: the first tasks/get is `working` (with a 1ms
+        // pollInterval), the second is `completed`, then tasks/result returns.
+        let mut client = canned_client(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"status\":\"working\",\"pollInterval\":1}}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"status\":\"completed\"}}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"isError\":false,\"content\":[]}}\n",
+        );
+        let result = client.wait_result("t").await.unwrap();
+        assert_eq!(result["isError"], false);
     }
 }
