@@ -162,9 +162,10 @@ where
             if matches!(status, "completed" | "failed" | "cancelled") {
                 return self.result(task_id).await;
             }
-            let poll_ms = task["pollInterval"]
-                .as_u64()
-                .unwrap_or(DEFAULT_POLL_INTERVAL_MS);
+            // Split into single-call statements (no multi-call chain) so
+            // rustfmt keeps each on one line and coverage tracks them reliably.
+            let advertised = task["pollInterval"].as_u64();
+            let poll_ms = advertised.unwrap_or(DEFAULT_POLL_INTERVAL_MS);
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
     }
