@@ -334,7 +334,7 @@ async fn test_prometheus_metric_no_description() {
     exporter.add_metric(MetricPoint {
         name: "nodesc".to_string(),
         metric_type: MetricType::Gauge,
-        value: 3.14,
+        value: 1.5,
         timestamp: Utc::now(),
         labels: HashMap::new(),
         unit: None,
@@ -342,7 +342,7 @@ async fn test_prometheus_metric_no_description() {
     });
     let output = exporter.export_prometheus().await.unwrap();
     assert!(!output.contains("# HELP nodesc"));
-    assert!(output.contains("nodesc 3.14"));
+    assert!(output.contains("nodesc 1.5"));
 }
 
 #[tokio::test]
