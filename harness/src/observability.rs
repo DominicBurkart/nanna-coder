@@ -1120,8 +1120,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_and_stop_monitoring() {
-        let mut system = ObservabilitySystem::new()
-            .with_health_check_interval(Duration::from_millis(500));
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_millis(500));
         system.start_monitoring().await.unwrap();
         system.stop_monitoring().await;
     }
@@ -1153,35 +1153,62 @@ mod tests {
     fn test_determine_alert_category_container() {
         let system = ObservabilitySystem::new();
         let alert = make_test_alert("container-svc", "Alert", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ContainerHealth);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
     }
 
     #[test]
     fn test_determine_alert_category_model() {
         let system = ObservabilitySystem::new();
         let alert = make_test_alert("model-inference", "Alert", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ModelQuality);
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
     }
 
     #[test]
     fn test_determine_alert_category_performance() {
         let system = ObservabilitySystem::new();
-        let alert = make_test_alert("backend", "Performance degradation detected", AlertSeverity::Warning);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Performance);
+        let alert = make_test_alert(
+            "backend",
+            "Performance degradation detected",
+            AlertSeverity::Warning,
+        );
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
     }
 
     #[test]
     fn test_determine_alert_category_resources() {
         let system = ObservabilitySystem::new();
-        let alert = make_test_alert("storage", "Resource exhaustion imminent", AlertSeverity::Error);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Resources);
+        let alert = make_test_alert(
+            "storage",
+            "Resource exhaustion imminent",
+            AlertSeverity::Error,
+        );
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
     }
 
     #[test]
     fn test_determine_alert_category_availability() {
         let system = ObservabilitySystem::new();
-        let alert = make_test_alert("api-gateway", "Service unavailable", AlertSeverity::Critical);
-        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Availability);
+        let alert = make_test_alert(
+            "api-gateway",
+            "Service unavailable",
+            AlertSeverity::Critical,
+        );
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
     }
 
     #[test]
@@ -1219,7 +1246,11 @@ mod tests {
     #[test]
     fn test_calculate_priority_score_capped_at_100() {
         let system = ObservabilitySystem::new();
-        let alert = make_test_alert("container-1", "Critical container failure", AlertSeverity::Critical);
+        let alert = make_test_alert(
+            "container-1",
+            "Critical container failure",
+            AlertSeverity::Critical,
+        );
         let score = system.calculate_priority_score(&alert, &AlertCategory::ContainerHealth);
         assert_eq!(score, 100); // 100 + 20 = 120, capped at 100
     }
@@ -1271,7 +1302,11 @@ mod tests {
         let system = ObservabilitySystem::new();
         let alerts = vec![
             make_test_alert("container-1", "Container health", AlertSeverity::Critical),
-            make_test_alert("model-inference", "Model quality degraded", AlertSeverity::Warning),
+            make_test_alert(
+                "model-inference",
+                "Model quality degraded",
+                AlertSeverity::Warning,
+            ),
             make_test_alert("backend", "Performance degradation", AlertSeverity::Error),
             make_test_alert("storage", "Resource exhaustion", AlertSeverity::Error),
             make_test_alert("api", "Service unavailable", AlertSeverity::Critical),

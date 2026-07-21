@@ -1,5 +1,7 @@
 use chrono::Utc;
-use harness::monitoring::{CacheMetrics, ErrorMetrics, LatencyMetrics, SystemMetrics, SystemResourceMetrics};
+use harness::monitoring::{
+    CacheMetrics, ErrorMetrics, LatencyMetrics, SystemMetrics, SystemResourceMetrics,
+};
 use harness::telemetry::{
     CustomEvent, ExportEndpoints, MetricPoint, MetricType, PrometheusExporter, ServiceInfo,
     SpanStatus, TelemetryConfig, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
@@ -115,7 +117,11 @@ async fn test_export_all_with_exporter_and_data() {
     let exporter = PrometheusExporter::new(None);
     let system = TelemetrySystem::new().add_exporter(Box::new(exporter));
     system.record_counter("my_counter", 5.0, vec![("env", "test")]);
-    system.record_event("deploy", "operations", serde_json::json!({"version": "1.0"}));
+    system.record_event(
+        "deploy",
+        "operations",
+        serde_json::json!({"version": "1.0"}),
+    );
     let result = system.export_all().await;
     assert!(result.is_ok());
 }

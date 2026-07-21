@@ -4,7 +4,9 @@ use harness::monitoring::{
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
     MonitoringSystem,
 };
-use harness::monitoring::{ErrorEvent, ErrorSeverity, ModelMetrics, ModelResourceUsage, QualityMetrics};
+use harness::monitoring::{
+    ErrorEvent, ErrorSeverity, ModelMetrics, ModelResourceUsage, QualityMetrics,
+};
 use std::time::Duration;
 
 #[test]
@@ -84,7 +86,10 @@ async fn test_record_error_stores_event() {
     collector.record_error(error).await;
     let metrics = collector.get_current_metrics().await.unwrap();
     assert_eq!(metrics.error_metrics.total_errors, 1);
-    assert!(metrics.error_metrics.errors_by_type.contains_key("test_error"));
+    assert!(metrics
+        .error_metrics
+        .errors_by_type
+        .contains_key("test_error"));
     assert_eq!(metrics.error_metrics.recent_errors.len(), 1);
 }
 
@@ -95,7 +100,9 @@ async fn test_record_multiple_errors_computes_rate() {
     collector
         .record_request_latency("svc", Duration::from_millis(50))
         .await;
-    collector.record_request_latency("svc", Duration::from_millis(60)).await;
+    collector
+        .record_request_latency("svc", Duration::from_millis(60))
+        .await;
     // Record errors
     for severity in [ErrorSeverity::Warning, ErrorSeverity::Critical] {
         let error = ErrorEvent {
@@ -167,7 +174,10 @@ async fn test_record_model_inference_no_gpu() {
         .record_model_inference("cpu-model", model_metrics)
         .await;
     let metrics = collector.get_current_metrics().await.unwrap();
-    assert!(metrics.model_metrics["cpu-model"].resource_usage.gpu_utilization_percent.is_none());
+    assert!(metrics.model_metrics["cpu-model"]
+        .resource_usage
+        .gpu_utilization_percent
+        .is_none());
 }
 
 #[tokio::test]
@@ -206,10 +216,7 @@ async fn test_acknowledge_unknown_alert_returns_error() {
     let manager = DefaultAlertManager::new();
     let result = manager.acknowledge_alert("nonexistent_id").await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("nonexistent_id"));
+    assert!(result.unwrap_err().to_string().contains("nonexistent_id"));
 }
 
 #[tokio::test]
