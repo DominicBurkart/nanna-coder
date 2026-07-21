@@ -363,8 +363,8 @@ async fn test_prometheus_metric_empty_labels() {
     assert!(!output.contains("nolabels{"));
 }
 
-#[test]
-fn test_trace_guard_new_and_trace_access() {
+#[tokio::test]
+async fn test_trace_guard_new_and_trace_access() {
     let system = TelemetrySystem::new();
     let trace = system.start_trace("guarded_op");
     let guard = TraceGuard::new(&system, trace);
@@ -373,8 +373,8 @@ fn test_trace_guard_new_and_trace_access() {
     // drop → finish_trace called automatically
 }
 
-#[test]
-fn test_trace_guard_record_error() {
+#[tokio::test]
+async fn test_trace_guard_record_error() {
     let system = TelemetrySystem::new();
     let trace = system.start_trace("error_op");
     let mut guard = TraceGuard::new(&system, trace);
@@ -383,8 +383,8 @@ fn test_trace_guard_record_error() {
     assert!(guard.trace().unwrap().attributes.contains_key("error"));
 }
 
-#[test]
-fn test_trace_guard_set_status() {
+#[tokio::test]
+async fn test_trace_guard_set_status() {
     let system = TelemetrySystem::new();
     let trace = system.start_trace("cancel_op");
     let mut guard = TraceGuard::new(&system, trace);
@@ -392,8 +392,8 @@ fn test_trace_guard_set_status() {
     assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
 }
 
-#[test]
-fn test_trace_guard_drop_calls_finish() {
+#[tokio::test]
+async fn test_trace_guard_drop_calls_finish() {
     let system = TelemetrySystem::new();
     let trace = system.start_trace("drop_op");
     assert_eq!(system.get_active_trace_count(), 1);
@@ -403,8 +403,8 @@ fn test_trace_guard_drop_calls_finish() {
     assert_eq!(system.get_active_trace_count(), 0);
 }
 
-#[test]
-fn test_trace_span_macro_basic() {
+#[tokio::test]
+async fn test_trace_span_macro_basic() {
     // TraceGuard must be in scope where the macro expands
     #[allow(unused_imports)]
     use harness::telemetry::TraceGuard;
@@ -412,8 +412,8 @@ fn test_trace_span_macro_basic() {
     let _guard = harness::trace_span!(&system, "macro_basic_op");
 }
 
-#[test]
-fn test_trace_span_macro_with_attributes() {
+#[tokio::test]
+async fn test_trace_span_macro_with_attributes() {
     #[allow(unused_imports)]
     use harness::telemetry::TraceGuard;
     let system = TelemetrySystem::new();
