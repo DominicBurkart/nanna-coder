@@ -147,9 +147,13 @@ where the newest commit's result is the only one that matters.
 ## Instrumentation gap
 
 The pipeline currently has no first-class build-time telemetry outside the
-GitHub Actions UI. Issue #5 tracks adding metrics collection; PR-level slice
-lives at [`ci-metrics.yml`](../../.github/workflows/ci-metrics.yml) once
-merged. See that workflow's step summary for per-job wall-time snapshots.
+GitHub Actions UI. Issue #5 tracks adding metrics collection; the
+first-slice workflow is proposed in
+[`proposed-ci-metrics-workflow.md`](proposed-ci-metrics-workflow.md)
+pending a maintainer with `workflows` permission installing it into
+`.github/workflows/ci-metrics.yml`. Once installed, per-job wall-time
+snapshots appear as the workflow's step summary and as
+`ci-metrics-<run_id>` artifacts.
 
 ## See also
 

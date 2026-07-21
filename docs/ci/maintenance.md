@@ -7,6 +7,12 @@ owner-of-last-resort, and a concrete command.
 
 ### Weekly
 
+- **Check `ci-metrics.yml` artifacts on recent `main` runs** (once the
+  workflow proposed in [`proposed-ci-metrics-workflow.md`](proposed-ci-metrics-workflow.md)
+  is installed). Per-job wall times are attached as `ci-metrics-<run_id>`
+  artifacts (90d retention). A job that has drifted over its target from
+  [`performance.md`](performance.md#wall-time-budget) is a signal to
+  investigate.
 - **Review `ci-integration.yml` cron run** (scheduled `0 6 * * 1`, Mondays
   06:00 UTC). This is the canary for CI infra drift: nix2container revisions,
   container loading, cold-cache path. Failures here rarely fail PRs but

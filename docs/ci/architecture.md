@@ -20,6 +20,7 @@ workflow, please keep this file in sync.
 | [`install-nightly.yml`](../../.github/workflows/install-nightly.yml) | Cron 06:00 UTC + manual | Full nightly install-and-smoke including multi-GB Gemma pull. |
 | [`eval.yml`](../../.github/workflows/eval.yml) | Manual (`workflow_dispatch`) | Runs the eval suite against a chosen model, optionally posts back to a PR. |
 | [`badges.yaml`](../../.github/workflows/badges.yaml) | Push to `main` | Regenerates SVG badges (LOC, contributors) committed back to the repo. |
+| [`ci-metrics.yml` (proposed)](proposed-ci-metrics-workflow.md) | `workflow_run` completion of CI/CD Pipeline + manual | Slice of #5. YAML is documented here pending install into `.github/workflows/` by a maintainer with `workflows` permission. |
 
 ## The primary pipeline (`ci.yml`)
 
