@@ -1257,7 +1257,10 @@ mod tests {
 
         let metrics = collector.get_current_metrics().await.unwrap();
         assert_eq!(metrics.error_metrics.total_errors, 1);
-        assert!(metrics.error_metrics.errors_by_type.contains_key("network_error"));
+        assert!(metrics
+            .error_metrics
+            .errors_by_type
+            .contains_key("network_error"));
     }
 
     #[tokio::test]
@@ -1281,7 +1284,9 @@ mod tests {
                 gpu_utilization_percent: None,
             },
         };
-        collector.record_model_inference("qwen3:0.6b", model_metrics).await;
+        collector
+            .record_model_inference("qwen3:0.6b", model_metrics)
+            .await;
 
         let metrics = collector.get_current_metrics().await.unwrap();
         assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));

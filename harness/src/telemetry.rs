@@ -1185,8 +1185,8 @@ mod tests {
 
     #[test]
     fn test_add_exporter() {
-        let telemetry = TelemetrySystem::new()
-            .add_exporter(Box::new(PrometheusExporter::new(None)));
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
         assert_eq!(telemetry.exporters.len(), 1);
     }
 
