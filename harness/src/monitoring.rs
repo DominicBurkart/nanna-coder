@@ -1242,4 +1242,167 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_record_error() {
+        let mut collector = DefaultMetricsCollector::new();
+        let error = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "network_error".to_string(),
+            message: "Connection refused".to_string(),
+            component: "container".to_string(),
+            severity: ErrorSeverity::Error,
+        };
+        collector.record_error(error).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.error_metrics.errors_by_type.contains_key("network_error"));
+    }
+
+    #[tokio::test]
+    async fn test_record_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3:0.6b".to_string(),
+            inference_count: 5,
+            avg_inference_time_ms: 120.0,
+            tokens_per_second: 40.0,
+            success_rate: 0.98,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.88,
+                avg_relevance: 0.92,
+                consistency: 0.85,
+                accuracy_rate: 0.9,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 256.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector.record_model_inference("qwen3:0.6b", model_metrics).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
+        assert_eq!(metrics.model_metrics["qwen3:0.6b"].inference_count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector.record_cache_hit("key1").await;
+        collector.record_cache_hit("key2").await;
+        collector.record_cache_miss("miss").await;
+
+        let before = collector.get_current_metrics().await.unwrap();
+        assert_eq!(before.cache_metrics.hits, 2);
+        assert_eq!(before.cache_metrics.misses, 1);
+
+        collector.reset_metrics().await;
+
+        let after = collector.get_current_metrics().await.unwrap();
+        assert_eq!(after.cache_metrics.hits, 0);
+        assert_eq!(after.cache_metrics.misses, 0);
+    }
+
+    #[tokio::test]
+    async fn test_custom_format_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history() {
+        let manager = DefaultAlertManager::new();
+        manager
+            .send_alert("Alert 1", "First", AlertSeverity::Info)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 2", "Second", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 3", "Third", AlertSeverity::Error)
+            .await
+            .unwrap();
+
+        let history = manager.get_alert_history(2).await.unwrap();
+        assert_eq!(history.len(), 2);
+
+        let all_history = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(all_history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 2000,
+            min_cache_hit_rate: 0.7,
+            max_error_rate: 0.1,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.85,
+            health_check_timeout: Duration::from_secs(15),
+        };
+        manager.configure_thresholds(thresholds).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_model_health() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let result = monitor.check_model_health("qwen3:0.6b").await.unwrap();
+        assert_eq!(result.status, HealthStatus::Healthy);
+        assert!(result.component.starts_with("model:"));
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_start_stop() {
+        let mut system = MonitoringSystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+    }
+
+    #[test]
+    fn test_alert_thresholds_default() {
+        let thresholds = AlertThresholds::default();
+        assert_eq!(thresholds.max_latency_ms, 5000);
+        assert_eq!(thresholds.min_cache_hit_rate, 0.8);
+        assert_eq!(thresholds.max_error_rate, 0.05);
+        assert_eq!(thresholds.max_cpu_usage, 0.9);
+        assert_eq!(thresholds.max_memory_usage, 0.9);
+    }
+
+    #[test]
+    fn test_error_severity_ordering() {
+        assert!(ErrorSeverity::Critical > ErrorSeverity::Error);
+        assert!(ErrorSeverity::Error > ErrorSeverity::Warning);
+        assert!(ErrorSeverity::Warning > ErrorSeverity::Info);
+    }
+
+    #[test]
+    fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Critical > AlertSeverity::Error);
+        assert!(AlertSeverity::Error > AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning > AlertSeverity::Info);
+    }
+
+    #[test]
+    fn test_health_status_methods() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
 }

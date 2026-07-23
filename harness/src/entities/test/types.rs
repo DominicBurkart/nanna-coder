@@ -44,3 +44,45 @@ impl Default for TestEntity {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::EntityType;
+
+    #[test]
+    fn test_new_creates_test_entity() {
+        let entity = TestEntity::new();
+        assert_eq!(entity.metadata.entity_type, EntityType::Test);
+        assert_eq!(entity.metadata.version, 1);
+        assert!(entity.metadata.tags.is_empty());
+    }
+
+    #[test]
+    fn test_default_matches_new() {
+        let entity = TestEntity::default();
+        assert_eq!(entity.metadata.entity_type, EntityType::Test);
+    }
+
+    #[test]
+    fn test_to_json_serializes_entity_type() {
+        let entity = TestEntity::new();
+        let json = entity.to_json().unwrap();
+        assert!(json.contains("\"entity_type\""));
+        assert!(json.contains("Test"));
+    }
+
+    #[test]
+    fn test_metadata_returns_reference() {
+        let entity = TestEntity::new();
+        let metadata = entity.metadata();
+        assert_eq!(metadata.entity_type, EntityType::Test);
+    }
+
+    #[test]
+    fn test_metadata_mut_allows_modification() {
+        let mut entity = TestEntity::new();
+        entity.metadata_mut().tags.push("ci".to_string());
+        assert_eq!(entity.metadata.tags, vec!["ci".to_string()]);
+    }
+}
