@@ -760,4 +760,146 @@ mod tests {
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
     }
+
+    #[test]
+    fn test_container_error_display_all_variants() {
+        let e = ContainerError::ContainerStartFailed {
+            name: "c1".to_string(),
+            reason: "out of memory".to_string(),
+        };
+        assert!(e.to_string().contains("c1"));
+        assert!(e.to_string().contains("out of memory"));
+
+        let e = ContainerError::OperationTimeout {
+            operation: "pull model".to_string(),
+            timeout: 300,
+        };
+        assert!(e.to_string().contains("300"));
+        assert!(e.to_string().contains("pull model"));
+
+        let e = ContainerError::HealthCheckFailed {
+            reason: "curl failed".to_string(),
+        };
+        assert!(e.to_string().contains("curl failed"));
+
+        let e = ContainerError::ModelPullFailed {
+            model: "qwen3".to_string(),
+            reason: "network error".to_string(),
+        };
+        assert!(e.to_string().contains("qwen3"));
+        assert!(e.to_string().contains("network error"));
+
+        let e = ContainerError::CleanupFailed {
+            name: "c2".to_string(),
+            reason: "permission denied".to_string(),
+        };
+        assert!(e.to_string().contains("c2"));
+        assert!(e.to_string().contains("permission denied"));
+
+        let e = ContainerError::CommandFailed {
+            command: "docker exec".to_string(),
+        };
+        assert!(e.to_string().contains("docker exec"));
+
+        let e = ContainerError::ImageLoadFailed {
+            path: "/tmp/img.tar".to_string(),
+            reason: "bad format".to_string(),
+        };
+        assert!(e.to_string().contains("/tmp/img.tar"));
+        assert!(e.to_string().contains("bad format"));
+    }
+
+    #[test]
+    fn test_cleanup_container_no_runtime() {
+        let handle = ContainerHandle {
+            name: "test".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        };
+        let result = cleanup_container(&handle);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_container_handle_drop_no_cleanup() {
+        // ContainerHandle with needs_cleanup=false and None runtime should drop
+        // without attempting any real container command.
+        let _handle = ContainerHandle {
+            name: "drop-test".to_string(),
+            runtime: ContainerRuntime::None,
+            port: Some(11435),
+            needs_cleanup: false,
+        };
+        // Drop happens here implicitly — just assert we reach this point.
+    }
+
+    #[test]
+    fn test_container_config_fields() {
+        let config = ContainerConfig {
+            base_image: "my-image:1.0".to_string(),
+            test_image: Some("test-image:latest".to_string()),
+            container_name: "my-container".to_string(),
+            port_mapping: Some((8080, 80)),
+            model_to_pull: Some("llama3".to_string()),
+            startup_timeout: Duration::from_secs(60),
+            health_check_timeout: Duration::from_secs(15),
+            env_vars: vec![("KEY".to_string(), "VALUE".to_string())],
+            additional_args: vec!["--gpus=all".to_string()],
+        };
+        assert_eq!(config.base_image, "my-image:1.0");
+        assert_eq!(config.test_image.as_deref(), Some("test-image:latest"));
+        assert_eq!(config.container_name, "my-container");
+        assert_eq!(config.port_mapping, Some((8080, 80)));
+        assert_eq!(config.model_to_pull.as_deref(), Some("llama3"));
+        assert_eq!(config.startup_timeout, Duration::from_secs(60));
+        assert_eq!(config.env_vars, vec![("KEY".to_string(), "VALUE".to_string())]);
+        assert_eq!(config.additional_args, vec!["--gpus=all".to_string()]);
+    }
+
+    #[test]
+    fn test_shared_model_pool_new_and_ref_count() {
+        let config = ContainerConfig::default();
+        let pool = SharedModelPool::new(config);
+        assert_eq!(pool.ref_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_no_runtime() {
+        let handle = ContainerHandle {
+            name: "hc-test".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        };
+        let result = health_check_container(
+            &handle,
+            "http://localhost/health",
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(result, Err(ContainerError::HealthCheckFailed { .. })));
+    }
+
+    #[test]
+    fn test_start_container_with_fallback_no_runtime() {
+        // When no container runtime is detected, start_container_with_fallback
+        // returns NoRuntimeAvailable. We can only test this deterministically
+        // on this machine if no runtime is present; otherwise we just confirm
+        // the function exists and is callable.
+        let config = ContainerConfig {
+            startup_timeout: Duration::from_millis(0),
+            ..ContainerConfig::default()
+        };
+        // Build the runtime to check; if runtime is None we can assert the error.
+        let rt = detect_runtime();
+        if rt == ContainerRuntime::None {
+            let result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(start_container_with_fallback(&config));
+            assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
+        }
+        // If a runtime IS present we skip the assertion to avoid starting a
+        // real container in unit tests.
+    }
 }
