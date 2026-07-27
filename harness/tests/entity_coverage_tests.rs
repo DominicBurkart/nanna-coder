@@ -2,7 +2,7 @@
 //!
 //! Coverage target: harness/src/entities/test/types.rs (TestEntity).
 
-use harness::entities::{Entity, EntityType, InMemoryEntityStore, EntityStore};
+use harness::entities::{Entity, EntityStore, EntityType, InMemoryEntityStore};
 
 #[test]
 fn test_entity_new_has_test_type() {
@@ -37,9 +37,10 @@ fn test_entity_metadata_mut() {
 fn test_entity_to_json_is_valid() {
     use harness::entities::test::TestEntity;
     let entity = TestEntity::new();
-    let json = entity.to_json().expect("TestEntity should serialize to JSON");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&json).expect("JSON should parse back");
+    let json = entity
+        .to_json()
+        .expect("TestEntity should serialize to JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON should parse back");
     assert_eq!(parsed["entity_type"], "Test");
 }
 
