@@ -250,24 +250,15 @@ mod tests {
             FileType::from_path(Path::new("src/app.py")),
             FileType::Python
         );
-        assert_eq!(
-            FileType::from_path(Path::new("cmd/main.go")),
-            FileType::Go
-        );
-        assert_eq!(
-            FileType::from_path(Path::new("App.java")),
-            FileType::Java
-        );
+        assert_eq!(FileType::from_path(Path::new("cmd/main.go")), FileType::Go);
+        assert_eq!(FileType::from_path(Path::new("App.java")), FileType::Java);
 
         // JSON / YAML
         assert_eq!(
             FileType::from_path(Path::new("config.json")),
             FileType::Json
         );
-        assert_eq!(
-            FileType::from_path(Path::new("ci.yaml")),
-            FileType::Yaml
-        );
+        assert_eq!(FileType::from_path(Path::new("ci.yaml")), FileType::Yaml);
         assert_eq!(
             FileType::from_path(Path::new("docker-compose.yml")),
             FileType::Yaml
@@ -321,7 +312,11 @@ mod tests {
         ] {
             let entity = make_file_entity(ft.clone());
             assert!(entity.is_config(), "{:?} should be config", ft);
-            assert!(!entity.is_source_code(), "{:?} should not be source code", ft);
+            assert!(
+                !entity.is_source_code(),
+                "{:?} should not be source code",
+                ft
+            );
         }
     }
 
@@ -333,7 +328,11 @@ mod tests {
             FileType::Other("bin".to_string()),
         ] {
             let entity = make_file_entity(ft.clone());
-            assert!(!entity.is_source_code(), "{:?} should not be source code", ft);
+            assert!(
+                !entity.is_source_code(),
+                "{:?} should not be source code",
+                ft
+            );
             assert!(!entity.is_config(), "{:?} should not be config", ft);
         }
     }
