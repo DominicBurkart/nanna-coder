@@ -2484,6 +2484,42 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_no_git_suffix() {
+        let result = parse_github_remote("git@github.com:owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_with_git_suffix() {
+        let result = parse_github_remote("https://github.com/owner/repo.git");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_without_git_suffix() {
+        let result = parse_github_remote("https://github.com/owner/repo");
+        assert_eq!(result, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_github_remote_non_github_url_returns_none() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_github_remote_empty_string_returns_none() {
+        let result = parse_github_remote("");
+        assert_eq!(result, None);
+    }
 }
 
 #[cfg(kani)]
