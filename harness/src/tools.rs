@@ -1963,9 +1963,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("nanna_test_read_notfound");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let tool = ReadFileTool::new(temp_dir.clone());
-        let result = tool
-            .execute(json!({ "path": "does_not_exist.txt" }))
-            .await;
+        let result = tool.execute(json!({ "path": "does_not_exist.txt" })).await;
         assert!(result.is_err());
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
