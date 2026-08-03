@@ -1146,4 +1146,65 @@ mod tests {
         let provider = OllamaProvider::new(config).unwrap();
         assert_eq!(provider.base_url, "http://localhost:11434");
     }
+
+    #[test]
+    fn test_calculate_variance_empty() {
+        assert_eq!(calculate_variance(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_variance_single() {
+        assert_eq!(calculate_variance(&[42.0]), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_variance_identical_values() {
+        let result = calculate_variance(&[5.0, 5.0, 5.0, 5.0]);
+        assert!((result - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_calculate_variance_known_values() {
+        // [2, 4, 4, 4, 5, 5, 7, 9] → mean=5, variance=4.0
+        let values = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let result = calculate_variance(&values);
+        assert!((result - 4.0).abs() < 1e-10, "expected 4.0 got {result}");
+    }
+
+    #[test]
+    fn test_calculate_variance_two_values() {
+        // [0, 10] → mean=5, variance=25
+        let result = calculate_variance(&[0.0, 10.0]);
+        assert!((result - 25.0).abs() < 1e-10, "expected 25.0 got {result}");
+    }
+
+    #[test]
+    fn test_parse_response_missing_usage_tokens() {
+        let raw = OllamaChatRawResponse {
+            message: OllamaRawMessage {
+                role: "assistant".to_string(),
+                content: "response".to_string(),
+                tool_calls: None,
+            },
+            done: true,
+            prompt_eval_count: None,
+            eval_count: None,
+        };
+        let response = OllamaProvider::parse_raw_response(raw).unwrap();
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn test_messages_to_json_tool_response_null_content() {
+        let msg = ChatMessage::tool_response("call_abc", "");
+        let json = OllamaProvider::messages_to_json(&[msg]);
+        assert_eq!(json[0]["role"], "tool");
+        assert_eq!(json[0]["tool_call_id"], "call_abc");
+    }
+
+    #[test]
+    fn test_tools_to_json_empty_list() {
+        let json = OllamaProvider::tools_to_json(&[]);
+        assert!(json.is_empty());
+    }
 }

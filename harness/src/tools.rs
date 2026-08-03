@@ -1907,6 +1907,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"operation": "subtract", "a": 10.0, "b": 3.0}))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"operation": "multiply", "a": 4.0, "b": 5.0}))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_divide() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"operation": "divide", "a": 10.0, "b": 2.0}))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"operation": "modulo", "a": 10.0, "b": 3.0}))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("Unknown operation"));
+            }
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_parameter() {
+        let tool = CalculatorTool::new();
+        let result = tool.execute(json!({"a": 5.0, "b": 3.0})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_not_found() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_read_notfound");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = ReadFileTool::new(temp_dir.clone());
+        let result = tool
+            .execute(json!({ "path": "does_not_exist.txt" }))
+            .await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_file_path_security() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_security");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let tool = WriteFileTool::new(temp_dir.clone());
+        let result = tool
+            .execute(json!({ "path": "../../etc/cron.d/evil", "content": "bad" }))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::PathSecurityViolation { .. }) => {}
+            _ => panic!("Expected PathSecurityViolation"),
+        }
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("nonexistent", json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_tool_registry() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool::new()));
