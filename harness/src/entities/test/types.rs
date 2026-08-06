@@ -65,7 +65,10 @@ mod tests {
         let from_new = TestEntity::new();
         let from_default = TestEntity::default();
         // Both must be Test entities (we can't compare ids, which are unique UUIDs).
-        assert_eq!(from_new.metadata().entity_type, from_default.metadata().entity_type);
+        assert_eq!(
+            from_new.metadata().entity_type,
+            from_default.metadata().entity_type
+        );
     }
 
     #[test]
@@ -95,8 +98,8 @@ mod tests {
     fn json_round_trip_preserves_entity_type() {
         let entity = TestEntity::new();
         let json = entity.to_json().unwrap();
-        let deserialized: TestEntity = serde_json::from_str(&json)
-            .expect("TestEntity JSON must deserialize back");
+        let deserialized: TestEntity =
+            serde_json::from_str(&json).expect("TestEntity JSON must deserialize back");
         assert_eq!(deserialized.metadata().entity_type, EntityType::Test);
     }
 
