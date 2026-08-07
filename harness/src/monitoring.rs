@@ -1374,7 +1374,7 @@ mod tests {
         assert!(ErrorSeverity::Warning < ErrorSeverity::Error);
         assert!(ErrorSeverity::Error < ErrorSeverity::Critical);
         assert!(ErrorSeverity::Info < ErrorSeverity::Critical);
-        assert!(!(ErrorSeverity::Critical < ErrorSeverity::Info));
+        assert!(ErrorSeverity::Critical >= ErrorSeverity::Info);
     }
 
     #[test]
