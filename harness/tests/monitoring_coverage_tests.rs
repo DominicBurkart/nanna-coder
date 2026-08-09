@@ -149,9 +149,15 @@ async fn test_reset_metrics_clears_all_data() {
     collector.reset_metrics().await;
 
     let after = collector.get_current_metrics().await.unwrap();
-    assert!(after.request_latencies.is_empty(), "latencies should be cleared");
+    assert!(
+        after.request_latencies.is_empty(),
+        "latencies should be cleared"
+    );
     assert_eq!(after.cache_metrics.hits, 0, "cache hits should reset to 0");
-    assert_eq!(after.cache_metrics.misses, 0, "cache misses should reset to 0");
+    assert_eq!(
+        after.cache_metrics.misses, 0,
+        "cache misses should reset to 0"
+    );
     assert!(
         (after.cache_metrics.hit_rate - 0.0).abs() < 1e-9,
         "hit_rate should reset to 0.0"
@@ -244,11 +250,26 @@ async fn test_custom_format_export_returns_error() {
 
 #[test]
 fn test_health_status_is_healthy() {
-    assert!(HealthStatus::Healthy.is_healthy(), "Healthy should be is_healthy()");
-    assert!(!HealthStatus::Warning.is_healthy(), "Warning should NOT be is_healthy()");
-    assert!(!HealthStatus::Degraded.is_healthy(), "Degraded should NOT be is_healthy()");
-    assert!(!HealthStatus::Unhealthy.is_healthy(), "Unhealthy should NOT be is_healthy()");
-    assert!(!HealthStatus::Unknown.is_healthy(), "Unknown should NOT be is_healthy()");
+    assert!(
+        HealthStatus::Healthy.is_healthy(),
+        "Healthy should be is_healthy()"
+    );
+    assert!(
+        !HealthStatus::Warning.is_healthy(),
+        "Warning should NOT be is_healthy()"
+    );
+    assert!(
+        !HealthStatus::Degraded.is_healthy(),
+        "Degraded should NOT be is_healthy()"
+    );
+    assert!(
+        !HealthStatus::Unhealthy.is_healthy(),
+        "Unhealthy should NOT be is_healthy()"
+    );
+    assert!(
+        !HealthStatus::Unknown.is_healthy(),
+        "Unknown should NOT be is_healthy()"
+    );
 }
 
 #[test]
@@ -390,11 +411,21 @@ async fn test_alert_history_and_active_alerts() {
     let history_2 = manager.get_alert_history(2).await.expect("get history 2");
     assert_eq!(history_2.len(), 2, "limit=2 should return exactly 2 alerts");
 
-    let history_all = manager.get_alert_history(100).await.expect("get full history");
-    assert_eq!(history_all.len(), 3, "full history should contain all 3 alerts");
+    let history_all = manager
+        .get_alert_history(100)
+        .await
+        .expect("get full history");
+    assert_eq!(
+        history_all.len(),
+        3,
+        "full history should contain all 3 alerts"
+    );
 
     // Active alerts exclude the acknowledged one
-    let active = manager.get_active_alerts().await.expect("get active alerts");
+    let active = manager
+        .get_active_alerts()
+        .await
+        .expect("get active alerts");
     assert_eq!(
         active.len(),
         2,
