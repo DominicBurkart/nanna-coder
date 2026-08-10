@@ -1329,10 +1329,7 @@ mod tests {
 
         let metrics = collector.get_current_metrics().await.unwrap();
         assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
-        assert_eq!(
-            metrics.model_metrics["qwen3:0.6b"].inference_count,
-            10
-        );
+        assert_eq!(metrics.model_metrics["qwen3:0.6b"].inference_count, 10);
     }
 
     #[tokio::test]
