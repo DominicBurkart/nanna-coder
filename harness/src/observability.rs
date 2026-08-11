@@ -1097,4 +1097,72 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_with_alert_policy_builder() {
+        let policy = AlertPolicy::immediate_critical();
+        let expected_rules_count = policy.escalation_rules.len();
+        let system = ObservabilitySystem::new().with_alert_policy(policy);
+        assert_eq!(system.alert_policy.escalation_rules.len(), expected_rules_count);
+    }
+
+    #[tokio::test]
+    async fn test_with_health_thresholds_builder() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 95.0,
+            memory_threshold: 95.0,
+            disk_threshold: 95.0,
+            max_latency_ms: 5000,
+            min_cache_hit_rate: 0.5,
+            max_error_rate: 0.1,
+            container_timeout: Duration::from_secs(60),
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        assert_eq!(system.health_thresholds.cpu_threshold, 95.0);
+        assert_eq!(system.health_thresholds.max_latency_ms, 5000);
+        assert_eq!(system.health_thresholds.min_cache_hit_rate, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_default() {
+        let system = ObservabilitySystem::default();
+        assert_eq!(system.service_name, "nanna-coder");
+        assert!(system.get_uptime() < Duration::from_secs(5));
+        assert!(system.monitoring_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trend_direction_variants() {
+        assert_eq!(TrendDirection::Improving, TrendDirection::Improving);
+        assert_eq!(TrendDirection::Stable, TrendDirection::Stable);
+        assert_eq!(TrendDirection::Degrading, TrendDirection::Degrading);
+        assert_eq!(TrendDirection::Unknown, TrendDirection::Unknown);
+        assert_ne!(TrendDirection::Improving, TrendDirection::Degrading);
+        assert_ne!(TrendDirection::Unknown, TrendDirection::Stable);
+
+        // Verify they can appear in PerformanceTrends
+        let trends = PerformanceTrends {
+            latency_trend: TrendDirection::Improving,
+            throughput_trend: TrendDirection::Unknown,
+            error_rate_trend: TrendDirection::Stable,
+            resource_usage_trend: TrendDirection::Degrading,
+            cache_performance_trend: TrendDirection::Improving,
+            performance_score: 85.0,
+        };
+        assert_eq!(trends.latency_trend, TrendDirection::Improving);
+        assert_eq!(trends.throughput_trend, TrendDirection::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = ObservabilitySystem::new()
+            // Long interval so the background task never actually fires
+            .with_health_check_interval(Duration::from_secs(3600));
+
+        system.start_monitoring().await.unwrap();
+        assert!(system.monitoring_task.is_some());
+
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }

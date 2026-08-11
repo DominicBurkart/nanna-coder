@@ -1242,4 +1242,186 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_health_status_methods() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+    }
+
+    #[tokio::test]
+    async fn test_record_error() {
+        let mut collector = DefaultMetricsCollector::new();
+        let event = ErrorEvent {
+            timestamp: chrono::Utc::now(),
+            error_type: "NetworkError".to_string(),
+            message: "Connection refused".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Error,
+        };
+        collector.record_error(event).await;
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics
+            .error_metrics
+            .errors_by_type
+            .contains_key("NetworkError"));
+    }
+
+    #[tokio::test]
+    async fn test_record_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3:0.6b".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 150.0,
+            tokens_per_second: 25.0,
+            success_rate: 0.99,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.88,
+                accuracy_rate: 0.92,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("qwen3:0.6b", model_metrics)
+            .await;
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history() {
+        let manager = DefaultAlertManager::new();
+        manager
+            .send_alert("Alert 1", "desc1", AlertSeverity::Info)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 2", "desc2", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 3", "desc3", AlertSeverity::Critical)
+            .await
+            .unwrap();
+
+        let history = manager.get_alert_history(2).await.unwrap();
+        assert_eq!(history.len(), 2);
+        // History is reversed, so most recent first
+        assert_eq!(history[0].title, "Alert 3");
+        assert_eq!(history[1].title, "Alert 2");
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.8,
+            health_check_timeout: Duration::from_secs(15),
+        };
+        manager.configure_thresholds(thresholds).await.unwrap();
+        // If we reach here, thresholds were configured successfully
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("test", Duration::from_millis(100))
+            .await;
+        collector.record_cache_hit("key").await;
+
+        let metrics_before = collector.get_current_metrics().await.unwrap();
+        assert!(!metrics_before.request_latencies.is_empty());
+
+        collector.reset_metrics().await;
+
+        let metrics_after = collector.get_current_metrics().await.unwrap();
+        assert!(metrics_after.request_latencies.is_empty());
+        assert_eq!(metrics_after.cache_metrics.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_error_display() {
+        let err = MonitoringError::MetricsCollectionFailed {
+            reason: "test reason".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("test reason"));
+
+        let err2 = MonitoringError::HealthCheckFailed {
+            component: "mycomp".to_string(),
+            reason: "check failed".to_string(),
+        };
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("mycomp"));
+        assert!(msg2.contains("check failed"));
+
+        let err3 = MonitoringError::AlertSendFailed {
+            reason: "no channel".to_string(),
+        };
+        assert!(err3.to_string().contains("no channel"));
+
+        let err4 = MonitoringError::ContainerMonitoringFailed {
+            reason: "docker down".to_string(),
+        };
+        assert!(err4.to_string().contains("docker down"));
+
+        let err5 = MonitoringError::SystemMonitoringFailed {
+            reason: "resource unavailable".to_string(),
+        };
+        assert!(err5.to_string().contains("resource unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_alert_thresholds_default() {
+        let thresholds = AlertThresholds::default();
+        assert_eq!(thresholds.max_latency_ms, 5000);
+        assert!(thresholds.min_cache_hit_rate > 0.0);
+        assert!(thresholds.max_error_rate > 0.0);
+        assert!(thresholds.max_cpu_usage > 0.0);
+        assert!(thresholds.max_memory_usage > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_format_custom_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("my_format".to_string()))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(MonitoringError::MetricsCollectionFailed { reason }) => {
+                assert!(reason.contains("my_format"));
+            }
+            _ => panic!("Expected MetricsCollectionFailed error"),
+        }
+    }
 }
