@@ -1103,7 +1103,10 @@ mod tests {
         let policy = AlertPolicy::immediate_critical();
         let expected_rules_count = policy.escalation_rules.len();
         let system = ObservabilitySystem::new().with_alert_policy(policy);
-        assert_eq!(system.alert_policy.escalation_rules.len(), expected_rules_count);
+        assert_eq!(
+            system.alert_policy.escalation_rules.len(),
+            expected_rules_count
+        );
     }
 
     #[tokio::test]
