@@ -1097,4 +1097,49 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    // ── Default impl ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn observability_system_default_creates_valid_system() {
+        let system = ObservabilitySystem::default();
+        assert!(system.get_uptime() < Duration::from_secs(1));
+    }
+
+    // ── Builder methods ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn observability_system_with_alert_policy_and_health_thresholds() {
+        let policy = AlertPolicy::immediate_critical();
+        let thresholds = HealthThreshold {
+            cpu_threshold: 70.0,
+            ..HealthThreshold::default()
+        };
+        // Verify builder chain compiles and doesn't panic
+        let _system = ObservabilitySystem::new()
+            .with_alert_policy(policy)
+            .with_health_thresholds(thresholds);
+    }
+
+    // ── get_uptime ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn observability_system_get_uptime_returns_elapsed() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime < Duration::from_secs(1));
+    }
+
+    // ── start_monitoring / stop_monitoring ────────────────────────────────────
+
+    #[tokio::test]
+    async fn observability_system_start_and_stop_monitoring() {
+        // Use a very long interval so the background task doesn't actually fire
+        let mut system = ObservabilitySystem::new()
+            .with_health_check_interval(Duration::from_secs(3600));
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+        // A second stop is a no-op and must not panic
+        system.stop_monitoring().await;
+    }
 }
