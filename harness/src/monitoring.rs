@@ -1320,11 +1320,7 @@ mod tests {
         // Insert 5 alerts
         for i in 0..5 {
             manager
-                .send_alert(
-                    &format!("Alert {}", i),
-                    "desc",
-                    AlertSeverity::Info,
-                )
+                .send_alert(&format!("Alert {}", i), "desc", AlertSeverity::Info)
                 .await
                 .unwrap();
         }
@@ -1369,10 +1365,7 @@ mod tests {
             AlertSeverity::Error,
             AlertSeverity::Critical,
         ] {
-            manager
-                .send_alert("title", "desc", severity)
-                .await
-                .unwrap();
+            manager.send_alert("title", "desc", severity).await.unwrap();
         }
         let active = manager.get_active_alerts().await.unwrap();
         assert_eq!(active.len(), 4);
