@@ -11,6 +11,7 @@
 , binaryCacheUtils
 , devUtils
 , cacheUtils
+, buildScripts
 , vllmImage
 , vllmImageMimo
 , vllmImageQwen
@@ -19,12 +20,18 @@
 {
   default = flake-utils.lib.mkApp {
     drv = harness;
-    exePath = "/bin/harness";
+    exePath = "/bin/nanna";
   };
 
+  nanna = flake-utils.lib.mkApp {
+    drv = harness;
+    exePath = "/bin/nanna";
+  };
+
+  # Backwards-compat alias during the harness → nanna grace period.
   harness = flake-utils.lib.mkApp {
     drv = harness;
-    exePath = "/bin/harness";
+    exePath = "/bin/nanna";
   };
 
   # CI/CD utilities
@@ -56,6 +63,16 @@
   # Cache management
   cache-info = flake-utils.lib.mkApp {
     drv = cacheUtils.cache-info;
+  };
+
+  # Pod management apps — start-pod is called at runtime by harness/src/pod.rs
+  # via `nix run .#start-pod` when Ollama is not yet reachable.
+  start-pod = flake-utils.lib.mkApp {
+    drv = buildScripts.start-pod;
+  };
+
+  stop-pod = flake-utils.lib.mkApp {
+    drv = buildScripts.stop-pod;
   };
 
   # vLLM container management
