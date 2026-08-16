@@ -31,7 +31,7 @@ let
     };
 
     config = {
-      Cmd = [ "${harness}/bin/harness" ];
+      Cmd = [ "${harness}/bin/nanna" ];
       Env = [
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "RUST_LOG=info"
@@ -109,6 +109,7 @@ let
     config = {
       Cmd = [ "${pkgs.ollama}/bin/ollama" "serve" ];
       Env = [
+        "HOME=/root"
         "OLLAMA_HOST=0.0.0.0"
         "OLLAMA_PORT=11434"
         "PATH=/bin"

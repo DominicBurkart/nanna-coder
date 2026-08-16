@@ -13,7 +13,7 @@ use tracing::{error, info};
 // will introduce `PersistentEntityStore` and swap the binding here.
 
 #[derive(Parser)]
-#[command(name = "harness")]
+#[command(name = "nanna")]
 #[command(about = "A CLI tool for interacting with language models")]
 struct Cli {
     #[command(subcommand)]
@@ -36,13 +36,20 @@ enum Commands {
         /// Temperature setting (0.0 to 2.0)
         #[arg(long, default_value = "0.7")]
         temperature: f32,
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
     },
     /// List available models
     Models,
     /// List available tools
     Tools,
     /// Health check
-    Health,
+    Health {
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
+    },
     /// Run the autonomous agent with a prompt
     Agent {
         /// The prompt for the agent
@@ -60,6 +67,20 @@ enum Commands {
         /// Enable tool calling
         #[arg(short, long)]
         tools: bool,
+        /// Workspace root the agent operates against. Defaults to cwd.
+        #[arg(long)]
+        work_dir: Option<std::path::PathBuf>,
+        /// Write the structured AgentRunReport JSON here. When set, the
+        /// human-readable summary is suppressed and the eval-shape JSON is
+        /// the sole output artifact.
+        #[arg(long)]
+        output_json: Option<std::path::PathBuf>,
+        /// Override the Ollama endpoint (default http://localhost:11434).
+        #[arg(long)]
+        ollama_url: Option<String>,
+        /// Skip the on-startup pod-ensure check
+        #[arg(long)]
+        no_ensure_pod: bool,
     },
     /// Run as an MCP server over stdio
     McpServe {
@@ -69,6 +90,46 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
+    },
+    /// Delegate a coding task through the MCP Tasks protocol.
+    ///
+    /// Drives an in-process MCP server as a Tasks client: submits an
+    /// `assign_task` tool call augmented with a `task`, polls `tasks/get` to
+    /// completion, and prints the `tasks/result` payload. This exercises the
+    /// same wire protocol external orchestrators use.
+    Delegate {
+        /// Description of the coding task to perform
+        #[arg(short, long)]
+        description: String,
+        /// Absolute path to the git repository
+        #[arg(short, long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base the worktree on
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+        /// The model to use
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Requested task lifetime in milliseconds
+        #[arg(long)]
+        ttl_ms: Option<u64>,
+    },
+    /// Generate a SWE-bench report from JSON results
+    SweBenchReport {
+        /// Path to the JSON results file
+        #[arg(short, long)]
+        input: std::path::PathBuf,
+        /// Output base directory. The final report is written under
+        /// `<output_dir>/<sha>/<bench>/<scenario>/report.md`. Defaults to
+        /// `<current_working_directory>/results`.
+        #[arg(short, long)]
+        output_dir: Option<std::path::PathBuf>,
+        /// Optional second JSON file for comparison report
+        #[arg(long)]
+        compare: Option<std::path::PathBuf>,
     },
 }
 
@@ -80,19 +141,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let config = OllamaConfig::default();
-    let provider = OllamaProvider::new(config)?;
-
-    let workspace_root = std::env::current_dir()?;
-    let tool_registry = create_tool_registry(&workspace_root);
-
     match cli.command {
         Commands::Chat {
             model,
             prompt,
             tools,
             temperature,
+            no_ensure_pod,
         } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let workspace_root = std::env::current_dir()?;
+            let tool_registry = create_tool_registry(&workspace_root);
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -118,12 +178,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             list_models(&provider).await?;
         }
         Commands::Tools => {
+            let workspace_root = std::env::current_dir()?;
+            let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
         }
-        Commands::Health => {
+        Commands::Health { no_ensure_pod } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let provider = OllamaProvider::new(OllamaConfig::default())?;
             health_check(&provider).await?;
         }
         Commands::Agent {
@@ -132,7 +197,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             verbose,
             tools,
+            work_dir,
+            output_json,
+            ollama_url,
+            no_ensure_pod,
         } => {
+            ensure_pod_or_exit(no_ensure_pod).await;
+            let workspace_root = match work_dir {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
             run_agent(
                 &prompt,
                 &model,
@@ -140,6 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
                 tools,
                 &workspace_root,
+                output_json.as_deref(),
+                ollama_url.as_deref(),
             )
             .await?;
         }
@@ -149,9 +225,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_mcp_server(&model, max_iterations).await?;
         }
+        Commands::Delegate {
+            description,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            ttl_ms,
+        } => {
+            run_delegate(
+                &description,
+                &repo_path,
+                &branch,
+                &model,
+                max_iterations,
+                ttl_ms,
+            )
+            .await?;
+        }
+        Commands::SweBenchReport {
+            input,
+            output_dir,
+            compare,
+        } => {
+            let (report_path, comparison_path) =
+                generate_swebench_report(&input, output_dir.as_deref(), compare.as_deref())?;
+            println!("Report written to: {}", report_path.display());
+            if let Some(p) = comparison_path {
+                println!("Comparison report written to: {}", p.display());
+            }
+        }
     }
 
     Ok(())
+}
+
+fn generate_swebench_report(
+    input: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+    compare: Option<&std::path::Path>,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), Box<dyn std::error::Error>> {
+    use harness::eval::swebench_report::SweBenchReport;
+    use harness::eval::swebench_results::SweBenchRunResult;
+
+    let json = std::fs::read_to_string(input)?;
+    let run_result: SweBenchRunResult = serde_json::from_str(&json)?;
+
+    let owned_default;
+    let base_dir: &std::path::Path = match output_dir {
+        Some(p) => p,
+        None => {
+            owned_default = std::env::current_dir()?.join("results");
+            owned_default.as_path()
+        }
+    };
+
+    let report = SweBenchReport::new("SWE-bench Report", run_result);
+    let report_path = report.write_to_directory(base_dir)?;
+
+    let comparison_path = if let Some(compare_path) = compare {
+        let compare_json = std::fs::read_to_string(compare_path)?;
+        let compare_result: SweBenchRunResult = serde_json::from_str(&compare_json)?;
+        Some(report.write_comparison_to_directory(&compare_result, base_dir)?)
+    } else {
+        None
+    };
+
+    Ok((report_path, comparison_path))
 }
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
@@ -495,6 +635,26 @@ fn build_session_system_prompt(workspace_root: &std::path::Path) -> String {
     }
 }
 
+/// Run `pod::ensure_running`; on failure, print to stderr and exit with
+/// code 3 so the eval-side caller (or a CI step) can distinguish pod
+/// bring-up failures from agent-loop failures.
+///
+/// `async` to match `pod::ensure_running` — the probe and post-bring-up
+/// health wait both run on the Tokio executor. The previous sync wrapper
+/// used `std::thread::sleep` inside `wait_for_ollama` and stalled the
+/// runtime for up to 60s.
+async fn ensure_pod_or_exit(no_ensure_pod_flag: bool) {
+    let cfg = harness::pod::EnsureConfig::from_env_and_flag(no_ensure_pod_flag);
+    match harness::pod::ensure_running(&cfg).await {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("nanna: pod ensure failed: {e}");
+            std::process::exit(3);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_agent(
     prompt: &str,
     model: &str,
@@ -502,11 +662,16 @@ async fn run_agent(
     verbose: bool,
     tools: bool,
     workspace_root: &std::path::Path,
+    output_json: Option<&std::path::Path>,
+    ollama_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::agent::{AgentConfig, AgentContext, AgentLoop};
+    use harness::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunReport};
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
+    let mut config = OllamaConfig::default();
+    if let Some(url) = ollama_url {
+        config = config.with_base_url(url.to_string());
+    }
     let provider = Arc::new(OllamaProvider::new(config)?);
     let entity_store = initialize_workspace(workspace_root).await;
 
@@ -517,17 +682,20 @@ async fn run_agent(
         model_name: model.to_string(),
     };
 
+    // Match the eval-runner shape: prompt enters via `user_prompt`, not via
+    // pre-seeded `conversation_history`. `run_tool_loop` builds the user
+    // message from `user_prompt` itself.
     let context = AgentContext {
         user_prompt: prompt.to_string(),
-        conversation_history: vec![ChatMessage::user(prompt)],
+        conversation_history: vec![],
         app_state_id: "cli".to_string(),
     };
 
     if verbose {
-        println!("Starting agent with model: {}", model);
-        println!("Prompt: {}", prompt);
-        println!("Max iterations: {}", max_iterations);
-        println!("Tools enabled: {}", tools);
+        eprintln!("Starting agent with model: {}", model);
+        eprintln!("Prompt: {}", prompt);
+        eprintln!("Max iterations: {}", max_iterations);
+        eprintln!("Tools enabled: {}", tools);
     }
 
     let mut agent = if tools {
@@ -537,7 +705,19 @@ async fn run_agent(
         AgentLoop::with_llm(agent_config, entity_store, provider)
     };
 
-    let result = agent.run(context).await?;
+    let result = match agent.run_tool_loop(context).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("nanna: agent error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if let Some(path) = output_json {
+        let report = AgentRunReport::from(&result);
+        report.write_to_path(path)?;
+        return Ok(());
+    }
 
     println!("\n--- Agent Result ---");
     println!("Completed: {}", result.task_completed);
@@ -583,10 +763,168 @@ async fn run_mcp_server(
         model, max_iterations
     );
 
-    let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
     server.serve(reader, writer).await?;
     Ok(())
+}
+
+/// Delegate a coding task through the MCP Tasks protocol by driving an
+/// in-process server as a client over an in-memory duplex. This dogfoods the
+/// exact wire protocol external orchestrators use, without spawning a child
+/// process.
+async fn run_delegate(
+    description: &str,
+    repo_path: &std::path::Path,
+    branch: &str,
+    model: &str,
+    max_iterations: usize,
+    ttl_ms: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::mcp::client::NannaMcpClient;
+    use harness::mcp::NannaMcpServer;
+    use harness::task::TaskManager;
+    use std::sync::Arc;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let task_manager = Arc::new(TaskManager::default());
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
+
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let serve_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(tokio::io::BufReader::new(server_read), server_write)
+            .await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_side);
+    let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
+
+    client.initialize().await?;
+    let arguments = serde_json::json!({
+        "description": description,
+        "repo_path": repo_path.to_string_lossy(),
+        "branch": branch,
+        "model": model,
+        "max_iterations": max_iterations,
+    });
+    let task_id = client.submit_task(arguments, ttl_ms).await?;
+    info!("Delegated task {task_id}; awaiting completion...");
+
+    let result = client.wait_result(&task_id).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    drop(client);
+    let _ = serve_handle.await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness::eval::swebench_results::{
+        SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
+    };
+
+    fn fixture_run(scenario: &str) -> SweBenchRunResult {
+        SweBenchRunResult {
+            config: SweBenchRunConfig {
+                commit_sha: "abc123".to_string(),
+                bench_name: "swebench_verified".to_string(),
+                scenario: scenario.to_string(),
+                model_name: Some("gemma4:e4b".to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+            instances: vec![SweBenchInstanceResult {
+                instance_id: "django__django-11099".to_string(),
+                resolved: true,
+                orchestrator_token_usage: TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                },
+                worker_token_usage: None,
+                wall_time_secs: 12.0,
+                error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn generate_report_compare_path_writes_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.json");
+        let b_path = dir.path().join("b.json");
+        std::fs::write(
+            &a_path,
+            serde_json::to_string(&fixture_run("nanna_only")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &b_path,
+            serde_json::to_string(&fixture_run("claude_plus_nanna")).unwrap(),
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let (report_path, comparison_path) =
+            generate_swebench_report(&a_path, Some(out.as_path()), Some(b_path.as_path()))
+                .expect("generate should succeed");
+
+        assert!(report_path.exists(), "report.md missing");
+        let comparison_path = comparison_path.expect("comparison path returned");
+        assert!(comparison_path.exists(), "comparison.md missing");
+        assert!(comparison_path
+            .to_string_lossy()
+            .contains("nanna_only_vs_claude_plus_nanna"));
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_bad_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{not valid json").unwrap();
+
+        let out = dir.path().join("out");
+        let result = generate_swebench_report(&bad, Some(out.as_path()), None);
+        assert!(result.is_err(), "expected error on malformed JSON");
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.json");
+        let out = dir.path().join("out");
+        let result = generate_swebench_report(&missing, Some(out.as_path()), None);
+        assert!(result.is_err(), "expected error on missing input file");
+    }
+
+    #[test]
+    fn generate_report_returns_err_on_missing_compare_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.json");
+        std::fs::write(&a_path, serde_json::to_string(&fixture_run("a")).unwrap()).unwrap();
+        let out = dir.path().join("out");
+        let missing_compare = dir.path().join("missing.json");
+        let result = generate_swebench_report(
+            &a_path,
+            Some(out.as_path()),
+            Some(missing_compare.as_path()),
+        );
+        assert!(result.is_err(), "expected error on missing compare file");
+    }
 }
