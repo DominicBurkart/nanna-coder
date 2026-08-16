@@ -10,13 +10,14 @@ on:
       model:
         description: 'Model to use for evaluation'
         required: false
-        default: 'qwen3:0.6b'
+        default: 'gemma4:e4b'
         type: choice
         options:
+          - gemma4:e4b
           - qwen3:0.6b
           - llama3.1:8b
       case_filter:
-        description: 'Additional nextest filter expression for case selection (optional)'
+        description: 'Substring matched against case ID (optional; empty = run all)'
         required: false
         default: ''
 
@@ -51,18 +52,39 @@ jobs:
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
         ollama serve &
-        # Wait for Ollama to be ready
-        for i in $(seq 1 30); do
+        # Wait up to 60s for Ollama to be ready
+        for i in $(seq 1 60); do
           ollama list > /dev/null 2>&1 && break
           sleep 1
         done
-        ollama pull "$MODEL"
+        if ! ollama list > /dev/null 2>&1; then
+          echo "Ollama did not become ready within 60s"
+          exit 1
+        fi
+        for attempt in 1 2 3; do
+          echo "Pulling $MODEL (attempt $attempt/3)..."
+          if timeout 600 ollama pull "$MODEL"; then
+            echo "Pulled $MODEL"
+            break
+          fi
+          if [ "$attempt" = "3" ]; then
+            echo "Failed to pull $MODEL after 3 attempts"
+            exit 1
+          fi
+          sleep $((attempt * 10))
+        done
 
     - name: Run eval suite
       id: eval
       env:
         MODEL: ${{ inputs.model }}
+        NANNA_EVAL_MODEL: ${{ inputs.model }}
         CASE_FILTER: ${{ inputs.case_filter }}
+        # SWE-bench cases shell out to the installed `nanna` binary; point
+        # the eval-runner at the workspace-built artefact rather than
+        # whatever happens to be on PATH. The Build step above produces
+        # this via `cargo build --release --workspace --all-features`.
+        NANNA_HARNESS_BIN: ${{ github.workspace }}/target/release/nanna
       run: |
         echo "## Eval Results" > eval-results.md
         echo "" >> eval-results.md
@@ -71,20 +93,14 @@ jobs:
         echo "**Triggered by:** @${{ github.actor }}" >> eval-results.md
         echo "" >> eval-results.md
 
-        echo "### Unit-level eval tests" >> eval-results.md
+        echo "### Eval cases" >> eval-results.md
         echo '```' >> eval-results.md
 
-        FILTER='test(eval)'
-        if [ -n "${CASE_FILTER}" ]; then
-          FILTER="${FILTER} & ${CASE_FILTER}"
-        fi
-
         set +e
-        nix develop --command cargo nextest run \
-          --workspace --all-features \
-          -E "$FILTER" \
-          --no-fail-fast 2>&1 | tee eval-output.txt
-        EXIT_CODE=$?
+        nix develop --command cargo run --release --bin harness-eval --features eval-runner -- \
+          --filter "${CASE_FILTER}" \
+          2>&1 | tee eval-output.txt
+        EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
         cat eval-output.txt >> eval-results.md
