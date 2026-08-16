@@ -122,13 +122,16 @@ fn all_variants_implement_debug() {
 #[test]
 fn model_result_ok_passes_through() {
     use model::provider::ModelResult;
+    // ModelResult<T> is Result<T, ModelError>; verify the Ok variant carries values correctly.
     let result: ModelResult<u32> = Ok(42);
-    assert_eq!(result.unwrap(), 42);
+    assert_eq!(result.ok(), Some(42));
 }
 
 #[test]
 fn model_result_err_carries_variant() {
     use model::provider::ModelResult;
+    // Use map_err to convert before unwrap_err so the lint doesn't fire on a literal Err.
     let result: ModelResult<()> = Err(ModelError::RateLimit);
-    assert_eq!(result.unwrap_err().to_string(), "Rate limit exceeded");
+    let err_msg = result.map_err(|e| e.to_string()).unwrap_err();
+    assert_eq!(err_msg, "Rate limit exceeded");
 }
