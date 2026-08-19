@@ -1044,4 +1044,143 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_trace_with_attribute() {
+        let trace = TraceContext::new("test_op")
+            .with_attribute("key1", "value1")
+            .with_attribute("key2", "value2");
+        assert_eq!(trace.attributes.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_trace_set_status() {
+        let mut trace = TraceContext::new("test_op");
+        assert_eq!(trace.status, SpanStatus::InProgress);
+
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "test_metric".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 10.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+        exporter.add_metric(metric);
+
+        let output_before = exporter.export_prometheus().await.unwrap();
+        assert!(!output_before.is_empty());
+
+        exporter.clear_buffer();
+        let output_after = exporter.export_prometheus().await.unwrap();
+        assert!(output_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("env", "test")
+            .with_global_attribute("region", "us-west");
+
+        let trace = telemetry.start_trace("test_op");
+        assert_eq!(trace.attributes.get("env"), Some(&"test".to_string()));
+        assert_eq!(trace.attributes.get("region"), Some(&"us-west".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_config() {
+        let mut config = TelemetryConfig::default();
+        config.service.name = "custom-service".to_string();
+        config.log_level = "debug".to_string();
+
+        let telemetry = TelemetrySystem::new().with_config(config);
+        let trace = telemetry.start_trace("op");
+        assert_eq!(
+            trace.attributes.get("service.name"),
+            Some(&"custom-service".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_add_exporter() {
+        let exporter = Box::new(PrometheusExporter::new(None));
+        let telemetry = TelemetrySystem::new().add_exporter(exporter);
+        assert_eq!(telemetry.exporters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        assert!(uptime < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_traces() {
+        let exporter = PrometheusExporter::new(None);
+
+        let mut trace = TraceContext::new("traced_op");
+        trace.finish();
+        assert!(trace.duration.is_some());
+
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("trace_duration_seconds"));
+    }
+
+    #[tokio::test]
+    async fn test_gauge_and_summary_metric_types() {
+        let exporter = PrometheusExporter::new(None);
+
+        let gauge = MetricPoint {
+            name: "test_gauge".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 42.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+
+        let summary = MetricPoint {
+            name: "test_summary".to_string(),
+            metric_type: MetricType::Summary,
+            value: 0.95,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+
+        exporter.add_metric(gauge);
+        exporter.add_metric(summary);
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("# TYPE test_gauge gauge"));
+        assert!(output.contains("# TYPE test_summary summary"));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_config_default() {
+        let config = TelemetryConfig::default();
+        assert_eq!(config.service.name, "nanna-coder");
+        assert!(config.enable_logging);
+        assert!(config.enable_tracing);
+        assert!(config.enable_metrics);
+        assert_eq!(config.trace_sample_rate, 1.0);
+        assert!(config.global_attributes.is_empty());
+    }
 }
