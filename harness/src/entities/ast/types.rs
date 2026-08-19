@@ -213,10 +213,7 @@ mod tests {
             FileType::from_path(Path::new("index.js")),
             FileType::JavaScript
         );
-        assert_eq!(
-            FileType::from_path(Path::new("script.sh")),
-            FileType::Shell
-        );
+        assert_eq!(FileType::from_path(Path::new("script.sh")), FileType::Shell);
     }
 
     #[test]
