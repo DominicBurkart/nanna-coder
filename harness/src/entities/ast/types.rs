@@ -170,6 +170,55 @@ mod tests {
         );
     }
 
+    /// Covers the JavaScript (`js`, `mjs`, `cjs`) and additional language
+    /// extensions that are not exercised by the baseline test.
+    #[test]
+    fn test_file_type_from_extension_all_variants() {
+        use std::path::Path;
+
+        // JavaScript variants
+        assert_eq!(FileType::from_extension("js"), FileType::JavaScript);
+        assert_eq!(FileType::from_extension("mjs"), FileType::JavaScript);
+        assert_eq!(FileType::from_extension("cjs"), FileType::JavaScript);
+
+        // TypeScript variant
+        assert_eq!(FileType::from_extension("tsx"), FileType::TypeScript);
+
+        // Other languages
+        assert_eq!(FileType::from_extension("go"), FileType::Go);
+        assert_eq!(FileType::from_extension("java"), FileType::Java);
+
+        // Data / config formats
+        assert_eq!(FileType::from_extension("json"), FileType::Json);
+        assert_eq!(FileType::from_extension("yaml"), FileType::Yaml);
+        assert_eq!(FileType::from_extension("yml"), FileType::Yaml);
+        assert_eq!(FileType::from_extension("md"), FileType::Markdown);
+        assert_eq!(FileType::from_extension("markdown"), FileType::Markdown);
+
+        // Shell
+        assert_eq!(FileType::from_extension("sh"), FileType::Shell);
+        assert_eq!(FileType::from_extension("bash"), FileType::Shell);
+        assert_eq!(FileType::from_extension("zsh"), FileType::Shell);
+
+        // Special names
+        assert_eq!(FileType::from_extension("dockerfile"), FileType::Dockerfile);
+        assert_eq!(FileType::from_extension("nix"), FileType::Nix);
+
+        // Case-insensitive mapping
+        assert_eq!(FileType::from_extension("RS"), FileType::Rust);
+        assert_eq!(FileType::from_extension("PY"), FileType::Python);
+
+        // Roundtrip path helper agrees with extension helper.
+        assert_eq!(
+            FileType::from_path(Path::new("index.js")),
+            FileType::JavaScript
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("script.sh")),
+            FileType::Shell
+        );
+    }
+
     #[test]
     fn test_file_type_from_path() {
         use std::path::Path;
@@ -183,6 +232,22 @@ mod tests {
             FileType::Dockerfile
         );
         assert_eq!(FileType::from_path(Path::new("flake.nix")), FileType::Nix);
+    }
+
+    /// `from_path` on a path with no extension should fall back to
+    /// `Other("unknown")`.
+    #[test]
+    fn test_file_type_from_path_no_extension() {
+        use std::path::Path;
+
+        assert_eq!(
+            FileType::from_path(Path::new("Makefile")),
+            FileType::Other("unknown".to_string())
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("LICENSE")),
+            FileType::Other("unknown".to_string())
+        );
     }
 
     #[tokio::test]
@@ -199,6 +264,91 @@ mod tests {
         assert_eq!(entity.line_count, 3);
         assert!(entity.is_source_code());
         assert!(!entity.is_config());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    /// `FileEntity` built from a config file must report `is_config()` true and
+    /// `is_source_code()` false.
+    #[tokio::test]
+    async fn test_file_entity_is_config_true() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_file_entity_config");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // JSON → is_config
+        let json_file = temp_dir.join("config.json");
+        std::fs::write(&json_file, r#"{"key": "value"}"#).unwrap();
+        let entity = FileEntity::from_path(json_file, &temp_dir).unwrap();
+        assert!(entity.is_config());
+        assert!(!entity.is_source_code());
+
+        // TOML → is_config
+        let toml_file = temp_dir.join("Cargo.toml");
+        std::fs::write(&toml_file, "[package]\nname = \"x\"\n").unwrap();
+        let entity = FileEntity::from_path(toml_file, &temp_dir).unwrap();
+        assert!(entity.is_config());
+
+        // YAML → is_config
+        let yaml_file = temp_dir.join("ci.yml");
+        std::fs::write(&yaml_file, "key: value\n").unwrap();
+        let entity = FileEntity::from_path(yaml_file, &temp_dir).unwrap();
+        assert!(entity.is_config());
+
+        // Dockerfile (by name) → is_config
+        let dockerfile = temp_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM ubuntu\n").unwrap();
+        let entity = FileEntity::from_path(dockerfile, &temp_dir).unwrap();
+        assert!(entity.is_config());
+
+        // Nix → is_config
+        let nix_file = temp_dir.join("flake.nix");
+        std::fs::write(&nix_file, "{ inputs = {}; }").unwrap();
+        let entity = FileEntity::from_path(nix_file, &temp_dir).unwrap();
+        assert!(entity.is_config());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    /// `FileEntity::from_path` on a non-readable file falls back to
+    /// `"(binary or unreadable)"` for the content preview and 0 for the line count.
+    #[test]
+    fn test_file_entity_from_path_unreadable_preview() {
+        // Create a temp file, read its metadata, then check the struct.
+        let temp_dir = std::env::temp_dir().join("nanna_test_unreadable");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("data.bin");
+        // Write some valid bytes so the file exists.
+        std::fs::write(&file_path, b"\x00\x01\x02").unwrap();
+
+        // We can still create the entity even for binary files (the error
+        // branch is triggered when `read_to_string` fails, e.g. on non-UTF-8).
+        // Trigger the fallback by writing non-UTF-8 bytes.
+        std::fs::write(&file_path, b"\xff\xfe invalid utf8 \x80").unwrap();
+
+        let entity = FileEntity::from_path(file_path, &temp_dir).unwrap();
+        // The fallback string must appear when the file is not valid UTF-8.
+        assert_eq!(entity.content_preview, "(binary or unreadable)");
+        assert_eq!(entity.line_count, 0);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    /// `FileEntity::to_json` (from the `Entity` trait) must round-trip cleanly.
+    #[test]
+    fn test_file_entity_to_json() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_entity_json");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("main.py");
+        std::fs::write(&file_path, "print('hello')\n").unwrap();
+
+        let entity = FileEntity::from_path(file_path, &temp_dir).unwrap();
+        let json = entity.to_json().expect("to_json must succeed");
+        let back: FileEntity = serde_json::from_str(&json).expect("round-trip must succeed");
+
+        assert_eq!(back.relative_path, entity.relative_path);
+        assert_eq!(back.file_type, entity.file_type);
+        assert_eq!(back.line_count, entity.line_count);
+        assert!(back.is_source_code());
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
