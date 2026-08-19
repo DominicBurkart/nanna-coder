@@ -2484,6 +2484,96 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // -- CalculatorTool branch coverage --
+
+    #[tokio::test]
+    async fn test_calculator_tool_subtract() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "subtract", "a": 10.0, "b": 3.0 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_multiply() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "multiply", "a": 4.0, "b": 5.0 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_divide_success() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "divide", "a": 10.0, "b": 2.0 });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "modulo", "a": 10.0, "b": 3.0 });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("modulo"));
+            }
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculator_tool_missing_a() {
+        let tool = CalculatorTool::new();
+        let args = json!({ "operation": "add", "b": 3.0 });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_echo_tool_missing_message() {
+        let tool = EchoTool::new();
+        let args = json!({});
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { .. }) => {}
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_not_found() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("nonexistent", json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::NotFound { name }) => {
+                assert_eq!(name, "nonexistent");
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_path_traversal() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_write_security");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let tool = WriteFileTool::new(temp_dir.clone());
+        let args = json!({ "path": "../outside.txt", "content": "escape" });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::PathSecurityViolation { .. }) => {}
+            _ => panic!("Expected PathSecurityViolation error"),
+        }
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 }
 
 #[cfg(kani)]
