@@ -240,4 +240,265 @@ mod tests {
         assert_eq!(message.content, deserialized.content);
         assert_eq!(message.role, deserialized.role);
     }
+
+    // -----------------------------------------------------------------------
+    // ChatMessage::assistant and assistant_with_tools
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assistant_message_constructor() {
+        let msg = ChatMessage::assistant("I can help with that.");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content, Some("I can help with that.".to_string()));
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_assistant_with_tools_constructor() {
+        let tool_call = ToolCall {
+            id: "call_abc".to_string(),
+            function: FunctionCall {
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"location": "Paris"}),
+            },
+        };
+        let msg = ChatMessage::assistant_with_tools(Some("Using tool".to_string()), vec![tool_call.clone()]);
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content, Some("Using tool".to_string()));
+        let calls = msg.tool_calls.expect("tool_calls should be present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        // None content variant
+        let msg_no_content = ChatMessage::assistant_with_tools(None, vec![]);
+        assert!(msg_no_content.content.is_none());
+        assert_eq!(msg_no_content.role, MessageRole::Assistant);
+    }
+
+    // -----------------------------------------------------------------------
+    // ChatRequest::with_tools
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_request_with_tools() {
+        let tool = ToolDefinition {
+            function: FunctionDefinition {
+                name: "search".to_string(),
+                description: "Searches the web".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut map = HashMap::new();
+                        map.insert(
+                            "query".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("The search query".to_string()),
+                                items: None,
+                            },
+                        );
+                        map
+                    }),
+                    required: Some(vec!["query".to_string()]),
+                },
+            },
+        };
+        let messages = vec![ChatMessage::user("Search for Rust")];
+        let request = ChatRequest::new("llama3.1:8b", messages).with_tools(vec![tool]);
+
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(request.tools.as_ref().unwrap()[0].function.name, "search");
+        assert_eq!(request.tool_choice, Some(ToolChoice::Auto));
+    }
+
+    // -----------------------------------------------------------------------
+    // ToolChoice serialization (all variants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_choice_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Required).unwrap(),
+            "\"required\""
+        );
+
+        // Specific variant
+        let specific = ToolChoice::Specific("my_fn".to_string());
+        let json = serde_json::to_string(&specific).unwrap();
+        let roundtripped: ToolChoice = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped, specific);
+    }
+
+    #[test]
+    fn test_tool_choice_default() {
+        let choice = ToolChoice::default();
+        assert_eq!(choice, ToolChoice::Auto);
+    }
+
+    // -----------------------------------------------------------------------
+    // FinishReason serialization (all variants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finish_reason_serialization() {
+        let cases = [
+            (FinishReason::Stop, "\"stop\""),
+            (FinishReason::ToolCalls, "\"tool_calls\""),
+            (FinishReason::Length, "\"length\""),
+            (FinishReason::ContentFilter, "\"content_filter\""),
+        ];
+        for (reason, expected_json) in cases {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, expected_json, "wrong JSON for {:?}", reason);
+            let roundtripped: FinishReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtripped, reason);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool and schema types serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_call_serialization() {
+        let tool_call = ToolCall {
+            id: "call_xyz".to_string(),
+            function: FunctionCall {
+                name: "do_something".to_string(),
+                arguments: serde_json::json!({"key": "value"}),
+            },
+        };
+        let json = serde_json::to_string(&tool_call).unwrap();
+        let roundtripped: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.id, tool_call.id);
+        assert_eq!(roundtripped.function.name, tool_call.function.name);
+        assert_eq!(roundtripped.function.arguments, tool_call.function.arguments);
+    }
+
+    #[test]
+    fn test_schema_type_serialization() {
+        let types = [
+            (SchemaType::Object, "\"object\""),
+            (SchemaType::String, "\"string\""),
+            (SchemaType::Number, "\"number\""),
+            (SchemaType::Integer, "\"integer\""),
+            (SchemaType::Boolean, "\"boolean\""),
+            (SchemaType::Array, "\"array\""),
+        ];
+        for (schema_type, expected) in types {
+            let json = serde_json::to_string(&schema_type).unwrap();
+            assert_eq!(json, expected);
+        }
+    }
+
+    #[test]
+    fn test_json_schema_with_array_property() {
+        let schema = JsonSchema {
+            schema_type: SchemaType::Object,
+            properties: Some({
+                let mut map = HashMap::new();
+                map.insert(
+                    "tags".to_string(),
+                    PropertySchema {
+                        schema_type: SchemaType::Array,
+                        description: Some("List of tags".to_string()),
+                        items: Some(Box::new(PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: None,
+                            items: None,
+                        })),
+                    },
+                );
+                map
+            }),
+            required: None,
+        };
+        let json = serde_json::to_string(&schema).unwrap();
+        let roundtripped: JsonSchema = serde_json::from_str(&json).unwrap();
+        let props = roundtripped.properties.unwrap();
+        let tags = props.get("tags").unwrap();
+        assert!(matches!(tags.schema_type, SchemaType::Array));
+        assert!(tags.items.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_usage_serialization() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let roundtripped: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.prompt_tokens, usage.prompt_tokens);
+        assert_eq!(roundtripped.completion_tokens, usage.completion_tokens);
+        assert_eq!(roundtripped.total_tokens, usage.total_tokens);
+    }
+
+    // -----------------------------------------------------------------------
+    // ChatResponse and Choice
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_response_serialization() {
+        let response = ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage::assistant("Hello!"),
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 3,
+                total_tokens: 8,
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let roundtripped: ChatResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.choices.len(), 1);
+        assert_eq!(
+            roundtripped.choices[0].message.content,
+            Some("Hello!".to_string())
+        );
+        assert_eq!(
+            roundtripped.choices[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+        let u = roundtripped.usage.unwrap();
+        assert_eq!(u.total_tokens, 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelInfo
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_model_info_serialization() {
+        let info = ModelInfo {
+            name: "llama3.1:8b".to_string(),
+            size: Some(4_000_000_000),
+            digest: Some("sha256:abc123".to_string()),
+            modified_at: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let roundtripped: ModelInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.name, info.name);
+        assert_eq!(roundtripped.size, info.size);
+        assert_eq!(roundtripped.digest, info.digest);
+        assert_eq!(roundtripped.modified_at, info.modified_at);
+    }
 }
