@@ -263,7 +263,10 @@ mod tests {
                 arguments: serde_json::json!({"location": "Paris"}),
             },
         };
-        let msg = ChatMessage::assistant_with_tools(Some("Using tool".to_string()), vec![tool_call.clone()]);
+        let msg = ChatMessage::assistant_with_tools(
+            Some("Using tool".to_string()),
+            vec![tool_call.clone()],
+        );
         assert_eq!(msg.role, MessageRole::Assistant);
         assert_eq!(msg.content, Some("Using tool".to_string()));
         let calls = msg.tool_calls.expect("tool_calls should be present");
@@ -383,7 +386,10 @@ mod tests {
         let roundtripped: ToolCall = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.id, tool_call.id);
         assert_eq!(roundtripped.function.name, tool_call.function.name);
-        assert_eq!(roundtripped.function.arguments, tool_call.function.arguments);
+        assert_eq!(
+            roundtripped.function.arguments,
+            tool_call.function.arguments
+        );
     }
 
     #[test]
