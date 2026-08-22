@@ -1907,6 +1907,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let args = json!({
+            "operation": "subtract",
+            "a": 10.0,
+            "b": 3.0
+        });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let args = json!({
+            "operation": "multiply",
+            "a": 4.0,
+            "b": 5.0
+        });
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let args = json!({
+            "operation": "modulo",
+            "a": 10.0,
+            "b": 3.0
+        });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { .. }) => {}
+            _ => panic!("Expected InvalidArguments error"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_tool_registry() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool::new()));
