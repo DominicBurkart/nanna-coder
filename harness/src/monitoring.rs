@@ -1352,10 +1352,7 @@ mod tests {
             max_memory_usage: 0.8,
             health_check_timeout: Duration::from_secs(10),
         };
-        manager
-            .configure_thresholds(new_thresholds)
-            .await
-            .unwrap();
+        manager.configure_thresholds(new_thresholds).await.unwrap();
     }
 
     #[tokio::test]
