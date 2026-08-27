@@ -1100,8 +1100,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_observability_system_start_stop_monitoring() {
-        let mut system = ObservabilitySystem::new()
-            .with_health_check_interval(Duration::from_secs(60));
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(60));
         system.start_monitoring().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         system.stop_monitoring().await;
