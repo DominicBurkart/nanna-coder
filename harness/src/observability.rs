@@ -1097,4 +1097,28 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_system_start_stop_monitoring() {
+        let mut system = ObservabilitySystem::new()
+            .with_health_check_interval(Duration::from_secs(60));
+        system.start_monitoring().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_stop_when_not_started() {
+        // Stopping when no monitoring task is running should be a no-op
+        let mut system = ObservabilitySystem::new();
+        system.stop_monitoring().await;
+    }
+
+    #[test]
+    fn test_observability_system_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        // The uptime should be a very small duration (just constructed)
+        assert!(uptime.as_secs() < 5);
+    }
 }

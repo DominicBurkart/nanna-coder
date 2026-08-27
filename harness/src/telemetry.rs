@@ -1044,4 +1044,91 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[test]
+    fn test_telemetry_system_default() {
+        let system = TelemetrySystem::default();
+        assert_eq!(system.get_active_trace_count(), 0);
+        assert_eq!(system.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_add_exporter() {
+        let exporter = PrometheusExporter::new(None);
+        let system = TelemetrySystem::new().add_exporter(Box::new(exporter));
+        // After adding an exporter the system should still be uninitialised but functional
+        assert_eq!(system.get_active_trace_count(), 0);
+    }
+
+    #[test]
+    fn test_get_prometheus_exporter_returns_none() {
+        // The current implementation always returns None (typed-exporter refs not stored)
+        let system = TelemetrySystem::new();
+        assert!(system.get_prometheus_exporter().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_all_no_exporters() {
+        let system = TelemetrySystem::new();
+        // export_all with no exporters and empty buffers should succeed
+        system.export_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_export_all_with_exporter() {
+        let exporter = PrometheusExporter::new(None);
+        let system = TelemetrySystem::new().add_exporter(Box::new(exporter));
+
+        system.record_counter("req_count", 1.0, vec![]);
+        system.record_event("ev", "cat", serde_json::json!({}));
+
+        // Start and finish a trace so it is eligible for export
+        let trace = system.start_trace("op");
+        system.finish_trace(trace);
+
+        system.export_all().await.unwrap();
+        // Buffers should be cleared after export
+        assert_eq!(system.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_trace() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("guarded");
+        let guard = TraceGuard::new(&telemetry, trace);
+        assert!(guard.trace().is_some());
+        assert_eq!(guard.trace().unwrap().operation_name, "guarded");
+        // guard drops here, finishing the trace automatically
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.record_error("boom");
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+        guard.set_status(SpanStatus::Ok);
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_drop_finishes_trace() {
+        let telemetry = TelemetrySystem::new();
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+        {
+            let trace = telemetry.start_trace("drop_test");
+            let _guard = TraceGuard::new(&telemetry, trace);
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+        }
+        // After the guard drops the trace is finished (moved to finished state)
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
 }
