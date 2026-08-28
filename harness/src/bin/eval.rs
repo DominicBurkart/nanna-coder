@@ -217,14 +217,23 @@ mod tests {
     /// A non-empty filter matches when it's a substring of the case ID.
     #[test]
     fn case_matches_substring_match() {
-        assert!(case_matches("django__django-1234", &Some("django".to_string())));
-        assert!(case_matches("scikit-learn__scikit-learn-9999", &Some("scikit".to_string())));
+        assert!(case_matches(
+            "django__django-1234",
+            &Some("django".to_string())
+        ));
+        assert!(case_matches(
+            "scikit-learn__scikit-learn-9999",
+            &Some("scikit".to_string())
+        ));
     }
 
     /// A non-empty filter does not match when the needle is absent.
     #[test]
     fn case_matches_no_substring_match() {
-        assert!(!case_matches("django__django-1234", &Some("flask".to_string())));
+        assert!(!case_matches(
+            "django__django-1234",
+            &Some("flask".to_string())
+        ));
         assert!(!case_matches("", &Some("anything".to_string())));
     }
 }

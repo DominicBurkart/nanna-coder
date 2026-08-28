@@ -469,10 +469,7 @@ mod tests {
         let out = git_capture(&["--version"]);
         assert!(out.is_some(), "git --version should succeed");
         let out = out.unwrap();
-        assert!(
-            out.starts_with("git version"),
-            "unexpected output: {out}"
-        );
+        assert!(out.starts_with("git version"), "unexpected output: {out}");
     }
 
     /// A nonsensical sub-command returns None rather than panicking.
