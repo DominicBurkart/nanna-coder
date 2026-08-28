@@ -154,3 +154,77 @@ async fn main() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── resolve_model ────────────────────────────────────────────────────────
+
+    /// A CLI value takes precedence over env vars and the built-in default.
+    #[test]
+    fn resolve_model_cli_wins() {
+        std::env::remove_var("NANNA_EVAL_MODEL");
+        std::env::remove_var("MODEL");
+        let m = resolve_model(Some("my-cli-model".to_string()));
+        assert_eq!(m, "my-cli-model");
+    }
+
+    /// When no CLI value is provided, `NANNA_EVAL_MODEL` is consulted next.
+    #[test]
+    fn resolve_model_nanna_env_var() {
+        std::env::remove_var("MODEL");
+        std::env::set_var("NANNA_EVAL_MODEL", "env-model-a");
+        let m = resolve_model(None);
+        std::env::remove_var("NANNA_EVAL_MODEL");
+        assert_eq!(m, "env-model-a");
+    }
+
+    /// `MODEL` is the fallback env var when `NANNA_EVAL_MODEL` is absent.
+    #[test]
+    fn resolve_model_model_env_var() {
+        std::env::remove_var("NANNA_EVAL_MODEL");
+        std::env::set_var("MODEL", "env-model-b");
+        let m = resolve_model(None);
+        std::env::remove_var("MODEL");
+        assert_eq!(m, "env-model-b");
+    }
+
+    /// When nothing is provided, the hard-coded default is returned.
+    #[test]
+    fn resolve_model_default() {
+        std::env::remove_var("NANNA_EVAL_MODEL");
+        std::env::remove_var("MODEL");
+        let m = resolve_model(None);
+        assert_eq!(m, "qwen3:0.6b");
+    }
+
+    // ── case_matches ─────────────────────────────────────────────────────────
+
+    /// No filter means every case ID matches.
+    #[test]
+    fn case_matches_no_filter() {
+        assert!(case_matches("any-case-id", &None));
+        assert!(case_matches("", &None));
+    }
+
+    /// An empty-string filter is treated as no filter (matches everything).
+    #[test]
+    fn case_matches_empty_filter_string() {
+        assert!(case_matches("any-case-id", &Some(String::new())));
+    }
+
+    /// A non-empty filter matches when it's a substring of the case ID.
+    #[test]
+    fn case_matches_substring_match() {
+        assert!(case_matches("django__django-1234", &Some("django".to_string())));
+        assert!(case_matches("scikit-learn__scikit-learn-9999", &Some("scikit".to_string())));
+    }
+
+    /// A non-empty filter does not match when the needle is absent.
+    #[test]
+    fn case_matches_no_substring_match() {
+        assert!(!case_matches("django__django-1234", &Some("flask".to_string())));
+        assert!(!case_matches("", &Some("anything".to_string())));
+    }
+}
