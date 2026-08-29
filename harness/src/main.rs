@@ -5,6 +5,7 @@ use harness::entities::{EntityStore, InMemoryEntityStore};
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tracing::{error, info};
 
 // NOTE: `main.rs` binds the workspace entity store to `InMemoryEntityStore`
@@ -16,6 +17,19 @@ use tracing::{error, info};
 #[command(name = "nanna")]
 #[command(about = "A CLI tool for interacting with language models")]
 struct Cli {
+    /// Provider backend: "ollama" or "openai-compat"
+    #[arg(long, default_value = "ollama", global = true)]
+    provider: String,
+
+    /// Base URL for the API (overrides provider default)
+    #[arg(long, global = true)]
+    api_base: Option<String>,
+
+    /// API key for authentication (openai-compat only).
+    /// Prefer setting NANNA_API_KEY in the environment to avoid shell history exposure.
+    #[arg(long, env = "NANNA_API_KEY", global = true)]
+    api_key: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -150,14 +164,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_ensure_pod,
         } => {
             ensure_pod_or_exit(no_ensure_pod).await;
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
+            let provider = build_provider_arc(
+                &cli.provider,
+                cli.api_base.as_deref(),
+                cli.api_key.as_deref(),
+            )?;
             let workspace_root = std::env::current_dir()?;
             let tool_registry = create_tool_registry(&workspace_root);
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
                 single_chat(
-                    &provider,
+                    provider.as_ref(),
                     &tool_registry,
                     &model,
                     &initial_prompt,
@@ -167,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             } else {
                 interactive_chat(
-                    &provider,
+                    provider.as_ref(),
                     &tool_registry,
                     &model,
                     tools,
@@ -178,8 +196,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Models => {
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
-            list_models(&provider).await?;
+            let provider = build_provider_arc(
+                &cli.provider,
+                cli.api_base.as_deref(),
+                cli.api_key.as_deref(),
+            )?;
+            list_models(provider.as_ref()).await?;
         }
         Commands::Tools => {
             let workspace_root = std::env::current_dir()?;
@@ -188,8 +210,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Health { no_ensure_pod } => {
             ensure_pod_or_exit(no_ensure_pod).await;
-            let provider = OllamaProvider::new(OllamaConfig::default())?;
-            health_check(&provider).await?;
+            let provider = build_provider_arc(
+                &cli.provider,
+                cli.api_base.as_deref(),
+                cli.api_key.as_deref(),
+            )?;
+            health_check(provider.as_ref()).await?;
         }
         Commands::Agent {
             prompt,
@@ -208,6 +234,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => std::env::current_dir()?,
             };
             run_agent(
+                &cli.provider,
+                cli.api_base.as_deref(),
+                cli.api_key.as_deref(),
                 &prompt,
                 &model,
                 max_iterations,
@@ -223,7 +252,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            run_mcp_server(
+                &cli.provider,
+                cli.api_base.as_deref(),
+                cli.api_key.as_deref(),
+                &model,
+                max_iterations,
+            )
+            .await?;
         }
         Commands::Delegate {
             description,
@@ -292,6 +328,35 @@ fn generate_swebench_report(
     };
 
     Ok((report_path, comparison_path))
+}
+
+fn build_provider_arc(
+    provider_name: &str,
+    api_base: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<Arc<dyn ModelProvider>, Box<dyn std::error::Error>> {
+    let gateway = match provider_name {
+        "ollama" => {
+            let mut cfg = OllamaConfig::default();
+            if let Some(base) = api_base {
+                cfg = cfg.with_base_url(base);
+            }
+            GatewayConfig::Ollama(cfg)
+        }
+        "openai-compat" => {
+            let base_url = api_base.unwrap_or("http://localhost:8080").to_string();
+            GatewayConfig::OpenaiCompat(OpenAICompatConfig {
+                base_url,
+                api_key: api_key.map(|s| s.to_string()),
+                default_model: "default".to_string(),
+                timeout: std::time::Duration::from_secs(30),
+            })
+        }
+        other => {
+            return Err(format!("Unknown provider: {}", other).into());
+        }
+    };
+    Ok(gateway.build_provider()?)
 }
 
 fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
@@ -374,7 +439,7 @@ async fn store_repo_guidance_entity(
 }
 
 async fn single_chat(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     prompt: &str,
@@ -442,7 +507,7 @@ async fn single_chat(
 }
 
 async fn interactive_chat<S: EntityStore + Send>(
-    provider: &OllamaProvider,
+    provider: &dyn ModelProvider,
     tool_registry: &ToolRegistry,
     model: &str,
     enable_tools: bool,
@@ -541,7 +606,7 @@ async fn interactive_chat<S: EntityStore + Send>(
     Ok(())
 }
 
-async fn list_models(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_models(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
     println!("Available models:");
     let models = provider.list_models().await?;
 
@@ -579,16 +644,20 @@ fn list_tools(tool_registry: &ToolRegistry) {
     }
 }
 
-async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Performing health check...");
+async fn health_check(provider: &dyn ModelProvider) -> Result<(), Box<dyn std::error::Error>> {
+    let name = provider.provider_name();
+    println!("Performing health check ({})...", name);
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!(
+                "\u{2713} Health check passed. {} is running and accessible.",
+                name
+            );
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
@@ -656,6 +725,9 @@ async fn ensure_pod_or_exit(no_ensure_pod_flag: bool) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_agent(
+    provider_name: &str,
+    api_base: Option<&str>,
+    api_key: Option<&str>,
     prompt: &str,
     model: &str,
     max_iterations: usize,
@@ -666,13 +738,12 @@ async fn run_agent(
     ollama_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::agent::{AgentConfig, AgentContext, AgentLoop, AgentRunReport};
-    use std::sync::Arc;
 
-    let mut config = OllamaConfig::default();
-    if let Some(url) = ollama_url {
-        config = config.with_base_url(url.to_string());
-    }
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    // `--ollama-url` is the legacy per-subcommand override; the new `--api-base`
+    // flag supersedes it. We let `--ollama-url` win when both are set to keep
+    // existing CLI invocations stable.
+    let effective_api_base = ollama_url.or(api_base);
+    let provider = build_provider_arc(provider_name, effective_api_base, api_key)?;
     let entity_store = initialize_workspace(workspace_root).await;
 
     let agent_config = AgentConfig {
@@ -747,15 +818,16 @@ async fn run_agent(
 }
 
 async fn run_mcp_server(
+    provider_name: &str,
+    api_base: Option<&str>,
+    api_key: Option<&str>,
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
-    use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
+    let provider = build_provider_arc(provider_name, api_base, api_key)?;
     let task_manager = Arc::new(TaskManager::default());
 
     info!(
