@@ -1097,4 +1097,31 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+
+        system
+            .start_monitoring()
+            .await
+            .expect("start_monitoring should succeed");
+        assert!(
+            system.monitoring_task.is_some(),
+            "background task should be running after start"
+        );
+
+        system.stop_monitoring().await;
+        assert!(
+            system.monitoring_task.is_none(),
+            "background task should be gone after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_monitoring_noop_when_not_started() {
+        let mut system = ObservabilitySystem::new();
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }
