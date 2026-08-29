@@ -1242,4 +1242,146 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[test]
+    fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Critical > AlertSeverity::Error);
+        assert!(AlertSeverity::Error > AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning > AlertSeverity::Info);
+    }
+
+    #[test]
+    fn test_error_severity_ordering() {
+        assert!(ErrorSeverity::Critical > ErrorSeverity::Error);
+        assert!(ErrorSeverity::Error > ErrorSeverity::Warning);
+        assert!(ErrorSeverity::Warning > ErrorSeverity::Info);
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_nonexistent_alert_returns_error() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("nonexistent_id").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history_respects_limit() {
+        let manager = DefaultAlertManager::new();
+        for i in 0..5 {
+            manager
+                .send_alert(&format!("Alert {}", i), "description", AlertSeverity::Info)
+                .await
+                .unwrap();
+        }
+        let history = manager.get_alert_history(3).await.unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.7,
+            max_error_rate: 0.1,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.8,
+            health_check_timeout: Duration::from_secs(60),
+        };
+        assert!(manager.configure_thresholds(thresholds).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics_clears_state() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(100))
+            .await;
+        collector.record_cache_hit("k").await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
+
+    #[tokio::test]
+    async fn test_export_custom_format_returns_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = MonitoringSystem::new();
+        assert!(system.monitoring_task.is_none());
+
+        system.start_monitoring().await.unwrap();
+        assert!(system.monitoring_task.is_some());
+
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_record_error_populates_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        let error = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "TestError".to_string(),
+            message: "test error message".to_string(),
+            component: "test-component".to_string(),
+            severity: ErrorSeverity::Warning,
+        };
+        collector.record_error(error).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics
+            .error_metrics
+            .errors_by_type
+            .contains_key("TestError"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_services_latency_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("service-a", Duration::from_millis(100))
+            .await;
+        collector
+            .record_request_latency("service-b", Duration::from_millis(200))
+            .await;
+        collector
+            .record_request_latency("service-a", Duration::from_millis(150))
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.request_latencies.len(), 2);
+        assert_eq!(metrics.request_latencies["service-a"].request_count, 2);
+        assert_eq!(metrics.request_latencies["service-b"].request_count, 1);
+    }
 }
