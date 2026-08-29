@@ -135,8 +135,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the default tracing subscriber with a redacting writer so that
+    // any logs emitted by the process get a best-effort secret-redaction pass
+    // before hitting stderr. See `harness::logging::redaction` for the scope
+    // and threat model of this pass.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(harness::logging::RedactingMakeWriter::new(std::io::stderr))
         .init();
 
     let cli = Cli::parse();
