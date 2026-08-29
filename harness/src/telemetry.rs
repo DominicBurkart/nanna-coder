@@ -1044,4 +1044,148 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_trace_context_with_attribute() {
+        let trace = TraceContext::new("op")
+            .with_attribute("key1", "val1")
+            .with_attribute("key2", "val2");
+        assert_eq!(trace.attributes.get("key1"), Some(&"val1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"val2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("op");
+        trace.set_status(SpanStatus::Ok);
+        assert_eq!(trace.status, SpanStatus::Ok);
+
+        trace.set_status(SpanStatus::Error);
+        assert_eq!(trace.status, SpanStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_create_child() {
+        let parent = TraceContext::new("parent");
+        let child = parent.create_child("child");
+        assert_eq!(child.operation_name, "child");
+        assert_eq!(child.trace_id, parent.trace_id);
+        assert_eq!(child.parent_span_id, Some(parent.span_id.clone()));
+        assert_ne!(child.span_id, parent.span_id);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        // Uptime should be a very small but non-negative duration.
+        assert!(uptime < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("env", "test")
+            .with_global_attribute("version", "1.0");
+        assert_eq!(
+            telemetry.config.global_attributes.get("env"),
+            Some(&"test".to_string())
+        );
+        assert_eq!(
+            telemetry.config.global_attributes.get("version"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_with_version_and_environment() {
+        let telemetry = TelemetrySystem::new()
+            .with_version("2.3.1")
+            .with_environment("staging");
+        assert_eq!(telemetry.config.service.version, "2.3.1".to_string());
+        assert_eq!(telemetry.config.service.environment, "staging".to_string());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_get_prometheus_exporter_returns_none() {
+        // Without adding a PrometheusExporter, get_prometheus_exporter returns None.
+        let telemetry = TelemetrySystem::new();
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+        exporter.add_metric(MetricPoint {
+            name: "m".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+        assert_eq!(exporter.metrics_buffer.lock().unwrap().len(), 1);
+        exporter.clear_buffer();
+        assert_eq!(exporter.metrics_buffer.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_system_export_all() {
+        let telemetry = TelemetrySystem::new();
+        // No exporters added, so export_all should succeed (no-op).
+        telemetry.export_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_new_and_trace_accessor() {
+        let telemetry = TelemetrySystem::new();
+        let ctx = TraceContext::new("guarded_op");
+        let guard = TraceGuard::new(&telemetry, ctx);
+        let trace_ref = guard.trace().expect("trace should be present");
+        assert_eq!(trace_ref.operation_name, "guarded_op");
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let ctx = TraceContext::new("error_op");
+        let mut guard = TraceGuard::new(&telemetry, ctx);
+        guard.record_error("oops");
+        let trace_ref = guard.trace().unwrap();
+        assert_eq!(trace_ref.status, SpanStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let ctx = TraceContext::new("status_op");
+        let mut guard = TraceGuard::new(&telemetry, ctx);
+        guard.set_status(SpanStatus::Ok);
+        let trace_ref = guard.trace().unwrap();
+        assert_eq!(trace_ref.status, SpanStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_drop_finishes_trace() {
+        let telemetry = TelemetrySystem::new();
+        {
+            let ctx = telemetry.start_trace("drop_op");
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+            let _guard = TraceGuard::new(&telemetry, ctx);
+            // Drop guard here — finish_trace is called in Drop impl.
+        }
+        // After drop the trace is removed from active_traces.
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_reset_via_buffer_count() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_gauge("cpu", 55.0, vec![]);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+        // Clear the buffer directly and verify count drops.
+        telemetry.metrics_buffer.lock().unwrap().clear();
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
 }
