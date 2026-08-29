@@ -185,7 +185,9 @@ jobs:
         fi
 
     - name: Upload coverage reports
-      if: matrix.test-type == 'security'
+      if: matrix.test-type == 'security' && env.HAS_CODECOV_TOKEN == 'true'
+      env:
+        HAS_CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN != '' }}
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
