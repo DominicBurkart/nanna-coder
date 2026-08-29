@@ -53,6 +53,7 @@ which = "6"
 workspace = true
 
 [dev-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 serial_test = "3.4"
 tempfile = "3.0"
