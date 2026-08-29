@@ -1928,6 +1928,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tool_registry_execute_not_found() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute("missing_tool", json!({})).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ToolError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_calculator_subtract() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "subtract", "a": 10.0, "b": 3.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 7.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_multiply() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "multiply", "a": 4.0, "b": 5.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_divide() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "divide", "a": 15.0, "b": 3.0 }))
+            .await
+            .unwrap();
+        assert_eq!(result["result"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_calculator_unknown_operation() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({ "operation": "modulo", "a": 10.0, "b": 3.0 }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_operation() {
+        let tool = CalculatorTool::new();
+        let result = tool.execute(json!({ "a": 1.0, "b": 2.0 })).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_calculator_missing_operands() {
+        let tool = CalculatorTool::new();
+        let result = tool.execute(json!({ "operation": "add", "a": 1.0 })).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_echo_missing_message() {
+        let tool = EchoTool::new();
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn test_read_file_tool() {
         let temp_dir = std::env::temp_dir().join("nanna_test_read");
         std::fs::create_dir_all(&temp_dir).unwrap();
