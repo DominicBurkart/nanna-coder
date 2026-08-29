@@ -2484,6 +2484,79 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
+
+    // --- RunCommandTool tests ---
+
+    fn make_no_runtime_handle() -> std::sync::Arc<crate::container::ContainerHandle> {
+        std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_name() {
+        let tool = RunCommandTool::new(make_no_runtime_handle(), None);
+        assert_eq!(tool.name(), "run_command");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_definition() {
+        let tool = RunCommandTool::new(make_no_runtime_handle(), None);
+        let def = tool.definition();
+        assert_eq!(def.function.name, "run_command");
+        assert!(!def.function.description.is_empty());
+        let props = def.function.parameters.properties.unwrap();
+        assert!(props.contains_key("command"));
+        let required = def.function.parameters.required.unwrap();
+        assert!(required.contains(&"command".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_missing_command() {
+        let tool = RunCommandTool::new(make_no_runtime_handle(), None);
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { .. }) => {}
+            other => panic!("Expected InvalidArguments, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_null_command() {
+        let tool = RunCommandTool::new(make_no_runtime_handle(), None);
+        let result = tool.execute(json!({ "command": null })).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::InvalidArguments { .. }) => {}
+            other => panic!("Expected InvalidArguments, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_no_runtime_fails_execution() {
+        let tool = RunCommandTool::new(make_no_runtime_handle(), None);
+        let result = tool.execute(json!({ "command": "echo hello" })).await;
+        assert!(result.is_err());
+        match result {
+            Err(ToolError::ExecutionFailed { .. }) => {}
+            other => panic!("Expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_command_tool_with_working_dir() {
+        let tool = RunCommandTool::new(
+            make_no_runtime_handle(),
+            Some("/workspace".to_string()),
+        );
+        assert_eq!(tool.name(), "run_command");
+        let result = tool.execute(json!({ "command": "pwd" })).await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed { .. })));
+    }
 }
 
 #[cfg(kani)]
