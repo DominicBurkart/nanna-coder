@@ -1111,11 +1111,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_observability_with_health_thresholds() {
-        let mut thresholds = HealthThreshold::default();
-        thresholds.cpu_threshold = 0.95;
-        thresholds.memory_threshold = 0.98;
-
-        let system = ObservabilitySystem::new().with_health_thresholds(thresholds.clone());
+        let thresholds = HealthThreshold {
+            cpu_threshold: 0.95,
+            memory_threshold: 0.98,
+            ..Default::default()
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
         assert!((system.health_thresholds.cpu_threshold - 0.95).abs() < f64::EPSILON);
         assert!((system.health_thresholds.memory_threshold - 0.98).abs() < f64::EPSILON);
     }
