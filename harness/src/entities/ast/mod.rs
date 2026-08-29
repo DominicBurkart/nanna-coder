@@ -5,6 +5,12 @@
 //!
 //! See issue #23 and ARCHITECTURE.md for details.
 
+pub mod query;
+pub mod rust;
+
+pub use query::*;
+pub use rust::*;
+
 pub mod types;
 
 pub use types::*;
