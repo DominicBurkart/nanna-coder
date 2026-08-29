@@ -207,11 +207,12 @@ The pipeline is designed for maximum parallelization and efficiency:
 
 ### Caching Strategy
 
-#### Multi-Tier Caching
-1. **Cachix Binary Cache**: Persistent, shared across CI runs
-2. **Magic Nix Cache**: GitHub Actions automatic caching
-3. **Cargo Cache**: Rust dependency caching
-4. **Container Cache**: Docker layer caching
+#### Caching layers
+1. **Cachix Binary Cache** (`cachix-action@v15`): persistent, shared across CI runs and developer machines. See [CACHE_STRATEGY.md](./CACHE_STRATEGY.md).
+2. **Cargo Cache**: Rust dependency caching.
+3. **Container Cache**: Docker/Podman layer caching.
+
+(Magic Nix Cache was used previously but was removed when DeterminateSystems deprecated it in Feb 2025; see [cachix-migration.md](./cachix-migration.md).)
 
 #### Cache Configuration
 - **Push Filter**: Excludes source tarballs and nixpkgs
@@ -368,4 +369,4 @@ nix flake metadata
 
 ---
 
-For additional information about the CI/CD pipeline, consult the workflow files or create an issue for pipeline improvements.
+For additional information, consult the workflow files under [`.github/workflows/`](../.github/workflows/) or open an issue.
