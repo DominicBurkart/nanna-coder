@@ -115,6 +115,42 @@ pub fn promote_to_release(_dev_image: &Path) -> ImageBuilderResult<PathBuf> {
     )
 }
 
+/// Validate that a built image artifact exists and is plausibly non-empty.
+///
+/// This is a structural sanity check, not a semantic one: it does not parse
+/// the image manifest nor verify Nix store contents. It exists so that
+/// callers can fail fast before handing an empty or absent path to a
+/// container runtime.
+///
+/// # Invariants
+///
+/// * A path that does not exist returns `Ok(false)`.
+/// * A regular file returns `Ok(true)` iff its first byte is `b'{'`
+///   (the leading byte of a JSON image manifest tarball stream entry, the
+///   shape `nix build` emits when materializing OCI images to a single file).
+///   An empty file, a file beginning with any other byte, and a non-readable
+///   file all return `Ok(false)` (the last surfaces as `Err` only when the
+///   read itself fails).
+/// * A directory returns `Ok(true)` iff it contains at least one entry.
+///   An empty directory returns `Ok(false)`.
+/// * Other filesystem object kinds (sockets, devices, broken symlinks
+///   resolved to nothing) fall through to `Ok(false)`.
+///
+/// # Errors
+///
+/// Returns `Err(ImageBuilderError::Io)` only when the underlying open /
+/// read / directory enumeration syscall fails (e.g. permission denied).
+///
+/// # Examples
+///
+/// A nonexistent path is treated as invalid, never as an error:
+///
+/// ```
+/// use image_builder::validate_image;
+/// use std::path::Path;
+///
+/// assert!(!validate_image(Path::new("/definitely/not/here")).unwrap());
+/// ```
 pub fn validate_image(image_path: &Path) -> ImageBuilderResult<bool> {
     if !image_path.exists() {
         return Ok(false);
@@ -153,6 +189,7 @@ mod tests {
         let config = ImageBuildConfig::default();
         assert_eq!(config.image_type, ImageType::Dev);
         assert_eq!(config.source_path, PathBuf::from("."));
+        assert_eq!(config.output_path, PathBuf::from("./result"));
         assert!(config.nix_args.is_empty());
     }
 
@@ -211,5 +248,65 @@ mod tests {
         f.write_all(b"{}").unwrap();
         let result = validate_image(f.path());
         assert!(result.unwrap());
+    }
+
+    /// Invariant: a file whose first byte is not `b'{'` is not a valid image
+    /// manifest, even if it is non-empty. Guards against blindly accepting
+    /// arbitrary build output (e.g. a stray text file at the result path).
+    #[test]
+    fn test_validate_image_file_with_non_brace_leading_byte_is_invalid() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"not a manifest").unwrap();
+        assert!(
+            !validate_image(f.path()).unwrap(),
+            "non-{{ leading byte must yield false"
+        );
+    }
+
+    /// Invariant: an empty file is invalid (no leading byte to inspect).
+    /// Catches the case where a build creates the output path but writes
+    /// nothing to it.
+    #[test]
+    fn test_validate_image_empty_file_is_invalid() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            !validate_image(f.path()).unwrap(),
+            "empty file must yield false"
+        );
+    }
+
+    /// Invariant: a directory with at least one entry is treated as a valid
+    /// image (matches the `nix build` "store path directory" output shape).
+    #[test]
+    fn test_validate_image_non_empty_directory_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        assert!(
+            validate_image(dir.path()).unwrap(),
+            "non-empty directory must yield true"
+        );
+    }
+
+    /// Invariant: an empty directory is invalid. Otherwise a stale `mkdir`
+    /// at the output path would silently pass validation.
+    #[test]
+    fn test_validate_image_empty_directory_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !validate_image(dir.path()).unwrap(),
+            "empty directory must yield false"
+        );
+    }
+
+    /// Invariant: validation is total over the "absent" case — a missing
+    /// path never returns `Err`, only `Ok(false)`. This lets callers use a
+    /// single `?` site and treat absence as a normal negative result.
+    #[test]
+    fn test_validate_image_missing_path_is_ok_false_not_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        let result = validate_image(&missing);
+        assert!(result.is_ok(), "missing path must not raise Err");
+        assert!(!result.unwrap(), "missing path must yield false");
     }
 }
