@@ -55,8 +55,6 @@
 
 use crate::agent::{AgentConfig, AgentContext, AgentLoop, AgentState};
 use crate::entities::{EntityQuery, EntityStore, EntityType, InMemoryEntityStore};
-use crate::monitoring::SystemMetrics;
-use crate::observability::ObservabilitySystem;
 use model::judge::{ValidationCriteria, ValidationResult};
 use model::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -104,9 +102,6 @@ pub struct EvaluationConfig {
     /// Number of retry attempts
     pub max_retries: u32,
 
-    /// Enable observability collection
-    pub collect_observability: bool,
-
     /// Validation criteria for LLM outputs
     pub validation_criteria: ValidationCriteria,
 }
@@ -118,7 +113,6 @@ impl Default for EvaluationConfig {
             timeout: Duration::from_secs(300),
             verbose: false,
             max_retries: 2,
-            collect_observability: true,
             validation_criteria: ValidationCriteria {
                 min_response_length: 10,
                 max_response_length: 1000,
@@ -414,9 +408,6 @@ pub struct AgentEvaluationResult {
     /// Warnings
     pub warnings: Vec<String>,
 
-    /// System metrics (if observability enabled)
-    pub system_metrics: Option<SystemMetrics>,
-
     /// Timestamp
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
@@ -425,31 +416,12 @@ pub struct AgentEvaluationResult {
 pub struct AgentEvaluator {
     /// Configuration
     config: EvaluationConfig,
-
-    /// Observability system (optional)
-    observability: Option<ObservabilitySystem>,
 }
 
 impl AgentEvaluator {
     /// Create a new agent evaluator
     pub async fn new(config: EvaluationConfig) -> EvaluationResult<Self> {
-        let observability = if config.collect_observability {
-            let mut obs = ObservabilitySystem::new()
-                .with_service_name("agent-evaluator")
-                .with_health_check_interval(Duration::from_secs(60));
-
-            // Initialize, but don't fail if it errors (might be tracing already set up)
-            let _ = obs.initialize().await;
-
-            Some(obs)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            config,
-            observability,
-        })
+        Ok(Self { config })
     }
 
     /// Evaluate an agent scenario
@@ -503,7 +475,6 @@ impl AgentEvaluator {
                     final_state: AgentState::Error(e.to_string()),
                     failures,
                     warnings,
-                    system_metrics: None,
                     timestamp: chrono::Utc::now(),
                 });
             }
@@ -520,7 +491,6 @@ impl AgentEvaluator {
                     final_state: AgentState::Error("Timeout".to_string()),
                     failures,
                     warnings,
-                    system_metrics: None,
                     timestamp: chrono::Utc::now(),
                 });
             }
@@ -568,13 +538,6 @@ impl AgentEvaluator {
             }
         }
 
-        // Collect system metrics if observability enabled
-        let system_metrics = if let Some(obs) = &self.observability {
-            obs.get_comprehensive_status().await.ok().map(|s| s.metrics)
-        } else {
-            None
-        };
-
         Ok(AgentEvaluationResult {
             scenario_id: scenario.id,
             success,
@@ -582,7 +545,6 @@ impl AgentEvaluator {
             final_state: run_result.final_state,
             failures,
             warnings,
-            system_metrics,
             timestamp: chrono::Utc::now(),
         })
     }
@@ -852,7 +814,6 @@ mod tests {
     #[tokio::test]
     async fn test_evaluator_creation_without_model() {
         let config = EvaluationConfig {
-            collect_observability: false,
             ..Default::default()
         };
 
@@ -863,7 +824,6 @@ mod tests {
     #[tokio::test]
     async fn test_simple_entity_creation_scenario() {
         let config = EvaluationConfig {
-            collect_observability: false,
             timeout: Duration::from_secs(10),
             verbose: true,
             ..Default::default()
@@ -896,7 +856,6 @@ mod tests {
     #[tokio::test]
     async fn test_rag_retrieval_scenario() {
         let config = EvaluationConfig {
-            collect_observability: false,
             timeout: Duration::from_secs(10),
             ..Default::default()
         };
@@ -923,7 +882,6 @@ mod tests {
     #[tokio::test]
     async fn test_batch_evaluation() {
         let config = EvaluationConfig {
-            collect_observability: false,
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
