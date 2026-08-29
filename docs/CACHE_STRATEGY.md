@@ -368,4 +368,4 @@ If issues arise with Cachix:
 - [Cachix GitHub Action](https://github.com/cachix/cachix-action)
 - [Nanna Coder Cachix Dashboard](https://nanna-coder.cachix.org)
 - [GitHub Actions Cache Documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows)
-- [Issue #18: Cache Strategy Evaluation](https://github.com/DominicBurkart/nanna-coder/issues/18)
+- [Issue #18: Cache Strategy Evaluation](https://github.com/dominicburkart/nanna-coder/issues/18)
