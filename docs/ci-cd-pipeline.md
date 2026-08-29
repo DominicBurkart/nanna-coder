@@ -203,35 +203,11 @@ The pipeline is designed for maximum parallelization and efficiency:
 - **Failure Detection**: Automatic failure reporting
 - **GitHub Integration**: Step Summary with rich formatting
 
-## Performance Optimizations
+## Performance optimizations
 
-### Caching Strategy
-
-#### Multi-Tier Caching
-1. **Cachix Binary Cache**: Persistent, shared across CI runs
-2. **Magic Nix Cache**: GitHub Actions automatic caching
-3. **Cargo Cache**: Rust dependency caching
-4. **Container Cache**: Docker layer caching
-
-#### Cache Configuration
-- **Push Filter**: Excludes source tarballs and nixpkgs
-- **Cache Keys**: Content-addressed for reproducibility
-- **TTL**: 300s for tarball caching
-- **Size Management**: 50GB maximum cache size
-
-### Parallel Execution
-
-#### Matrix Optimization
-- **Fail-Fast Disabled**: Independent job execution
-- **Resource Distribution**: Balanced across runner types
-- **Platform Specialization**: Optimal tool usage per platform
-- **Selective Testing**: Platform-appropriate test suites
-
-#### Build Optimization
-- **Incremental Compilation**: Cargo incremental builds
-- **Parallel Jobs**: Maximum CPU utilization
-- **Cross-Compilation**: Nix-based for Linux, Cargo for macOS
-- **Container Parallelization**: Simultaneous multi-image builds
+- **Caching**: see [CACHE_STRATEGY.md](./CACHE_STRATEGY.md) and [binary-cache-strategy.md](./binary-cache-strategy.md).
+- **Matrix**: `fail-fast` disabled so independent jobs run to completion; platform-appropriate test subsets (e.g., container tests Linux-only).
+- **Build**: Cargo incremental compilation; Nix cross-compilation for Linux targets, Cargo for macOS; container images built in parallel.
 
 ## Monitoring and Observability
 
@@ -302,54 +278,14 @@ The pipeline is designed for maximum parallelization and efficiency:
 
 ## Troubleshooting
 
-### Common Issues
+For cache issues see [CACHE_STRATEGY.md#troubleshooting](./CACHE_STRATEGY.md#troubleshooting). For local reproduction of CI failures:
 
-#### Cache Misses
-1. **Check Cachix Configuration**: Ensure auth token is set
-2. **Verify Cache Keys**: Content-addressed cache validation
-3. **Review Push Filters**: Exclude patterns verification
-4. **Monitor Cache Size**: Storage limit management
-
-#### Cross-Compilation Failures
-1. **Target Validation**: Ensure target is supported
-2. **Dependency Compatibility**: Cross-compilation support
-3. **Fallback Strategy**: Native compilation backup
-4. **Tool Availability**: Cross-compilation toolchain
-
-#### Container Build Issues
-1. **Registry Authentication**: GitHub token permissions
-2. **Base Image Updates**: Dependency availability
-3. **Multi-arch Support**: Platform compatibility
-4. **Resource Limits**: Memory and disk usage
-
-### Debug Commands
-
-#### Local Reproduction
 ```bash
-# Reproduce test issues
-nix develop --command cargo nextest run
-nix run .#dev-check
-
-# Reproduce build issues
-nix build .#nanna-coder
-nix flake check
-
-# Reproduce container issues
-nix build .#qwen3-container
-nix run .#container-test
-```
-
-#### CI Investigation
-```bash
-# Check cache status
-nix run .#cache-analytics
-
-# Verify binary cache
-nix path-info --json .#nanna-coder
-
-# Debug flake configuration
-nix flake show
-nix flake metadata
+nix develop --command cargo nextest run   # tests
+nix build .#nanna-coder                   # build
+nix flake check                           # full flake check
+nix run .#cache-analytics                 # cache status
+nix path-info --json .#nanna-coder        # verify cache
 ```
 
 ## Performance Targets
