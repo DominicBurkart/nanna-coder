@@ -233,4 +233,21 @@ mod tests {
             deserialized.default_context_length
         );
     }
+
+    #[test]
+    fn test_with_max_tokens_sets_field_and_validates() {
+        let config = OllamaConfig::new().with_max_tokens(2048);
+        assert_eq!(config.default_max_tokens, Some(2048));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_tokens() {
+        let config = OllamaConfig {
+            default_max_tokens: Some(0),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("zero max_tokens must error");
+        assert!(err.contains("Max tokens"));
+    }
 }
