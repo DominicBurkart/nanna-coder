@@ -19,8 +19,9 @@
 //! - #24 — runtime instrumentation surface
 //! - #25 — cross-entity correlation / relationship indexing
 //!
-//! Until those land, [`TelemetryEntity::new`] remains a zero-argument
-//! placeholder constructor so that existing call sites (notably
+//! Until those land, [`TelemetryEntity::placeholder`] (alias
+//! [`TelemetryEntity::new`]) remains a zero-argument placeholder
+//! constructor so that existing call sites (notably
 //! `harness::agent::eval`) keep compiling.
 //!
 //! # Do not confuse with `harness::telemetry`
@@ -34,5 +35,17 @@
 pub mod config;
 pub mod types;
 
-pub use config::*;
-pub use types::*;
+// Explicit re-exports (no glob) so the public surface of this module is
+// auditable and so the colliding names that this module shares with
+// `harness::telemetry` (TelemetryError, TelemetryConfig) stay grep-able.
+// Adding glob re-exports actively makes `use harness::entities::telemetry::TelemetryError;`
+// visually indistinguishable from `use harness::telemetry::TelemetryError;` at
+// call sites — which is exactly the confusion the module-level docs warn
+// against.
+pub use config::{
+    load_project_telemetry_config, load_telemetry_config, validate_telemetry_config,
+    AccessControlConfig, CustomMetricKind, CustomMetricSpec, LogsConfig, MetricsConfig,
+    PiiFilterConfig, ProjectTelemetryConfig, RetentionConfig, TelemetryConfig, TelemetryError,
+    TracesConfig,
+};
+pub use types::{TelemetryEntity, TelemetrySample, TelemetrySignalKind};
