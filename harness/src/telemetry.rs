@@ -1044,4 +1044,268 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_traces() {
+        let exporter = PrometheusExporter::new(None);
+
+        // A finished trace (with duration) should produce a metric.
+        let mut trace = TraceContext::new("test_operation");
+        trace.finish();
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("trace_duration_seconds"));
+
+        // A trace without finish() has no duration — no metric should be added.
+        exporter.clear_buffer();
+        let pending_trace = TraceContext::new("pending_op");
+        exporter.export_traces(vec![pending_trace]).await.unwrap();
+        let output2 = exporter.export_prometheus().await.unwrap();
+        assert!(output2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_metrics() {
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "exported_gauge".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 77.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: Some("bytes".to_string()),
+            description: None,
+        };
+
+        exporter.export_metrics(vec![metric]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("exported_gauge 77"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_events() {
+        let exporter = PrometheusExporter::new(None);
+        let event = CustomEvent {
+            name: "user_action".to_string(),
+            timestamp: Utc::now(),
+            category: "user_interaction".to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({"key": "value"}),
+            trace_context: None,
+        };
+
+        exporter.export_events(vec![event]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("custom_events_total"));
+        assert!(output.contains("user_action"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_export_system_metrics() {
+        use crate::monitoring::{
+            CacheMetrics, ErrorMetrics, LatencyMetrics, SystemMetrics, SystemResourceMetrics,
+        };
+
+        let exporter = PrometheusExporter::new(None);
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::from([(
+                "test_service".to_string(),
+                LatencyMetrics {
+                    avg_latency_ms: 100.0,
+                    p95_latency_ms: 200.0,
+                    p99_latency_ms: 300.0,
+                    max_latency_ms: 500.0,
+                    min_latency_ms: 50.0,
+                    request_count: 10,
+                    requests_per_second: 2.5,
+                },
+            )]),
+            cache_metrics: CacheMetrics {
+                hits: 80,
+                misses: 20,
+                hit_rate: 0.8,
+                size_bytes: 1024,
+                item_count: 100,
+                evictions: 5,
+            },
+            container_metrics: vec![],
+            system_resources: SystemResourceMetrics {
+                cpu_usage_percent: 50.0,
+                total_memory_bytes: 8589934592,
+                used_memory_bytes: 4294967296,
+                memory_usage_percent: 50.0,
+                available_disk_bytes: 107374182400,
+                total_disk_bytes: 214748364800,
+                disk_usage_percent: 50.0,
+                load_average: [1.0, 1.2, 1.1],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: vec![],
+            },
+        };
+
+        exporter.export_system_metrics(metrics).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("cache_hit_rate"));
+        assert!(output.contains("request_duration_seconds"));
+        assert!(output.contains("requests_per_second"));
+        assert!(output.contains("error_rate"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_health_check() {
+        let exporter = PrometheusExporter::new(None);
+        assert!(exporter.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+
+        let metric = MetricPoint {
+            name: "temp_metric".to_string(),
+            metric_type: MetricType::Counter,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+        exporter.add_metric(metric);
+        exporter.clear_buffer();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_export_all_with_no_data() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.export_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_export_all_with_metrics_and_events() {
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
+
+        telemetry.record_counter("requests_total", 5.0, vec![("service", "api")]);
+        telemetry.record_event(
+            "deploy",
+            "lifecycle",
+            serde_json::json!({"version": "1.2.3"}),
+        );
+
+        telemetry.export_all().await.unwrap();
+
+        // After export_all the metrics buffer should be drained.
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_prometheus_exporter_returns_none() {
+        let telemetry = TelemetrySystem::new();
+        // Default implementation returns None (no Prometheus exporter configured).
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_methods() {
+        let telemetry = TelemetrySystem::new();
+
+        let trace = telemetry.start_trace("guarded_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+
+        assert!(guard.trace().is_some());
+        guard.record_error("something failed");
+        guard.set_status(SpanStatus::Timeout);
+
+        // Drop automatically finishes and removes the trace.
+        drop(guard);
+
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("environment", "test")
+            .with_global_attribute("region", "us-east-1");
+
+        let trace = telemetry.start_trace("attributed_op");
+        assert_eq!(
+            trace.attributes.get("environment"),
+            Some(&"test".to_string())
+        );
+        assert_eq!(
+            trace.attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+        telemetry.finish_trace(trace);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_with_config() {
+        let config = TelemetryConfig {
+            service: ServiceInfo {
+                name: "custom-service".to_string(),
+                version: "2.0.0".to_string(),
+                environment: "staging".to_string(),
+                instance_id: "i-123".to_string(),
+                metadata: HashMap::new(),
+            },
+            log_level: "debug".to_string(),
+            ..TelemetryConfig::default()
+        };
+
+        let telemetry = TelemetrySystem::new().with_config(config);
+        assert!(telemetry.get_uptime().as_nanos() > 0);
+        assert_eq!(telemetry.config.service.name, "custom-service");
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("test");
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        assert!(telemetry.get_uptime().as_nanos() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_with_no_labels() {
+        // Exercises the empty-labels path in export_prometheus.
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "no_labels_metric".to_string(),
+            metric_type: MetricType::Summary,
+            value: 1.5,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+        exporter.add_metric(metric);
+
+        let output = exporter.export_prometheus().await.unwrap();
+        // Should format as `no_labels_metric 1.5` (no braces).
+        assert!(output.contains("no_labels_metric 1.5"));
+        assert!(!output.contains('{'));
+    }
 }
