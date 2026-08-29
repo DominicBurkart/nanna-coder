@@ -1,7 +1,8 @@
-# Agent Control Flow
+# Agents
+
+## Agent Control Flow
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
-
 
 ## What an agent should NOT do
 
@@ -16,8 +17,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 2. If you are blocked because your architectural decisions yield untestable code, re-architect.
 3. If a CI-environment failure you cannot fix is blocking your tests, escalate by opening a GitHub issue describing the exact missing-test problem.
 
-
-# Agent State Machine
+## Agent State Machine
 
 ```mermaid
 stateDiagram-v2

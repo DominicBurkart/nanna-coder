@@ -565,7 +565,6 @@ impl ObservabilitySystem {
             self.service_name
         );
 
-        // Initialize telemetry
         self.telemetry
             .initialize()
             .await
@@ -573,7 +572,6 @@ impl ObservabilitySystem {
                 reason: e.to_string(),
             })?;
 
-        // Initialize monitoring
         self.monitoring.start_monitoring().await.map_err(|e| {
             ObservabilityError::MonitoringFailed {
                 reason: e.to_string(),
@@ -603,19 +601,16 @@ impl ObservabilitySystem {
                 interval.tick().await;
                 debug!("Performing comprehensive health check");
 
-                // Perform health checks
                 if let Err(e) =
                     Self::perform_health_checks(&health_history, &thresholds, &runtime).await
                 {
                     error!("Health check failed: {}", e);
                 }
 
-                // Analyze performance trends
                 if let Err(e) = Self::analyze_performance_trends().await {
                     error!("Performance trend analysis failed: {}", e);
                 }
 
-                // Check SLA compliance
                 if let Err(e) = Self::check_sla_compliance().await {
                     error!("SLA compliance check failed: {}", e);
                 }
@@ -643,25 +638,12 @@ impl ObservabilitySystem {
         let start_time = Instant::now();
         let trace = self.telemetry.start_trace("get_comprehensive_status");
 
-        // Get base system status
         let system_status = self.monitoring.get_system_status().await?;
-
-        // Get detailed component health
         let component_health = self.get_component_health().await?;
-
-        // Analyze performance trends
         let performance_trends = self.analyze_current_trends(&system_status.metrics)?;
-
-        // Get container summary
         let container_summary = self.get_container_summary().await?;
-
-        // Get model summary
         let model_summary = self.get_model_summary(&system_status.metrics)?;
-
-        // Calculate availability metrics
         let availability_metrics = self.calculate_availability_metrics()?;
-
-        // Convert alerts to enhanced format
         let active_alerts = self.enhance_alerts(system_status.active_alerts).await?;
 
         let comprehensive_status = ComprehensiveStatus {

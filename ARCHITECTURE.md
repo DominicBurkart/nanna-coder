@@ -1,4 +1,6 @@
-# Primary Use-Case (Background Agents Delegate Tasks to Nanna)
+# Architecture
+
+## Primary Use-Case: Background Agents Delegate Tasks to Nanna
 
 ```mermaid
 ---
@@ -51,7 +53,7 @@ flowchart TD
     class NannaModel,OrchestratorModel,OrchestratorSecondaryModel model
 ```
 
-# API
+## API
 
 The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol (protocol revision `2025-11-25`), including the [MCP Tasks extension](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) for long-running operations. External orchestrators connect to Nanna exclusively through this MCP interface. The `delegate` CLI subcommand is a first-party client of the same interface (it drives an in-process server over an in-memory channel), so the CLI and external orchestrators exercise identical wire semantics.
 
@@ -101,7 +103,7 @@ flowchart LR
     class assign_task,onboard_repo,tget,tresult,tlist,tcancel mcp
 ```
 
-# Delegation Sequence
+## Delegation Sequence
 
 ```mermaid
 sequenceDiagram
@@ -119,7 +121,7 @@ sequenceDiagram
     N-->>O: CallToolResult (summary, patch, ...)
 ```
 
-# Harness Control Flow
+## Harness Control Flow
 
 ```mermaid
 ---
@@ -153,7 +155,7 @@ flowchart TD
     classDef Aqua stroke-width:1px, stroke-dasharray:none, stroke:#46EDC8, fill:#DEFFF8, color:#378E7A
 ```
 
-# Container Topology
+## Container Topology
 
 See [TESTING.md](TESTING.md) for the test topology and how each layer is exercised.
 
