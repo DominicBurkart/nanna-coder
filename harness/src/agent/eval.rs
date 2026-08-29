@@ -957,4 +957,104 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_scenario_multi_entity_workflow() {
+        let scenario = EvaluationScenario::multi_entity_workflow();
+        assert_eq!(scenario.category, EvaluationCategory::Workflow);
+        assert_eq!(scenario.id, "multi_entity_workflow");
+        assert_eq!(scenario.expected_outcomes.min_entities_created, 2);
+        assert_eq!(scenario.expected_outcomes.min_relationships_created, 1);
+        assert!(scenario.expected_outcomes.should_complete);
+    }
+
+    #[test]
+    fn test_scenario_decision_quality_test() {
+        let scenario = EvaluationScenario::decision_quality_test();
+        assert_eq!(scenario.category, EvaluationCategory::DecisionMaking);
+        assert_eq!(scenario.id, "decision_quality_test");
+        assert!(scenario.expected_outcomes.min_decision_quality > 0.0);
+        assert!(!scenario.initial_entities.is_empty());
+    }
+
+    #[test]
+    fn test_scenario_rag_retrieval_accuracy_fields() {
+        let scenario = EvaluationScenario::rag_retrieval_accuracy();
+        assert_eq!(scenario.category, EvaluationCategory::RagRetrieval);
+        assert_eq!(scenario.id, "rag_retrieval_accuracy");
+        assert!(!scenario.initial_entities.is_empty());
+        assert!(scenario.expected_outcomes.min_rag_relevance > 0.0);
+    }
+
+    #[test]
+    fn test_evaluation_category_custom_variant() {
+        let cat = EvaluationCategory::Custom("my_category".to_string());
+        match &cat {
+            EvaluationCategory::Custom(name) => assert_eq!(name, "my_category"),
+            _ => panic!("Expected Custom variant"),
+        }
+    }
+
+    #[test]
+    fn test_evaluation_metrics_default() {
+        let metrics = EvaluationMetrics::default();
+        assert_eq!(metrics.iterations_executed, 0);
+        assert_eq!(metrics.entities_created, 0);
+        assert_eq!(metrics.relationships_created, 0);
+        assert_eq!(metrics.decision_quality, 0.0);
+        assert_eq!(metrics.rag_relevance, 0.0);
+        assert_eq!(metrics.entity_accuracy, 0.0);
+        assert_eq!(metrics.prompt_effectiveness, 0.0);
+        assert!(metrics.state_transitions.is_empty());
+        assert!(metrics.validation_results.is_empty());
+        assert!(metrics.custom_metrics.is_empty());
+        assert_eq!(metrics.execution_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_expected_outcomes_default() {
+        let outcomes = ExpectedOutcomes::default();
+        assert!(outcomes.should_complete);
+        assert_eq!(outcomes.min_entities_created, 1);
+        assert_eq!(outcomes.min_relationships_created, 0);
+        assert!(outcomes.min_decision_quality > 0.0);
+        assert!(outcomes.min_rag_relevance > 0.0);
+        assert_eq!(outcomes.final_state, Some(AgentState::Completed));
+    }
+
+    #[test]
+    fn test_evaluation_error_display() {
+        let e1 = EvaluationError::SetupFailed("init failed".to_string());
+        assert!(e1.to_string().contains("init failed"));
+
+        let e2 = EvaluationError::AgentExecutionFailed("crash".to_string());
+        assert!(e2.to_string().contains("crash"));
+
+        let e3 = EvaluationError::ValidationFailed("bad output".to_string());
+        assert!(e3.to_string().contains("bad output"));
+
+        let e4 = EvaluationError::Timeout(Duration::from_secs(42));
+        let msg = e4.to_string();
+        assert!(msg.contains("42") || msg.contains("Timeout") || msg.contains("timeout"));
+    }
+
+    #[test]
+    fn test_evaluation_config_default_values() {
+        let config = EvaluationConfig::default();
+        assert!(!config.model.is_empty());
+        assert!(config.timeout > Duration::ZERO);
+        assert!(!config.verbose);
+        assert!(config.max_retries > 0);
+        assert!(config.collect_observability);
+    }
+
+    #[test]
+    fn test_scenario_serialization_roundtrip() {
+        let scenario = EvaluationScenario::simple_entity_creation();
+        let json = serde_json::to_string(&scenario).expect("serialize scenario");
+        let decoded: EvaluationScenario = serde_json::from_str(&json).expect("deserialize scenario");
+        assert_eq!(decoded.id, scenario.id);
+        assert_eq!(decoded.name, scenario.name);
+        assert_eq!(decoded.category, scenario.category);
+    }
 }
