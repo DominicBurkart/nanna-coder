@@ -85,16 +85,6 @@ impl Onboarder for DeterministicOnboarder {
     }
 }
 
-pub async fn ensure_dev_container(
-    source: &Path,
-    onboarder: &dyn Onboarder,
-) -> Result<PathBuf, OnboardingError> {
-    if !source.join("flake.nix").exists() {
-        onboarder.onboard(source).await?;
-    }
-    image_builder::build_dev_container(source).map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,22 +145,5 @@ edition = "2021"
         assert!(result.flake_path.ends_with("flake.nix"));
         let written = fs::read_to_string(&result.flake_path).unwrap();
         assert_eq!(written, result.flake_content);
-    }
-
-    #[tokio::test]
-    async fn ensure_dev_container_skips_onboarding_when_flake_exists() {
-        let dir = TempDir::new().unwrap();
-        write_file(&dir, "flake.nix", "{}");
-
-        struct NeverOnboarder;
-        #[async_trait]
-        impl Onboarder for NeverOnboarder {
-            async fn onboard(&self, _: &Path) -> Result<OnboardingResult, OnboardingError> {
-                panic!("onboard should not be called when flake.nix exists");
-            }
-        }
-
-        let result = ensure_dev_container(dir.path(), &NeverOnboarder).await;
-        assert!(result.is_err());
     }
 }
