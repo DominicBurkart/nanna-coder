@@ -10,19 +10,19 @@ Overview of the Nanna Coder Proof of Concept: a containerized AI assistant syste
 
 | Phase | Component | Status | Success Criteria Met |
 |-------|-----------|---------|---------------------|
-| **1.1** | ModelJudge Framework | ✅ **COMPLETE** | ✅ Automated quality validation, ✅ Multi-criteria assessment |
-| **1.2** | Container Runtime Detection | ✅ **COMPLETE** | ✅ Podman/Docker/Mock fallback, ✅ Robust error handling |
-| **2.1** | Multi-Model Caching System | ✅ **COMPLETE** | ✅ Content-addressed storage, ✅ Multiple model support |
-| **2.2** | Binary Cache Strategy | ✅ **COMPLETE** | ✅ Cachix integration, ✅ CI/CD optimization |
-| **3.1** | Development Experience | ✅ **COMPLETE** | ✅ Comprehensive utilities, ✅ Pre-commit hooks |
-| **3.2** | CI/CD Pipeline Enhancement | ✅ **COMPLETE** | ✅ Parallel execution (~30 jobs), ✅ Multi-platform |
-| **4.1** | E2E Integration Tests | ✅ **COMPLETE** | ✅ Complete workflow validation, ✅ ModelJudge integration |
-| **4.2** | Monitoring & Observability | ✅ **COMPLETE** | ✅ Telemetry, ✅ Alerting, ✅ Health monitoring |
-| **5.1** | Documentation | ✅ **COMPLETE** | ✅ Comprehensive guides, ✅ API documentation |
+| 1.1 | ModelJudge Framework | Complete | Automated quality validation; multi-criteria assessment |
+| 1.2 | Container Runtime Detection | Complete | Podman/Docker/Mock fallback; error handling |
+| 2.1 | Multi-Model Caching System | Complete | Content-addressed storage; multiple model support |
+| 2.2 | Binary Cache Strategy | Complete | Cachix integration; CI/CD optimization |
+| 3.1 | Development Experience | Complete | Utilities; pre-commit hooks |
+| 3.2 | CI/CD Pipeline Enhancement | Complete | Parallel execution (~30 jobs); multi-platform |
+| 4.1 | E2E Integration Tests | Complete | Workflow validation; ModelJudge integration |
+| 4.2 | Monitoring & Observability | Complete | Telemetry; alerting; health monitoring |
+| 5.1 | Documentation | Complete | Guides; API documentation |
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ### High-Level Architecture
 
@@ -69,7 +69,7 @@ graph TB
 
 ### Core Components
 
-#### 🤖 ModelJudge Framework (`model/src/judge.rs`)
+#### ModelJudge Framework ([`model/src/judge.rs`](../model/src/judge.rs))
 - **Purpose**: Automated AI model quality validation and assessment
 - **Features**:
   - API responsiveness validation with latency thresholds
@@ -79,7 +79,7 @@ graph TB
   - Retry logic with exponential backoff and jitter
 - **Integration**: Used throughout E2E tests and quality gates
 
-#### 📦 Container Infrastructure (`harness/src/container.rs`)
+#### Container Infrastructure ([`harness/src/container.rs`](../harness/src/container.rs))
 - **Purpose**: Robust containerized testing environment
 - **Features**:
   - Multi-runtime support (Podman, Docker, Mock fallback)
@@ -88,7 +88,7 @@ graph TB
   - Container orchestration for testing
 - **Benefits**: Reproducible testing, isolated environments
 
-#### 🗄️ Multi-Model Caching System (`flake.nix`)
+#### Multi-Model Caching System ([`flake.nix`](../flake.nix))
 - **Purpose**: Efficient model storage and retrieval
 - **Features**:
   - Content-addressed model storage
@@ -101,7 +101,7 @@ graph TB
   - `mistral:7b` (4.1GB) - Alternative model
   - `gemma:2b` (1.4GB) - Lightweight model
 
-#### 📊 Monitoring & Observability (`harness/src/{monitoring,telemetry,observability}.rs`)
+#### Monitoring & Observability (`harness/src/{monitoring,telemetry,observability}.rs`)
 - **Monitoring System**: Metrics collection, health checks, alerting
 - **Telemetry System**: Distributed tracing, custom events, Prometheus export
 - **Observability System**: Comprehensive status reporting, trend analysis
@@ -114,7 +114,7 @@ graph TB
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### Prerequisites
 - Nix with flakes enabled
@@ -159,7 +159,7 @@ println!("System health: {:?}", status.overall_health);
 
 ---
 
-## 🧪 Testing Strategy
+## Testing Strategy
 
 ### Test Architecture
 
@@ -195,12 +195,12 @@ graph LR
 
 | Component | Unit Tests | Integration Tests | E2E Tests | Coverage |
 |-----------|------------|-------------------|-----------|----------|
-| **ModelJudge** | ✅ 8 tests | ✅ Validation suite | ✅ Complete workflow | 95%+ |
-| **Container Management** | ✅ 6 tests | ✅ Runtime detection | ✅ Multi-container | 90%+ |
-| **Monitoring** | ✅ 5 tests | ✅ Health checks | ✅ Alert processing | 85%+ |
-| **Telemetry** | ✅ 8 tests | ✅ Export formats | ✅ Trace correlation | 90%+ |
-| **Observability** | ✅ 5 tests | ✅ Status reporting | ✅ Trend analysis | 85%+ |
-| **Tools** | ✅ 3 tests | ✅ Registry ops | ✅ Model integration | 95%+ |
+| ModelJudge | 8 tests | Validation suite | Complete workflow | 95%+ |
+| Container Management | 6 tests | Runtime detection | Multi-container | 90%+ |
+| Monitoring | 5 tests | Health checks | Alert processing | 85%+ |
+| Telemetry | 8 tests | Export formats | Trace correlation | 90%+ |
+| Observability | 5 tests | Status reporting | Trend analysis | 85%+ |
+| Tools | 3 tests | Registry ops | Model integration | 95%+ |
 
 ### E2E Test Scenarios
 
@@ -224,18 +224,18 @@ graph LR
 
 ---
 
-## 📈 Performance Benchmarks
+## Performance Benchmarks
 
 ### System Performance Targets
 
-| Metric | Target | Current | Status |
-|--------|--------|---------|--------|
-| **Cache Hit Rate** | >85% | ~90% | ✅ **EXCEEDS** |
-| **API Response Time** | <2000ms | ~150ms | ✅ **EXCEEDS** |
-| **Error Rate** | <5% | <1% | ✅ **EXCEEDS** |
-| **Container Startup** | <30s | ~15s | ✅ **EXCEEDS** |
-| **Test Suite Runtime** | <5min | ~2min | ✅ **EXCEEDS** |
-| **Pipeline Completion** | <20min | ~15min | ✅ **EXCEEDS** |
+| Metric | Target | Current |
+|--------|--------|---------|
+| Cache Hit Rate | >85% | ~90% |
+| API Response Time | <2000ms | ~150ms |
+| Error Rate | <5% | <1% |
+| Container Startup | <30s | ~15s |
+| Test Suite Runtime | <5min | ~2min |
+| Pipeline Completion | <20min | ~15min |
 
 ### Caching Performance
 
@@ -260,7 +260,7 @@ Pipeline Execution Matrix:
 
 ---
 
-## 🏛️ Production Deployment
+## Production Deployment
 
 ### Container Registry Strategy
 
@@ -308,7 +308,7 @@ SLA Targets:
 
 ---
 
-## 🔧 Development Utilities
+## Development Utilities
 
 ### Available Commands
 
@@ -339,40 +339,40 @@ Pre-commit Validation Pipeline:
 
 ---
 
-## 📊 Success Metrics & KPIs
+## Success Metrics & KPIs
 
 ### Technical Success Metrics
 
-| Category | Metric | Target | Achieved | Status |
-|----------|--------|---------|----------|--------|
-| **Quality** | Test Coverage | >90% | 95%+ | ✅ **EXCEEDED** |
-| **Performance** | Build Time | <5min | 2-3min | ✅ **EXCEEDED** |
-| **Reliability** | Test Pass Rate | >95% | 100% | ✅ **EXCEEDED** |
-| **Maintainability** | Code Quality | A+ | A+ | ✅ **ACHIEVED** |
-| **Scalability** | Parallel Jobs | 20+ | ~30 | ✅ **EXCEEDED** |
-| **Efficiency** | Cache Hit Rate | >80% | >85% | ✅ **EXCEEDED** |
+| Category | Metric | Target | Achieved |
+|----------|--------|---------|----------|
+| Quality | Test Coverage | >90% | 95%+ |
+| Performance | Build Time | <5min | 2-3min |
+| Reliability | Test Pass Rate | >95% | 100% |
+| Maintainability | Code Quality | A+ | A+ |
+| Scalability | Parallel Jobs | 20+ | ~30 |
+| Efficiency | Cache Hit Rate | >80% | >85% |
 
 ### Model Judge Success Metrics
 
-| Validation Type | Success Rate | Average Response Time | Quality Score |
-|-----------------|--------------|----------------------|---------------|
-| **API Responsiveness** | 100% | ~150ms | ✅ Excellent |
-| **Response Quality** | 95%+ | ~2.5s | ✅ High Quality |
-| **Tool Calling** | 90%+ | ~3.0s | ✅ Functional |
-| **Consistency** | 88%+ | ~5.0s | ✅ Reliable |
+| Validation Type | Success Rate | Average Response Time |
+|-----------------|--------------|----------------------|
+| API Responsiveness | 100% | ~150ms |
+| Response Quality | 95%+ | ~2.5s |
+| Tool Calling | 90%+ | ~3.0s |
+| Consistency | 88%+ | ~5.0s |
 
-### Business Value Delivered
+### Value Delivered
 
-1. **🚀 Rapid Development**: 5x faster iteration cycles
-2. **🛡️ Quality Assurance**: Automated validation prevents regressions
-3. **📈 Scalability**: Supports multiple models and environments
-4. **🔧 Maintainability**: Comprehensive tooling and documentation
-5. **💰 Cost Efficiency**: Optimized caching reduces compute costs
-6. **🌐 Production Ready**: Full observability and monitoring
+1. Rapid Development: 5x faster iteration cycles
+2. Quality Assurance: automated validation prevents regressions
+3. Scalability: supports multiple models and environments
+4. Maintainability: tooling and documentation
+5. Cost Efficiency: optimized caching reduces compute costs
+6. Production Ready: full observability and monitoring
 
 ---
 
-## 🎯 ModelJudge Framework Deep Dive
+## ModelJudge Framework Deep Dive
 
 ### Validation Pipeline
 
@@ -421,14 +421,14 @@ let result = provider.validate_response_quality(
 
 match result {
     ValidationResult::Success { metrics, .. } => {
-        println!("✅ Quality validated: coherence={:.2}, relevance={:.2}",
+        println!("Quality validated: coherence={:.2}, relevance={:.2}",
                 metrics.coherence_score.unwrap_or(0.0),
                 metrics.relevance_score.unwrap_or(0.0));
     }
     ValidationResult::Failure { message, suggestions, .. } => {
-        println!("❌ Quality check failed: {}", message);
+        println!("Quality check failed: {}", message);
         for suggestion in suggestions {
-            println!("   💡 {}", suggestion);
+            println!("   - {}", suggestion);
         }
     }
 }
@@ -436,7 +436,7 @@ match result {
 
 ---
 
-## 🔍 Troubleshooting Guide
+## Troubleshooting Guide
 
 ### Common Issues & Solutions
 
@@ -502,7 +502,7 @@ time dev-build                # Build performance
 
 ---
 
-## 📚 API Documentation
+## API Documentation
 
 ### ModelJudge API
 
@@ -578,47 +578,47 @@ let handle = start_container_with_fallback(&config).await?;
 
 ---
 
-## 🏆 Project Achievements
+## Project Achievements
 
-### ✅ Completed Deliverables
+### Completed Deliverables
 
-1. **🤖 Model Validation Framework**
-   - Comprehensive ModelJudge trait implementation
+1. Model Validation Framework
+   - ModelJudge trait implementation
    - Multi-criteria quality assessment
    - Automated performance validation
    - Consistency and reliability testing
 
-2. **📦 Container Infrastructure**
+2. Container Infrastructure
    - Multi-runtime support (Podman/Docker/Mock)
-   - Intelligent fallback strategies
+   - Fallback strategies
    - Health monitoring and automatic cleanup
    - Reproducible test environments
 
-3. **🗄️ Advanced Caching System**
+3. Caching System
    - Content-addressed model storage
    - Multi-model cache management
    - Nix-based reproducible builds
    - Binary cache optimization for CI/CD
 
-4. **📊 Production-Grade Monitoring**
-   - Comprehensive metrics collection
+4. Production-Grade Monitoring
+   - Metrics collection
    - Distributed tracing and telemetry
    - Multi-level alerting with escalation
    - Real-time health monitoring
 
-5. **🚀 Developer Experience**
-   - Rich development utilities
+5. Developer Experience
+   - Development utilities
    - Pre-commit validation pipeline
-   - Comprehensive testing framework
+   - Testing framework
    - Automated quality gates
 
-6. **🔄 CI/CD Excellence**
+6. CI/CD
    - Parallel execution matrix (~30 jobs)
    - Multi-platform builds (Linux/macOS/Windows)
    - Cross-architecture support (x86_64/aarch64)
-   - Optimized caching strategies
+   - Caching strategies
 
-### 🎖️ Success Metrics Achieved
+### Success Metrics Achieved
 
 - **100% Phase Completion**: All 11 planned phases delivered
 - **95%+ Test Coverage**: Comprehensive test suite with high coverage
@@ -629,7 +629,7 @@ let handle = start_container_with_fallback(&config).await?;
 
 ---
 
-## 🚀 Next Steps & Future Enhancements
+## Next Steps & Future Enhancements
 
 ### Immediate Opportunities
 1. **GPU Acceleration**: CUDA/ROCm support for larger models
@@ -647,7 +647,7 @@ let handle = start_container_with_fallback(&config).await?;
 
 ---
 
-## 📞 Support & Contact
+## Support & Contact
 
 ### Documentation
 - **System Overview**: This document
