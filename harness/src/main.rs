@@ -373,6 +373,27 @@ async fn store_repo_guidance_entity(
     }
 }
 
+/// Records a task failure caused by a tool execution error.
+///
+/// Appends both the assistant message that triggered the failing tool call and
+/// a `tool_response` message carrying the error text to `messages`, so the
+/// conversation history accurately reflects what happened. This mirrors the
+/// successful-execution path and is called from every site that handles an
+/// `Err` arm after [`ToolRegistry::execute`].
+fn record_task_failure(
+    messages: &mut Vec<ChatMessage>,
+    assistant_message: ChatMessage,
+    tool_call_id: String,
+    error: &dyn std::error::Error,
+) {
+    error!("Tool execution failed: {}", error);
+    messages.push(assistant_message);
+    messages.push(ChatMessage::tool_response(
+        tool_call_id,
+        format!("Error: {}", error),
+    ));
+}
+
 async fn single_chat(
     provider: &OllamaProvider,
     tool_registry: &ToolRegistry,
@@ -422,12 +443,12 @@ async fn single_chat(
                         ));
                     }
                     Err(e) => {
-                        error!("Tool execution failed: {}", e);
-                        messages.push(choice.message.clone());
-                        messages.push(ChatMessage::tool_response(
+                        record_task_failure(
+                            &mut messages,
+                            choice.message.clone(),
                             tool_call.id.clone(),
-                            format!("Error: {}", e),
-                        ));
+                            &e,
+                        );
                     }
                 }
             }
@@ -520,12 +541,12 @@ async fn interactive_chat<S: EntityStore + Send>(
                             ));
                         }
                         Err(e) => {
-                            error!("Tool execution failed: {}", e);
-                            messages.push(choice.message.clone());
-                            messages.push(ChatMessage::tool_response(
+                            record_task_failure(
+                                &mut messages,
+                                choice.message.clone(),
                                 tool_call.id.clone(),
-                                format!("Error: {}", e),
-                            ));
+                                &e,
+                            );
                         }
                     }
                 }
@@ -584,11 +605,11 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     match provider.health_check().await {
         Ok(()) => {
-            println!("✓ Health check passed. Ollama is running and accessible.");
+            println!("\u{2713} Health check passed. Ollama is running and accessible.");
             info!("Health check successful");
         }
         Err(e) => {
-            println!("✗ Health check failed: {}", e);
+            println!("\u{2717} Health check failed: {}", e);
             error!("Health check failed: {}", e);
             return Err(e.into());
         }
