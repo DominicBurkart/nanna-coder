@@ -621,6 +621,7 @@ impl AgentEvaluator {
                     line_count: 0,
                 }),
                 EntityType::Env => Box::new(crate::entities::env::types::EnvEntity::new()),
+                EntityType::Lint => Box::new(crate::entities::test::types::LintResultEntity::new()),
                 EntityType::Telemetry => {
                     Box::new(crate::entities::telemetry::types::TelemetryEntity::new())
                 }
