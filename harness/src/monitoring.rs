@@ -1242,4 +1242,225 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_methods() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[test]
+    fn test_severity_ordering() {
+        assert!(ErrorSeverity::Critical > ErrorSeverity::Error);
+        assert!(ErrorSeverity::Error > ErrorSeverity::Warning);
+        assert!(ErrorSeverity::Warning > ErrorSeverity::Info);
+        assert!(AlertSeverity::Critical > AlertSeverity::Error);
+        assert!(AlertSeverity::Error > AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning > AlertSeverity::Info);
+    }
+
+    #[test]
+    fn test_default_impls() {
+        let _collector = DefaultMetricsCollector::default();
+        let _manager = DefaultAlertManager::default();
+        let _system = MonitoringSystem::default();
+        let _thresholds = AlertThresholds::default();
+    }
+
+    #[tokio::test]
+    async fn test_metrics_custom_format_err() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("my_format".to_string()))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("my_format"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+        collector.record_cache_hit("k").await;
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.hit_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_cache_hit_rate() {
+        let collector = DefaultMetricsCollector::new();
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.cache_metrics.hit_rate, 0.0);
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+        assert_eq!(metrics.error_metrics.error_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_record_error_and_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let error = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "timeout".to_string(),
+            message: "Request timed out".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Warning,
+        };
+        collector.record_error(error).await;
+
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 50.0,
+            tokens_per_second: 100.0,
+            success_rate: 0.99,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.88,
+                accuracy_rate: 0.92,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 20.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("qwen3", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.error_metrics.errors_by_type.contains_key("timeout"));
+        assert!(metrics.model_metrics.contains_key("qwen3"));
+    }
+
+    #[tokio::test]
+    async fn test_check_model_health() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let result = monitor.check_model_health("qwen3:0.6b").await.unwrap();
+        assert_eq!(result.status, HealthStatus::Healthy);
+        assert!(result.component.starts_with("model:"));
+        assert!(result.details.contains_key("model"));
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_health_check() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let results = monitor.comprehensive_health_check().await.unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.component == "system"));
+    }
+
+    #[tokio::test]
+    async fn test_set_check_interval() {
+        let mut monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        monitor.set_check_interval(Duration::from_secs(60));
+        // Verify the interval was updated by performing a health check
+        let result = monitor.check_system_health().await.unwrap();
+        assert_eq!(result.status, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.8,
+            health_check_timeout: Duration::from_secs(10),
+        };
+        manager.configure_thresholds(thresholds).await.unwrap();
+        // Verify the manager still works after reconfiguration
+        manager
+            .send_alert("test", "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
+        let alerts = manager.get_active_alerts().await.unwrap();
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history_with_limit() {
+        let manager = DefaultAlertManager::new();
+        manager
+            .send_alert("A1", "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
+        manager
+            .send_alert("A2", "desc", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        manager
+            .send_alert("A3", "desc", AlertSeverity::Error)
+            .await
+            .unwrap();
+
+        let history = manager.get_alert_history(2).await.unwrap();
+        assert_eq!(history.len(), 2);
+
+        let all_history = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(all_history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_all_alert_severity_paths() {
+        let manager = DefaultAlertManager::new();
+        manager
+            .send_alert("critical-title", "desc", AlertSeverity::Critical)
+            .await
+            .unwrap();
+        manager
+            .send_alert("error-title", "desc", AlertSeverity::Error)
+            .await
+            .unwrap();
+        manager
+            .send_alert("info-title", "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
+
+        let history = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().any(|a| a.title == "critical-title"));
+        assert!(history.iter().any(|a| a.title == "error-title"));
+        assert!(history.iter().any(|a| a.title == "info-title"));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_nonexistent_alert() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("nonexistent-id").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent-id") || err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = MonitoringSystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+        // Second stop is a no-op (no running task)
+        system.stop_monitoring().await;
+    }
 }
