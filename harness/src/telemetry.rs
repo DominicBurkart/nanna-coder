@@ -1044,4 +1044,223 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[test]
+    fn test_telemetry_config_default() {
+        let config = TelemetryConfig::default();
+        assert_eq!(config.service.name, "nanna-coder");
+        assert_eq!(config.service.version, "0.1.0");
+        assert_eq!(config.service.environment, "development");
+        assert!(config.enable_logging);
+        assert!(config.enable_tracing);
+        assert!(config.enable_metrics);
+        assert_eq!(config.log_level, "info");
+        assert_eq!(config.trace_sample_rate, 1.0);
+    }
+
+    #[test]
+    fn test_trace_with_attribute() {
+        let trace = TraceContext::new("test_op")
+            .with_attribute("key1", "value1")
+            .with_attribute("key2", "value2");
+        assert_eq!(trace.attributes.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_trace_set_status() {
+        let mut trace = TraceContext::new("test_op");
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_and_health_check() {
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "test_gauge".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        };
+        exporter.add_metric(metric);
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(!output.is_empty());
+
+        exporter.clear_buffer();
+        let output_after = exporter.export_prometheus().await.unwrap();
+        assert!(output_after.is_empty());
+
+        let healthy = exporter.health_check().await.unwrap();
+        assert!(healthy);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_export_finished_traces() {
+        let exporter = PrometheusExporter::new(None);
+        let mut trace = TraceContext::new("traced_op");
+        trace.finish();
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("trace_duration_seconds"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_export_unfinished_trace_skipped() {
+        let exporter = PrometheusExporter::new(None);
+        let trace = TraceContext::new("unfinished_op");
+        exporter.export_traces(vec![trace]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_export_events() {
+        let exporter = PrometheusExporter::new(None);
+        let event = CustomEvent {
+            name: "user_action".to_string(),
+            timestamp: Utc::now(),
+            category: "ux".to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({}),
+            trace_context: None,
+        };
+        exporter.export_events(vec![event]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("custom_events_total"));
+        assert!(output.contains("event_name=\"user_action\""));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_trait_export_metrics() {
+        let exporter = PrometheusExporter::new(None);
+        let metric = MetricPoint {
+            name: "api_calls".to_string(),
+            metric_type: MetricType::Counter,
+            value: 10.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: Some("calls".to_string()),
+            description: Some("API call count".to_string()),
+        };
+        exporter.export_metrics(vec![metric]).await.unwrap();
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(output.contains("api_calls"));
+    }
+
+    #[test]
+    fn test_telemetry_builder_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_service_name("my-service")
+            .with_version("2.0.0")
+            .with_environment("staging")
+            .with_global_attribute("region", "eu-west-1");
+
+        assert_eq!(telemetry.config.service.name, "my-service");
+        assert_eq!(telemetry.config.service.version, "2.0.0");
+        assert_eq!(telemetry.config.service.environment, "staging");
+        assert_eq!(
+            telemetry.config.global_attributes.get("region"),
+            Some(&"eu-west-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_telemetry_uptime_and_prometheus_exporter_none() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        assert!(uptime.as_secs() < 10);
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[test]
+    fn test_add_exporter() {
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(PrometheusExporter::new(None)));
+        assert_eq!(telemetry.exporters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_export_all_clears_buffers() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("test_metric", 1.0, vec![]);
+        telemetry.record_event("test_event", "category", serde_json::json!({}));
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+
+        telemetry.export_all().await.unwrap();
+
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+        let events = telemetry.events_buffer.lock().unwrap();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_drop_finishes_trace() {
+        let telemetry = TelemetrySystem::new();
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+
+        {
+            let trace = telemetry.start_trace("guarded_op");
+            let _guard = TraceGuard::new(&telemetry, trace);
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+        }
+
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_methods() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("error_op");
+        let mut guard = TraceGuard::new(&telemetry, trace);
+
+        assert!(guard.trace().is_some());
+
+        guard.record_error("something failed");
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
+
+        guard.set_status(SpanStatus::Timeout);
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_with_config() {
+        let custom_config = TelemetryConfig {
+            service: crate::telemetry::ServiceInfo {
+                name: "custom-svc".to_string(),
+                version: "3.0.0".to_string(),
+                environment: "prod".to_string(),
+                instance_id: "i-001".to_string(),
+                metadata: HashMap::new(),
+            },
+            enable_logging: false,
+            enable_tracing: true,
+            enable_metrics: true,
+            log_level: "warn".to_string(),
+            metrics_export_interval: Duration::from_secs(30),
+            trace_sample_rate: 0.5,
+            export_endpoints: crate::telemetry::ExportEndpoints {
+                prometheus_endpoint: None,
+                otlp_endpoint: None,
+                webhook_endpoints: vec![],
+                log_endpoint: None,
+            },
+            global_attributes: HashMap::new(),
+        };
+
+        let telemetry = TelemetrySystem::new().with_config(custom_config);
+        assert_eq!(telemetry.config.service.name, "custom-svc");
+        assert!(!telemetry.config.enable_logging);
+        assert_eq!(telemetry.config.trace_sample_rate, 0.5);
+    }
 }
