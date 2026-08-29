@@ -1,16 +1,20 @@
 //! Focused unit tests for gaps identified in harness/src/tools.rs.
 //!
 //! Coverage added:
-//! - `CalculatorTool`: subtract, multiply, and unknown-operation error (previously only add +
-//!   divide-by-zero were tested)
-//! - `ToolRegistry::execute`: `ToolError::NotFound` path when the tool name is unknown
+//! - `CalculatorTool`: subtract, multiply, divide, and unknown-operation error
+//! - `ToolRegistry::execute`: `ToolError::NotFound` path; `list_tools`; `get_definitions`
 //! - `WriteFileTool`: path-traversal security rejection via `..` components
 //! - `ReadFileTool`: IO error on missing file; `start_line`-only (no `end_line`); line-number
 //!   prefix format in returned content
+//! - `PrStatusData::to_l0`: GitHubStatus variants, closed PR status, ahead branch, zero staleness
+//! - `PrStatusData::to_l1`: github, staleness-None, diff-no-data, ci-unknown-status branches
 //! - `TaskId`: `Display` / `fmt` implementation
 
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    CalculatorTool, GitHubStatus, PrStatusData, ReadFileTool, Tool, ToolError, ToolRegistry,
+    WriteFileTool,
+};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -235,6 +239,215 @@ async fn read_file_start_line_1_returns_all_lines() {
     assert_eq!(
         result["lines_shown"], 3,
         "start_line=1 should return all 3 lines"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CalculatorTool – divide (non-zero divisor)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn calculator_divide_non_zero() {
+    let tool = CalculatorTool::new();
+    let result = tool
+        .execute(json!({ "operation": "divide", "a": 10.0, "b": 4.0 }))
+        .await
+        .expect("non-zero divide should succeed");
+    assert_eq!(result["result"], 2.5);
+    assert_eq!(result["operation"], "divide");
+}
+
+// ---------------------------------------------------------------------------
+// ToolRegistry – list_tools and get_definitions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_registry_list_tools_returns_registered_names() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(CalculatorTool::new()));
+    let names = registry.list_tools();
+    assert!(
+        names.contains(&"calculate"),
+        "expected calculate in list, got: {names:?}"
+    );
+}
+
+#[test]
+fn tool_registry_get_definitions_returns_definitions() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(CalculatorTool::new()));
+    let defs = registry.get_definitions();
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].function.name, "calculate");
+}
+
+// ---------------------------------------------------------------------------
+// PrStatusData::to_l0 – uncovered branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pr_status_l0_github_no_token() {
+    let data = PrStatusData {
+        head_sha: Some("abc".to_string()),
+        has_upstream: false,
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:unconfigured]"),
+        "expected [github:unconfigured] in: {l0}"
+    );
+}
+
+#[test]
+fn pr_status_l0_github_api_error() {
+    let data = PrStatusData {
+        head_sha: Some("abc".to_string()),
+        has_upstream: false,
+        github_status: GitHubStatus::ApiError("rate limited".to_string()),
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(
+        l0.contains("[github:error]"),
+        "expected [github:error] in: {l0}"
+    );
+}
+
+#[test]
+fn pr_status_l0_closed_pr_status() {
+    let data = PrStatusData {
+        pr_number: Some(7),
+        pr_status: Some("closed".to_string()),
+        has_upstream: true,
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("closed"), "expected closed in: {l0}");
+}
+
+#[test]
+fn pr_status_l0_ahead_branch() {
+    let data = PrStatusData {
+        pr_number: Some(5),
+        has_upstream: true,
+        ahead: Some(2),
+        behind: Some(0),
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(l0.contains("ahead:2"), "expected ahead:2 in: {l0}");
+}
+
+#[test]
+fn pr_status_l0_zero_staleness_not_shown() {
+    let data = PrStatusData {
+        pr_number: Some(1),
+        has_upstream: true,
+        staleness_days: Some(0),
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let l0 = data.to_l0();
+    assert!(
+        !l0.contains('d'),
+        "zero staleness days must not appear in: {l0}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PrStatusData::to_l1 – uncovered branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pr_status_l1_github_connected() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::Connected,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("connected"),
+        "expected 'connected' in: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_github_no_token() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::NoToken,
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("not configured") || detail.contains("GITHUB_TOKEN"),
+        "expected token guidance in: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_github_api_error() {
+    let data = PrStatusData {
+        github_status: GitHubStatus::ApiError("timeout".to_string()),
+        ..Default::default()
+    };
+    let detail = data.to_l1("github").unwrap();
+    assert!(
+        detail.contains("timeout"),
+        "expected error message in: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_staleness_none() {
+    let data = PrStatusData::default();
+    let detail = data.to_l1("staleness").unwrap();
+    assert_eq!(detail, "Staleness data not available.");
+}
+
+#[test]
+fn pr_status_l1_diff_no_data() {
+    let data = PrStatusData::default(); // additions and deletions are None
+    let detail = data.to_l1("diff").unwrap();
+    assert!(
+        detail.contains("no diff data"),
+        "expected 'no diff data' when additions/deletions are None, got: {detail}"
+    );
+}
+
+#[test]
+fn pr_status_l1_diff_with_stats_no_files() {
+    let data = PrStatusData {
+        additions: Some(10),
+        deletions: Some(5),
+        changed_files: vec![],
+        ..Default::default()
+    };
+    let detail = data.to_l1("diff").unwrap();
+    assert!(
+        detail.contains("+10/-5"),
+        "expected diff stats in: {detail}"
+    );
+    assert!(
+        !detail.contains("Changed files"),
+        "no file list when changed_files is empty"
+    );
+}
+
+#[test]
+fn pr_status_l1_ci_none_status_shows_unknown() {
+    let data = PrStatusData {
+        ci_status: None,
+        ci_failing_checks: vec![],
+        ..Default::default()
+    };
+    let detail = data.to_l1("ci").unwrap();
+    assert!(
+        detail.contains("unknown"),
+        "expected 'unknown' for None ci_status, got: {detail}"
     );
 }
 
