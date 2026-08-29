@@ -23,6 +23,14 @@
 #   --yes               Don't prompt; assume yes for sudo notices.
 #   --no-claude-mcp     Don't register nanna-coder as a Claude Code MCP server even
 #                       if a Claude Code config is detected.
+#   --force-wsl         On WSL2, proceed even if systemd is not detected as active.
+#                       Default behavior on WSL2: probe for systemd; if missing,
+#                       die with an actionable error pointing at /etc/wsl.conf.
+#                       Use this flag if you have a non-systemd workaround
+#                       (e.g. rootless podman with custom netns plumbing).
+#   --branch <name>     No-op accepted for compatibility with scripts/install.ps1,
+#                       which forwards its --Branch parameter to this script when
+#                       delegating into WSL2. Recorded in plan output for parity.
 #   -h, --help          Show this help.
 #
 # What this script does (in order):
@@ -48,6 +56,8 @@ NO_PULL=0
 DRY_RUN=0
 ASSUME_YES=0
 NO_CLAUDE_MCP=0
+FORCE_WSL=0
+BRANCH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,7 +72,9 @@ while [[ $# -gt 0 ]]; do
     --ollama-image)    OLLAMA_IMAGE_OVERRIDE="$2"; shift 2;;
     --yes|-y)          ASSUME_YES=1; shift;;
     --no-claude-mcp)   NO_CLAUDE_MCP=1; shift;;
-    -h|--help)         sed -n '2,32p' "$0" 2>/dev/null || true; exit 0;;
+    --force-wsl)       FORCE_WSL=1; shift;;
+    --branch)          BRANCH="$2"; shift 2;;
+    -h|--help)         sed -n '2,40p' "$0" 2>/dev/null || true; exit 0;;
     *) echo "unknown flag: $1" >&2; exit 64;;
   esac
 done
@@ -89,38 +101,87 @@ notify_sudo() {
   # The wizard's plan + confirmation already covered the sudo step. Print
   # a short banner so the user knows this is the privileged moment, but
   # don't double-prompt; sudo itself will ask for the password.
-  printf '\n%s┌─ sudo step ─────────────────────────────────────%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
+  printf '\n%s┌─ sudo step ──────────────────────────────────%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
   printf '%s│%s component: %s\n' "$C_YELLOW" "$C_RESET" "$1"
   printf '%s│%s reason:    %s\n' "$C_YELLOW" "$C_RESET" "$2"
-  printf '%s└─────────────────────────────────────────────────%s\n\n' "$C_YELLOW" "$C_RESET"
+  printf '%s└───────────────────────────────────────────────%s\n\n' "$C_YELLOW" "$C_RESET"
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
 is_wsl() { [[ -r /proc/version ]] && grep -qiE 'microsoft|wsl' /proc/version; }
 
+# Probe whether systemd is the running PID-1 / active inside this WSL distro.
+# WSL2 only routes /run/netns bind mounts through podman's pod infra container
+# correctly when systemd is enabled (`[boot] systemd=true` in /etc/wsl.conf,
+# applied after `wsl --shutdown`). Without systemd, `podman pod create` fails
+# with "failed to bind mount ns at /run/netns/...: invalid argument".
+#
+# We accept any of:
+#   - PID 1's comm is "systemd" (most reliable signal)
+#   - `systemctl is-system-running` returns one of the live states
+#   - /run/systemd/system exists (tmpfs marker created by systemd at boot)
+is_wsl_systemd_active() {
+  if [[ -r /proc/1/comm ]] && grep -qx 'systemd' /proc/1/comm 2>/dev/null; then
+    return 0
+  fi
+  if have systemctl; then
+    local state
+    state="$(systemctl is-system-running 2>/dev/null || true)"
+    case "$state" in
+      running|degraded|starting|maintenance) return 0 ;;
+    esac
+  fi
+  [[ -d /run/systemd/system ]]
+}
+
 # ---------- OS detection ----------
 
+IS_WSL=no
 case "$(uname -s)" in
   Linux*)
+    OS=linux
     if is_wsl; then
-      cat >&2 <<'EOF'
-✗ WSL2 (Windows Subsystem for Linux) is not a supported install target for
-  scripts/install.sh.
+      IS_WSL=yes
+      if is_wsl_systemd_active; then
+        warn "WSL2 detected with systemd active — proceeding (experimental)."
+        warn "If \`podman pod create\` later fails with \"failed to bind mount ns\","
+        warn "the kernel does not expose /run/netns; fall back to scripts/install.ps1."
+      elif [[ $FORCE_WSL -eq 1 ]]; then
+        warn "WSL2 detected without systemd; --force-wsl set, proceeding anyway."
+        warn "Expect netns failures during pod creation if your distro lacks the"
+        warn "/run/netns bind-mount path that podman pod infra containers need."
+      else
+        cat >&2 <<'EOF'
+✗ WSL2 (Windows Subsystem for Linux) detected without systemd active.
 
-  The bash installer drives podman directly inside the host kernel, but
-  WSL2's kernel does not provide the network-namespace bind-mount path
-  (/run/netns/) that podman pod creation requires. You will get errors
-  such as:
+  The bash installer drives podman directly, and WSL2's default (non-systemd)
+  init does not provide the /run/netns bind-mount path that podman pod
+  infra containers require. Pod creation will fail with:
     failed to bind mount ns at /run/netns/...: invalid argument
 
-  Supported Windows install path: run scripts/install.ps1 from a Windows
-  PowerShell session, which sets up Podman Desktop / WSL with a
-  preconfigured environment. See README for details.
+  Two supported paths forward:
+
+  1. Enable systemd in this WSL distro (recommended):
+       sudo tee /etc/wsl.conf >/dev/null <<'CONF'
+       [boot]
+       systemd=true
+       CONF
+     Then from a Windows PowerShell:  wsl --shutdown
+     Reopen the WSL shell and re-run this installer. The check above will
+     pass once `systemctl is-system-running` reports a live state.
+
+  2. Use the Windows-native entry point: scripts/install.ps1 (run from a
+     Windows PowerShell session). It bootstraps WSL + this script with
+     systemd preconfigured. See README for details.
+
+  Override (advanced): re-run with --force-wsl if you have a non-systemd
+  workaround in place. Tracked in https://github.com/DominicBurkart/nanna-coder/issues/326.
 EOF
-      die "WSL2 detected; not supported by install.sh"
+        die "WSL2 without systemd; not supported by install.sh (see above for fix)"
+      fi
     fi
-    OS=linux ;;
+    ;;
   Darwin*) OS=macos ;;
   *) die "unsupported OS: $(uname -s). Linux and macOS only. (Windows: use scripts/install.ps1)" ;;
 esac
@@ -204,9 +265,13 @@ audit_system() {
 
 print_plan() {
   printf '\n%sNanna Coder installer%s\n' "$C_BOLD" "$C_RESET"
-  printf '  detected:       %s/%s\n' "$OS" "$ARCH"
+  printf '  detected:       %s/%s%s\n' "$OS" "$ARCH" \
+    "$([[ "$IS_WSL" == yes ]] && echo ' (WSL2)')"
   printf '  registry:       %s\n' "$REGISTRY"
   printf '  tag:            %s\n' "$TAG"
+  if [[ -n "$BRANCH" ]]; then
+    printf '  branch:         %s (informational; passed in by install.ps1)\n' "$BRANCH"
+  fi
   printf '  model:          %s%s\n' "$MODEL" \
     "$([[ $SKIP_MODEL_PULL -eq 1 ]] && echo ' (skipped)')"
   printf '  pod name:       %s\n' "$POD_NAME"
