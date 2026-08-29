@@ -196,4 +196,41 @@ mod tests {
         let flake = generate_flake(&profile).unwrap();
         assert!(flake.contains("1.75.0"));
     }
+
+    /// When `rust_version` is `None`, the generator must fall back to
+    /// `DEFAULT_RUST_VERSION` rather than emitting a literal placeholder
+    /// or panicking. This guards the `unwrap_or(DEFAULT_RUST_VERSION)`
+    /// branch in `generate_cargo_flake`.
+    #[test]
+    fn generated_flake_falls_back_to_default_rust_version_when_unset() {
+        let mut profile = minimal_cargo_profile("myapp");
+        profile.rust_version = None;
+        let flake = generate_flake(&profile).unwrap();
+        assert!(
+            flake.contains(DEFAULT_RUST_VERSION),
+            "fallback default {} should appear in generated flake",
+            DEFAULT_RUST_VERSION
+        );
+        assert!(
+            !flake.contains("__RUST_VERSION__"),
+            "placeholder must be substituted even with no explicit rust_version"
+        );
+    }
+
+    /// Every templated placeholder must be substituted; a leaked
+    /// `__FOO__` token would produce an invalid flake at evaluation
+    /// time. Asserting on placeholders directly catches future
+    /// template additions that forget to wire a substitution.
+    #[test]
+    fn generated_flake_has_no_unsubstituted_placeholders() {
+        let profile = minimal_cargo_profile("myapp");
+        let flake = generate_flake(&profile).unwrap();
+        for token in ["__PROJECT_NAME__", "__RUST_VERSION__", "__PACKAGES__"] {
+            assert!(
+                !flake.contains(token),
+                "placeholder {} leaked into generated flake",
+                token
+            );
+        }
+    }
 }

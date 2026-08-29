@@ -233,4 +233,28 @@ mod tests {
             deserialized.default_context_length
         );
     }
+
+    /// `with_max_tokens` is the only way to set a non-`None` cap from the
+    /// builder, and `validate` rejects a zero cap. Together they pin the
+    /// invariant that an explicit cap is strictly positive.
+    #[test]
+    fn with_max_tokens_sets_some_and_validates() {
+        let config = OllamaConfig::new().with_max_tokens(4096);
+        assert_eq!(config.default_max_tokens, Some(4096));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_tokens() {
+        let config = OllamaConfig {
+            default_max_tokens: Some(0),
+            ..OllamaConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("Max tokens"),
+            "expected error to mention max tokens, got: {}",
+            err
+        );
+    }
 }
