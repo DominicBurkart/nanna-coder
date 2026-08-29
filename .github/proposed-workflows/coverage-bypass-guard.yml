@@ -1,0 +1,277 @@
+name: coverage-bypass-guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify yq is available
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "::error::yq is required but not installed on this runner"
+            exit 1
+          fi
+          yq --version
+
+      - name: Check for coverage-exception-approved label
+        id: label
+        env:
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$LABELS_JSON" | grep -q '"coverage-exception-approved"'; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::coverage-exception-approved label present; guard will skip net-delta check."
+          else
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve base and head SHAs
+        if: steps.label.outputs.approved != 'true'
+        id: refs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "::error::base/head SHA not available on event payload; fail-closed per policy"
+            exit 1
+          fi
+          if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1; then
+            echo "::error::base SHA '$BASE_SHA' not resolvable in checkout; fail-closed"
+            exit 1
+          fi
+          if ! git rev-parse --verify "$HEAD_SHA" >/dev/null 2>&1; then
+            echo "::error::head SHA '$HEAD_SHA' not resolvable in checkout; fail-closed"
+            exit 1
+          fi
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Compute net delta of bypass annotations in *.rs
+        if: steps.label.outputs.approved != 'true'
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          set -euo pipefail
+
+          # Patterns we treat as coverage bypasses. Each is a fixed string
+          # (grep -F). We count occurrences across all *.rs files at the
+          # base tree and the head tree, and fail if the net delta > 0.
+          #
+          # Heuristic trade-offs:
+          #  - We do not parse Rust. A `cfg(not(tarpaulin))` mention inside
+          #    a comment or string literal will count. That is conservative
+          #    by design: the guard is a floor, not a parser. False positives
+          #    are resolved by either removing the literal text or by repo
+          #    admin applying the `coverage-exception-approved` label.
+          #  - For `#[ignore]`, we only count occurrences that appear within
+          #    3 lines of a `#[test]` / `#[tokio::test]` / `#[rstest]` style
+          #    attribute, to avoid matching `ignore` in doc strings or
+          #    unrelated attributes (e.g., `#[serde(ignore)]`). This is also
+          #    just a grep heuristic - same admin-bypass story applies.
+          #  - We compare counts (not file:line identity), so refactors that
+          #    move an annotation between files but keep the total flat are
+          #    accepted. Net additions are what matters.
+
+          PATTERNS=(
+            'cfg(not(tarpaulin))'
+            'cfg(not(tarpaulin_include))'
+            'cfg_attr(coverage_nightly, coverage(off))'
+            'cfg_attr(coverage, coverage(off))'
+            'coverage(off)'
+          )
+
+          # Build a list of *.rs paths that exist on either side, so we can
+          # count occurrences against both trees uniformly.
+          RS_PATHS_BASE="$(git ls-tree -r --name-only "$BASE" | grep -E '\.rs$' || true)"
+          RS_PATHS_HEAD="$(git ls-tree -r --name-only "$HEAD" | grep -E '\.rs$' || true)"
+
+          count_pattern_in_tree() {
+            # $1 = tree-ish, $2 = pattern (fixed string), $3 = newline-separated paths
+            local tree="$1"
+            local pattern="$2"
+            local paths="$3"
+            local total=0
+            if [ -z "$paths" ]; then
+              echo 0
+              return
+            fi
+            # Iterate file-by-file via git show; count fixed-string matches.
+            # `|| true` to tolerate files where grep returns 1 (no match).
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if git cat-file -e "$tree:$f" 2>/dev/null; then
+                local n
+                n="$(git show "$tree:$f" | grep -F -c -- "$pattern" || true)"
+                total=$(( total + n ))
+              fi
+            done <<< "$paths"
+            echo "$total"
+          }
+
+          # For #[ignore] on tests we run an awk pass over each file's contents
+          # that flags `#[ignore]` lines preceded within 3 lines by a
+          # test-attribute marker (#[test], #[tokio::test], #[rstest]). This
+          # avoids matching `ignore` in doc strings or unrelated attributes.
+          count_ignored_tests_in_tree() {
+            local tree="$1"
+            local paths="$2"
+            local total=0
+            if [ -z "$paths" ]; then
+              echo 0
+              return
+            fi
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if git cat-file -e "$tree:$f" 2>/dev/null; then
+                local n
+                n="$(git show "$tree:$f" | awk '
+                  {
+                    line[NR] = $0
+                  }
+                  END {
+                    count = 0
+                    for (i = 1; i <= NR; i++) {
+                      if (line[i] ~ /#\[[[:space:]]*ignore([[:space:]]|\]|=|\()/) {
+                        lo = i - 3; if (lo < 1) lo = 1
+                        hi = i + 3; if (hi > NR) hi = NR
+                        for (j = lo; j <= hi; j++) {
+                          if (j == i) continue
+                          if (line[j] ~ /#\[(tokio::)?(test|rstest)([[:space:]]|\(|\])/) {
+                            count++
+                            break
+                          }
+                        }
+                      }
+                    }
+                    print count
+                  }
+                ')"
+                total=$(( total + n ))
+              fi
+            done <<< "$paths"
+            echo "$total"
+          }
+
+          # locate_new_occurrences <pattern> prints `path:line: text` for each
+          # head-side occurrence whose line text is not present in the base
+          # blob's matches. Used purely for human-readable failure output;
+          # not authoritative - the count comparison above is.
+          locate_new_occurrences() {
+            local pattern="$1"
+            local paths_head="$2"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              local head_hits
+              head_hits="$(git show "$HEAD:$f" 2>/dev/null | grep -nF -- "$pattern" || true)"
+              [ -z "$head_hits" ] && continue
+              local base_lines=""
+              if git cat-file -e "$BASE:$f" 2>/dev/null; then
+                base_lines="$(git show "$BASE:$f" 2>/dev/null | grep -F -- "$pattern" || true)"
+              fi
+              while IFS= read -r hit; do
+                [ -z "$hit" ] && continue
+                local lineno="${hit%%:*}"
+                local body="${hit#*:}"
+                if [ -z "$base_lines" ] || ! printf '%s\n' "$base_lines" | grep -Fxq -- "$body"; then
+                  echo "  - $f:$lineno: $body"
+                fi
+              done <<< "$head_hits"
+            done <<< "$paths_head"
+          }
+
+          REGRESSION=0
+          REASONS=()
+
+          for pat in "${PATTERNS[@]}"; do
+            base_count="$(count_pattern_in_tree "$BASE" "$pat" "$RS_PATHS_BASE")"
+            head_count="$(count_pattern_in_tree "$HEAD" "$pat" "$RS_PATHS_HEAD")"
+            delta=$(( head_count - base_count ))
+            echo "pattern '$pat': base=$base_count head=$head_count delta=$delta"
+            if [ "$delta" -gt 0 ]; then
+              REGRESSION=1
+              REASONS+=("net additions of '$pat': +$delta (base=$base_count, head=$head_count)")
+              echo "::group::new occurrences of '$pat'"
+              locate_new_occurrences "$pat" "$RS_PATHS_HEAD" || true
+              echo "::endgroup::"
+            fi
+          done
+
+          ignore_base="$(count_ignored_tests_in_tree "$BASE" "$RS_PATHS_BASE")"
+          ignore_head="$(count_ignored_tests_in_tree "$HEAD" "$RS_PATHS_HEAD")"
+          ignore_delta=$(( ignore_head - ignore_base ))
+          echo "pattern '#[ignore] on test fns': base=$ignore_base head=$ignore_head delta=$ignore_delta"
+          if [ "$ignore_delta" -gt 0 ]; then
+            REGRESSION=1
+            REASONS+=("net additions of '#[ignore]' on test fns: +$ignore_delta (base=$ignore_base, head=$ignore_head)")
+          fi
+
+          # tarpaulin.toml exclude-files / exclude growth check.
+          TARP="tarpaulin.toml"
+          OLD_TARP_EXISTS=0
+          NEW_TARP_EXISTS=0
+          if git cat-file -e "$BASE:$TARP" 2>/dev/null; then OLD_TARP_EXISTS=1; fi
+          if git cat-file -e "$HEAD:$TARP" 2>/dev/null; then NEW_TARP_EXISTS=1; fi
+
+          if [ "$NEW_TARP_EXISTS" -eq 1 ]; then
+            NEW_TARP_CONTENT="$(git show "$HEAD:$TARP")"
+            NEW_EXCLUDE_FILES="$(printf '%s\n' "$NEW_TARP_CONTENT" | yq -p toml '.config.exclude-files // [] | length' -)"
+            NEW_EXCLUDE="$(printf '%s\n' "$NEW_TARP_CONTENT" | yq -p toml '.config.exclude // [] | length' -)"
+          else
+            NEW_EXCLUDE_FILES=0
+            NEW_EXCLUDE=0
+          fi
+
+          if [ "$OLD_TARP_EXISTS" -eq 1 ]; then
+            OLD_TARP_CONTENT="$(git show "$BASE:$TARP")"
+            OLD_EXCLUDE_FILES="$(printf '%s\n' "$OLD_TARP_CONTENT" | yq -p toml '.config.exclude-files // [] | length' -)"
+            OLD_EXCLUDE="$(printf '%s\n' "$OLD_TARP_CONTENT" | yq -p toml '.config.exclude // [] | length' -)"
+          else
+            OLD_EXCLUDE_FILES=0
+            OLD_EXCLUDE=0
+          fi
+
+          echo "tarpaulin.toml exclude-files: base=$OLD_EXCLUDE_FILES head=$NEW_EXCLUDE_FILES"
+          echo "tarpaulin.toml exclude:       base=$OLD_EXCLUDE       head=$NEW_EXCLUDE"
+
+          if [ "$NEW_EXCLUDE_FILES" -gt "$OLD_EXCLUDE_FILES" ]; then
+            REGRESSION=1
+            REASONS+=("tarpaulin.toml [config].exclude-files grew from $OLD_EXCLUDE_FILES to $NEW_EXCLUDE_FILES")
+          fi
+          if [ "$NEW_EXCLUDE" -gt "$OLD_EXCLUDE" ]; then
+            REGRESSION=1
+            REASONS+=("tarpaulin.toml [config].exclude grew from $OLD_EXCLUDE to $NEW_EXCLUDE")
+          fi
+
+          if [ "$REGRESSION" -eq 0 ]; then
+            echo "coverage-bypass-guard: no net additions of bypass annotations detected"
+            exit 0
+          fi
+
+          {
+            echo "::error::coverage-bypass-guard detected net additions of coverage-bypass annotations."
+            for r in "${REASONS[@]}"; do echo "  - $r"; done
+            echo ""
+            echo "If this change is intentional (e.g., genuinely-untestable code path),"
+            echo "a repository admin must apply the 'coverage-exception-approved' label"
+            echo "to this PR. The guard will then skip the net-delta check on the next"
+            echo "synchronize. No commit trailer, env var, or script flag can bypass this."
+            echo ""
+            echo "Reference: AGENTS.md \"What an agent should NOT do\" section."
+          } >&2
+          exit 1
