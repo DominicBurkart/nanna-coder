@@ -43,6 +43,8 @@
 //! # }
 //! ```
 
+pub mod ci_metrics;
+
 use crate::container::{detect_runtime, ContainerRuntime};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
