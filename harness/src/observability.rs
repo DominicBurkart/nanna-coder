@@ -1006,6 +1006,7 @@ impl Default for ObservabilitySystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitoring::Alert;
 
     #[tokio::test]
     async fn test_observability_system_initialization() {
@@ -1096,5 +1097,355 @@ mod tests {
 
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
+    }
+
+    fn make_test_alert(component: &str, title: &str) -> Alert {
+        Alert {
+            id: "test-id".to_string(),
+            title: title.to_string(),
+            description: "desc".to_string(),
+            severity: AlertSeverity::Warning,
+            component: component.to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_methods() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 70.0,
+            ..HealthThreshold::default()
+        };
+        let system = ObservabilitySystem::new()
+            .with_service_name("builder-test")
+            .with_alert_policy(AlertPolicy::immediate_critical())
+            .with_health_thresholds(thresholds)
+            .with_health_check_interval(Duration::from_secs(5));
+        assert!(system.get_uptime() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+    }
+
+    #[test]
+    fn test_get_uptime() {
+        let system = ObservabilitySystem::new();
+        assert!(system.get_uptime() >= Duration::ZERO);
+    }
+
+    #[test]
+    fn test_determine_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("container-health", "");
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("model-inference", "");
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("system", "Performance Degraded");
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_resources() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("system", "Resource Exhausted");
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("system", "Unknown Error");
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score() {
+        let system = ObservabilitySystem::new();
+
+        let mut alert = make_test_alert("system", "Test");
+        alert.severity = AlertSeverity::Critical;
+        // Critical=100 + Performance+10=110 → capped at 100
+        assert_eq!(
+            system.calculate_priority_score(&alert, &AlertCategory::Performance),
+            100
+        );
+
+        alert.severity = AlertSeverity::Warning;
+        // Warning=50 + Availability+20=70
+        assert_eq!(
+            system.calculate_priority_score(&alert, &AlertCategory::Availability),
+            70
+        );
+
+        alert.severity = AlertSeverity::Info;
+        // Info=25 + ModelQuality(no adj)=25
+        assert_eq!(
+            system.calculate_priority_score(&alert, &AlertCategory::ModelQuality),
+            25
+        );
+
+        alert.severity = AlertSeverity::Error;
+        // Error=75 + Security+30=105 → capped at 100
+        assert_eq!(
+            system.calculate_priority_score(&alert, &AlertCategory::Security),
+            100
+        );
+
+        alert.severity = AlertSeverity::Warning;
+        // Warning=50 + ContainerHealth+20=70
+        assert_eq!(
+            system.calculate_priority_score(&alert, &AlertCategory::ContainerHealth),
+            70
+        );
+    }
+
+    #[test]
+    fn test_generate_recommended_actions() {
+        let system = ObservabilitySystem::new();
+        let alert = make_test_alert("system", "Test");
+
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert!(!actions.is_empty());
+
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert!(!actions.is_empty());
+
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Availability);
+        assert!(!actions.is_empty());
+
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Resources);
+        assert!(!actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enhance_alerts() {
+        let system = ObservabilitySystem::new();
+        let alerts = vec![
+            make_test_alert("container-abc", "Container Down"),
+            make_test_alert("model-x", "Model Slow"),
+            make_test_alert("system", "Performance Issue"),
+        ];
+        let enhanced = system.enhance_alerts(alerts).await.unwrap();
+        assert_eq!(enhanced.len(), 3);
+        assert_eq!(enhanced[0].category, AlertCategory::ContainerHealth);
+        assert_eq!(enhanced[1].category, AlertCategory::ModelQuality);
+        assert_eq!(enhanced[2].category, AlertCategory::Performance);
+        assert!(!enhanced[0].recommended_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_container_summary() {
+        let system = ObservabilitySystem::new();
+        let summary = system.get_container_summary().await.unwrap();
+        assert_eq!(summary.total_containers, 1);
+        assert_eq!(summary.failed_containers, 0);
+    }
+
+    #[test]
+    fn test_get_model_summary_with_models() {
+        use crate::monitoring::{
+            CacheMetrics, ErrorMetrics, ModelMetrics, ModelResourceUsage, QualityMetrics,
+            SystemResourceMetrics,
+        };
+        let system = ObservabilitySystem::new();
+        let mut model_metrics = HashMap::new();
+        model_metrics.insert(
+            "qwen3".to_string(),
+            ModelMetrics {
+                model_name: "qwen3".to_string(),
+                inference_count: 10,
+                avg_inference_time_ms: 150.0,
+                tokens_per_second: 100.0,
+                success_rate: 0.99,
+                quality_scores: QualityMetrics {
+                    avg_coherence: 0.9,
+                    avg_relevance: 0.85,
+                    consistency: 0.88,
+                    accuracy_rate: 0.95,
+                },
+                resource_usage: ModelResourceUsage {
+                    peak_memory_mb: 512.0,
+                    avg_cpu_percent: 40.0,
+                    gpu_utilization_percent: None,
+                },
+            },
+        );
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: CacheMetrics {
+                hits: 0,
+                misses: 0,
+                hit_rate: 0.0,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: SystemResourceMetrics {
+                cpu_usage_percent: 0.0,
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                memory_usage_percent: 0.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 0,
+                disk_usage_percent: 0.0,
+                load_average: [0.0, 0.0, 0.0],
+            },
+            model_metrics,
+            error_metrics: ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        let summary = system.get_model_summary(&metrics).unwrap();
+        assert_eq!(summary.total_models, 1);
+        assert_eq!(summary.active_models, 1);
+        assert!(summary.avg_inference_time_ms > 0.0);
+        assert!(summary.availability_percentage > 0.0);
+    }
+
+    #[test]
+    fn test_get_model_summary_no_models() {
+        use crate::monitoring::{CacheMetrics, ErrorMetrics, SystemResourceMetrics};
+        let system = ObservabilitySystem::new();
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: CacheMetrics {
+                hits: 0,
+                misses: 0,
+                hit_rate: 0.0,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: SystemResourceMetrics {
+                cpu_usage_percent: 0.0,
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                memory_usage_percent: 0.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 0,
+                disk_usage_percent: 0.0,
+                load_average: [0.0, 0.0, 0.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        let summary = system.get_model_summary(&metrics).unwrap();
+        assert_eq!(summary.total_models, 0);
+        assert_eq!(summary.availability_percentage, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_availability_metrics() {
+        let system = ObservabilitySystem::new();
+        let availability = system.calculate_availability_metrics().unwrap();
+        // implementation returns 99.5 which is AtRisk (>=99.0 but <99.9)
+        assert_eq!(availability.sla_compliance.status, SlaStatus::AtRisk);
+        assert!(availability.uptime >= Duration::ZERO);
+        assert!(availability.mtbf.is_some());
+        assert!(availability.mttr.is_some());
+        assert_eq!(availability.sla_compliance.target_availability, 99.9);
+    }
+
+    #[test]
+    fn test_sla_status_variants() {
+        let compliant = SlaStatus::Compliant;
+        let at_risk = SlaStatus::AtRisk;
+        let breached = SlaStatus::Breached;
+        assert_ne!(compliant, at_risk);
+        assert_ne!(at_risk, breached);
+        assert_ne!(compliant, breached);
+    }
+
+    #[test]
+    fn test_trend_direction_variants() {
+        let improving = TrendDirection::Improving;
+        let stable = TrendDirection::Stable;
+        let degrading = TrendDirection::Degrading;
+        let unknown = TrendDirection::Unknown;
+        assert_ne!(improving, stable);
+        assert_ne!(degrading, unknown);
+        assert_ne!(stable, degrading);
+        assert_ne!(improving, unknown);
+    }
+
+    #[tokio::test]
+    async fn test_perform_health_checks_static() {
+        use crate::container::detect_runtime;
+        use std::sync::Arc;
+        let history = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let thresholds = HealthThreshold::default();
+        let runtime = detect_runtime();
+        ObservabilitySystem::perform_health_checks(&history, &thresholds, &runtime)
+            .await
+            .unwrap();
+        let h = history.lock().unwrap();
+        assert!(h.contains_key("system"));
+    }
+
+    #[tokio::test]
+    async fn test_analyze_performance_trends_static() {
+        ObservabilitySystem::analyze_performance_trends()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_sla_compliance_static() {
+        ObservabilitySystem::check_sla_compliance().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alert_policy_balanced_grouping() {
+        let balanced = AlertPolicy::balanced();
+        assert!(!balanced.grouping_rules.is_empty());
+        let rule = &balanced.grouping_rules[0];
+        assert!(!rule.group_by_fields.is_empty());
+        assert!(rule.max_alerts_per_group > 0);
     }
 }
