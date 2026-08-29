@@ -279,9 +279,18 @@
     {
       packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
         let
+          # The container images defined in this block (ollamaImage,
+          # harnessImage, etc.) need the same ollama-overlay applied as
+          # the eachSystem block above, otherwise the registry-published
+          # ollama container ends up with the stale `pkgs.ollama` from
+          # the main nixpkgs pin (0.11.10, no Gemma 4 support).
+          ollamaPkgs = import nixpkgs-ollama { inherit system; config.allowUnfree = false; };
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [ (import rust-overlay) ];
+            overlays = [
+              (import rust-overlay)
+              (final: prev: { ollama = ollamaPkgs.ollama; })
+            ];
             config.allowUnfree = false;
           };
           rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
