@@ -1242,4 +1242,125 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_record_error_appears_in_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let event = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "timeout".to_string(),
+            message: "connection timed out".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Warning,
+        };
+        collector.record_error(event).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert_eq!(metrics.error_metrics.recent_errors.len(), 1);
+        assert_eq!(metrics.error_metrics.recent_errors[0].error_type, "timeout");
+    }
+
+    #[tokio::test]
+    async fn test_record_model_inference_appears_in_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let model_metrics = ModelMetrics {
+            model_name: "llama3".to_string(),
+            inference_count: 42,
+            avg_inference_time_ms: 250.0,
+            tokens_per_second: 100.0,
+            success_rate: 0.99,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.8,
+                accuracy_rate: 0.95,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("llama3", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.model_metrics.contains_key("llama3"));
+        assert_eq!(metrics.model_metrics["llama3"].inference_count, 42);
+    }
+
+    #[tokio::test]
+    async fn test_export_metrics_custom_format_errors() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("html".to_string()))
+            .await;
+        assert!(result.is_err());
+        if let Err(MonitoringError::MetricsCollectionFailed { reason }) = result {
+            assert!(reason.contains("html"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history_includes_acknowledged() {
+        let manager = DefaultAlertManager::new();
+
+        let id1 = manager
+            .send_alert("Alert One", "first", AlertSeverity::Info)
+            .await
+            .unwrap();
+        let _id2 = manager
+            .send_alert("Alert Two", "second", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        let _id3 = manager
+            .send_alert("Alert Three", "third", AlertSeverity::Error)
+            .await
+            .unwrap();
+
+        manager.acknowledge_alert(&id1).await.unwrap();
+
+        // get_active_alerts filters out acknowledged; get_alert_history does not
+        let active = manager.get_active_alerts().await.unwrap();
+        assert_eq!(active.len(), 2);
+
+        let history = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history_respects_limit() {
+        let manager = DefaultAlertManager::new();
+
+        for i in 0..5 {
+            manager
+                .send_alert(&format!("Alert {i}"), "msg", AlertSeverity::Info)
+                .await
+                .unwrap();
+        }
+
+        let history = manager.get_alert_history(2).await.unwrap();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds_updates_successfully() {
+        let mut manager = DefaultAlertManager::new();
+
+        let custom = AlertThresholds {
+            max_latency_ms: 100,
+            min_cache_hit_rate: 0.5,
+            max_error_rate: 0.1,
+            max_cpu_usage: 0.7,
+            max_memory_usage: 0.7,
+            health_check_timeout: Duration::from_secs(10),
+        };
+
+        let result = manager.configure_thresholds(custom).await;
+        assert!(result.is_ok());
+    }
 }
