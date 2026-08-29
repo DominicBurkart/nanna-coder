@@ -255,6 +255,18 @@ impl Tool for CalculatorTool {
     }
 }
 
+/// Compile a glob pattern and check whether `name` matches it, mapping
+/// compile errors to [`ToolError::InvalidArguments`]. Centralizes the
+/// pattern previously inlined in `list_directory` (recursive + flat) and
+/// `search` so future changes (e.g. pattern caching) live in one place.
+fn glob_pattern_matches(pattern: &str, name: &str) -> ToolResult<bool> {
+    Ok(glob::Pattern::new(pattern)
+        .map_err(|e| ToolError::InvalidArguments {
+            message: format!("Invalid glob pattern: {}", e),
+        })?
+        .matches(name))
+}
+
 fn validate_path_within_workspace(path: &Path, workspace_root: &Path) -> ToolResult<PathBuf> {
     let canonical_root =
         workspace_root
@@ -547,12 +559,7 @@ impl ListDirTool {
                 self.list_recursive(&path, root, pattern, entries)?;
             } else {
                 if let Some(pat) = pattern {
-                    if !glob::Pattern::new(pat)
-                        .map_err(|e| ToolError::InvalidArguments {
-                            message: format!("Invalid glob pattern: {}", e),
-                        })?
-                        .matches(&name)
-                    {
+                    if !glob_pattern_matches(pat, &name)? {
                         continue;
                     }
                 }
@@ -643,12 +650,7 @@ impl Tool for ListDirTool {
                 let name = entry.file_name().to_string_lossy().to_string();
 
                 if let Some(pat) = pattern {
-                    if !glob::Pattern::new(pat)
-                        .map_err(|e| ToolError::InvalidArguments {
-                            message: format!("Invalid glob pattern: {}", e),
-                        })?
-                        .matches(&name)
-                    {
+                    if !glob_pattern_matches(pat, &name)? {
                         continue;
                     }
                 }
@@ -709,12 +711,7 @@ impl SearchTool {
                 let name = entry.file_name().to_string_lossy().to_string();
 
                 if let Some(pat) = file_pattern {
-                    if !glob::Pattern::new(pat)
-                        .map_err(|e| ToolError::InvalidArguments {
-                            message: format!("Invalid glob pattern: {}", e),
-                        })?
-                        .matches(&name)
-                    {
+                    if !glob_pattern_matches(pat, &name)? {
                         continue;
                     }
                 }
@@ -1874,6 +1871,27 @@ pub fn create_container_tool_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_pattern_matches_returns_true_on_match() {
+        assert!(glob_pattern_matches("*.rs", "main.rs").unwrap());
+    }
+
+    #[test]
+    fn glob_pattern_matches_returns_false_on_no_match() {
+        assert!(!glob_pattern_matches("*.rs", "main.py").unwrap());
+    }
+
+    #[test]
+    fn glob_pattern_matches_returns_invalid_arguments_on_bad_pattern() {
+        let err = glob_pattern_matches("[", "anything").unwrap_err();
+        match err {
+            ToolError::InvalidArguments { message } => {
+                assert!(message.contains("Invalid glob pattern"));
+            }
+            other => panic!("expected InvalidArguments, got {:?}", other),
+        }
+    }
 
     #[tokio::test]
     async fn test_echo_tool() {
