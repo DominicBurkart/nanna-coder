@@ -71,7 +71,22 @@ impl Default for JudgeConfig {
 }
 
 impl JudgeConfig {
-    /// Create a new configuration with custom retry settings
+    /// Create a new configuration with custom retry settings.
+    ///
+    /// All fields not explicitly set here keep the values from [`JudgeConfig::default`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use model::judge::JudgeConfig;
+    ///
+    /// let config = JudgeConfig::with_retries(5, 200);
+    /// assert_eq!(config.max_retries, 5);
+    /// assert_eq!(config.base_delay_ms, 200);
+    /// // Other fields retain their defaults
+    /// assert_eq!(config.max_delay_ms, JudgeConfig::default().max_delay_ms);
+    /// assert!(!config.verbose_logging);
+    /// ```
     pub fn with_retries(max_retries: u32, base_delay_ms: u64) -> Self {
         Self {
             max_retries,

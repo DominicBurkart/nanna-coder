@@ -887,14 +887,14 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     }
 
     /// Perform Entity Modification (ARCHITECTURE.md) — execute the planned
-    /// modification, dispatching to tool-based or MVP implementation.
-    #[allow(deprecated)]
+    /// modification, dispatching to tool-based or fallback implementation.
     async fn perform_entity_modification(&mut self, context: &AgentContext) -> AgentResult<()> {
         if self.llm_provider.is_some() && self.tool_registry.is_some() {
             let provider = self.llm_provider.as_ref().unwrap().clone();
             self.perform_entity_modification_with_tools(context, &provider)
                 .await
         } else {
+            #[allow(deprecated)]
             self.perform_entity_modification_mvp(context).await
         }
     }
@@ -1389,8 +1389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn test_perform_entity_modification_without_tools_mvp_fallback() {
+    async fn test_perform_entity_modification_without_tools_fallback() {
         let config = AgentConfig {
             max_iterations: 10,
             ..Default::default()
@@ -1406,7 +1405,7 @@ mod tests {
             app_state_id: "test".to_string(),
         };
 
-        let result = agent.perform_entity_modification_mvp(&context).await;
+        let result = agent.perform_entity_modification(&context).await;
         assert!(result.is_ok());
         assert_eq!(agent.performed_actions, 1);
 
@@ -1418,7 +1417,7 @@ mod tests {
         assert_eq!(
             entities.len(),
             1,
-            "MVP should create a GitRepository entity"
+            "Fallback should create a GitRepository entity"
         );
     }
 
