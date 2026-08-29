@@ -624,6 +624,7 @@ impl AgentEvaluator {
                 EntityType::Telemetry => {
                     Box::new(crate::entities::telemetry::types::TelemetryEntity::new())
                 }
+                EntityType::Lint => Box::new(crate::entities::test::types::LintResultEntity::new()),
             };
 
             store.store(entity).await?;
