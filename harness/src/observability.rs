@@ -1006,6 +1006,7 @@ impl Default for ObservabilitySystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitoring::Alert;
 
     #[tokio::test]
     async fn test_observability_system_initialization() {
@@ -1096,5 +1097,360 @@ mod tests {
 
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_performance_trends_degrading_latency() {
+        let system = ObservabilitySystem::new();
+        let mut metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 80,
+                misses: 20,
+                hit_rate: 0.8,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 10.0,
+                total_memory_bytes: 8_000_000_000,
+                used_memory_bytes: 1_000_000_000,
+                memory_usage_percent: 12.5,
+                available_disk_bytes: 100_000_000_000,
+                total_disk_bytes: 200_000_000_000,
+                disk_usage_percent: 50.0,
+                load_average: [0.1, 0.1, 0.1],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        metrics.request_latencies.insert(
+            "slow-svc".to_string(),
+            crate::monitoring::LatencyMetrics {
+                avg_latency_ms: 3000.0,
+                p95_latency_ms: 3500.0,
+                p99_latency_ms: 4000.0,
+                max_latency_ms: 5000.0,
+                min_latency_ms: 2500.0,
+                request_count: 10,
+                requests_per_second: 1.0,
+            },
+        );
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.latency_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score <= 80.0);
+    }
+
+    #[tokio::test]
+    async fn test_performance_trends_degrading_error_rate() {
+        let system = ObservabilitySystem::new();
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 80,
+                misses: 20,
+                hit_rate: 0.8,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 10.0,
+                total_memory_bytes: 8_000_000_000,
+                used_memory_bytes: 1_000_000_000,
+                memory_usage_percent: 12.5,
+                available_disk_bytes: 100_000_000_000,
+                total_disk_bytes: 200_000_000_000,
+                disk_usage_percent: 50.0,
+                load_average: [0.1, 0.1, 0.1],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 200,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.2,
+                recent_errors: Vec::new(),
+            },
+        };
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.error_rate_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score <= 75.0);
+    }
+
+    #[tokio::test]
+    async fn test_performance_trends_degrading_cache() {
+        let system = ObservabilitySystem::new();
+        let metrics = SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 10,
+                misses: 90,
+                hit_rate: 0.1,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 10.0,
+                total_memory_bytes: 8_000_000_000,
+                used_memory_bytes: 1_000_000_000,
+                memory_usage_percent: 12.5,
+                available_disk_bytes: 100_000_000_000,
+                total_disk_bytes: 200_000_000_000,
+                disk_usage_percent: 50.0,
+                load_average: [0.1, 0.1, 0.1],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.cache_performance_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score <= 85.0);
+    }
+
+    #[tokio::test]
+    async fn test_availability_metrics_sla_at_risk() {
+        let system = ObservabilitySystem::new();
+        let metrics = system.calculate_availability_metrics().unwrap();
+        assert_eq!(metrics.sla_compliance.status, SlaStatus::AtRisk);
+        assert_eq!(metrics.sla_compliance.target_availability, 99.9);
+        assert_eq!(metrics.sla_compliance.current_availability, 99.5);
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "1".to_string(),
+            title: "Down".to_string(),
+            description: "Container stopped".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "container-web".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "2".to_string(),
+            title: "Drift detected".to_string(),
+            description: "Quality drop".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "model-qwen3".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "3".to_string(),
+            title: "Performance degradation detected".to_string(),
+            description: "Slow response".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "api-gateway".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_resources() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "4".to_string(),
+            title: "Resource exhaustion imminent".to_string(),
+            description: "Low disk".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "storage".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alert_category_default_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "5".to_string(),
+            title: "Service unreachable".to_string(),
+            description: "Cannot connect".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "network".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        assert_eq!(
+            system.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
+    }
+
+    #[tokio::test]
+    async fn test_priority_score_critical_availability_capped() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "6".to_string(),
+            title: "Outage".to_string(),
+            description: "System down".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "network".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Critical (100) + Availability (+20) = 120, capped to 100
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Availability);
+        assert_eq!(score, 100);
+    }
+
+    #[tokio::test]
+    async fn test_priority_score_warning_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "7".to_string(),
+            title: "Slow".to_string(),
+            description: "High latency".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "api".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Warning (50) + Performance (+10) = 60
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Performance);
+        assert_eq!(score, 60);
+    }
+
+    #[tokio::test]
+    async fn test_priority_score_info_config_no_adjustment() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "8".to_string(),
+            title: "Config changed".to_string(),
+            description: "Setting updated".to_string(),
+            severity: AlertSeverity::Info,
+            component: "config".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        // Info (25) + Configuration (no adjustment) = 25
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Configuration);
+        assert_eq!(score, 25);
+    }
+
+    #[tokio::test]
+    async fn test_recommended_actions_container_health() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "9".to_string(),
+            title: "Container down".to_string(),
+            description: "Stopped".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "container-web".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.to_lowercase().contains("container")));
+    }
+
+    #[tokio::test]
+    async fn test_recommended_actions_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "10".to_string(),
+            title: "Slow".to_string(),
+            description: "High latency".to_string(),
+            severity: AlertSeverity::Warning,
+            component: "api".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.to_lowercase().contains("resource")));
+    }
+
+    #[tokio::test]
+    async fn test_recommended_actions_model_quality() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "11".to_string(),
+            title: "Quality drop".to_string(),
+            description: "Drift detected".to_string(),
+            severity: AlertSeverity::Error,
+            component: "model-llm".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.to_lowercase().contains("model")));
+    }
+
+    #[tokio::test]
+    async fn test_recommended_actions_default_category() {
+        let system = ObservabilitySystem::new();
+        let alert = Alert {
+            id: "12".to_string(),
+            title: "Outage".to_string(),
+            description: "System down".to_string(),
+            severity: AlertSeverity::Critical,
+            component: "network".to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        };
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Availability);
+        assert!(!actions.is_empty());
     }
 }
