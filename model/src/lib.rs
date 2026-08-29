@@ -6,7 +6,7 @@ pub mod types;
 
 pub use config::{ModelDefaults, OllamaConfig};
 pub use judge::{JudgeConfig, ModelJudge, ValidationCriteria, ValidationMetrics, ValidationResult};
-pub use provider::{ModelError, ModelProvider, ModelResult, StreamingModelProvider};
+pub use provider::{ModelError, ModelProvider, ModelResult};
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, FunctionCall, FunctionDefinition,
     JsonSchema, MessageRole, ModelInfo, PropertySchema, SchemaType, ToolCall, ToolChoice,
