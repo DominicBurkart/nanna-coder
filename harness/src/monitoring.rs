@@ -1283,7 +1283,7 @@ mod tests {
     /// callers using `min`/`max` to gate notifications get the right endpoints.
     #[test]
     fn alert_severity_min_max() {
-        let severities = vec![
+        let severities = [
             AlertSeverity::Critical,
             AlertSeverity::Info,
             AlertSeverity::Error,
