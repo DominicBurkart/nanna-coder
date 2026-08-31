@@ -1102,10 +1102,7 @@ mod tests {
             .with_attribute("user_id", "abc123")
             .with_attribute("region", "us-east-1");
 
-        assert_eq!(
-            trace.attributes.get("user_id"),
-            Some(&"abc123".to_string())
-        );
+        assert_eq!(trace.attributes.get("user_id"), Some(&"abc123".to_string()));
         assert_eq!(
             trace.attributes.get("region"),
             Some(&"us-east-1".to_string())
@@ -1279,10 +1276,7 @@ mod tests {
             trace.attributes.get("datacenter"),
             Some(&"us-west-2".to_string())
         );
-        assert_eq!(
-            trace.attributes.get("team"),
-            Some(&"platform".to_string())
-        );
+        assert_eq!(trace.attributes.get("team"), Some(&"platform".to_string()));
         // service attributes are also added
         assert_eq!(
             trace.attributes.get("service.name"),
@@ -1451,7 +1445,10 @@ mod tests {
             },
         };
 
-        exporter.export_system_metrics(system_metrics).await.unwrap();
+        exporter
+            .export_system_metrics(system_metrics)
+            .await
+            .unwrap();
 
         let output = exporter.export_prometheus().await.unwrap();
         assert!(output.contains("cache_hit_rate"));
