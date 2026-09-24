@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod backlog;
 pub mod container;
+pub mod deploy;
 pub mod entities;
 pub mod eval;
 pub mod leases;

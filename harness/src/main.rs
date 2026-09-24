@@ -153,6 +153,11 @@ enum Commands {
         #[arg(long)]
         queue_path: Option<std::path::PathBuf>,
     },
+    /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -166,6 +171,34 @@ enum Commands {
         /// Optional second JSON file for comparison report
         #[arg(long)]
         compare: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Print the deployment plan for an environment without executing it
+    Plan {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to plan for
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Print the plan as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a starter template for a full-stack Rust repository
+    Init {
+        /// Risk class of the system: unused, internal, edge or core
+        #[arg(long)]
+        risk: harness::deploy::RiskClass,
+        /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -307,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::Deploy { command } => run_deploy(command)?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -321,6 +355,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DeployCommands::Plan {
+            repo_path,
+            env,
+            score,
+            json,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if json {
+                println!("{}", plan.to_json_pretty());
+            } else {
+                print!("{plan}");
+            }
+        }
+        DeployCommands::Init { risk, repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::deploy::init(&repo, risk)?;
+            println!("Wrote {}", path.display());
+        }
+    }
     Ok(())
 }
 
