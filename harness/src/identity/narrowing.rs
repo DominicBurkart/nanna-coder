@@ -19,7 +19,9 @@
 use super::{AgentIdentity, IdentityError};
 
 impl AgentIdentity {
-    /// Check that `self` grants no more than `base` (see the [module docs](self)).
+    /// Check that `self` grants no more than `base`: `scope.max_effect` and every
+    /// `[limits]` value at or below the base, and `scope.repos`, `scope.paths`,
+    /// `scope.tools` and `scope.read_paths` string-set subsets of the base lists.
     ///
     /// ```
     /// use harness::identity::AgentIdentity;
