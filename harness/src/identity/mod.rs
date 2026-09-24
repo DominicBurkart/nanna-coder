@@ -27,9 +27,11 @@
 //! [`IdentityCatalog`] loads a directory of them and applies repo-local
 //! overrides, which may only narrow the global identity they shadow.
 
+mod catalog;
 mod dev_loop;
 mod pattern;
 
+pub use catalog::{IdentityCatalog, AGENTS_SUBDIR, CONFIG_DIR_ENV, REPO_AGENTS_DIR};
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
 mod narrowing;
