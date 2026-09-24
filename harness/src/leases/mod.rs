@@ -6,8 +6,10 @@
 //! identifies each such resource and a [`LeaseStore`] hands out named,
 //! TTL-bearing leases on them.
 
+mod jsonl;
 mod name;
 mod store;
 
+pub use jsonl::{default_lease_path, lease_path_from, JsonlLeaseStore, LEASE_PATH_ENV};
 pub use name::{LeaseKind, LeaseName};
 pub use store::{InMemoryLeaseStore, Lease, LeaseError, LeaseStore, LeaseToken};

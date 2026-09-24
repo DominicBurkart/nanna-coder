@@ -160,14 +160,28 @@ pub trait LeaseStore: Send + Sync {
 }
 
 /// Pure lease bookkeeping shared by every store implementation.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct LeaseTable {
     leases: BTreeMap<LeaseName, Lease>,
 }
 
 impl LeaseTable {
+    pub(super) fn from_leases(leases: impl IntoIterator<Item = Lease>) -> Self {
+        Self {
+            leases: leases.into_iter().map(|l| (l.name.clone(), l)).collect(),
+        }
+    }
+
     pub(super) fn snapshot(&self) -> Vec<Lease> {
         self.leases.values().cloned().collect()
+    }
+
+    pub(super) fn insert(&mut self, lease: Lease) {
+        self.leases.insert(lease.name.clone(), lease);
+    }
+
+    pub(super) fn remove(&mut self, name: &LeaseName) {
+        self.leases.remove(name);
     }
 
     fn blocker(&self, name: &LeaseName, holder: &str, now: DateTime<Utc>) -> Option<&Lease> {
