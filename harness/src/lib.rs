@@ -3,6 +3,7 @@ pub mod backlog;
 pub mod container;
 pub mod entities;
 pub mod eval;
+pub mod leases;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
