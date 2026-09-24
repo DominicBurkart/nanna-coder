@@ -117,6 +117,42 @@ enum Commands {
         #[arg(long)]
         ttl_ms: Option<u64>,
     },
+    /// Pull open GitHub issues into the persistent task queue
+    ///
+    /// Issues already queued (by number) or already claimed by an open pull
+    /// request carrying a `Nanna-Identity:` marker are skipped. Reads
+    /// `GITHUB_TOKEN` for authentication when set. Entries land in the queue
+    /// log and are picked up when `mcp-serve` next starts.
+    BacklogSync {
+        /// GitHub repository in `owner/name` form
+        #[arg(long)]
+        repo: String,
+        /// Absolute path to the local checkout tasks run against
+        #[arg(long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base task worktrees on
+        #[arg(long, default_value = "HEAD")]
+        branch: String,
+        /// GitHub search query fragment selecting the issues
+        #[arg(long, default_value = "label:nanna")]
+        query: String,
+        /// Identity hint attached to every ingested task
+        #[arg(long)]
+        identity: String,
+        /// The model the tasks run with
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations per task
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Maximum pending tasks per repository path
+        #[arg(long)]
+        max_per_repo: Option<usize>,
+        /// Queue log location (defaults to NANNA_QUEUE_PATH or
+        /// ~/.local/state/nanna/queue.jsonl)
+        #[arg(long)]
+        queue_path: Option<std::path::PathBuf>,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -240,6 +276,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &model,
                 max_iterations,
                 ttl_ms,
+            )
+            .await?;
+        }
+        Commands::BacklogSync {
+            repo,
+            repo_path,
+            branch,
+            query,
+            identity,
+            model,
+            max_iterations,
+            max_per_repo,
+            queue_path,
+        } => {
+            run_backlog_sync(
+                harness::backlog::BacklogConfig {
+                    sources: vec![harness::backlog::BacklogSource {
+                        repo,
+                        repo_path,
+                        branch,
+                        query,
+                        identity,
+                        model,
+                        max_iterations,
+                    }],
+                    max_per_repo,
+                },
+                queue_path,
             )
             .await?;
         }
@@ -626,6 +690,32 @@ fn resolve_queue_path(
         .ok_or_else(|| {
             "no queue location: pass --queue-path or set NANNA_QUEUE_PATH or HOME".into()
         })
+}
+
+async fn run_backlog_sync(
+    config: harness::backlog::BacklogConfig,
+    queue_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
+    use harness::scheduler::JsonlQueueStore;
+
+    let path = resolve_queue_path(queue_path)?;
+    let store = JsonlQueueStore::open(&path)?;
+    let sink = StoreSink::open(Box::new(store))?;
+    let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
+    let report = backlog_sync(&client, &sink, &config).await?;
+    println!(
+        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}",
+        path.display(),
+        report.enqueued.len(),
+        report.duplicates,
+        report.claimed,
+        report.capped
+    );
+    for origin in &report.enqueued {
+        println!("  + {origin}");
+    }
+    Ok(())
 }
 
 /// Default system prompt used when an onboarded repo does not supply any
