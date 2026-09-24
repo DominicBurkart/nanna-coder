@@ -76,6 +76,16 @@ pub enum LeaseError {
     /// A zero or negative TTL.
     #[error("lease TTL must be positive, got {0}")]
     NonPositiveTtl(Duration),
+    /// [`required_leases`](super::required_leases) lacked the context field
+    /// an effect needs.
+    #[error("{effect} effect needs `{field}` in its lease context")]
+    MissingContext {
+        effect: super::Effect,
+        field: &'static str,
+    },
+    /// An effect name did not match any [`Effect`](super::Effect).
+    #[error("unknown effect `{0}` (expected one of: local, repository, sandbox, production)")]
+    UnknownEffect(String),
     /// The persistent store could not be read or written.
     #[error("lease store I/O error: {0}")]
     Io(String),
