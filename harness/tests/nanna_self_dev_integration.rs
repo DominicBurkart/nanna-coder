@@ -102,6 +102,7 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args,
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let handle = start_container_with_fallback(&config)

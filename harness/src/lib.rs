@@ -17,7 +17,8 @@ pub mod workspace;
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
-    ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
+    ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, NetworkPolicy,
+    SharedModelPool,
 };
 pub use effects::{EffectClass, UnknownEffectClass};
 pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};

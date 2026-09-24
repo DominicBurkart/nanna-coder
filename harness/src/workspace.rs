@@ -158,6 +158,7 @@ impl TaskWorkspace {
             health_check_timeout: Duration::from_secs(10),
             env_vars: vec![],
             additional_args,
+            network: crate::container::NetworkPolicy::Enabled,
         };
 
         let handle = match start_fn(config).await {
