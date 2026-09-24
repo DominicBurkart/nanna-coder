@@ -1,0 +1,29 @@
+[target]
+kind = "container-registry+serverless"
+registry = "registry.example.invalid/ns"
+image = "fullstack-fixture"
+environments = ["sandbox", "staging", "production"]
+
+[risk]
+class = "edge"
+
+[rollout]
+strategy = "gradual"
+steps = [10, 50, 100]
+min_step_duration = "8h"
+windows = "business-hours"
+
+[health]
+endpoints = ["/health/v1"]
+error_rate_max = 0.01
+latency_p99_max_ms = 800
+bake_time = "30m"
+
+[rollback]
+automatic = true
+on_breach = "rollback"
+
+[shadow]
+enabled = false
+mirror_percent = 0
+compare = ["status", "latency"]
