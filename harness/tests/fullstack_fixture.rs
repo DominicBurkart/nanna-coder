@@ -1,5 +1,6 @@
 use harness::capabilities::detect_capabilities;
 use harness::onboarding::detect::scan_project;
+use harness::onboarding::fullstack::DatabaseUsage;
 use harness::onboarding::profile::BuildSystem;
 use std::fs;
 use std::path::PathBuf;
@@ -84,6 +85,41 @@ fn fixture_profile_uses_cargo_build_system() {
     assert_eq!(profile.build_system, BuildSystem::Cargo);
     assert!(profile.tools.iter().any(|t| t.name == "build"));
     assert!(profile.tools.iter().any(|t| t.name == "test"));
+}
+
+#[test]
+fn fixture_is_detected_as_full_stack_rust() {
+    let signals = scan_project(&fixture_root()).unwrap();
+    let profile = signals
+        .full_stack
+        .expect("fixture matches the full-stack profile");
+    assert_eq!(profile.api.name, "api");
+    assert_eq!(profile.frontend.name, "ui");
+    assert_eq!(profile.shared.len(), 1);
+    assert_eq!(profile.shared[0].name, "shared");
+    assert_eq!(
+        profile.database,
+        Some(DatabaseUsage {
+            sqlx_postgres: true,
+            migrations_dir: Some(PathBuf::from("migrations")),
+        })
+    );
+    assert_eq!(profile.health_path(), "/health/v1");
+    assert_eq!(profile.proxy_backends.len(), 2);
+}
+
+#[test]
+fn plain_library_crate_is_not_full_stack_rust() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+    let signals = scan_project(dir.path()).unwrap();
+    assert!(signals.full_stack.is_none());
 }
 
 #[test]

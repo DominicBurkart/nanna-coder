@@ -1,4 +1,5 @@
 use super::OnboardingError;
+use crate::onboarding::fullstack::FullStackRust;
 use crate::onboarding::profile::{
     BuildSystem, ProjectProfile, ToolCategory, ToolSpec, DEFAULT_RUST_VERSION,
 };
@@ -19,6 +20,8 @@ pub struct ProjectSignals {
     pub has_makefile: bool,
     pub has_flake_nix: bool,
     pub top_level_entries: Vec<String>,
+    /// Present when the workspace matches the full-stack Rust profile.
+    pub full_stack: Option<FullStackRust>,
 }
 
 pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
@@ -44,12 +47,15 @@ pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
         None
     };
 
+    let full_stack = FullStackRust::detect(source)?;
+
     Ok(ProjectSignals {
         cargo_toml,
         has_build_file,
         has_makefile,
         has_flake_nix,
         top_level_entries,
+        full_stack,
     })
 }
 
