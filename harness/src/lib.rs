@@ -15,8 +15,8 @@ pub mod tools;
 pub mod workspace;
 
 pub use capabilities::{
-    detect_capabilities, detect_capabilities_from_entries, find_capability, CargoCapability,
-    CARGO_CAPABILITIES,
+    detect_capabilities, detect_capabilities_from_entries, detect_capability_locations,
+    find_capability, CargoCapability, SignalScope, CARGO_CAPABILITIES,
 };
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
@@ -44,10 +44,12 @@ pub use telemetry::{
 pub use tools::{
     cargo_audit_args, cargo_bench_args, cargo_build_args, cargo_check_args, cargo_deny_args,
     cargo_run_args, cargo_test_args, create_container_tool_registry, create_tool_registry,
-    CalculatorTool, CargoAuditTool, CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool,
-    CargoRunTool, CargoTestTool, EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus,
-    GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
-    ToolError, ToolRegistry, ToolResult, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    member_working_dir, sqlx_migrate_args, trunk_build_args, CalculatorTool, CargoAuditTool,
+    CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool, CargoRunTool, CargoTestTool,
+    EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool,
+    PrStatusData, ReadFileTool, RunCommandTool, SearchTool, SqlxMigrateTool, Tool, ToolError,
+    ToolRegistry, ToolResult, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    SQLX_MIGRATE_COMMANDS,
 };
 
 // Export agent types

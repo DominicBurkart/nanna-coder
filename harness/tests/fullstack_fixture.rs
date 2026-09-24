@@ -156,8 +156,12 @@ fn fixture_flake_provisions_full_stack_toolchain_and_packages() {
 }
 
 #[test]
-fn fixture_has_no_signal_gated_capabilities() {
-    assert!(detect_capabilities(&fixture_root()).is_empty());
+fn fixture_exposes_trunk_build_and_sqlx_migrate_capabilities() {
+    let ids: Vec<&str> = detect_capabilities(&fixture_root())
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, vec!["trunk_build", "sqlx_migrate"]);
 }
 
 #[test]
