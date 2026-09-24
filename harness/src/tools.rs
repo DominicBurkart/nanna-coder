@@ -96,13 +96,9 @@ impl ToolRegistry {
         self.tools.get(name).map(|tool| tool.effect_class())
     }
 
-    fn tools_where(&self, keep: impl Fn(EffectClass) -> bool) -> Vec<&dyn Tool> {
-        let mut selected: Vec<&dyn Tool> = self
-            .tools
-            .values()
-            .map(|tool| tool.as_ref())
-            .filter(|tool| keep(tool.effect_class()))
-            .collect();
+    fn tools_where(&self, keep: &dyn Fn(EffectClass) -> bool) -> Vec<&dyn Tool> {
+        let candidates = self.tools.values().map(|tool| tool.as_ref());
+        let mut selected: Vec<_> = candidates.filter(|t| keep(t.effect_class())).collect();
         selected.sort_by(|a, b| a.name().cmp(b.name()));
         selected
     }
@@ -127,7 +123,7 @@ impl ToolRegistry {
     /// assert!(read_only.iter().all(|tool| tool.effect_class() == EffectClass::None));
     /// ```
     pub fn at_most(&self, ceiling: EffectClass) -> Vec<&dyn Tool> {
-        self.tools_where(|class| class <= ceiling)
+        self.tools_where(&|class| class <= ceiling)
     }
 
     /// Every tool declaring exactly `class`, sorted by name.
@@ -146,7 +142,7 @@ impl ToolRegistry {
     /// assert!(registry.with_class(EffectClass::Production).is_empty());
     /// ```
     pub fn with_class(&self, class: EffectClass) -> Vec<&dyn Tool> {
-        self.tools_where(|candidate| candidate == class)
+        self.tools_where(&|candidate| candidate == class)
     }
 
     /// Tool names grouped by effect class. Every class is present as a key,

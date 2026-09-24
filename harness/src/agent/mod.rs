@@ -395,11 +395,12 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         &self.state_history
     }
 
+    fn tool_call_records(&self, history: &[ChatMessage]) -> Vec<ToolCallRecord> {
+        extract_tool_calls_from_history(history, self.tool_registry.as_ref())
+    }
+
     fn enrich_error(&self, error: AgentError) -> AgentError {
-        let tool_calls = extract_tool_calls_from_history(
-            &self.conversation_history,
-            self.tool_registry.as_ref(),
-        );
+        let tool_calls = self.tool_call_records(&self.conversation_history);
         let conversation = self.conversation_history.clone();
         let state = self.state.clone();
         let iterations = self.iterations;
@@ -470,8 +471,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             if self.state == AgentState::Completed {
                 let task_description = context.user_prompt.clone();
                 let conversation = self.conversation_history.clone();
-                let tool_calls_made =
-                    extract_tool_calls_from_history(&conversation, self.tool_registry.as_ref());
+                let tool_calls_made = self.tool_call_records(&conversation);
                 let result_summary = extract_result_summary(&conversation);
                 let model_used = self.config.model_name.clone();
                 let entity = ContextEntity::new(
@@ -1046,8 +1046,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.state = AgentState::Completed;
         let task_description = context.user_prompt.clone();
         let conversation = self.conversation_history.clone();
-        let tool_calls_made =
-            extract_tool_calls_from_history(&conversation, self.tool_registry.as_ref());
+        let tool_calls_made = self.tool_call_records(&conversation);
         let result_summary = extract_result_summary(&conversation);
         let model_used = self.config.model_name.clone();
         let entity = ContextEntity::new(
