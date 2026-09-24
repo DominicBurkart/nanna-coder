@@ -7,5 +7,7 @@
 //! TTL-bearing leases on them.
 
 mod name;
+mod store;
 
 pub use name::{LeaseKind, LeaseName};
+pub use store::{InMemoryLeaseStore, Lease, LeaseError, LeaseStore, LeaseToken};
