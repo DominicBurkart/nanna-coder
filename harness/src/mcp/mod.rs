@@ -327,14 +327,23 @@ impl NannaMcpServer {
     }
 
     /// `tasks/list` — return all tasks (v1 returns the full set, no pagination)
-    /// plus the scheduler's queue metrics under `_meta.queue`.
+    /// plus the scheduler's queue metrics under `_meta.queue` and the lease
+    /// snapshot under `_meta.leases`. A lease store that cannot be read is
+    /// reported as `_meta.leases.error` rather than hidden.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
         let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
         let queue = self.task_manager.queue_metrics().await.to_json();
+        let leases = match self.task_manager.lease_snapshot() {
+            Ok(snapshot) => snapshot.to_json(),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read lease store for tasks/list");
+                serde_json::json!({ "error": e.to_string() })
+            }
+        };
         JsonRpcResponse::success(
             id,
-            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue } }),
+            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue, "leases": leases } }),
         )
     }
 
@@ -838,6 +847,16 @@ mod tests {
         assert_eq!(task["status"], "working");
         assert!(task["ttl"].is_null());
 
+        let holder = server.task_manager.leases();
+        let name = crate::leases::LeaseName::branch("example/repo", "main");
+        holder
+            .acquire(
+                &name,
+                &task_id,
+                chrono::Duration::hours(1),
+                chrono::Utc::now(),
+            )
+            .unwrap();
         let listed = server
             .handle_request(method_call(21, "tasks/list", serde_json::json!({})))
             .await
@@ -846,6 +865,8 @@ mod tests {
         assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(listed["_meta"]["queue"]["queued"], 1);
         assert_eq!(listed["_meta"]["queue"]["running"], 0);
+        assert_eq!(listed["_meta"]["leases"]["held"], 1);
+        assert_eq!(listed["_meta"]["leases"]["leases"][0]["holder"], task_id);
 
         // tasks/cancel transitions it to cancelled and returns the task.
         let cancelled = server
@@ -856,6 +877,73 @@ mod tests {
             ))
             .await;
         assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
+        assert!(holder.snapshot().unwrap().is_empty());
+    }
+
+    struct BrokenLeases;
+
+    impl crate::leases::LeaseStore for BrokenLeases {
+        fn acquire(
+            &self,
+            _name: &crate::leases::LeaseName,
+            _holder: &str,
+            _ttl: chrono::Duration,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::leases::Lease, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn renew(
+            &self,
+            _lease: &crate::leases::Lease,
+            _ttl: chrono::Duration,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::leases::Lease, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn release(&self, _lease: &crate::leases::Lease) -> Result<(), crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn release_all(
+            &self,
+            _holder: &str,
+        ) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn expired(
+            &self,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn snapshot(&self) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tasks_list_reports_unreadable_lease_store() {
+        let manager = TaskManager::with_stores(
+            0,
+            Box::new(crate::scheduler::HybridPolicy::default()),
+            Box::new(crate::scheduler::InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+        )
+        .unwrap();
+        let server = NannaMcpServer::new(
+            Arc::new(manager),
+            Arc::new(NoopProvider),
+            "qwen3:0.6b".to_string(),
+            100,
+        );
+        let listed = server
+            .handle_request(method_call(30, "tasks/list", serde_json::json!({})))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            listed["_meta"]["leases"]["error"],
+            "lease store I/O error: broken"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
-use crate::leases::{InMemoryLeaseStore, LeaseStore};
+use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -246,14 +246,25 @@ pub struct TaskManager {
 impl TaskManager {
     /// An in-memory manager with the default hybrid policy.
     pub fn new(max_concurrent_tasks: usize) -> Self {
-        Self::build(
+        Self::with_stores(
             max_concurrent_tasks,
             Box::new(HybridPolicy::default()),
             Box::new(InMemoryQueueStore::default()),
             Arc::new(InMemoryLeaseStore::default()),
-            None,
         )
         .expect("an empty in-memory queue store always loads")
+    }
+
+    /// A manager over explicit stores whose queue is empty or whose entries
+    /// will be submitted afresh; use [`restore`](Self::restore) to resume a
+    /// persisted backlog.
+    pub fn with_stores(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+    ) -> Result<Self, QueueStoreError> {
+        Self::build(max_concurrent_tasks, policy, store, leases, None)
     }
 
     /// Build a manager over `store`, re-queue every entry the store still
@@ -315,6 +326,11 @@ impl TaskManager {
     /// the leases are released when the task ends.
     pub fn leases(&self) -> Arc<dyn LeaseStore> {
         Arc::clone(&self.runner.leases)
+    }
+
+    /// Every recorded lease with live and expired counts as of now.
+    pub fn lease_snapshot(&self) -> Result<LeaseSnapshot, LeaseError> {
+        LeaseSnapshot::from_store(&*self.runner.leases, Utc::now())
     }
 
     async fn get_or_build_image(
@@ -1840,6 +1856,7 @@ mod scheduler_tests {
         assert_eq!(metrics.queued, 1);
         assert_eq!(metrics.running, 1);
         assert_eq!(metrics.dispatched_newest, 1);
+        assert_eq!(manager.lease_snapshot().unwrap().held, 0);
 
         open.send(true).unwrap();
         let done = wait_for(&manager, &first, TaskStatus::is_terminal).await;
@@ -2241,14 +2258,14 @@ mod scheduler_tests {
         .expect("restore must fail when expired-lease reclamation fails");
         assert!(matches!(empty, QueueStoreError::Rejected(_)));
 
-        let manager = TaskManager::build(
+        let manager = TaskManager::with_stores(
             0,
             Box::new(HybridPolicy::default()),
             Box::new(InMemoryQueueStore::default()),
             Arc::new(BrokenLeases),
-            Some(provider.clone()),
         )
         .unwrap();
+        assert!(manager.lease_snapshot().is_err());
         let id = manager
             .submit_task(queued(Path::new("/nonexistent")), provider)
             .await;

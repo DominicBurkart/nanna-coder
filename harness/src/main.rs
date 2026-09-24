@@ -659,7 +659,38 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
     }
 
     report_queue_health()?;
+    report_lease_health()?;
 
+    Ok(())
+}
+
+/// Print every recorded coordination lease with live and expired counts.
+/// A missing lease log means no lease has been granted yet.
+fn report_lease_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::{default_lease_path, JsonlLeaseStore, LeaseSnapshot};
+
+    let Some(path) = default_lease_path() else {
+        println!("- Leases: no lease location (set NANNA_LEASE_PATH, NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Leases: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlLeaseStore::open(&path)?;
+    let snapshot = LeaseSnapshot::from_store(&store, chrono::Utc::now())?;
+    println!("- Leases ({}): {}", path.display(), snapshot);
+    for lease in &snapshot.leases {
+        let state = if lease.is_expired(snapshot.at) {
+            "expired"
+        } else {
+            "held"
+        };
+        println!(
+            "  {} {} by {} until {}",
+            state, lease.name, lease.holder, lease.until
+        );
+    }
     Ok(())
 }
 
