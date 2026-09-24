@@ -3,6 +3,7 @@ pub mod container;
 pub mod effects;
 pub mod entities;
 pub mod eval;
+pub mod identity;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
