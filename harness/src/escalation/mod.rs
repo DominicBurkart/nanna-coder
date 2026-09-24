@@ -6,13 +6,23 @@
 //! a summary, evidence and a suggested action; `needs-card` escalations
 //! carry a proposed identity skeleton rendered from a [`CardRequest`].
 //! Titles and dedupe keys are deterministic so repeats of the same problem
-//! land on the same issue. Everything leaving the process is passed through
-//! [`redact`] first.
+//! land on the same issue: the [`GithubIssueSink`] comments on the open
+//! issue instead of filing a duplicate. A [`WebhookSink`] posts the JSON
+//! form, and a [`FanoutSink`] delivers to several sinks at once. Everything
+//! leaving the process is passed through [`redact`] first.
 
 mod card;
+mod github;
 mod model;
 mod redact;
+mod sink;
+mod webhook;
 
 pub use card::{CardRequest, MODEL_PLACEHOLDER};
+pub use github::{GithubIssueSink, ESCALATION_LABEL};
 pub use model::{Escalation, EscalationSource, Severity, UnknownName, HEADLINE_CHARS};
 pub use redact::{marker, redact, redact_value};
+pub use sink::{
+    DeliveryOutcome, DeliveryReceipt, EscalationError, EscalationSink, FanoutSink, SinkFailure,
+};
+pub use webhook::WebhookSink;
