@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod apprun;
 pub mod capabilities;
 pub mod container;
 pub mod entities;
