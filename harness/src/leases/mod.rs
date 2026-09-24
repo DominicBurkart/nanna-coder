@@ -6,11 +6,13 @@
 //! identifies each such resource and a [`LeaseStore`] hands out named,
 //! TTL-bearing leases on them.
 
+mod acquire;
 mod jsonl;
 mod name;
 mod policy;
 mod store;
 
+pub use acquire::acquire_all;
 pub use jsonl::{default_lease_path, lease_path_from, JsonlLeaseStore, LEASE_PATH_ENV};
 pub use name::{LeaseKind, LeaseName};
 pub use policy::{required_leases, Effect, LeaseContext};
