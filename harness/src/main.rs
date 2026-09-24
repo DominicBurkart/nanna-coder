@@ -682,6 +682,16 @@ fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Lease log location: `NANNA_LEASE_PATH` when set, otherwise
+/// `leases.jsonl` next to the queue log.
+fn resolve_lease_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::leases::lease_path_from(
+        std::env::var_os(harness::leases::LEASE_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields a lease path")
+}
+
 fn resolve_queue_path(
     explicit: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -871,6 +881,7 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -879,21 +890,24 @@ async fn run_mcp_server(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
+    let lease_path = resolve_lease_path(&queue_path);
     let task_manager = Arc::new(
         TaskManager::restore(
             DEFAULT_MAX_CONCURRENT_TASKS,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&queue_path)?),
+            Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
         )
         .await?,
     );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {})",
         model,
         max_iterations,
-        queue_path.display()
+        queue_path.display(),
+        lease_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
