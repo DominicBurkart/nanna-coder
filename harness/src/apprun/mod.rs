@@ -8,6 +8,8 @@
 //! instances are tracked in [`RunningApps`] so that a second `app_start`
 //! returns the instance already running.
 
+pub mod instance;
 pub mod ports;
 
+pub use instance::{AppInstance, Limits, RunningApps, DEFAULT_MAX_WALL_CLOCK_SECS};
 pub use ports::{PortAllocator, PortError, PortLease, DEFAULT_PORT_RANGE, LEASE_DIR_NAME};
