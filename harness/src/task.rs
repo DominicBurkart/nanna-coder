@@ -2,6 +2,7 @@ use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
+use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
@@ -88,11 +89,21 @@ pub struct TaskResult {
     pub format_patch: Option<String>,
     pub files_modified: Vec<String>,
     pub tool_calls_made: Vec<ToolCallRecord>,
+    /// Every call the identity scope refused during the run, in order.
+    /// Empty when the task ran without an identity.
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
 }
 
 impl TaskResult {
+    /// Number of refused calls; repeated denials are the auditor's signal
+    /// that the identity lacks a capability the task needs.
+    pub fn denial_count(&self) -> usize {
+        self.denials.len()
+    }
+
     /// The widest blast radius any attributed tool call in this result
     /// reached, or `None` when no call carried an effect attribution.
     pub fn max_effect_class(&self) -> Option<EffectClass> {
@@ -110,6 +121,8 @@ impl TaskResult {
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
             "max_effect_class": self.max_effect_class(),
+            "denials": self.denials,
+            "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
         })
@@ -547,6 +560,7 @@ impl TaskManager {
                                 format_patch,
                                 files_modified,
                                 tool_calls_made: result.tool_calls_made,
+                                denials: result.denials,
                                 iterations: result.iterations,
                                 model_used: model,
                             };
@@ -850,14 +864,30 @@ mod tests {
             format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
             files_modified: vec!["foo.rs".to_string()],
             tool_calls_made: vec![],
+            denials: vec![crate::scope::ScopeDenial {
+                identity: "rust-implementer".to_string(),
+                tool: "write_file".to_string(),
+                reason: crate::scope::DenialReason::ToolNotInScope,
+            }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
         };
+        assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
         assert_eq!(json["result_summary"], "Done");
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["denial_count"], 1);
+        assert_eq!(json["denials"][0]["identity"], "rust-implementer");
+        assert_eq!(json["denials"][0]["tool"], "write_file");
+        assert_eq!(json["denials"][0]["reason"]["kind"], "tool_not_in_scope");
+        let legacy: TaskResult = serde_json::from_value(serde_json::json!({
+            "result_summary": "", "changes_patch": null, "format_patch": null,
+            "files_modified": [], "tool_calls_made": [], "iterations": 0, "model_used": "m"
+        }))
+        .unwrap();
+        assert_eq!(legacy.denial_count(), 0);
     }
 
     #[test]
@@ -923,6 +953,7 @@ mod tests {
             format_patch: None,
             files_modified: vec![],
             tool_calls_made,
+            denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
         }

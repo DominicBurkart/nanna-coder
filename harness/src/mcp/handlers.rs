@@ -307,6 +307,7 @@ mod tests {
             format_patch: None,
             files_modified: vec!["a.rs".to_string()],
             tool_calls_made: vec![],
+            denials: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
         }
