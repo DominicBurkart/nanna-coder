@@ -23,6 +23,7 @@ pub mod report;
 
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
+use crate::effects::EffectRecord;
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
 use crate::tools::ToolRegistry;
@@ -231,7 +232,10 @@ pub struct AgentRunResult {
     pub token_usage: Option<Usage>,
 }
 
-fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
+fn extract_tool_calls_from_history(
+    history: &[ChatMessage],
+    registry: Option<&ToolRegistry>,
+) -> Vec<ToolCallRecord> {
     use std::collections::HashMap;
 
     let mut call_args: HashMap<String, (String, serde_json::Value)> = HashMap::new();
@@ -259,11 +263,15 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecor
         .into_iter()
         .map(|(call_id, (tool_name, arguments))| {
             let result = call_results.get(&call_id).cloned().unwrap_or_default();
+            let effect = registry
+                .and_then(|r| r.effect_class_of(&tool_name))
+                .map(EffectRecord::new);
             ToolCallRecord {
                 tool_name,
                 arguments,
                 call_id,
                 result,
+                effect,
             }
         })
         .collect()
@@ -388,7 +396,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     }
 
     fn enrich_error(&self, error: AgentError) -> AgentError {
-        let tool_calls = extract_tool_calls_from_history(&self.conversation_history);
+        let tool_calls = extract_tool_calls_from_history(
+            &self.conversation_history,
+            self.tool_registry.as_ref(),
+        );
         let conversation = self.conversation_history.clone();
         let state = self.state.clone();
         let iterations = self.iterations;
@@ -459,7 +470,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             if self.state == AgentState::Completed {
                 let task_description = context.user_prompt.clone();
                 let conversation = self.conversation_history.clone();
-                let tool_calls_made = extract_tool_calls_from_history(&conversation);
+                let tool_calls_made =
+                    extract_tool_calls_from_history(&conversation, self.tool_registry.as_ref());
                 let result_summary = extract_result_summary(&conversation);
                 let model_used = self.config.model_name.clone();
                 let entity = ContextEntity::new(
@@ -1034,7 +1046,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.state = AgentState::Completed;
         let task_description = context.user_prompt.clone();
         let conversation = self.conversation_history.clone();
-        let tool_calls_made = extract_tool_calls_from_history(&conversation);
+        let tool_calls_made =
+            extract_tool_calls_from_history(&conversation, self.tool_registry.as_ref());
         let result_summary = extract_result_summary(&conversation);
         let model_used = self.config.model_name.clone();
         let entity = ContextEntity::new(
@@ -2162,7 +2175,7 @@ mod tests {
             ChatMessage::assistant("done"),
         ];
 
-        let mut records = extract_tool_calls_from_history(&history);
+        let mut records = extract_tool_calls_from_history(&history, None);
         records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
 
         assert_eq!(records.len(), 2);
@@ -2184,7 +2197,7 @@ mod tests {
             // No tool response for "orphan".
         ];
 
-        let records = extract_tool_calls_from_history(&history);
+        let records = extract_tool_calls_from_history(&history, None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].call_id, "orphan");
         assert_eq!(records[0].result, "");
@@ -2201,7 +2214,44 @@ mod tests {
             ChatMessage::assistant("ok"),
         ];
 
-        assert!(extract_tool_calls_from_history(&history).is_empty());
+        assert!(extract_tool_calls_from_history(&history, None).is_empty());
+    }
+
+    /// With a registry attached, each record carries the effect class the
+    /// tool declares; calls to unregistered tools (which never executed)
+    /// carry no attribution at all.
+    #[test]
+    fn extract_tool_calls_attributes_effects_from_registry() {
+        use crate::effects::EffectClass;
+        use crate::tools::{CalculatorTool, WriteFileTool};
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CalculatorTool::new()));
+        registry.register(Box::new(WriteFileTool::new(std::path::PathBuf::from("."))));
+        let history = vec![
+            assistant_tool_calls(vec![
+                ("call_a", "calculate", serde_json::json!({"x": 2})),
+                ("call_b", "write_file", serde_json::json!({"path": "f"})),
+                ("call_c", "unregistered", serde_json::json!({})),
+            ]),
+            ChatMessage::tool_response("call_a", "4"),
+        ];
+
+        let mut records = extract_tool_calls_from_history(&history, Some(&registry));
+        records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+
+        assert_eq!(
+            records[0].effect,
+            Some(EffectRecord::new(EffectClass::None))
+        );
+        assert_eq!(
+            records[1].effect,
+            Some(EffectRecord::new(EffectClass::Workspace))
+        );
+        assert_eq!(records[2].effect, None);
+
+        let without_registry = extract_tool_calls_from_history(&history, None);
+        assert!(without_registry.iter().all(|r| r.effect.is_none()));
     }
 
     /// `extract_result_summary` returns the most recent assistant message

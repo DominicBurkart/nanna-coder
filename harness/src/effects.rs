@@ -99,6 +99,38 @@ impl EffectClass {
     }
 }
 
+/// Effect attribution stored on a single tool-call record.
+///
+/// Kept as a struct rather than a bare [`EffectClass`] so that finer-grained
+/// attribution (for example which assets a call touched) can be added later
+/// without changing the shape of existing records.
+///
+/// ```
+/// use harness::effects::{EffectClass, EffectRecord};
+///
+/// let record = EffectRecord::new(EffectClass::Workspace);
+/// assert_eq!(record.class, EffectClass::Workspace);
+/// assert_eq!(serde_json::to_value(&record).unwrap(), serde_json::json!({"class": "workspace"}));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EffectRecord {
+    /// Blast radius declared by the tool at the time of the call.
+    pub class: EffectClass,
+}
+
+impl EffectRecord {
+    /// Attribute a call to `class`.
+    pub const fn new(class: EffectClass) -> Self {
+        Self { class }
+    }
+}
+
+impl From<EffectClass> for EffectRecord {
+    fn from(class: EffectClass) -> Self {
+        Self::new(class)
+    }
+}
+
 impl fmt::Display for EffectClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -184,6 +216,16 @@ mod tests {
         for class in EffectClass::ALL.into_iter().skip(1) {
             assert!(class.is_effectful(), "{class} should be effectful");
         }
+    }
+
+    #[test]
+    fn effect_record_round_trips_and_converts_from_class() {
+        let record: EffectRecord = EffectClass::Sandbox.into();
+        assert_eq!(record, EffectRecord::new(EffectClass::Sandbox));
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(json, r#"{"class":"sandbox"}"#);
+        let back: EffectRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, record);
     }
 
     fn any_class() -> impl Strategy<Value = EffectClass> {
