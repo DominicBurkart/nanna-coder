@@ -21,4 +21,7 @@ pub use runner::{
     AppContext, AppError, AppSpec, StoppedApp, BIND_ADDR_VAR, DEFAULT_POLL_INTERVAL,
     DEFAULT_RUST_LOG, FRONTEND_DIST_VAR, LOG_DIR, LOG_TAIL_ON_FAILURE, RUST_LOG_VAR,
 };
-pub use tools::{register_app_tools, AppStartTool, APP_START_TOOL};
+pub use tools::{
+    parse_tail, register_app_tools, AppLogsTool, AppStartTool, AppStopTool, APP_LOGS_TOOL,
+    APP_START_TOOL, APP_STOP_TOOL, DEFAULT_LOG_TAIL,
+};
