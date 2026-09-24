@@ -287,7 +287,7 @@ fn outside_root(path: &Path) -> ToolError {
     ))
 }
 
-fn canonical_root(workspace_root: &Path) -> ToolResult<PathBuf> {
+pub(crate) fn canonical_root(workspace_root: &Path) -> ToolResult<PathBuf> {
     workspace_root
         .canonicalize()
         .map_err(|e| violation(format!("Cannot resolve workspace root: {}", e)))
