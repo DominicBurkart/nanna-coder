@@ -194,7 +194,9 @@ impl PostgresSidecar {
     }
 
     /// The sidecar specification: the Postgres image creates `database` at
-    /// first start and `pg_isready` gates readiness.
+    /// first start and `pg_isready` over TCP gates readiness. The probe must
+    /// use TCP because the image's entrypoint first runs a temporary,
+    /// socket-only server while it initialises the database.
     pub fn spec(&self) -> SidecarSpec {
         SidecarSpec {
             name: Self::container_name(&self.task_id),
@@ -208,6 +210,10 @@ impl PostgresSidecar {
             port: POSTGRES_PORT,
             readiness: vec![
                 "pg_isready".to_string(),
+                "-h".to_string(),
+                "127.0.0.1".to_string(),
+                "-p".to_string(),
+                POSTGRES_PORT.to_string(),
                 "-U".to_string(),
                 self.user.clone(),
                 "-d".to_string(),
@@ -521,7 +527,17 @@ mod tests {
         );
         assert_eq!(
             spec.readiness,
-            vec!["pg_isready", "-U", "postgres", "-d", "task_t_1"]
+            vec![
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-U",
+                "postgres",
+                "-d",
+                "task_t_1"
+            ]
         );
         assert_eq!(
             spec.exports,
