@@ -9,6 +9,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod scope;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
@@ -31,6 +32,7 @@ pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
 };
+pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,

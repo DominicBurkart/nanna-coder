@@ -39,6 +39,9 @@ mod schema;
 
 pub use schema::{AgentIdentity, IdentitySection, LimitsSection, ScopeSection, SystemPrompt};
 
+#[cfg(test)]
+pub(crate) use schema::tests::example;
+
 use std::path::PathBuf;
 use thiserror::Error;
 

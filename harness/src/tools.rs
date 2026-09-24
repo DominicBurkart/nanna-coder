@@ -1,4 +1,5 @@
 use crate::effects::EffectClass;
+use crate::scope::{validate_path_for_write, validate_path_within_workspace, ScopeDenial};
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
@@ -22,6 +23,9 @@ pub enum ToolError {
 
     #[error("Path security violation: {message}")]
     PathSecurityViolation { message: String },
+
+    #[error("Scope denial: {0}")]
+    ScopeDenied(ScopeDenial),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -378,79 +382,6 @@ impl Tool for CalculatorTool {
     fn effect_class(&self) -> EffectClass {
         EffectClass::None
     }
-}
-
-fn validate_path_within_workspace(path: &Path, workspace_root: &Path) -> ToolResult<PathBuf> {
-    let canonical_root =
-        workspace_root
-            .canonicalize()
-            .map_err(|e| ToolError::PathSecurityViolation {
-                message: format!("Cannot resolve workspace root: {}", e),
-            })?;
-
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    };
-
-    let canonical_path = resolved
-        .canonicalize()
-        .map_err(|e| ToolError::PathSecurityViolation {
-            message: format!("Cannot resolve path '{}': {}", path.display(), e),
-        })?;
-
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(ToolError::PathSecurityViolation {
-            message: format!("Path '{}' is outside workspace root", path.display()),
-        });
-    }
-
-    Ok(canonical_path)
-}
-
-fn validate_path_for_write(path: &Path, workspace_root: &Path) -> ToolResult<PathBuf> {
-    let canonical_root =
-        workspace_root
-            .canonicalize()
-            .map_err(|e| ToolError::PathSecurityViolation {
-                message: format!("Cannot resolve workspace root: {}", e),
-            })?;
-
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    };
-
-    let mut check_path = resolved.as_path();
-    loop {
-        if let Ok(canonical) = check_path.canonicalize() {
-            if !canonical.starts_with(&canonical_root) {
-                return Err(ToolError::PathSecurityViolation {
-                    message: format!("Path '{}' is outside workspace root", path.display()),
-                });
-            }
-            break;
-        }
-        match check_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => {
-                check_path = parent;
-            }
-            _ => break,
-        }
-    }
-
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(ToolError::PathSecurityViolation {
-            message: "Path contains '..' components".to_string(),
-        });
-    }
-
-    Ok(resolved)
 }
 
 pub struct ReadFileTool {
