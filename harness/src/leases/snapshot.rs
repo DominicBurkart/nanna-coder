@@ -112,6 +112,9 @@ mod tests {
         assert_eq!(json["leases"][0]["holder"], "b");
         assert_eq!(json["leases"][1]["name"], "sandbox:r:1");
         assert_eq!(snapshot.to_string(), "held=1 expired=1");
+        let telemetry = TelemetrySystem::new();
+        snapshot.record(&telemetry);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 2);
     }
 
     struct Broken;
