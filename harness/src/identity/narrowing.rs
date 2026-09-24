@@ -16,7 +16,7 @@
 //! `identity.system_prompt` may differ freely: they change what the agent is
 //! told, not what it can reach.
 
-use super::{AgentIdentity, IdentityError};
+use super::{AgentIdentity, IdentityError, LimitsSection};
 
 impl AgentIdentity {
     /// Check that `self` grants no more than `base`: `scope.max_effect` and every
@@ -61,11 +61,9 @@ impl AgentIdentity {
     /// ```
     pub fn narrows(&self, base: &AgentIdentity) -> Result<(), IdentityError> {
         let name = self.identity.name.as_str();
-        if self.scope.max_effect > base.scope.max_effect {
-            let reason = format!(
-                "{} exceeds {}",
-                self.scope.max_effect, base.scope.max_effect
-            );
+        let (own_effect, base_effect) = (self.scope.max_effect, base.scope.max_effect);
+        if own_effect > base_effect {
+            let reason = format!("{own_effect} exceeds {base_effect}");
             return Err(widens(name, "scope.max_effect", reason));
         }
         subset(name, "scope.repos", &self.scope.repos, &base.scope.repos)?;
@@ -76,60 +74,58 @@ impl AgentIdentity {
         match (&self.scope.read_paths, &base.scope.read_paths) {
             (_, None) => {}
             (None, Some(_)) => {
-                let reason = "reads are unrestricted but the base restricts them".to_string();
+                let reason = UNRESTRICTED_READS.to_string();
                 return Err(widens(name, "scope.read_paths", reason));
             }
             (Some(own), Some(base)) => subset(name, "scope.read_paths", own, base)?,
         }
-        let (own, base_limits) = (self.limits, base.limits);
-        at_most(
-            name,
-            "limits.max_iterations",
-            own.max_iterations as u64,
-            base_limits.max_iterations as u64,
-        )?;
-        at_most(
-            name,
-            "limits.max_wall_clock_secs",
-            own.max_wall_clock_secs,
-            base_limits.max_wall_clock_secs,
-        )?;
-        at_most(
-            name,
-            "limits.max_concurrent",
-            own.max_concurrent as u64,
-            base_limits.max_concurrent as u64,
-        )?;
+        let (own, base) = (limit_values(self.limits), limit_values(base.limits));
+        for ((field, own), base) in LIMIT_FIELDS.iter().zip(own).zip(base) {
+            at_most(name, field, own, base)?;
+        }
         Ok(())
     }
 }
 
+const LIMIT_FIELDS: [&str; 3] = [
+    "limits.max_iterations",
+    "limits.max_wall_clock_secs",
+    "limits.max_concurrent",
+];
+
+fn limit_values(l: LimitsSection) -> [u64; 3] {
+    [
+        l.max_iterations as u64,
+        l.max_wall_clock_secs,
+        l.max_concurrent as u64,
+    ]
+}
+
+const UNRESTRICTED_READS: &str = "reads are unrestricted but the base restricts them";
+
 fn widens(name: &str, field: &str, reason: String) -> IdentityError {
+    let (name, field) = (name.to_string(), field.to_string());
     IdentityError::WidensScope {
-        name: name.to_string(),
-        field: field.to_string(),
+        name,
+        field,
         reason,
     }
 }
 
 fn subset(name: &str, field: &str, own: &[String], base: &[String]) -> Result<(), IdentityError> {
     match own.iter().find(|item| !base.contains(item)) {
-        Some(extra) => Err(widens(
-            name,
-            field,
-            format!("`{extra}` is not in the base {field}"),
-        )),
+        Some(extra) => {
+            let reason = format!("`{extra}` is not in the base {field}");
+            Err(widens(name, field, reason))
+        }
         None => Ok(()),
     }
 }
 
 fn at_most(name: &str, field: &str, own: u64, base: u64) -> Result<(), IdentityError> {
     if own > base {
-        return Err(widens(
-            name,
-            field,
-            format!("{own} exceeds the base {field} of {base}"),
-        ));
+        let reason = format!("{own} exceeds the base {field} of {base}");
+        return Err(widens(name, field, reason));
     }
     Ok(())
 }

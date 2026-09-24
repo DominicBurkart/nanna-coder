@@ -318,6 +318,7 @@ impl Validator<'_> {
         self.positive("limits.max_iterations", raw.limits.max_iterations as u64)?;
         self.positive("limits.max_wall_clock_secs", raw.limits.max_wall_clock_secs)?;
         self.positive("limits.max_concurrent", raw.limits.max_concurrent as u64)?;
+        let source = self.file.to_path_buf();
 
         Ok(AgentIdentity {
             identity: IdentitySection {
@@ -335,7 +336,7 @@ impl Validator<'_> {
                 tools,
             },
             limits: raw.limits,
-            source: self.file.to_path_buf(),
+            source,
         })
     }
 }
@@ -392,13 +393,14 @@ impl AgentIdentity {
         file: impl AsRef<Path>,
     ) -> Result<Self, IdentityError> {
         let file = file.as_ref();
-        let raw = RawIdentity::from(AgentIdentity {
+        let source = file.to_path_buf();
+        let typed = AgentIdentity {
             identity,
             scope,
             limits,
-            source: file.to_path_buf(),
-        });
-        Validator { file }.validate(raw)
+            source,
+        };
+        Validator { file }.validate(RawIdentity::from(typed))
     }
 
     /// Catalog key (`identity.name`).

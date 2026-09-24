@@ -120,10 +120,8 @@ impl IdentityCatalog {
         }
         let mut overrides = Self::default();
         for local in load_dir(&dir)? {
-            let base = self
-                .identities
-                .get(local.name())
-                .ok_or_else(|| no_base(&local))?;
+            let name = local.name();
+            let base = self.identities.get(name).ok_or_else(|| no_base(&local))?;
             local.narrows(base)?;
             overrides.insert_unique(local)?;
         }
