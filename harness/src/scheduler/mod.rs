@@ -9,8 +9,8 @@
 //!
 //! Queued entries can be persisted through a [`QueueStore`] so that a
 //! rebuilt manager resumes the same backlog, and can be parked with a
-//! `not_before` instant so that work outside a human-availability window
-//! waits without occupying a slot.
+//! `not_before` instant (see [`parked_until`]) so that work outside a
+//! human-availability window waits without occupying a slot.
 //!
 //! ```
 //! use chrono::Utc;
@@ -35,10 +35,16 @@
 //! assert_eq!(queue.entries()[second.index].description, "task 2");
 //! ```
 
+mod dispatch;
+mod metrics;
+mod park;
 mod policy;
 mod queue;
 mod store;
 
+pub use dispatch::{BoxFuture, CancelOutcome, Dispatcher, Launcher};
+pub use metrics::QueueMetrics;
+pub use park::parked_until;
 pub use policy::{HybridPolicy, PolicyError, SchedulingPolicy, Selection, Side, SlotState};
 pub use queue::TaskQueue;
 pub use store::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
