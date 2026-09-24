@@ -1,5 +1,6 @@
 use crate::container::{
-    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle,
+    cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
+    ContainerHandle,
 };
 use crate::sidecar::SidecarSet;
 use crate::tools::{
@@ -10,6 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -209,11 +211,26 @@ impl TaskWorkspace {
         self.sidecars.as_ref().map_or(&[], |s| s.exports())
     }
 
+    /// Remove the worktree, the dev container and any sidecars.
+    ///
+    /// The dev container is removed explicitly rather than through the last
+    /// `Arc<ContainerHandle>` drop, because tool registries built from this
+    /// workspace keep their own reference to the handle and may outlive it;
+    /// the sidecar network can only be removed once the container has left it.
     pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
         if self.cleaned_up {
             return Ok(());
         }
-        drop(self.container_handle.take());
+        if let Some(handle) = self.container_handle.take() {
+            if handle.needs_cleanup {
+                if let Err(e) = cleanup_container(&handle) {
+                    warn!(
+                        "dev container cleanup for task {} failed: {e}",
+                        self.task_id
+                    );
+                }
+            }
+        }
         drop(self.sidecars.take());
         let output = git_cmd(&self.source_repo)
             .args([
@@ -639,6 +656,44 @@ mod tests {
         ws.cleanup().unwrap();
         assert!(ws.sidecars.is_none());
         assert!(ws.sidecar_env().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_removes_container_even_when_registry_holds_a_reference() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-stub"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "stub-handle".to_string(),
+            runtime: ContainerRuntime::Stub,
+            port: None,
+            needs_cleanup: true,
+        }));
+        let registry = ws.build_tool_registry();
+        ws.cleanup().unwrap();
+        assert!(ws.container_handle.is_none());
+        assert!(registry.get_tool("run_command").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_tolerates_container_removal_failure() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-fail"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Docker,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
     }
 
     #[test]
