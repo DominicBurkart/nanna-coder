@@ -760,23 +760,14 @@ impl TaskRunner {
             }
             Err(e) => {
                 let partial_changes = changes_patch;
-                let (tool_calls_slice, conv_slice, diag_iters, diag_state) = e.diagnostics();
+                let (tool_calls_slice, conv_slice, iterations_completed, diag_state) =
+                    e.diagnostics();
                 let tool_call_history: Vec<ToolCallRecord> = tool_calls_slice.to_vec();
                 let conversation_snapshot: Vec<ChatMessage> = conv_slice.to_vec();
                 let last_agent_state = Some(format!("{:?}", diag_state));
                 let last_tool_call = tool_call_history.last().cloned();
-                let (error_type, iterations_completed) = match &e {
-                    AgentError::MaxIterationsExceeded {
-                        iterations_completed,
-                        ..
-                    } => ("MaxIterationsExceeded".to_string(), *iterations_completed),
-                    AgentError::StateError { .. } => ("StateError".to_string(), diag_iters),
-                    AgentError::TaskCheckFailed { .. } => {
-                        ("TaskCheckFailed".to_string(), diag_iters)
-                    }
-                };
                 let diagnostics = FailureDiagnostics {
-                    error_type,
+                    error_type: agent_error_type(&e).to_string(),
                     iterations_completed,
                     last_tool_call,
                     partial_changes,
@@ -795,6 +786,15 @@ impl TaskRunner {
                 .await;
             }
         }
+    }
+}
+
+/// Stable `error_type` label for an agent failure.
+fn agent_error_type(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::MaxIterationsExceeded { .. } => "MaxIterationsExceeded",
+        AgentError::StateError { .. } => "StateError",
+        AgentError::TaskCheckFailed { .. } => "TaskCheckFailed",
     }
 }
 
@@ -972,6 +972,37 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"src/main.rs".to_string()));
         assert!(files.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn test_agent_error_type_labels_every_variant() {
+        use crate::agent::AgentState;
+        let state_error = AgentError::StateError {
+            message: "m".to_string(),
+            iterations_completed: 1,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PlanningEntityModification,
+        };
+        let check_failed = AgentError::TaskCheckFailed {
+            message: "m".to_string(),
+            iterations_completed: 2,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::CheckingTaskCompletion,
+        };
+        let exceeded = AgentError::MaxIterationsExceeded {
+            iterations_completed: 3,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PerformingEntityModification,
+        };
+        assert_eq!(agent_error_type(&state_error), "StateError");
+        assert_eq!(agent_error_type(&check_failed), "TaskCheckFailed");
+        assert_eq!(agent_error_type(&exceeded), "MaxIterationsExceeded");
+        assert_eq!(state_error.diagnostics().2, 1);
+        assert_eq!(check_failed.diagnostics().2, 2);
+        assert_eq!(exceeded.diagnostics().2, 3);
     }
 
     #[test]
