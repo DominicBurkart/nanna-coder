@@ -622,8 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_with_container_networked_without_runtime_fails() {
-        use crate::container::detect_runtime;
+    async fn test_create_with_container_fails_without_an_image() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
@@ -636,14 +635,21 @@ mod tests {
         )
         .await;
 
-        if detect_runtime().is_available() {
-            assert!(result.is_err() || result.unwrap().cleanup().is_ok());
-        } else {
-            assert!(matches!(
-                result,
-                Err(WorkspaceError::ContainerSetupFailed(_))
-            ));
-        }
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::ContainerSetupFailed(_))
+        ));
+        let default_network = TaskWorkspace::create_with_container(
+            source.path(),
+            &unique_id("ws-default-network"),
+            "HEAD",
+            "nonexistent-image-for-nanna-tests:none",
+        )
+        .await;
+        assert!(matches!(
+            default_network,
+            Err(WorkspaceError::ContainerSetupFailed(_))
+        ));
     }
 
     fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {

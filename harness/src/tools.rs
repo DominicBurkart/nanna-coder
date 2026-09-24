@@ -133,10 +133,8 @@ impl ToolRegistry {
     }
 
     fn record(&self, denial: ScopeDenial) {
-        self.denials
-            .lock()
-            .expect("denial log poisoned")
-            .push(denial);
+        let mut log = self.denials.lock().expect("denial log poisoned");
+        log.push(denial);
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
