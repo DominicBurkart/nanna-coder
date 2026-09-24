@@ -54,6 +54,16 @@ fn git_cmd(cwd: &Path) -> Command {
     cmd
 }
 
+/// The `-v` argument that mounts the worktree at [`CONTAINER_WORKSPACE_DIR`].
+/// The `:z` option relabels the directory for SELinux hosts (where the
+/// container could otherwise only read it) and is ignored elsewhere.
+pub fn worktree_mount_arg(workspace_path: &Path) -> String {
+    format!(
+        "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+        workspace_path.display()
+    )
+}
+
 pub struct TaskWorkspace {
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
@@ -178,10 +188,7 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![format!(
-            "-v={}:{CONTAINER_WORKSPACE_DIR}",
-            workspace_path.display()
-        )];
+        let mut additional_args = vec![worktree_mount_arg(&workspace_path)];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
             additional_args.extend(set.container_args());
@@ -751,6 +758,12 @@ mod tests {
 
         let config = seen.lock().unwrap().take().unwrap();
         assert!(config.additional_args.contains(&expected_network));
+        let mount = format!("-v={}:/workspace:z", ws.workspace_path.display());
+        assert_eq!(
+            config.additional_args[0], mount,
+            "worktree mount is relabelled"
+        );
+        assert_eq!(worktree_mount_arg(Path::new("/w")), "-v=/w:/workspace:z");
         assert_eq!(config.env_vars, specs[0].exports);
         assert_eq!(ws.sidecar_env(), specs[0].exports.as_slice());
         ws.cleanup().unwrap();
