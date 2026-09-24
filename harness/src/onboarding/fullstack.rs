@@ -7,6 +7,7 @@
 //! frontend's `Trunk.toml`; it never runs cargo or touches the network.
 
 use super::OnboardingError;
+use crate::sidecar::{PostgresSidecar, SidecarSpec};
 use std::path::{Path, PathBuf};
 
 /// Endpoint manifest at the workspace root, one absolute path per line.
@@ -152,6 +153,16 @@ impl FullStackRust {
     /// Whether the workspace uses a database.
     pub fn has_database(&self) -> bool {
         self.database.is_some()
+    }
+
+    /// Sidecars the dev container of `task_id` needs: a Postgres database
+    /// when the workspace uses one, nothing otherwise.
+    pub fn sidecars(&self, task_id: &str) -> Vec<SidecarSpec> {
+        if self.has_database() {
+            vec![PostgresSidecar::for_task(task_id).spec()]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -404,6 +415,23 @@ dioxus = { version = "0.7", features = ["web"] }
                 "http://127.0.0.1:8080/health/"
             ]
         );
+    }
+
+    #[test]
+    fn profile_with_database_declares_a_postgres_sidecar() {
+        let profile = FullStackRust::detect(&fixture_root()).unwrap().unwrap();
+        let sidecars = profile.sidecars("task-9");
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(sidecars[0].name, "nanna-task-task-9-postgres");
+        assert_eq!(sidecars[0].exports[0].0, "DATABASE_URL");
+        assert!(sidecars[0].exports[0].1.ends_with("/task_task_9"));
+    }
+
+    #[test]
+    fn profile_without_database_declares_no_sidecars() {
+        let dir = minimal_workspace();
+        let profile = FullStackRust::detect(dir.path()).unwrap().unwrap();
+        assert!(profile.sidecars("task-9").is_empty());
     }
 
     #[test]

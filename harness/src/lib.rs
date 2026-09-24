@@ -8,6 +8,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod sidecar;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
@@ -30,6 +31,11 @@ pub use monitoring::{
 pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
+};
+pub use sidecar::{
+    task_network_name, CommandRunner, PostgresSidecar, ReadinessConfig, RunOutput, RunningSidecar,
+    SidecarError, SidecarSet, SidecarSpec, SystemRunner, TaskNetwork, DATABASE_URL_VAR,
+    POSTGRES_ALIAS, POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_USER,
 };
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
