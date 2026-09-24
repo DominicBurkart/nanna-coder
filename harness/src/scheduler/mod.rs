@@ -7,8 +7,10 @@
 //! between a cursor that serves the newest work (fast wins) and one that
 //! serves the oldest (the long tail), so neither starves the other.
 //!
-//! Queued entries can be parked with a `not_before` instant so that work
-//! outside a human-availability window waits without occupying a slot.
+//! Queued entries can be persisted through a [`QueueStore`] so that a
+//! rebuilt manager resumes the same backlog, and can be parked with a
+//! `not_before` instant so that work outside a human-availability window
+//! waits without occupying a slot.
 //!
 //! ```
 //! use chrono::Utc;
@@ -35,9 +37,11 @@
 
 mod policy;
 mod queue;
+mod store;
 
 pub use policy::{HybridPolicy, PolicyError, SchedulingPolicy, Selection, Side, SlotState};
 pub use queue::TaskQueue;
+pub use store::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
 
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};
