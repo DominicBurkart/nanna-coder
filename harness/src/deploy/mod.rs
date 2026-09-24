@@ -58,10 +58,12 @@
 //! [`DeployTemplate::resolve_risk`]. Such a template is validated against the
 //! highest class its thresholds can produce.
 
+mod init;
 mod plan;
 mod template;
 mod validate;
 
+pub use init::{init, starter_template};
 pub use plan::{format_duration, plan_for_repo, DeployPlan, DeployStep, Precondition, StepKind};
 pub use template::{
     DeployTemplate, Health, OnBreach, RiskClass, RiskSpec, RiskThresholds, Rollback, Rollout,
