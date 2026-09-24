@@ -1,8 +1,11 @@
 use crate::container::{
-    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle,
+    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle, NetworkPolicy,
 };
+use crate::identity::AgentIdentity;
+use crate::scope::ScopeError;
 use crate::tools::{
-    create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
+    create_container_tool_registry, create_container_tool_registry_for, create_tool_registry,
+    create_tool_registry_for, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,11 +87,27 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
     ) -> Result<Self, WorkspaceError> {
+        let network = NetworkPolicy::Enabled;
+        Self::create_with_container_networked(source_repo, task_id, branch, image_ref, network)
+            .await
+    }
+
+    /// Like [`TaskWorkspace::create_with_container`], with the dev
+    /// container's network set by `network` (see
+    /// [`NetworkPolicy::for_ceiling`] for the identity-derived policy).
+    pub async fn create_with_container_networked(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        network: NetworkPolicy,
+    ) -> Result<Self, WorkspaceError> {
         Self::create_with_container_using(
             source_repo,
             task_id,
             branch,
             image_ref,
+            network,
             |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
         )
         .await
@@ -105,6 +124,7 @@ impl TaskWorkspace {
         task_id: &str,
         branch: &str,
         image_ref: &str,
+        network: NetworkPolicy,
         start_fn: F,
     ) -> Result<Self, WorkspaceError>
     where
@@ -158,7 +178,7 @@ impl TaskWorkspace {
             health_check_timeout: Duration::from_secs(10),
             env_vars: vec![],
             additional_args,
-            network: crate::container::NetworkPolicy::Enabled,
+            network,
         };
 
         let handle = match start_fn(config).await {
@@ -210,6 +230,24 @@ impl TaskWorkspace {
             )
         } else {
             create_tool_registry(&self.workspace_path)
+        }
+    }
+
+    /// The registry for this workspace restricted to `identity`: only tools
+    /// in `scope.tools` at or below `scope.max_effect`, with file tools
+    /// confined to `scope.paths` / `scope.read_paths`. `run_command` is
+    /// present only with a container and a ceiling of at least `workspace`.
+    pub fn build_tool_registry_for(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<ToolRegistry, ScopeError> {
+        let root = &self.workspace_path;
+        match &self.container_handle {
+            Some(handle) => {
+                let handle = Arc::clone(handle);
+                create_container_tool_registry_for(root, handle, CONTAINER_WORKSPACE_DIR, identity)
+            }
+            None => create_tool_registry_for(root, identity),
         }
     }
 
@@ -469,6 +507,7 @@ mod tests {
             &unique_id("ws-using-ok"),
             "HEAD",
             "mock-image:latest",
+            NetworkPolicy::Enabled,
             |_config: crate::container::ContainerConfig| async {
                 Ok(ContainerHandle {
                     name: "mock-container".to_string(),
@@ -500,6 +539,7 @@ mod tests {
             &unique_id("ws-using-fail"),
             "HEAD",
             "bad-image:latest",
+            NetworkPolicy::Enabled,
             |_config: crate::container::ContainerConfig| async {
                 Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
             },
@@ -526,6 +566,7 @@ mod tests {
             &unique_id("ws-worktree-fail"),
             "HEAD",
             "mock-image:latest",
+            NetworkPolicy::Enabled,
             |_config: crate::container::ContainerConfig| async {
                 use crate::container::{ContainerHandle, ContainerRuntime};
                 Ok(ContainerHandle {
@@ -542,6 +583,134 @@ mod tests {
             result,
             Err(WorkspaceError::GitWorktreeCreateFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_passes_the_network_policy() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-network"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(config.network, NetworkPolicy::Disabled);
+        let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
+        assert!(args.iter().any(|a| a == "--network=none"));
+        assert!(args.iter().any(|a| a.ends_with(CONTAINER_WORKSPACE_DIR)));
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_networked_without_runtime_fails() {
+        use crate::container::detect_runtime;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let result = TaskWorkspace::create_with_container_networked(
+            source.path(),
+            &unique_id("ws-networked"),
+            "HEAD",
+            "nonexistent-image-for-nanna-tests:none",
+            NetworkPolicy::Disabled,
+        )
+        .await;
+
+        if detect_runtime().is_available() {
+            assert!(result.is_err() || result.unwrap().cleanup().is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(WorkspaceError::ContainerSetupFailed(_))
+            ));
+        }
+    }
+
+    fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = ceiling;
+        identity.scope.tools = vec!["*".parse().unwrap()];
+        identity
+    }
+
+    #[test]
+    fn test_build_tool_registry_for_identity_without_container() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-identity"), "HEAD").unwrap();
+
+        let registry = ws
+            .build_tool_registry_for(&workspace_identity(EffectClass::Workspace))
+            .unwrap();
+        assert_eq!(registry.identity(), Some("rust-implementer"));
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("run_command").is_none());
+        assert!(registry.get_tool("github_pr_status").is_none());
+
+        let mut bad = workspace_identity(EffectClass::Workspace);
+        bad.scope.paths = vec!["[".to_string()];
+        assert!(ws.build_tool_registry_for(&bad).is_err());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_build_tool_registry_for_identity_with_container() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-identity-container"), "HEAD")
+                .unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        }));
+
+        let workspace = ws
+            .build_tool_registry_for(&workspace_identity(EffectClass::Workspace))
+            .unwrap();
+        assert!(workspace.get_tool("run_command").is_some());
+        assert!(workspace.get_tool("github_pr_status").is_none());
+
+        let read_only = ws
+            .build_tool_registry_for(&workspace_identity(EffectClass::None))
+            .unwrap();
+        assert!(read_only.get_tool("run_command").is_none());
+        assert!(read_only.get_tool("write_file").is_none());
+        assert!(read_only.get_tool("read_file").is_some());
+
+        let repository = ws
+            .build_tool_registry_for(&workspace_identity(EffectClass::Repository))
+            .unwrap();
+        assert!(repository.get_tool("run_command").is_some());
+        assert!(repository.get_tool("github_pr_status").is_some());
+        ws.cleanup().unwrap();
     }
 
     #[test]
