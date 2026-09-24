@@ -297,6 +297,9 @@ mod tests {
             created_at: now,
             last_updated_at: now,
             ttl_ms: Some(60000),
+            not_before: None,
+            identity_hint: None,
+            origin: None,
         }
     }
 
