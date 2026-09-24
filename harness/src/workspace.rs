@@ -7,6 +7,7 @@ use crate::container::{
     ContainerHandle,
 };
 use crate::onboarding::fullstack::FullStackRust;
+use crate::onboarding::OnboardingError;
 use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
     create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
@@ -62,6 +63,16 @@ pub fn worktree_mount_arg(workspace_path: &Path) -> String {
         "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
         workspace_path.display()
     )
+}
+
+/// The app spec of the full-stack workspace at `workspace_path`, `None`
+/// when the workspace does not match the profile.
+fn detect_app_spec(workspace_path: &Path) -> Result<Option<AppSpec>, OnboardingError> {
+    let Some(profile) = FullStackRust::detect(workspace_path)? else {
+        return Ok(None);
+    };
+    let spec = AppSpec::from_profile(&profile, workspace_path, CONTAINER_WORKSPACE_DIR)?;
+    Ok(Some(spec))
 }
 
 pub struct TaskWorkspace {
@@ -265,8 +276,8 @@ impl TaskWorkspace {
     /// register.
     fn app_context(&self) -> Option<AppContext> {
         let handle = self.container_handle.as_ref()?;
-        let profile = match FullStackRust::detect(&self.workspace_path) {
-            Ok(Some(profile)) => profile,
+        let spec = match detect_app_spec(&self.workspace_path) {
+            Ok(Some(spec)) => spec,
             Ok(None) => return None,
             Err(e) => {
                 warn!(
@@ -276,17 +287,6 @@ impl TaskWorkspace {
                 return None;
             }
         };
-        let spec =
-            match AppSpec::from_profile(&profile, &self.workspace_path, CONTAINER_WORKSPACE_DIR) {
-                Ok(spec) => spec,
-                Err(e) => {
-                    warn!(
-                        "task {}: frontend config unreadable, app tools skipped: {e}",
-                        self.task_id
-                    );
-                    return None;
-                }
-            };
         Some(AppContext {
             task_id: self.task_id.clone(),
             handle: Arc::clone(handle),
