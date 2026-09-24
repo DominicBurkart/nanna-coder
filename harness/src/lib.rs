@@ -9,6 +9,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod protected;
 pub mod scope;
 pub mod task;
 pub mod telemetry;
@@ -31,6 +32,9 @@ pub use monitoring::{
 pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
+};
+pub use protected::{
+    AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,
 };
 pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
 pub use telemetry::{
