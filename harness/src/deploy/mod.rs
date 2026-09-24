@@ -59,11 +59,13 @@
 //! highest class its thresholds can produce.
 
 mod template;
+mod validate;
 
 pub use template::{
     DeployTemplate, Health, OnBreach, RiskClass, RiskSpec, RiskThresholds, Rollback, Rollout,
     Shadow, ShadowCompare, Strategy, Target, TargetKind,
 };
+pub use validate::{min_span, min_steps, strategy_allowed};
 
 use std::path::PathBuf;
 use thiserror::Error;

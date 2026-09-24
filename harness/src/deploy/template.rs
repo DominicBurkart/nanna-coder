@@ -553,6 +553,7 @@ impl DeployTemplate {
                 }),
             shadow: raw.shadow.map(|s| convert_shadow(file, s)).transpose()?,
         };
+        template.validate()?;
         Ok(template)
     }
 }
@@ -811,7 +812,7 @@ fn convert_shadow(file: &Path, raw: RawShadow) -> Result<Shadow, DeployError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::Duration;
 
