@@ -1,7 +1,8 @@
+use crate::effects::EffectClass;
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -33,6 +34,13 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, args: Value) -> ToolResult<Value>;
     fn name(&self) -> &str;
+    /// The largest blast radius a call to this tool can reach.
+    ///
+    /// There is deliberately no default: every tool must state its class
+    /// explicitly so that policy layers never treat an unclassified tool as
+    /// harmless. Tools that can reach several classes (shell runners, for
+    /// example) declare the maximum and are treated as that class.
+    fn effect_class(&self) -> EffectClass;
 }
 
 pub struct ToolRegistry {
@@ -70,6 +78,119 @@ impl ToolRegistry {
                 name: name.to_string(),
             }),
         }
+    }
+
+    /// Effect class declared by the named tool, or `None` when no such tool
+    /// is registered.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new("."));
+    /// assert_eq!(registry.effect_class_of("read_file"), Some(EffectClass::None));
+    /// assert_eq!(registry.effect_class_of("write_file"), Some(EffectClass::Workspace));
+    /// assert_eq!(registry.effect_class_of("no_such_tool"), None);
+    /// ```
+    pub fn effect_class_of(&self, name: &str) -> Option<EffectClass> {
+        self.tools.get(name).map(|tool| tool.effect_class())
+    }
+
+    fn tools_where(&self, keep: impl Fn(EffectClass) -> bool) -> Vec<&dyn Tool> {
+        let mut selected: Vec<&dyn Tool> = self
+            .tools
+            .values()
+            .map(|tool| tool.as_ref())
+            .filter(|tool| keep(tool.effect_class()))
+            .collect();
+        selected.sort_by(|a, b| a.name().cmp(b.name()));
+        selected
+    }
+
+    /// Every tool whose effect class is at most `ceiling`, sorted by name.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new("."));
+    /// let allowed: Vec<&str> = registry
+    ///     .at_most(EffectClass::Workspace)
+    ///     .iter()
+    ///     .map(|tool| tool.name())
+    ///     .collect();
+    /// assert!(allowed.contains(&"read_file"));
+    /// assert!(allowed.contains(&"write_file"));
+    /// assert!(!allowed.contains(&"github_pr_status"));
+    ///
+    /// let read_only = registry.at_most(EffectClass::None);
+    /// assert!(read_only.iter().all(|tool| tool.effect_class() == EffectClass::None));
+    /// ```
+    pub fn at_most(&self, ceiling: EffectClass) -> Vec<&dyn Tool> {
+        self.tools_where(|class| class <= ceiling)
+    }
+
+    /// Every tool declaring exactly `class`, sorted by name.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new("."));
+    /// let names: Vec<&str> = registry
+    ///     .with_class(EffectClass::Repository)
+    ///     .iter()
+    ///     .map(|tool| tool.name())
+    ///     .collect();
+    /// assert_eq!(names, vec!["github_pr_status"]);
+    /// assert!(registry.with_class(EffectClass::Production).is_empty());
+    /// ```
+    pub fn with_class(&self, class: EffectClass) -> Vec<&dyn Tool> {
+        self.tools_where(|candidate| candidate == class)
+    }
+
+    /// Tool names grouped by effect class. Every class is present as a key,
+    /// with an empty list for classes no registered tool declares.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new("."));
+    /// let grouped = registry.by_class();
+    /// assert_eq!(grouped.len(), EffectClass::ALL.len());
+    /// assert_eq!(grouped[&EffectClass::Workspace], vec!["write_file"]);
+    /// assert!(grouped[&EffectClass::Ci].is_empty());
+    /// ```
+    pub fn by_class(&self) -> BTreeMap<EffectClass, Vec<&str>> {
+        EffectClass::ALL
+            .into_iter()
+            .map(|class| {
+                let names = self
+                    .with_class(class)
+                    .into_iter()
+                    .map(|tool| tool.name())
+                    .collect();
+                (class, names)
+            })
+            .collect()
+    }
+
+    /// Drop every tool whose effect class exceeds `ceiling`, leaving a
+    /// registry that can only produce effects at or below that class.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let mut registry = create_tool_registry(std::path::Path::new("."));
+    /// registry.retain_at_most(EffectClass::None);
+    /// assert!(registry.get_tool("read_file").is_some());
+    /// assert!(registry.get_tool("write_file").is_none());
+    /// assert!(registry.get_tool("github_pr_status").is_none());
+    /// ```
+    pub fn retain_at_most(&mut self, ceiling: EffectClass) {
+        self.tools.retain(|_, tool| tool.effect_class() <= ceiling);
     }
 }
 
@@ -136,6 +257,10 @@ impl Tool for EchoTool {
 
     fn name(&self) -> &str {
         "echo"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
     }
 }
 
@@ -252,6 +377,10 @@ impl Tool for CalculatorTool {
 
     fn name(&self) -> &str {
         "calculate"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
     }
 }
 
@@ -433,6 +562,10 @@ impl Tool for ReadFileTool {
     fn name(&self) -> &str {
         "read_file"
     }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
+    }
 }
 
 pub struct WriteFileTool {
@@ -512,6 +645,10 @@ impl Tool for WriteFileTool {
 
     fn name(&self) -> &str {
         "write_file"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
     }
 }
 
@@ -670,6 +807,10 @@ impl Tool for ListDirTool {
 
     fn name(&self) -> &str {
         "list_directory"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
     }
 }
 
@@ -839,6 +980,10 @@ impl Tool for SearchTool {
     fn name(&self) -> &str {
         "search"
     }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
+    }
 }
 
 pub struct GitStatusTool {
@@ -889,6 +1034,10 @@ impl Tool for GitStatusTool {
 
     fn name(&self) -> &str {
         "git_status"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
     }
 }
 
@@ -986,6 +1135,10 @@ impl Tool for GitDiffTool {
     fn name(&self) -> &str {
         "git_diff"
     }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
+    }
 }
 
 pub struct RunCommandTool {
@@ -1060,6 +1213,10 @@ impl Tool for RunCommandTool {
 
     fn name(&self) -> &str {
         "run_command"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
     }
 }
 
@@ -1834,6 +1991,10 @@ impl Tool for GitHubPrStatusTool {
     fn name(&self) -> &str {
         "github_pr_status"
     }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
 }
 
 pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
@@ -1874,6 +2035,200 @@ pub fn create_container_tool_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    struct StubTool {
+        name: String,
+        class: EffectClass,
+    }
+
+    impl StubTool {
+        fn boxed(name: &str, class: EffectClass) -> Box<dyn Tool> {
+            Box::new(Self {
+                name: name.to_string(),
+                class,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                function: FunctionDefinition {
+                    name: self.name.clone(),
+                    description: String::new(),
+                    parameters: JsonSchema {
+                        schema_type: SchemaType::Object,
+                        properties: None,
+                        required: None,
+                    },
+                },
+            }
+        }
+
+        async fn execute(&self, _args: Value) -> ToolResult<Value> {
+            Ok(json!({ "class": self.class.as_str() }))
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn effect_class(&self) -> EffectClass {
+            self.class
+        }
+    }
+
+    fn names(tools: &[&dyn Tool]) -> Vec<String> {
+        tools.iter().map(|tool| tool.name().to_string()).collect()
+    }
+
+    const EXPECTED_CLASSES: [(&str, EffectClass); 9] = [
+        ("calculate", EffectClass::None),
+        ("echo", EffectClass::None),
+        ("git_diff", EffectClass::None),
+        ("git_status", EffectClass::None),
+        ("github_pr_status", EffectClass::Repository),
+        ("list_directory", EffectClass::None),
+        ("read_file", EffectClass::None),
+        ("search", EffectClass::None),
+        ("write_file", EffectClass::Workspace),
+    ];
+
+    #[test]
+    fn every_default_tool_declares_the_expected_effect_class() {
+        let registry = create_tool_registry(Path::new("."));
+        let mut registered = registry.list_tools();
+        registered.sort_unstable();
+        let expected: Vec<&str> = EXPECTED_CLASSES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            registered, expected,
+            "every registered tool must be classified"
+        );
+        for (name, class) in EXPECTED_CLASSES {
+            assert_eq!(registry.effect_class_of(name), Some(class), "{name}");
+        }
+    }
+
+    #[test]
+    fn run_command_declares_the_maximum_class_it_can_reach() {
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "effects-test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry =
+            create_container_tool_registry(Path::new("."), handle, CONTAINER_WORKSPACE_DIR);
+        assert_eq!(
+            registry.effect_class_of("run_command"),
+            Some(EffectClass::Workspace)
+        );
+        let workspace_names = names(&registry.at_most(EffectClass::Workspace));
+        assert!(workspace_names.contains(&"run_command".to_string()));
+        assert!(!workspace_names.contains(&"github_pr_status".to_string()));
+    }
+
+    #[test]
+    fn at_most_workspace_excludes_repository_tools() {
+        let registry = create_tool_registry(Path::new("."));
+        let allowed = names(&registry.at_most(EffectClass::Workspace));
+        assert_eq!(
+            allowed,
+            vec![
+                "calculate",
+                "echo",
+                "git_diff",
+                "git_status",
+                "list_directory",
+                "read_file",
+                "search",
+                "write_file",
+            ]
+        );
+        let everything = names(&registry.at_most(EffectClass::Production));
+        assert_eq!(everything.len(), EXPECTED_CLASSES.len());
+    }
+
+    #[test]
+    fn with_class_and_by_class_partition_the_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        registry.register(StubTool::boxed("ls", EffectClass::None));
+        registry.register(StubTool::boxed("cat", EffectClass::None));
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+
+        assert_eq!(
+            names(&registry.with_class(EffectClass::None)),
+            vec!["cat", "ls"]
+        );
+        assert_eq!(
+            names(&registry.with_class(EffectClass::Ci)),
+            Vec::<String>::new()
+        );
+
+        let grouped = registry.by_class();
+        assert_eq!(grouped.len(), EffectClass::ALL.len());
+        assert_eq!(grouped[&EffectClass::None], vec!["cat", "ls"]);
+        assert_eq!(grouped[&EffectClass::Workspace], Vec::<&str>::new());
+        assert_eq!(grouped[&EffectClass::Repository], vec!["push"]);
+        assert_eq!(grouped[&EffectClass::Production], vec!["deploy"]);
+    }
+
+    #[tokio::test]
+    async fn retain_at_most_drops_tools_above_the_ceiling() {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        registry.register(StubTool::boxed("edit", EffectClass::Workspace));
+        registry.register(StubTool::boxed("ls", EffectClass::None));
+
+        registry.retain_at_most(EffectClass::Workspace);
+
+        let mut remaining = registry.list_tools();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec!["edit", "ls"]);
+        assert!(matches!(
+            registry.execute("deploy", json!({})).await,
+            Err(ToolError::NotFound { .. })
+        ));
+        assert_eq!(
+            registry.execute("edit", json!({})).await.unwrap()["class"],
+            "workspace"
+        );
+    }
+
+    fn any_class() -> impl Strategy<Value = EffectClass> {
+        prop::sample::select(EffectClass::ALL.to_vec())
+    }
+
+    proptest! {
+        #[test]
+        fn at_most_keeps_exactly_the_tools_within_the_ceiling(
+            classes in prop::collection::vec(any_class(), 0..12),
+            ceiling in any_class(),
+        ) {
+            let mut registry = ToolRegistry::new();
+            for (i, class) in classes.iter().enumerate() {
+                registry.register(StubTool::boxed(&format!("tool_{i:02}"), *class));
+            }
+
+            let kept = registry.at_most(ceiling);
+            prop_assert!(kept.iter().all(|tool| tool.effect_class() <= ceiling));
+            let expected = classes.iter().filter(|class| **class <= ceiling).count();
+            prop_assert_eq!(kept.len(), expected);
+            let kept_names = names(&kept);
+            let mut sorted = kept_names.clone();
+            sorted.sort();
+            prop_assert_eq!(kept_names, sorted);
+
+            let grouped_total: usize = registry.by_class().values().map(Vec::len).sum();
+            prop_assert_eq!(grouped_total, classes.len());
+
+            registry.retain_at_most(ceiling);
+            prop_assert_eq!(registry.list_tools().len(), expected);
+        }
+    }
 
     #[tokio::test]
     async fn test_echo_tool() {
