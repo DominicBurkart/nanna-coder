@@ -594,7 +594,38 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
         }
     }
 
+    report_queue_health()?;
+
     Ok(())
+}
+
+/// Print the persisted backlog's depth, parked count and age of its oldest
+/// entry. A missing queue log means no backlog has been recorded yet.
+fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::scheduler::{default_queue_path, JsonlQueueStore, QueueMetrics};
+
+    let Some(path) = default_queue_path() else {
+        println!("- Task queue: no queue location (set NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Task queue: empty (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlQueueStore::open(&path)?;
+    let metrics = QueueMetrics::from_store(&store, chrono::Utc::now())?;
+    println!("- Task queue ({}): {}", path.display(), metrics);
+    Ok(())
+}
+
+fn resolve_queue_path(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    explicit
+        .or_else(harness::scheduler::default_queue_path)
+        .ok_or_else(|| {
+            "no queue location: pass --queue-path or set NANNA_QUEUE_PATH or HOME".into()
+        })
 }
 
 /// Default system prompt used when an onboarded repo does not supply any
@@ -751,16 +782,28 @@ async fn run_mcp_server(
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let queue_path = resolve_queue_path(None)?;
+    let task_manager = Arc::new(
+        TaskManager::restore(
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path)?),
+            provider.clone(),
+        )
+        .await?,
+    );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {})",
-        model, max_iterations
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {})",
+        model,
+        max_iterations,
+        queue_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(

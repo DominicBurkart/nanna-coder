@@ -47,7 +47,10 @@ pub use metrics::QueueMetrics;
 pub use park::parked_until;
 pub use policy::{HybridPolicy, PolicyError, SchedulingPolicy, Selection, Side, SlotState};
 pub use queue::TaskQueue;
-pub use store::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
+pub use store::{
+    default_queue_path, queue_path_from, InMemoryQueueStore, JsonlQueueStore, QueueStore,
+    QueueStoreError, QUEUE_PATH_ENV,
+};
 
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};

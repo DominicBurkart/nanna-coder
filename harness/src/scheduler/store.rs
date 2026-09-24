@@ -71,6 +71,47 @@ impl QueueStore for InMemoryQueueStore {
     }
 }
 
+/// Environment variable overriding the queue log location.
+pub const QUEUE_PATH_ENV: &str = "NANNA_QUEUE_PATH";
+
+/// Location of the queue log for this user: `NANNA_QUEUE_PATH` when set,
+/// otherwise `$HOME/.local/state/nanna/queue.jsonl`, or `None` when neither
+/// is available.
+pub fn default_queue_path() -> Option<PathBuf> {
+    queue_path_from(std::env::var_os(QUEUE_PATH_ENV), std::env::var_os("HOME"))
+}
+
+/// Pure form of [`default_queue_path`].
+///
+/// ```
+/// use harness::scheduler::queue_path_from;
+/// use std::path::PathBuf;
+///
+/// assert_eq!(
+///     queue_path_from(Some("/var/lib/nanna/q.jsonl".into()), Some("/home/u".into())),
+///     Some(PathBuf::from("/var/lib/nanna/q.jsonl"))
+/// );
+/// assert_eq!(
+///     queue_path_from(None, Some("/home/u".into())),
+///     Some(PathBuf::from("/home/u/.local/state/nanna/queue.jsonl"))
+/// );
+/// assert_eq!(queue_path_from(None, None), None);
+/// ```
+pub fn queue_path_from(
+    override_path: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    override_path.map(PathBuf::from).or_else(|| {
+        home.map(|h| {
+            PathBuf::from(h)
+                .join(".local")
+                .join("state")
+                .join("nanna")
+                .join("queue.jsonl")
+        })
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Record {
@@ -225,6 +266,13 @@ mod tests {
         let err = store.load().unwrap_err();
         assert!(matches!(err, QueueStoreError::Serde(_)));
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn default_queue_path_reads_environment() {
+        let resolved = default_queue_path();
+        let expected = queue_path_from(std::env::var_os(QUEUE_PATH_ENV), std::env::var_os("HOME"));
+        assert_eq!(resolved, expected);
     }
 
     #[test]
