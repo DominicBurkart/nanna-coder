@@ -7,6 +7,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod scheduler;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
