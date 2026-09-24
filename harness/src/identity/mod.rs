@@ -32,6 +32,7 @@ mod pattern;
 
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
+mod narrowing;
 mod schema;
 
 pub use schema::{AgentIdentity, IdentitySection, LimitsSection, ScopeSection, SystemPrompt};
