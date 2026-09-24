@@ -1,13 +1,15 @@
 use crate::effects::EffectClass;
+use crate::identity::AgentIdentity;
 use crate::scope::{
-    canonical_root, relative_to, resolve_path, validate_path_within_workspace, PathAccess,
-    PathScope, ScopeDenial,
+    canonical_root, relative_to, resolve_path, validate_path_within_workspace, DenialReason,
+    PathAccess, PathScope, ScopeDenial, ScopeError,
 };
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -52,13 +54,89 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    identity: Option<String>,
+    denials: Mutex<Vec<ScopeDenial>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            identity: None,
+            denials: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Keep only the tools `identity` may call: those whose name matches a
+    /// `scope.tools` pattern and whose effect class is at most
+    /// `scope.max_effect`. Everything else is dropped, so it never appears in
+    /// the definitions sent to the model. Calls to dropped or unknown tools
+    /// are refused with [`ToolError::ScopeDenied`] and recorded.
+    ///
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::identity::AgentIdentity;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "reader"
+    /// description = "Reads code."
+    /// loop = "inner"
+    /// model = "gemma4:e4b"
+    /// system_prompt = { inline = "Read." }
+    ///
+    /// [scope]
+    /// repos = []
+    /// paths = []
+    /// max_effect = "workspace"
+    /// tools = ["read_file", "write_file", "github_*"]
+    ///
+    /// [limits]
+    /// max_iterations = 10
+    /// max_wall_clock_secs = 60
+    /// max_concurrent = 1
+    /// "#;
+    /// let identity = AgentIdentity::from_toml_str(toml, "reader.toml").unwrap();
+    /// let scoped = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+    ///
+    /// let mut names = scoped.list_tools();
+    /// names.sort_unstable();
+    /// assert_eq!(names, vec!["read_file", "write_file"]);
+    /// assert_eq!(scoped.identity(), Some("reader"));
+    /// assert!(scoped.get_tool("github_pr_status").is_none(), "repository class exceeds the ceiling");
+    /// assert!(scoped.get_tool("search").is_none(), "not named in scope.tools");
+    /// assert_eq!(scoped.denial_count(), 0);
+    /// ```
+    pub fn scoped_for(mut self, identity: &AgentIdentity) -> Self {
+        let keep = |name: &String, tool: &mut Box<dyn Tool>| {
+            identity.allows_tool(name) && identity.allows_effect(tool.effect_class())
+        };
+        self.tools.retain(keep);
+        self.identity = Some(identity.name().to_string());
+        self
+    }
+
+    /// Name of the identity this registry is scoped to, if any.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// Every call refused so far, in order.
+    pub fn denials(&self) -> Vec<ScopeDenial> {
+        self.denials.lock().expect("denial log poisoned").clone()
+    }
+
+    /// Number of refused calls, for escalation on repeats.
+    pub fn denial_count(&self) -> usize {
+        self.denials.lock().expect("denial log poisoned").len()
+    }
+
+    fn record(&self, denial: ScopeDenial) {
+        self.denials
+            .lock()
+            .expect("denial log poisoned")
+            .push(denial);
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -79,12 +157,21 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult<Value> {
-        match self.tools.get(name) {
-            Some(tool) => tool.execute(args).await,
-            None => Err(ToolError::NotFound {
+        let outcome = match (self.tools.get(name), &self.identity) {
+            (Some(tool), _) => tool.execute(args).await,
+            (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
+                identity: identity.clone(),
+                tool: name.to_string(),
+                reason: DenialReason::ToolNotInScope,
+            })),
+            (None, None) => Err(ToolError::NotFound {
                 name: name.to_string(),
             }),
+        };
+        if let Err(ToolError::ScopeDenied(denial)) = &outcome {
+            self.record(denial.clone());
         }
+        outcome
     }
 
     /// Effect class declared by the named tool, or `None` when no such tool
@@ -2005,13 +2092,32 @@ impl Tool for GitHubPrStatusTool {
 }
 
 pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
+    create_tool_registry_with_scope(workspace_root, None)
+}
+
+/// The default tools restricted to `identity`: file tools carry the
+/// identity's [`PathScope`] and the registry is [`ToolRegistry::scoped_for`]
+/// the identity.
+pub fn create_tool_registry_for(
+    workspace_root: &std::path::Path,
+    identity: &AgentIdentity,
+) -> Result<ToolRegistry, ScopeError> {
+    let scope = PathScope::from_identity(identity)?;
+    Ok(create_tool_registry_with_scope(workspace_root, Some(scope)).scoped_for(identity))
+}
+
+fn create_tool_registry_with_scope(
+    workspace_root: &std::path::Path,
+    scope: Option<PathScope>,
+) -> ToolRegistry {
+    let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
     registry.register(Box::new(CalculatorTool::new()));
-    registry.register(Box::new(ReadFileTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(WriteFileTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(ListDirTool::new(workspace_root.to_path_buf())));
-    registry.register(Box::new(SearchTool::new(workspace_root.to_path_buf())));
+    registry.register(Box::new(ReadFileTool::scoped(root.clone(), scope.clone())));
+    registry.register(Box::new(WriteFileTool::scoped(root.clone(), scope.clone())));
+    registry.register(Box::new(ListDirTool::scoped(root.clone(), scope.clone())));
+    registry.register(Box::new(SearchTool::scoped(root, scope)));
     registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
     registry.register(Box::new(GitDiffTool::new(workspace_root.to_path_buf())));
     registry.register(Box::new(GitHubPrStatusTool::new(
@@ -2037,6 +2143,22 @@ pub fn create_container_tool_registry(
         Some(container_working_dir.to_string()),
     )));
     registry
+}
+
+/// The container-bound tools restricted to `identity`. `run_command`
+/// survives the scoping only when `scope.tools` names it and the ceiling is
+/// at least [`EffectClass::Workspace`], the class it declares.
+pub fn create_container_tool_registry_for(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+    identity: &AgentIdentity,
+) -> Result<ToolRegistry, ScopeError> {
+    let scope = PathScope::from_identity(identity)?;
+    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope));
+    let working_dir = Some(container_working_dir.to_string());
+    registry.register(Box::new(RunCommandTool::new(container_handle, working_dir)));
+    Ok(registry.scoped_for(identity))
 }
 
 #[cfg(test)]
@@ -2391,6 +2513,245 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inside_api["count"], 0);
+    }
+
+    fn identity_with(ceiling: EffectClass, tools: &[&str]) -> crate::identity::AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = ceiling;
+        identity.scope.tools = tools.iter().map(|t| t.parse().unwrap()).collect();
+        identity
+    }
+
+    fn sorted_names(registry: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry
+            .list_tools()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn workspace_ceiling_registry_holds_no_repository_ci_sandbox_or_production_tools() {
+        let mut registry = create_tool_registry(Path::new("."));
+        registry.register(StubTool::boxed("ci_trigger", EffectClass::Ci));
+        registry.register(StubTool::boxed("sandbox_deploy", EffectClass::Sandbox));
+        registry.register(StubTool::boxed("prod_rollout", EffectClass::Production));
+        let identity = identity_with(EffectClass::Workspace, &["*"]);
+        let scoped = registry.scoped_for(&identity);
+        assert_eq!(scoped.identity(), Some("rust-implementer"));
+        assert_eq!(
+            sorted_names(&scoped),
+            vec![
+                "calculate",
+                "echo",
+                "git_diff",
+                "git_status",
+                "list_directory",
+                "read_file",
+                "search",
+                "write_file"
+            ]
+        );
+        for tool in scoped.at_most(EffectClass::Production) {
+            assert!(
+                tool.effect_class() <= EffectClass::Workspace,
+                "{}",
+                tool.name()
+            );
+        }
+        let names: Vec<String> = scoped
+            .get_definitions()
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert!(!names
+            .iter()
+            .any(|n| n == "github_pr_status" || n == "ci_trigger" || n == "prod_rollout"));
+    }
+
+    #[test]
+    fn every_ceiling_enumerates_exactly_the_tools_at_or_below_it() {
+        for ceiling in EffectClass::ALL {
+            let mut registry = ToolRegistry::new();
+            for class in EffectClass::ALL {
+                registry.register(StubTool::boxed(&format!("tool_{class}"), class));
+            }
+            let scoped = registry.scoped_for(&identity_with(ceiling, &["tool_*"]));
+            let expected: Vec<String> = EffectClass::ALL
+                .iter()
+                .filter(|c| **c <= ceiling)
+                .map(|c| format!("tool_{c}"))
+                .collect();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(sorted_names(&scoped), expected, "{ceiling}");
+        }
+    }
+
+    #[test]
+    fn tool_patterns_hide_tools_the_identity_did_not_name() {
+        let registry = create_tool_registry(Path::new("."));
+        let identity = identity_with(EffectClass::Production, &["read_file", "git_*"]);
+        let scoped = registry.scoped_for(&identity);
+        assert_eq!(
+            sorted_names(&scoped),
+            vec!["git_diff", "git_status", "read_file"]
+        );
+        assert!(scoped.get_tool("write_file").is_none());
+    }
+
+    #[tokio::test]
+    async fn calls_to_tools_outside_scope_are_denied_and_counted() {
+        let registry = create_tool_registry(Path::new("."));
+        let identity = identity_with(EffectClass::Workspace, &["read_file"]);
+        let scoped = registry.scoped_for(&identity);
+        assert_eq!(scoped.denial_count(), 0);
+
+        let err = scoped
+            .execute("github_pr_status", json!({}))
+            .await
+            .unwrap_err();
+        let first = denial(err);
+        assert_eq!(first.identity, "rust-implementer");
+        assert_eq!(first.tool, "github_pr_status");
+        assert_eq!(first.reason, DenialReason::ToolNotInScope);
+
+        let err = scoped.execute("no_such_tool", json!({})).await.unwrap_err();
+        assert_eq!(denial(err).reason, DenialReason::ToolNotInScope);
+        assert_eq!(scoped.denial_count(), 2);
+        assert_eq!(scoped.denials().len(), 2);
+        assert_eq!(scoped.denials()[1].tool, "no_such_tool");
+    }
+
+    #[tokio::test]
+    async fn unscoped_registry_still_reports_not_found() {
+        let registry = create_tool_registry(Path::new("."));
+        assert_eq!(registry.identity(), None);
+        let err = registry
+            .execute("no_such_tool", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound { .. }));
+        assert_eq!(registry.denial_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn path_denials_raised_by_tools_are_recorded_on_the_registry() {
+        let ws = scoped_workspace();
+        let identity = identity_with(EffectClass::Workspace, &["write_file", "read_file"]);
+        let registry = create_tool_registry_for(ws.path(), &identity).unwrap();
+        assert_eq!(sorted_names(&registry), vec!["read_file", "write_file"]);
+
+        let ok = registry
+            .execute(
+                "write_file",
+                json!({ "path": "api/new.rs", "content": "x" }),
+            )
+            .await;
+        assert!(ok.is_ok());
+        let err = registry
+            .execute(
+                "write_file",
+                json!({ "path": "Cargo.toml", "content": "x" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ScopeDenied(_)));
+        let escape = registry
+            .execute("write_file", json!({ "path": "../x", "content": "x" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(escape, ToolError::PathSecurityViolation { .. }));
+
+        let denials = registry.denials();
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].tool, "write_file");
+        let expected = DenialReason::PathOutsideScope {
+            access: PathAccess::Write,
+            path: "Cargo.toml".to_string(),
+        };
+        assert_eq!(denials[0].reason, expected);
+        assert_eq!(registry.denial_count(), 1);
+    }
+
+    #[test]
+    fn scoped_registry_builders_reject_invalid_globs() {
+        let mut identity = identity_with(EffectClass::Workspace, &["*"]);
+        identity.scope.paths = vec!["[".to_string()];
+        assert!(create_tool_registry_for(Path::new("."), &identity).is_err());
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "scope-test".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let err = create_container_tool_registry_for(
+            Path::new("."),
+            handle,
+            CONTAINER_WORKSPACE_DIR,
+            &identity,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn container_registry_for_a_workspace_identity_keeps_run_command() {
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "scope-test".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        let registry = create_container_tool_registry_for(
+            Path::new("."),
+            std::sync::Arc::clone(&handle),
+            CONTAINER_WORKSPACE_DIR,
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(sorted_names(&registry), vec!["read_file", "run_command"]);
+
+        let read_only = identity_with(EffectClass::None, &["run_command", "read_file"]);
+        let registry = create_container_tool_registry_for(
+            Path::new("."),
+            handle,
+            CONTAINER_WORKSPACE_DIR,
+            &read_only,
+        )
+        .unwrap();
+        assert_eq!(sorted_names(&registry), vec!["read_file"]);
+    }
+
+    proptest! {
+        #[test]
+        fn a_scoped_registry_is_a_subset_of_the_unscoped_one_and_never_exceeds_the_ceiling(
+            classes in prop::collection::vec(any_class(), 0..12),
+            ceiling in any_class(),
+            allowed in prop::collection::btree_set(0usize..12, 0..12),
+        ) {
+            let build = || {
+                let mut registry = ToolRegistry::new();
+                for (i, class) in classes.iter().enumerate() {
+                    registry.register(StubTool::boxed(&format!("tool_{i:02}"), *class));
+                }
+                registry
+            };
+            let unscoped = sorted_names(&build());
+            let patterns: Vec<&str> = allowed.iter().map(|i| if *i % 2 == 0 { "tool_?[02468]" } else { "tool_?[13579]" }).collect();
+            let identity = identity_with(ceiling, &patterns);
+            let scoped = build().scoped_for(&identity);
+            let scoped_names = sorted_names(&scoped);
+            prop_assert!(scoped_names.iter().all(|name| unscoped.contains(name)));
+            for name in &scoped_names {
+                prop_assert!(scoped.effect_class_of(name).unwrap() <= ceiling);
+                prop_assert!(identity.allows_tool(name));
+            }
+            let expected = classes.iter().enumerate().filter(|(i, class)| **class <= ceiling && identity.allows_tool(&format!("tool_{i:02}"))).count();
+            prop_assert_eq!(scoped_names.len(), expected);
+        }
     }
 
     #[tokio::test]
