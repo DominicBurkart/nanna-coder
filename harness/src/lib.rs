@@ -20,6 +20,7 @@ pub use container::{
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
 pub use effects::{EffectClass, UnknownEffectClass};
+pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
