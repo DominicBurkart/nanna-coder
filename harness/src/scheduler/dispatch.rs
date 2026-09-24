@@ -44,6 +44,12 @@ struct RunningSlot {
     abort: AbortHandle,
 }
 
+impl RunningSlot {
+    fn new(side: Side, repo: PathBuf, abort: AbortHandle) -> Self {
+        Self { side, repo, abort }
+    }
+}
+
 struct State {
     queue: TaskQueue,
     slots: SlotState,
@@ -150,15 +156,13 @@ impl<L: Launcher> Dispatcher<L> {
         self: &Arc<Self>,
         task: QueuedTask,
     ) -> Result<QueuedTask, QueueStoreError> {
-        let stored = {
-            let mut state = self.state.lock().await;
-            let stored = state.queue.push(task);
-            if let Err(e) = self.store.insert(&stored) {
-                state.queue.remove(&stored.id);
-                return Err(e);
-            }
-            stored
-        };
+        let mut state = self.state.lock().await;
+        let stored = state.queue.push(task);
+        if let Err(e) = self.store.insert(&stored) {
+            state.queue.remove(&stored.id);
+            return Err(e);
+        }
+        drop(state);
         self.dispatch().await;
         Ok(stored)
     }
@@ -184,14 +188,8 @@ impl<L: Launcher> Dispatcher<L> {
                 this.release(&id).await;
             });
             state.slots.occupy(side, &task.repo_path);
-            state.running.insert(
-                task.id.clone(),
-                RunningSlot {
-                    side,
-                    repo: task.repo_path.clone(),
-                    abort: handle.abort_handle(),
-                },
-            );
+            let slot = RunningSlot::new(side, task.repo_path.clone(), handle.abort_handle());
+            state.running.insert(task.id.clone(), slot);
             match side {
                 Side::Newest => self.dispatched_newest.fetch_add(1, Ordering::Relaxed),
                 Side::Oldest => self.dispatched_oldest.fetch_add(1, Ordering::Relaxed),
@@ -219,38 +217,33 @@ impl<L: Launcher> Dispatcher<L> {
     /// Free the slot held by `id` (if any), forget it in the store, and
     /// dispatch the next entry.
     pub async fn release(self: &Arc<Self>, id: &TaskId) {
-        let freed = {
-            let mut state = self.state.lock().await;
-            match state.running.remove(id) {
-                Some(slot) => {
-                    state.slots.release(slot.side, &slot.repo);
-                    true
-                }
-                None => false,
+        if self.take_running(id).await.is_some() {
+            if let Err(e) = self.store.remove(id) {
+                tracing::error!(task_id = %id, error = %e, "Failed to remove finished task from queue store");
             }
-        };
-        if !freed {
-            return;
+            self.dispatch().await;
         }
-        if let Err(e) = self.store.remove(id) {
-            tracing::error!(task_id = %id, error = %e, "Failed to remove finished task from queue store");
-        }
-        self.dispatch().await;
+    }
+
+    async fn take_running(&self, id: &TaskId) -> Option<RunningSlot> {
+        let mut state = self.state.lock().await;
+        let slot = state.running.remove(id)?;
+        state.slots.release(slot.side, &slot.repo);
+        Some(slot)
     }
 
     /// Remove `id` from the queue, or abort it if running.
     pub async fn cancel(self: &Arc<Self>, id: &TaskId) -> Result<CancelOutcome, QueueStoreError> {
-        let outcome = {
-            let mut state = self.state.lock().await;
-            if let Some(task) = state.queue.remove(id) {
-                CancelOutcome::Queued(Box::new(task))
-            } else if let Some(slot) = state.running.remove(id) {
-                slot.abort.abort();
-                state.slots.release(slot.side, &slot.repo);
-                CancelOutcome::Running
-            } else {
-                return Ok(CancelOutcome::NotFound);
-            }
+        let queued = self.state.lock().await.queue.remove(id);
+        let outcome = match queued {
+            Some(task) => CancelOutcome::Queued(Box::new(task)),
+            None => match self.take_running(id).await {
+                Some(slot) => {
+                    slot.abort.abort();
+                    CancelOutcome::Running
+                }
+                None => return Ok(CancelOutcome::NotFound),
+            },
         };
         self.store.remove(id)?;
         if outcome == CancelOutcome::Running {
