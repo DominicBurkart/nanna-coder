@@ -1,5 +1,6 @@
 use harness::capabilities::detect_capabilities;
 use harness::onboarding::detect::scan_project;
+use harness::onboarding::flake_template::generate_flake;
 use harness::onboarding::fullstack::DatabaseUsage;
 use harness::onboarding::profile::BuildSystem;
 use std::fs;
@@ -120,6 +121,38 @@ fn plain_library_crate_is_not_full_stack_rust() {
     fs::write(dir.path().join("src/lib.rs"), "").unwrap();
     let signals = scan_project(dir.path()).unwrap();
     assert!(signals.full_stack.is_none());
+}
+
+const EXPECTED_FLAKE_TOOLCHAIN: &str = r#"        rustToolchain = pkgs.rust-bin.stable."1.84.0".default.override {
+          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+"#;
+
+const EXPECTED_FLAKE_PACKAGES: &str = r#"        devContainerPackages = [
+          rustToolchain
+          pkgs.cargo-nextest
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.git
+          pkgs.cacert
+          pkgs.trunk
+          pkgs.wasm-bindgen-cli
+          pkgs.sqlx-cli
+          pkgs.postgresql
+        ];
+"#;
+
+#[test]
+fn fixture_flake_provisions_full_stack_toolchain_and_packages() {
+    let profile = scan_project(&fixture_root())
+        .unwrap()
+        .to_cargo_profile()
+        .unwrap();
+    let flake = generate_flake(&profile).unwrap();
+    assert!(flake.contains(EXPECTED_FLAKE_TOOLCHAIN), "{flake}");
+    assert!(flake.contains(EXPECTED_FLAKE_PACKAGES), "{flake}");
+    assert!(flake.contains(r#"name = "fullstack-dev";"#));
 }
 
 #[test]
