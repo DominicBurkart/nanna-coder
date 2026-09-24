@@ -641,6 +641,7 @@ impl FromStr for WindowSet {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use proptest::prelude::*;
 
     const EXAMPLE: &str = r#"
 [[window]]
@@ -1082,6 +1083,85 @@ applies_to = ["production"]
                 matches!(parse_duration(bad), Err(WindowError::InvalidDuration(s)) if s == bad),
                 "input {bad:?}"
             );
+        }
+    }
+
+    const ZONES: [&str; 7] = [
+        "UTC",
+        "Europe/Paris",
+        "America/New_York",
+        "America/Santiago",
+        "Australia/Lord_Howe",
+        "Pacific/Apia",
+        "Asia/Kolkata",
+    ];
+
+    fn arb_window_toml() -> impl Strategy<Value = String> {
+        (
+            0..ZONES.len(),
+            1u8..128,
+            0u32..1439,
+            proptest::collection::vec(0u32..730, 0..4),
+        )
+            .prop_flat_map(|(zone, day_mask, start, holiday_offsets)| {
+                ((start + 1)..1440).prop_map(move |end| {
+                    let days: Vec<String> = (0u8..7)
+                        .filter(|bit| day_mask & (1 << bit) != 0)
+                        .map(|bit| format!("\"{}\"", Weekday::try_from(bit).unwrap()))
+                        .collect();
+                    let base = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+                    let holidays: Vec<String> = holiday_offsets
+                        .iter()
+                        .map(|off| format!("\"{}\"", base + Duration::days(i64::from(*off))))
+                        .collect();
+                    format!(
+                        "[[window]]\nname = \"w\"\ntimezone = \"{}\"\ndays = [{}]\nstart = \"{:02}:{:02}\"\nend = \"{:02}:{:02}\"\napplies_to = [\"production\"]\nholidays = [{}]\n",
+                        ZONES[zone],
+                        days.join(", "),
+                        start / 60,
+                        start % 60,
+                        end / 60,
+                        end % 60,
+                        holidays.join(", ")
+                    )
+                })
+            })
+    }
+
+    fn arb_now() -> impl Strategy<Value = DateTime<Utc>> {
+        (1_735_689_600i64..1_798_761_600).prop_map(|secs| Utc.timestamp_opt(secs, 0).unwrap())
+    }
+
+    proptest! {
+        #[test]
+        fn next_open_is_not_before_now_and_is_open(src in arb_window_toml(), now in arb_now()) {
+            let set = WindowSet::parse(&src).unwrap();
+            let next = set.next_open("w", now).unwrap();
+            prop_assert!(next >= now);
+            prop_assert!(set.is_open("w", next).unwrap());
+        }
+
+        #[test]
+        fn next_open_with_adhoc_override_holds(
+            src in arb_window_toml(),
+            now in arb_now(),
+            opened_ago in 0i64..(48 * 60),
+            minutes in 1i64..(24 * 60),
+        ) {
+            let mut set = WindowSet::parse(&src).unwrap();
+            let opened_at = now - Duration::minutes(opened_ago);
+            set.open_adhoc("w", Duration::minutes(minutes), opened_at).unwrap();
+            let next = set.next_open("w", now).unwrap();
+            prop_assert!(next >= now);
+            prop_assert!(set.is_open("w", next).unwrap());
+        }
+
+        #[test]
+        fn is_open_implies_next_open_is_now(src in arb_window_toml(), now in arb_now()) {
+            let set = WindowSet::parse(&src).unwrap();
+            if set.is_open("w", now).unwrap() {
+                prop_assert_eq!(set.next_open("w", now).unwrap(), now);
+            }
         }
     }
 }
