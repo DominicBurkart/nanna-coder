@@ -2,10 +2,16 @@
 //! headless browser scenarios, run from the dev container and recorded as
 //! artefacts under the task workspace.
 
+pub mod artifacts;
 pub mod browser;
 pub mod cdp;
 pub mod manifest;
+pub mod summary;
 
+pub use artifacts::{
+    next_index, write_json, QaArtifacts, ARTIFACT_DIR, BROWSER_PREFIX, BROWSER_REPORT_FILE,
+    ENDPOINT_PREFIX, QA_DIR,
+};
 pub use browser::{
     click_expression, step_name, text_expression, type_expression, BrowserDriver, BrowserPage,
     BrowserReport, BrowserScenario, CdpPage, ChromiumDriver, ScenarioError, ScenarioRunner, Step,
@@ -21,3 +27,4 @@ pub use manifest::{
     ManifestChecker, ManifestError, ManifestReport, ProbeError, ProbeResponse,
     DEFAULT_EXPECTED_STATUS, DEFAULT_PROBE_TIMEOUT_SECS, SNIPPET_CHARS,
 };
+pub use summary::{QaLedger, QaSummary};
