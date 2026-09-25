@@ -2,6 +2,7 @@ pub mod agent;
 pub mod backlog;
 pub mod container;
 pub mod entities;
+pub mod escalation;
 pub mod eval;
 pub mod leases;
 pub mod mcp;

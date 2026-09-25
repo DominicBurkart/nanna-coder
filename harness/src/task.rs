@@ -1,6 +1,7 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
+use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
@@ -241,6 +242,9 @@ struct TaskRunner {
 pub struct TaskManager {
     runner: Arc<TaskRunner>,
     dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
+    /// Escalation keys and incident holds; in memory unless
+    /// [`with_escalations`](Self::with_escalations) swaps in a persisted log.
+    escalations: Arc<EscalationLog>,
 }
 
 impl TaskManager {
@@ -313,7 +317,31 @@ impl TaskManager {
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
-        Ok(Self { runner, dispatcher })
+        let escalations = Arc::new(EscalationLog::in_memory());
+        Ok(Self {
+            runner,
+            dispatcher,
+            escalations,
+        })
+    }
+
+    /// Use `escalations` (for example the persisted log under `mcp-serve`)
+    /// instead of the in-memory default.
+    pub fn with_escalations(mut self, escalations: Arc<EscalationLog>) -> Self {
+        self.escalations = escalations;
+        self
+    }
+
+    /// The escalation log, for producers building an
+    /// [`Escalator`](crate::escalation::Escalator) and for consumers
+    /// checking [`production_held`](EscalationLog::production_held).
+    pub fn escalations(&self) -> Arc<EscalationLog> {
+        Arc::clone(&self.escalations)
+    }
+
+    /// Tracked escalation keys and live incident holds as of now.
+    pub fn escalation_snapshot(&self) -> EscalationSnapshot {
+        self.escalations.snapshot(Utc::now())
     }
 
     /// Backlog depth, parked count, age of the oldest queued task and
@@ -1756,6 +1784,34 @@ mod scheduler_tests {
     use super::*;
     use crate::leases::{JsonlLeaseStore, Lease, LeaseError, LeaseName};
     use crate::scheduler::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
+
+    #[test]
+    fn test_escalation_log_defaults_in_memory_and_can_be_replaced() {
+        use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
+        let manager = TaskManager::new(0);
+        assert!(manager.escalations().path().is_none());
+        assert_eq!(
+            manager.escalation_snapshot().to_string(),
+            "tracked=0 occurrences=0 holds=0"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(EscalationLog::open(&dir.path().join("escalations.jsonl")).unwrap());
+        let incident = Escalation::new(
+            Severity::Incident,
+            EscalationSource::Rollout,
+            "example/repo",
+            "down",
+        )
+        .with_id("inc-1");
+        log.hold(&incident, Utc::now()).unwrap();
+        let manager = manager.with_escalations(Arc::clone(&log));
+        assert!(manager.escalations().production_held("example/repo"));
+        assert_eq!(manager.escalation_snapshot().holds.len(), 1);
+        assert_eq!(
+            manager.escalation_snapshot().to_json()["production_held"][0],
+            "example/repo"
+        );
+    }
     use async_trait::async_trait;
     use model::provider::{ModelError, ModelResult};
     use model::types::{ChatRequest, ChatResponse, ModelInfo};
