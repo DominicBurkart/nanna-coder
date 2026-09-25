@@ -79,6 +79,7 @@ mod tests {
             ],
             additional_args: Vec::new(),
             network: crate::container::NetworkPolicy::Enabled,
+            read_only_mounts: vec![],
         }
     }
 

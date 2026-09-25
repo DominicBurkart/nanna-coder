@@ -103,6 +103,7 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let handle = start_container_with_fallback(&config)
