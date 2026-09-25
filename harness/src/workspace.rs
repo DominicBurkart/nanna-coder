@@ -166,7 +166,7 @@ impl TaskWorkspace {
 
         let container_name = format!("nanna-task-{}", task_id);
         let mut additional_args = vec![format!(
-            "-v={}:{CONTAINER_WORKSPACE_DIR}",
+            "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
             workspace_path.display()
         )];
         let mut env_vars = vec![];
