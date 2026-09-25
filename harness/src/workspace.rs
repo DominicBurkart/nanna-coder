@@ -291,14 +291,25 @@ impl TaskWorkspace {
     /// renames reported as a deletion and an addition.
     pub fn changed_paths(&self) -> Result<Vec<String>, WorkspaceError> {
         let output = git_cmd(&self.workspace_path)
-            .args(["diff", "--cached", "--name-only", "--no-renames", "HEAD"])
+            .args([
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "HEAD",
+            ])
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::ExtractChangesFailed(stderr));
         }
         let listing = String::from_utf8_lossy(&output.stdout);
-        let mut paths: Vec<String> = listing.lines().map(str::to_string).collect();
+        let mut paths: Vec<String> = listing
+            .split(' ')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
         paths.sort();
         Ok(paths)
     }
@@ -1030,6 +1041,34 @@ mod tests {
         );
 
         std::fs::write(&git_file, original).unwrap();
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_changed_paths_reports_the_unquoted_name_of_a_non_ascii_protected_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-nonascii"), "HEAD").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b".nanna/agents/\xc3\xa9.toml");
+        let dir = ws.workspace_path.join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(ws.workspace_path.join(name), "[identity]").unwrap();
+        git_cmd(&ws.workspace_path)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+
+        let paths = ws.changed_paths().unwrap();
+        assert!(
+            paths.iter().any(|p| p == ".nanna/agents/\u{e9}.toml"),
+            "expected an unquoted non-ASCII path, got {paths:?}"
+        );
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, ".nanna/**");
         ws.cleanup().unwrap();
     }
 }

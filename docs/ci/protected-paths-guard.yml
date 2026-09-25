@@ -69,9 +69,8 @@ jobs:
             "codecov.yml"
             "windows.toml"
           )
-          CHANGED="$(git diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA")"
           VIOLATIONS=()
-          while IFS= read -r path; do
+          while IFS= read -r -d '' path; do
             [ -z "$path" ] && continue
             for pattern in "${PROTECTED_PATTERNS[@]}"; do
               shell_glob="${pattern//\*\*/*}"
@@ -84,7 +83,7 @@ jobs:
                   ;;
               esac
             done
-          done <<< "$CHANGED"
+          done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
 
           if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
             echo "identity '$IDENTITY' touched no protected path"
