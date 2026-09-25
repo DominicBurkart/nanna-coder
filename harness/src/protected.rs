@@ -379,4 +379,18 @@ mod tests {
         let hook: std::sync::Arc<dyn AuditHook> = std::sync::Arc::new(NoopAuditHook);
         hook.on_protected_path_violation("task-1", &violation);
     }
+
+    #[test]
+    fn the_ci_guard_lists_every_protected_pattern_and_reads_the_identity_marker() {
+        let guard = include_str!("../../docs/ci/protected-paths-guard.yml");
+        for pattern in PROTECTED_PATTERNS {
+            let quoted = format!("\"{pattern}\"");
+            assert!(
+                guard.contains(&quoted),
+                "{pattern} missing from the CI guard"
+            );
+        }
+        assert!(guard.contains(crate::marker::IDENTITY_TRAILER));
+        assert!(guard.contains("on:\n  pull_request:"));
+    }
 }
