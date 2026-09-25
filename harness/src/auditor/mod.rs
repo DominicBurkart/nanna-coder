@@ -17,14 +17,18 @@
 //! escalation is handed to a [`SpawnEscalationHook`].
 
 mod context;
+mod gate;
 mod llm;
+mod log;
 mod record;
 mod request;
 mod rules;
 mod verdict;
 
 pub use context::AuditContext;
+pub use gate::{Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook};
 pub use llm::{ModelAuditor, AUDITOR_FRAMING, OUTPUT_CONTRACT, SUBTASK_CLOSE, SUBTASK_OPEN};
+pub use log::{AuditLog, AuditLogEntry};
 pub use record::{content_hash, AuditOutcome, AuditRecord};
 pub use request::{SpawnRequest, TaskSummary};
 pub use rules::{RuleAuditor, RULE_AUDITOR_NAME};
@@ -58,6 +62,9 @@ pub enum AuditError {
     /// The audit log could not be written.
     #[error("audit log write failed: {0}")]
     Log(#[from] std::io::Error),
+    /// An audit log entry could not be (de)serialized.
+    #[error("audit log entry serialization failed: {0}")]
+    Serde(#[from] serde_json::Error),
 }
 
 /// Reviews proposed spawns.
