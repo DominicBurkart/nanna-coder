@@ -1,5 +1,6 @@
 pub mod detect;
 pub mod flake_template;
+pub mod fullstack;
 pub mod profile;
 
 use async_trait::async_trait;

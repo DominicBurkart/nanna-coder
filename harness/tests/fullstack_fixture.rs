@@ -1,5 +1,7 @@
 use harness::capabilities::detect_capabilities;
 use harness::onboarding::detect::scan_project;
+use harness::onboarding::flake_template::generate_flake;
+use harness::onboarding::fullstack::DatabaseUsage;
 use harness::onboarding::profile::BuildSystem;
 use std::fs;
 use std::path::PathBuf;
@@ -87,8 +89,79 @@ fn fixture_profile_uses_cargo_build_system() {
 }
 
 #[test]
-fn fixture_has_no_signal_gated_capabilities() {
-    assert!(detect_capabilities(&fixture_root()).is_empty());
+fn fixture_is_detected_as_full_stack_rust() {
+    let signals = scan_project(&fixture_root()).unwrap();
+    let profile = signals
+        .full_stack
+        .expect("fixture matches the full-stack profile");
+    assert_eq!(profile.api.name, "api");
+    assert_eq!(profile.frontend.name, "ui");
+    assert_eq!(profile.shared.len(), 1);
+    assert_eq!(profile.shared[0].name, "shared");
+    assert_eq!(
+        profile.database,
+        Some(DatabaseUsage {
+            sqlx_postgres: true,
+            migrations_dir: Some(PathBuf::from("migrations")),
+        })
+    );
+    assert_eq!(profile.health_path(), "/health/v1");
+    assert_eq!(profile.proxy_backends.len(), 2);
+}
+
+#[test]
+fn plain_library_crate_is_not_full_stack_rust() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+    let signals = scan_project(dir.path()).unwrap();
+    assert!(signals.full_stack.is_none());
+}
+
+const EXPECTED_FLAKE_TOOLCHAIN: &str = r#"        rustToolchain = pkgs.rust-bin.stable."1.84.0".default.override {
+          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+"#;
+
+const EXPECTED_FLAKE_PACKAGES: &str = r#"        devContainerPackages = [
+          rustToolchain
+          pkgs.cargo-nextest
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.git
+          pkgs.cacert
+          pkgs.trunk
+          pkgs.wasm-bindgen-cli
+          pkgs.sqlx-cli
+          pkgs.postgresql
+        ];
+"#;
+
+#[test]
+fn fixture_flake_provisions_full_stack_toolchain_and_packages() {
+    let profile = scan_project(&fixture_root())
+        .unwrap()
+        .to_cargo_profile()
+        .unwrap();
+    let flake = generate_flake(&profile).unwrap();
+    assert!(flake.contains(EXPECTED_FLAKE_TOOLCHAIN), "{flake}");
+    assert!(flake.contains(EXPECTED_FLAKE_PACKAGES), "{flake}");
+    assert!(flake.contains(r#"name = "fullstack-dev";"#));
+}
+
+#[test]
+fn fixture_exposes_trunk_build_and_sqlx_migrate_capabilities() {
+    let ids: Vec<&str> = detect_capabilities(&fixture_root())
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, vec!["trunk_build", "sqlx_migrate"]);
 }
 
 #[test]

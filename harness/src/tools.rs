@@ -1075,6 +1075,37 @@ pub fn cargo_audit_args() -> Vec<String> {
     vec!["cargo".to_string(), "audit".to_string()]
 }
 
+/// Argument vector for `trunk build`, optionally in release mode.
+pub fn trunk_build_args(release: bool) -> Vec<String> {
+    let mut args = vec!["trunk".to_string(), "build".to_string()];
+    if release {
+        args.push("--release".to_string());
+    }
+    args
+}
+
+/// `sqlx migrate` subcommands the agent may run.
+pub const SQLX_MIGRATE_COMMANDS: [&str; 3] = ["run", "info", "revert"];
+
+/// Argument vector for `sqlx migrate <command>`.
+pub fn sqlx_migrate_args(command: &str) -> Vec<String> {
+    vec![
+        "sqlx".to_string(),
+        "migrate".to_string(),
+        command.to_string(),
+    ]
+}
+
+/// Working directory inside the container for a workspace-relative
+/// directory: `base` itself for the workspace root, `base/<rel>` otherwise.
+pub fn member_working_dir(base: &str, rel: &std::path::Path) -> String {
+    if rel.as_os_str().is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{}", rel.display())
+    }
+}
+
 pub fn cargo_build_args(package: Option<&str>, release: bool) -> Vec<String> {
     let mut args = vec!["cargo".to_string(), "build".to_string()];
     if let Some(pkg) = package {
@@ -1682,6 +1713,169 @@ impl Tool for CargoAuditTool {
 
     fn name(&self) -> &str {
         "cargo_audit"
+    }
+}
+
+pub struct TrunkBuildTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl TrunkBuildTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TrunkBuildTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "trunk_build".to_string(),
+                description: crate::capabilities::find_capability("trunk_build")
+                    .map(|c| c.description)
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "release".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Set to 'true' to build in release mode".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+        let argv = trunk_build_args(release);
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+            "working_dir": self.working_dir,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "trunk_build"
+    }
+}
+
+pub struct SqlxMigrateTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl SqlxMigrateTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SqlxMigrateTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "sqlx_migrate".to_string(),
+                description: crate::capabilities::find_capability("sqlx_migrate")
+                    .map(|c| c.description)
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "command".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Migration command: run (default), info, or revert".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let command_name = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("run");
+        if !SQLX_MIGRATE_COMMANDS.contains(&command_name) {
+            return Err(ToolError::InvalidArguments {
+                message: format!(
+                    "unknown sqlx migrate command '{command_name}'; expected one of {}",
+                    SQLX_MIGRATE_COMMANDS.join(", ")
+                ),
+            });
+        }
+        let argv = sqlx_migrate_args(command_name);
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+            "working_dir": self.working_dir,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "sqlx_migrate"
     }
 }
 
@@ -2512,8 +2706,9 @@ pub fn create_container_tool_registry(
             container_handle.clone(),
             wd.clone(),
         )));
-        let detected = crate::capabilities::detect_capabilities(workspace_root);
-        for cap in detected {
+        let detected = crate::capabilities::detect_capability_locations(workspace_root);
+        for (cap, rel) in detected {
+            let member_wd = Some(member_working_dir(container_working_dir, &rel));
             match cap.id {
                 "cargo_deny" => registry.register(Box::new(CargoDenyTool::new(
                     container_handle.clone(),
@@ -2522,6 +2717,14 @@ pub fn create_container_tool_registry(
                 "cargo_audit" => registry.register(Box::new(CargoAuditTool::new(
                     container_handle.clone(),
                     wd.clone(),
+                ))),
+                "trunk_build" => registry.register(Box::new(TrunkBuildTool::new(
+                    container_handle.clone(),
+                    member_wd,
+                ))),
+                "sqlx_migrate" => registry.register(Box::new(SqlxMigrateTool::new(
+                    container_handle.clone(),
+                    member_wd,
                 ))),
                 _ => {}
             }
