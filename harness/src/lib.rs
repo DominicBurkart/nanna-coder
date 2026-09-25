@@ -4,6 +4,7 @@ pub mod effects;
 pub mod entities;
 pub mod eval;
 pub mod identity;
+pub mod marker;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
@@ -24,6 +25,7 @@ pub use container::{
 };
 pub use effects::{EffectClass, UnknownEffectClass};
 pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
+pub use marker::{parse_identity_from_text, render_html_marker, render_trailer, IDENTITY_TRAILER};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
