@@ -138,6 +138,7 @@ const EXPECTED_FLAKE_PACKAGES: &str = r#"        devContainerPackages = [
           pkgs.cacert
           pkgs.trunk
           pkgs.wasm-bindgen-cli
+          pkgs.curl
           pkgs.sqlx-cli
           pkgs.postgresql
         ];
