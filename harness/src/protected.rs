@@ -51,9 +51,7 @@ pub struct ProtectedPathViolation {
 /// implementor a workspace starts with.
 pub trait AuditHook: Send + Sync {
     /// Called when `task_id` produced changes touching a protected path.
-    fn on_protected_path_violation(&self, task_id: &str, violation: &ProtectedPathViolation) {
-        let _ = (task_id, violation);
-    }
+    fn on_protected_path_violation(&self, _task_id: &str, _violation: &ProtectedPathViolation) {}
 }
 
 /// An [`AuditHook`] that records nothing.

@@ -2184,4 +2184,32 @@ mod tests {
             crate::scope::UNSCOPED_IDENTITY
         );
     }
+
+    #[tokio::test]
+    async fn test_a_run_that_exhausts_its_iterations_fails_with_no_denials() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let responses: Vec<ChatResponse> = (0..5).map(|_| stop_response("not done yet")).collect();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(responses);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                0,
+                provider,
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "MaxIterationsExceeded");
+                assert!(diagnostics.denials.is_empty());
+                assert_eq!(diagnostics.to_json()["denials"], serde_json::json!([]));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
 }

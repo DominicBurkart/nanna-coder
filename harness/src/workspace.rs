@@ -1013,4 +1013,23 @@ mod tests {
         }
         ws.cleanup().unwrap();
     }
+
+    #[test]
+    fn test_changed_paths_reports_a_git_failure() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-broken"), "HEAD").unwrap();
+        let git_file = ws.workspace_path.join(".git");
+        let original = std::fs::read(&git_file).unwrap();
+        std::fs::write(&git_file, "gitdir: /nonexistent/worktree").unwrap();
+
+        let err = ws.changed_paths().unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::ExtractChangesFailed(_)),
+            "{err:?}"
+        );
+
+        std::fs::write(&git_file, original).unwrap();
+        ws.cleanup().unwrap();
+    }
 }
