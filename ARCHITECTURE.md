@@ -64,12 +64,14 @@ The task lifecycle uses the standard Tasks methods instead of custom tools:
 
 - **`tasks/get`** — poll a task's status by `taskId` (`working`, `completed`, `failed`, or `cancelled`) with `createdAt`/`lastUpdatedAt`/`ttl`/`pollInterval` metadata. Non-blocking.
 - **`tasks/result`** — retrieve the terminal `CallToolResult` (result summary, patch, tool calls, model). Blocks until the task reaches a terminal state; carries the `io.modelcontextprotocol/related-task` metadata.
-- **`tasks/list`** — enumerate all tasks Nanna is tracking with their statuses. The result's `_meta.queue` carries the scheduler's backlog metrics (depth, parked, running, age of the oldest entry, per-side dispatch counts).
+- **`tasks/list`** — enumerate all tasks Nanna is tracking with their statuses. The result's `_meta.queue` carries the scheduler's backlog metrics (depth, parked, running, age of the oldest entry, per-side dispatch counts); `_meta.leases` the coordination lease snapshot; `_meta.escalations` the escalation snapshot (tracked keys, live incident holds, repositories whose production work is held).
 - **`tasks/cancel`** — request cancellation by `taskId`; the task transitions to `cancelled`. Cancelling an already-terminal task returns `-32602`.
 
 The server advertises `capabilities.tasks: { list, cancel, requests: { tools: { call } } }` at `initialize`. Task IDs are UUIDv4 with no authorization-context binding — appropriate for a single-user local stdio server (see the Tasks spec's security considerations). `input_required`/elicitation is out of scope for this revision.
 
 Submissions beyond the concurrency limit are queued, not rejected. `harness::scheduler` orders the backlog by submission time and dispatches it with a hybrid FIFO/LIFO policy (half the slots chase the newest work, half serve the oldest, with an optional per-repository cap); queued entries are persisted to a JSON Lines log (`NANNA_QUEUE_PATH`, default `~/.local/state/nanna/queue.jsonl`) and restored when `mcp-serve` starts. Entries may be parked until a human-availability window opens (`harness::windows`). The `backlog-sync` subcommand pulls open GitHub issues into that log as tasks, skipping issues already queued or already claimed by an open pull request carrying a `Nanna-Identity:` marker.
+
+When a producer (auditor verdict, rollout halt, budget exhaustion, repeated scope denials, incident postmortem) cannot proceed, it hands off through `harness::escalation`: a deterministic-title GitHub issue labelled `nanna-escalation` (repeats comment on the open issue) and/or a JSON webhook, every body redacted. Occurrences are logged to `escalations.jsonl` beside the queue log (`NANNA_ESCALATION_PATH`) and identical escalations inside a window collapse into a counter. An `incident` escalation records a hold that parks production-class work for the repository until a human runs `nanna escalation resolve <id>`; no agent tool can clear it.
 
 ```mermaid
 ---
@@ -87,6 +89,7 @@ flowchart LR
         tools
         health
         backlogsync["backlog-sync"]
+        escalation["escalation resolve"]
     end
     subgraph MCP["MCP (stdio, via mcp-serve) — Tasks extension"]
         assign_task["assign_task (taskSupport: required)"]
@@ -100,7 +103,7 @@ flowchart LR
     delegate -.->|in-process client| MCP
     classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,delegate,mcpserve,models,tools,health,backlogsync cli
+    class chat,agent,delegate,mcpserve,models,tools,health,backlogsync,escalation cli
     class assign_task,onboard_repo,tget,tresult,tlist,tcancel mcp
 ```
 
