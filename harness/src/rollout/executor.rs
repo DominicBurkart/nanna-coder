@@ -1,7 +1,8 @@
-use super::adapter::{FakeAdapter, TargetAdapter};
+use super::adapter::{FakeAdapter, FallbackPolicy, TargetAdapter};
 use super::health::{check_health, FakeHealthSource, HealthBreach, HealthSource};
 use super::hooks::{AuditHook, EscalationHook, LogEscalation, NoAudit, RolloutEscalation};
 use super::log::RolloutLog;
+use super::shadow::{FakeShadowSource, NoShadowSource, ShadowComparator, ShadowSource};
 use super::state::{RolloutRecord, RolloutState};
 use super::RolloutError;
 use crate::deploy::{DeployPlan, DeployStep, OnBreach, Precondition, StepKind};
@@ -51,7 +52,7 @@ impl Default for RolloutConfig {
 /// .unwrap()
 /// .plan("sandbox")
 /// .unwrap();
-/// let (executor, adapter, _health) = fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
+/// let (executor, adapter, _health, _shadow, _clock) = fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
 /// let record = executor.start(plan, "registry.example.invalid/ns/app:v2").await.unwrap();
 /// let done = executor.run(&record.id).await.unwrap();
 /// assert_eq!(done.state, RolloutState::Complete);
@@ -66,31 +67,98 @@ pub struct RolloutExecutor {
     clock: Arc<dyn Clock>,
     adapter: Arc<dyn TargetAdapter>,
     health: Arc<dyn HealthSource>,
+    shadow: Arc<dyn ShadowSource>,
     audit: Arc<dyn AuditHook>,
     escalation: Arc<dyn EscalationHook>,
     config: RolloutConfig,
 }
 
 /// An executor over in-memory leases, a simulated clock started now, a
-/// [`FakeAdapter`] serving `current_image` and a healthy
-/// [`FakeHealthSource`] for `endpoints`: the `--fake` dry run.
+/// [`FakeAdapter`] serving `current_image`, a healthy [`FakeHealthSource`]
+/// for `endpoints` and a [`FakeShadowSource`] whose mirrored pairs always
+/// agree: the `--fake` dry run. The returned clock drives [`run_simulated`].
 pub fn fake_executor(
     log: RolloutLog,
     windows: WindowSet,
     current_image: &str,
     endpoints: &[String],
-) -> (RolloutExecutor, Arc<FakeAdapter>, Arc<FakeHealthSource>) {
+) -> (
+    RolloutExecutor,
+    Arc<FakeAdapter>,
+    Arc<FakeHealthSource>,
+    Arc<FakeShadowSource>,
+    Arc<SimulatedClock>,
+) {
     let adapter = Arc::new(FakeAdapter::new(current_image));
     let health = Arc::new(FakeHealthSource::healthy(endpoints));
+    let shadow = Arc::new(FakeShadowSource::agreeing(1));
     let clock = Arc::new(SimulatedClock::new(Utc::now()));
     let leases = Arc::new(InMemoryLeaseStore::default());
-    let executor =
-        RolloutExecutor::new(log, leases, windows, clock, adapter.clone(), health.clone());
-    (executor, adapter, health)
+    let executor = RolloutExecutor::new(
+        log,
+        leases,
+        windows,
+        clock.clone(),
+        adapter.clone(),
+        health.clone(),
+    )
+    .with_shadow_source(shadow.clone());
+    (executor, adapter, health, shadow, clock)
+}
+
+/// Drive `id` to a non-parked state on `clock`, advancing it past every
+/// `Parked { until, .. }` in between and collecting each intermediate
+/// record along the way.
+///
+/// A rollout parks only on a precondition that is not yet met (a window,
+/// a contended lease, or a `Retire` step's `rollback.retain_for`); on a
+/// [`SimulatedClock`] there is nothing else that would make it become met
+/// on its own, so this always terminates: [`RolloutExecutor::run`] only
+/// returns a `Parked` record when `now < until`, and this advances the
+/// clock to exactly `until` before running again.
+///
+/// ```
+/// use harness::deploy::DeployTemplate;
+/// use harness::rollout::{fake_executor, run_simulated, RolloutLog, RolloutState};
+/// use harness::windows::WindowSet;
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let dir = tempfile::tempdir().unwrap();
+/// let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+/// let plan = DeployTemplate::parse(
+///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n",
+/// )
+/// .unwrap()
+/// .plan("sandbox")
+/// .unwrap();
+/// let (executor, _adapter, _health, _shadow, clock) =
+///     fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
+/// let record = executor.start(plan, "registry.example.invalid/ns/app:v2").await.unwrap();
+/// let steps = run_simulated(&executor, &clock, &record.id).await.unwrap();
+/// assert!(matches!(steps[0].state, RolloutState::Parked { .. }));
+/// assert_eq!(steps.last().unwrap().state, RolloutState::Complete);
+/// # });
+/// ```
+pub async fn run_simulated(
+    executor: &RolloutExecutor,
+    clock: &SimulatedClock,
+    id: &str,
+) -> Result<Vec<RolloutRecord>, RolloutError> {
+    let mut records = Vec::new();
+    let mut record = executor.run(id).await?;
+    while let RolloutState::Parked { until, .. } = record.state {
+        records.push(record);
+        clock.advance(until - clock.now());
+        record = executor.run(id).await?;
+    }
+    records.push(record);
+    Ok(records)
 }
 
 impl RolloutExecutor {
-    /// An executor with a no-op audit hook and a logging escalation hook.
+    /// An executor with a no-op audit hook, a logging escalation hook and
+    /// no shadow source (a `Shadow` step fails fast until
+    /// [`with_shadow_source`](Self::with_shadow_source) is called).
     pub fn new(
         log: RolloutLog,
         leases: Arc<dyn LeaseStore>,
@@ -106,10 +174,17 @@ impl RolloutExecutor {
             clock,
             adapter,
             health,
+            shadow: Arc::new(NoShadowSource),
             audit: Arc::new(NoAudit),
             escalation: Arc::new(LogEscalation),
             config: RolloutConfig::default(),
         }
+    }
+
+    /// Replace the shadow source a `Shadow` step compares against.
+    pub fn with_shadow_source(mut self, shadow: Arc<dyn ShadowSource>) -> Self {
+        self.shadow = shadow;
+        self
     }
 
     /// Replace the audit hook.
@@ -186,13 +261,21 @@ impl RolloutExecutor {
         let record = self.log.load(id)?;
         let mut next = record.clone();
         next.transition(RolloutState::Step(0), self.clock.now())?;
+        if let Some(retained) = &record.retained_slot {
+            self.adapter.set_traffic(retained, 100).await?;
+        }
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.mirror(slot, 0).await?;
+            self.adapter.clear_fallback(slot).await?;
             self.adapter.retire(slot).await?;
         }
         next.image = image.to_string();
         next.pr = Some(pr.to_string());
         next.slot = None;
+        next.retained_slot = None;
+        next.retained_since = None;
+        next.fallback = None;
         next.traffic_percent = 0;
         next.breach = None;
         self.log.append(Some(&record.state), &next)?;
@@ -297,25 +380,76 @@ impl RolloutExecutor {
             None if n == 0 => {
                 let slot = self.adapter.deploy_inactive(&record.image).await?;
                 record.slot = Some(slot.clone());
+                let support = self
+                    .adapter
+                    .set_fallback(&slot, &FallbackPolicy::default())
+                    .await?;
+                record.fallback = Some(support);
                 self.log.append(Some(&record.state), &record)?;
                 slot
             }
             None => return Err(RolloutError::NoSlot(record.id.clone())),
         };
-        if step.kind != StepKind::Traffic {
-            return Err(RolloutError::UnsupportedStep(step.kind.name()));
+        match step.kind {
+            StepKind::Traffic => {
+                record.set_traffic(step.traffic_percent)?;
+                self.adapter
+                    .set_traffic(&slot, step.traffic_percent)
+                    .await?;
+            }
+            StepKind::Shadow { mirror_percent } => {
+                record.set_traffic(step.traffic_percent)?;
+                self.adapter.mirror(&slot, mirror_percent).await?;
+            }
+            StepKind::Swap => {
+                record.set_traffic(step.traffic_percent)?;
+                let swapped = self.adapter.swap().await?;
+                record.slot = Some(swapped.active);
+                record.retained_slot = Some(swapped.retired_candidate);
+                record.retained_since = Some(self.clock.now());
+            }
+            StepKind::Retire => {
+                let (retained, retained_since) =
+                    match (record.retained_slot.clone(), record.retained_since) {
+                        (Some(retained), Some(retained_since)) => (retained, retained_since),
+                        _ => return Err(RolloutError::NoRetainedSlot(record.id.clone())),
+                    };
+                let ready_at = retained_since + step.min_duration;
+                if now < ready_at {
+                    self.leases.release_all(&record.id)?;
+                    return self.park(record, ready_at);
+                }
+                self.adapter.clear_fallback(&retained).await?;
+                self.adapter.retire(&retained).await?;
+                record.retained_slot = None;
+                record.retained_since = None;
+                record.set_traffic(step.traffic_percent)?;
+                return self.advance_or_complete(record, n).await;
+            }
         }
-        record.set_traffic(step.traffic_percent)?;
-        self.adapter
-            .set_traffic(&slot, step.traffic_percent)
-            .await?;
         let since = self.clock.now();
         self.persist(&mut record, RolloutState::Baking { step: n, since })
     }
 
-    async fn bake(
+    async fn advance_or_complete(
         &self,
         mut record: RolloutRecord,
+        n: usize,
+    ) -> Result<(), RolloutError> {
+        if n + 1 < record.plan.steps.len() {
+            return self.persist(&mut record, RolloutState::Step(n + 1));
+        }
+        if let Some(slot) = record.slot.clone() {
+            self.adapter.clear_fallback(&slot).await?;
+        }
+        self.persist(&mut record, RolloutState::Complete)?;
+        self.leases.release_all(&record.id)?;
+        Ok(())
+    }
+
+    async fn bake(
+        &self,
+        record: RolloutRecord,
         n: usize,
         since: DateTime<Utc>,
     ) -> Result<(), RolloutError> {
@@ -324,6 +458,16 @@ impl RolloutExecutor {
             .slot
             .clone()
             .ok_or_else(|| RolloutError::NoSlot(record.id.clone()))?;
+        let comparator = match step.kind {
+            StepKind::Shadow { .. } => Some(ShadowComparator::from_template(
+                record
+                    .plan
+                    .shadow
+                    .as_ref()
+                    .ok_or_else(|| RolloutError::NoShadowConfig(record.id.clone()))?,
+            )),
+            _ => None,
+        };
         let bake_end = since + step.bake_time;
         let hold_end = bake_end + step.min_duration;
         loop {
@@ -334,6 +478,12 @@ impl RolloutExecutor {
             if let Some(health) = &record.plan.health {
                 let sample = self.health.sample(&slot, self.config.poll_interval).await?;
                 if let Some(breach) = check_health(health, &sample, n) {
+                    return self.on_breach(record, breach).await;
+                }
+            }
+            if let Some(comparator) = &comparator {
+                let samples = self.shadow.sample(&slot, self.config.poll_interval).await?;
+                if let Some(breach) = comparator.check(&samples, n) {
                     return self.on_breach(record, breach).await;
                 }
             }
@@ -351,12 +501,10 @@ impl RolloutExecutor {
                 return Ok(());
             }
         }
-        if n + 1 < record.plan.steps.len() {
-            return self.persist(&mut record, RolloutState::Step(n + 1));
+        if let StepKind::Shadow { .. } = step.kind {
+            self.adapter.mirror(&slot, 0).await?;
         }
-        self.persist(&mut record, RolloutState::Complete)?;
-        self.leases.release_all(&record.id)?;
-        Ok(())
+        self.advance_or_complete(record, n).await
     }
 
     async fn on_breach(
@@ -390,11 +538,18 @@ impl RolloutExecutor {
     }
 
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
+        if let Some(retained) = &record.retained_slot {
+            self.adapter.set_traffic(retained, 100).await?;
+        }
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.mirror(slot, 0).await?;
+            self.adapter.clear_fallback(slot).await?;
         }
         self.adapter.rollback_to(&record.previous_image).await?;
         record.set_traffic(0)?;
+        record.retained_slot = None;
+        record.retained_since = None;
         self.persist(&mut record, RolloutState::RolledBack)?;
         self.leases.release_all(&record.id)?;
         Ok(())
@@ -437,11 +592,12 @@ impl std::fmt::Debug for RolloutExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy::DeployTemplate;
+    use crate::deploy::{DeployTemplate, ShadowCompare};
     use crate::leases::{LeaseName, SimulatedClock};
-    use crate::rollout::adapter::{AdapterCall, AdapterOp, Slot};
-    use crate::rollout::health::{HealthError, HealthSample};
+    use crate::rollout::adapter::{AdapterCall, AdapterOp, FallbackPolicy, FallbackSupport, Slot};
+    use crate::rollout::health::{HealthError, HealthObservation, HealthSample, HealthThreshold};
     use crate::rollout::hooks::{RecordingAudit, RecordingEscalation};
+    use crate::rollout::shadow::ShadowSample;
     use crate::rollout::state::tests::{plan, t0, GRADUAL};
     use async_trait::async_trait;
     use chrono::TimeZone;
@@ -458,6 +614,7 @@ mod tests {
         leases: Arc<InMemoryLeaseStore>,
         adapter: Arc<FakeAdapter>,
         health: Arc<FakeHealthSource>,
+        shadow: Arc<FakeShadowSource>,
         audit: Arc<RecordingAudit>,
         escalation: Arc<RecordingEscalation>,
         executor: RolloutExecutor,
@@ -477,6 +634,7 @@ mod tests {
         let leases = Arc::new(InMemoryLeaseStore::default());
         let adapter = Arc::new(FakeAdapter::new(V1));
         let health = Arc::new(FakeHealthSource::healthy(&["/health/v1".to_string()]));
+        let shadow = Arc::new(FakeShadowSource::agreeing(1));
         let audit = Arc::new(RecordingAudit::default());
         let escalation = Arc::new(RecordingEscalation::default());
         let executor = RolloutExecutor::new(
@@ -487,6 +645,7 @@ mod tests {
             adapter.clone(),
             health.clone(),
         )
+        .with_shadow_source(shadow.clone())
         .with_audit(audit.clone())
         .with_escalation(escalation.clone())
         .with_config(one_poll_per_step());
@@ -497,6 +656,7 @@ mod tests {
             leases,
             adapter,
             health,
+            shadow,
             audit,
             escalation,
             executor,
@@ -545,16 +705,20 @@ mod tests {
         assert_eq!(done.slot, Some(slot.clone()));
         assert_eq!(rig.adapter.current(), V2);
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
+        let policy = FallbackPolicy::default();
         assert_eq!(
             rig.adapter.calls(),
             vec![
                 AdapterCall::CurrentImage,
                 AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(slot.clone(), policy),
                 AdapterCall::SetTraffic(slot.clone(), 10),
                 AdapterCall::SetTraffic(slot.clone(), 50),
                 AdapterCall::SetTraffic(slot.clone(), 100),
+                AdapterCall::ClearFallback(slot.clone()),
             ]
         );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
         assert_eq!(
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
@@ -586,7 +750,12 @@ mod tests {
         assert_eq!(rig.adapter.traffic(&slot), Some(0));
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
         let calls = rig.adapter.calls();
-        assert_eq!(calls[calls.len() - 2], AdapterCall::SetTraffic(slot, 0));
+        assert_eq!(
+            calls[calls.len() - 4],
+            AdapterCall::SetTraffic(slot.clone(), 0)
+        );
+        assert_eq!(calls[calls.len() - 3], AdapterCall::Mirror(slot.clone(), 0));
+        assert_eq!(calls[calls.len() - 2], AdapterCall::ClearFallback(slot));
         assert_eq!(calls[calls.len() - 1], AdapterCall::RollbackTo(V1.into()));
         assert!(states(&rig.executor, &record.id).ends_with(&[
             "baking".into(),
@@ -808,9 +977,12 @@ mod tests {
         assert_eq!(forwarded.slot, None);
         assert_eq!(forwarded.traffic_percent, 0);
         assert_eq!(forwarded.breach, None);
+        assert_eq!(forwarded.fallback, None);
         let old = Slot::new("slot-1");
         assert!(rig.adapter.calls().ends_with(&[
             AdapterCall::SetTraffic(old.clone(), 0),
+            AdapterCall::Mirror(old.clone(), 0),
+            AdapterCall::ClearFallback(old.clone()),
             AdapterCall::Retire(old.clone())
         ]));
         let done = rig.executor.run(&record.id).await.unwrap();
@@ -988,6 +1160,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn best_effort_fallback_is_recorded_and_shown_in_status() {
+        let rig = rig();
+        rig.adapter
+            .set_fallback_support(FallbackSupport::BestEffort);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.fallback, Some(FallbackSupport::BestEffort));
+        assert!(done.summary().ends_with("fallback: best-effort"));
+    }
+
+    #[tokio::test]
     async fn adapter_failures_surface_and_the_next_run_retries_the_step() {
         let rig = rig();
         rig.adapter.fail(AdapterOp::DeployInactive);
@@ -1056,7 +1240,9 @@ mod tests {
             RolloutState::RolledBack
         );
         assert!(rig.adapter.calls().ends_with(&[
-            AdapterCall::SetTraffic(slot, 0),
+            AdapterCall::SetTraffic(slot.clone(), 0),
+            AdapterCall::Mirror(slot.clone(), 0),
+            AdapterCall::ClearFallback(slot),
             AdapterCall::RollbackTo(V1.into())
         ]));
     }
@@ -1118,16 +1304,309 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blue_green_steps_are_not_supported_yet() {
+    async fn blue_green_swaps_and_retires_only_after_retain_for() {
         let rig = rig();
         let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
         let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
         let record = rig.executor.start(plan, V2).await.unwrap();
-        let err = rig.executor.run(&record.id).await.unwrap_err();
+        let old = Slot::new("slot-0");
+        let new = Slot::new("slot-1");
+        let parked = rig.executor.run(&record.id).await.unwrap();
+        let until = t0() + Duration::days(2);
         assert_eq!(
-            err.to_string(),
-            "step kind `swap` is not supported by the rollout executor yet"
+            parked.state,
+            RolloutState::Parked {
+                until,
+                resume_state: Box::new(RolloutState::Step(1)),
+            },
+            "retire waits on the clock rather than blocking it"
         );
+        assert_eq!(parked.retained_slot, Some(old.clone()));
+        assert_eq!(rig.adapter.image_in(&old), Some(V1.to_string()));
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::Retire(_))));
+        assert!(
+            rig.leases.snapshot().unwrap().is_empty(),
+            "released while parked"
+        );
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap(),
+            parked,
+            "a run before retain_for elapses is a no-op"
+        );
+        rig.clock.advance(until - rig.clock.now());
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.traffic_percent, 100);
+        assert_eq!(done.slot, Some(new.clone()));
+        assert_eq!(done.retained_slot, None, "cleared once retired");
+        assert_eq!(rig.adapter.current(), V2);
+        assert_eq!(rig.adapter.active(), new);
+        assert_eq!(rig.adapter.traffic(&new), Some(100));
+        assert_eq!(
+            rig.adapter.image_in(&old),
+            None,
+            "retired once retain_for elapsed"
+        );
+        assert_eq!(
+            rig.adapter.calls(),
+            vec![
+                AdapterCall::CurrentImage,
+                AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(new.clone(), FallbackPolicy::default()),
+                AdapterCall::Swap,
+                AdapterCall::ClearFallback(old.clone()),
+                AdapterCall::Retire(old.clone()),
+                AdapterCall::ClearFallback(new.clone()),
+            ]
+        );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
+        assert_eq!(
+            states(&rig.executor, &record.id),
+            ["pending", "step", "step", "baking", "step", "parked", "step", "complete"]
+        );
+        assert_eq!(rig.clock.now(), until);
+        assert!(rig.leases.snapshot().unwrap().is_empty());
+        assert!(rig.escalation.escalations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_simulated_drives_blue_green_through_the_park_to_completion() {
+        let rig = rig();
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let start = rig.clock.now();
+        let steps = run_simulated(&rig.executor, &rig.clock, &record.id)
+            .await
+            .unwrap();
+        let states: Vec<&'static str> = steps.iter().map(|r| r.state.name()).collect();
+        assert_eq!(states, ["parked", "complete"]);
+        assert_eq!(steps[0].retained_slot, Some(Slot::new("slot-0")));
+        assert_eq!(steps[1].retained_slot, None);
+        assert_eq!(
+            rig.clock.now(),
+            start + Duration::days(2),
+            "retain_for is measured from the swap, not from the swap step's own hold"
+        );
+        let history = rig.executor.log().history(&record.id).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|t| t.summary().contains("retained: slot-0")),
+            "{history:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_after_swap_restores_the_retained_slot() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::RolledBack);
+        assert_eq!(done.breach.as_ref().unwrap().step, 0);
+        let old = Slot::new("slot-0");
+        let new = Slot::new("slot-1");
+        assert_eq!(done.retained_slot, None, "cleared on rollback");
+        assert_eq!(rig.adapter.current(), V1);
+        assert_eq!(rig.adapter.active(), old);
+        assert_eq!(rig.adapter.traffic(&old), Some(100));
+        assert_eq!(rig.adapter.traffic(&new), Some(0));
+        assert_eq!(rig.adapter.image_in(&old).as_deref(), Some(V1));
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::Retire(_))));
+        let calls = rig.adapter.calls();
+        let restore = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(old.clone(), 100))
+            .unwrap();
+        let drain = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(new.clone(), 0))
+            .unwrap();
+        assert!(
+            restore < drain,
+            "the retained slot is restored before the bad one is drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn roll_forward_after_a_swap_restores_the_retained_slot_before_draining_the_bad_one() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"roll-forward\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        let old = Slot::new("slot-0");
+        let bad = Slot::new("slot-1");
+        assert_eq!(halted.slot, Some(bad.clone()));
+        assert_eq!(halted.retained_slot, Some(old.clone()));
+        assert_eq!(
+            rig.adapter.current(),
+            V2,
+            "the swap already happened before the breach was detected"
+        );
+        let forwarded = rig
+            .executor
+            .roll_forward(
+                &record.id,
+                V3,
+                Some("https://github.com/example/repo/pull/9"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.state, RolloutState::Step(0));
+        assert_eq!(forwarded.retained_slot, None);
+        assert_eq!(forwarded.slot, None);
+        assert_eq!(
+            rig.adapter.active(),
+            old,
+            "the retained slot serves live traffic again"
+        );
+        assert_eq!(rig.adapter.current(), V1);
+        assert_eq!(rig.adapter.traffic(&old), Some(100));
+        assert_eq!(rig.adapter.image_in(&bad), None, "the bad slot is retired");
+        let calls = rig.adapter.calls();
+        let restore = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(old.clone(), 100))
+            .unwrap();
+        let retire = calls
+            .iter()
+            .position(|c| *c == AdapterCall::Retire(bad.clone()))
+            .unwrap();
+        assert!(
+            restore < retire,
+            "the retained slot is restored before the bad one is retired"
+        );
+    }
+
+    const SHADOW_THEN_GRADUAL: &str ="[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [50, 100]\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\nmax_divergence = 0.2\n[rollback]\nautomatic = true\non_breach = \"rollback\"\n";
+
+    fn shadow_plan() -> DeployPlan {
+        DeployTemplate::parse(SHADOW_THEN_GRADUAL)
+            .unwrap()
+            .plan("sandbox")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shadow_then_gradual_mirrors_then_promotes_to_full_traffic() {
+        let rig = rig();
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.traffic_percent, 100);
+        let slot = Slot::new("slot-1");
+        assert_eq!(done.slot, Some(slot.clone()));
+        assert_eq!(rig.adapter.current(), V2);
+        assert_eq!(rig.adapter.active(), slot, "the 100% step cuts over live");
+        assert_eq!(
+            rig.adapter.mirrored(&slot),
+            Some(0),
+            "cleared once the shadow step finished"
+        );
+        assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
+        assert_eq!(
+            rig.adapter.calls(),
+            vec![
+                AdapterCall::CurrentImage,
+                AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(slot.clone(), FallbackPolicy::default()),
+                AdapterCall::Mirror(slot.clone(), 15),
+                AdapterCall::Mirror(slot.clone(), 0),
+                AdapterCall::SetTraffic(slot.clone(), 50),
+                AdapterCall::SetTraffic(slot.clone(), 100),
+                AdapterCall::ClearFallback(slot.clone()),
+            ]
+        );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
+        assert_eq!(
+            states(&rig.executor, &record.id),
+            ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
+        );
+        assert_eq!(rig.health.calls().len(), 3);
+        assert_eq!(
+            rig.shadow.calls().len(),
+            1,
+            "only the shadow step polls the comparator"
+        );
+        assert_eq!(
+            rig.clock.now(),
+            t0() + Duration::minutes(10) * 3 + Duration::hours(1) * 3
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_divergence_above_the_threshold_is_a_breach_that_rolls_back() {
+        let rig = rig();
+        let diverging = vec![
+            ShadowSample {
+                status_active: 200,
+                status_shadow: 500,
+                latency_active_ms: 10,
+                latency_shadow_ms: 10,
+            };
+            4
+        ];
+        rig.shadow.push(diverging);
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::RolledBack);
+        let breach = done.breach.unwrap();
+        assert_eq!(breach.step, 0);
+        assert_eq!(
+            breach.threshold,
+            HealthThreshold::ShadowDivergenceMax {
+                compare: ShadowCompare::Status,
+                max: 0.2
+            }
+        );
+        assert_eq!(breach.observed, HealthObservation::ShadowDivergence(1.0));
+        assert_eq!(rig.adapter.current(), V1);
+        assert_eq!(rig.adapter.traffic(&Slot::new("slot-0")), Some(100));
+    }
+
+    #[tokio::test]
+    async fn corrupt_shadow_and_retire_records_are_refused_not_guessed() {
+        let rig = rig();
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let mut crafted = record.clone();
+        crafted.slot = Some(Slot::new("slot-1"));
+        crafted.state = RolloutState::Baking {
+            step: 0,
+            since: t0(),
+        };
+        crafted.plan.shadow = None;
+        rig.executor.log().append(None, &crafted).unwrap();
+        assert!(matches!(
+            rig.executor.run(&record.id).await.unwrap_err(),
+            RolloutError::NoShadowConfig(id) if id == record.id
+        ));
+
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V3).await.unwrap();
+        let mut crafted = record.clone();
+        crafted.slot = Some(Slot::new("slot-2"));
+        crafted.retained_slot = None;
+        crafted.state = RolloutState::Step(1);
+        rig.executor.log().append(None, &crafted).unwrap();
+        assert!(matches!(
+            rig.executor.run(&record.id).await.unwrap_err(),
+            RolloutError::NoRetainedSlot(id) if id == record.id
+        ));
     }
 
     #[tokio::test]
@@ -1162,7 +1641,7 @@ mod tests {
     async fn list_orders_by_creation_and_fake_executor_dry_runs() {
         let dir = tempfile::tempdir().unwrap();
         let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
-        let (executor, adapter, health) =
+        let (executor, adapter, health, _shadow, _clock) =
             fake_executor(log, WindowSet::default(), V1, &["/health/v1".to_string()]);
         let first = executor.start(plan("sandbox"), V2).await.unwrap();
         let second = executor.start(plan("sandbox"), V3).await.unwrap();

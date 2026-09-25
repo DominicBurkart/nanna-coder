@@ -1,4 +1,4 @@
-use super::template::{DeployTemplate, Health, RiskClass, Rollback, Strategy};
+use super::template::{DeployTemplate, Health, RiskClass, Rollback, Shadow, Strategy};
 use super::{DeployError, PRODUCTION_ENV};
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,9 @@ pub struct DeployPlan {
     pub health: Option<Health>,
     /// What a health breach triggers.
     pub rollback: Rollback,
+    /// The template's `[shadow]` section when mirroring is enabled: what a
+    /// `Shadow` step compares and the divergence rate that breaches.
+    pub shadow: Option<Shadow>,
     /// Steps in execution order.
     pub steps: Vec<DeployStep>,
 }
@@ -201,7 +204,7 @@ impl DeployPlan {
     /// assert_eq!(json["steps"][0]["preconditions"][0]["lease_held"], "deploy:app:sandbox");
     /// ```
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "environment": self.environment,
             "image": self.image,
             "risk_class": self.risk_class.name(),
@@ -210,7 +213,15 @@ impl DeployPlan {
             "on_breach": self.rollback.on_breach.name(),
             "total_min_duration_seconds": self.total_min_duration().num_seconds(),
             "steps": self.steps.iter().map(DeployStep::to_json).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(shadow) = &self.shadow {
+            value["shadow"] = json!({
+                "mirror_percent": shadow.mirror_percent,
+                "compare": shadow.compare.iter().map(|c| c.name()).collect::<Vec<_>>(),
+                "max_divergence": shadow.max_divergence,
+            });
+        }
+        value
     }
 
     /// Pretty-printed [`DeployPlan::to_json`] for the CLI.
@@ -293,7 +304,7 @@ impl DeployTemplate {
     /// use harness::deploy::{DeployTemplate, RiskClass, StepKind};
     ///
     /// let template = DeployTemplate::parse(
-    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
     /// )
     /// .unwrap();
     /// let plan = template.plan_with_score("staging", Some(75)).unwrap();
@@ -376,6 +387,7 @@ impl DeployTemplate {
             lease,
             health: self.health.clone(),
             rollback: self.rollback.clone(),
+            shadow: self.shadow.clone().filter(|s| s.enabled),
             steps,
         })
     }

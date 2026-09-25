@@ -1,4 +1,4 @@
-use super::adapter::Slot;
+use super::adapter::{FallbackSupport, Slot};
 use super::health::HealthBreach;
 use super::RolloutError;
 use crate::deploy::{DeployPlan, DeployStep};
@@ -91,6 +91,7 @@ impl RolloutState {
             (Step(_) | Baking { .. } | Halted, Step(0)) => true,
             (Baking { step, .. }, Step(m)) => *m == step + 1 && *m < steps,
             (Baking { step, .. }, Complete) => step + 1 == steps,
+            (Step(n), Complete) => n + 1 == steps,
             (Step(_) | Baking { .. }, RollingBack) => true,
             (RollingBack, RolledBack) => true,
             (Parked { resume_state, .. }, resumed) => **resume_state == *resumed,
@@ -126,6 +127,19 @@ pub struct RolloutRecord {
     pub previous_image: String,
     /// Slot the new image is deployed to, once it is.
     pub slot: Option<Slot>,
+    /// The slot a `Swap` step retired the previous image to; held until a
+    /// `Retire` step's `min_duration` (`rollback.retain_for`) elapses, so
+    /// `rollback_to` can restore it. Cleared once the slot is retired.
+    pub retained_slot: Option<Slot>,
+    /// When [`retained_slot`](Self::retained_slot) was set; the `Retire`
+    /// step parks until this plus its `min_duration` (`rollback.retain_for`)
+    /// elapses, rather than blocking the clock for the hold.
+    pub retained_since: Option<DateTime<Utc>>,
+    /// How faithfully the target honours the fallback policy installed on
+    /// the new slot for the duration of the rollout; `None` before it is
+    /// installed. `BestEffort` is worth surfacing to an operator: a `5xx`
+    /// may reach clients rather than being retried against the old slot.
+    pub fallback: Option<FallbackSupport>,
     /// Share of live traffic the new image serves right now.
     pub traffic_percent: u8,
     /// Current state.
@@ -155,6 +169,9 @@ impl RolloutRecord {
             image: image.to_string(),
             previous_image: previous_image.to_string(),
             slot: None,
+            retained_slot: None,
+            retained_since: None,
+            fallback: None,
             traffic_percent: 0,
             state: RolloutState::Pending,
             pr: None,
@@ -257,8 +274,16 @@ impl RolloutRecord {
 
     /// One-line summary for the CLI.
     pub fn summary(&self) -> String {
+        let retained = self
+            .retained_slot
+            .as_ref()
+            .map_or_else(String::new, |slot| format!("  retained: {slot}"));
+        let fallback = match self.fallback {
+            Some(FallbackSupport::BestEffort) => "  fallback: best-effort",
+            _ => "",
+        };
         format!(
-            "{}  {}  {} -> {}  traffic {}%  state: {}",
+            "{}  {}  {} -> {}  traffic {}%  state: {}{retained}{fallback}",
             self.id,
             self.plan.environment,
             self.previous_image,
@@ -353,6 +378,7 @@ pub(crate) mod tests {
                     (Step(_) | Baking { .. } | Halted, Step(0)) => true,
                     (Baking { step, .. }, Step(m)) => *m == step + 1,
                     (Baking { step, .. }, Complete) => *step == 2,
+                    (Step(n), Complete) => *n == 2,
                     (Step(_) | Baking { .. }, RollingBack) => true,
                     (RollingBack, RolledBack) => true,
                     (Parked { resume_state, .. }, to) => **resume_state == *to,
@@ -483,10 +509,25 @@ pub(crate) mod tests {
         assert_eq!(RolloutState::RolledBack.name(), "rolled-back");
         assert_eq!(RolloutState::Complete.name(), "complete");
         assert_eq!(RolloutState::Halted.name(), "halted");
-        let r = record("production");
+        let mut r = record("production");
         assert_eq!(
             r.summary(),
             "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending"
+        );
+        r.retained_slot = Some(Slot::new("slot-0"));
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0"
+        );
+        r.fallback = Some(FallbackSupport::Native);
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0"
+        );
+        r.fallback = Some(FallbackSupport::BestEffort);
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0  fallback: best-effort"
         );
     }
 
@@ -582,6 +623,7 @@ mod kani_proofs {
                 on_breach: crate::deploy::OnBreach::Rollback,
                 retain_for: chrono::Duration::zero(),
             },
+            shadow: None,
             steps,
         };
         let step: usize = kani::any();

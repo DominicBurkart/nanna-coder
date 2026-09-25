@@ -1,4 +1,6 @@
-use super::adapter::{AdapterError, AdapterOp, Slot, TargetAdapter};
+use super::adapter::{
+    AdapterError, AdapterOp, FallbackPolicy, FallbackSupport, Slot, Swapped, TargetAdapter,
+};
 use async_trait::async_trait;
 use std::process::Command;
 use std::sync::Arc;
@@ -39,10 +41,15 @@ impl CommandRunner for ProcessRunner {
 }
 
 /// Command templates for each adapter operation, whitespace-separated with
-/// `{image}`, `{slot}` and `{percent}` placeholders.
+/// `{image}`, `{slot}`, `{percent}`, `{retries}` and `{statuses}`
+/// placeholders.
 ///
 /// `deploy_inactive` must print the new slot's name; `current_image` must
-/// print the live image reference.
+/// print the live image reference; `swap` must print the new active slot
+/// and the retired candidate, in that order; `set_fallback` must print
+/// `native` or `best-effort`. The two fallback templates are optional: a
+/// provider without an edge retry leaves them unset and every rollout on
+/// it records its fallback as [`FallbackSupport::BestEffort`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerlessConfig {
     /// Template for [`TargetAdapter::deploy_inactive`].
@@ -55,10 +62,18 @@ pub struct ServerlessConfig {
     pub rollback_to: String,
     /// Template for [`TargetAdapter::retire`].
     pub retire: String,
+    /// Template for [`TargetAdapter::mirror`].
+    pub mirror: String,
+    /// Template for [`TargetAdapter::swap`].
+    pub swap: String,
+    /// Template for [`TargetAdapter::set_fallback`], when the provider has one.
+    pub set_fallback: Option<String>,
+    /// Template for [`TargetAdapter::clear_fallback`], when the provider has one.
+    pub clear_fallback: Option<String>,
 }
 
-/// Environment variables holding each template, in [`AdapterOp`] order.
-pub const SERVERLESS_ENV: [(&str, AdapterOp); 5] = [
+/// Environment variables holding each required template, in [`AdapterOp`] order.
+pub const SERVERLESS_ENV: [(&str, AdapterOp); 7] = [
     (
         "NANNA_SERVERLESS_DEPLOY_INACTIVE_CMD",
         AdapterOp::DeployInactive,
@@ -70,6 +85,17 @@ pub const SERVERLESS_ENV: [(&str, AdapterOp); 5] = [
     ),
     ("NANNA_SERVERLESS_ROLLBACK_TO_CMD", AdapterOp::RollbackTo),
     ("NANNA_SERVERLESS_RETIRE_CMD", AdapterOp::Retire),
+    ("NANNA_SERVERLESS_MIRROR_CMD", AdapterOp::Mirror),
+    ("NANNA_SERVERLESS_SWAP_CMD", AdapterOp::Swap),
+];
+
+/// Environment variables holding the optional fallback templates.
+pub const SERVERLESS_FALLBACK_ENV: [(&str, AdapterOp); 2] = [
+    ("NANNA_SERVERLESS_SET_FALLBACK_CMD", AdapterOp::SetFallback),
+    (
+        "NANNA_SERVERLESS_CLEAR_FALLBACK_CMD",
+        AdapterOp::ClearFallback,
+    ),
 ];
 
 impl ServerlessConfig {
@@ -78,8 +104,10 @@ impl ServerlessConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Build from `lookup`, which resolves each [`SERVERLESS_ENV`] name.
-    /// A missing or blank template is an error naming the operation.
+    /// Build from `lookup`, which resolves each [`SERVERLESS_ENV`] and
+    /// [`SERVERLESS_FALLBACK_ENV`] name. A missing or blank required
+    /// template is an error naming the operation; a missing or blank
+    /// fallback template means the provider has no edge retry.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, AdapterError> {
         let mut templates = Vec::with_capacity(SERVERLESS_ENV.len());
         for (name, op) in SERVERLESS_ENV {
@@ -89,13 +117,19 @@ impl ServerlessConfig {
             };
             templates.push(template);
         }
+        let [(set_fallback_name, _), (clear_fallback_name, _)] = SERVERLESS_FALLBACK_ENV;
+        let optional = |name: &str| lookup(name).filter(|t| !t.trim().is_empty());
         let mut templates = templates.into_iter();
         Ok(Self {
-            deploy_inactive: templates.next().expect("five templates"),
-            set_traffic: templates.next().expect("five templates"),
-            current_image: templates.next().expect("five templates"),
-            rollback_to: templates.next().expect("five templates"),
-            retire: templates.next().expect("five templates"),
+            deploy_inactive: templates.next().expect("seven templates"),
+            set_traffic: templates.next().expect("seven templates"),
+            current_image: templates.next().expect("seven templates"),
+            rollback_to: templates.next().expect("seven templates"),
+            retire: templates.next().expect("seven templates"),
+            mirror: templates.next().expect("seven templates"),
+            swap: templates.next().expect("seven templates"),
+            set_fallback: optional(set_fallback_name),
+            clear_fallback: optional(clear_fallback_name),
         })
     }
 }
@@ -104,7 +138,7 @@ impl ServerlessConfig {
 /// configured CLI, so no provider SDK enters the core crate.
 ///
 /// ```
-/// use harness::rollout::{CommandOutput, CommandRunner, ServerlessAdapter, ServerlessConfig, TargetAdapter};
+/// use harness::rollout::{CommandOutput, CommandRunner, FallbackPolicy, FallbackSupport, ServerlessAdapter, ServerlessConfig, TargetAdapter};
 /// use std::sync::{Arc, Mutex};
 ///
 /// struct Echo(Mutex<Vec<Vec<String>>>);
@@ -113,7 +147,8 @@ impl ServerlessConfig {
 ///         let mut line = vec![program.to_string()];
 ///         line.extend(args.iter().cloned());
 ///         self.0.lock().unwrap().push(line);
-///         Ok(CommandOutput { success: true, stdout: "green\n".into(), stderr: String::new() })
+///         let stdout = if args.first().map(String::as_str) == Some("swap") { "green blue\n" } else { "green\n" };
+///         Ok(CommandOutput { success: true, stdout: stdout.into(), stderr: String::new() })
 ///     }
 /// }
 ///
@@ -124,13 +159,22 @@ impl ServerlessConfig {
 ///     current_image: "cloudctl current-image".into(),
 ///     rollback_to: "cloudctl rollback {image}".into(),
 ///     retire: "cloudctl retire {slot}".into(),
+///     mirror: "cloudctl mirror {slot} {percent}".into(),
+///     swap: "cloudctl swap".into(),
+///     set_fallback: None,
+///     clear_fallback: None,
 /// };
 /// let runner = Arc::new(Echo(Mutex::new(Vec::new())));
 /// let adapter = ServerlessAdapter::new(config, runner.clone());
 /// let slot = adapter.deploy_inactive("registry.example.invalid/ns/app:v2").await.unwrap();
 /// assert_eq!(slot.name(), "green");
-/// adapter.set_traffic(&slot, 10).await.unwrap();
-/// assert_eq!(runner.0.lock().unwrap()[1], ["cloudctl", "traffic", "green", "10"]);
+/// adapter.mirror(&slot, 5).await.unwrap();
+/// assert_eq!(runner.0.lock().unwrap()[1], ["cloudctl", "mirror", "green", "5"]);
+/// let swapped = adapter.swap().await.unwrap();
+/// assert_eq!((swapped.active.name(), swapped.retired_candidate.name()), ("green", "blue"));
+/// let support = adapter.set_fallback(&slot, &FallbackPolicy::default()).await.unwrap();
+/// assert_eq!(support, FallbackSupport::BestEffort, "no fallback template: best effort");
+/// assert_eq!(runner.0.lock().unwrap().len(), 3);
 /// # });
 /// ```
 pub struct ServerlessAdapter {
@@ -144,15 +188,17 @@ impl ServerlessAdapter {
         Self { config, runner }
     }
 
-    /// Substitute the placeholders and split the template into arguments.
-    pub fn render(template: &str, image: &str, slot: &str, percent: u8) -> Vec<String> {
+    /// Substitute each `{name}` in `substitutions` and split the template
+    /// into arguments.
+    pub fn render(template: &str, substitutions: &[(&str, &str)]) -> Vec<String> {
         template
             .split_whitespace()
             .map(|token| {
-                token
-                    .replace("{image}", image)
-                    .replace("{slot}", slot)
-                    .replace("{percent}", &percent.to_string())
+                substitutions
+                    .iter()
+                    .fold(token.to_string(), |t, (name, value)| {
+                        t.replace(&format!("{{{name}}}"), value)
+                    })
             })
             .collect()
     }
@@ -161,11 +207,9 @@ impl ServerlessAdapter {
         &self,
         op: AdapterOp,
         template: &str,
-        image: &str,
-        slot: &str,
-        percent: u8,
+        substitutions: &[(&str, &str)],
     ) -> Result<String, AdapterError> {
-        let argv = Self::render(template, image, slot, percent);
+        let argv = Self::render(template, substitutions);
         let Some((program, args)) = argv.split_first() else {
             return Err(AdapterError {
                 op,
@@ -189,9 +233,9 @@ impl ServerlessAdapter {
         &self,
         op: AdapterOp,
         template: &str,
-        image: &str,
+        substitutions: &[(&str, &str)],
     ) -> Result<String, AdapterError> {
-        let out = self.invoke(op, template, image, "", 0)?;
+        let out = self.invoke(op, template, substitutions)?;
         if out.is_empty() {
             return Err(AdapterError {
                 op,
@@ -213,42 +257,92 @@ impl std::fmt::Debug for ServerlessAdapter {
 #[async_trait]
 impl TargetAdapter for ServerlessAdapter {
     async fn deploy_inactive(&self, image: &str) -> Result<Slot, AdapterError> {
+        let subs = [("image", image)];
         self.invoke_for_output(
             AdapterOp::DeployInactive,
             &self.config.deploy_inactive,
-            image,
+            &subs,
         )
         .map(Slot::new)
     }
 
     async fn set_traffic(&self, slot: &Slot, percent: u8) -> Result<(), AdapterError> {
-        self.invoke(
-            AdapterOp::SetTraffic,
-            &self.config.set_traffic,
-            "",
-            slot.name(),
-            percent,
-        )
-        .map(drop)
+        let percent = percent.to_string();
+        let subs = [("slot", slot.name()), ("percent", percent.as_str())];
+        self.invoke(AdapterOp::SetTraffic, &self.config.set_traffic, &subs)
+            .map(drop)
     }
 
     async fn current_image(&self) -> Result<String, AdapterError> {
-        self.invoke_for_output(AdapterOp::CurrentImage, &self.config.current_image, "")
+        self.invoke_for_output(AdapterOp::CurrentImage, &self.config.current_image, &[])
     }
 
     async fn rollback_to(&self, image: &str) -> Result<(), AdapterError> {
-        self.invoke(
-            AdapterOp::RollbackTo,
-            &self.config.rollback_to,
-            image,
-            "",
-            100,
-        )
-        .map(drop)
+        let subs = [("image", image), ("percent", "100")];
+        self.invoke(AdapterOp::RollbackTo, &self.config.rollback_to, &subs)
+            .map(drop)
     }
 
     async fn retire(&self, slot: &Slot) -> Result<(), AdapterError> {
-        self.invoke(AdapterOp::Retire, &self.config.retire, "", slot.name(), 0)
+        let subs = [("slot", slot.name())];
+        self.invoke(AdapterOp::Retire, &self.config.retire, &subs)
+            .map(drop)
+    }
+
+    async fn mirror(&self, slot: &Slot, percent: u8) -> Result<(), AdapterError> {
+        let percent = percent.to_string();
+        let subs = [("slot", slot.name()), ("percent", percent.as_str())];
+        self.invoke(AdapterOp::Mirror, &self.config.mirror, &subs)
+            .map(drop)
+    }
+
+    async fn swap(&self) -> Result<Swapped, AdapterError> {
+        let out = self.invoke_for_output(AdapterOp::Swap, &self.config.swap, &[])?;
+        let mut names = out.split_whitespace();
+        match (names.next(), names.next(), names.next()) {
+            (Some(active), Some(retired), None) => Ok(Swapped {
+                active: Slot::new(active),
+                retired_candidate: Slot::new(retired),
+            }),
+            _ => Err(AdapterError {
+                op: AdapterOp::Swap,
+                reason: format!("command must print `<active> <retired>`, got `{out}`"),
+            }),
+        }
+    }
+
+    async fn set_fallback(
+        &self,
+        slot: &Slot,
+        policy: &FallbackPolicy,
+    ) -> Result<FallbackSupport, AdapterError> {
+        let Some(template) = &self.config.set_fallback else {
+            return Ok(FallbackSupport::BestEffort);
+        };
+        let retries = policy.retries.to_string();
+        let statuses = format!("{}-{}", policy.status_min, policy.status_max);
+        let subs = [
+            ("slot", slot.name()),
+            ("retries", retries.as_str()),
+            ("statuses", statuses.as_str()),
+        ];
+        let out = self.invoke_for_output(AdapterOp::SetFallback, template, &subs)?;
+        match out.as_str() {
+            "native" => Ok(FallbackSupport::Native),
+            "best-effort" => Ok(FallbackSupport::BestEffort),
+            other => Err(AdapterError {
+                op: AdapterOp::SetFallback,
+                reason: format!("command must print `native` or `best-effort`, got `{other}`"),
+            }),
+        }
+    }
+
+    async fn clear_fallback(&self, slot: &Slot) -> Result<(), AdapterError> {
+        let Some(template) = &self.config.clear_fallback else {
+            return Ok(());
+        };
+        let subs = [("slot", slot.name())];
+        self.invoke(AdapterOp::ClearFallback, template, &subs)
             .map(drop)
     }
 }
@@ -280,8 +374,20 @@ mod tests {
             *self.reply.lock().unwrap() = reply;
         }
 
+        fn print(&self, stdout: &str) {
+            self.set(Ok(CommandOutput {
+                success: true,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            }));
+        }
+
         fn last(&self) -> Vec<String> {
             self.calls.lock().unwrap().last().cloned().unwrap()
+        }
+
+        fn count(&self) -> usize {
+            self.calls.lock().unwrap().len()
         }
     }
 
@@ -316,6 +422,19 @@ mod tests {
                 "NANNA_SERVERLESS_RETIRE_CMD",
                 "cloudctl retire {slot}".to_string(),
             ),
+            (
+                "NANNA_SERVERLESS_MIRROR_CMD",
+                "cloudctl mirror {slot} {percent}".to_string(),
+            ),
+            ("NANNA_SERVERLESS_SWAP_CMD", "cloudctl swap".to_string()),
+            (
+                "NANNA_SERVERLESS_SET_FALLBACK_CMD",
+                "cloudctl fallback {slot} --retries {retries} --on {statuses}".to_string(),
+            ),
+            (
+                "NANNA_SERVERLESS_CLEAR_FALLBACK_CMD",
+                "cloudctl fallback {slot} --off".to_string(),
+            ),
         ])
     }
 
@@ -324,8 +443,13 @@ mod tests {
     }
 
     #[test]
-    fn config_requires_every_template() {
+    fn config_requires_every_template_but_fallback() {
         assert_eq!(config().retire, "cloudctl retire {slot}");
+        assert_eq!(config().swap, "cloudctl swap");
+        assert_eq!(
+            config().set_fallback.as_deref(),
+            Some("cloudctl fallback {slot} --retries {retries} --on {statuses}")
+        );
         let mut partial = env();
         partial.insert("NANNA_SERVERLESS_ROLLBACK_TO_CMD", "  ".into());
         let err = ServerlessConfig::from_lookup(|name| partial.get(name).cloned()).unwrap_err();
@@ -334,16 +458,33 @@ mod tests {
             err.to_string(),
             "target adapter rollback_to failed: NANNA_SERVERLESS_ROLLBACK_TO_CMD is not set"
         );
+        let mut no_mirror = env();
+        no_mirror.remove("NANNA_SERVERLESS_MIRROR_CMD");
+        let err = ServerlessConfig::from_lookup(|name| no_mirror.get(name).cloned()).unwrap_err();
+        assert_eq!(err.op, AdapterOp::Mirror);
+        let mut no_fallback = env();
+        no_fallback.remove("NANNA_SERVERLESS_SET_FALLBACK_CMD");
+        no_fallback.insert("NANNA_SERVERLESS_CLEAR_FALLBACK_CMD", " ".into());
+        let config = ServerlessConfig::from_lookup(|name| no_fallback.get(name).cloned()).unwrap();
+        assert_eq!(config.set_fallback, None);
+        assert_eq!(config.clear_fallback, None);
         assert!(ServerlessConfig::from_env().is_err());
     }
 
     #[test]
     fn render_substitutes_every_placeholder() {
         assert_eq!(
-            ServerlessAdapter::render(" a  {image}/{slot}:{percent} ", "img", "s", 42),
+            ServerlessAdapter::render(
+                " a  {image}/{slot}:{percent} ",
+                &[("image", "img"), ("slot", "s"), ("percent", "42")]
+            ),
             ["a", "img/s:42"]
         );
-        assert!(ServerlessAdapter::render("", "i", "s", 0).is_empty());
+        assert_eq!(
+            ServerlessAdapter::render("{slot} {retries}", &[("slot", "s")]),
+            ["s", "{retries}"]
+        );
+        assert!(ServerlessAdapter::render("", &[("image", "i")]).is_empty());
     }
 
     #[tokio::test]
@@ -356,12 +497,91 @@ mod tests {
         assert_eq!(runner.last(), ["cloudctl", "deploy", "--image", "app:v2"]);
         adapter.set_traffic(&slot, 25).await.unwrap();
         assert_eq!(runner.last(), ["cloudctl", "traffic", "green", "25"]);
+        adapter.split(&slot, 30).await.unwrap();
+        assert_eq!(runner.last(), ["cloudctl", "traffic", "green", "30"]);
         assert_eq!(adapter.current_image().await.unwrap(), "green");
         assert_eq!(runner.last(), ["cloudctl", "current"]);
         adapter.rollback_to("app:v1").await.unwrap();
         assert_eq!(runner.last(), ["cloudctl", "rollback", "app:v1"]);
         adapter.retire(&slot).await.unwrap();
         assert_eq!(runner.last(), ["cloudctl", "retire", "green"]);
+        adapter.mirror(&slot, 7).await.unwrap();
+        assert_eq!(runner.last(), ["cloudctl", "mirror", "green", "7"]);
+        adapter.clear_fallback(&slot).await.unwrap();
+        assert_eq!(runner.last(), ["cloudctl", "fallback", "green", "--off"]);
+    }
+
+    #[tokio::test]
+    async fn swap_parses_the_active_and_retired_slots() {
+        let runner = Scripted::ok("green blue\n");
+        let adapter = ServerlessAdapter::new(config(), runner.clone());
+        let swapped = adapter.swap().await.unwrap();
+        assert_eq!(runner.last(), ["cloudctl", "swap"]);
+        assert_eq!(swapped.active, Slot::new("green"));
+        assert_eq!(swapped.retired_candidate, Slot::new("blue"));
+        runner.print("green\n");
+        let err = adapter.swap().await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "target adapter swap failed: command must print `<active> <retired>`, got `green`"
+        );
+        runner.print("a b c\n");
+        assert!(adapter.swap().await.is_err());
+        runner.print("");
+        assert_eq!(
+            adapter.swap().await.unwrap_err().to_string(),
+            "target adapter swap failed: command printed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_reports_support_and_is_best_effort_without_a_template() {
+        let runner = Scripted::ok("native\n");
+        let adapter = ServerlessAdapter::new(config(), runner.clone());
+        let slot = Slot::new("green");
+        let policy = FallbackPolicy::default();
+        assert_eq!(
+            adapter.set_fallback(&slot, &policy).await.unwrap(),
+            FallbackSupport::Native
+        );
+        assert_eq!(
+            runner.last(),
+            [
+                "cloudctl",
+                "fallback",
+                "green",
+                "--retries",
+                "1",
+                "--on",
+                "500-599"
+            ]
+        );
+        runner.print("best-effort");
+        assert_eq!(
+            adapter.set_fallback(&slot, &policy).await.unwrap(),
+            FallbackSupport::BestEffort
+        );
+        runner.print("maybe");
+        assert_eq!(
+            adapter.set_fallback(&slot, &policy).await.unwrap_err().to_string(),
+            "target adapter set_fallback failed: command must print `native` or `best-effort`, got `maybe`"
+        );
+        runner.print("");
+        assert_eq!(
+            adapter.set_fallback(&slot, &policy).await.unwrap_err().op,
+            AdapterOp::SetFallback
+        );
+        let mut without = config();
+        without.set_fallback = None;
+        without.clear_fallback = None;
+        let adapter = ServerlessAdapter::new(without, runner.clone());
+        let before = runner.count();
+        assert_eq!(
+            adapter.set_fallback(&slot, &policy).await.unwrap(),
+            FallbackSupport::BestEffort
+        );
+        adapter.clear_fallback(&slot).await.unwrap();
+        assert_eq!(runner.count(), before, "no template, no command");
     }
 
     #[tokio::test]
@@ -390,6 +610,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "target adapter rollback_to failed: spawn failed"
+        );
+        assert_eq!(
+            adapter.mirror(&Slot::new("g"), 1).await.unwrap_err().op,
+            AdapterOp::Mirror
+        );
+        assert_eq!(
+            adapter
+                .clear_fallback(&Slot::new("g"))
+                .await
+                .unwrap_err()
+                .op,
+            AdapterOp::ClearFallback
         );
         let mut empty = config();
         empty.retire = " ".into();

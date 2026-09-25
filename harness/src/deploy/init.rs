@@ -23,7 +23,7 @@ pub fn starter_template(class: RiskClass) -> String {
         RiskClass::Core => ("gradual", "[1, 5, 10, 25, 50, 75, 100]", "1d"),
     };
     format!(
-        "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\", \"staging\", \"production\"]\n\n[risk]\nclass = \"{class}\"\n\n[rollout]\nstrategy = \"{strategy}\"\nsteps = {steps}\nmin_step_duration = \"{min_step_duration}\"\nwindows = \"business-hours\"\n\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"30m\"\n\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"1d\"\n\n[shadow]\nenabled = false\nmirror_percent = 0\ncompare = [\"status\", \"latency\"]\n"
+        "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\", \"staging\", \"production\"]\n\n[risk]\nclass = \"{class}\"\n\n[rollout]\nstrategy = \"{strategy}\"\nsteps = {steps}\nmin_step_duration = \"{min_step_duration}\"\nwindows = \"business-hours\"\n\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"30m\"\n\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"1d\"\n\n[shadow]\nenabled = false\nmirror_percent = 0\ncompare = [\"status\", \"latency\"]\nmax_divergence = 0.05\n"
     )
 }
 
