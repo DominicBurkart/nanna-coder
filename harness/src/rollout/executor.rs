@@ -1,4 +1,4 @@
-use super::adapter::{FakeAdapter, TargetAdapter};
+use super::adapter::{FakeAdapter, FallbackPolicy, TargetAdapter};
 use super::health::{check_health, FakeHealthSource, HealthBreach, HealthSource};
 use super::hooks::{AuditHook, EscalationHook, LogEscalation, NoAudit, RolloutEscalation};
 use super::log::RolloutLog;
@@ -207,11 +207,13 @@ impl RolloutExecutor {
         next.transition(RolloutState::Step(0), self.clock.now())?;
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.clear_fallback(slot).await?;
             self.adapter.retire(slot).await?;
         }
         next.image = image.to_string();
         next.pr = Some(pr.to_string());
         next.slot = None;
+        next.fallback = None;
         next.traffic_percent = 0;
         next.breach = None;
         self.log.append(Some(&record.state), &next)?;
@@ -316,6 +318,11 @@ impl RolloutExecutor {
             None if n == 0 => {
                 let slot = self.adapter.deploy_inactive(&record.image).await?;
                 record.slot = Some(slot.clone());
+                let support = self
+                    .adapter
+                    .set_fallback(&slot, &FallbackPolicy::default())
+                    .await?;
+                record.fallback = Some(support);
                 self.log.append(Some(&record.state), &record)?;
                 slot
             }
@@ -410,6 +417,9 @@ impl RolloutExecutor {
         if n + 1 < record.plan.steps.len() {
             return self.persist(&mut record, RolloutState::Step(n + 1));
         }
+        if let Some(slot) = record.slot.clone() {
+            self.adapter.clear_fallback(&slot).await?;
+        }
         self.persist(&mut record, RolloutState::Complete)?;
         self.leases.release_all(&record.id)?;
         Ok(())
@@ -448,6 +458,7 @@ impl RolloutExecutor {
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.clear_fallback(slot).await?;
         }
         self.adapter.rollback_to(&record.previous_image).await?;
         record.set_traffic(0)?;
@@ -495,7 +506,7 @@ mod tests {
     use super::*;
     use crate::deploy::{DeployTemplate, ShadowCompare};
     use crate::leases::{LeaseName, SimulatedClock};
-    use crate::rollout::adapter::{AdapterCall, AdapterOp, Slot};
+    use crate::rollout::adapter::{AdapterCall, AdapterOp, FallbackPolicy, FallbackSupport, Slot};
     use crate::rollout::health::{HealthError, HealthObservation, HealthSample, HealthThreshold};
     use crate::rollout::hooks::{RecordingAudit, RecordingEscalation};
     use crate::rollout::shadow::ShadowSample;
@@ -606,16 +617,20 @@ mod tests {
         assert_eq!(done.slot, Some(slot.clone()));
         assert_eq!(rig.adapter.current(), V2);
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
+        let policy = FallbackPolicy::default();
         assert_eq!(
             rig.adapter.calls(),
             vec![
                 AdapterCall::CurrentImage,
                 AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(slot.clone(), policy),
                 AdapterCall::SetTraffic(slot.clone(), 10),
                 AdapterCall::SetTraffic(slot.clone(), 50),
                 AdapterCall::SetTraffic(slot.clone(), 100),
+                AdapterCall::ClearFallback(slot.clone()),
             ]
         );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
         assert_eq!(
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
@@ -647,7 +662,11 @@ mod tests {
         assert_eq!(rig.adapter.traffic(&slot), Some(0));
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
         let calls = rig.adapter.calls();
-        assert_eq!(calls[calls.len() - 2], AdapterCall::SetTraffic(slot, 0));
+        assert_eq!(
+            calls[calls.len() - 3],
+            AdapterCall::SetTraffic(slot.clone(), 0)
+        );
+        assert_eq!(calls[calls.len() - 2], AdapterCall::ClearFallback(slot));
         assert_eq!(calls[calls.len() - 1], AdapterCall::RollbackTo(V1.into()));
         assert!(states(&rig.executor, &record.id).ends_with(&[
             "baking".into(),
@@ -869,9 +888,11 @@ mod tests {
         assert_eq!(forwarded.slot, None);
         assert_eq!(forwarded.traffic_percent, 0);
         assert_eq!(forwarded.breach, None);
+        assert_eq!(forwarded.fallback, None);
         let old = Slot::new("slot-1");
         assert!(rig.adapter.calls().ends_with(&[
             AdapterCall::SetTraffic(old.clone(), 0),
+            AdapterCall::ClearFallback(old.clone()),
             AdapterCall::Retire(old.clone())
         ]));
         let done = rig.executor.run(&record.id).await.unwrap();
@@ -1049,6 +1070,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn best_effort_fallback_is_recorded_and_shown_in_status() {
+        let rig = rig();
+        rig.adapter
+            .set_fallback_support(FallbackSupport::BestEffort);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.fallback, Some(FallbackSupport::BestEffort));
+        assert!(done.summary().ends_with("fallback: best-effort"));
+    }
+
+    #[tokio::test]
     async fn adapter_failures_surface_and_the_next_run_retries_the_step() {
         let rig = rig();
         rig.adapter.fail(AdapterOp::DeployInactive);
@@ -1117,7 +1150,8 @@ mod tests {
             RolloutState::RolledBack
         );
         assert!(rig.adapter.calls().ends_with(&[
-            AdapterCall::SetTraffic(slot, 0),
+            AdapterCall::SetTraffic(slot.clone(), 0),
+            AdapterCall::ClearFallback(slot),
             AdapterCall::RollbackTo(V1.into())
         ]));
     }
@@ -1204,10 +1238,13 @@ mod tests {
             vec![
                 AdapterCall::CurrentImage,
                 AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(new.clone(), FallbackPolicy::default()),
                 AdapterCall::Swap,
                 AdapterCall::Retire(old.clone()),
+                AdapterCall::ClearFallback(new.clone()),
             ]
         );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
         assert_eq!(
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "complete"]
@@ -1275,11 +1312,14 @@ mod tests {
             vec![
                 AdapterCall::CurrentImage,
                 AdapterCall::DeployInactive(V2.into()),
+                AdapterCall::SetFallback(slot.clone(), FallbackPolicy::default()),
                 AdapterCall::Mirror(slot.clone(), 15),
                 AdapterCall::SetTraffic(slot.clone(), 50),
                 AdapterCall::SetTraffic(slot.clone(), 100),
+                AdapterCall::ClearFallback(slot.clone()),
             ]
         );
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
         assert_eq!(
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]

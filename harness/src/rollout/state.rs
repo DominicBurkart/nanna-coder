@@ -1,4 +1,4 @@
-use super::adapter::Slot;
+use super::adapter::{FallbackSupport, Slot};
 use super::health::HealthBreach;
 use super::RolloutError;
 use crate::deploy::{DeployPlan, DeployStep};
@@ -130,6 +130,11 @@ pub struct RolloutRecord {
     /// `Retire` step's `min_duration` (`rollback.retain_for`) elapses, so
     /// `rollback_to` can restore it.
     pub retained_slot: Option<Slot>,
+    /// How faithfully the target honours the fallback policy installed on
+    /// the new slot for the duration of the rollout; `None` before it is
+    /// installed. `BestEffort` is worth surfacing to an operator: a `5xx`
+    /// may reach clients rather than being retried against the old slot.
+    pub fallback: Option<FallbackSupport>,
     /// Share of live traffic the new image serves right now.
     pub traffic_percent: u8,
     /// Current state.
@@ -160,6 +165,7 @@ impl RolloutRecord {
             previous_image: previous_image.to_string(),
             slot: None,
             retained_slot: None,
+            fallback: None,
             traffic_percent: 0,
             state: RolloutState::Pending,
             pr: None,
@@ -266,8 +272,12 @@ impl RolloutRecord {
             .retained_slot
             .as_ref()
             .map_or_else(String::new, |slot| format!("  retained: {slot}"));
+        let fallback = match self.fallback {
+            Some(FallbackSupport::BestEffort) => "  fallback: best-effort",
+            _ => "",
+        };
         format!(
-            "{}  {}  {} -> {}  traffic {}%  state: {}{retained}",
+            "{}  {}  {} -> {}  traffic {}%  state: {}{retained}{fallback}",
             self.id,
             self.plan.environment,
             self.previous_image,
@@ -501,6 +511,16 @@ pub(crate) mod tests {
         assert_eq!(
             r.summary(),
             "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0"
+        );
+        r.fallback = Some(FallbackSupport::Native);
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0"
+        );
+        r.fallback = Some(FallbackSupport::BestEffort);
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0  fallback: best-effort"
         );
     }
 
