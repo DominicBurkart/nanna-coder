@@ -117,6 +117,7 @@
             (pkgs.lib.hasSuffix "\.rs" path) ||
             (pkgs.lib.hasSuffix "\.toml" path) ||
             (pkgs.lib.hasSuffix "\.lock" path) ||
+            (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
             (type == "directory");
         };
 
@@ -301,6 +302,7 @@
               (pkgs.lib.hasSuffix "\.rs" path) ||
               (pkgs.lib.hasSuffix "\.toml" path) ||
               (pkgs.lib.hasSuffix "\.lock" path) ||
+              (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
               (type == "directory");
           };
 
