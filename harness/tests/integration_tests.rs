@@ -312,6 +312,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
         health_check_timeout: Duration::from_secs(10),
         env_vars: vec![],
         additional_args: vec![],
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     // Start container with smart fallback
@@ -727,6 +728,7 @@ async fn test_container_configuration() {
             ("ANOTHER_VAR".to_string(), "another_value".to_string()),
         ],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     assert_eq!(custom_config.base_image, "custom/image:latest");
@@ -769,6 +771,7 @@ async fn test_e2e_container_to_validated_inference() {
         health_check_timeout: HEALTH_CHECK_TIMEOUT,
         env_vars: vec![("OLLAMA_MODELS".to_string(), "/models".to_string())],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1057,6 +1060,7 @@ async fn test_e2e_multi_model_comparison() {
             health_check_timeout: HEALTH_CHECK_TIMEOUT,
             env_vars: vec![],
             additional_args: vec![],
+            network: harness::container::NetworkPolicy::Enabled,
         };
 
         let _container_handle = match start_container_with_fallback(&config).await {
@@ -1173,6 +1177,7 @@ async fn test_e2e_performance_and_reliability() {
             ("OLLAMA_MAX_LOADED_MODELS".to_string(), "1".to_string()),
         ],
         additional_args: vec!["--memory".to_string(), "4g".to_string()],
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1761,6 +1766,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         health_check_timeout: HEALTH_CHECK_TIMEOUT,
         env_vars: vec![],
         additional_args: vec![],
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let container_handle = match start_container_with_fallback(&config).await {

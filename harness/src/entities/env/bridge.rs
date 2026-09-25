@@ -78,6 +78,7 @@ mod tests {
                 ("DB_URL".to_string(), "postgres://...".to_string()),
             ],
             additional_args: Vec::new(),
+            network: crate::container::NetworkPolicy::Enabled,
         }
     }
 
