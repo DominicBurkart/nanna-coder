@@ -7,6 +7,7 @@ pub mod browser;
 pub mod cdp;
 pub mod manifest;
 pub mod summary;
+pub mod tools;
 
 pub use artifacts::{
     next_index, write_json, QaArtifacts, ARTIFACT_DIR, BROWSER_PREFIX, BROWSER_REPORT_FILE,
@@ -28,3 +29,7 @@ pub use manifest::{
     DEFAULT_EXPECTED_STATUS, DEFAULT_PROBE_TIMEOUT_SECS, SNIPPET_CHARS,
 };
 pub use summary::{QaLedger, QaSummary};
+pub use tools::{
+    register_qa_tools, workspace_file, QaBrowserTool, QaContext, QaEndpointsTool, QaError,
+    MANIFEST_SOURCE_DERIVED, MANIFEST_SOURCE_REPO, QA_BROWSER_TOOL, QA_ENDPOINTS_TOOL,
+};
