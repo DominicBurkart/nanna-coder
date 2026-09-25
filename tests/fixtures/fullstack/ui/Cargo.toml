@@ -1,0 +1,16 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "dioxus web frontend of the full-stack fixture, built with trunk"
+
+[[bin]]
+name = "ui"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+shared = { workspace = true }
