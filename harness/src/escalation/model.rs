@@ -273,9 +273,18 @@ impl Escalation {
         format!("{}:{}:{}", self.source, self.repo, self.hash())
     }
 
-    /// First line of the summary, cut to [`HEADLINE_CHARS`] characters.
+    /// First line of the summary, redacted and cut to [`HEADLINE_CHARS`]
+    /// characters.
+    ///
+    /// Redaction runs before truncation: cutting first could split a secret
+    /// so neither half is long enough to match a pattern, leaking a
+    /// fragment. This is itself an outgoing string (used directly to build
+    /// [`crate::escalation::IncidentHold`], and by every caller of
+    /// [`Escalation::title`]), so it carries the same "redacted before it
+    /// leaves" guarantee `title` and `body` do.
     pub fn headline(&self) -> String {
-        let line = self.summary.lines().next().unwrap_or("").trim();
+        let redacted = redact(&self.summary);
+        let line = redacted.lines().next().unwrap_or("").trim();
         let mut head: String = line.chars().take(HEADLINE_CHARS).collect();
         if line.chars().count() > HEADLINE_CHARS {
             head.push('…');
@@ -457,6 +466,18 @@ mod tests {
             Escalation::new(Severity::Info, EscalationSource::Manual, "r", "").headline(),
             ""
         );
+    }
+
+    #[test]
+    fn headline_redacts_before_truncating_so_a_split_secret_cannot_leak_a_fragment() {
+        let prefix = "x".repeat(HEADLINE_CHARS - 11);
+        let summary = format!("{prefix} ghp_abcdefghijklmnopqrstuvwxyz0123456789 tail");
+        let e = Escalation::new(Severity::Info, EscalationSource::Manual, "r", &summary);
+        let headline = e.headline();
+        assert!(!headline.contains("ghp_"), "{headline}");
+        assert!(headline.contains("<redacted:"), "{headline}");
+        let title = e.title();
+        assert!(!title.contains("ghp_"), "{title}");
     }
 
     #[test]

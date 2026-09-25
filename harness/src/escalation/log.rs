@@ -521,6 +521,28 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_in_the_summary_never_reaches_the_hold() {
+        let log = EscalationLog::in_memory();
+        let leaky = Escalation::new(
+            Severity::Incident,
+            EscalationSource::Incident,
+            "example/repo",
+            "rollout halted; push used ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        )
+        .with_id("inc-leak");
+        let hold = log.hold(&leaky, t0()).unwrap();
+        assert!(!hold.summary.contains("ghp_"), "{}", hold.summary);
+        assert!(
+            hold.summary.contains("<redacted:github-token>"),
+            "{}",
+            hold.summary
+        );
+        let json = log.snapshot(t0()).to_json();
+        let rendered = json.to_string();
+        assert!(!rendered.contains("ghp_"), "{rendered}");
+    }
+
+    #[test]
     fn jsonl_round_trip_replays_and_compacts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("escalations.jsonl");
