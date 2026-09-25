@@ -30,8 +30,8 @@ pub use adapter::{
 };
 pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
 pub use health::{
-    check_health, FakeHealthSource, HealthBreach, HealthError, HealthObservation, HealthSample,
-    HealthSource, HealthThreshold,
+    check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
+    HealthSample, HealthSource, HealthThreshold, EVIDENCE_CAP,
 };
 pub use hooks::{
     AuditDenied, AuditHook, EscalationHook, LogEscalation, NoAudit, RecordingAudit,

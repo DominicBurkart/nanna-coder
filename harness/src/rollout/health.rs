@@ -81,6 +81,42 @@ pub enum HealthObservation {
     ShadowDivergence(f64),
 }
 
+/// One endpoint's status at the moment of a [`HealthBreach`], kept as
+/// evidence for whoever investigates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceSample {
+    /// Endpoint path probed.
+    pub endpoint: String,
+    /// Status it answered with.
+    pub status: u16,
+}
+
+/// How many [`EvidenceSample`]s a breach carries at most.
+pub const EVIDENCE_CAP: usize = 3;
+
+/// The worst-offending endpoints in `sample`, at most `cap`: every
+/// non-`2xx` status, worst status first, ties broken by endpoint name for
+/// a deterministic order (`endpoint_statuses` is a `BTreeMap`, so this is
+/// stable across calls).
+pub(crate) fn worst_endpoints(sample: &HealthSample, cap: usize) -> Vec<EvidenceSample> {
+    let mut offenders: Vec<EvidenceSample> = sample
+        .endpoint_statuses
+        .iter()
+        .filter(|(_, status)| !(200..300).contains(*status))
+        .map(|(endpoint, status)| EvidenceSample {
+            endpoint: endpoint.clone(),
+            status: *status,
+        })
+        .collect();
+    offenders.sort_by(|a, b| {
+        b.status
+            .cmp(&a.status)
+            .then_with(|| a.endpoint.cmp(&b.endpoint))
+    });
+    offenders.truncate(cap);
+    offenders
+}
+
 /// A health gate breached during step `step`; what `[rollback].on_breach`
 /// acts on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +127,13 @@ pub struct HealthBreach {
     pub observed: HealthObservation,
     /// Plan step during which it happened.
     pub step: usize,
+    /// A few of the worst-offending endpoint statuses observed alongside
+    /// the breach, for an incident responder to inspect without a second
+    /// round trip. Empty for a shadow-divergence breach, which has no
+    /// endpoint identity to attach. `#[serde(default)]` so a rollout log
+    /// line written before this field existed still deserialises.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceSample>,
 }
 
 impl fmt::Display for HealthBreach {
@@ -139,11 +182,13 @@ impl fmt::Display for HealthBreach {
 /// assert_eq!(breach.step, 2);
 /// ```
 pub fn check_health(health: &Health, sample: &HealthSample, step: usize) -> Option<HealthBreach> {
+    let evidence = worst_endpoints(sample, EVIDENCE_CAP);
     if sample.error_rate > health.error_rate_max {
         return Some(HealthBreach {
             threshold: HealthThreshold::ErrorRateMax(health.error_rate_max),
             observed: HealthObservation::ErrorRate(sample.error_rate),
             step,
+            evidence,
         });
     }
     if sample.p99_latency_ms > health.latency_p99_max_ms {
@@ -151,6 +196,7 @@ pub fn check_health(health: &Health, sample: &HealthSample, step: usize) -> Opti
             threshold: HealthThreshold::LatencyP99MaxMs(health.latency_p99_max_ms),
             observed: HealthObservation::LatencyP99Ms(sample.p99_latency_ms),
             step,
+            evidence,
         });
     }
     for endpoint in &health.endpoints {
@@ -163,6 +209,7 @@ pub fn check_health(health: &Health, sample: &HealthSample, step: usize) -> Opti
             threshold: HealthThreshold::EndpointOk(endpoint.clone()),
             observed,
             step,
+            evidence,
         });
     }
     None
@@ -300,6 +347,44 @@ mod tests {
         );
         let json = serde_json::to_string(&breach).unwrap();
         assert_eq!(serde_json::from_str::<HealthBreach>(&json).unwrap(), breach);
+    }
+
+    #[test]
+    fn breach_evidence_carries_the_worst_offending_endpoints_capped_and_ordered() {
+        let h = health();
+        let mut sample = HealthSample::healthy(&h.endpoints);
+        sample.error_rate = 0.5;
+        sample.endpoint_statuses.insert("/ready".into(), 503);
+        sample.endpoint_statuses.insert("/metrics".into(), 500);
+        sample.endpoint_statuses.insert("/version".into(), 429);
+        let breach = check_health(&h, &sample, 1).unwrap();
+        assert_eq!(
+            breach.evidence,
+            vec![
+                EvidenceSample {
+                    endpoint: "/ready".into(),
+                    status: 503
+                },
+                EvidenceSample {
+                    endpoint: "/metrics".into(),
+                    status: 500
+                },
+                EvidenceSample {
+                    endpoint: "/version".into(),
+                    status: 429
+                },
+            ]
+        );
+        assert_eq!(worst_endpoints(&sample, 3).len(), EVIDENCE_CAP);
+        assert!(worst_endpoints(&HealthSample::healthy(&h.endpoints), 3).is_empty());
+    }
+
+    #[test]
+    fn breach_evidence_defaults_when_missing_from_an_older_log_line() {
+        let json =
+            r#"{"threshold":{"error_rate_max":0.01},"observed":{"error_rate":0.5},"step":0}"#;
+        let breach: HealthBreach = serde_json::from_str(json).unwrap();
+        assert!(breach.evidence.is_empty());
     }
 
     #[tokio::test]
