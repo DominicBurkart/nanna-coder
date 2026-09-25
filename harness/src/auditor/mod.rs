@@ -16,13 +16,13 @@
 //! manager. Every verdict is appended to an [`AuditLog`] and every
 //! escalation is handed to a [`SpawnEscalationHook`].
 
-mod context;
+pub(crate) mod context;
 mod gate;
 mod llm;
 mod log;
 mod record;
 mod request;
-mod rules;
+pub(crate) mod rules;
 mod verdict;
 
 pub use context::AuditContext;
