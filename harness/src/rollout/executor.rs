@@ -52,7 +52,7 @@ impl Default for RolloutConfig {
 /// .unwrap()
 /// .plan("sandbox")
 /// .unwrap();
-/// let (executor, adapter, _health, _shadow) = fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
+/// let (executor, adapter, _health, _shadow, _clock) = fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
 /// let record = executor.start(plan, "registry.example.invalid/ns/app:v2").await.unwrap();
 /// let done = executor.run(&record.id).await.unwrap();
 /// assert_eq!(done.state, RolloutState::Complete);
@@ -76,7 +76,7 @@ pub struct RolloutExecutor {
 /// An executor over in-memory leases, a simulated clock started now, a
 /// [`FakeAdapter`] serving `current_image`, a healthy [`FakeHealthSource`]
 /// for `endpoints` and a [`FakeShadowSource`] whose mirrored pairs always
-/// agree: the `--fake` dry run.
+/// agree: the `--fake` dry run. The returned clock drives [`run_simulated`].
 pub fn fake_executor(
     log: RolloutLog,
     windows: WindowSet,
@@ -87,16 +87,72 @@ pub fn fake_executor(
     Arc<FakeAdapter>,
     Arc<FakeHealthSource>,
     Arc<FakeShadowSource>,
+    Arc<SimulatedClock>,
 ) {
     let adapter = Arc::new(FakeAdapter::new(current_image));
     let health = Arc::new(FakeHealthSource::healthy(endpoints));
     let shadow = Arc::new(FakeShadowSource::agreeing(1));
     let clock = Arc::new(SimulatedClock::new(Utc::now()));
     let leases = Arc::new(InMemoryLeaseStore::default());
-    let executor =
-        RolloutExecutor::new(log, leases, windows, clock, adapter.clone(), health.clone())
-            .with_shadow_source(shadow.clone());
-    (executor, adapter, health, shadow)
+    let executor = RolloutExecutor::new(
+        log,
+        leases,
+        windows,
+        clock.clone(),
+        adapter.clone(),
+        health.clone(),
+    )
+    .with_shadow_source(shadow.clone());
+    (executor, adapter, health, shadow, clock)
+}
+
+/// Drive `id` to a non-parked state on `clock`, advancing it past every
+/// `Parked { until, .. }` in between and collecting each intermediate
+/// record along the way.
+///
+/// A rollout parks only on a precondition that is not yet met (a window,
+/// a contended lease, or a `Retire` step's `rollback.retain_for`); on a
+/// [`SimulatedClock`] there is nothing else that would make it become met
+/// on its own, so this always terminates: [`RolloutExecutor::run`] only
+/// returns a `Parked` record when `now < until`, and this advances the
+/// clock to exactly `until` before running again.
+///
+/// ```
+/// use harness::deploy::DeployTemplate;
+/// use harness::rollout::{fake_executor, run_simulated, RolloutLog, RolloutState};
+/// use harness::windows::WindowSet;
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let dir = tempfile::tempdir().unwrap();
+/// let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+/// let plan = DeployTemplate::parse(
+///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n",
+/// )
+/// .unwrap()
+/// .plan("sandbox")
+/// .unwrap();
+/// let (executor, _adapter, _health, _shadow, clock) =
+///     fake_executor(log, WindowSet::default(), "registry.example.invalid/ns/app:v1", &[]);
+/// let record = executor.start(plan, "registry.example.invalid/ns/app:v2").await.unwrap();
+/// let steps = run_simulated(&executor, &clock, &record.id).await.unwrap();
+/// assert!(matches!(steps[0].state, RolloutState::Parked { .. }));
+/// assert_eq!(steps.last().unwrap().state, RolloutState::Complete);
+/// # });
+/// ```
+pub async fn run_simulated(
+    executor: &RolloutExecutor,
+    clock: &SimulatedClock,
+    id: &str,
+) -> Result<Vec<RolloutRecord>, RolloutError> {
+    let mut records = Vec::new();
+    let mut record = executor.run(id).await?;
+    while let RolloutState::Parked { until, .. } = record.state {
+        records.push(record);
+        clock.advance(until - clock.now());
+        record = executor.run(id).await?;
+    }
+    records.push(record);
+    Ok(records)
 }
 
 impl RolloutExecutor {
@@ -350,7 +406,7 @@ impl RolloutExecutor {
                 let swapped = self.adapter.swap().await?;
                 record.slot = Some(swapped.active);
                 record.retained_slot = Some(swapped.retired_candidate);
-                record.retained_since = Some(now);
+                record.retained_since = Some(self.clock.now());
             }
             StepKind::Retire => {
                 let (retained, retained_since) =
@@ -363,6 +419,7 @@ impl RolloutExecutor {
                     self.leases.release_all(&record.id)?;
                     return self.park(record, ready_at);
                 }
+                self.adapter.clear_fallback(&retained).await?;
                 self.adapter.retire(&retained).await?;
                 record.retained_slot = None;
                 record.retained_since = None;
@@ -481,6 +538,9 @@ impl RolloutExecutor {
     }
 
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
+        if let Some(retained) = &record.retained_slot {
+            self.adapter.set_traffic(retained, 100).await?;
+        }
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
             self.adapter.mirror(slot, 0).await?;
@@ -488,6 +548,8 @@ impl RolloutExecutor {
         }
         self.adapter.rollback_to(&record.previous_image).await?;
         record.set_traffic(0)?;
+        record.retained_slot = None;
+        record.retained_since = None;
         self.persist(&mut record, RolloutState::RolledBack)?;
         self.leases.release_all(&record.id)?;
         Ok(())
@@ -1296,6 +1358,7 @@ mod tests {
                 AdapterCall::DeployInactive(V2.into()),
                 AdapterCall::SetFallback(new.clone(), FallbackPolicy::default()),
                 AdapterCall::Swap,
+                AdapterCall::ClearFallback(old.clone()),
                 AdapterCall::Retire(old.clone()),
                 AdapterCall::ClearFallback(new.clone()),
             ]
@@ -1311,6 +1374,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_simulated_drives_blue_green_through_the_park_to_completion() {
+        let rig = rig();
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let start = rig.clock.now();
+        let steps = run_simulated(&rig.executor, &rig.clock, &record.id)
+            .await
+            .unwrap();
+        let states: Vec<&'static str> = steps.iter().map(|r| r.state.name()).collect();
+        assert_eq!(states, ["parked", "complete"]);
+        assert_eq!(steps[0].retained_slot, Some(Slot::new("slot-0")));
+        assert_eq!(steps[1].retained_slot, None);
+        assert_eq!(
+            rig.clock.now(),
+            start + Duration::days(2),
+            "retain_for is measured from the swap, not from the swap step's own hold"
+        );
+        let history = rig.executor.log().history(&record.id).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|t| t.summary().contains("retained: slot-0")),
+            "{history:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn rollback_after_swap_restores_the_retained_slot() {
         let rig = rig();
         rig.health.push(breach_sample());
@@ -1322,11 +1413,7 @@ mod tests {
         assert_eq!(done.breach.as_ref().unwrap().step, 0);
         let old = Slot::new("slot-0");
         let new = Slot::new("slot-1");
-        assert_eq!(
-            done.retained_slot,
-            Some(old.clone()),
-            "still tracked; never retired"
-        );
+        assert_eq!(done.retained_slot, None, "cleared on rollback");
         assert_eq!(rig.adapter.current(), V1);
         assert_eq!(rig.adapter.active(), old);
         assert_eq!(rig.adapter.traffic(&old), Some(100));
@@ -1337,6 +1424,19 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, AdapterCall::Retire(_))));
+        let calls = rig.adapter.calls();
+        let restore = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(old.clone(), 100))
+            .unwrap();
+        let drain = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(new.clone(), 0))
+            .unwrap();
+        assert!(
+            restore < drain,
+            "the retained slot is restored before the bad one is drained"
+        );
     }
 
     #[tokio::test]
@@ -1411,6 +1511,7 @@ mod tests {
         let slot = Slot::new("slot-1");
         assert_eq!(done.slot, Some(slot.clone()));
         assert_eq!(rig.adapter.current(), V2);
+        assert_eq!(rig.adapter.active(), slot, "the 100% step cuts over live");
         assert_eq!(
             rig.adapter.mirrored(&slot),
             Some(0),
@@ -1540,7 +1641,7 @@ mod tests {
     async fn list_orders_by_creation_and_fake_executor_dry_runs() {
         let dir = tempfile::tempdir().unwrap();
         let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
-        let (executor, adapter, health, _shadow) =
+        let (executor, adapter, health, _shadow, _clock) =
             fake_executor(log, WindowSet::default(), V1, &["/health/v1".to_string()]);
         let first = executor.start(plan("sandbox"), V2).await.unwrap();
         let second = executor.start(plan("sandbox"), V3).await.unwrap();
