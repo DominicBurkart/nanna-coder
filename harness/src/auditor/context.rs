@@ -47,11 +47,13 @@ use std::sync::Arc;
 pub struct AuditContext {
     catalog: Arc<IdentityCatalog>,
     auditor: AgentIdentity,
+    auditor_prompt: String,
     repo_profile: Option<String>,
 }
 
 impl AuditContext {
-    /// Build a context over `catalog` for `auditor`, which must be inert.
+    /// Build a context over `catalog` for `auditor`, which must be inert and
+    /// whose system prompt must resolve.
     pub fn new(
         catalog: impl Into<Arc<IdentityCatalog>>,
         auditor: AgentIdentity,
@@ -71,9 +73,11 @@ impl AuditContext {
             );
             return Err(AuditError::AuditorNotInert { name, reason });
         }
+        let auditor_prompt = auditor.system_prompt_text()?;
         Ok(Self {
             catalog: catalog.into(),
             auditor,
+            auditor_prompt,
             repo_profile: None,
         })
     }
@@ -122,6 +126,11 @@ impl AuditContext {
         &self.auditor
     }
 
+    /// The auditor identity's resolved system prompt.
+    pub fn auditor_prompt(&self) -> &str {
+        &self.auditor_prompt
+    }
+
     /// The repository summary, if one was attached.
     pub fn repo_profile(&self) -> Option<&str> {
         self.repo_profile.as_deref()
@@ -165,6 +174,10 @@ max_concurrent = 4
     fn inert_auditor_is_accepted() {
         let context = context().with_repo_profile("a rust monorepo");
         assert_eq!(context.auditor().name(), "auditor");
+        assert_eq!(
+            context.auditor_prompt(),
+            "You are the auditor. Find the flaw in every spawn."
+        );
         assert_eq!(context.repo_profile(), Some("a rust monorepo"));
         assert!(context.catalog().is_empty());
     }
@@ -175,6 +188,19 @@ max_concurrent = 4
         let auditor = AgentIdentity::from_toml_str(&toml, "auditor.toml").unwrap();
         let err = AuditContext::new(IdentityCatalog::default(), auditor).unwrap_err();
         assert_eq!(err.to_string(), "auditor identity `auditor` is not inert: scope.max_effect is `workspace`, expected `none`");
+    }
+
+    #[test]
+    fn auditor_prompt_must_resolve() {
+        let toml = AUDITOR_TOML.replace(
+            "system_prompt = { inline = \"You are the auditor. Find the flaw in every spawn.\" }",
+            "system_prompt = \"prompts/missing.md\"",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = AgentIdentity::from_toml_str(&toml, dir.path().join("auditor.toml")).unwrap();
+        let err = AuditContext::new(IdentityCatalog::default(), auditor).unwrap_err();
+        assert!(matches!(err, AuditError::Identity(_)), "{err}");
+        assert!(err.to_string().contains("missing.md"), "{err}");
     }
 
     #[test]

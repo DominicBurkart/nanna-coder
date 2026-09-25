@@ -17,12 +17,14 @@
 //! escalation is handed to a [`SpawnEscalationHook`].
 
 mod context;
+mod llm;
 mod record;
 mod request;
 mod rules;
 mod verdict;
 
 pub use context::AuditContext;
+pub use llm::{ModelAuditor, AUDITOR_FRAMING, OUTPUT_CONTRACT, SUBTASK_CLOSE, SUBTASK_OPEN};
 pub use record::{content_hash, AuditOutcome, AuditRecord};
 pub use request::{SpawnRequest, TaskSummary};
 pub use rules::{RuleAuditor, RULE_AUDITOR_NAME};
@@ -31,6 +33,7 @@ pub use verdict::{
     VerdictKind,
 };
 
+use crate::identity::IdentityError;
 use async_trait::async_trait;
 use model::ModelError;
 use thiserror::Error;
@@ -46,6 +49,9 @@ pub enum AuditError {
         /// Which field grants it effects.
         reason: String,
     },
+    /// The auditor's own identity could not be resolved.
+    #[error("auditor identity: {0}")]
+    Identity(#[from] IdentityError),
     /// The model behind a [`ModelAuditor`] failed.
     #[error("auditor model call failed: {0}")]
     Model(#[from] ModelError),
