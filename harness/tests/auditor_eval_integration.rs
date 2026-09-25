@@ -19,7 +19,7 @@ fn resolve_model() -> Option<String> {
 }
 
 #[tokio::test]
-#[ignore] // requires Ollama instance and NANNA_EVAL_MODEL
+#[ignore = "requires a reachable Ollama instance and NANNA_EVAL_MODEL"]
 async fn model_auditor_scores_the_shipped_cases() {
     let Some(model) = resolve_model() else {
         eprintln!("model_auditor_scores_the_shipped_cases: NANNA_EVAL_MODEL not set; skipping");

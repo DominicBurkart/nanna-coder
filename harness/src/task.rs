@@ -4,7 +4,7 @@ use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
-use crate::identity::{AgentIdentity, IdentityCatalog};
+use crate::identity::AgentIdentity;
 use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
 use chrono::{DateTime, Utc};
@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
@@ -64,15 +63,6 @@ fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
 
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
-
-/// Why [`TaskManager::submit_spawn`] could not start an audited spawn.
-#[derive(Debug, Error)]
-pub enum SpawnSubmitError {
-    /// The audited request names an identity absent from the catalog
-    /// passed to `submit_spawn`.
-    #[error("audited identity `{0}` is not in the catalog passed to submit_spawn")]
-    UnknownIdentity(String),
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
@@ -393,42 +383,32 @@ impl TaskManager {
     /// The only entry point a planner (#640) may use: `allowed` can only
     /// have been produced by [`crate::auditor::Gate::check`], so a spawn
     /// that an [`Auditor`](crate::auditor::Auditor) blocked or escalated can
-    /// never reach this function. The identity named in the audited request
-    /// is looked up in `catalog` (the same catalog the auditor consulted)
-    /// and run exactly as [`TaskManager::submit_with_identity`] runs an
-    /// explicit identity; the subtask text becomes the task description.
-    ///
-    /// Returns [`SpawnSubmitError::UnknownIdentity`] when `catalog` does not
-    /// contain the audited identity, which only happens when the caller
-    /// passes a different catalog than the one the request was audited
-    /// against.
+    /// never reach this function. `allowed` carries both the audited
+    /// request and the exact identity it was audited against, so this
+    /// always runs under that identity's scope, exactly as
+    /// [`TaskManager::submit_with_identity`] runs an explicit identity; the
+    /// subtask text becomes the task description.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_spawn(
         &self,
         allowed: Allowed,
-        catalog: &IdentityCatalog,
         repo_path: PathBuf,
         branch: String,
         model: String,
         max_iterations: usize,
         provider: Arc<dyn ModelProvider>,
-    ) -> Result<TaskId, SpawnSubmitError> {
-        let request = allowed.into_request();
-        let identity = catalog
-            .get(&request.identity)
-            .cloned()
-            .ok_or_else(|| SpawnSubmitError::UnknownIdentity(request.identity.clone()))?;
-        Ok(self
-            .submit_with_identity(
-                request.subtask,
-                repo_path,
-                branch,
-                model,
-                max_iterations,
-                provider,
-                Some(identity),
-            )
-            .await)
+    ) -> TaskId {
+        let (request, identity) = allowed.into_parts();
+        self.submit_with_identity(
+            request.subtask,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            provider,
+            Some(identity),
+        )
+        .await
     }
 
     /// Submit a task that, when `identity` is present, runs under that
@@ -1772,51 +1752,6 @@ mod tests {
         let repo_dir = tempfile::tempdir().unwrap();
         init_test_git_repo(repo_dir.path());
 
-        let identity_catalog = catalog(true);
-        let audit_context =
-            AuditContext::new(identity_catalog.clone(), auditor_identity()).unwrap();
-        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
-        let request = SpawnRequest {
-            parent_task: TaskSummary::new("parent-1", "Fix bug X", "github.com/example/repo"),
-            identity: "rust-implementer".to_string(),
-            subtask: "Add a regression test.".to_string(),
-            dev_loop: DevLoop::Inner,
-            requested_effect: EffectClass::Workspace,
-        };
-        let allowed = gate.check(request, &audit_context).await.unwrap();
-
-        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(
-            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
-        );
-        let task_id = manager
-            .submit_spawn(
-                allowed,
-                &identity_catalog,
-                repo_dir.path().to_path_buf(),
-                "HEAD".to_string(),
-                "mock".to_string(),
-                20,
-                provider,
-            )
-            .await
-            .unwrap();
-
-        let status = wait_for_terminal(&manager, &task_id).await;
-        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
-        let task = manager.poll(&task_id).await.unwrap();
-        assert_eq!(task.description, "Add a regression test.");
-    }
-
-    #[tokio::test]
-    async fn test_submit_spawn_rejects_a_catalog_missing_the_audited_identity() {
-        use crate::auditor::context::tests::auditor_identity;
-        use crate::auditor::rules::tests::catalog;
-        use crate::auditor::{
-            AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary,
-        };
-        use crate::identity::DevLoop;
-
         let audit_context = AuditContext::new(catalog(true), auditor_identity()).unwrap();
         let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
         let request = SpawnRequest {
@@ -1827,26 +1762,27 @@ mod tests {
             requested_effect: EffectClass::Workspace,
         };
         let allowed = gate.check(request, &audit_context).await.unwrap();
+        assert_eq!(allowed.identity().name(), "rust-implementer");
 
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
-        let empty_catalog = crate::identity::IdentityCatalog::default();
-        let err = manager
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
+        );
+        let task_id = manager
             .submit_spawn(
                 allowed,
-                &empty_catalog,
-                PathBuf::from("/does-not-matter"),
+                repo_dir.path().to_path_buf(),
                 "HEAD".to_string(),
                 "mock".to_string(),
                 20,
                 provider,
             )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "audited identity `rust-implementer` is not in the catalog passed to submit_spawn"
-        );
+            .await;
+
+        let status = wait_for_terminal(&manager, &task_id).await;
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.description, "Add a regression test.");
     }
 
     #[tokio::test]

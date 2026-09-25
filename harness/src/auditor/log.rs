@@ -65,8 +65,8 @@ enum Backing {
 /// assert_eq!(entries[0].request, request);
 /// assert!(entries[0].verdict.is_allow());
 ///
-/// // A fresh handle on the same path sees the appended entry.
-/// assert_eq!(AuditLog::file(dir.path().join("audit.jsonl")).entries().unwrap().len(), 1);
+/// let fresh_handle_on_the_same_path = AuditLog::file(dir.path().join("audit.jsonl"));
+/// assert_eq!(fresh_handle_on_the_same_path.entries().unwrap().len(), 1);
 /// ```
 #[derive(Clone)]
 pub struct AuditLog {
