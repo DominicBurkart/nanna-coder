@@ -99,7 +99,7 @@ impl Check {
                     return Err("contains= needs a non-empty text".to_string());
                 }
                 check.contains = Some(text.to_string());
-                break;
+                return Ok(check);
             }
             let (option, tail) = match rest.find(char::is_whitespace) {
                 Some(i) => (&rest[..i], rest[i..].trim_start()),
@@ -182,6 +182,12 @@ impl Manifest {
 
     /// The manifest used when a repository has none: the health path, the
     /// index page and every static asset root, without duplicates.
+    ///
+    /// An asset root is a directory (`trunk_asset_roots` returns the
+    /// directory of each absolute reference, not a file inside it), so a
+    /// server that 404s directory listings will fail this check even when
+    /// the assets themselves are fine; a repository that hits this should
+    /// write a `CHECKS` manifest naming actual files instead.
     ///
     /// ```
     /// use harness::qa::manifest::Manifest;
@@ -381,6 +387,61 @@ pub fn snippet(body: &str) -> String {
     collapsed.join(" ").chars().take(SNIPPET_CHARS).collect()
 }
 
+/// Static asset roots referenced by the frontend's `index.html`: the
+/// directory of every absolute `href=`/`src=` attribute (`link`, `script`,
+/// `img`), deduplicated and sorted. Trunk-injected assets such as the wasm
+/// bundle are relative and so never appear here; this only catches
+/// hand-written absolute references to a static directory. Returns an
+/// empty list when `frontend_dir` has no `index.html`.
+///
+/// ```
+/// use harness::qa::manifest::trunk_asset_roots;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// std::fs::write(
+///     dir.path().join("index.html"),
+///     r#"<link rel="icon" href="/static/favicon.ico"><script src="/static/js/app.js"></script>"#,
+/// )
+/// .unwrap();
+/// assert_eq!(trunk_asset_roots(dir.path()).unwrap(), vec!["/static/", "/static/js/"]
+///     .into_iter().map(str::to_string).collect::<Vec<_>>());
+/// ```
+pub fn trunk_asset_roots(frontend_dir: &Path) -> std::io::Result<Vec<String>> {
+    let path = frontend_dir.join("index.html");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let html = std::fs::read_to_string(&path)?;
+    let mut roots: Vec<String> = asset_references(&html)
+        .filter_map(|reference| asset_root(&reference))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn asset_references(html: &str) -> impl Iterator<Item = String> + '_ {
+    ["href=\"", "src=\""].into_iter().flat_map(move |marker| {
+        html.match_indices(marker).filter_map(move |(index, _)| {
+            let start = index + marker.len();
+            let rest = &html[start..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+    })
+}
+
+fn asset_root(reference: &str) -> Option<String> {
+    if !reference.starts_with('/') {
+        return None;
+    }
+    let end = reference.rfind('/')? + 1;
+    if end <= 1 {
+        return None;
+    }
+    Some(reference[..end].to_string())
+}
+
 /// Judge `response` against `check`.
 pub fn evaluate(
     check: &Check,
@@ -532,6 +593,41 @@ mod tests {
         let paths: Vec<&str> = manifest.checks.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["/", "/health/v1", "/api/v1/greeting"]);
         assert!(manifest.checks.iter().all(|c| c.expect == 200));
+    }
+
+    #[test]
+    fn trunk_asset_roots_collects_absolute_href_and_src_directories() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<html><head>
+<link data-trunk rel="rust" data-bin="ui" />
+<link rel="icon" href="/static/favicon.ico">
+<script src="/static/js/app.js"></script>
+<script src="/static/js/vendor.js"></script>
+<img src="/img/logo.png">
+<a href="relative/page.html">no</a>
+<a href="/">root, no directory</a>
+</head><body></body></html>"#,
+        )
+        .unwrap();
+        let roots = trunk_asset_roots(dir.path()).unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                "/img/".to_string(),
+                "/static/".to_string(),
+                "/static/js/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn trunk_asset_roots_is_empty_without_an_index_or_absolute_references() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(trunk_asset_roots(dir.path()).unwrap(), Vec::<String>::new());
+        std::fs::write(dir.path().join("index.html"), "<html><body></body></html>").unwrap();
+        assert_eq!(trunk_asset_roots(dir.path()).unwrap(), Vec::<String>::new());
     }
 
     #[test]

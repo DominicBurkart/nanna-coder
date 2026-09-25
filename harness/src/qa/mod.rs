@@ -24,8 +24,8 @@ pub use cdp::{
     ConsoleError, PipeTransport, ProcessSpawner, TransportSpawner, MESSAGE_TERMINATOR,
 };
 pub use manifest::{
-    evaluate, join_url, snippet, Check, CheckResult, ContainerProbe, HttpProbe, Manifest,
-    ManifestChecker, ManifestError, ManifestReport, ProbeError, ProbeResponse,
+    evaluate, join_url, snippet, trunk_asset_roots, Check, CheckResult, ContainerProbe, HttpProbe,
+    Manifest, ManifestChecker, ManifestError, ManifestReport, ProbeError, ProbeResponse,
     DEFAULT_EXPECTED_STATUS, DEFAULT_PROBE_TIMEOUT_SECS, SNIPPET_CHARS,
 };
 pub use summary::{QaLedger, QaSummary};
