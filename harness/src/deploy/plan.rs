@@ -1,12 +1,14 @@
-use super::template::{DeployTemplate, RiskClass, Strategy};
+use super::template::{DeployTemplate, Health, RiskClass, Rollback, Strategy};
 use super::{DeployError, PRODUCTION_ENV};
 use chrono::Duration;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 use std::path::Path;
 
 /// Something that must hold before a step may start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Precondition {
     /// The named availability window must be open.
     WindowOpen(String),
@@ -37,7 +39,8 @@ impl fmt::Display for Precondition {
 }
 
 /// What a step does to the target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepKind {
     /// Route `traffic_percent` of live traffic to the new version.
     Traffic,
@@ -65,7 +68,7 @@ impl StepKind {
 }
 
 /// One ordered step of a [`DeployPlan`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployStep {
     /// Position in the plan, starting at 0.
     pub index: usize,
@@ -107,7 +110,7 @@ impl DeployStep {
 }
 
 /// The ordered steps a rollout executor performs for one environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployPlan {
     /// Environment the plan targets.
     pub environment: String,
@@ -119,6 +122,10 @@ pub struct DeployPlan {
     pub strategy: Strategy,
     /// Coordination lease every step requires, `deploy:<repo>:<env>`.
     pub lease: String,
+    /// Health gates polled while a step bakes, when the template has `[health]`.
+    pub health: Option<Health>,
+    /// What a health breach triggers.
+    pub rollback: Rollback,
     /// Steps in execution order.
     pub steps: Vec<DeployStep>,
 }
@@ -200,6 +207,7 @@ impl DeployPlan {
             "risk_class": self.risk_class.name(),
             "strategy": self.strategy.name(),
             "lease": self.lease,
+            "on_breach": self.rollback.on_breach.name(),
             "total_min_duration_seconds": self.total_min_duration().num_seconds(),
             "steps": self.steps.iter().map(DeployStep::to_json).collect::<Vec<_>>(),
         })
@@ -366,6 +374,8 @@ impl DeployTemplate {
             risk_class,
             strategy: self.rollout.strategy,
             lease,
+            health: self.health.clone(),
+            rollback: self.rollback.clone(),
             steps,
         })
     }
@@ -374,6 +384,7 @@ impl DeployTemplate {
 #[cfg(test)]
 mod tests {
     use super::super::template::tests::FIXTURE;
+    use super::super::template::OnBreach;
     use super::super::validate::{min_span, min_steps, strategy_allowed};
     use super::*;
     use proptest::prelude::{any, prop_assert, prop_assert_eq, proptest, Strategy as _};
@@ -433,6 +444,37 @@ mod tests {
             plan.total_min_duration(),
             Duration::hours(25) + Duration::minutes(30)
         );
+    }
+
+    #[test]
+    fn plan_round_trips_through_serde_and_carries_health_and_rollback() {
+        let plan = DeployTemplate::parse(FIXTURE)
+            .unwrap()
+            .plan("production")
+            .unwrap();
+        let health = plan.health.as_ref().unwrap();
+        assert_eq!(health.endpoints, ["/health/v1"]);
+        assert_eq!(health.latency_p99_max_ms, 800);
+        assert_eq!(plan.rollback.on_breach, OnBreach::Rollback);
+        assert!(plan.rollback.automatic);
+        assert_eq!(plan.to_json()["on_breach"], "rollback");
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: DeployPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plan);
+        assert!(json.contains("\"window_open\":\"business-hours\""));
+        assert!(json.contains("\"health_ok\""));
+        let shadow = template(
+            "edge",
+            "shadow-then-gradual",
+            "[10, 50, 100]",
+            "8h",
+            "[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\"]\n",
+        )
+        .plan("production")
+        .unwrap();
+        let json = serde_json::to_string(&shadow).unwrap();
+        assert!(json.contains("\"kind\":{\"shadow\":{\"mirror_percent\":5}}"));
+        assert_eq!(serde_json::from_str::<DeployPlan>(&json).unwrap(), shadow);
     }
 
     #[test]
