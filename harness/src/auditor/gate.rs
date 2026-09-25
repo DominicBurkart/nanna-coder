@@ -2,8 +2,8 @@
 //! [`Auditor`], log the outcome, and let anything but `Allow` refuse it.
 
 use super::{
-    AuditContext, AuditError, AuditLog, AuditRecord, Auditor, CardSuggestion, Reason, SpawnRequest,
-    SpawnVerdict,
+    AuditContext, AuditError, AuditLog, AuditOutcome, AuditRecord, Auditor, CardSuggestion, Reason,
+    SpawnRequest, SpawnVerdict, VerdictKind,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -195,35 +195,44 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
         request: SpawnRequest,
         context: &AuditContext,
     ) -> Result<Allowed, Refused> {
-        let outcome = self
-            .auditor
-            .audit_spawn(&request, context)
-            .await
-            .map_err(Refused::AuditFailed)?;
+        let audited = self.auditor.audit_spawn(&request, context).await;
+        let outcome = audited.map_err(Refused::AuditFailed)?;
         let _ = self.log.append(&request, &outcome);
-        match outcome.verdict {
-            SpawnVerdict::Allow => Ok(Allowed::new(request)),
-            SpawnVerdict::Block { reasons } => Err(Refused::Verdict {
-                verdict: SpawnVerdict::block(reasons),
-                record: outcome.record,
-            }),
-            SpawnVerdict::Escalate {
-                reasons,
-                suggested_identity_change,
-            } => {
-                let escalation = SpawnEscalation {
-                    request,
-                    reasons: reasons.clone(),
-                    suggested_identity_change: suggested_identity_change.clone(),
-                    record: outcome.record.clone(),
-                };
-                self.hook.on_escalate(&escalation).await;
-                Err(Refused::Verdict {
-                    verdict: SpawnVerdict::escalate(reasons, suggested_identity_change),
-                    record: outcome.record,
-                })
-            }
+        self.settle(request, outcome).await
+    }
+
+    async fn settle(
+        &self,
+        request: SpawnRequest,
+        outcome: AuditOutcome,
+    ) -> Result<Allowed, Refused> {
+        let AuditOutcome { verdict, record } = outcome;
+        if verdict.is_allow() {
+            return Ok(Allowed::new(request));
         }
+        if verdict.kind() == VerdictKind::Escalate {
+            self.notify_escalation(&request, &verdict, &record).await;
+        }
+        Err(Refused::Verdict { verdict, record })
+    }
+
+    async fn notify_escalation(
+        &self,
+        request: &SpawnRequest,
+        verdict: &SpawnVerdict,
+        record: &AuditRecord,
+    ) {
+        let suggestion = match verdict.suggestion() {
+            Some(suggestion) => suggestion,
+            None => unreachable!("escalate always has a suggestion"),
+        };
+        let escalation = SpawnEscalation {
+            request: request.clone(),
+            reasons: verdict.reasons().to_vec(),
+            suggested_identity_change: suggestion.clone(),
+            record: record.clone(),
+        };
+        self.hook.on_escalate(&escalation).await;
     }
 }
 

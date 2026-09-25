@@ -9,7 +9,7 @@ use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
 use async_trait::async_trait;
 use regex::{Regex, RegexBuilder};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// Name the rule auditor records against its verdicts.
 pub const RULE_AUDITOR_NAME: &str = "rule-auditor";
@@ -21,7 +21,7 @@ struct Pattern {
 }
 
 impl Pattern {
-    const fn new(label: &'static str, source: &'static str) -> Self {
+    fn new(label: &'static str, source: &'static str) -> Self {
         Self {
             label,
             source,
@@ -44,53 +44,63 @@ impl Pattern {
     }
 }
 
-static INJECTION_PATTERNS: [Pattern; 7] = [
-    Pattern::new(
-        "ignore previous instructions",
-        r"\b(ignore|disregard|forget)\b[^.\n]{0,24}\b(previous|prior|above|earlier|preceding|original|system)\b[^.\n]{0,16}\b(instructions?|prompts?|rules|guidance|guidelines|constraints)\b",
-    ),
-    Pattern::new(
-        "role override",
-        r"\b(you are now|you are no longer|from now on,? you|pretend (that )?you are|pretend to be|act as (if you were|though you are)|your new (role|identity|persona) is)\b",
-    ),
-    Pattern::new(
-        "new system prompt",
-        r"\b(new|updated|revised|real|actual) (system )?(prompt|instructions)\b",
-    ),
-    Pattern::new(
-        "chat template marker",
-        r"(<\|im_start\|>|<\|system\|>|\[INST\]|<<SYS>>|<\|start_header_id\|>)",
-    ),
-    Pattern::new(
-        "role label",
-        r"^\s*(system|assistant|developer|human|user)\s*:",
-    ),
-    Pattern::new(
-        "embedded tool call",
-        r#""(tool_calls|function_call)"\s*:|\{\s*"(name|function|tool)"\s*:\s*"[^"]+"\s*,\s*"(arguments|parameters|input)"\s*:"#,
-    ),
-    Pattern::new(
-        "auditor instruction",
-        r"\b(auditor|reviewer|gate)\b[^.\n]{0,40}\b(allow|approve|pass|skip|bypass)\b|\b(pre-?approved|already approved|already reviewed)\b|(respond|reply|answer|output|return)\s+(with\s+)?(only\s+)?[{\x22]?\s*\x22?verdict\x22?\s*:?\s*\x22?allow",
-    ),
-];
+static INJECTION_PATTERNS: LazyLock<[Pattern; 7]> = LazyLock::new(|| {
+    [
+        Pattern::new(
+            "ignore previous instructions",
+            r"\b(ignore|disregard|forget)\b[^.\n]{0,24}\b(previous|prior|above|earlier|preceding|original|system)\b[^.\n]{0,16}\b(instructions?|prompts?|rules|guidance|guidelines|constraints)\b",
+        ),
+        Pattern::new(
+            "role override",
+            r"\b(you are now|you are no longer|from now on,? you|pretend (that )?you are|pretend to be|act as (if you were|though you are)|your new (role|identity|persona) is)\b",
+        ),
+        Pattern::new(
+            "new system prompt",
+            r"\b(new|updated|revised|real|actual) (system )?(prompt|instructions)\b",
+        ),
+        Pattern::new(
+            "chat template marker",
+            r"(<\|im_start\|>|<\|system\|>|\[INST\]|<<SYS>>|<\|start_header_id\|>)",
+        ),
+        Pattern::new(
+            "role label",
+            r"^\s*(system|assistant|developer|human|user)\s*:",
+        ),
+        Pattern::new(
+            "embedded tool call",
+            r#""(tool_calls|function_call)"\s*:|\{\s*"(name|function|tool)"\s*:\s*"[^"]+"\s*,\s*"(arguments|parameters|input)"\s*:"#,
+        ),
+        Pattern::new(
+            "auditor instruction",
+            r"\b(auditor|reviewer|gate)\b[^.\n]{0,40}\b(allow|approve|pass|skip|bypass)\b|\b(pre-?approved|already approved|already reviewed)\b|(respond|reply|answer|output|return)\s+(with\s+)?(only\s+)?[{\x22]?\s*\x22?verdict\x22?\s*:?\s*\x22?allow",
+        ),
+    ]
+});
 
-static DEPLOY_VERB: Pattern = Pattern::new(
-    "deploy verb",
-    r"\b(deploy(s|ed|ing|ment)?|roll ?(s|ed|ing)? ?out|rollout|promote(s|d)? to|release(s|d)? to|hotfix (in|to))\b",
-);
-static PRODUCTION_TARGET: Pattern = Pattern::new(
-    "production target",
-    r"\b(prod|production|live traffic|live environment|all users|customers)\b",
-);
-static CI_TRIGGER: Pattern = Pattern::new(
-    "ci trigger",
-    r"\b(trigger|run|kick off|launch|start|re-?run|dispatch)\b[^.\n]{0,24}\b(ci|pipeline|workflow run|github actions|the (full )?matrix|nightly)\b",
-);
-static REPOSITORY_WRITE: Pattern = Pattern::new(
-    "repository write",
-    r"\b(push(es|ed|ing)?|force-?push)\b[^.\n]{0,30}\b(branch|origin|remote|upstream|main|master|github)\b|\b(open|create|raise|file|submit)\b[^.\n]{0,12}\b(pull request|pr|draft pr|issue|release tag)\b|\bmerge\b[^.\n]{0,16}\b(pull request|pr|branch|into main)\b|\btag (a |the )?release\b",
-);
+static DEPLOY_VERB: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::new(
+        "deploy verb",
+        r"\b(deploy(s|ed|ing|ment)?|roll ?(s|ed|ing)? ?out|rollout|promote(s|d)? to|release(s|d)? to|hotfix (in|to))\b",
+    )
+});
+static PRODUCTION_TARGET: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::new(
+        "production target",
+        r"\b(prod|production|live traffic|live environment|all users|customers)\b",
+    )
+});
+static CI_TRIGGER: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::new(
+        "ci trigger",
+        r"\b(trigger|run|kick off|launch|start|re-?run|dispatch)\b[^.\n]{0,24}\b(ci|pipeline|workflow run|github actions|the (full )?matrix|nightly)\b",
+    )
+});
+static REPOSITORY_WRITE: LazyLock<Pattern> = LazyLock::new(|| {
+    Pattern::new(
+        "repository write",
+        r"\b(push(es|ed|ing)?|force-?push)\b[^.\n]{0,30}\b(branch|origin|remote|upstream|main|master|github)\b|\b(open|create|raise|file|submit)\b[^.\n]{0,12}\b(pull request|pr|draft pr|issue|release tag)\b|\bmerge\b[^.\n]{0,16}\b(pull request|pr|branch|into main)\b|\btag (a |the )?release\b",
+    )
+});
 
 /// Cheap, deterministic review used by unit tests, the eval runner and as
 /// the first pass of [`ModelAuditor`](super::ModelAuditor).

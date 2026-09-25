@@ -59,18 +59,14 @@ impl AuditContext {
         auditor: AgentIdentity,
     ) -> Result<Self, AuditError> {
         let name = auditor.name().to_string();
-        if auditor.scope.max_effect != EffectClass::None {
-            let reason = format!(
-                "scope.max_effect is `{}`, expected `none`",
-                auditor.scope.max_effect
-            );
+        let ceiling = auditor.scope.max_effect;
+        let tool_count = auditor.scope.tools.len();
+        if ceiling != EffectClass::None {
+            let reason = format!("scope.max_effect is `{ceiling}`, expected `none`");
             return Err(AuditError::AuditorNotInert { name, reason });
         }
-        if !auditor.scope.tools.is_empty() {
-            let reason = format!(
-                "scope.tools grants {} tool pattern(s), expected none",
-                auditor.scope.tools.len()
-            );
+        if tool_count != 0 {
+            let reason = format!("scope.tools grants {tool_count} tool pattern(s), expected none");
             return Err(AuditError::AuditorNotInert { name, reason });
         }
         let auditor_prompt = auditor.system_prompt_text()?;
