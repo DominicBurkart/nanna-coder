@@ -54,6 +54,20 @@ pub struct RolloutTransition {
     pub record: RolloutRecord,
 }
 
+impl RolloutTransition {
+    /// One line for the CLI: when, from which state, to which, at what traffic.
+    pub fn summary(&self) -> String {
+        let from = self
+            .from
+            .as_ref()
+            .map_or_else(|| "created".to_string(), ToString::to_string);
+        format!(
+            "{}  {from} -> {}  traffic {}%",
+            self.at, self.record.state, self.record.traffic_percent
+        )
+    }
+}
+
 /// Append-only JSON Lines log of rollout transitions: one
 /// [`RolloutTransition`] per line. The latest line per id is the rollout's
 /// current record, which is what a restarted executor resumes from.
@@ -164,6 +178,22 @@ impl RolloutLog {
             .remove(id)
             .ok_or_else(|| RolloutError::UnknownRollout(id.to_string()))
     }
+
+    /// Kill switch: record rollout `id` as `Halted` at `now`, holding its
+    /// traffic split. Needs no adapter, so the CLI can do it from any
+    /// process; a running executor notices at its next poll.
+    pub fn halt(&self, id: &str, now: DateTime<Utc>) -> Result<RolloutRecord, RolloutError> {
+        let mut record = self.load(id)?;
+        let from = record.state.clone();
+        record.transition(RolloutState::Halted, now)?;
+        self.append(Some(&from), &record)?;
+        tracing::warn!(
+            rollout = id,
+            traffic = record.traffic_percent,
+            "Rollout halted by operator"
+        );
+        Ok(record)
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +232,38 @@ mod tests {
             reopened.load("rollout-3").unwrap_err().to_string(),
             "unknown rollout `rollout-3`"
         );
+    }
+
+    #[test]
+    fn halt_holds_any_live_rollout_and_refuses_terminal_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        let mut r = record("sandbox");
+        r.state = RolloutState::Step(1);
+        r.traffic_percent = 10;
+        log.append(None, &r).unwrap();
+        let later = t0() + chrono::Duration::minutes(5);
+        let halted = log.halt("rollout-1", later).unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 10);
+        assert_eq!(halted.updated_at, later);
+        let history = log.history("rollout-1").unwrap();
+        assert_eq!(
+            history[1].summary(),
+            format!("{later}  step 1 -> halted  traffic 10%")
+        );
+        assert_eq!(
+            history[0].summary(),
+            format!("{}  created -> step 1  traffic 10%", t0())
+        );
+        assert!(matches!(
+            log.halt("rollout-1", later).unwrap_err(),
+            RolloutError::InvalidTransition { .. }
+        ));
+        assert!(matches!(
+            log.halt("rollout-2", later).unwrap_err(),
+            RolloutError::UnknownRollout(_)
+        ));
     }
 
     #[test]

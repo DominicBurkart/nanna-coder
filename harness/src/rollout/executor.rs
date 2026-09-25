@@ -166,18 +166,10 @@ impl RolloutExecutor {
         Ok(records)
     }
 
-    /// Kill switch: hold rollout `id` where it is. A running
-    /// [`run`](Self::run) notices at its next poll. Human-only: no agent
-    /// tool exposes this.
+    /// Kill switch: hold rollout `id` where it is; see [`RolloutLog::halt`].
+    /// Human-only: no agent tool exposes this.
     pub fn halt(&self, id: &str) -> Result<RolloutRecord, RolloutError> {
-        let mut record = self.log.load(id)?;
-        self.persist(&mut record, RolloutState::Halted)?;
-        tracing::warn!(
-            rollout = id,
-            traffic = record.traffic_percent,
-            "Rollout halted by operator"
-        );
-        Ok(record)
+        self.log.halt(id, self.clock.now())
     }
 
     /// Restart rollout `id` from step 0 with `image`, the fix that `pr`
