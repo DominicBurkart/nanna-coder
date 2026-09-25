@@ -19,11 +19,13 @@
 mod context;
 mod record;
 mod request;
+mod rules;
 mod verdict;
 
 pub use context::AuditContext;
 pub use record::{content_hash, AuditOutcome, AuditRecord};
 pub use request::{SpawnRequest, TaskSummary};
+pub use rules::{RuleAuditor, RULE_AUDITOR_NAME};
 pub use verdict::{
     CardSuggestion, Reason, ReasonCode, SpawnVerdict, UnknownReasonCode, UnknownVerdictKind,
     VerdictKind,
