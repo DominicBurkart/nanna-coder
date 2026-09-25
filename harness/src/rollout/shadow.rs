@@ -159,6 +159,7 @@ impl ShadowComparator {
                 },
                 observed: HealthObservation::ShadowDivergence(d.rate()),
                 step,
+                evidence: Vec::new(),
             })
     }
 }

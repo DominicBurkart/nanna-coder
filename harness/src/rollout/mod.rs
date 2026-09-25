@@ -18,7 +18,9 @@ mod adapter;
 mod executor;
 mod health;
 mod hooks;
+mod incident;
 mod log;
+mod probe;
 #[cfg(feature = "serverless-adapter")]
 mod serverless;
 mod shadow;
@@ -30,16 +32,21 @@ pub use adapter::{
 };
 pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
 pub use health::{
-    check_health, FakeHealthSource, HealthBreach, HealthError, HealthObservation, HealthSample,
-    HealthSource, HealthThreshold,
+    check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
+    HealthSample, HealthSource, HealthThreshold, EVIDENCE_CAP,
 };
 pub use hooks::{
     AuditDenied, AuditHook, EscalationHook, LogEscalation, NoAudit, RecordingAudit,
     RecordingEscalation, RolloutEscalation,
 };
+pub use incident::{
+    collect_evidence, Incident, IncidentIdentity, IncidentResponder, Postmortem, ProposedAction,
+    INCIDENT_RESPONDER_FIXTURE_TOML, READ_LOGS_TOOL, ROLLBACK_TOOL, ROLL_FORWARD_PR_TOOL,
+};
 pub use log::{
     default_rollout_path, rollout_path_from, RolloutLog, RolloutTransition, ROLLOUT_PATH_ENV,
 };
+pub use probe::{EndpointHealthSource, FakeHttpProbe, HttpProbe, ProbeResponse, ReqwestProbe};
 #[cfg(feature = "serverless-adapter")]
 pub use serverless::{
     CommandOutput, CommandRunner, ProcessRunner, ServerlessAdapter, ServerlessConfig,
