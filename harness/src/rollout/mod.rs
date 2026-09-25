@@ -15,14 +15,21 @@
 //! [`FakeAdapter`], which records every call.
 
 mod adapter;
+mod executor;
 mod health;
+mod hooks;
 mod log;
 mod state;
 
 pub use adapter::{AdapterCall, AdapterError, AdapterOp, FakeAdapter, Slot, TargetAdapter};
+pub use executor::{fake_executor, RolloutConfig, RolloutExecutor};
 pub use health::{
     check_health, FakeHealthSource, HealthBreach, HealthError, HealthObservation, HealthSample,
     HealthSource, HealthThreshold,
+};
+pub use hooks::{
+    AuditDenied, AuditHook, EscalationHook, LogEscalation, NoAudit, RecordingAudit,
+    RecordingEscalation, RolloutEscalation,
 };
 pub use log::{
     default_rollout_path, rollout_path_from, RolloutLog, RolloutTransition, ROLLOUT_PATH_ENV,
