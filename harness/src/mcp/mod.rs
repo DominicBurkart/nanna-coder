@@ -326,11 +326,16 @@ impl NannaMcpServer {
         }
     }
 
-    /// `tasks/list` — return all tasks (v1 returns the full set, no pagination).
+    /// `tasks/list` — return all tasks (v1 returns the full set, no pagination)
+    /// plus the scheduler's queue metrics under `_meta.queue`.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
         let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
-        JsonRpcResponse::success(id, serde_json::json!({ "tasks": wire }))
+        let queue = self.task_manager.queue_metrics().await.to_json();
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue } }),
+        )
     }
 
     /// `tasks/cancel` — cancel a task; already-terminal tasks yield -32602.
@@ -835,8 +840,12 @@ mod tests {
 
         let listed = server
             .handle_request(method_call(21, "tasks/list", serde_json::json!({})))
-            .await;
-        assert_eq!(listed.result.unwrap()["tasks"].as_array().unwrap().len(), 1);
+            .await
+            .result
+            .unwrap();
+        assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["_meta"]["queue"]["queued"], 1);
+        assert_eq!(listed["_meta"]["queue"]["running"], 0);
 
         // tasks/cancel transitions it to cancelled and returns the task.
         let cancelled = server
