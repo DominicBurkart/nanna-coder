@@ -3,6 +3,7 @@
 //! Defines context entity type for storing agent run history, conversation,
 //! and tool call records. Implementation tracked in issue #26.
 
+use crate::effects::EffectRecord;
 use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
 use async_trait::async_trait;
 use model::types::ChatMessage;
@@ -15,6 +16,11 @@ pub struct ToolCallRecord {
     pub arguments: serde_json::Value,
     pub call_id: String,
     pub result: String,
+    /// Effect attribution for this call. `None` when the call named no
+    /// registered tool (so nothing executed) or the record predates
+    /// effect classification.
+    #[serde(default)]
+    pub effect: Option<EffectRecord>,
 }
 
 /// Project context entity — persists the history of a completed agent run
@@ -89,6 +95,7 @@ mod tests {
             arguments: serde_json::json!({"message": "hello"}),
             call_id: "call_0".to_string(),
             result: "echoed: hello".to_string(),
+            effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
         };
 
         let entity = ContextEntity::new(
@@ -126,6 +133,7 @@ mod tests {
             arguments: serde_json::json!({"operation": "add", "a": 1, "b": 2}),
             call_id: "call_1".to_string(),
             result: "3".to_string(),
+            effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
         };
 
         let json = serde_json::to_string(&record).unwrap();
@@ -135,6 +143,21 @@ mod tests {
         assert_eq!(deserialized.call_id, "call_1");
         assert_eq!(deserialized.result, "3");
         assert_eq!(deserialized.arguments["operation"], "add");
+        assert_eq!(
+            deserialized.effect.unwrap().class,
+            crate::effects::EffectClass::None
+        );
+    }
+
+    #[test]
+    fn test_tool_call_record_without_effect_field_still_deserializes() {
+        let legacy = r#"{"tool_name":"echo","arguments":{},"call_id":"c","result":"r"}"#;
+        let record: ToolCallRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.effect, None);
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["effect"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
