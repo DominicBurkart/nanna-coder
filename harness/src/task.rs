@@ -1,11 +1,13 @@
-use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::identity::AgentIdentity;
+use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
+use crate::workspace::WorkspaceError;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
 use model::types::ChatMessage;
@@ -140,6 +142,8 @@ pub struct FailureDiagnostics {
     pub tool_call_history: Vec<ToolCallRecord>,
     pub last_agent_state: Option<String>,
     pub conversation_snapshot: Option<Vec<ChatMessage>>,
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
 }
 
 impl FailureDiagnostics {
@@ -152,8 +156,40 @@ impl FailureDiagnostics {
             "tool_call_history": self.tool_call_history,
             "last_agent_state": self.last_agent_state,
             "conversation_snapshot": self.conversation_snapshot,
+            "denials": self.denials,
         })
     }
+}
+
+fn protected_failure(
+    violation: ProtectedPathViolation,
+    identity: Option<&str>,
+    run_result: &Result<AgentRunResult, AgentError>,
+) -> (String, FailureDiagnostics) {
+    let (iterations_completed, tool_call_history, mut denials) = match run_result {
+        Ok(result) => (
+            result.iterations,
+            result.tool_calls_made.clone(),
+            result.denials.clone(),
+        ),
+        Err(e) => (e.diagnostics().2, e.diagnostics().0.to_vec(), vec![]),
+    };
+    let mut denial = ScopeDenial::protected("extract_changes", &violation);
+    if let Some(identity) = identity {
+        denial.identity = identity.to_string();
+    }
+    denials.push(denial);
+    let diagnostics = FailureDiagnostics {
+        error_type: "ProtectedPathViolation".to_string(),
+        iterations_completed,
+        last_tool_call: tool_call_history.last().cloned(),
+        partial_changes: None,
+        tool_call_history,
+        last_agent_state: None,
+        conversation_snapshot: None,
+        denials,
+    };
+    (violation.to_string(), diagnostics)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +270,7 @@ pub struct TaskManager {
     /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
     build_locks: BuildLocks,
     status_senders: StatusSenders,
+    audit: Arc<dyn AuditHook>,
 }
 
 impl TaskManager {
@@ -246,7 +283,14 @@ impl TaskManager {
             image_cache: Arc::new(RwLock::new(HashMap::new())),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             status_senders: Arc::new(RwLock::new(HashMap::new())),
+            audit: Arc::new(NoopAuditHook),
         }
+    }
+
+    /// Deliver protected-path violations from every task's workspace to `hook`.
+    pub fn with_audit_hook(mut self, hook: Arc<dyn AuditHook>) -> Self {
+        self.audit = hook;
+        self
     }
 
     /// Transition a task to a new status: update the stored `Task` (status +
@@ -431,6 +475,7 @@ impl TaskManager {
         let handles_ref = Arc::clone(&self.handles);
         let progress_ref = Arc::clone(&self.progress);
         let senders_ref = Arc::clone(&self.status_senders);
+        let audit_ref = Arc::clone(&self.audit);
         let semaphore = Arc::clone(&self.max_concurrent);
         let image_cache_ref = Arc::clone(&self.image_cache);
         let build_locks_ref = Arc::clone(&self.build_locks);
@@ -490,6 +535,7 @@ impl TaskManager {
                                     tool_call_history: vec![],
                                     last_agent_state: None,
                                     conversation_snapshot: None,
+                                    denials: vec![],
                                 },
                             },
                         )
@@ -511,6 +557,7 @@ impl TaskManager {
                 TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch)
                     .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
             };
+            let workspace_result = workspace_result.map(|ws| ws.with_audit_hook(audit_ref));
 
             match workspace_result {
                 Err((e, error_type)) => {
@@ -537,6 +584,7 @@ impl TaskManager {
                                 tool_call_history: vec![],
                                 last_agent_state: None,
                                 conversation_snapshot: None,
+                                denials: vec![],
                             },
                         },
                     )
@@ -570,6 +618,7 @@ impl TaskManager {
                                         tool_call_history: vec![],
                                         last_agent_state: None,
                                         conversation_snapshot: None,
+                                        denials: vec![],
                                     },
                                 },
                             )
@@ -595,17 +644,21 @@ impl TaskManager {
                     agent.set_progress_counter(Arc::clone(&progress_counter));
                     let run_result = agent.run(context).await;
 
-                    let changes_patch = workspace.extract_changes().ok().and_then(|patch| {
+                    let extracted = workspace.extract_changes();
+                    let changes_patch = extracted.as_ref().ok().and_then(|patch| {
                         if patch.is_empty() {
                             None
                         } else if patch.len() > MAX_DIFF_BYTES {
                             Some(patch[..MAX_DIFF_BYTES].to_string())
                         } else {
-                            Some(patch)
+                            Some(patch.clone())
                         }
                     });
 
-                    let format_patch = workspace.format_patch().ok().flatten();
+                    let format_patch = match &extracted {
+                        Err(WorkspaceError::ProtectedPath(_)) => None,
+                        _ => workspace.format_patch().ok().flatten(),
+                    };
 
                     let _ = workspace.cleanup();
 
@@ -616,6 +669,19 @@ impl TaskManager {
                     {
                         let mut progress = progress_ref.write().await;
                         progress.remove(&task_id_clone);
+                    }
+
+                    if let Err(WorkspaceError::ProtectedPath(violation)) = extracted {
+                        let name = identity.as_ref().map(|i| i.name());
+                        let (error, diagnostics) = protected_failure(violation, name, &run_result);
+                        let finished_at = Utc::now();
+                        let status = TaskStatus::Failed {
+                            finished_at,
+                            error,
+                            diagnostics,
+                        };
+                        Self::set_status(&tasks_ref, &senders_ref, &task_id_clone, status).await;
+                        return;
                     }
 
                     match run_result {
@@ -670,6 +736,7 @@ impl TaskManager {
                                 tool_call_history,
                                 last_agent_state,
                                 conversation_snapshot: Some(conversation_snapshot),
+                                denials: vec![],
                             };
                             Self::set_status(
                                 &tasks_ref,
@@ -871,14 +938,25 @@ mod tests {
     };
     use std::sync::Mutex;
 
+    type ChatHook = Box<dyn Fn() + Send + Sync>;
+
     struct MockProvider {
         responses: Mutex<Vec<ChatResponse>>,
+        on_chat: Option<ChatHook>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses),
+                on_chat: None,
+            })
+        }
+
+        fn with_hook(responses: Vec<ChatResponse>, on_chat: ChatHook) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses),
+                on_chat: Some(on_chat),
             })
         }
     }
@@ -886,6 +964,9 @@ mod tests {
     #[async_trait]
     impl ModelProvider for MockProvider {
         async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            if let Some(hook) = &self.on_chat {
+                hook();
+            }
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Err(ModelError::Unknown {
@@ -1008,6 +1089,7 @@ mod tests {
             tool_call_history: vec![],
             last_agent_state: None,
             conversation_snapshot: None,
+            denials: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "MaxIterationsExceeded");
@@ -1033,6 +1115,7 @@ mod tests {
             tool_call_history: vec![tool_call],
             last_agent_state: Some("Performing".to_string()),
             conversation_snapshot: Some(vec![ChatMessage::user("do something")]),
+            denials: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "StateError");
@@ -1922,5 +2005,183 @@ mod tests {
         assert_eq!(manager.poll(&id).await.unwrap().ttl_ms, Some(1234));
         // set_ttl on an unknown id is a no-op (does not panic).
         manager.set_ttl(&TaskId("nope".to_string()), Some(1)).await;
+    }
+
+    #[test]
+    fn failure_diagnostics_json_carries_denials_and_tolerates_their_absence() {
+        let violation = crate::protected::ProtectedPathViolation {
+            path: "codecov.yml".to_string(),
+            rule: "codecov.yml".to_string(),
+        };
+        let diagnostics = FailureDiagnostics {
+            error_type: "ProtectedPathViolation".to_string(),
+            iterations_completed: 1,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+            denials: vec![crate::scope::ScopeDenial::protected(
+                "extract_changes",
+                &violation,
+            )],
+        };
+        let json = diagnostics.to_json();
+        assert_eq!(json["denials"][0]["reason"]["kind"], "protected_path");
+        assert_eq!(json["denials"][0]["tool"], "extract_changes");
+        let legacy = serde_json::json!({
+            "error_type": "StateError", "iterations_completed": 0, "last_tool_call": null,
+            "partial_changes": null, "tool_call_history": [], "last_agent_state": null,
+            "conversation_snapshot": null
+        });
+        let parsed: FailureDiagnostics = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.denials.is_empty());
+    }
+
+    fn plant_protected_file(source_repo: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .current_dir(source_repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let worktree = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .find(|path| path.contains("nanna-task-"))
+            .expect("task worktree present");
+        let agents = std::path::Path::new(worktree).join(".nanna/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("x.toml"), "[identity]").unwrap();
+    }
+
+    struct RecordingHook {
+        seen: std::sync::Mutex<Vec<(String, crate::protected::ProtectedPathViolation)>>,
+    }
+
+    impl crate::protected::AuditHook for RecordingHook {
+        fn on_protected_path_violation(
+            &self,
+            task_id: &str,
+            violation: &crate::protected::ProtectedPathViolation,
+        ) {
+            let entry = (task_id.to_string(), violation.clone());
+            self.seen.lock().unwrap().push(entry);
+        }
+    }
+
+    fn planting_provider(repo: std::path::PathBuf) -> Arc<dyn ModelProvider> {
+        let responses = wrap_with_state_machine_responses(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "api/new.rs", "content": "ok"}),
+            ),
+            stop_response("done"),
+        ]);
+        MockProvider::with_hook(responses, Box::new(move || plant_protected_file(&repo)))
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_touching_an_identity_file_fails_the_task_under_an_identity() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_audit_hook(hook.clone());
+        let provider = planting_provider(repo_dir.path().to_path_buf());
+        let task_id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+
+        let (error, diagnostics) = match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (error, diagnostics),
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+        assert!(
+            error.contains("`.nanna/agents/x.toml` is protected by rule `.nanna/**`"),
+            "{error}"
+        );
+        assert!(diagnostics.iterations_completed > 0);
+        assert!(!diagnostics.tool_call_history.is_empty());
+        assert!(diagnostics.last_tool_call.is_some());
+        let denial = diagnostics.denials.last().unwrap();
+        assert_eq!(denial.identity, "rust-implementer");
+        assert_eq!(denial.tool, "extract_changes");
+        assert!(
+            matches!(&denial.reason, crate::scope::DenialReason::ProtectedPath { path, .. } if path == ".nanna/agents/x.toml")
+        );
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, task_id.0);
+        assert_eq!(seen[0].1.rule, ".nanna/**");
+        assert!(manager.handles.read().await.get(&task_id).is_none());
+        assert!(manager.progress.read().await.get(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_touching_an_identity_file_fails_the_task_without_an_identity() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider = planting_provider(repo_dir.path().to_path_buf());
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+                let denial = diagnostics.denials.last().unwrap();
+                assert_eq!(denial.identity, crate::scope::UNSCOPED_IDENTITY);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protected_failure_after_an_errored_run_keeps_its_iterations_and_calls() {
+        let violation = crate::protected::ProtectedPathViolation {
+            path: "windows.toml".to_string(),
+            rule: "windows.toml".to_string(),
+        };
+        let call = record("write_file", Some(EffectClass::Workspace));
+        let run: Result<AgentRunResult, AgentError> = Err(AgentError::MaxIterationsExceeded {
+            iterations_completed: 7,
+            tool_calls_made: vec![call.clone()],
+            conversation_snapshot: vec![],
+            last_agent_state: crate::agent::AgentState::PerformingEntityModification,
+        });
+        let (error, diagnostics) = protected_failure(violation, None, &run);
+        assert!(error.starts_with("`windows.toml` is protected"));
+        assert_eq!(diagnostics.iterations_completed, 7);
+        assert_eq!(diagnostics.tool_call_history.len(), 1);
+        assert_eq!(
+            diagnostics.last_tool_call.map(|c| c.tool_name),
+            Some("write_file".to_string())
+        );
+        assert_eq!(diagnostics.denials.len(), 1);
+        assert_eq!(
+            diagnostics.denials[0].identity,
+            crate::scope::UNSCOPED_IDENTITY
+        );
     }
 }
