@@ -239,13 +239,14 @@ impl ProjectSignals {
 
 /// Nix packages the full-stack profile adds to the dev container: the trunk
 /// bundler and wasm-bindgen for the frontend, curl for in-container health
-/// probes, plus the sqlx CLI and the Postgres client when the workspace uses
-/// a database.
+/// probes, headless chromium for browser QA, plus the sqlx CLI and the
+/// Postgres client when the workspace uses a database.
 pub fn full_stack_packages(has_database: bool) -> Vec<String> {
     let mut packages = vec![
         "pkgs.trunk".to_string(),
         "pkgs.wasm-bindgen-cli".to_string(),
         "pkgs.curl".to_string(),
+        "pkgs.chromium".to_string(),
     ];
     if has_database {
         packages.push("pkgs.sqlx-cli".to_string());
@@ -437,6 +438,7 @@ openssl = "0.10"
             "pkgs.trunk",
             "pkgs.wasm-bindgen-cli",
             "pkgs.curl",
+            "pkgs.chromium",
             "pkgs.sqlx-cli",
             "pkgs.postgresql",
         ] {
@@ -453,9 +455,14 @@ openssl = "0.10"
         let packages = full_stack_packages(false);
         assert_eq!(
             packages,
-            vec!["pkgs.trunk", "pkgs.wasm-bindgen-cli", "pkgs.curl"]
+            vec![
+                "pkgs.trunk",
+                "pkgs.wasm-bindgen-cli",
+                "pkgs.curl",
+                "pkgs.chromium"
+            ]
         );
-        assert_eq!(full_stack_packages(true).len(), 5);
+        assert_eq!(full_stack_packages(true).len(), 6);
     }
 
     #[test]

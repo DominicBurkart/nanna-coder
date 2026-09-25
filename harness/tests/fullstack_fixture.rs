@@ -139,6 +139,7 @@ const EXPECTED_FLAKE_PACKAGES: &str = r#"        devContainerPackages = [
           pkgs.trunk
           pkgs.wasm-bindgen-cli
           pkgs.curl
+          pkgs.chromium
           pkgs.sqlx-cli
           pkgs.postgresql
         ];

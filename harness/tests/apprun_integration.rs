@@ -79,7 +79,10 @@ fn build_dev_image(runtime: &ContainerRuntime) {
         "FROM docker.io/library/rust:1-bookworm\n\
          RUN rustup target add wasm32-unknown-unknown \\\n\
          \x20&& curl -fsSL {TRUNK_URL} | tar -xz -C /usr/local/bin trunk \\\n\
-         \x20&& mkdir -p /home/dev /cache\n\
+         \x20&& mkdir -p /home/dev /cache \\\n\
+         \x20&& apt-get update \\\n\
+         \x20&& apt-get install -y --no-install-recommends chromium \\\n\
+         \x20&& rm -rf /var/lib/apt/lists/*\n\
          ENV HOME=/home/dev CARGO_TARGET_DIR=/cache/target\n\
          COPY fixture /src\n\
          RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
