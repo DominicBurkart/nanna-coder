@@ -28,12 +28,59 @@ pub const BROWSER_REPORT_FILE: &str = "report.json";
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QaArtifacts {
+    workspace_root: PathBuf,
     root: PathBuf,
+}
+
+/// A path resolved outside the workspace it was supposed to be under --
+/// typically because a task planted a symlink at an ancestor of the target
+/// (e.g. `.nanna-artifacts` itself) pointing somewhere else on the host.
+fn escaped_workspace(workspace_root: &Path, target: &Path) -> std::io::Error {
+    std::io::Error::other(format!(
+        "'{}' resolves outside the workspace root '{}'",
+        target.display(),
+        workspace_root.display()
+    ))
+}
+
+/// Confirm `target`'s nearest *existing* ancestor canonicalises to somewhere
+/// under `workspace_root`, before anything below it is created.
+///
+/// `QaArtifacts` only ever writes under a fixed, workspace-relative path
+/// (`.nanna-artifacts/qa/...`), but that path is computed by joining
+/// strings, not by resolving symlinks -- a task's own tools already have
+/// ordinary write access to the workspace, so it could plant a symlink at
+/// `.nanna-artifacts` (or `.nanna-artifacts/qa`) pointing outside it before
+/// a QA tool runs. `create_dir_all`/`create_dir` follow an existing
+/// symlinked ancestor like any other directory, so checking only *after*
+/// creation is too late: the escaped directory would already exist. This
+/// walks up to the nearest ancestor that already exists and checks that one
+/// instead, so a planted symlink is caught before anything is created
+/// through it.
+fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> std::io::Result<()> {
+    let canonical_root = workspace_root.canonicalize()?;
+    let mut check = target;
+    loop {
+        match check.canonicalize() {
+            Ok(canonical) => {
+                return if canonical.starts_with(&canonical_root) {
+                    Ok(())
+                } else {
+                    Err(escaped_workspace(workspace_root, target))
+                };
+            }
+            Err(_) => match check.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => check = parent,
+                _ => return Err(escaped_workspace(workspace_root, target)),
+            },
+        }
+    }
 }
 
 impl QaArtifacts {
     pub fn new(workspace_path: &Path) -> Self {
         Self {
+            workspace_root: workspace_path.to_path_buf(),
             root: workspace_path.join(ARTIFACT_DIR).join(QA_DIR),
         }
     }
@@ -53,11 +100,13 @@ impl QaArtifacts {
     pub fn next_browser_dir(&self) -> std::io::Result<PathBuf> {
         let n = self.next_index(BROWSER_PREFIX, "")?;
         let dir = self.root.join(format!("{BROWSER_PREFIX}{n}"));
+        ensure_within_workspace(&self.workspace_root, &dir)?;
         std::fs::create_dir(&dir)?;
         Ok(dir)
     }
 
     fn next_index(&self, prefix: &str, suffix: &str) -> std::io::Result<usize> {
+        ensure_within_workspace(&self.workspace_root, &self.root)?;
         std::fs::create_dir_all(&self.root)?;
         let names: Vec<String> = std::fs::read_dir(&self.root)?
             .filter_map(Result::ok)
@@ -171,5 +220,39 @@ mod tests {
         assert!(artifacts.next_endpoint_report().is_err());
         assert!(artifacts.next_browser_dir().is_err());
         assert!(write_json(&dir.path().join("missing").join("r.json"), &json!(1)).is_err());
+    }
+
+    #[test]
+    fn a_wholly_nonexistent_workspace_root_is_reported_not_created_through() {
+        let dir = TempDir::new().unwrap();
+        let missing_root = dir.path().join("nowhere").join("at").join("all");
+        let artifacts = QaArtifacts::new(&missing_root);
+        assert!(artifacts.next_endpoint_report().is_err());
+        assert!(!missing_root.exists());
+    }
+
+    #[test]
+    fn ensure_within_workspace_fails_closed_when_no_ancestor_of_the_target_exists() {
+        let dir = TempDir::new().unwrap();
+        let target = Path::new("nowhere_relative_and_unanchored");
+        assert!(ensure_within_workspace(dir.path(), target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_artifact_dir_is_rejected_not_followed() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(ARTIFACT_DIR)).unwrap();
+        let artifacts = QaArtifacts::new(workspace.path());
+        let err = artifacts.next_endpoint_report().unwrap_err();
+        assert!(
+            err.to_string().contains("outside the workspace root"),
+            "{err}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "nothing was written through the escaped symlink"
+        );
     }
 }

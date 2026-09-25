@@ -75,6 +75,12 @@ pub struct QaContext {
 }
 
 /// `rel` resolved under `root`; absolute paths and `..` are refused.
+///
+/// The lexical check alone would still let a symlinked ancestor (planted by
+/// the task itself, which has ordinary write access to `root`) resolve
+/// outside the workspace -- `rel` and every component it joins onto `root`
+/// must exist, so the result is canonicalised and re-checked against `root`
+/// before it is handed to a file reader.
 pub fn workspace_file(root: &Path, rel: &str) -> Result<PathBuf, QaError> {
     let path = Path::new(rel);
     let safe = path
@@ -85,7 +91,22 @@ pub fn workspace_file(root: &Path, rel: &str) -> Result<PathBuf, QaError> {
             path: rel.to_string(),
         });
     }
-    Ok(root.join(path))
+    let canonical_root = root.canonicalize().map_err(|_| QaError::InvalidPath {
+        path: rel.to_string(),
+    })?;
+    let canonical = root
+        .join(path)
+        .canonicalize()
+        .map_err(|_| QaError::InvalidPath {
+            path: rel.to_string(),
+        })?;
+    if canonical.starts_with(&canonical_root) {
+        Ok(canonical)
+    } else {
+        Err(QaError::InvalidPath {
+            path: rel.to_string(),
+        })
+    }
 }
 
 impl QaContext {
@@ -545,7 +566,7 @@ mod tests {
             (json!({ "manifest": "../CHECKS" }), "invalid"),
             (json!({ "manifest": "/etc/passwd" }), "invalid"),
             (json!({ "manifest": "" }), "invalid"),
-            (json!({ "manifest": "missing" }), "execution"),
+            (json!({ "manifest": "missing" }), "invalid"),
         ] {
             let err = tool.execute(args.clone()).await.unwrap_err();
             let matched = match kind {
@@ -682,7 +703,7 @@ mod tests {
             .execute(json!({ "scenario": "missing.json" }))
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err}");
+        assert!(matches!(err, ToolError::InvalidArguments { .. }), "{err}");
 
         let f = fixture(probe(&[]), vec![]);
         start_app(&f);
@@ -706,18 +727,40 @@ mod tests {
 
     #[test]
     fn workspace_file_accepts_only_relative_paths_inside_the_root() {
-        let root = Path::new("/w");
+        let ws = TempDir::new().unwrap();
+        let root = ws.path();
+        std::fs::write(root.join("CHECKS"), "/health").unwrap();
+        std::fs::create_dir(root.join("qa")).unwrap();
+        std::fs::write(root.join("qa/smoke"), "[]").unwrap();
         assert_eq!(
             workspace_file(root, "CHECKS").unwrap(),
-            PathBuf::from("/w/CHECKS")
+            root.canonicalize().unwrap().join("CHECKS")
         );
         assert_eq!(
             workspace_file(root, "./qa/smoke").unwrap(),
-            PathBuf::from("/w/./qa/smoke")
+            root.canonicalize().unwrap().join("qa/smoke")
         );
-        for bad in ["", "/abs", "../up", "a/../b"] {
+        for bad in ["", "/abs", "../up", "a/../b", "does_not_exist"] {
             let err = workspace_file(root, bad).unwrap_err();
             assert!(matches!(err, QaError::InvalidPath { .. }), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn workspace_file_reports_a_nonexistent_root_as_an_invalid_path() {
+        let missing = Path::new("/definitely/does/not/exist/here");
+        let err = workspace_file(missing, "CHECKS").unwrap_err();
+        assert!(matches!(err, QaError::InvalidPath { .. }), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_rejects_a_symlink_escaping_the_workspace() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("escape")).unwrap();
+        let err = workspace_file(ws.path(), "escape/secret").unwrap_err();
+        assert!(matches!(err, QaError::InvalidPath { .. }), "{err}");
     }
 }
