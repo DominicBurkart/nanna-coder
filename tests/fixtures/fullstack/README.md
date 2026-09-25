@@ -18,6 +18,12 @@ root workspace.
 
 `CHECKS` lists these paths one per line for smoke tests.
 
+`ui/index.html`'s `<body>` must keep its `<div id="main">`: dioxus-web's
+default config mounts the app there, and its silent fallback on a missing
+mount point (a detached DOM node, not `document.body`) means the page loads
+and returns `200` with no visible sign anything is wrong — only a real
+browser session shows `#greeting` as permanently absent.
+
 ## Environment hooks
 
 | Variable | Effect |
