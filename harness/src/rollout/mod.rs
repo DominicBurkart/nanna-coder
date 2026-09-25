@@ -21,6 +21,7 @@ mod hooks;
 mod log;
 #[cfg(feature = "serverless-adapter")]
 mod serverless;
+mod shadow;
 mod state;
 
 pub use adapter::{
@@ -43,6 +44,10 @@ pub use log::{
 pub use serverless::{
     CommandOutput, CommandRunner, ProcessRunner, ServerlessAdapter, ServerlessConfig,
     SERVERLESS_ENV, SERVERLESS_FALLBACK_ENV,
+};
+pub use shadow::{
+    FakeShadowSource, NoShadowSource, ShadowComparator, ShadowDivergence, ShadowError,
+    ShadowSample, ShadowSource, DEFAULT_LATENCY_SLACK,
 };
 pub use state::{RolloutRecord, RolloutState};
 
@@ -108,6 +113,9 @@ pub enum RolloutError {
     /// The health source failed.
     #[error(transparent)]
     Health(#[from] HealthError),
+    /// The shadow source failed.
+    #[error(transparent)]
+    Shadow(#[from] ShadowError),
     /// The lease store failed.
     #[error(transparent)]
     Lease(#[from] LeaseError),

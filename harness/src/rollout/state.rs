@@ -582,6 +582,7 @@ mod kani_proofs {
                 on_breach: crate::deploy::OnBreach::Rollback,
                 retain_for: chrono::Duration::zero(),
             },
+            shadow: None,
             steps,
         };
         let step: usize = kani::any();

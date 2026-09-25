@@ -117,9 +117,8 @@ impl ServerlessConfig {
             };
             templates.push(template);
         }
-        let mut optional = SERVERLESS_FALLBACK_ENV
-            .iter()
-            .map(|(name, _)| lookup(name).filter(|t| !t.trim().is_empty()));
+        let [(set_fallback_name, _), (clear_fallback_name, _)] = SERVERLESS_FALLBACK_ENV;
+        let optional = |name: &str| lookup(name).filter(|t| !t.trim().is_empty());
         let mut templates = templates.into_iter();
         Ok(Self {
             deploy_inactive: templates.next().expect("seven templates"),
@@ -129,8 +128,8 @@ impl ServerlessConfig {
             retire: templates.next().expect("seven templates"),
             mirror: templates.next().expect("seven templates"),
             swap: templates.next().expect("seven templates"),
-            set_fallback: optional.next().expect("two fallback templates"),
-            clear_fallback: optional.next().expect("two fallback templates"),
+            set_fallback: optional(set_fallback_name),
+            clear_fallback: optional(clear_fallback_name),
         })
     }
 }
