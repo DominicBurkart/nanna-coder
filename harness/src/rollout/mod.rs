@@ -19,6 +19,7 @@ mod executor;
 mod health;
 mod hooks;
 mod log;
+mod probe;
 #[cfg(feature = "serverless-adapter")]
 mod serverless;
 mod shadow;
@@ -40,6 +41,7 @@ pub use hooks::{
 pub use log::{
     default_rollout_path, rollout_path_from, RolloutLog, RolloutTransition, ROLLOUT_PATH_ENV,
 };
+pub use probe::{EndpointHealthSource, FakeHttpProbe, HttpProbe, ProbeResponse, ReqwestProbe};
 #[cfg(feature = "serverless-adapter")]
 pub use serverless::{
     CommandOutput, CommandRunner, ProcessRunner, ServerlessAdapter, ServerlessConfig,
