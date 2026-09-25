@@ -1,6 +1,7 @@
 use super::adapter::{FakeAdapter, FallbackPolicy, TargetAdapter};
 use super::health::{check_health, FakeHealthSource, HealthBreach, HealthSource};
 use super::hooks::{AuditHook, EscalationHook, LogEscalation, NoAudit, RolloutEscalation};
+use super::incident::{Incident, IncidentResponder, ProposedAction};
 use super::log::RolloutLog;
 use super::shadow::{FakeShadowSource, NoShadowSource, ShadowComparator, ShadowSource};
 use super::state::{RolloutRecord, RolloutState};
@@ -70,6 +71,7 @@ pub struct RolloutExecutor {
     shadow: Arc<dyn ShadowSource>,
     audit: Arc<dyn AuditHook>,
     escalation: Arc<dyn EscalationHook>,
+    incident_responder: Option<Arc<IncidentResponder>>,
     config: RolloutConfig,
 }
 
@@ -177,6 +179,7 @@ impl RolloutExecutor {
             shadow: Arc::new(NoShadowSource),
             audit: Arc::new(NoAudit),
             escalation: Arc::new(LogEscalation),
+            incident_responder: None,
             config: RolloutConfig::default(),
         }
     }
@@ -196,6 +199,15 @@ impl RolloutExecutor {
     /// Replace the escalation hook.
     pub fn with_escalation(mut self, escalation: Arc<dyn EscalationHook>) -> Self {
         self.escalation = escalation;
+        self
+    }
+
+    /// Give a `halt-and-escalate` breach a chance at automatic remediation
+    /// before it reaches a human. With none configured (the default),
+    /// every `halt-and-escalate` breach halts and escalates directly,
+    /// unchanged from before this existed.
+    pub fn with_incident_responder(mut self, responder: Arc<IncidentResponder>) -> Self {
+        self.incident_responder = Some(responder);
         self
     }
 
@@ -529,12 +541,61 @@ impl RolloutExecutor {
                 self.halt_and_escalate(record, step, summary, Some(breach))
                     .await
             }
-            OnBreach::HaltAndEscalate => {
-                let summary = breach.to_string();
-                self.halt_and_escalate(record, step, summary, Some(breach))
-                    .await
-            }
+            OnBreach::HaltAndEscalate => match &self.incident_responder {
+                Some(responder) => {
+                    self.respond_to_incident(record, breach, step, responder.clone())
+                        .await
+                }
+                None => {
+                    let summary = breach.to_string();
+                    self.halt_and_escalate(record, step, summary, Some(breach))
+                        .await
+                }
+            },
         }
+    }
+
+    /// Give `responder` a chance to remediate `breach` before it reaches a
+    /// human: propose an action from the breach's own evidence, have the
+    /// audit hook review it, and either apply an approved rollback or fall
+    /// back to halting and escalating (with the proposal in the summary)
+    /// for anything else, exactly as `halt-and-escalate` already does
+    /// without a responder configured.
+    ///
+    /// This deliberately does not poll the health source again for a
+    /// fresher sample: `breach` already carries the evidence from the
+    /// caller's own poll a moment ago, and a fallible poll here, ahead of
+    /// any persist, would leave the record stuck `Baking` with live
+    /// traffic on a bad slot if the health source failed at exactly this
+    /// moment — the one case a responder-less halt never risks, since it
+    /// persists `Halted` before doing anything else that can fail.
+    async fn respond_to_incident(
+        &self,
+        mut record: RolloutRecord,
+        breach: HealthBreach,
+        step: usize,
+        responder: Arc<IncidentResponder>,
+    ) -> Result<(), RolloutError> {
+        let incident = Incident {
+            breach: breach.clone(),
+            evidence: breach.evidence.clone(),
+            step,
+            deploy_id: record.id.clone(),
+        };
+        let action = responder.propose(&breach, None);
+        if let Err(denied) = self.audit.review_action(&incident, &action).await {
+            let summary = format!("incident action denied: {}; {breach}", denied.reason);
+            return self
+                .halt_and_escalate(record, step, summary, Some(breach))
+                .await;
+        }
+        if action == ProposedAction::Rollback && responder.permits(&action) {
+            return self.persist(&mut record, RolloutState::RollingBack);
+        }
+        let summary =
+            format!("{breach}; incident responder proposes to {action}: escalating for a human");
+        self.halt_and_escalate(record, step, summary, Some(breach))
+            .await
     }
 
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
@@ -597,6 +658,7 @@ mod tests {
     use crate::rollout::adapter::{AdapterCall, AdapterOp, FallbackPolicy, FallbackSupport, Slot};
     use crate::rollout::health::{HealthError, HealthObservation, HealthSample, HealthThreshold};
     use crate::rollout::hooks::{RecordingAudit, RecordingEscalation};
+    use crate::rollout::incident::{IncidentIdentity, IncidentResponder, ProposedAction};
     use crate::rollout::shadow::ShadowSample;
     use crate::rollout::state::tests::{plan, t0, GRADUAL};
     use async_trait::async_trait;
@@ -661,6 +723,14 @@ mod tests {
             escalation,
             executor,
         }
+    }
+
+    fn rig_with_responder(identity: IncidentIdentity) -> Rig {
+        let mut rig = rig();
+        rig.executor = rig
+            .executor
+            .with_incident_responder(Arc::new(IncidentResponder::new(identity)));
+        rig
     }
 
     fn breach_sample() -> HealthSample {
@@ -915,6 +985,63 @@ mod tests {
             "halted rollout keeps the deploy lease"
         );
         assert_eq!(rig.executor.run(&record.id).await.unwrap(), halted);
+    }
+
+    #[tokio::test]
+    async fn incident_responder_rolls_back_an_approved_action_instead_of_halting() {
+        let rig = rig_with_responder(IncidentIdentity::from_fixture());
+        rig.health.push_after(1, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::RolledBack);
+        assert_eq!(rig.adapter.current(), V1);
+        assert!(rig.escalation.escalations().is_empty());
+        assert_eq!(
+            rig.leases.snapshot().unwrap().len(),
+            0,
+            "a completed rollback releases the deploy lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn incident_responder_action_denied_by_audit_halts_and_escalates() {
+        let rig = rig_with_responder(IncidentIdentity::from_fixture());
+        rig.audit.deny_next_action("evidence is inconclusive");
+        rig.health.push_after(1, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0]
+            .summary
+            .contains("incident action denied: evidence is inconclusive"));
+        assert_eq!(
+            rig.audit.action_reviews(),
+            vec![(record.id.clone(), ProposedAction::Rollback)]
+        );
+    }
+
+    #[tokio::test]
+    async fn incident_responder_without_the_rollback_tool_escalates_instead_of_acting() {
+        let identity = IncidentIdentity::from_toml_str(
+            "[identity]\nname = \"x\"\n[scope]\nrepos = []\npaths = []\nmax_effect = \"production\"\ntools = [\"read_logs\"]\n[limits]\nmax_iterations = 1\nmax_wall_clock_secs = 1\nmax_concurrent = 1\n",
+        )
+        .unwrap();
+        let rig = rig_with_responder(identity);
+        rig.health.push_after(1, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(rig.adapter.current(), V1, "no rollback was applied");
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0]
+            .summary
+            .contains("incident responder proposes to rollback: escalating for a human"));
     }
 
     #[tokio::test]

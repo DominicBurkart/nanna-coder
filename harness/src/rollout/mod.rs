@@ -18,6 +18,7 @@ mod adapter;
 mod executor;
 mod health;
 mod hooks;
+mod incident;
 mod log;
 mod probe;
 #[cfg(feature = "serverless-adapter")]
@@ -37,6 +38,10 @@ pub use health::{
 pub use hooks::{
     AuditDenied, AuditHook, EscalationHook, LogEscalation, NoAudit, RecordingAudit,
     RecordingEscalation, RolloutEscalation,
+};
+pub use incident::{
+    collect_evidence, Incident, IncidentIdentity, IncidentResponder, Postmortem, ProposedAction,
+    INCIDENT_RESPONDER_FIXTURE_TOML, READ_LOGS_TOOL, ROLLBACK_TOOL, ROLL_FORWARD_PR_TOOL,
 };
 pub use log::{
     default_rollout_path, rollout_path_from, RolloutLog, RolloutTransition, ROLLOUT_PATH_ENV,
