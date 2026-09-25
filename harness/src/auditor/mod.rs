@@ -17,6 +17,7 @@
 //! escalation is handed to a [`SpawnEscalationHook`].
 
 pub(crate) mod context;
+pub mod eval;
 mod gate;
 mod llm;
 mod log;
