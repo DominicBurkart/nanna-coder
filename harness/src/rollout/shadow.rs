@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn comparator_from_template_uses_compare_and_max_divergence() {
         let template = DeployTemplate::parse(
-            "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [100]\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"latency\"]\nmax_divergence = 0.2\n",
+            "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [100]\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"latency\"]\nmax_divergence = 0.2\n",
         )
         .unwrap();
         let c = ShadowComparator::from_template(template.shadow.as_ref().unwrap());

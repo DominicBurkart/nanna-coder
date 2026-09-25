@@ -1,4 +1,4 @@
-use super::template::{DeployTemplate, RiskClass, Strategy};
+use super::template::{DeployTemplate, Health, RiskClass, Strategy};
 use super::{DeployError, PRODUCTION_ENV};
 use crate::windows::WindowSet;
 use chrono::Duration;
@@ -63,6 +63,10 @@ fn invalid(file: &Path, field: &'static str, reason: String) -> DeployError {
         field,
         reason,
     }
+}
+
+fn lacks_observation_window(health: Option<&Health>) -> bool {
+    !health.is_some_and(|h| h.bake_time > Duration::zero())
 }
 
 impl DeployTemplate {
@@ -140,6 +144,13 @@ impl DeployTemplate {
                     "requires rollout.strategy = {}, got {strategy}",
                     Strategy::ShadowThenGradual
                 ),
+            ));
+        }
+        if shadow_enabled && lacks_observation_window(self.health.as_ref()) {
+            return Err(invalid(
+                file,
+                "health",
+                "section with a positive bake_time is required when shadow.enabled is true: it is the Shadow step's observation window".to_string(),
             ));
         }
         if strategy == Strategy::BlueGreen && self.rollback.retain_for <= Duration::zero() {
@@ -403,6 +414,24 @@ mod tests {
         let (field, reason) = field_error(&shadow_on_gradual);
         assert_eq!(field, "shadow.enabled");
         assert!(reason.contains("shadow-then-gradual"), "{reason}");
+    }
+
+    #[test]
+    fn shadow_requires_a_positive_observation_window() {
+        let base = template(
+            RiskClass::Unused,
+            Strategy::ShadowThenGradual,
+            "[100]",
+            "0m",
+        );
+        assert!(
+            DeployTemplate::parse(&base).is_ok(),
+            "the base template is valid"
+        );
+        let no_bake = base.replace("bake_time = \"30m\"", "bake_time = \"0m\"");
+        let (field, reason) = field_error(&no_bake);
+        assert_eq!(field, "health");
+        assert!(reason.contains("Shadow step"), "{reason}");
     }
 
     #[test]

@@ -91,6 +91,7 @@ impl RolloutState {
             (Step(_) | Baking { .. } | Halted, Step(0)) => true,
             (Baking { step, .. }, Step(m)) => *m == step + 1 && *m < steps,
             (Baking { step, .. }, Complete) => step + 1 == steps,
+            (Step(n), Complete) => n + 1 == steps,
             (Step(_) | Baking { .. }, RollingBack) => true,
             (RollingBack, RolledBack) => true,
             (Parked { resume_state, .. }, resumed) => **resume_state == *resumed,
@@ -128,8 +129,12 @@ pub struct RolloutRecord {
     pub slot: Option<Slot>,
     /// The slot a `Swap` step retired the previous image to; held until a
     /// `Retire` step's `min_duration` (`rollback.retain_for`) elapses, so
-    /// `rollback_to` can restore it.
+    /// `rollback_to` can restore it. Cleared once the slot is retired.
     pub retained_slot: Option<Slot>,
+    /// When [`retained_slot`](Self::retained_slot) was set; the `Retire`
+    /// step parks until this plus its `min_duration` (`rollback.retain_for`)
+    /// elapses, rather than blocking the clock for the hold.
+    pub retained_since: Option<DateTime<Utc>>,
     /// How faithfully the target honours the fallback policy installed on
     /// the new slot for the duration of the rollout; `None` before it is
     /// installed. `BestEffort` is worth surfacing to an operator: a `5xx`
@@ -165,6 +170,7 @@ impl RolloutRecord {
             previous_image: previous_image.to_string(),
             slot: None,
             retained_slot: None,
+            retained_since: None,
             fallback: None,
             traffic_percent: 0,
             state: RolloutState::Pending,
@@ -372,6 +378,7 @@ pub(crate) mod tests {
                     (Step(_) | Baking { .. } | Halted, Step(0)) => true,
                     (Baking { step, .. }, Step(m)) => *m == step + 1,
                     (Baking { step, .. }, Complete) => *step == 2,
+                    (Step(n), Complete) => *n == 2,
                     (Step(_) | Baking { .. }, RollingBack) => true,
                     (RollingBack, RolledBack) => true,
                     (Parked { resume_state, .. }, to) => **resume_state == *to,

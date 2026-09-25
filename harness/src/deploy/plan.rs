@@ -304,7 +304,7 @@ impl DeployTemplate {
     /// use harness::deploy::{DeployTemplate, RiskClass, StepKind};
     ///
     /// let template = DeployTemplate::parse(
-    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
     /// )
     /// .unwrap();
     /// let plan = template.plan_with_score("staging", Some(75)).unwrap();

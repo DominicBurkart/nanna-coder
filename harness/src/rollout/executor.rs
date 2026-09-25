@@ -205,14 +205,20 @@ impl RolloutExecutor {
         let record = self.log.load(id)?;
         let mut next = record.clone();
         next.transition(RolloutState::Step(0), self.clock.now())?;
+        if let Some(retained) = &record.retained_slot {
+            self.adapter.set_traffic(retained, 100).await?;
+        }
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.mirror(slot, 0).await?;
             self.adapter.clear_fallback(slot).await?;
             self.adapter.retire(slot).await?;
         }
         next.image = image.to_string();
         next.pr = Some(pr.to_string());
         next.slot = None;
+        next.retained_slot = None;
+        next.retained_since = None;
         next.fallback = None;
         next.traffic_percent = 0;
         next.breach = None;
@@ -340,22 +346,53 @@ impl RolloutExecutor {
                 self.adapter.mirror(&slot, mirror_percent).await?;
             }
             StepKind::Swap => {
+                record.set_traffic(step.traffic_percent)?;
                 let swapped = self.adapter.swap().await?;
                 record.slot = Some(swapped.active);
                 record.retained_slot = Some(swapped.retired_candidate);
-                record.set_traffic(step.traffic_percent)?;
+                record.retained_since = Some(now);
             }
             StepKind::Retire => {
+                let (retained, retained_since) =
+                    match (record.retained_slot.clone(), record.retained_since) {
+                        (Some(retained), Some(retained_since)) => (retained, retained_since),
+                        _ => return Err(RolloutError::NoRetainedSlot(record.id.clone())),
+                    };
+                let ready_at = retained_since + step.min_duration;
+                if now < ready_at {
+                    self.leases.release_all(&record.id)?;
+                    return self.park(record, ready_at);
+                }
+                self.adapter.retire(&retained).await?;
+                record.retained_slot = None;
+                record.retained_since = None;
                 record.set_traffic(step.traffic_percent)?;
+                return self.advance_or_complete(record, n).await;
             }
         }
         let since = self.clock.now();
         self.persist(&mut record, RolloutState::Baking { step: n, since })
     }
 
-    async fn bake(
+    async fn advance_or_complete(
         &self,
         mut record: RolloutRecord,
+        n: usize,
+    ) -> Result<(), RolloutError> {
+        if n + 1 < record.plan.steps.len() {
+            return self.persist(&mut record, RolloutState::Step(n + 1));
+        }
+        if let Some(slot) = record.slot.clone() {
+            self.adapter.clear_fallback(&slot).await?;
+        }
+        self.persist(&mut record, RolloutState::Complete)?;
+        self.leases.release_all(&record.id)?;
+        Ok(())
+    }
+
+    async fn bake(
+        &self,
+        record: RolloutRecord,
         n: usize,
         since: DateTime<Utc>,
     ) -> Result<(), RolloutError> {
@@ -407,22 +444,10 @@ impl RolloutExecutor {
                 return Ok(());
             }
         }
-        if step.kind == StepKind::Retire {
-            let retained = record
-                .retained_slot
-                .clone()
-                .ok_or_else(|| RolloutError::NoRetainedSlot(record.id.clone()))?;
-            self.adapter.retire(&retained).await?;
+        if let StepKind::Shadow { .. } = step.kind {
+            self.adapter.mirror(&slot, 0).await?;
         }
-        if n + 1 < record.plan.steps.len() {
-            return self.persist(&mut record, RolloutState::Step(n + 1));
-        }
-        if let Some(slot) = record.slot.clone() {
-            self.adapter.clear_fallback(&slot).await?;
-        }
-        self.persist(&mut record, RolloutState::Complete)?;
-        self.leases.release_all(&record.id)?;
-        Ok(())
+        self.advance_or_complete(record, n).await
     }
 
     async fn on_breach(
@@ -458,6 +483,7 @@ impl RolloutExecutor {
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
         if let Some(slot) = &record.slot {
             self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.mirror(slot, 0).await?;
             self.adapter.clear_fallback(slot).await?;
         }
         self.adapter.rollback_to(&record.previous_image).await?;
@@ -663,9 +689,10 @@ mod tests {
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
         let calls = rig.adapter.calls();
         assert_eq!(
-            calls[calls.len() - 3],
+            calls[calls.len() - 4],
             AdapterCall::SetTraffic(slot.clone(), 0)
         );
+        assert_eq!(calls[calls.len() - 3], AdapterCall::Mirror(slot.clone(), 0));
         assert_eq!(calls[calls.len() - 2], AdapterCall::ClearFallback(slot));
         assert_eq!(calls[calls.len() - 1], AdapterCall::RollbackTo(V1.into()));
         assert!(states(&rig.executor, &record.id).ends_with(&[
@@ -892,6 +919,7 @@ mod tests {
         let old = Slot::new("slot-1");
         assert!(rig.adapter.calls().ends_with(&[
             AdapterCall::SetTraffic(old.clone(), 0),
+            AdapterCall::Mirror(old.clone(), 0),
             AdapterCall::ClearFallback(old.clone()),
             AdapterCall::Retire(old.clone())
         ]));
@@ -1151,6 +1179,7 @@ mod tests {
         );
         assert!(rig.adapter.calls().ends_with(&[
             AdapterCall::SetTraffic(slot.clone(), 0),
+            AdapterCall::Mirror(slot.clone(), 0),
             AdapterCall::ClearFallback(slot),
             AdapterCall::RollbackTo(V1.into())
         ]));
@@ -1218,13 +1247,40 @@ mod tests {
         let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
         let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
         let record = rig.executor.start(plan, V2).await.unwrap();
+        let old = Slot::new("slot-0");
+        let new = Slot::new("slot-1");
+        let parked = rig.executor.run(&record.id).await.unwrap();
+        let until = t0() + Duration::days(2);
+        assert_eq!(
+            parked.state,
+            RolloutState::Parked {
+                until,
+                resume_state: Box::new(RolloutState::Step(1)),
+            },
+            "retire waits on the clock rather than blocking it"
+        );
+        assert_eq!(parked.retained_slot, Some(old.clone()));
+        assert_eq!(rig.adapter.image_in(&old), Some(V1.to_string()));
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::Retire(_))));
+        assert!(
+            rig.leases.snapshot().unwrap().is_empty(),
+            "released while parked"
+        );
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap(),
+            parked,
+            "a run before retain_for elapses is a no-op"
+        );
+        rig.clock.advance(until - rig.clock.now());
         let done = rig.executor.run(&record.id).await.unwrap();
         assert_eq!(done.state, RolloutState::Complete);
         assert_eq!(done.traffic_percent, 100);
-        let old = Slot::new("slot-0");
-        let new = Slot::new("slot-1");
         assert_eq!(done.slot, Some(new.clone()));
-        assert_eq!(done.retained_slot, Some(old.clone()));
+        assert_eq!(done.retained_slot, None, "cleared once retired");
         assert_eq!(rig.adapter.current(), V2);
         assert_eq!(rig.adapter.active(), new);
         assert_eq!(rig.adapter.traffic(&new), Some(100));
@@ -1247,12 +1303,9 @@ mod tests {
         assert_eq!(done.fallback, Some(FallbackSupport::Native));
         assert_eq!(
             states(&rig.executor, &record.id),
-            ["pending", "step", "step", "baking", "step", "baking", "complete"]
+            ["pending", "step", "step", "baking", "step", "parked", "step", "complete"]
         );
-        assert_eq!(
-            rig.clock.now(),
-            t0() + Duration::hours(1) + Duration::days(2)
-        );
+        assert_eq!(rig.clock.now(), until);
         assert!(rig.leases.snapshot().unwrap().is_empty());
         assert!(rig.escalation.escalations().is_empty());
     }
@@ -1286,7 +1339,60 @@ mod tests {
             .any(|c| matches!(c, AdapterCall::Retire(_))));
     }
 
-    const SHADOW_THEN_GRADUAL: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [50, 100]\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\nmax_divergence = 0.2\n[rollback]\nautomatic = true\non_breach = \"rollback\"\n";
+    #[tokio::test]
+    async fn roll_forward_after_a_swap_restores_the_retained_slot_before_draining_the_bad_one() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"roll-forward\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        let old = Slot::new("slot-0");
+        let bad = Slot::new("slot-1");
+        assert_eq!(halted.slot, Some(bad.clone()));
+        assert_eq!(halted.retained_slot, Some(old.clone()));
+        assert_eq!(
+            rig.adapter.current(),
+            V2,
+            "the swap already happened before the breach was detected"
+        );
+        let forwarded = rig
+            .executor
+            .roll_forward(
+                &record.id,
+                V3,
+                Some("https://github.com/example/repo/pull/9"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.state, RolloutState::Step(0));
+        assert_eq!(forwarded.retained_slot, None);
+        assert_eq!(forwarded.slot, None);
+        assert_eq!(
+            rig.adapter.active(),
+            old,
+            "the retained slot serves live traffic again"
+        );
+        assert_eq!(rig.adapter.current(), V1);
+        assert_eq!(rig.adapter.traffic(&old), Some(100));
+        assert_eq!(rig.adapter.image_in(&bad), None, "the bad slot is retired");
+        let calls = rig.adapter.calls();
+        let restore = calls
+            .iter()
+            .position(|c| *c == AdapterCall::SetTraffic(old.clone(), 100))
+            .unwrap();
+        let retire = calls
+            .iter()
+            .position(|c| *c == AdapterCall::Retire(bad.clone()))
+            .unwrap();
+        assert!(
+            restore < retire,
+            "the retained slot is restored before the bad one is retired"
+        );
+    }
+
+    const SHADOW_THEN_GRADUAL: &str ="[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [50, 100]\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\nmax_divergence = 0.2\n[rollback]\nautomatic = true\non_breach = \"rollback\"\n";
 
     fn shadow_plan() -> DeployPlan {
         DeployTemplate::parse(SHADOW_THEN_GRADUAL)
@@ -1305,7 +1411,11 @@ mod tests {
         let slot = Slot::new("slot-1");
         assert_eq!(done.slot, Some(slot.clone()));
         assert_eq!(rig.adapter.current(), V2);
-        assert_eq!(rig.adapter.mirrored(&slot), Some(15));
+        assert_eq!(
+            rig.adapter.mirrored(&slot),
+            Some(0),
+            "cleared once the shadow step finished"
+        );
         assert_eq!(rig.adapter.max_traffic(&slot), Some(100));
         assert_eq!(
             rig.adapter.calls(),
@@ -1314,6 +1424,7 @@ mod tests {
                 AdapterCall::DeployInactive(V2.into()),
                 AdapterCall::SetFallback(slot.clone(), FallbackPolicy::default()),
                 AdapterCall::Mirror(slot.clone(), 15),
+                AdapterCall::Mirror(slot.clone(), 0),
                 AdapterCall::SetTraffic(slot.clone(), 50),
                 AdapterCall::SetTraffic(slot.clone(), 100),
                 AdapterCall::ClearFallback(slot.clone()),
@@ -1389,10 +1500,7 @@ mod tests {
         let mut crafted = record.clone();
         crafted.slot = Some(Slot::new("slot-2"));
         crafted.retained_slot = None;
-        crafted.state = RolloutState::Baking {
-            step: 1,
-            since: t0(),
-        };
+        crafted.state = RolloutState::Step(1);
         rig.executor.log().append(None, &crafted).unwrap();
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
