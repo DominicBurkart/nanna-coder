@@ -1,6 +1,7 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
+use crate::qa::QaSummary;
 use crate::workspace::TaskWorkspace;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
@@ -89,6 +90,10 @@ pub struct TaskResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     pub iterations: usize,
     pub model_used: String,
+    /// Endpoint and browser QA the task's tools ran, empty when it ran none.
+    /// Defaulted so results recorded before this field existed still parse.
+    #[serde(default)]
+    pub qa_summary: QaSummary,
 }
 
 impl TaskResult {
@@ -101,6 +106,7 @@ impl TaskResult {
             "tool_calls_made": self.tool_calls_made,
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "qa_summary": self.qa_summary.to_json(),
         })
     }
 }
@@ -431,6 +437,7 @@ impl TaskManager {
                     });
 
                     let format_patch = workspace.format_patch().ok().flatten();
+                    let qa_summary = workspace.qa_summary();
 
                     let _ = workspace.cleanup();
 
@@ -454,6 +461,7 @@ impl TaskManager {
                                 tool_calls_made: result.tool_calls_made,
                                 iterations: result.iterations,
                                 model_used: model,
+                                qa_summary,
                             };
                             let mut tasks = tasks_ref.write().await;
                             if let Some(task) = tasks.get_mut(&task_id_clone) {
@@ -712,12 +720,31 @@ mod tests {
             tool_calls_made: vec![],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            qa_summary: QaSummary::default(),
         };
         let json = result.to_json();
         assert_eq!(json["result_summary"], "Done");
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
+        assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_task_result_qa_summary_defaults_when_absent_from_stored_json() {
+        let stored = serde_json::json!({
+            "result_summary": "Done",
+            "changes_patch": null,
+            "format_patch": null,
+            "files_modified": [],
+            "tool_calls_made": [],
+            "iterations": 1,
+            "model_used": "qwen3:0.6b",
+        });
+        let result: TaskResult = serde_json::from_value(stored).unwrap();
+        assert!(result.qa_summary.is_empty());
+        assert_eq!(result.qa_summary, QaSummary::default());
     }
 
     #[test]

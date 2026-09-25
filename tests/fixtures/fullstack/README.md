@@ -18,6 +18,13 @@ root workspace.
 
 `CHECKS` lists these paths one per line for smoke tests.
 
+`index.html` mounts the app into `<div id="main">`, dioxus 0.7's default
+root: without it, `dioxus::launch` logs a fallback ("mounting to the body")
+but never actually attaches the tree, so a real browser sees an empty
+`<body>` (found running the `qa_browser` container test in a headless
+Chromium; a plain `.wasm` substring check on `index.html`, as
+`apprun_integration` does, does not catch this).
+
 ## Environment hooks
 
 | Variable | Effect |

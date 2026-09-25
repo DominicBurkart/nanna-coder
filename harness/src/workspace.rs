@@ -6,8 +6,13 @@ use crate::container::{
     cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
     ContainerHandle,
 };
-use crate::onboarding::fullstack::FullStackRust;
+use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
 use crate::onboarding::OnboardingError;
+use crate::qa::{
+    register_qa_tools, trunk_asset_roots, BrowserDriver, ChromiumDriver, ContainerProbe, HttpProbe,
+    Manifest, ProcessSpawner, QaContext, QaLedger, QaSummary, ARTIFACT_DIR, DEFAULT_POLL,
+    DEFAULT_WAIT,
+};
 use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
     create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
@@ -65,14 +70,24 @@ pub fn worktree_mount_arg(workspace_path: &Path) -> String {
     )
 }
 
-/// The app spec of the full-stack workspace at `workspace_path`, `None`
-/// when the workspace does not match the profile.
-fn detect_app_spec(workspace_path: &Path) -> Result<Option<AppSpec>, OnboardingError> {
+/// What the full-stack profile tells the app and QA tools about a worktree.
+struct FullStackApp {
+    profile: FullStackRust,
+    spec: AppSpec,
+    asset_roots: Vec<String>,
+}
+
+fn detect_full_stack(workspace_path: &Path) -> Result<Option<FullStackApp>, OnboardingError> {
     let Some(profile) = FullStackRust::detect(workspace_path)? else {
         return Ok(None);
     };
     let spec = AppSpec::from_profile(&profile, workspace_path, CONTAINER_WORKSPACE_DIR)?;
-    Ok(Some(spec))
+    let asset_roots = trunk_asset_roots(&workspace_path.join(&profile.frontend.path))?;
+    Ok(Some(FullStackApp {
+        profile,
+        spec,
+        asset_roots,
+    }))
 }
 
 pub struct TaskWorkspace {
@@ -85,6 +100,10 @@ pub struct TaskWorkspace {
     port_allocator: Arc<PortAllocator>,
     app_runner: Arc<dyn CommandRunner>,
     app_limits: Limits,
+    extra_app_env: Vec<(String, String)>,
+    qa_probe: Option<Arc<dyn HttpProbe>>,
+    qa_driver: Option<Arc<dyn BrowserDriver>>,
+    qa_ledger: Arc<QaLedger>,
     cleaned_up: bool,
 }
 
@@ -113,6 +132,10 @@ impl TaskWorkspace {
             port_allocator: PortAllocator::shared(),
             app_runner: Arc::new(SystemRunner),
             app_limits: Limits::default(),
+            extra_app_env: Vec::new(),
+            qa_probe: None,
+            qa_driver: None,
+            qa_ledger: Arc::new(QaLedger::new()),
             cleaned_up: false,
         })
     }
@@ -236,6 +259,10 @@ impl TaskWorkspace {
             port_allocator: PortAllocator::shared(),
             app_runner: Arc::new(SystemRunner),
             app_limits: Limits::default(),
+            extra_app_env: Vec::new(),
+            qa_probe: None,
+            qa_driver: None,
+            qa_ledger: Arc::new(QaLedger::new()),
             cleaned_up: false,
         })
     }
@@ -244,6 +271,42 @@ impl TaskWorkspace {
     /// the workspace has no sidecars.
     pub fn sidecar_env(&self) -> &[(String, String)] {
         self.sidecars.as_ref().map_or(&[], |s| s.exports())
+    }
+
+    /// Extra environment for the application process, exported after the
+    /// sidecar variables (a repository hook such as `FIXTURE_BREAK_ROUTE=1`).
+    /// Call before [`Self::build_tool_registry`]: it bakes the environment
+    /// into the tool context it returns, so a later call here has no effect
+    /// on a registry already built.
+    pub fn set_app_env(&mut self, env: Vec<(String, String)>) {
+        self.extra_app_env = env;
+    }
+
+    /// The application environment: sidecar exports, then the extra
+    /// variables from [`TaskWorkspace::set_app_env`].
+    pub fn app_env(&self) -> Vec<(String, String)> {
+        let mut env = self.sidecar_env().to_vec();
+        env.extend(self.extra_app_env.iter().cloned());
+        env
+    }
+
+    /// Probe the `qa_endpoints` tool requests with (a stub in tests);
+    /// default: `curl` inside the dev container. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_qa_probe(&mut self, probe: Arc<dyn HttpProbe>) {
+        self.qa_probe = Some(probe);
+    }
+
+    /// Browser the `qa_browser` tool drives (a stub in tests); default:
+    /// headless Chromium inside the dev container. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_qa_driver(&mut self, driver: Arc<dyn BrowserDriver>) {
+        self.qa_driver = Some(driver);
+    }
+
+    /// Totals of the QA the task's tools have run so far.
+    pub fn qa_summary(&self) -> QaSummary {
+        self.qa_ledger.snapshot()
     }
 
     /// Limits for the app tools; `None` restores the defaults.
@@ -274,10 +337,10 @@ impl TaskWorkspace {
     /// full-stack Rust workspace; `None` otherwise. A profile that cannot be
     /// read is logged and treated as absent so the remaining tools still
     /// register.
-    fn app_context(&self) -> Option<AppContext> {
+    fn app_context(&self) -> Option<(FullStackApp, AppContext)> {
         let handle = self.container_handle.as_ref()?;
-        let spec = match detect_app_spec(&self.workspace_path) {
-            Ok(Some(spec)) => spec,
+        let app = match detect_full_stack(&self.workspace_path) {
+            Ok(Some(app)) => app,
             Ok(None) => return None,
             Err(e) => {
                 warn!(
@@ -287,17 +350,46 @@ impl TaskWorkspace {
                 return None;
             }
         };
-        Some(AppContext {
+        let ctx = AppContext {
             task_id: self.task_id.clone(),
             handle: Arc::clone(handle),
             runner: Arc::clone(&self.app_runner),
             apps: Arc::clone(&self.apps),
             ports: Arc::clone(&self.port_allocator),
-            spec,
-            env: self.sidecar_env().to_vec(),
+            spec: app.spec.clone(),
+            env: self.app_env(),
             limits: self.app_limits,
             poll_interval: DEFAULT_POLL_INTERVAL,
-        })
+        };
+        Some((app, ctx))
+    }
+
+    /// QA tool context next to the app tools: the repository manifest (or
+    /// one derived from the profile), the injected or container-backed
+    /// probe and browser, and the shared ledger.
+    fn qa_context(&self, app: &FullStackApp, ctx: &AppContext) -> QaContext {
+        let handle = Arc::clone(&ctx.handle);
+        let runner = Arc::clone(&ctx.runner);
+        let probe: Arc<dyn HttpProbe> = match &self.qa_probe {
+            Some(probe) => Arc::clone(probe),
+            None => Arc::new(ContainerProbe::new(Arc::clone(&handle), runner)),
+        };
+        let driver: Arc<dyn BrowserDriver> = match &self.qa_driver {
+            Some(driver) => Arc::clone(driver),
+            None => Arc::new(ChromiumDriver::new(handle, Arc::new(ProcessSpawner))),
+        };
+        QaContext {
+            task_id: self.task_id.clone(),
+            apps: Arc::clone(&self.apps),
+            workspace_root: self.workspace_path.clone(),
+            manifest_path: self.workspace_path.join(CHECKS_FILE),
+            derived: Manifest::derived(app.profile.health_path(), &app.asset_roots),
+            probe,
+            driver,
+            ledger: Arc::clone(&self.qa_ledger),
+            wait: DEFAULT_WAIT,
+            poll: DEFAULT_POLL,
+        }
     }
 
     fn stop_forgotten_app(&self, handle: &ContainerHandle) {
@@ -360,7 +452,8 @@ impl TaskWorkspace {
                 Arc::clone(handle),
                 CONTAINER_WORKSPACE_DIR,
             );
-            if let Some(ctx) = self.app_context() {
+            if let Some((app, ctx)) = self.app_context() {
+                register_qa_tools(&mut registry, self.qa_context(&app, &ctx));
                 register_app_tools(&mut registry, ctx);
             }
             registry
@@ -369,9 +462,13 @@ impl TaskWorkspace {
         }
     }
 
+    /// Stage every change except the harness artefacts under
+    /// [`ARTIFACT_DIR`], which are evidence for the task result, not part
+    /// of the patch.
     fn stage_all(&self) -> Result<(), WorkspaceError> {
+        let exclude = format!(":(exclude){ARTIFACT_DIR}");
         let add_output = git_cmd(&self.workspace_path)
-            .args(["add", "--all"])
+            .args(["add", "--all", "--", ".", &exclude])
             .output()?;
         if !add_output.status.success() {
             let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
@@ -530,6 +627,32 @@ mod tests {
             diff.contains("untracked.txt"),
             "Diff should include untracked file, got: {}",
             diff
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_excludes_qa_artifacts() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-artifact-exclude"), "HEAD")
+                .unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna-artifacts/qa")).unwrap();
+        std::fs::write(
+            ws.workspace_path
+                .join(".nanna-artifacts/qa/endpoints-1.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(ws.workspace_path.join("tracked.txt"), "hello").unwrap();
+
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("tracked.txt"), "{diff}");
+        assert!(
+            !diff.contains(".nanna-artifacts"),
+            "QA artefacts must not enter the patch: {diff}"
         );
         ws.cleanup().unwrap();
     }
@@ -968,6 +1091,9 @@ mod tests {
             for name in [APP_START_TOOL, APP_STOP_TOOL, APP_LOGS_TOOL] {
                 assert!(registry.get_tool(name).is_some(), "{name} missing");
             }
+            for name in [crate::qa::QA_ENDPOINTS_TOOL, crate::qa::QA_BROWSER_TOOL] {
+                assert!(registry.get_tool(name).is_some(), "{name} missing");
+            }
             assert!(registry.get_tool("trunk_build").is_some());
             ws.cleanup().unwrap();
 
@@ -981,6 +1107,12 @@ mod tests {
                 registry.get_tool(APP_START_TOOL).is_none(),
                 "plain repo has no app tools"
             );
+            for name in [crate::qa::QA_ENDPOINTS_TOOL, crate::qa::QA_BROWSER_TOOL] {
+                assert!(
+                    registry.get_tool(name).is_none(),
+                    "plain repo has no {name}"
+                );
+            }
             assert!(registry.get_tool("run_command").is_some());
             ws.cleanup().unwrap();
         }
@@ -998,6 +1130,8 @@ mod tests {
             ws.container_handle = Some(stub_handle());
             let registry = ws.build_tool_registry();
             assert!(registry.get_tool(APP_START_TOOL).is_none());
+            assert!(registry.get_tool(crate::qa::QA_ENDPOINTS_TOOL).is_none());
+            assert!(registry.get_tool(crate::qa::QA_BROWSER_TOOL).is_none());
             assert!(registry.get_tool("run_command").is_some());
             ws.cleanup().unwrap();
         }
@@ -1105,6 +1239,140 @@ mod tests {
             );
             ws.cleanup().unwrap();
             assert!(!ws.workspace_path.exists());
+        }
+
+        struct StubHttpProbe {
+            responses: std::collections::HashMap<String, (u16, String)>,
+        }
+
+        impl crate::qa::HttpProbe for StubHttpProbe {
+            fn get(&self, url: &str) -> Result<crate::qa::ProbeResponse, crate::qa::ProbeError> {
+                self.responses
+                    .get(url)
+                    .map(|(status, body)| crate::qa::ProbeResponse {
+                        status: *status,
+                        body: body.clone(),
+                    })
+                    .ok_or_else(|| crate::qa::ProbeError::Request {
+                        url: url.to_string(),
+                        detail: "unscripted request".to_string(),
+                    })
+            }
+        }
+
+        #[tokio::test]
+        async fn qa_tools_run_against_the_started_app_using_the_repository_manifest() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::new(46000..=46000, leases.path()));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-checks",
+            );
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46000/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46000/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46000/api/v1/greeting".to_string(),
+                (200, "Hello from the full-stack fixture".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let page = crate::qa::browser::stub::StubPage::new(&[
+                serde_json::json!("complete"),
+                serde_json::json!("Hello from the full-stack fixture"),
+            ]);
+            ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let endpoints = registry
+                .execute(crate::qa::QA_ENDPOINTS_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(endpoints["manifest"], "CHECKS");
+            assert_eq!(endpoints["all_passed"], true, "{endpoints}");
+            let scenario = serde_json::json!({ "steps": [
+                { "step": "goto", "path": "/" },
+                { "step": "expect_text", "selector": "#greeting", "text": "Hello" }
+            ] });
+            let browser = registry
+                .execute(
+                    crate::qa::QA_BROWSER_TOOL,
+                    serde_json::json!({ "scenario": scenario }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(browser["passed"], true, "{browser}");
+            let summary = ws.qa_summary();
+            assert_eq!(summary.endpoint_runs, 1);
+            assert_eq!(summary.browser_runs, 1);
+            assert_eq!(summary.artifacts.len(), 2);
+            ws.cleanup().unwrap();
+        }
+
+        #[tokio::test]
+        async fn qa_endpoints_derives_a_manifest_when_the_repo_has_no_checks_file() {
+            let source = fixture_repo();
+            std::fs::remove_file(source.path().join("CHECKS")).unwrap();
+            git_cmd(source.path())
+                .args(["commit", "-qam", "drop checks"])
+                .output()
+                .unwrap();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::new(46100..=46100, leases.path()));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-derived",
+            );
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46100/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46100/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let endpoints = registry
+                .execute(crate::qa::QA_ENDPOINTS_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(endpoints["manifest"], "derived");
+            assert_eq!(endpoints["passed"], 2, "{endpoints}");
+            assert_eq!(endpoints["all_passed"], true, "{endpoints}");
+            ws.cleanup().unwrap();
+        }
+
+        #[test]
+        fn app_env_appends_extra_vars_after_sidecar_exports() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-app-env"), "HEAD").unwrap();
+            assert!(ws.app_env().is_empty());
+            ws.set_app_env(vec![("FIXTURE_BREAK_ROUTE".to_string(), "1".to_string())]);
+            assert_eq!(
+                ws.app_env(),
+                vec![("FIXTURE_BREAK_ROUTE".to_string(), "1".to_string())]
+            );
+            ws.cleanup().unwrap();
         }
 
         #[test]
