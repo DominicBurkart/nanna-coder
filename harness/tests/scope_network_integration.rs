@@ -59,6 +59,7 @@ async fn start(network: NetworkPolicy) -> Option<Arc<ContainerHandle>> {
         env_vars: vec![],
         additional_args: vec!["-i".to_string(), "-t".to_string()],
         network,
+        read_only_mounts: vec![],
     };
     match start_container_with_fallback(&config).await {
         Ok(handle) => Some(Arc::new(handle)),

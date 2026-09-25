@@ -179,6 +179,7 @@ impl TaskWorkspace {
             env_vars: vec![],
             additional_args,
             network,
+            read_only_mounts: vec![],
         };
 
         let handle = match start_fn(config).await {
