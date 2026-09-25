@@ -1,5 +1,6 @@
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
+use crate::protected::ProtectedPathViolation;
 use crate::scope::{
     canonical_root, relative_to, resolve_path, validate_path_within_workspace, DenialReason,
     PathAccess, PathScope, ScopeDenial, ScopeError,
@@ -31,6 +32,9 @@ pub enum ToolError {
 
     #[error("Scope denial: {0}")]
     ScopeDenied(ScopeDenial),
+
+    #[error("Protected path: {0}")]
+    ProtectedPath(ProtectedPathViolation),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
