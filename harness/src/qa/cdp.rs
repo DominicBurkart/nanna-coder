@@ -93,14 +93,14 @@ impl PipeTransport {
             .stderr(Stdio::null())
             .spawn()?;
         let stdin = child.stdin.take();
-        let stdout = child.stdout.take().map(BufReader::new);
-        let Some(stdout) = stdout else {
-            return Err(std::io::Error::other("child has no stdout"));
-        };
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("child has no stdout"))?;
         Ok(Self {
             child,
             stdin,
-            stdout,
+            stdout: BufReader::new(stdout),
         })
     }
 }
@@ -190,20 +190,26 @@ impl CdpSession {
         if let Some(session) = &self.session_id {
             message["sessionId"] = Value::String(session.clone());
         }
-        let pipe = |source| BrowserError::Pipe {
-            method: method.to_string(),
-            source,
-        };
-        self.transport.send(&message.to_string()).map_err(pipe)?;
-        loop {
-            let raw = self.transport.receive().map_err(pipe)?;
-            let msg: Value = serde_json::from_str(&raw)
-                .map_err(|_| BrowserError::Malformed { raw: raw.clone() })?;
-            if msg.get("id").and_then(Value::as_u64) == Some(id) {
-                return response(method, msg);
-            }
-            self.record_event(&msg);
+        self.transport
+            .send(&message.to_string())
+            .map_err(|source| pipe_error(method, source))?;
+        self.await_response(method, id)
+    }
+
+    /// Read protocol messages until the response to `id` arrives, recording
+    /// every event seen along the way.
+    fn await_response(&mut self, method: &str, id: u64) -> Result<Value, BrowserError> {
+        let raw = self
+            .transport
+            .receive()
+            .map_err(|source| pipe_error(method, source))?;
+        let msg: Value =
+            serde_json::from_str(&raw).map_err(|_| BrowserError::Malformed { raw: raw.clone() })?;
+        if msg.get("id").and_then(Value::as_u64) == Some(id) {
+            return response(method, msg);
         }
+        self.record_event(&msg);
+        self.await_response(method, id)
     }
 
     /// Create a blank page target, attach to it and enable the page,
@@ -230,6 +236,13 @@ impl CdpSession {
         if let Some(error) = console_error_from_event(msg) {
             self.console_errors.push(error);
         }
+    }
+}
+
+fn pipe_error(method: &str, source: std::io::Error) -> BrowserError {
+    BrowserError::Pipe {
+        method: method.to_string(),
+        source,
     }
 }
 
@@ -654,6 +667,10 @@ mod tests {
         )
         .is_none());
         assert!(console_error_from_event(&json!({ "params": {} })).is_none());
+        assert!(console_error_from_event(
+            &json!({ "method": "Page.loadEventFired", "params": {} })
+        )
+        .is_none());
         assert!(console_error_from_event(
             &json!({ "method": "Runtime.exceptionThrown", "params": {} })
         )

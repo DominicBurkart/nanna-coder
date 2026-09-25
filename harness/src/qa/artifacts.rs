@@ -59,10 +59,11 @@ impl QaArtifacts {
 
     fn next_index(&self, prefix: &str, suffix: &str) -> std::io::Result<usize> {
         std::fs::create_dir_all(&self.root)?;
-        let names = std::fs::read_dir(&self.root)?
+        let names: Vec<String> = std::fs::read_dir(&self.root)?
             .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned());
-        Ok(next_index(names, prefix, suffix))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        Ok(next_index(&names, prefix, suffix))
     }
 }
 
@@ -72,13 +73,15 @@ impl QaArtifacts {
 /// use harness::qa::artifacts::next_index;
 ///
 /// let names = ["endpoints-1.json", "endpoints-7.json", "endpoints-x.json", "browser-3"];
-/// assert_eq!(next_index(names.iter().map(|s| s.to_string()), "endpoints-", ".json"), 8);
-/// assert_eq!(next_index(names.iter().map(|s| s.to_string()), "browser-", ""), 4);
-/// assert_eq!(next_index(std::iter::empty(), "browser-", ""), 1);
+/// let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+/// assert_eq!(next_index(&names, "endpoints-", ".json"), 8);
+/// assert_eq!(next_index(&names, "browser-", ""), 4);
+/// assert_eq!(next_index(&[], "browser-", ""), 1);
 /// ```
-pub fn next_index(names: impl Iterator<Item = String>, prefix: &str, suffix: &str) -> usize {
+pub fn next_index(names: &[String], prefix: &str, suffix: &str) -> usize {
     names
-        .filter_map(|name| index_of(&name, prefix, suffix))
+        .iter()
+        .filter_map(|name| index_of(name, prefix, suffix))
         .max()
         .map_or(1, |max| max + 1)
 }
@@ -150,6 +153,13 @@ mod tests {
         assert_eq!(index_of("endpoints-3.json", "endpoints-", ".json"), Some(3));
         assert_eq!(index_of("endpoints-3", "endpoints-", ".json"), None);
         assert_eq!(index_of("other", "endpoints-", ".json"), None);
+    }
+
+    #[test]
+    fn next_index_of_an_empty_slice_is_one() {
+        assert_eq!(next_index(&[], "browser-", ""), 1);
+        let names = vec!["browser-2".to_string(), "browser-9".to_string()];
+        assert_eq!(next_index(&names, "browser-", ""), 10);
     }
 
     #[test]

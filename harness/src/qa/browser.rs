@@ -445,7 +445,10 @@ impl ScenarioRunner {
                 return report;
             }
         };
-        for step in &scenario.steps {
+        let mut index = 0;
+        let mut fatal_stop = false;
+        while index < scenario.steps.len() && !fatal_stop {
+            let step = &scenario.steps[index];
             let outcome = self.run_step(page.as_mut(), frontend_url, step, &mut report.screenshots);
             report.console_errors.extend(page.drain_console_errors());
             let (passed, detail, fatal) = match outcome {
@@ -457,9 +460,8 @@ impl ScenarioRunner {
                 passed,
                 detail,
             });
-            if fatal {
-                break;
-            }
+            fatal_stop = fatal;
+            index += 1;
         }
         if let Err(e) = page.close() {
             tracing::warn!("browser did not close cleanly: {e}");
@@ -547,15 +549,15 @@ impl ScenarioRunner {
         accept: impl Fn(&Value) -> bool,
     ) -> Result<Result<Value, Value>, BrowserError> {
         let deadline = Instant::now() + self.wait;
-        loop {
-            let value = page.evaluate(expression)?;
-            if accept(&value) {
-                return Ok(Ok(value));
-            }
-            if Instant::now() >= deadline {
-                return Ok(Err(value));
-            }
+        let mut value = page.evaluate(expression)?;
+        while !accept(&value) && Instant::now() < deadline {
             std::thread::sleep(self.poll);
+            value = page.evaluate(expression)?;
+        }
+        if accept(&value) {
+            Ok(Ok(value))
+        } else {
+            Ok(Err(value))
         }
     }
 }
@@ -1021,6 +1023,16 @@ mod tests {
         );
         assert!(report.steps[0].passed);
         assert!(!report.passed);
+
+        let page = StubPage::new(&[json!("complete")]);
+        let driver = StubDriver::new(vec![page]);
+        let scenario = steps_of(json!([
+            { "step": "goto", "path": "/" },
+            { "step": "expect_text", "selector": "#never", "text": "x" }
+        ]));
+        let report = fast(driver, dir.path()).run("http://app", &scenario);
+        assert_eq!(report.steps[1].detail, "no element matches `#never`");
+        assert!(!report.steps[1].passed);
     }
 
     #[test]
