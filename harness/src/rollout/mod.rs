@@ -23,7 +23,10 @@ mod log;
 mod serverless;
 mod state;
 
-pub use adapter::{AdapterCall, AdapterError, AdapterOp, FakeAdapter, Slot, TargetAdapter};
+pub use adapter::{
+    AdapterCall, AdapterError, AdapterOp, FakeAdapter, FallbackPolicy, FallbackSupport, Slot,
+    Swapped, TargetAdapter,
+};
 pub use executor::{fake_executor, RolloutConfig, RolloutExecutor};
 pub use health::{
     check_health, FakeHealthSource, HealthBreach, HealthError, HealthObservation, HealthSample,
@@ -39,7 +42,7 @@ pub use log::{
 #[cfg(feature = "serverless-adapter")]
 pub use serverless::{
     CommandOutput, CommandRunner, ProcessRunner, ServerlessAdapter, ServerlessConfig,
-    SERVERLESS_ENV,
+    SERVERLESS_ENV, SERVERLESS_FALLBACK_ENV,
 };
 pub use state::{RolloutRecord, RolloutState};
 
