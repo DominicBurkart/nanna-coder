@@ -191,10 +191,22 @@ fn executable_in_message(line: &str) -> Option<String> {
 }
 
 /// `curl` probe of the health endpoint from inside the container.
+/// Per-probe curl timeout, in seconds.
+///
+/// A connection that accepts a socket but never answers would otherwise let
+/// a single health probe hang past [`wait_healthy`]'s deadline check, which
+/// only runs *between* probes: `app_start`'s hard wall-clock limit could be
+/// defeated by one stalled request. A healthy app answers in well under
+/// this window; if it doesn't, the probe should fail fast and let the
+/// deadline loop decide whether to keep waiting or give up.
+pub const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
+
 pub fn health_probe_argv(port: u16, health_path: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
         "-sf".to_string(),
+        "-m".to_string(),
+        HEALTH_PROBE_TIMEOUT_SECS.to_string(),
         "-o".to_string(),
         "/dev/null".to_string(),
         format!("http://127.0.0.1:{port}{health_path}"),
@@ -726,6 +738,8 @@ mod tests {
             [
                 "curl",
                 "-sf",
+                "-m",
+                &HEALTH_PROBE_TIMEOUT_SECS.to_string(),
                 "-o",
                 "/dev/null",
                 "http://127.0.0.1:18000/health/v1"
@@ -863,6 +877,8 @@ mod tests {
                 "nanna-task-t",
                 "curl",
                 "-sf",
+                "-m",
+                &HEALTH_PROBE_TIMEOUT_SECS.to_string(),
                 "-o",
                 "/dev/null",
                 "http://127.0.0.1:41000/health/v1"
