@@ -1,6 +1,7 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
+use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -227,6 +228,8 @@ struct TaskRunner {
     providers: RwLock<HashMap<TaskId, Arc<dyn ModelProvider>>>,
     /// Provider for tasks restored from the queue store, which carry none.
     default_provider: Option<Arc<dyn ModelProvider>>,
+    /// Coordination leases; a task's leases are released when it ends.
+    leases: Arc<dyn LeaseStore>,
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -243,27 +246,49 @@ pub struct TaskManager {
 impl TaskManager {
     /// An in-memory manager with the default hybrid policy.
     pub fn new(max_concurrent_tasks: usize) -> Self {
-        Self::build(
+        Self::with_stores(
             max_concurrent_tasks,
             Box::new(HybridPolicy::default()),
             Box::new(InMemoryQueueStore::default()),
-            None,
+            Arc::new(InMemoryLeaseStore::default()),
         )
         .expect("an empty in-memory queue store always loads")
+    }
+
+    /// A manager over explicit stores whose queue is empty or whose entries
+    /// will be submitted afresh; use [`restore`](Self::restore) to resume a
+    /// persisted backlog.
+    pub fn with_stores(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+    ) -> Result<Self, QueueStoreError> {
+        Self::build(max_concurrent_tasks, policy, store, leases, None)
     }
 
     /// Build a manager over `store`, re-queue every entry the store still
     /// holds and start dispatching. Restored entries run with `provider`;
     /// entries submitted later carry their own.
+    ///
+    /// Crash recovery for `leases`: every lease held by a restored task is
+    /// released, since the task will start over, and every expired lease is
+    /// reclaimed. Recovery failures surface as `QueueStoreError::Rejected`.
     pub async fn restore(
         max_concurrent_tasks: usize,
         policy: Box<dyn SchedulingPolicy>,
         store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
     ) -> Result<Self, QueueStoreError> {
-        let manager = Self::build(max_concurrent_tasks, policy, store, Some(provider))?;
+        let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
+            manager.runner.recover_leases(&queued.id)?;
+        }
+        let reclaimed = manager.runner.leases.expired(Utc::now()).map_err(reject)?;
+        for lease in reclaimed {
+            tracing::info!(lease = %lease.name, holder = %lease.holder, "Reclaimed expired lease on restore");
         }
         manager.dispatcher.dispatch().await;
         Ok(manager)
@@ -273,6 +298,7 @@ impl TaskManager {
         max_concurrent_tasks: usize,
         policy: Box<dyn SchedulingPolicy>,
         store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, QueueStoreError> {
         let runner = Arc::new(TaskRunner {
@@ -283,6 +309,7 @@ impl TaskManager {
             status_senders: Arc::new(RwLock::new(HashMap::new())),
             providers: RwLock::new(HashMap::new()),
             default_provider,
+            leases,
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -293,6 +320,17 @@ impl TaskManager {
     /// per-side dispatch counts.
     pub async fn queue_metrics(&self) -> QueueMetrics {
         self.dispatcher.metrics(Utc::now()).await
+    }
+
+    /// The coordination lease store. Acquire with the task id as holder so
+    /// the leases are released when the task ends.
+    pub fn leases(&self) -> Arc<dyn LeaseStore> {
+        Arc::clone(&self.runner.leases)
+    }
+
+    /// Every recorded lease with live and expired counts as of now.
+    pub fn lease_snapshot(&self) -> Result<LeaseSnapshot, LeaseError> {
+        LeaseSnapshot::from_store(&*self.runner.leases, Utc::now())
     }
 
     async fn get_or_build_image(
@@ -491,6 +529,7 @@ impl TaskManager {
             task.last_updated_at = now;
             task.clone()
         };
+        self.runner.release_leases(task_id);
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -600,10 +639,36 @@ impl TaskRunner {
                 task.last_updated_at = Utc::now();
             }
         }
+        if status.is_terminal() {
+            self.release_leases(task_id);
+        }
         let senders = self.status_senders.read().await;
         if let Some((tx, _keepalive)) = senders.get(task_id) {
             let _ = tx.send(status);
         }
+    }
+
+    /// Give back every lease the task holds. A store failure is logged: the
+    /// task is already terminal and the leases lapse at their TTL.
+    fn release_leases(&self, task_id: &TaskId) {
+        match self.leases.release_all(&task_id.0) {
+            Ok(released) => {
+                for lease in released {
+                    tracing::info!(task_id = %task_id, lease = %lease.name, "Released lease at task end");
+                }
+            }
+            Err(e) => {
+                tracing::error!(task_id = %task_id, error = %e, "Failed to release leases at task end");
+            }
+        }
+    }
+
+    /// Release the leases a restored task held before the crash.
+    fn recover_leases(&self, task_id: &TaskId) -> Result<(), QueueStoreError> {
+        for lease in self.leases.release_all(&task_id.0).map_err(reject)? {
+            tracing::info!(task_id = %task_id, lease = %lease.name, "Released lease of restored task");
+        }
+        Ok(())
     }
 
     /// Mark a task `Failed` before any agent iteration ran.
@@ -787,6 +852,10 @@ impl TaskRunner {
             }
         }
     }
+}
+
+fn reject(e: crate::leases::LeaseError) -> QueueStoreError {
+    QueueStoreError::Rejected(format!("lease recovery failed: {e}"))
 }
 
 /// Stable `error_type` label for an agent failure.
@@ -1685,6 +1754,7 @@ mod tests {
 mod scheduler_tests {
     use super::tests::{stop_response, MockProvider};
     use super::*;
+    use crate::leases::{JsonlLeaseStore, Lease, LeaseError, LeaseName};
     use crate::scheduler::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
     use async_trait::async_trait;
     use model::provider::{ModelError, ModelResult};
@@ -1786,6 +1856,7 @@ mod scheduler_tests {
         assert_eq!(metrics.queued, 1);
         assert_eq!(metrics.running, 1);
         assert_eq!(metrics.dispatched_newest, 1);
+        assert_eq!(manager.lease_snapshot().unwrap().held, 0);
 
         open.send(true).unwrap();
         let done = wait_for(&manager, &first, TaskStatus::is_terminal).await;
@@ -1833,6 +1904,7 @@ mod scheduler_tests {
             0,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
         )
         .await
@@ -1860,6 +1932,7 @@ mod scheduler_tests {
             2,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
         )
         .await
@@ -1894,6 +1967,7 @@ mod scheduler_tests {
             1,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
             provider,
         )
         .await;
@@ -1934,6 +2008,7 @@ mod scheduler_tests {
             1,
             Box::new(HybridPolicy::default()),
             Box::new(RejectingStore),
+            Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
         )
         .await
@@ -1977,6 +2052,7 @@ mod scheduler_tests {
             0,
             Box::new(HybridPolicy::default()),
             Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
         )
         .await
@@ -1992,5 +2068,208 @@ mod scheduler_tests {
             manager.wait_terminal(&id).await.map(|s| s.is_terminal()),
             Some(true)
         );
+    }
+
+    fn lease(name: &str) -> LeaseName {
+        LeaseName::branch("example/repo", name)
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_cancelled_task() {
+        let manager = TaskManager::new(0);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let entry = queued(Path::new("/nonexistent"));
+        let holder = entry.id.0.clone();
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &holder,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let other = leases
+            .acquire(
+                &lease("dev"),
+                "someone-else",
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        assert_eq!(leases.snapshot().unwrap().len(), 2);
+        manager.cancel(&id).await.unwrap();
+        assert_eq!(leases.snapshot().unwrap(), vec![other]);
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_failed_task() {
+        let manager = TaskManager::new(1);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let entry = queued(Path::new("/nonexistent"));
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &entry.id.0,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Failed { .. }));
+        assert!(leases.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_completed_task() {
+        let repo = git_repo();
+        let manager = TaskManager::new(1);
+        let (_open, gate) = watch::channel(true);
+        let provider: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let entry = queued(repo.path());
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &entry.id.0,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Completed { .. }));
+        assert!(leases.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restore_releases_crashed_task_leases_and_reclaims_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+        let lease_path = dir.path().join("leases.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
+            Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let entry = queued(Path::new("/nonexistent"));
+        let crashed = entry.id.0.clone();
+        let now = Utc::now();
+        let leases = first.leases();
+        leases
+            .acquire(&lease("main"), &crashed, chrono::Duration::hours(1), now)
+            .unwrap();
+        leases
+            .acquire(
+                &lease("stale"),
+                "gone",
+                chrono::Duration::seconds(1),
+                now - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let live = leases
+            .acquire(&lease("live"), "elsewhere", chrono::Duration::hours(1), now)
+            .unwrap();
+        first.submit_task(entry, Arc::clone(&provider)).await;
+        drop(first);
+
+        let second = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
+            Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
+            provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.list().await.len(), 1);
+        assert_eq!(second.leases().snapshot().unwrap(), vec![live]);
+    }
+
+    struct BrokenLeases;
+
+    impl LeaseStore for BrokenLeases {
+        fn acquire(
+            &self,
+            _name: &LeaseName,
+            _holder: &str,
+            _ttl: chrono::Duration,
+            _now: DateTime<Utc>,
+        ) -> Result<Lease, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn renew(
+            &self,
+            _lease: &Lease,
+            _ttl: chrono::Duration,
+            _now: DateTime<Utc>,
+        ) -> Result<Lease, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn release(&self, _lease: &Lease) -> Result<(), LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn release_all(&self, _holder: &str) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn expired(&self, _now: DateTime<Utc>) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn snapshot(&self) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_surfaces_lease_recovery_failures() {
+        let store = InMemoryQueueStore::default();
+        store.insert(&queued(Path::new("/nonexistent"))).unwrap();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let err = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(BrokenLeases),
+            Arc::clone(&provider),
+        )
+        .await
+        .err()
+        .expect("restore must fail when lease recovery fails");
+        assert!(err.to_string().contains("lease recovery failed"));
+        assert!(err.to_string().contains("broken"));
+
+        let empty = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+            Arc::clone(&provider),
+        )
+        .await
+        .err()
+        .expect("restore must fail when expired-lease reclamation fails");
+        assert!(matches!(empty, QueueStoreError::Rejected(_)));
+
+        let manager = TaskManager::with_stores(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+        )
+        .unwrap();
+        assert!(manager.lease_snapshot().is_err());
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        let cancelled = manager.cancel(&id).await.unwrap();
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
     }
 }

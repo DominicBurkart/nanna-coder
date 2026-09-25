@@ -659,7 +659,38 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
     }
 
     report_queue_health()?;
+    report_lease_health()?;
 
+    Ok(())
+}
+
+/// Print every recorded coordination lease with live and expired counts.
+/// A missing lease log means no lease has been granted yet.
+fn report_lease_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::{default_lease_path, JsonlLeaseStore, LeaseSnapshot};
+
+    let Some(path) = default_lease_path() else {
+        println!("- Leases: no lease location (set NANNA_LEASE_PATH, NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Leases: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlLeaseStore::open(&path)?;
+    let snapshot = LeaseSnapshot::from_store(&store, chrono::Utc::now())?;
+    println!("- Leases ({}): {}", path.display(), snapshot);
+    for lease in &snapshot.leases {
+        let state = if lease.is_expired(snapshot.at) {
+            "expired"
+        } else {
+            "held"
+        };
+        println!(
+            "  {} {} by {} until {}",
+            state, lease.name, lease.holder, lease.until
+        );
+    }
     Ok(())
 }
 
@@ -680,6 +711,16 @@ fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = QueueMetrics::from_store(&store, chrono::Utc::now())?;
     println!("- Task queue ({}): {}", path.display(), metrics);
     Ok(())
+}
+
+/// Lease log location: `NANNA_LEASE_PATH` when set, otherwise
+/// `leases.jsonl` next to the queue log.
+fn resolve_lease_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::leases::lease_path_from(
+        std::env::var_os(harness::leases::LEASE_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields a lease path")
 }
 
 fn resolve_queue_path(
@@ -871,6 +912,7 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -879,21 +921,24 @@ async fn run_mcp_server(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
+    let lease_path = resolve_lease_path(&queue_path);
     let task_manager = Arc::new(
         TaskManager::restore(
             DEFAULT_MAX_CONCURRENT_TASKS,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&queue_path)?),
+            Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
         )
         .await?,
     );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {})",
         model,
         max_iterations,
-        queue_path.display()
+        queue_path.display(),
+        lease_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
