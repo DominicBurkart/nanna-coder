@@ -9,6 +9,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod qa;
 pub mod sidecar;
 pub mod task;
 pub mod telemetry;
