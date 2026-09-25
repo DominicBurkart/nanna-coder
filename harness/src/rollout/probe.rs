@@ -49,8 +49,13 @@ struct ProbeRecord {
 /// latency and per-endpoint status, the shape [`HealthSource`] needs.
 ///
 /// Each call probes every endpoint once, appends the outcomes (stamped by
-/// the injected [`Clock`]) to a rolling buffer, drops entries older than
-/// `now - window`, and aggregates what remains. A transport failure counts
+/// the injected [`Clock`]) to a rolling buffer, drops every entry at or
+/// before `now - window`, and aggregates what remains. The cutoff is
+/// exclusive so that, at the executor's own poll cadence (one `sample`
+/// call every `window`), the previous call's entries — timestamped exactly
+/// on the new cutoff — are dropped rather than kept: an inclusive cutoff
+/// would blend a step-change regression across two polls and delay its
+/// breach by one interval. A transport failure counts
 /// toward `error_rate` but leaves the endpoint out of `endpoint_statuses`
 /// (it reads as [`HealthObservation::EndpointMissing`](super::health::HealthObservation::EndpointMissing)
 /// downstream rather than inventing a status code).
@@ -126,7 +131,7 @@ impl HealthSource for EndpointHealthSource {
         }
         let mut history = self.history.lock().unwrap();
         let cutoff = now - window;
-        history.retain(|r| r.at >= cutoff);
+        history.retain(|r| r.at > cutoff);
         let mut statuses: BTreeMap<String, u16> = BTreeMap::new();
         let mut latencies: Vec<u32> = Vec::new();
         let mut total = 0usize;
@@ -249,7 +254,7 @@ impl ReqwestProbe {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
-                .unwrap_or_default(),
+                .expect("static reqwest client config"),
         }
     }
 }
@@ -385,6 +390,29 @@ mod tests {
         let sample = source.sample(&slot(), Duration::minutes(1)).await.unwrap();
         assert_eq!(sample.endpoint_statuses["/health/v1"], 200);
         assert_eq!(sample.error_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_step_change_to_broken_is_not_diluted_by_the_previous_healthy_poll() {
+        let clock = Arc::new(SimulatedClock::new(Utc::now()));
+        let probe = Arc::new(FakeHttpProbe::healthy());
+        let source = source(probe.clone(), clock.clone(), &["/health/v1"]);
+        let window = Duration::minutes(1);
+        let healthy = source.sample(&slot(), window).await.unwrap();
+        assert_eq!(healthy.error_rate, 0.0);
+        clock.advance(window);
+        probe.push(
+            "http://fixture.invalid/health/v1",
+            ProbeResponse {
+                status: 500,
+                latency_ms: 1,
+            },
+        );
+        let broken = source.sample(&slot(), window).await.unwrap();
+        assert_eq!(
+            broken.error_rate, 1.0,
+            "the previous healthy poll, timestamped exactly on the new cutoff, must not survive"
+        );
     }
 
     #[test]

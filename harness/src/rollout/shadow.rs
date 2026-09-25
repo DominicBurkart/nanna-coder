@@ -159,9 +159,6 @@ impl ShadowComparator {
                 },
                 observed: HealthObservation::ShadowDivergence(d.rate()),
                 step,
-                // A mirrored pair has no endpoint identity at this layer
-                // (`ShadowSample` compares a status/latency pair, not a
-                // path), so there is nothing to attach as evidence.
                 evidence: Vec::new(),
             })
     }

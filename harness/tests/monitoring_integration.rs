@@ -8,8 +8,11 @@
 //! (it belongs to a different lane's `tests/fixtures/` tree), so this test
 //! stands up its own minimal HTTP stub instead, following the same raw
 //! `tokio::net::TcpListener` pattern already used for Ollama stubs in
-//! `harness/src/eval/runner.rs`. The stub always answers `/health/v1` with
-//! `500`, playing the role of `FIXTURE_BREAK_ROUTE=1`.
+//! `harness/src/eval/runner.rs`. The stub answers `/health/v1` with `200`
+//! for the first request and `500` (playing the role of
+//! `FIXTURE_BREAK_ROUTE=1`) for every one after that, so the rollout is
+//! seen healthy on its first poll and only regresses on the next one, the
+//! way a real deploy-then-break would look.
 
 use chrono::{Duration, Utc};
 use harness::deploy::DeployTemplate;
@@ -19,28 +22,34 @@ use harness::rollout::{
     RolloutState,
 };
 use harness::windows::WindowSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const PLAN: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"gradual\"\nsteps = [100]\nmin_step_duration = \"1m\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 1.0\nlatency_p99_max_ms = 5000\nbake_time = \"5m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\n";
+const PLAN: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"gradual\"\nsteps = [100]\nmin_step_duration = \"1m\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.5\nlatency_p99_max_ms = 5000\nbake_time = \"5m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\n";
 
-/// Always answers `GET /health/v1` (and anything else) with `500`,
-/// simulating the fixture's `FIXTURE_BREAK_ROUTE=1` behaviour.
-async fn spawn_always_broken_stub() -> std::net::SocketAddr {
+/// Answers `GET /health/v1` (and anything else) with `200` for the first
+/// request, `500` after that.
+async fn spawn_stub_that_breaks_after_the_first_request() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = match listener.accept().await {
                 Ok(s) => s,
                 Err(_) => break,
             };
+            let requests = requests.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 1024];
                 let _ = socket.read(&mut buf).await;
-                let response =
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let response = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
                 let _ = socket.write_all(response.as_bytes()).await;
             });
         }
@@ -50,7 +59,7 @@ async fn spawn_always_broken_stub() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn a_broken_endpoint_breaches_health_within_one_poll_interval_and_rolls_back() {
-    let addr = spawn_always_broken_stub().await;
+    let addr = spawn_stub_that_breaks_after_the_first_request().await;
     let dir = tempfile::tempdir().unwrap();
     let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
     let clock = Arc::new(SimulatedClock::new(Utc::now()));
@@ -62,6 +71,7 @@ async fn a_broken_endpoint_breaches_health_within_one_poll_interval_and_rolls_ba
         Arc::new(ReqwestProbe::new()),
         clock.clone(),
     ));
+    let poll_interval = Duration::minutes(1);
     let executor = RolloutExecutor::new(
         log,
         leases,
@@ -71,7 +81,7 @@ async fn a_broken_endpoint_breaches_health_within_one_poll_interval_and_rolls_ba
         health,
     )
     .with_config(RolloutConfig {
-        poll_interval: Duration::minutes(1),
+        poll_interval,
         lease_grace: Duration::hours(1),
     });
     let plan = DeployTemplate::parse(PLAN)
@@ -87,10 +97,11 @@ async fn a_broken_endpoint_breaches_health_within_one_poll_interval_and_rolls_ba
     assert_eq!(done.state, RolloutState::RolledBack);
     assert_eq!(adapter.current(), "registry.example.invalid/ns/app:v1");
     let breach = done.breach.expect("a health breach was recorded");
-    assert!(
-        clock.sleeps().is_empty(),
-        "the breach must be caught on the very first poll, before any poll interval elapses; \
-         sleeps recorded: {:?}",
+    assert_eq!(
+        clock.sleeps(),
+        vec![poll_interval],
+        "the breach must be caught on the poll right after the one poll interval \
+         that followed the healthy first poll; sleeps recorded: {:?}",
         clock.sleeps()
     );
     assert_eq!(breach.step, 0);
