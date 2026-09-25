@@ -508,6 +508,9 @@ mod tests {
             snapshot.to_json()["holds"][0]["since"],
             "2026-09-24T12:00:00+00:00"
         );
+        let telemetry = TelemetrySystem::new();
+        snapshot.record(&telemetry);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 2);
         assert_eq!(log.resolve("inc-1", t0()).unwrap().escalation_id, "inc-1");
         assert!(log.production_held("example/repo"));
         let err = log.resolve("inc-1", t0()).unwrap_err();
