@@ -83,15 +83,11 @@ impl ServerlessConfig {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, AdapterError> {
         let mut templates = Vec::with_capacity(SERVERLESS_ENV.len());
         for (name, op) in SERVERLESS_ENV {
-            match lookup(name).filter(|t| !t.trim().is_empty()) {
-                Some(template) => templates.push(template),
-                None => {
-                    return Err(AdapterError {
-                        op,
-                        reason: format!("{name} is not set"),
-                    })
-                }
-            }
+            let Some(template) = lookup(name).filter(|t| !t.trim().is_empty()) else {
+                let reason = format!("{name} is not set");
+                return Err(AdapterError { op, reason });
+            };
+            templates.push(template);
         }
         let mut templates = templates.into_iter();
         Ok(Self {

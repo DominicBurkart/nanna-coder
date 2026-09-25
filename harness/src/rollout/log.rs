@@ -282,6 +282,25 @@ mod tests {
     }
 
     #[test]
+    fn path_resolution_prefers_the_override_then_the_queue_log() {
+        assert_eq!(
+            rollout_path_from(Some("/var/lib/nanna/r.jsonl".into()), None),
+            Some(PathBuf::from("/var/lib/nanna/r.jsonl"))
+        );
+        assert_eq!(
+            rollout_path_from(
+                None,
+                Some(PathBuf::from("/home/u/.local/state/nanna/queue.jsonl"))
+            ),
+            Some(PathBuf::from("/home/u/.local/state/nanna/rollouts.jsonl"))
+        );
+        assert_eq!(rollout_path_from(None, None), None);
+        let resolved = default_rollout_path();
+        let expected = rollout_path_from(std::env::var_os(ROLLOUT_PATH_ENV), default_queue_path());
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
     fn io_failures_surface() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a"), "").unwrap();
