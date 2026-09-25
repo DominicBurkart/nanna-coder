@@ -379,9 +379,26 @@ pub fn resolve_path(
 ) -> ToolResult<PathBuf> {
     let (resolved, relative) = match access {
         PathAccess::Read => {
-            let (root, canonical) = canonical_within_workspace(path, workspace_root)?;
-            let relative = relative_to(&canonical, &root).to_path_buf();
-            (canonical, relative)
+            let root = canonical_root(workspace_root)?;
+            let joined = join_root(path, workspace_root);
+            match joined.canonicalize() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(denial) =
+                        deny_missing_read_uniformly(scope, tool, path, workspace_root)
+                    {
+                        return Err(denial);
+                    }
+                    return Err(cannot_resolve(path, e));
+                }
+                canonicalized => {
+                    let canonical = canonicalized.map_err(|e| cannot_resolve(path, e))?;
+                    if !canonical.starts_with(&root) {
+                        return Err(outside_root(path));
+                    }
+                    let relative = relative_to(&canonical, &root).to_path_buf();
+                    (canonical, relative)
+                }
+            }
         }
         PathAccess::Write => resolve_for_write(path, workspace_root)?,
     };
@@ -393,6 +410,39 @@ pub fn resolve_path(
         }
     }
     Ok(resolved)
+}
+
+/// When a read target does not exist, decide whether to report that
+/// directly or to deny it as out-of-scope instead.
+///
+/// Without this, a scoped identity could distinguish "exists but outside
+/// `scope.read_paths`" ([`ToolError::ScopeDenied`]) from "does not exist"
+/// ([`ToolError::PathSecurityViolation`]), using `read_file` as an oracle
+/// for the existence of files it has no business knowing about. A relative,
+/// non-traversing path that a scope would deny anyway is denied uniformly
+/// instead, so both outcomes look identical to the caller; the raw I/O
+/// error `canonical_within_workspace` produced is used everywhere else
+/// (traversal attempts, absolute paths, and any read a scope would permit).
+fn deny_missing_read_uniformly(
+    scope: Option<&PathScope>,
+    tool: &str,
+    path: &Path,
+    workspace_root: &Path,
+) -> Option<ToolError> {
+    let scope = scope?;
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    let relative = relative_to(&join_root(path, workspace_root), workspace_root).to_path_buf();
+    if scope.permits(PathAccess::Read, &relative) {
+        return None;
+    }
+    let path = relative.to_string_lossy().into_owned();
+    let reason = DenialReason::PathOutsideScope {
+        access: PathAccess::Read,
+        path,
+    };
+    Some(ToolError::ScopeDenied(scope.deny(tool, reason)))
 }
 
 #[cfg(test)]
@@ -594,6 +644,21 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_path_within_workspace_rejects_a_symlink_escape() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+        let escape = validate_path_within_workspace(Path::new("escape/secret"), root);
+        assert!(
+            matches!(escape, Err(ToolError::PathSecurityViolation { .. })),
+            "{escape:?}"
+        );
+    }
+
     #[test]
     fn scoped_writes_outside_paths_are_denied_with_the_relative_path() {
         let ws = workspace();
@@ -695,6 +760,115 @@ mod tests {
             }
             other => panic!("expected ScopeDenied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_missing_out_of_scope_read_does_not_leak_whether_it_exists() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let existing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("docs/README.md"),
+            root,
+        );
+        let missing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("docs/does_not_exist.md"),
+            root,
+        );
+        for (label, result) in [("existing", existing), ("missing", missing)] {
+            match result {
+                Err(ToolError::ScopeDenied(denial)) => {
+                    assert_eq!(
+                        denial.reason,
+                        DenialReason::PathOutsideScope {
+                            access: PathAccess::Read,
+                            path: format!(
+                                "docs/{}",
+                                if label == "existing" {
+                                    "README.md"
+                                } else {
+                                    "does_not_exist.md"
+                                }
+                            ),
+                        },
+                        "{label}"
+                    );
+                }
+                other => panic!("{label}: expected ScopeDenied, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_in_scope_read_still_reports_it_is_missing() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let missing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("api/does_not_exist.rs"),
+            root,
+        );
+        match &missing {
+            Err(ToolError::PathSecurityViolation { message }) => {
+                assert!(message.contains("does_not_exist.rs"), "{message}");
+            }
+            other => panic!("expected PathSecurityViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_scoped_read_with_a_traversal_or_absolute_path_is_not_masked_as_a_scope_denial() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let traversal = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("api/../does_not_exist.rs"),
+            root,
+        );
+        assert!(
+            matches!(traversal, Err(ToolError::PathSecurityViolation { .. })),
+            "{traversal:?}"
+        );
+        let absolute = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("/definitely/not/here.rs"),
+            root,
+        );
+        assert!(
+            matches!(absolute, Err(ToolError::PathSecurityViolation { .. })),
+            "{absolute:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_unscoped_read_still_reports_it_is_missing() {
+        let ws = workspace();
+        let root = ws.path();
+        let missing = resolve_path(
+            None,
+            "read_file",
+            PathAccess::Read,
+            Path::new("nope.rs"),
+            root,
+        );
+        assert!(matches!(
+            missing,
+            Err(ToolError::PathSecurityViolation { .. })
+        ));
     }
 
     #[cfg(unix)]
