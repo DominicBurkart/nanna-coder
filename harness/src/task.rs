@@ -1,4 +1,5 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
+use crate::auditor::Allowed;
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
@@ -417,6 +418,39 @@ impl TaskManager {
             max_iterations,
             provider,
             identity,
+        )
+        .await
+    }
+
+    /// Submit a spawn the planner obtained an [`Allowed`] proof for.
+    ///
+    /// The only entry point a planner (#640) may use: `allowed` can only
+    /// have been produced by [`crate::auditor::Gate::check`], so a spawn
+    /// that an [`Auditor`](crate::auditor::Auditor) blocked or escalated can
+    /// never reach this function. `allowed` carries both the audited
+    /// request and the exact identity it was audited against, so this
+    /// always runs under that identity's scope, exactly as
+    /// [`TaskManager::submit_with_identity`] runs an explicit identity; the
+    /// subtask text becomes the task description.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_spawn(
+        &self,
+        allowed: Allowed,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TaskId {
+        let (request, identity) = allowed.into_parts();
+        self.submit_with_identity(
+            request.subtask,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            provider,
+            Some(identity),
         )
         .await
     }
@@ -1787,6 +1821,51 @@ mod tests {
             "README.md"
         );
         assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_runs_the_audited_identity() {
+        use crate::auditor::context::tests::auditor_identity;
+        use crate::auditor::rules::tests::catalog;
+        use crate::auditor::{
+            AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary,
+        };
+        use crate::identity::DevLoop;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let audit_context = AuditContext::new(catalog(true), auditor_identity()).unwrap();
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", "github.com/example/repo"),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let allowed = gate.check(request, &audit_context).await.unwrap();
+        assert_eq!(allowed.identity().name(), "rust-implementer");
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
+        );
+        let task_id = manager
+            .submit_spawn(
+                allowed,
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        let status = wait_for_terminal(&manager, &task_id).await;
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.description, "Add a regression test.");
     }
 
     #[tokio::test]

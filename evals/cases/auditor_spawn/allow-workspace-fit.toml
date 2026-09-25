@@ -1,0 +1,19 @@
+[case]
+id = "allow-workspace-fit"
+name = "Regression test fits the implementer card"
+description = "A workspace-level subtask well inside rust-implementer's inner loop and repository ceiling."
+
+[request]
+parent_task_id = "task-1"
+parent_task_description = "Fix the login bug and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "rust-implementer"
+subtask = "Add a regression test for the empty-password path."
+dev_loop = "inner"
+requested_effect = "workspace"
+
+[expected]
+verdict = "allow"
+
+[metadata]
+tags = ["allow", "happy-path"]

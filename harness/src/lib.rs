@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auditor;
 pub mod container;
 pub mod effects;
 pub mod entities;
