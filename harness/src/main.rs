@@ -424,7 +424,7 @@ fn fake_rollout_executor(
         .map(|h| h.endpoints.clone())
         .unwrap_or_default();
     let previous = format!("{}:previous", plan.image);
-    let (executor, _adapter, _health) =
+    let (executor, _adapter, _health, _shadow) =
         harness::rollout::fake_executor(rollout_log()?, windows, &previous, &endpoints);
     Ok(executor)
 }

@@ -126,6 +126,10 @@ pub struct RolloutRecord {
     pub previous_image: String,
     /// Slot the new image is deployed to, once it is.
     pub slot: Option<Slot>,
+    /// The slot a `Swap` step retired the previous image to; held until a
+    /// `Retire` step's `min_duration` (`rollback.retain_for`) elapses, so
+    /// `rollback_to` can restore it.
+    pub retained_slot: Option<Slot>,
     /// Share of live traffic the new image serves right now.
     pub traffic_percent: u8,
     /// Current state.
@@ -155,6 +159,7 @@ impl RolloutRecord {
             image: image.to_string(),
             previous_image: previous_image.to_string(),
             slot: None,
+            retained_slot: None,
             traffic_percent: 0,
             state: RolloutState::Pending,
             pr: None,
@@ -257,8 +262,12 @@ impl RolloutRecord {
 
     /// One-line summary for the CLI.
     pub fn summary(&self) -> String {
+        let retained = self
+            .retained_slot
+            .as_ref()
+            .map_or_else(String::new, |slot| format!("  retained: {slot}"));
         format!(
-            "{}  {}  {} -> {}  traffic {}%  state: {}",
+            "{}  {}  {} -> {}  traffic {}%  state: {}{retained}",
             self.id,
             self.plan.environment,
             self.previous_image,
@@ -483,10 +492,15 @@ pub(crate) mod tests {
         assert_eq!(RolloutState::RolledBack.name(), "rolled-back");
         assert_eq!(RolloutState::Complete.name(), "complete");
         assert_eq!(RolloutState::Halted.name(), "halted");
-        let r = record("production");
+        let mut r = record("production");
         assert_eq!(
             r.summary(),
             "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending"
+        );
+        r.retained_slot = Some(Slot::new("slot-0"));
+        assert_eq!(
+            r.summary(),
+            "rollout-1  production  registry.example.invalid/ns/app:v1 -> registry.example.invalid/ns/app:v2  traffic 0%  state: pending  retained: slot-0"
         );
     }
 

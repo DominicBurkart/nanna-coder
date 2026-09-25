@@ -90,12 +90,15 @@ pub enum RolloutError {
     /// The plan's lease string is not `deploy:<repo>:<env>`.
     #[error("plan lease `{0}` is not of the form deploy:<repo>:<env>")]
     BadLeaseName(String),
-    /// A step kind this executor does not implement yet.
-    #[error("step kind `{0}` is not supported by the rollout executor yet")]
-    UnsupportedStep(&'static str),
     /// A step beyond the first found no deployed slot to route to.
     #[error("rollout {0} has no deployed slot")]
     NoSlot(String),
+    /// A `Retire` step found no slot a prior `Swap` had retained.
+    #[error("rollout {0} has no slot retained by a swap to retire")]
+    NoRetainedSlot(String),
+    /// A `Shadow` step found no `[shadow]` section on the plan.
+    #[error("rollout {0} is at a shadow step but its plan has no [shadow] section")]
+    NoShadowConfig(String),
     /// A persisted state names a step the plan does not have.
     #[error("rollout {id} is at step {step}, which its plan does not have")]
     NoSuchStep {
