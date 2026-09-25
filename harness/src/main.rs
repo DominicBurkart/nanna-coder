@@ -370,7 +370,7 @@ fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>>
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
-            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
             if json {
                 println!("{}", plan.to_json_pretty());
             } else {

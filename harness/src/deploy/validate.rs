@@ -1,5 +1,5 @@
 use super::template::{DeployTemplate, RiskClass, Strategy};
-use super::{DeployError, PRODUCTION_ENV};
+use super::{is_production_env, DeployError, PRODUCTION_ENV};
 use crate::windows::WindowSet;
 use chrono::Duration;
 use std::path::Path;
@@ -105,7 +105,12 @@ impl DeployTemplate {
         if span < min_span(class) {
             return Err(invalid(file, "rollout.min_step_duration", format!("risk class `{class}` requires a rollout span of at least {}, got {} ({steps} steps x {})", describe(min_span(class)), describe(span), describe(self.rollout.min_step_duration))));
         }
-        if self.target.environments.iter().any(|e| e == PRODUCTION_ENV) {
+        if self
+            .target
+            .environments
+            .iter()
+            .any(|e| is_production_env(e))
+        {
             if self.rollout.windows.is_none() {
                 return Err(invalid(
                     file,

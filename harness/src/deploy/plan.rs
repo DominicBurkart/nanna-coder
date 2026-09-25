@@ -1,5 +1,6 @@
 use super::template::{DeployTemplate, RiskClass, Strategy};
-use super::{DeployError, PRODUCTION_ENV};
+use super::{is_production_env, DeployError};
+use crate::windows::WINDOWS_FILE_NAME;
 use chrono::Duration;
 use serde_json::{json, Value};
 use std::fmt;
@@ -213,13 +214,65 @@ impl DeployPlan {
 
 /// Load `<repo>/.nanna/deploy.toml` and plan a rollout to `env`.
 ///
-/// `score` resolves a derived risk class; a static class ignores it.
+/// `score` resolves a derived risk class; a static class ignores it. This
+/// does not check `rollout.windows` against a real [`WindowSet`]: a template
+/// naming a window that does not exist anywhere is accepted. Prefer
+/// [`plan_for_repo_checked`], which validates against a co-located
+/// `windows.toml` when one is present.
 pub fn plan_for_repo(
     repo: &Path,
     env: &str,
     score: Option<u32>,
 ) -> Result<DeployPlan, DeployError> {
     DeployTemplate::load_from_repo(repo)?.plan_with_score(env, score)
+}
+
+/// Load `<repo>/.nanna/deploy.toml`, validate `rollout.windows` against
+/// `<repo>/.nanna/windows.toml` when that file exists, and plan a rollout.
+///
+/// This is what the `nanna deploy plan` CLI command uses: it is the
+/// human-facing preflight check, so a `rollout.windows` naming a window that
+/// will never open must be caught here rather than surfacing only once a
+/// rollout executor tries to act on the plan. When no `windows.toml` is
+/// co-located with the template, window names are not checked, matching
+/// [`plan_for_repo`] (Nanna's own window set may live outside the target
+/// repository).
+///
+/// ```
+/// use harness::deploy::{plan_for_repo_checked, DeployError};
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+/// std::fs::write(
+///     dir.path().join(".nanna/deploy.toml"),
+///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"instant\"\nwindows = \"not-a-real-window\"\n",
+/// )
+/// .unwrap();
+/// std::fs::write(
+///     dir.path().join(".nanna/windows.toml"),
+///     "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
+/// )
+/// .unwrap();
+/// let err = plan_for_repo_checked(dir.path(), "sandbox", None).unwrap_err();
+/// assert!(matches!(err, DeployError::InvalidField { field: "rollout.windows", .. }));
+/// ```
+pub fn plan_for_repo_checked(
+    repo: &Path,
+    env: &str,
+    score: Option<u32>,
+) -> Result<DeployPlan, DeployError> {
+    let template = DeployTemplate::load_from_repo(repo)?;
+    let windows_path = repo.join(super::DEPLOY_DIR).join(WINDOWS_FILE_NAME);
+    if windows_path.is_file() {
+        let windows = crate::windows::WindowSet::load(&windows_path).map_err(|source| {
+            DeployError::WindowSet {
+                path: windows_path,
+                source,
+            }
+        })?;
+        template.validate_against(&windows)?;
+    }
+    template.plan_with_score(env, score)
 }
 
 impl fmt::Display for DeployPlan {
@@ -299,6 +352,7 @@ impl DeployTemplate {
         env: &str,
         score: Option<u32>,
     ) -> Result<DeployPlan, DeployError> {
+        self.validate()?;
         if !self.target.environments.iter().any(|e| e == env) {
             return Err(DeployError::UnknownEnvironment {
                 env: env.to_string(),
@@ -308,7 +362,7 @@ impl DeployTemplate {
         let risk_class = self.resolve_risk(score)?;
         let lease = DeployPlan::lease_name(&self.target.image, env);
         let mut preconditions = vec![Precondition::LeaseHeld(lease.clone())];
-        if env == PRODUCTION_ENV {
+        if is_production_env(env) {
             preconditions.extend(self.rollout.windows.clone().map(Precondition::WindowOpen));
         }
         if self.health.is_some() {
@@ -712,17 +766,114 @@ minimum total: 1d 1h 30m
         );
     }
 
+    #[test]
+    fn checked_skips_window_validation_without_a_windows_file() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
+        let plan = plan_for_repo_checked(repo.path(), "staging", None).unwrap();
+        assert_eq!(plan.environment, "staging");
+    }
+
+    #[test]
+    fn checked_accepts_a_known_window() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
+        std::fs::write(
+            repo.path().join(".nanna/windows.toml"),
+            "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
+        )
+        .unwrap();
+        let plan = plan_for_repo_checked(repo.path(), "staging", None).unwrap();
+        assert_eq!(plan.environment, "staging");
+    }
+
+    #[test]
+    fn checked_rejects_an_unknown_window() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
+        std::fs::write(
+            repo.path().join(".nanna/windows.toml"),
+            "[[window]]\nname = \"after-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_for_repo_checked(repo.path(), "staging", None),
+            Err(DeployError::InvalidField {
+                field: "rollout.windows",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn checked_reports_a_malformed_windows_file() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
+        std::fs::write(
+            repo.path().join(".nanna/windows.toml"),
+            "not valid toml [[[",
+        )
+        .unwrap();
+        let err = plan_for_repo_checked(repo.path(), "staging", None).unwrap_err();
+        assert!(matches!(err, DeployError::WindowSet { .. }), "{err:?}");
+        assert!(err.to_string().contains("windows.toml"), "{err}");
+    }
+
     fn arb_steps(min: usize) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
         (min..=10usize)
             .prop_flat_map(|n| proptest::collection::btree_set(1u8..100, n - 1))
             .prop_map(|set| set.into_iter().chain(std::iter::once(100)).collect())
     }
 
-    fn arb_template() -> impl proptest::strategy::Strategy<Value = String> {
-        (0..RiskClass::ALL.len(), 0..Strategy::ALL.len(), any::<bool>(), 1u8..=100, 0i64..48)
-            .prop_map(|(c, s, production, mirror, extra_hours)| (RiskClass::ALL[c], Strategy::ALL[s], production, mirror, extra_hours))
+    /// A `[risk]` section whose thresholds resolve to `class` for any score
+    /// (the derived test below always plans with a fixed score), so the
+    /// property test below can fuse the derived-resolution path into the
+    /// same monotonicity check the static-class path already gets.
+    ///
+    /// `[risk.thresholds]` requires at least one field, and `highest_risk()`
+    /// (used by `validate()`) is the highest class among the *present*
+    /// fields regardless of their value -- so a derived template can never
+    /// have `highest_risk() == Unused`. Callers must not use this for
+    /// `RiskClass::Unused`; use a static `[risk]` section instead.
+    fn derived_risk_section(class: RiskClass) -> String {
+        debug_assert!(class >= RiskClass::Internal, "derived can't target Unused");
+        let mut thresholds = vec!["internal = 0".to_string()];
+        if class >= RiskClass::Edge {
+            thresholds.push("edge = 1".to_string());
+        }
+        if class >= RiskClass::Core {
+            thresholds.push("core = 2".to_string());
+        }
+        format!(
+            "[risk]\nclass = \"derived\"\n[risk.thresholds]\n{}\n",
+            thresholds.join("\n")
+        )
+    }
+
+    const DERIVED_SCORE: u32 = 100;
+
+    fn arb_template() -> impl proptest::strategy::Strategy<Value = (String, bool)> {
+        (
+            0..RiskClass::ALL.len(),
+            0..Strategy::ALL.len(),
+            any::<bool>(),
+            any::<bool>(),
+            1u8..=100,
+            0i64..48,
+        )
+            .prop_map(|(c, s, production, derived, mirror, extra_hours)| {
+                let class = RiskClass::ALL[c];
+                // A derived template's highest_risk() is at least Internal
+                // (see derived_risk_section), so it can never target Unused.
+                let derived = derived && class >= RiskClass::Internal;
+                (class, Strategy::ALL[s], production, derived, mirror, extra_hours)
+            })
             .prop_filter("strategy allowed for class", |(c, s, ..)| strategy_allowed(*c, *s))
-            .prop_flat_map(|(class, strategy, production, mirror, extra_hours)| {
+            .prop_flat_map(|(class, strategy, production, derived, mirror, extra_hours)| {
                 let min = if matches!(strategy, Strategy::Instant | Strategy::BlueGreen) { 1 } else { min_steps(class) };
                 let max = if matches!(strategy, Strategy::Instant | Strategy::BlueGreen) { 1 } else { 10 };
                 arb_steps(min).prop_filter("step count", move |steps| steps.len() <= max).prop_map(move |steps| {
@@ -731,17 +882,20 @@ minimum total: 1d 1h 30m
                     let envs = if production { "[\"sandbox\", \"production\"]" } else { "[\"sandbox\", \"staging\"]" };
                     let steps = steps.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
                     let shadow = if strategy == Strategy::ShadowThenGradual { format!("[shadow]\nenabled = true\nmirror_percent = {mirror}\ncompare = [\"status\"]\n") } else { String::new() };
-                    format!("[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = {envs}\n[risk]\nclass = \"{class}\"\n[rollout]\nstrategy = \"{strategy}\"\nsteps = [{steps}]\nmin_step_duration = \"{hours}h\"\nwindows = \"business-hours\"\n{HEALTH}[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"1d\"\n{shadow}")
+                    let risk = if derived { derived_risk_section(class) } else { format!("[risk]\nclass = \"{class}\"\n") };
+                    let src = format!("[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = {envs}\n{risk}[rollout]\nstrategy = \"{strategy}\"\nsteps = [{steps}]\nmin_step_duration = \"{hours}h\"\nwindows = \"business-hours\"\n{HEALTH}[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"1d\"\n{shadow}");
+                    (src, derived)
                 })
             })
     }
 
     proptest! {
         #[test]
-        fn plan_traffic_is_monotonic_and_ends_at_100(src in arb_template()) {
+        fn plan_traffic_is_monotonic_and_ends_at_100((src, derived) in arb_template()) {
             let template = DeployTemplate::parse(&src).unwrap();
             for env in &template.target.environments {
-                let plan = template.plan(env).unwrap();
+                let score = if derived { Some(DERIVED_SCORE) } else { None };
+                let plan = template.plan_with_score(env, score).unwrap();
                 let percents = percents(&plan);
                 prop_assert!(percents.windows(2).all(|w| w[0] <= w[1]), "{percents:?}");
                 prop_assert_eq!(percents.last().copied(), Some(100));
