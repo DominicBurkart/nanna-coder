@@ -164,6 +164,11 @@ enum Commands {
         #[command(subcommand)]
         action: EscalationAction,
     },
+    /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -206,6 +211,76 @@ enum EscalationAction {
         /// escalations.jsonl next to the queue log)
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Print the deployment plan for an environment without executing it
+    Plan {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to plan for
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Print the plan as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a starter template for a full-stack Rust repository
+    Init {
+        /// Risk class of the system: unused, internal, edge or core
+        #[arg(long)]
+        risk: harness::deploy::RiskClass,
+        /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+    },
+    /// Execute the deployment plan for an environment as a resumable rollout
+    Run {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to roll out to
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Image reference to roll out
+        #[arg(long)]
+        image: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
+    },
+    /// Show every rollout, or one rollout with its transition history
+    Status {
+        /// Rollout id
+        id: Option<String>,
+    },
+    /// Kill switch: hold a rollout's current traffic split (human only)
+    Halt {
+        /// Rollout id
+        id: String,
+    },
+    /// Restart a halted rollout from step 0 with a fixed image
+    RollForward {
+        /// Rollout id
+        id: String,
+        /// Fixed image reference
+        #[arg(long)]
+        image: String,
+        /// Pull request that delivered the fix
+        #[arg(long)]
+        pr: String,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
     },
 }
 
@@ -365,6 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_escalation_resolve(&id, path)?;
         }
+        Commands::Deploy { command } => run_deploy(command).await?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -379,6 +455,146 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn rollout_log() -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let path = harness::rollout::default_rollout_path()
+        .ok_or("no rollout log location: set NANNA_ROLLOUT_PATH or HOME")?;
+    Ok(harness::rollout::RolloutLog::open(&path)?)
+}
+
+type FakeExecutor = (
+    harness::rollout::RolloutExecutor,
+    std::sync::Arc<harness::leases::SimulatedClock>,
+);
+
+fn fake_rollout_executor(
+    repo: &std::path::Path,
+    plan: &harness::deploy::DeployPlan,
+) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
+    let windows_path = repo
+        .join(harness::deploy::DEPLOY_DIR)
+        .join(harness::windows::WINDOWS_FILE_NAME);
+    let windows = if windows_path.exists() {
+        harness::windows::WindowSet::load(&windows_path)?
+    } else {
+        harness::windows::WindowSet::default()
+    };
+    let endpoints = plan
+        .health
+        .as_ref()
+        .map(|h| h.endpoints.clone())
+        .unwrap_or_default();
+    let previous = format!("{}:previous", plan.image);
+    let (executor, _adapter, _health, _shadow, clock) =
+        harness::rollout::fake_executor(rollout_log()?, windows, &previous, &endpoints);
+    Ok((executor, clock))
+}
+
+async fn run_fake_to_a_stop(
+    executor: &harness::rollout::RolloutExecutor,
+    clock: &harness::leases::SimulatedClock,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let steps = harness::rollout::run_simulated(executor, clock, id).await?;
+    let Some((last, parked)) = steps.split_last() else {
+        return Ok(());
+    };
+    for step in parked {
+        println!("parked   {}", step.summary());
+    }
+    println!("finished {}", last.summary());
+    Ok(())
+}
+
+const NO_REAL_TARGET: &str =
+    "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DeployCommands::Run {
+            repo_path,
+            env,
+            image,
+            score,
+            fake,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let (executor, clock) = fake_rollout_executor(&repo, &plan)?;
+            let record = executor.start(plan, &image).await?;
+            println!("started  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &record.id).await?;
+        }
+        DeployCommands::Status { id } => {
+            let log = rollout_log()?;
+            match id {
+                Some(id) => {
+                    println!("{}", log.load(&id)?.summary());
+                    for transition in log.history(&id)? {
+                        println!("  {}", transition.summary());
+                    }
+                }
+                None => {
+                    for record in log.latest()?.into_values() {
+                        println!("{}", record.summary());
+                    }
+                }
+            }
+        }
+        DeployCommands::Halt { id } => {
+            let record = rollout_log()?.halt(&id, chrono::Utc::now())?;
+            println!("halted   {}", record.summary());
+        }
+        DeployCommands::RollForward {
+            id,
+            image,
+            pr,
+            fake,
+        } => {
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let log = rollout_log()?;
+            let plan = log.load(&id)?.plan;
+            let (executor, clock) = fake_rollout_executor(&std::env::current_dir()?, &plan)?;
+            let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
+            println!("forward  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &id).await?;
+        }
+        DeployCommands::Plan {
+            repo_path,
+            env,
+            score,
+            json,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if json {
+                println!("{}", plan.to_json_pretty());
+            } else {
+                print!("{plan}");
+            }
+        }
+        DeployCommands::Init { risk, repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::deploy::init(&repo, risk)?;
+            println!("Wrote {}", path.display());
+        }
+    }
     Ok(())
 }
 

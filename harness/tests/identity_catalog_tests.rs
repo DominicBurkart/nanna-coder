@@ -14,7 +14,13 @@ fn global_catalog_loads_all_fixture_identities() {
     let catalog = IdentityCatalog::load(fixtures().join("global")).unwrap();
     assert_eq!(
         catalog.names().collect::<Vec<_>>(),
-        vec!["auditor", "deployer", "pr-shepherd", "rust-implementer"]
+        vec![
+            "auditor",
+            "deployer",
+            "incident-responder",
+            "pr-shepherd",
+            "rust-implementer"
+        ]
     );
 
     let auditor = catalog.get("auditor").unwrap();
@@ -112,7 +118,11 @@ fn fixture_catalog_renders_a_table() {
         lines[2].split_whitespace().collect::<Vec<_>>(),
         vec!["deployer", "outer", "gemma4:e4b", "sandbox"]
     );
-    assert_eq!(lines.len(), 5);
+    assert_eq!(
+        lines[3].split_whitespace().collect::<Vec<_>>(),
+        vec!["incident-responder", "outer", "gemma4:e4b", "production"]
+    );
+    assert_eq!(lines.len(), 6);
 }
 
 #[test]
