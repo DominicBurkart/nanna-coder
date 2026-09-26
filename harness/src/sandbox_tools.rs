@@ -324,6 +324,25 @@ impl SandboxRegistry {
     }
 }
 
+/// Whether `s` is safe to append to a registry/image reference
+/// (`{registry}/{image}:{tag}`) built for [`SandboxTarget::deploy`].
+///
+/// `image_tag` is a model-supplied [`SandboxDeployTool`] argument, unlike
+/// `registry`/`image` which always come from the repository's own
+/// `.nanna/deploy.toml`. [`FakeSandboxTarget`] ignores the image string
+/// entirely, so nothing in this PR shells out with it yet, but
+/// [`SandboxTarget`] is a public trait a later real provider adapter
+/// implements directly against this same string; validating the tag now
+/// (loosely following Docker's own tag grammar) means that adapter never has
+/// to remember to sanitize it itself before passing it to `docker pull` or a
+/// registry API.
+fn valid_image_tag(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 fn property(schema_type: SchemaType, description: &str) -> PropertySchema {
     PropertySchema {
         schema_type,
@@ -434,6 +453,10 @@ impl SandboxDeployTool {
     /// never happened.
     fn validate<'a>(&self, args: &'a Value) -> Result<(DeployTemplate, &'a str), ToolError> {
         let image_tag = required_str(args, "image_tag")?;
+        if !valid_image_tag(image_tag) {
+            let message = format!("'image_tag' must be a plain Docker tag, got {image_tag:?}");
+            return Err(ToolError::InvalidArguments { message });
+        }
         if self.sandboxes.get(&self.task_id).is_some() {
             return Err(map_sandbox_error(SandboxError::AlreadyDeployed));
         }
@@ -770,6 +793,31 @@ mod tests {
         let tool = deploy_tool(dir.path(), target, sandboxes, 1);
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_an_image_tag_with_shell_or_path_metacharacters() {
+        let dir = fixture();
+        let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        for bad in ["v1; rm -rf /", "../escape", "v1/../v2", "", "v1 v2"] {
+            let err = tool.execute(json!({"image_tag": bad})).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidArguments { .. }),
+                "image_tag={bad:?} produced {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_image_tag_accepts_ordinary_tags_and_rejects_metacharacters() {
+        assert!(valid_image_tag("v1"));
+        assert!(valid_image_tag("1.2.3-rc1"));
+        assert!(!valid_image_tag(""));
+        assert!(!valid_image_tag("v1; rm -rf /"));
+        assert!(!valid_image_tag("a/b"));
+        assert!(!valid_image_tag(&"a".repeat(129)));
     }
 
     #[tokio::test]

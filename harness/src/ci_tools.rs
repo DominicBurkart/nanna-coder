@@ -133,6 +133,30 @@ fn optional_object(args: &Value, key: &str) -> ToolResult<Value> {
     }
 }
 
+/// Whether `s` is safe to interpolate as a single path segment in a GitHub
+/// Actions API URL (`/repos/{repo}/actions/workflows/{workflow}/...`).
+///
+/// `workflow` is a model-supplied [`ci_trigger`](CiTriggerTool) argument, not
+/// something read from the worktree like `repo`/`branch` are, so it cannot be
+/// trusted to be a plain file name or numeric id. Without this check, a
+/// value containing `/` turns one path segment into several, and the `url`
+/// crate's RFC 3986 dot-segment normalization resolves a `..` segment
+/// against whatever precedes it in the URL -- `workflow =
+/// "../../../../other-owner/other-repo/actions/workflows/ci.yml"` rewrites
+/// the request to dispatch a workflow in a *different* repository entirely
+/// using this harness's own `GITHUB_TOKEN`, bypassing `resolve_repo`'s
+/// guarantee that a tool call can only reach the worktree's own repo. GitHub
+/// workflow file names and numeric workflow ids never need `/` or a bare
+/// `.`/`..` segment, so this rejects the argument outright rather than
+/// attempting to percent-encode it.
+fn valid_workflow_ref(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 fn run_json(run: &WorkflowRun) -> Value {
     json!({
         "id": run.id,
@@ -224,15 +248,38 @@ impl CiTriggerTool {
         Ok(())
     }
 
+    /// The highest run id already listed for `branch`/[`DISPATCH_EVENT`]
+    /// before a dispatch, so [`Self::correlate_run`] can tell a genuinely
+    /// new run apart from one this same workflow/branch already had. Without
+    /// this baseline, re-dispatching the same workflow on the same branch --
+    /// the normal shape of the middle loop's fix-and-retry cycle -- would let
+    /// [`Self::correlate_run`] immediately return the *previous* dispatch's
+    /// run, since GitHub run ids only ever increase and the run list is
+    /// non-empty from the very first poll.
+    async fn max_known_run_id(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, BacklogError> {
+        let runs = self
+            .client
+            .list_workflow_runs(repo, workflow, branch, DISPATCH_EVENT)
+            .await?;
+        Ok(runs.into_iter().map(|run| run.id).max())
+    }
+
     /// `workflow_dispatch` hands back `204 No Content` with no run id, so
     /// the run is found by listing the workflow's runs filtered to `branch`
-    /// and [`DISPATCH_EVENT`] and taking the newest one, retrying until one
+    /// and [`DISPATCH_EVENT`] and taking the newest one with an id greater
+    /// than `after_id` (see [`Self::max_known_run_id`]), retrying until one
     /// appears or the budget elapses.
     async fn correlate_run(
         &self,
         repo: &str,
         workflow: &str,
         branch: &str,
+        after_id: Option<u64>,
     ) -> Result<WorkflowRun, BacklogError> {
         let start = Instant::now();
         loop {
@@ -240,6 +287,7 @@ impl CiTriggerTool {
                 .client
                 .list_workflow_runs(repo, workflow, branch, DISPATCH_EVENT)
                 .await?;
+            runs.retain(|run| after_id.is_none_or(|baseline| run.id > baseline));
             if !runs.is_empty() {
                 runs.sort_by_key(|run| std::cmp::Reverse(run.id));
                 return Ok(runs.remove(0));
@@ -304,14 +352,25 @@ impl Tool for CiTriggerTool {
             }));
         }
         let workflow = required_str(&args, "workflow")?;
+        if !valid_workflow_ref(workflow) {
+            return Err(ToolError::InvalidArguments {
+                message: format!(
+                    "'workflow' must be a plain file name or numeric workflow id (no '/', '.', or '..' segments), got {workflow:?}"
+                ),
+            });
+        }
         let inputs = optional_object(&args, "inputs")?;
+        let baseline = self
+            .max_known_run_id(&repo, workflow, &branch)
+            .await
+            .map_err(map_backlog_error)?;
         self.charge(&repo).await?;
         self.client
             .dispatch_workflow(&repo, workflow, &branch, inputs)
             .await
             .map_err(map_backlog_error)?;
         let run = self
-            .correlate_run(&repo, workflow, &branch)
+            .correlate_run(&repo, workflow, &branch, baseline)
             .await
             .map_err(map_backlog_error)?;
         Ok(json!({
@@ -586,6 +645,7 @@ mod tests {
     async fn dispatch_correlates_the_newest_matching_run() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
             list_result: vec![run(1, "queued", None), run(2, "queued", None)],
             ..Default::default()
         });
@@ -605,6 +665,48 @@ mod tests {
             .iter()
             .any(|c| c.contains("dispatch_workflow o/n ci.yml@feat/x")));
         assert!(calls.iter().any(|c| c.contains("list_workflow_runs")));
+    }
+
+    /// A re-dispatch of the same workflow/branch -- the normal shape of the
+    /// middle loop's fix-and-retry cycle -- must not resolve to the
+    /// *previous* dispatch's run just because it is still the only one
+    /// GitHub's eventually-consistent run list happens to show yet.
+    #[tokio::test]
+    async fn dispatch_does_not_correlate_to_a_run_that_predates_this_dispatch() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            list_result: vec![run(5, "completed", Some("failure"))],
+            ..Default::default()
+        });
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool
+            .execute(json!({"workflow": "ci.yml"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    /// Once the fix above snapshots the pre-dispatch baseline, a run that was
+    /// already visible before the dispatch is correctly excluded while a
+    /// genuinely new run (a higher id, appearing only once the list is
+    /// re-polled after the dispatch) is still picked up.
+    #[tokio::test]
+    async fn dispatch_correlates_to_the_new_run_even_when_an_older_run_is_still_listed() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![run(5, "completed", Some("failure"))]),
+            list_result: vec![run(5, "completed", Some("failure")), run(9, "queued", None)],
+            ..Default::default()
+        });
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let result = tool.execute(json!({"workflow": "ci.yml"})).await.unwrap();
+        assert_eq!(result["run_id"], 9);
     }
 
     #[tokio::test]
@@ -654,6 +756,42 @@ mod tests {
         let tool = trigger_tool(dir.path(), mock);
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_workflow_argument_that_would_escape_the_repo_path_segment() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        for bad in [
+            "../../../../other-owner/other-repo/actions/workflows/ci.yml",
+            "..",
+            ".",
+            "ci.yml/dispatches",
+            "",
+        ] {
+            let err = tool.execute(json!({"workflow": bad})).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidArguments { .. }),
+                "workflow={bad:?} produced {err:?}"
+            );
+        }
+        assert!(mock.calls().is_empty(), "no request should have been sent");
+    }
+
+    #[test]
+    fn valid_workflow_ref_accepts_ordinary_names_and_rejects_path_segments() {
+        assert!(valid_workflow_ref("ci.yml"));
+        assert!(valid_workflow_ref("deploy-staging.yaml"));
+        assert!(valid_workflow_ref("123456"));
+        assert!(!valid_workflow_ref(""));
+        assert!(!valid_workflow_ref("."));
+        assert!(!valid_workflow_ref(".."));
+        assert!(!valid_workflow_ref("a/b"));
+        assert!(!valid_workflow_ref("../../etc/passwd"));
     }
 
     #[tokio::test]

@@ -1382,6 +1382,14 @@ pub(crate) mod test_support {
         pub jobs: HashMap<u64, Vec<WorkflowJob>>,
         pub logs: HashMap<u64, String>,
         pub list_result: Vec<WorkflowRun>,
+        /// When set, every `list_workflow_runs` call before
+        /// [`GithubActionsClient::dispatch_workflow`] is invoked returns this
+        /// instead of `list_result`, so a test can script a run already
+        /// visible *before* a fresh dispatch (the baseline
+        /// [`crate::ci_tools::CiTriggerTool::max_known_run_id`] reads),
+        /// distinct from what becomes visible after it.
+        pub list_result_before_dispatch: Option<Vec<WorkflowRun>>,
+        pub(crate) dispatched: StdMutex<bool>,
         /// When set, every call returns this status as a
         /// [`BacklogError::Status`].
         pub fail_status: Option<u16>,
@@ -1433,6 +1441,10 @@ pub(crate) mod test_support {
             self.record(format!(
                 "dispatch_workflow {repo} {workflow}@{git_ref} {inputs}"
             ));
+            *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned") = true;
             self.maybe_fail("mock:dispatch_workflow")
         }
 
@@ -1452,6 +1464,15 @@ pub(crate) mod test_support {
                 "list_workflow_runs {repo} {workflow} {branch} {event}"
             ));
             self.maybe_fail("mock:list_workflow_runs")?;
+            let dispatched = *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned");
+            if !dispatched {
+                if let Some(before) = &self.list_result_before_dispatch {
+                    return Ok(before.clone());
+                }
+            }
             Ok(self.list_result.clone())
         }
 
