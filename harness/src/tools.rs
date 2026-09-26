@@ -1,16 +1,24 @@
+use crate::action_auditor::{
+    ActionAuditLogEntry, ActionContext, ActionDenied, ActionGate, ActionReview, ActionVerdict,
+};
+use crate::auditor::{Reason, ReasonCode};
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
+use crate::leases::LeaseContext;
 use crate::protected::{ProtectedPathViolation, ProtectedPaths};
 use crate::scope::{
     canonical_root, relative_to, resolve_path, resolve_path_guarded,
     validate_path_within_workspace, DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError,
+    UNSCOPED_IDENTITY,
 };
+use crate::task::TaskId;
 use async_trait::async_trait;
+use chrono::Utc;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -38,6 +46,11 @@ pub enum ToolError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The action auditor blocked or escalated an effectful tool call
+    /// before it reached the tool.
+    #[error("{0}")]
+    ActionDenied(ActionDenied),
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -56,10 +69,40 @@ pub trait Tool: Send + Sync {
     fn effect_class(&self) -> EffectClass;
 }
 
+/// Fixed, per-task context an effectful tool call is reviewed against: which
+/// task it belongs to, the calling identity's effect ceiling, the
+/// availability window (if any) `Sandbox`/`Production` calls target, and
+/// enough of the deployment context to derive coordination leases (see
+/// [`LeaseContext`]).
+#[derive(Debug, Clone)]
+pub struct ActionSubject {
+    /// Task the registry's calls belong to.
+    pub task_id: TaskId,
+    /// Widest effect class the calling identity may reach.
+    pub max_effect: EffectClass,
+    /// Name of the availability window `Sandbox`/`Production` calls target.
+    pub window: Option<String>,
+    /// Repository in `owner/name` form.
+    pub repo: String,
+    /// Branch pushed to, for `Repository`-class calls.
+    pub branch: Option<String>,
+    /// Pull request deployed, for `Sandbox`-class calls.
+    pub pr: Option<u64>,
+    /// Environment rolled out to, for `Production`-class calls.
+    pub environment: Option<String>,
+    /// Path globs the task edits.
+    pub paths: Vec<String>,
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     identity: Option<String>,
     denials: Mutex<Vec<ScopeDenial>>,
+    action_gate: Option<Arc<ActionGate>>,
+    action_subject: Option<ActionSubject>,
+    action_prior: Mutex<Vec<EffectClass>>,
+    action_denial_count: Mutex<usize>,
+    action_log: Mutex<Vec<ActionAuditLogEntry>>,
 }
 
 impl ToolRegistry {
@@ -68,7 +111,30 @@ impl ToolRegistry {
             tools: HashMap::new(),
             identity: None,
             denials: Mutex::new(Vec::new()),
+            action_gate: None,
+            action_subject: None,
+            action_prior: Mutex::new(Vec::new()),
+            action_denial_count: Mutex::new(0),
+            action_log: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Attach an action-review gate: every subsequent call to a tool whose
+    /// [`Tool::effect_class`] is at least [`EffectClass::Repository`] is
+    /// reviewed through `gate` under `subject` before it runs. Without a
+    /// gate, every such call is refused by default (see [`Self::execute`]),
+    /// so attaching one is how a caller opts a registry in rather than how
+    /// it opts one out.
+    pub fn with_action_gate(mut self, gate: Arc<ActionGate>, subject: ActionSubject) -> Self {
+        self.action_gate = Some(gate);
+        self.action_subject = Some(subject);
+        self
+    }
+
+    /// Every action review recorded so far for this registry's task, in
+    /// call order.
+    pub fn action_reviews(&self) -> Vec<ActionAuditLogEntry> {
+        self.action_log.lock().expect("action log poisoned").clone()
     }
 
     /// Keep only the tools `identity` may call: those whose name matches a
@@ -158,7 +224,22 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
+    /// Dispatch `name(args)`. A tool whose [`Tool::effect_class`] is at
+    /// least [`EffectClass::Repository`] is reviewed by the action auditor
+    /// first: this is the only chokepoint tool calls pass through, so the
+    /// review is structural (every effectful call goes through it) rather
+    /// than something each `Tool` implementation must remember to do. A
+    /// call below that threshold reaches the tool with no review at all,
+    /// matching the epic's own design principle that the container-isolated
+    /// inner loop needs no gate.
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult<Value> {
+        if let Some(class) = self.tools.get(name).map(|tool| tool.effect_class()) {
+            if class >= EffectClass::Repository {
+                if let Err(denied) = self.review_action(name, &args, class).await {
+                    return Err(ToolError::ActionDenied(denied));
+                }
+            }
+        }
         let outcome = match (self.tools.get(name), &self.identity) {
             (Some(tool), _) => tool.execute(args).await,
             (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
@@ -182,6 +263,100 @@ impl ToolRegistry {
             _ => {}
         }
         outcome
+    }
+
+    /// Review one effectful call: consult [`Self::action_gate`] under
+    /// [`Self::action_subject`] when both are configured, else refuse by
+    /// default (fail closed, never silently allow an unreviewed effectful
+    /// action). Every review, allowed or not, is appended to
+    /// [`Self::action_reviews`]. The third denial in this registry's task
+    /// is upgraded to [`ActionDenied::Escalate`] regardless of what the
+    /// auditor itself returned.
+    async fn review_action(
+        &self,
+        name: &str,
+        args: &Value,
+        class: EffectClass,
+    ) -> Result<(), ActionDenied> {
+        let identity = self
+            .identity
+            .clone()
+            .unwrap_or_else(|| UNSCOPED_IDENTITY.to_string());
+        let task_id = self
+            .action_subject
+            .as_ref()
+            .map(|subject| subject.task_id.clone())
+            .unwrap_or_else(|| TaskId(UNSCOPED_IDENTITY.to_string()));
+        let review = ActionReview {
+            identity,
+            task_id,
+            tool: name.to_string(),
+            args: args.clone(),
+            effect_class: class,
+            prior_actions: self
+                .action_prior
+                .lock()
+                .expect("action prior poisoned")
+                .clone(),
+        };
+        let verdict = match (&self.action_gate, &self.action_subject) {
+            (Some(gate), Some(subject)) => {
+                let ctx = ActionContext {
+                    max_effect: subject.max_effect,
+                    window: subject.window.as_deref(),
+                    lease: LeaseContext {
+                        repo: &subject.repo,
+                        branch: subject.branch.as_deref(),
+                        pr: subject.pr,
+                        environment: subject.environment.as_deref(),
+                        paths: &subject.paths,
+                    },
+                    now: Utc::now(),
+                };
+                gate.run_gate(&review, &ctx).await
+            }
+            _ => ActionVerdict::block(vec![Reason::new(
+                ReasonCode::Other,
+                "no action auditor configured for this registry; effectful tool calls are refused by default",
+            )]),
+        };
+        self.action_log
+            .lock()
+            .expect("action log poisoned")
+            .push(ActionAuditLogEntry {
+                review,
+                verdict: verdict.clone(),
+            });
+        match verdict {
+            ActionVerdict::Allow => {
+                self.action_prior
+                    .lock()
+                    .expect("action prior poisoned")
+                    .push(class);
+                Ok(())
+            }
+            ActionVerdict::Block { reasons } => Err(self.escalate_after_third_denial(reasons)),
+            ActionVerdict::Escalate { reasons } => {
+                *self
+                    .action_denial_count
+                    .lock()
+                    .expect("action denial count poisoned") += 1;
+                Err(ActionDenied::Escalate { reasons })
+            }
+        }
+    }
+
+    fn escalate_after_third_denial(&self, reasons: Vec<Reason>) -> ActionDenied {
+        let mut count = self
+            .action_denial_count
+            .lock()
+            .expect("action denial count poisoned");
+        *count += 1;
+        if *count >= 3 {
+            ActionDenied::Escalate { reasons }
+        } else {
+            ActionDenied::Block { reasons }
+        }
     }
 
     /// Effect class declared by the named tool, or `None` when no such tool
@@ -3485,6 +3660,194 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
+    }
+
+    struct CountingAuditor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingAuditor {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for CountingAuditor {
+        fn name(&self) -> &str {
+            "counting-block-everything"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &ActionReview,
+            _context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ActionVerdict::block(vec![Reason::new(
+                ReasonCode::Other,
+                "blocked for the test",
+            )]))
+        }
+    }
+
+    fn subject(max_effect: EffectClass) -> ActionSubject {
+        ActionSubject {
+            task_id: TaskId("t1".to_string()),
+            max_effect,
+            window: None,
+            repo: "example/repo".to_string(),
+            branch: None,
+            pr: None,
+            environment: None,
+            paths: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn calls_below_repository_never_reach_the_auditor_and_run_directly() {
+        let auditor = Arc::new(CountingAuditor::new());
+        let gate = Arc::new(ActionGate::new(
+            auditor.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("read", EffectClass::None));
+        registry.register(StubTool::boxed("edit", EffectClass::Workspace));
+        let registry = registry.with_action_gate(gate, subject(EffectClass::Production));
+
+        for tool in ["read", "edit"] {
+            let result = registry.execute(tool, json!({})).await;
+            assert!(result.is_ok(), "{tool}: {result:?}");
+        }
+        assert_eq!(auditor.calls(), 0);
+        assert!(registry.action_reviews().is_empty());
+    }
+
+    #[tokio::test]
+    async fn calls_at_or_above_repository_are_reviewed_exactly_once_and_refused_on_a_block() {
+        let auditor = Arc::new(CountingAuditor::new());
+        let gate = Arc::new(ActionGate::new(
+            auditor.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new();
+        let gated_classes = [
+            EffectClass::Repository,
+            EffectClass::Ci,
+            EffectClass::Sandbox,
+            EffectClass::Production,
+        ];
+        for class in gated_classes {
+            registry.register(StubTool::boxed(&format!("tool_{class}"), class));
+        }
+        let registry = registry.with_action_gate(gate, subject(EffectClass::Production));
+
+        for (i, class) in gated_classes.iter().enumerate() {
+            let name = format!("tool_{class}");
+            let err = registry.execute(&name, json!({})).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ActionDenied(_)),
+                "{class}: {err:?}"
+            );
+            assert_eq!(auditor.calls(), i + 1);
+        }
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), gated_classes.len());
+        for (review, class) in reviews.iter().zip(gated_classes.iter()) {
+            assert_eq!(&review.review.effect_class, class);
+            assert_eq!(review.verdict.kind(), crate::auditor::VerdictKind::Block);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_effectful_call_with_no_action_gate_attached_is_refused_by_default() {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        let err = registry.execute("push", json!({})).await.unwrap_err();
+        match err {
+            ToolError::ActionDenied(ActionDenied::Block { reasons }) => {
+                assert!(reasons[0].detail.contains("no action auditor configured"));
+            }
+            other => panic!("expected ActionDenied::Block, got {other:?}"),
+        }
+        assert_eq!(registry.action_reviews().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_third_denial_in_a_task_is_upgraded_to_an_escalation() {
+        let auditor = Arc::new(CountingAuditor::new());
+        let gate = Arc::new(ActionGate::new(
+            auditor,
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        let registry = registry.with_action_gate(gate, subject(EffectClass::Production));
+
+        for _ in 0..2 {
+            let err = registry.execute("push", json!({})).await.unwrap_err();
+            assert!(matches!(
+                err,
+                ToolError::ActionDenied(ActionDenied::Block { .. })
+            ));
+        }
+        let third = registry.execute("push", json!({})).await.unwrap_err();
+        match third {
+            ToolError::ActionDenied(ActionDenied::Escalate { .. }) => {}
+            other => panic!("expected ActionDenied::Escalate on the third denial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_calls_accumulate_as_prior_actions_for_the_next_review() {
+        struct RecordingAuditor {
+            seen_prior: Mutex<Vec<Vec<EffectClass>>>,
+        }
+
+        #[async_trait]
+        impl crate::action_auditor::ActionAuditor for RecordingAuditor {
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            async fn review_action(
+                &self,
+                review: &ActionReview,
+                _context: &ActionContext<'_>,
+            ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+                self.seen_prior
+                    .lock()
+                    .unwrap()
+                    .push(review.prior_actions.clone());
+                Ok(ActionVerdict::Allow)
+            }
+        }
+
+        let auditor = Arc::new(RecordingAuditor {
+            seen_prior: Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(ActionGate::new(
+            auditor.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry.register(StubTool::boxed("ci_trigger", EffectClass::Ci));
+        let registry = registry.with_action_gate(gate, subject(EffectClass::Production));
+
+        registry.execute("push", json!({})).await.unwrap();
+        registry.execute("ci_trigger", json!({})).await.unwrap();
+
+        let seen = auditor.seen_prior.lock().unwrap();
+        assert_eq!(seen[0], Vec::<EffectClass>::new());
+        assert_eq!(seen[1], vec![EffectClass::Repository]);
     }
 }
 
