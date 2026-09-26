@@ -439,6 +439,8 @@ impl ToolRegistry {
     ///     names,
     ///     vec![
     ///         "git_push_branch",
+    ///         "github_issue_comment",
+    ///         "github_issue_read",
     ///         "github_pr_close",
     ///         "github_pr_comments",
     ///         "github_pr_open",
@@ -2448,12 +2450,14 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 14] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 16] = [
         ("calculate", EffectClass::None),
         ("echo", EffectClass::None),
         ("git_diff", EffectClass::None),
         ("git_push_branch", EffectClass::Repository),
         ("git_status", EffectClass::None),
+        ("github_issue_comment", EffectClass::Repository),
+        ("github_issue_read", EffectClass::Repository),
         ("github_pr_close", EffectClass::Repository),
         ("github_pr_comments", EffectClass::Repository),
         ("github_pr_open", EffectClass::Repository),

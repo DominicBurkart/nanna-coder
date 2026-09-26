@@ -44,8 +44,8 @@ pub use observability::{
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
 };
 pub use pr_tools::{
-    GitPushBranchTool, GithubPrCloseTool, GithubPrCommentsTool, GithubPrOpenTool,
-    GithubPrPromoteTool,
+    GitPushBranchTool, GithubIssueCommentTool, GithubIssueReadTool, GithubPrCloseTool,
+    GithubPrCommentsTool, GithubPrOpenTool, GithubPrPromoteTool,
 };
 pub use protected::{
     AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,

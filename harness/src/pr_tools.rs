@@ -737,6 +737,152 @@ impl Tool for GithubPrCloseTool {
     }
 }
 
+/// Reads a GitHub issue's title, body, labels and comments. Closes the #187
+/// ask on this branch.
+pub struct GithubIssueReadTool {
+    workspace_root: PathBuf,
+    client: Arc<dyn GithubClient>,
+}
+
+impl GithubIssueReadTool {
+    pub fn new(workspace_root: PathBuf, client: Arc<dyn GithubClient>) -> Self {
+        Self {
+            workspace_root,
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubIssueReadTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_issue_read".to_string(),
+                description: "Read a GitHub issue's title, body, labels and comments.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "issue_number".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::Integer,
+                                description: Some("Issue number.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["issue_number".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let issue_number = required_u64(&args, "issue_number")?;
+        let repo = resolve_repo(&self.workspace_root)?;
+        let detail = self
+            .client
+            .get_issue(&repo, issue_number)
+            .await
+            .map_err(map_backlog_error)?;
+        let comments = self
+            .client
+            .list_issue_comments(&repo, issue_number)
+            .await
+            .map_err(map_backlog_error)?;
+        Ok(json!({
+            "number": detail.number,
+            "title": detail.title,
+            "body": detail.body,
+            "labels": detail.labels,
+            "html_url": detail.html_url,
+            "comments": comments.iter().map(comment_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "github_issue_read"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
+/// Posts a comment on a GitHub issue. Deliberately has no way to close an
+/// issue: agents close pull requests, never issues.
+pub struct GithubIssueCommentTool {
+    workspace_root: PathBuf,
+    client: Arc<dyn GithubClient>,
+}
+
+impl GithubIssueCommentTool {
+    pub fn new(workspace_root: PathBuf, client: Arc<dyn GithubClient>) -> Self {
+        Self {
+            workspace_root,
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubIssueCommentTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_issue_comment".to_string(),
+                description: "Post a comment on a GitHub issue.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "issue_number".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::Integer,
+                                description: Some("Issue number.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "body".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("Comment body.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["issue_number".to_string(), "body".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let issue_number = required_u64(&args, "issue_number")?;
+        let body = required_str(&args, "body")?;
+        let repo = resolve_repo(&self.workspace_root)?;
+        self.client
+            .comment_on_issue(&repo, issue_number, body)
+            .await
+            .map_err(map_backlog_error)?;
+        Ok(json!({ "number": issue_number, "commented": true }))
+    }
+
+    fn name(&self) -> &str {
+        "github_issue_comment"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
 /// Register every PR lifecycle tool against `registry`, scoped to
 /// `workspace_root` and `identity_name`.
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_name: &str) {
@@ -767,6 +913,14 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
     registry.register(Box::new(GithubPrCloseTool::new(
         workspace_root.to_path_buf(),
         identity_name,
+        Arc::clone(&client),
+    )));
+    registry.register(Box::new(GithubIssueReadTool::new(
+        workspace_root.to_path_buf(),
+        Arc::clone(&client),
+    )));
+    registry.register(Box::new(GithubIssueCommentTool::new(
+        workspace_root.to_path_buf(),
         client,
     )));
 }
@@ -775,7 +929,7 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
 mod tests {
     use super::*;
     use crate::backlog::test_support::MockGithub;
-    use crate::backlog::{GithubPullRequestCreated, GithubPullRequestDetail};
+    use crate::backlog::{GithubIssueDetail, GithubPullRequestCreated, GithubPullRequestDetail};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -1560,5 +1714,128 @@ mod tests {
             tool2.execute(json!({ "pr_number": 3 })).await.unwrap_err(),
             ToolError::InvalidArguments { .. }
         ));
+    }
+
+    // ---- github_issue_read ----
+
+    #[tokio::test]
+    async fn github_issue_read_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        assert_eq!(tool.name(), "github_issue_read");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+    }
+
+    #[tokio::test]
+    async fn github_issue_read_returns_title_body_labels_and_comments() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            issue_details: HashMap::from([(
+                ("example/repo".to_string(), 647),
+                GithubIssueDetail {
+                    number: 647,
+                    title: "PR lifecycle tools".to_string(),
+                    body: Some("Context.".to_string()),
+                    labels: vec!["enhancement".to_string()],
+                    html_url: "https://example.invalid/issues/647".to_string(),
+                },
+            )]),
+            issue_comments: HashMap::from([(
+                ("example/repo".to_string(), 647),
+                vec![comment(1, "alice", "note")],
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), mock);
+        let result = tool.execute(json!({ "issue_number": 647 })).await.unwrap();
+        assert_eq!(result["title"], json!("PR lifecycle tools"));
+        assert_eq!(result["labels"], json!(["enhancement"]));
+        assert_eq!(result["comments"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_issue_read_surfaces_a_missing_issue_error() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        let err = tool
+            .execute(json!({ "issue_number": 999 }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn github_issue_read_requires_issue_number() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        assert!(matches!(
+            tool.execute(json!({})).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    // ---- github_issue_comment ----
+
+    #[tokio::test]
+    async fn github_issue_comment_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubIssueCommentTool::new(dir.path().to_path_buf(), client);
+        assert_eq!(tool.name(), "github_issue_comment");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+    }
+
+    #[tokio::test]
+    async fn github_issue_comment_posts_a_comment() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub::default());
+        let tool = GithubIssueCommentTool::new(dir.path().to_path_buf(), mock.clone());
+        let result = tool
+            .execute(json!({ "issue_number": 10, "body": "status update" }))
+            .await
+            .unwrap();
+        assert_eq!(result["commented"], json!(true));
+        assert!(mock
+            .calls()
+            .iter()
+            .any(|c| c.contains("comment_on_issue example/repo#10: status update")));
+    }
+
+    #[tokio::test]
+    async fn github_issue_comment_requires_issue_number_and_body() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubIssueCommentTool::new(dir.path().to_path_buf(), client);
+        assert!(matches!(
+            tool.execute(json!({ "body": "b" })).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+        let client2: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool2 = GithubIssueCommentTool::new(dir.path().to_path_buf(), client2);
+        assert!(matches!(
+            tool2
+                .execute(json!({ "issue_number": 10 }))
+                .await
+                .unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn github_issue_comment_surfaces_a_client_error() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            fail_status: Some(500),
+            ..Default::default()
+        });
+        let tool = GithubIssueCommentTool::new(dir.path().to_path_buf(), mock);
+        let err = tool
+            .execute(json!({ "issue_number": 10, "body": "b" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 }
