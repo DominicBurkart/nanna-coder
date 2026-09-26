@@ -1838,4 +1838,32 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
+
+    #[test]
+    fn register_adds_every_pr_lifecycle_tool() {
+        let dir = github_repo_fixture();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, dir.path(), "sdlc-dev");
+        let mut names = registry.list_tools();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "git_push_branch",
+                "github_issue_comment",
+                "github_issue_read",
+                "github_pr_close",
+                "github_pr_comments",
+                "github_pr_open",
+                "github_pr_promote",
+            ]
+        );
+        for name in names {
+            assert_eq!(
+                registry.get_tool(name).unwrap().effect_class(),
+                EffectClass::Repository,
+                "{name} must be Repository-class"
+            );
+        }
+    }
 }
