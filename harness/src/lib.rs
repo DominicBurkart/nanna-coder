@@ -1,3 +1,4 @@
+pub mod action_auditor;
 pub mod agent;
 pub mod auditor;
 pub mod backlog;
