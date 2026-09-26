@@ -205,6 +205,10 @@ pub struct WorkflowRun {
     #[serde(default)]
     pub conclusion: Option<String>,
     pub html_url: String,
+    /// Branch the run's workflow file ran from; absent from some older
+    /// mocked payloads, hence the default rather than a hard parse failure.
+    #[serde(default)]
+    pub head_branch: Option<String>,
     #[serde(default)]
     pub run_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -222,6 +226,18 @@ impl WorkflowRun {
             return None;
         }
         Some((ended - started).num_seconds() as f64 / 60.0)
+    }
+
+    /// Whether re-running this run's failed jobs makes sense: it belongs to
+    /// `branch` and it actually finished with a failure-like conclusion,
+    /// rather than a run from an unrelated branch (a different PR, or
+    /// `main`) or one still in progress.
+    pub fn is_rerunnable_failure_on(&self, branch: &str) -> bool {
+        self.head_branch.as_deref() == Some(branch)
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("failure") | Some("timed_out") | Some("cancelled")
+            )
     }
 }
 
@@ -260,7 +276,7 @@ pub struct WorkflowStep {
 /// GitHub Actions access the CI tools need: dispatching or re-running a
 /// workflow and reading back its status, jobs and logs. Kept as a trait
 /// distinct from [`GithubClient`] (rather than added to it) so the existing
-/// issue/PR trait, its doctest and [`test_support::MockGithub`] are
+/// issue/PR trait, its doctest and `test_support::MockGithub` are
 /// untouched; [`ReqwestGithubClient`] implements both over the same
 /// retry/rate-limit plumbing.
 #[async_trait]
@@ -2356,9 +2372,29 @@ mod tests {
             status: status.to_string(),
             conclusion: conclusion.map(str::to_string),
             html_url: format!("https://example.invalid/runs/{id}"),
+            head_branch: None,
             run_started_at: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn is_rerunnable_failure_on_requires_a_matching_branch_and_a_failure_conclusion() {
+        let mut failed = run(1, "completed", Some("failure"));
+        failed.head_branch = Some("feat/x".to_string());
+        assert!(failed.is_rerunnable_failure_on("feat/x"));
+        assert!(!failed.is_rerunnable_failure_on("main"));
+
+        let mut succeeded = run(2, "completed", Some("success"));
+        succeeded.head_branch = Some("feat/x".to_string());
+        assert!(!succeeded.is_rerunnable_failure_on("feat/x"));
+
+        let mut timed_out = run(3, "completed", Some("timed_out"));
+        timed_out.head_branch = Some("feat/x".to_string());
+        assert!(timed_out.is_rerunnable_failure_on("feat/x"));
+
+        let no_branch = run(4, "completed", Some("failure"));
+        assert!(!no_branch.is_rerunnable_failure_on("feat/x"));
     }
 
     #[test]

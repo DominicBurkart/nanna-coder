@@ -17,7 +17,7 @@
 //!
 //! GitHub access goes through [`GithubActionsClient`] (a sibling of
 //! [`crate::backlog::GithubClient`] rather than an extension of it, so the
-//! existing trait, its doctest and [`crate::backlog::test_support::MockGithub`]
+//! existing trait, its doctest and `crate::backlog::test_support::MockGithub`
 //! are untouched). Credentials and repository resolution follow
 //! [`crate::pr_tools`]'s existing pattern: a `GITHUB_TOKEN` read from the
 //! harness process's environment, and the repository always resolved from
@@ -178,9 +178,10 @@ impl CiTriggerTool {
         }
     }
 
-    /// Override how long and how often [`Self::correlate_run`] polls for
-    /// the dispatched run to appear. Tests use a near-zero budget so a
-    /// "never appeared" case runs instantly instead of for real seconds.
+    /// Override how long and how often the dispatch-correlation retry loop
+    /// polls for the dispatched run to appear. Tests use a near-zero budget
+    /// so a "never appeared" case runs instantly instead of for real
+    /// seconds.
     pub fn with_correlation_policy(mut self, budget: Duration, poll: Duration) -> Self {
         self.correlation_budget = budget;
         self.correlation_poll = poll;
@@ -201,6 +202,26 @@ impl CiTriggerTool {
     ) -> Self {
         self.budget = Some(BudgetContext::new(accountant, identity, task_id));
         self
+    }
+
+    /// Charge one `Ci`-class call, when budgeted, once validation has
+    /// already passed -- a malformed or refused call must never burn budget
+    /// or raise an escalation for work that never ran.
+    async fn charge(&self, repo: &str) -> ToolResult<()> {
+        let Some(ctx) = &self.budget else {
+            return Ok(());
+        };
+        ctx.accountant
+            .charge_count(
+                &ctx.identity,
+                &ctx.task_id,
+                repo,
+                BudgetClass::Ci,
+                Utc::now(),
+            )
+            .await
+            .map_err(ToolError::BudgetExceeded)?;
+        Ok(())
     }
 
     /// `workflow_dispatch` hands back `204 No Content` with no run id, so
@@ -251,38 +272,40 @@ impl Tool for CiTriggerTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let repo = resolve_repo(&self.workspace_root)?;
-        if let Some(ctx) = &self.budget {
-            ctx.accountant
-                .charge_count(
-                    &ctx.identity,
-                    &ctx.task_id,
-                    &repo,
-                    BudgetClass::Ci,
-                    Utc::now(),
-                )
-                .await
-                .map_err(ToolError::BudgetExceeded)?;
-        }
+        let branch = current_branch(&self.workspace_root)?;
         if let Some(run_id) = optional_u64(&args, "run_id")? {
+            let run = self
+                .client
+                .get_workflow_run(&repo, run_id)
+                .await
+                .map_err(map_backlog_error)?;
+            if !run.is_rerunnable_failure_on(&branch) {
+                return Err(ToolError::InvalidArguments {
+                    message: format!(
+                        "run {run_id} is not a failed run on this task's branch ({branch}); refusing to rerun it"
+                    ),
+                });
+            }
+            self.charge(&repo).await?;
             self.client
                 .rerun_workflow(&repo, run_id)
                 .await
                 .map_err(map_backlog_error)?;
-            let run = self
+            let refreshed = self
                 .client
                 .get_workflow_run(&repo, run_id)
                 .await
                 .map_err(map_backlog_error)?;
             return Ok(json!({
                 "mode": "rerun",
-                "run_id": run.id,
-                "html_url": run.html_url,
-                "status": run.status,
+                "run_id": refreshed.id,
+                "html_url": refreshed.html_url,
+                "status": refreshed.status,
             }));
         }
         let workflow = required_str(&args, "workflow")?;
         let inputs = optional_object(&args, "inputs")?;
-        let branch = current_branch(&self.workspace_root)?;
+        self.charge(&repo).await?;
         self.client
             .dispatch_workflow(&repo, workflow, &branch, inputs)
             .await
@@ -548,6 +571,7 @@ mod tests {
             status: status.to_string(),
             conclusion: conclusion.map(str::to_string),
             html_url: format!("https://example.invalid/runs/{id}"),
+            head_branch: Some("feat/x".to_string()),
             run_started_at: None,
             updated_at: None,
         }
@@ -663,7 +687,7 @@ mod tests {
     async fn rerun_reuses_the_given_run_id() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions::default());
-        mock.set_run(run(9, "queued", None));
+        mock.set_run(run(9, "completed", Some("failure")));
         let tool = trigger_tool(
             dir.path(),
             Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
@@ -679,10 +703,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rerun_refuses_a_run_on_a_different_branch() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let mut other_branch = run(9, "completed", Some("failure"));
+        other_branch.head_branch = Some("main".to_string());
+        mock.set_run(other_branch);
+        let tool = trigger_tool(dir.path(), mock);
+        let err = tool.execute(json!({"run_id": 9})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn rerun_refuses_a_run_that_did_not_fail() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(9, "completed", Some("success")));
+        let tool = trigger_tool(dir.path(), mock);
+        let err = tool.execute(json!({"run_id": 9})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
     async fn trigger_with_budget_blocks_once_the_task_ceiling_is_reached() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions::default());
-        mock.set_run(run(1, "queued", None));
+        mock.set_run(run(1, "completed", Some("failure")));
         let config = BudgetConfig {
             ci: BudgetLimits {
                 max_count_per_task: Some(1),
@@ -702,8 +748,6 @@ mod tests {
         tool.execute(json!({"run_id": 1})).await.unwrap();
         let err = tool.execute(json!({"run_id": 1})).await.unwrap_err();
         assert!(matches!(err, ToolError::BudgetExceeded(_)));
-        // A rerun that never reaches the client because the budget already
-        // blocked it must not have been recorded twice.
         assert_eq!(accountant.task_summary("t1").ci.count, 1);
     }
 
@@ -711,7 +755,7 @@ mod tests {
     async fn trigger_without_budget_configured_is_unmetered() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions::default());
-        mock.set_run(run(1, "queued", None));
+        mock.set_run(run(1, "completed", Some("failure")));
         let tool = trigger_tool(dir.path(), mock);
         for _ in 0..5 {
             tool.execute(json!({"run_id": 1})).await.unwrap();
