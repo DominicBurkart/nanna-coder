@@ -1,6 +1,7 @@
 use crate::action_auditor::{ActionAuditLogEntry, ActionGate};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::auditor::Allowed;
+use crate::budget::{BudgetReport, CostAccountant};
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
@@ -15,6 +16,7 @@ use crate::scheduler::{
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
 };
 use crate::scope::ScopeDenial;
+use crate::workspace::default_cost_accountant;
 use crate::workspace::TaskWorkspace;
 use crate::workspace::WorkspaceError;
 use chrono::{DateTime, Utc};
@@ -116,6 +118,10 @@ pub struct TaskResult {
     /// Defaulted so results recorded before this field existed still parse.
     #[serde(default)]
     pub qa_summary: QaSummary,
+    /// `Ci`/`Sandbox` budget this task consumed. Defaulted so results
+    /// recorded before this field existed still parse.
+    #[serde(default)]
+    pub budget: BudgetReport,
 }
 
 impl TaskResult {
@@ -148,6 +154,7 @@ impl TaskResult {
             "iterations": self.iterations,
             "model_used": self.model_used,
             "qa_summary": self.qa_summary.to_json(),
+            "budget": self.budget.to_json(),
         })
     }
 }
@@ -322,6 +329,10 @@ struct TaskRunner {
     /// replaces it with a stronger one (typically a
     /// [`ModelActionAuditor`](crate::action_auditor::ModelActionAuditor)).
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
+    /// `Ci`/`Sandbox` budget every dispatched task's workspace charges
+    /// against; shared across tasks so per-day limits actually span them.
+    /// [`TaskManager::with_cost_accountant`] replaces the in-memory default.
+    cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
 }
 
 /// How long the default action gate's [`RuleActionAuditor`] holds a
@@ -425,6 +436,7 @@ impl TaskManager {
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::RwLock::new(Arc::new(NoopAuditHook)),
             action_gate: std::sync::RwLock::new(action_gate),
+            cost_accountant: std::sync::RwLock::new(default_cost_accountant()),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -462,6 +474,16 @@ impl TaskManager {
     /// terminal-transition handling release from.
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
+        self
+    }
+
+    /// Charge every dispatched task's `ci_trigger`/`ci_status`/
+    /// `sandbox_deploy`/`sandbox_teardown` against `accountant` instead of
+    /// the in-memory default, so a caller that wants per-day limits to
+    /// persist across restarts (or an [`crate::escalation::Escalator`]
+    /// wired to a real sink) can supply one.
+    pub fn with_cost_accountant(self, accountant: Arc<CostAccountant>) -> Self {
+        *self.runner.cost_accountant.write().unwrap() = accountant;
         self
     }
 
@@ -875,6 +897,10 @@ impl TaskRunner {
         Arc::clone(&self.action_gate.read().unwrap())
     }
 
+    fn cost_accountant(&self) -> Arc<CostAccountant> {
+        Arc::clone(&self.cost_accountant.read().unwrap())
+    }
+
     /// Transition a task to a new status: update the stored `Task` (status +
     /// `last_updated_at`) and broadcast the new status to any `wait_terminal`
     /// subscribers. This is the single choke point for status changes so the
@@ -1029,6 +1055,7 @@ impl TaskRunner {
                 return;
             }
         };
+        workspace.set_cost_accountant(self.cost_accountant());
 
         let tool_registry = match registry_for(&workspace, identity.as_ref()) {
             Ok(registry) => registry,
@@ -1071,6 +1098,7 @@ impl TaskRunner {
         let qa_summary = workspace.qa_summary();
 
         let _ = workspace.cleanup();
+        let budget = workspace.budget_summary();
 
         self.progress.write().await.remove(&task_id);
 
@@ -1104,6 +1132,7 @@ impl TaskRunner {
                     iterations: result.iterations,
                     model_used: queued.model,
                     qa_summary,
+                    budget,
                 };
                 self.set_status(
                     &task_id,
@@ -1370,6 +1399,13 @@ mod tests {
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
             qa_summary: QaSummary::default(),
+            budget: crate::budget::BudgetReport {
+                ci: crate::budget::Usage {
+                    count: 2,
+                    minutes: 9.0,
+                },
+                sandbox: crate::budget::Usage::default(),
+            },
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1383,6 +1419,9 @@ mod tests {
         assert_eq!(json["denials"][0]["reason"]["kind"], "tool_not_in_scope");
         assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
         assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+        assert_eq!(json["budget"]["ci"]["count"], 2);
+        assert_eq!(json["budget"]["ci"]["minutes"], 9.0);
+        assert_eq!(json["budget"]["sandbox"]["count"], 0);
         let legacy: TaskResult = serde_json::from_value(serde_json::json!({
             "result_summary": "", "changes_patch": null, "format_patch": null,
             "files_modified": [], "tool_calls_made": [], "iterations": 0, "model_used": "m"
@@ -1405,6 +1444,7 @@ mod tests {
         let result: TaskResult = serde_json::from_value(stored).unwrap();
         assert!(result.qa_summary.is_empty());
         assert_eq!(result.qa_summary, QaSummary::default());
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
     }
 
     #[test]
@@ -1479,6 +1519,7 @@ mod tests {
             iterations: 1,
             model_used: "mock".to_string(),
             qa_summary: QaSummary::default(),
+            budget: Default::default(),
         }
     }
 
@@ -2398,6 +2439,17 @@ mod tests {
         assert_eq!(result.action_audit.len(), 1);
         assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
         assert!(result.action_audit[0].verdict.is_allow());
+    }
+
+    #[test]
+    fn with_cost_accountant_replaces_the_in_memory_default() {
+        use crate::budget::{BudgetConfig, CostAccountant, InMemoryBudgetStore};
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let manager = TaskManager::new(0).with_cost_accountant(Arc::clone(&accountant));
+        assert!(Arc::ptr_eq(&manager.runner.cost_accountant(), &accountant));
     }
 
     #[tokio::test]

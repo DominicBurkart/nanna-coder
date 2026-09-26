@@ -24,6 +24,7 @@ pub mod pr_tools;
 pub mod protected;
 pub mod qa;
 pub mod rollout;
+pub mod sandbox_tools;
 pub mod scheduler;
 pub mod scope;
 pub mod sidecar;

@@ -316,6 +316,7 @@ mod tests {
             iterations: 3,
             model_used: "mock".to_string(),
             qa_summary: QaSummary::default(),
+            budget: Default::default(),
         }
     }
 

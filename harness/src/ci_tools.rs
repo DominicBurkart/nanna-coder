@@ -474,13 +474,19 @@ impl Tool for CiLogsTool {
     }
 }
 
+/// A fresh [`crate::backlog::ReqwestGithubClient`] built from `GITHUB_TOKEN`,
+/// shared by [`register`] and by [`crate::workspace::TaskWorkspace`]'s
+/// budget-aware re-registration of `ci_trigger`/`ci_status`.
+pub(crate) fn github_actions_client() -> Arc<dyn GithubActionsClient> {
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    Arc::new(crate::backlog::ReqwestGithubClient::github(token))
+}
+
 /// Registers `ci_trigger`, `ci_status` and `ci_logs` against a fresh
 /// [`crate::backlog::ReqwestGithubClient`] built from `GITHUB_TOKEN`,
 /// mirroring [`crate::pr_tools::register`].
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path) {
-    let token = std::env::var("GITHUB_TOKEN").ok();
-    let client: Arc<dyn GithubActionsClient> =
-        Arc::new(crate::backlog::ReqwestGithubClient::github(token));
+    let client = github_actions_client();
     registry.register(Box::new(CiTriggerTool::new(
         workspace_root.to_path_buf(),
         Arc::clone(&client),
