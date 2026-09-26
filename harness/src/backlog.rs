@@ -14,6 +14,7 @@
 use crate::scheduler::{QueueStore, QueueStoreError, QueuedTask, TaskOrigin, TaskQueue};
 use crate::task::TaskManager;
 use async_trait::async_trait;
+use chrono::Utc;
 use model::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -50,6 +51,47 @@ pub struct GithubPullRequest {
     pub body: Option<String>,
 }
 
+/// The pull request GitHub hands back right after creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPullRequestCreated {
+    pub number: u64,
+    pub html_url: String,
+    pub node_id: String,
+}
+
+/// The subset of a pull request's detail view the PR lifecycle tools need.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPullRequestDetail {
+    pub number: u64,
+    pub node_id: String,
+    pub draft: bool,
+    pub state: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub html_url: String,
+}
+
+/// A single review or issue comment on a pull request or issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub html_url: String,
+}
+
+/// The subset of an issue's detail view the issue-read tool needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubIssueDetail {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub html_url: String,
+}
+
 /// Failure during ingestion.
 #[derive(Debug, Error)]
 pub enum BacklogError {
@@ -61,6 +103,14 @@ pub enum BacklogError {
     Parse(#[from] serde_json::Error),
     #[error("queue store failed: {0}")]
     Store(#[from] QueueStoreError),
+    #[error("GitHub rate limit exceeded for {url} after {attempts} attempt(s), retry after {retry_after_secs:?}s")]
+    RateLimited {
+        url: String,
+        attempts: u32,
+        retry_after_secs: Option<u64>,
+    },
+    #[error("GitHub GraphQL error for {url}: {message}")]
+    GraphQl { url: String, message: String },
 }
 
 /// Read access to the GitHub data ingestion needs.
@@ -93,6 +143,53 @@ pub trait GithubClient: Send + Sync {
         number: u64,
         body: &str,
     ) -> Result<(), BacklogError>;
+
+    /// Open a pull request from `head` into `base` of `repo`. Always created
+    /// as a draft: the method takes no `draft` parameter, so there is no
+    /// argument that could make it create a ready-for-review pull request.
+    async fn create_draft_pull_request(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<GithubPullRequestCreated, BacklogError>;
+
+    /// Fetch pull request `number` of `repo`.
+    async fn get_pull_request(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<GithubPullRequestDetail, BacklogError>;
+
+    /// Convert draft pull request `number` of `repo` to ready for review.
+    async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
+
+    /// Close pull request `number` of `repo`. Never touches an issue: the
+    /// implementation always addresses the `pulls` endpoint, so this method
+    /// cannot be used to close an issue.
+    async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
+
+    /// Review comments (inline code comments) on pull request `number` of
+    /// `repo`.
+    async fn list_review_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError>;
+
+    /// Issue-style (conversation) comments on issue or pull request `number`
+    /// of `repo`. GitHub treats a pull request as an issue for this
+    /// endpoint, so the same method serves both.
+    async fn list_issue_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError>;
+
+    /// Fetch issue `number` of `repo`.
+    async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
 }
 
 /// A repository whose backlog is ingested.
@@ -185,8 +282,9 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///
 /// ```
 /// use harness::backlog::{
-///     backlog_sync, BacklogConfig, BacklogError, BacklogSource, GithubClient, GithubIssue,
-///     GithubPullRequest, StoreSink,
+///     backlog_sync, BacklogConfig, BacklogError, BacklogSource, GithubClient, GithubComment,
+///     GithubIssue, GithubIssueDetail, GithubPullRequest, GithubPullRequestCreated,
+///     GithubPullRequestDetail, StoreSink,
 /// };
 /// use harness::scheduler::InMemoryQueueStore;
 /// use std::path::PathBuf;
@@ -205,6 +303,27 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn comment_on_issue(&self, _: &str, _: u64, _: &str) -> Result<(), BacklogError> {
 ///         unreachable!("ingestion never comments")
+///     }
+///     async fn create_draft_pull_request(&self, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<GithubPullRequestCreated, BacklogError> {
+///         unreachable!("ingestion never opens pull requests")
+///     }
+///     async fn get_pull_request(&self, _: &str, _: u64) -> Result<GithubPullRequestDetail, BacklogError> {
+///         unreachable!("ingestion never reads pull request detail")
+///     }
+///     async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
+///         unreachable!("ingestion never promotes pull requests")
+///     }
+///     async fn close_pull_request(&self, _: &str, _: u64) -> Result<(), BacklogError> {
+///         unreachable!("ingestion never closes pull requests")
+///     }
+///     async fn list_review_comments(&self, _: &str, _: u64) -> Result<Vec<GithubComment>, BacklogError> {
+///         unreachable!("ingestion never reads review comments")
+///     }
+///     async fn list_issue_comments(&self, _: &str, _: u64) -> Result<Vec<GithubComment>, BacklogError> {
+///         unreachable!("ingestion never reads issue comments")
+///     }
+///     async fn get_issue(&self, _: &str, _: u64) -> Result<GithubIssueDetail, BacklogError> {
+///         unreachable!("ingestion never reads issue detail")
 ///     }
 /// }
 ///
@@ -365,15 +484,166 @@ impl BacklogSink for ManagerSink {
     }
 }
 
+/// Number of attempts [`ReqwestGithubClient`] makes for a call that keeps
+/// meeting a rate-limit response, including the first.
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Base delay [`ReqwestGithubClient`] waits before the second attempt,
+/// doubled for each attempt after that. The actual wait is at least the
+/// response's `Retry-After` (or rate-limit reset) delay, when it gave one.
+const DEFAULT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A `Retry-After`/rate-limit-reset delay longer than this fails the call
+/// immediately with [`BacklogError::RateLimited`] rather than blocking the
+/// caller for that long, and rather than resending a request GitHub has
+/// asked to be held back that long (repeatedly ignoring `Retry-After` risks
+/// the integration being blocked).
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+
+/// One of the HTTP methods [`ReqwestGithubClient`] issues.
+#[derive(Debug, Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+    Patch,
+}
+
+/// The `Retry-After` delay, in seconds, a rate-limited response asked for,
+/// derived from the `Retry-After` header or a `X-RateLimit-Remaining: 0` /
+/// `X-RateLimit-Reset` pair. `None` means the response carried neither.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(secs);
+    }
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok());
+    if remaining != Some("0") {
+        return None;
+    }
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    match reset {
+        Some(reset) => Some((reset - Utc::now().timestamp()).max(0) as u64),
+        None => Some(0),
+    }
+}
+
+#[derive(Deserialize)]
+struct RawUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct RawComment {
+    id: u64,
+    user: RawUser,
+    body: String,
+    html_url: String,
+}
+
+impl From<RawComment> for GithubComment {
+    fn from(raw: RawComment) -> Self {
+        Self {
+            id: raw.id,
+            author: raw.user.login,
+            body: raw.body,
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawLabel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RawIssueDetail {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    html_url: String,
+}
+
+impl From<RawIssueDetail> for GithubIssueDetail {
+    fn from(raw: RawIssueDetail) -> Self {
+        Self {
+            number: raw.number,
+            title: raw.title,
+            body: raw.body,
+            labels: raw.labels.into_iter().map(|label| label.name).collect(),
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPrDetail {
+    number: u64,
+    node_id: String,
+    draft: bool,
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    html_url: String,
+}
+
+impl From<RawPrDetail> for GithubPullRequestDetail {
+    fn from(raw: RawPrDetail) -> Self {
+        Self {
+            number: raw.number,
+            node_id: raw.node_id,
+            draft: raw.draft,
+            state: raw.state,
+            body: raw.body,
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPrCreated {
+    number: u64,
+    node_id: String,
+    html_url: String,
+}
+
+impl From<RawPrCreated> for GithubPullRequestCreated {
+    fn from(raw: RawPrCreated) -> Self {
+        Self {
+            number: raw.number,
+            html_url: raw.html_url,
+            node_id: raw.node_id,
+        }
+    }
+}
+
 /// [`GithubClient`] over the GitHub REST API using `reqwest`.
 ///
 /// Results are paginated `GITHUB_PAGE_SIZE` at a time until a short page is
-/// returned. A token, when given, is sent as a bearer token.
+/// returned. A token, when given, is sent as a bearer token. A response that
+/// carries a `429`, or a `403` with a `Retry-After` header or an exhausted
+/// `X-RateLimit-Remaining`, is retried with exponential backoff up to
+/// [`ReqwestGithubClient::with_retry_policy`]'s configured attempts before
+/// surfacing [`BacklogError::RateLimited`]. Any other non-success status
+/// fails immediately.
 #[derive(Debug, Clone)]
 pub struct ReqwestGithubClient {
     http: reqwest::Client,
     base_url: String,
     token: Option<String>,
+    max_attempts: u32,
+    base_backoff: std::time::Duration,
 }
 
 impl ReqwestGithubClient {
@@ -383,6 +653,8 @@ impl ReqwestGithubClient {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             token,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_backoff: DEFAULT_BASE_BACKOFF,
         }
     }
 
@@ -391,14 +663,25 @@ impl ReqwestGithubClient {
         Self::new(GITHUB_API_URL, token)
     }
 
+    /// Override the rate-limit retry policy: `max_attempts` total tries
+    /// (including the first) and `base_backoff` doubled for each attempt
+    /// after the first. Tests use a small `base_backoff` to avoid sleeping.
+    pub fn with_retry_policy(
+        mut self,
+        max_attempts: u32,
+        base_backoff: std::time::Duration,
+    ) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self.base_backoff = base_backoff;
+        self
+    }
+
     async fn get_json(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Result<serde_json::Value, BacklogError> {
-        let url = format!("{}{}", self.base_url, path);
-        let request = self.http.get(&url).query(query);
-        self.send(url, request).await
+        self.request_json(HttpMethod::Get, path, query, None).await
     }
 
     async fn post_json(
@@ -406,31 +689,78 @@ impl ReqwestGithubClient {
         path: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, BacklogError> {
-        let url = format!("{}{}", self.base_url, path);
-        let request = self.http.post(&url).json(payload);
-        self.send(url, request).await
+        self.request_json(HttpMethod::Post, path, &[], Some(payload))
+            .await
     }
 
-    async fn send(
+    async fn patch_json(
         &self,
-        url: String,
-        request: reqwest::RequestBuilder,
+        path: &str,
+        payload: &serde_json::Value,
     ) -> Result<serde_json::Value, BacklogError> {
-        let mut request = request
-            .header(reqwest::header::USER_AGENT, "nanna-coder")
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(BacklogError::Status {
+        self.request_json(HttpMethod::Patch, path, &[], Some(payload))
+            .await
+    }
+
+    /// Issue `method path`, rebuilding and resending the request on every
+    /// retry attempt (a [`reqwest::RequestBuilder`] is consumed by `send`,
+    /// so it cannot be reused across attempts).
+    async fn request_json(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, String)],
+        payload: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let mut request = match method {
+                HttpMethod::Get => self.http.get(&url).query(query),
+                HttpMethod::Post => self.http.post(&url),
+                HttpMethod::Patch => self.http.patch(&url),
+            };
+            if let Some(payload) = payload {
+                request = request.json(payload);
+            }
+            request = request
+                .header(reqwest::header::USER_AGENT, "nanna-coder")
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+            if let Some(token) = &self.token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(serde_json::from_str(&response.text().await?)?);
+            }
+            let retry_after = retry_after_secs(response.headers());
+            let rate_limited =
+                status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some());
+            if !rate_limited {
+                return Err(BacklogError::Status {
+                    url,
+                    status: status.as_u16(),
+                });
+            }
+            let exceeds_cap = retry_after.is_some_and(|secs| secs > MAX_RETRY_AFTER_SECS);
+            if !exceeds_cap && attempt < self.max_attempts {
+                let factor = 1u32 << (attempt - 1);
+                let backoff = self.base_backoff * factor;
+                let wait = match retry_after {
+                    Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
+                    None => backoff,
+                };
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Err(BacklogError::RateLimited {
                 url,
-                status: status.as_u16(),
+                attempts: attempt,
+                retry_after_secs: retry_after,
             });
         }
-        Ok(serde_json::from_str(&response.text().await?)?)
     }
 
     async fn paginate<T: for<'de> Deserialize<'de>>(
@@ -502,18 +832,159 @@ impl GithubClient for ReqwestGithubClient {
             .await?;
         Ok(())
     }
+
+    async fn create_draft_pull_request(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<GithubPullRequestCreated, BacklogError> {
+        let payload = serde_json::json!({
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+            "draft": true,
+        });
+        let value = self
+            .post_json(&format!("/repos/{repo}/pulls"), &payload)
+            .await?;
+        let raw: RawPrCreated = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
+
+    async fn get_pull_request(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<GithubPullRequestDetail, BacklogError> {
+        let value = self
+            .get_json(&format!("/repos/{repo}/pulls/{number}"), &[])
+            .await?;
+        let raw: RawPrDetail = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
+
+    async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        let detail = self.get_pull_request(repo, number).await?;
+        let payload = serde_json::json!({
+            "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
+            "variables": { "id": detail.node_id },
+        });
+        let url = format!("{}/graphql", self.base_url);
+        let value = self.post_json("/graphql", &payload).await?;
+        if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let message = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(BacklogError::GraphQl { url, message });
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        let payload = serde_json::json!({ "state": "closed" });
+        self.patch_json(&format!("/repos/{repo}/pulls/{number}"), &payload)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_review_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError> {
+        let raw: Vec<RawComment> = self
+            .paginate(
+                &format!("/repos/{repo}/pulls/{number}/comments"),
+                &[],
+                |v| v,
+            )
+            .await?;
+        Ok(raw.into_iter().map(GithubComment::from).collect())
+    }
+
+    async fn list_issue_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError> {
+        let raw: Vec<RawComment> = self
+            .paginate(
+                &format!("/repos/{repo}/issues/{number}/comments"),
+                &[],
+                |v| v,
+            )
+            .await?;
+        Ok(raw.into_iter().map(GithubComment::from).collect())
+    }
+
+    async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError> {
+        let value = self
+            .get_json(&format!("/repos/{repo}/issues/{number}"), &[])
+            .await?;
+        let raw: RawIssueDetail = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
 }
 
+/// Test doubles shared by `backlog`'s own tests and by other modules'
+/// (`pr_tools`) tests that need a mocked [`GithubClient`], so there is one
+/// mocked-client pattern for the whole crate rather than a parallel one per
+/// consumer.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::scheduler::InMemoryQueueStore;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use std::sync::Mutex as StdMutex;
 
-    struct MockGithub {
-        issues: HashMap<String, Vec<GithubIssue>>,
-        pulls: HashMap<String, Vec<GithubPullRequest>>,
+    /// A [`GithubClient`] double configured with canned responses. Every
+    /// call is appended to [`MockGithub::calls`] so a test can assert on
+    /// exactly what was sent (for example, that a created pull request's
+    /// payload carried `draft: true`).
+    #[derive(Default)]
+    pub(crate) struct MockGithub {
+        pub issues: HashMap<String, Vec<GithubIssue>>,
+        pub pulls: HashMap<String, Vec<GithubPullRequest>>,
+        pub pr_details: HashMap<(String, u64), GithubPullRequestDetail>,
+        pub issue_details: HashMap<(String, u64), GithubIssueDetail>,
+        pub review_comments: HashMap<(String, u64), Vec<GithubComment>>,
+        pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
+        pub created_pr: Option<GithubPullRequestCreated>,
+        /// When set, every call below except `get_pull_request`/`get_issue`
+        /// (which fail on a missing map entry instead) returns this status
+        /// as a [`BacklogError::Status`].
+        pub fail_status: Option<u16>,
+        pub(crate) calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockGithub {
+        /// Every call made so far, in order, as a human-readable summary.
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("mock call log poisoned").clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .expect("mock call log poisoned")
+                .push(call.into());
+        }
+
+        fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            match self.fail_status {
+                Some(status) => Err(BacklogError::Status {
+                    url: url.to_string(),
+                    status,
+                }),
+                None => Ok(()),
+            }
+        }
     }
 
     #[async_trait]
@@ -545,13 +1016,110 @@ mod tests {
 
         async fn comment_on_issue(
             &self,
-            _repo: &str,
-            _number: u64,
-            _body: &str,
+            repo: &str,
+            number: u64,
+            body: &str,
         ) -> Result<(), BacklogError> {
-            unreachable!("ingestion never comments")
+            self.record(format!("comment_on_issue {repo}#{number}: {body}"));
+            self.maybe_fail("mock:comment_on_issue")
+        }
+
+        async fn create_draft_pull_request(
+            &self,
+            repo: &str,
+            title: &str,
+            body: &str,
+            head: &str,
+            base: &str,
+        ) -> Result<GithubPullRequestCreated, BacklogError> {
+            self.record(format!(
+                "create_draft_pull_request {repo} {head}->{base} title={title}\nbody={body}"
+            ));
+            self.maybe_fail("mock:create_draft_pull_request")?;
+            self.created_pr.clone().ok_or_else(|| BacklogError::Status {
+                url: "mock:create_draft_pull_request".to_string(),
+                status: 500,
+            })
+        }
+
+        async fn get_pull_request(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubPullRequestDetail, BacklogError> {
+            self.pr_details
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:pulls/{number}"),
+                    status: 404,
+                })
+        }
+
+        async fn mark_pull_request_ready(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<(), BacklogError> {
+            self.record(format!("mark_pull_request_ready {repo}#{number}"));
+            self.maybe_fail("mock:mark_pull_request_ready")
+        }
+
+        async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+            self.record(format!("close_pull_request {repo}#{number}"));
+            self.maybe_fail("mock:close_pull_request")
+        }
+
+        async fn list_review_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            self.maybe_fail("mock:list_review_comments")?;
+            Ok(self
+                .review_comments
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn list_issue_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            self.maybe_fail("mock:list_issue_comments")?;
+            Ok(self
+                .issue_comments
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn get_issue(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubIssueDetail, BacklogError> {
+            self.issue_details
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:issues/{number}"),
+                    status: 404,
+                })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::MockGithub;
+    use super::*;
+    use crate::scheduler::InMemoryQueueStore;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn issue(number: u64) -> GithubIssue {
         GithubIssue {
@@ -610,6 +1178,7 @@ mod tests {
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(1), issue(2)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let store = InMemoryQueueStore::default();
         let sink = StoreSink::open(Box::new(store.clone())).unwrap();
@@ -660,6 +1229,7 @@ mod tests {
                     },
                 ],
             )]),
+            ..Default::default()
         };
         let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
         let report = backlog_sync(&github, &sink, &config(vec![source("o/n", "/repo")], None))
@@ -678,6 +1248,7 @@ mod tests {
                 ("o/b".to_string(), vec![issue(1), issue(2)]),
             ]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
         sink.enqueue(QueuedTask::new(
@@ -713,6 +1284,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_github_records_pr_lifecycle_calls() {
+        let mock = MockGithub {
+            created_pr: Some(GithubPullRequestCreated {
+                number: 1,
+                html_url: "u".to_string(),
+                node_id: "n".to_string(),
+            }),
+            pr_details: HashMap::from([(
+                ("o/n".to_string(), 1),
+                GithubPullRequestDetail {
+                    number: 1,
+                    node_id: "n".to_string(),
+                    draft: true,
+                    state: "open".to_string(),
+                    body: None,
+                    html_url: "u".to_string(),
+                },
+            )]),
+            ..Default::default()
+        };
+        mock.create_draft_pull_request("o/n", "t", "b", "feature", "main")
+            .await
+            .unwrap();
+        mock.mark_pull_request_ready("o/n", 1).await.unwrap();
+        mock.close_pull_request("o/n", 1).await.unwrap();
+        mock.comment_on_issue("o/n", 1, "reason").await.unwrap();
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].starts_with("create_draft_pull_request"));
+        assert!(calls[1].starts_with("mark_pull_request_ready"));
+        assert!(calls[2].starts_with("close_pull_request"));
+        assert!(calls[3].starts_with("comment_on_issue"));
+    }
+
+    #[tokio::test]
     async fn manager_sink_submits_and_reports_pending_tasks() {
         use crate::task::TaskStatus;
         use model::provider::{ModelError, ModelResult};
@@ -742,6 +1348,7 @@ mod tests {
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let cfg = config(vec![source("o/n", "/repo")], None);
         let report = backlog_sync(&github, &sink, &cfg).await.unwrap();
@@ -791,36 +1398,113 @@ mod tests {
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(1)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let cfg = config(vec![source("o/n", "/repo")], None);
         assert!(backlog_sync(&github, &sink, &cfg).await.is_err());
     }
 
-    async fn fake_github(
-        routes: Vec<(&'static str, u16, String)>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    /// One scripted response for [`fake_github_ext`]: `method` is an HTTP
+    /// verb or `"*"` for any, `path_contains` a substring of the request
+    /// target. Routes are consumed in the order they match, so the same
+    /// target can be scripted to answer differently across attempts (for
+    /// example a `429` followed by a `200`, to exercise retry).
+    struct MockRoute {
+        method: &'static str,
+        path_contains: &'static str,
+        status: u16,
+        body: String,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl MockRoute {
+        fn new(method: &'static str, path_contains: &'static str, status: u16, body: &str) -> Self {
+            Self {
+                method,
+                path_contains,
+                status,
+                body: body.to_string(),
+                headers: Vec::new(),
+            }
+        }
+
+        fn with_headers(mut self, headers: Vec<(&'static str, &'static str)>) -> Self {
+            self.headers = headers;
+            self
+        }
+    }
+
+    /// A mock GitHub server. Returns the base URL, the raw request lines
+    /// received so far (`"METHOD target body"`), and the server task handle.
+    async fn fake_github_ext(
+        routes: Vec<MockRoute>,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = Arc::new(StdMutex::new(routes));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let requests_for_server = Arc::clone(&requests);
         let handle = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 65536];
                 let n = socket.read(&mut buf).await.unwrap();
-                let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                let target = head.split_whitespace().nth(1).unwrap().to_string();
-                let (status, body) = routes
-                    .iter()
-                    .find(|(needle, _, _)| target.contains(needle))
-                    .map(|(_, status, body)| (*status, body.clone()))
-                    .unwrap_or((404, "{}".to_string()));
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = raw.split("\r\n").next().unwrap_or("").to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let body = raw
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(format!("{method} {target} {body}"));
+                let (status, body, headers) = {
+                    let mut guard = routes.lock().unwrap();
+                    let idx = guard.iter().position(|route| {
+                        (route.method == "*" || route.method == method)
+                            && target.contains(route.path_contains)
+                    });
+                    match idx {
+                        Some(i) => {
+                            let route = guard.remove(i);
+                            (route.status, route.body, route.headers)
+                        }
+                        None => (404, "{}".to_string(), Vec::new()),
+                    }
+                };
+                let mut extra_headers = String::new();
+                for (key, value) in &headers {
+                    extra_headers.push_str(&format!("{key}: {value}\r\n"));
+                }
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             }
         });
+        (base, requests, handle)
+    }
+
+    async fn fake_github(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let routes = routes
+            .into_iter()
+            .map(|(path, status, body)| MockRoute::new("*", path, status, &body))
+            .collect();
+        let (base, _requests, handle) = fake_github_ext(routes).await;
         (base, handle)
     }
 
@@ -908,5 +1592,336 @@ mod tests {
             BacklogError::Http(_)
         ));
         assert_eq!(ReqwestGithubClient::github(None).base_url, GITHUB_API_URL);
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_creates_draft_pull_request_always_sends_draft_true() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/repos/o/n/pulls",
+            201,
+            r#"{"number": 42, "node_id": "PR_kwid", "html_url": "https://example.invalid/pr/42"}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some("token".to_string()));
+        let created = client
+            .create_draft_pull_request("o/n", "title", "body", "feature", "main")
+            .await
+            .unwrap();
+        assert_eq!(created.number, 42);
+        assert_eq!(created.node_id, "PR_kwid");
+        assert_eq!(created.html_url, "https://example.invalid/pr/42");
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("\"draft\":true"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_pull_request_detail() {
+        let (base, server) = fake_github(vec![(
+            "/repos/o/n/pulls/7",
+            200,
+            r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": "desc", "html_url": "u"}"#.to_string(),
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let detail = client.get_pull_request("o/n", 7).await.unwrap();
+        assert_eq!(detail.number, 7);
+        assert_eq!(detail.node_id, "PR_x");
+        assert!(detail.draft);
+        assert_eq!(detail.state, "open");
+        assert_eq!(detail.body.as_deref(), Some("desc"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_marks_pull_request_ready_via_graphql() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": false}}}}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some("token".to_string()));
+        client.mark_pull_request_ready("o/n", 7).await.unwrap();
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].starts_with("POST /graphql"));
+        assert!(sent[1].contains("markPullRequestReadyForReview"));
+        assert!(sent[1].contains("PR_x"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_surfaces_graphql_errors() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"errors": [{"message": "Could not resolve to a node"}]}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        assert!(err.to_string().contains("Could not resolve to a node"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_closes_pull_request_patches_state_closed() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "PATCH",
+            "/repos/o/n/pulls/9",
+            200,
+            r#"{"number": 9, "state": "closed"}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client.close_pull_request("o/n", 9).await.unwrap();
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("PATCH /repos/o/n/pulls/9"));
+        assert!(sent[0].contains("\"state\":\"closed\""));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_review_and_issue_comments() {
+        let (base, server) = fake_github(vec![
+            (
+                "/repos/o/n/pulls/3/comments?per_page=100&page=1",
+                200,
+                r#"[{"id": 1, "user": {"login": "alice"}, "body": "inline", "html_url": "u1"}]"#.to_string(),
+            ),
+            (
+                "/repos/o/n/issues/3/comments?per_page=100&page=1",
+                200,
+                r#"[{"id": 2, "user": {"login": "bob"}, "body": "conversation", "html_url": "u2"}]"#.to_string(),
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let review = client.list_review_comments("o/n", 3).await.unwrap();
+        assert_eq!(
+            review,
+            vec![GithubComment {
+                id: 1,
+                author: "alice".to_string(),
+                body: "inline".to_string(),
+                html_url: "u1".to_string()
+            }]
+        );
+        let issue = client.list_issue_comments("o/n", 3).await.unwrap();
+        assert_eq!(
+            issue,
+            vec![GithubComment {
+                id: 2,
+                author: "bob".to_string(),
+                body: "conversation".to_string(),
+                html_url: "u2".to_string()
+            }]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_issue_detail_with_labels() {
+        let (base, server) = fake_github(vec![(
+            "/repos/o/n/issues/5",
+            200,
+            r#"{"number": 5, "title": "t", "body": "b", "labels": [{"name": "bug"}, {"name": "sdlc"}], "html_url": "u"}"#.to_string(),
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let detail = client.get_issue("o/n", 5).await.unwrap();
+        assert_eq!(detail.number, 5);
+        assert_eq!(detail.title, "t");
+        assert_eq!(detail.body.as_deref(), Some("b"));
+        assert_eq!(detail.labels, vec!["bug".to_string(), "sdlc".to_string()]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retries_429_then_succeeds() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}")
+                .with_headers(vec![("Retry-After", "0")]),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let detail = client.get_issue("o/n", 1).await.unwrap();
+        assert_eq!(detail.number, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retries_a_bare_429_with_no_rate_limit_headers() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}"),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let detail = client.get_issue("o/n", 1).await.unwrap();
+        assert_eq!(detail.number, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retry_waits_at_least_as_long_as_retry_after() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}")
+                .with_headers(vec![("Retry-After", "1")]),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        client.get_issue("o/n", 1).await.unwrap();
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(1),
+            "must wait at least the server's Retry-After, not just the base backoff"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retry_after_beyond_the_cap_fails_immediately() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            429,
+            "{}",
+        )
+        .with_headers(vec![("Retry-After", "120")])])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(5, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                attempts,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(attempts, 1);
+                assert_eq!(retry_after_secs, Some(120));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must not sleep when Retry-After exceeds the cap"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_403_with_remaining_zero_retries_then_exhausts() {
+        let route = || {
+            MockRoute::new("GET", "/repos/o/n/issues/1", 403, "{}").with_headers(vec![
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset", "0"),
+            ])
+        };
+        let (base, requests, server) = fake_github_ext(vec![route(), route()]).await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(2, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                attempts,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(attempts, 2);
+                assert_eq!(retry_after_secs, Some(0));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_403_with_remaining_zero_and_no_reset_header_defaults_to_zero() {
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            403,
+            "{}",
+        )
+        .with_headers(vec![("X-RateLimit-Remaining", "0")])])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, Some(0)),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_plain_403_is_not_retried() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            403,
+            "{}",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 403, .. }));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
     }
 }
