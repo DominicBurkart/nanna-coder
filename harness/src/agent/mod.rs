@@ -23,11 +23,12 @@ pub mod report;
 
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
+use crate::action_auditor::{ActionAuditLogEntry, ActionDenied};
 use crate::effects::EffectRecord;
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
 use crate::scope::ScopeDenial;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolError, ToolRegistry};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -235,6 +236,19 @@ pub struct AgentRunResult {
     /// order. Empty when the run was not scoped.
     #[serde(default)]
     pub denials: Vec<ScopeDenial>,
+    /// Every effectful action the action auditor reviewed, allowed or not,
+    /// in order. Empty when the run carried no action gate.
+    #[serde(default)]
+    pub action_audit: Vec<ActionAuditLogEntry>,
+}
+
+/// Whether a tool dispatch outcome is the action auditor halting the task,
+/// rather than a `Block` the agent may simply adapt to.
+fn is_escalation(outcome: &crate::tools::ToolResult<serde_json::Value>) -> bool {
+    matches!(
+        outcome,
+        Err(ToolError::ActionDenied(ActionDenied::Escalate { .. }))
+    )
 }
 
 fn extract_tool_calls_from_history(
@@ -411,6 +425,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             .unwrap_or_default()
     }
 
+    fn action_audit(&self) -> Vec<ActionAuditLogEntry> {
+        self.tool_registry
+            .as_ref()
+            .map(ToolRegistry::action_reviews)
+            .unwrap_or_default()
+    }
+
     fn enrich_error(&self, error: AgentError) -> AgentError {
         let tool_calls = self.tool_call_records(&self.conversation_history);
         let conversation = self.conversation_history.clone();
@@ -497,6 +518,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     tracing::warn!("Failed to store context entity: {}", e);
                 }
                 let denials = self.scope_denials();
+                let action_audit = self.action_audit();
                 return Ok(AgentRunResult {
                     final_state: self.state.clone(),
                     iterations: self.iterations,
@@ -506,6 +528,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     conversation_snapshot: conversation,
                     token_usage: None,
                     denials,
+                    action_audit,
                 });
             }
 
@@ -1074,6 +1097,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             tracing::warn!("Failed to store context entity: {}", e);
         }
         let denials = self.scope_denials();
+        let action_audit = self.action_audit();
         AgentRunResult {
             final_state: AgentState::Completed,
             iterations: self.iterations,
@@ -1083,9 +1107,16 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             conversation_snapshot: conversation,
             token_usage: Some(total_usage),
             denials,
+            action_audit,
         }
     }
 
+    /// Dispatch every tool call in `tool_calls` in order. A `Block` is fed
+    /// back to the model as a tool-response error so the agent can adapt;
+    /// an `Escalate` (the action auditor's own verdict, or the registry's
+    /// own third-denial-in-this-task upgrade) still gets that tool-response
+    /// so the transcript is complete, but then halts the run at this safe
+    /// checkpoint rather than letting the loop continue.
     async fn dispatch_tool_calls(&mut self, tool_calls: Option<Vec<ToolCall>>) -> AgentResult<()> {
         let calls = match tool_calls {
             Some(c) => c,
@@ -1099,12 +1130,19 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 Some(r) => r,
                 None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
             };
-            let response_content = match registry.execute(&name, args).await {
+            let outcome = registry.execute(&name, args).await;
+            let escalated = is_escalation(&outcome);
+            let response_content = match outcome {
                 Ok(v) => v.to_string(),
                 Err(e) => format!("Error: {}", e),
             };
             self.conversation_history
                 .push(ChatMessage::tool_response(call_id, response_content));
+            if escalated {
+                return Err(self.enrich_error(bare_state_error(format!(
+                    "action review escalated `{name}` after repeated denials; see action_audit in the task result"
+                ))));
+            }
         }
         Ok(())
     }
@@ -1166,6 +1204,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                         .unwrap()
                         .execute(&tc.function.name, tc.function.arguments.clone())
                         .await;
+                    let escalated = is_escalation(&result);
 
                     let content = match result {
                         Ok(val) => val.to_string(),
@@ -1174,6 +1213,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
                     self.conversation_history
                         .push(ChatMessage::tool_response(tc.id.clone(), content));
+
+                    if escalated {
+                        let name = tc.function.name.clone();
+                        return Err(self.enrich_error(bare_state_error(format!(
+                            "action review escalated `{name}` after repeated denials; see action_audit in the task result"
+                        ))));
+                    }
                 }
             } else {
                 self.conversation_history.push(choice.message);
@@ -1355,6 +1401,121 @@ mod tests {
             tool_replies[1]
         );
         assert_eq!(agent.tool_registry().unwrap().denial_count(), 2);
+    }
+
+    struct AlwaysBlocks;
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for AlwaysBlocks {
+        fn name(&self) -> &str {
+            "always-blocks"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(crate::action_auditor::ActionVerdict::block(vec![
+                crate::auditor::Reason::new(crate::auditor::ReasonCode::Other, "test block"),
+            ]))
+        }
+    }
+
+    fn gated_registry_for(root: &std::path::Path) -> ToolRegistry {
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(AlwaysBlocks),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let subject = crate::tools::ActionSubject {
+            task_id: crate::task::TaskId("t1".to_string()),
+            max_effect: crate::effects::EffectClass::Production,
+            window: None,
+            repo: "example/repo".to_string(),
+            branch: None,
+            pr: None,
+            environment: None,
+            paths: vec![],
+        };
+        crate::tools::create_tool_registry(root).with_action_gate(gate, subject)
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_halts_when_an_action_escalates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            plain_response("should never be reached"),
+        ]);
+        let config = AgentConfig {
+            max_iterations: 10,
+            ..Default::default()
+        };
+        let registry = gated_registry_for(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "check pr status repeatedly".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let err = agent.run_tool_loop(context).await.unwrap_err();
+        match err {
+            AgentError::StateError { message, .. } => {
+                assert!(message.contains("escalated"), "{message}");
+            }
+            other => panic!("expected StateError, got {other:?}"),
+        }
+        let audit = agent.action_audit();
+        assert_eq!(audit.len(), 3);
+        assert!(audit
+            .iter()
+            .all(|entry| entry.verdict.kind() == crate::auditor::VerdictKind::Block));
+        let tool_replies: Vec<&str> = agent
+            .conversation_history()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            tool_replies.len(),
+            3,
+            "the escalating call still gets a tool response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_run_halts_when_an_action_escalates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+        ]));
+        let config = AgentConfig {
+            max_iterations: 20,
+            ..Default::default()
+        };
+        let registry = gated_registry_for(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "check pr status repeatedly".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let err = agent.run(context).await.unwrap_err();
+        match err {
+            AgentError::StateError { message, .. } => {
+                assert!(message.contains("escalated"), "{message}");
+            }
+            other => panic!("expected StateError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
