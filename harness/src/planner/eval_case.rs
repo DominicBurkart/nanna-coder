@@ -63,8 +63,11 @@ mod tests {
                 files_modified: vec![],
                 tool_calls_made: vec![],
                 denials: vec![],
+                action_audit: vec![],
                 iterations: 1,
                 model_used: "mock".to_string(),
+                qa_summary: Default::default(),
+                budget: Default::default(),
             },
         }
     }

@@ -341,6 +341,8 @@ mod tests {
                         tool_call_history: vec![],
                         last_agent_state: None,
                         conversation_snapshot: None,
+                        denials: vec![],
+                        action_audit: vec![],
                     },
                 },
             }
@@ -361,8 +363,11 @@ mod tests {
                 files_modified: vec![],
                 tool_calls_made: vec![],
                 denials: vec![],
+                action_audit: vec![],
                 iterations: 1,
                 model_used: "mock".to_string(),
+                qa_summary: Default::default(),
+                budget: Default::default(),
             },
         }
     }
