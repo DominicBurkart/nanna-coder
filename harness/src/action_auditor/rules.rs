@@ -116,8 +116,11 @@ impl RuleActionAuditor {
             EffectClass::Repository | EffectClass::Ci => {
                 RuleOutcome::Decided(self.ceiling_check(review, ctx))
             }
-            EffectClass::Sandbox | EffectClass::Production => {
-                self.window_and_lease_check(review, ctx)
+            EffectClass::Sandbox => {
+                self.window_and_lease_check(review, ctx, leases::Effect::Sandbox)
+            }
+            EffectClass::Production => {
+                self.window_and_lease_check(review, ctx, leases::Effect::Production)
             }
         }
     }
@@ -140,6 +143,7 @@ impl RuleActionAuditor {
         &self,
         review: &ActionReview,
         ctx: &ActionContext<'_>,
+        effect: leases::Effect,
     ) -> RuleOutcome {
         let Some(window) = ctx.window else {
             let reason = Reason::new(
@@ -163,11 +167,6 @@ impl RuleActionAuditor {
                 return RuleOutcome::Decided(ActionVerdict::block(vec![reason]));
             }
         }
-        let effect = match review.effect_class {
-            EffectClass::Sandbox => leases::Effect::Sandbox,
-            EffectClass::Production => leases::Effect::Production,
-            _ => unreachable!("window_and_lease_check is only called for sandbox/production"),
-        };
         let names = match leases::required_leases(effect, &ctx.lease) {
             Ok(names) => names,
             Err(e) => {
