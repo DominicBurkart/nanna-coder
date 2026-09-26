@@ -1028,10 +1028,6 @@ impl TaskRunner {
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
         let run_result = agent.run(context).await;
-        // `agent` is not consumed by `run`, so the tool registry it owns
-        // (and every action review recorded on it) is still reachable here
-        // whether the run succeeded, failed, or was cut short by an
-        // escalation -- `AgentError` itself carries no action-audit data.
         let action_audit = agent
             .tool_registry()
             .map(crate::tools::ToolRegistry::action_reviews)
