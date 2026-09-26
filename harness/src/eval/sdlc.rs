@@ -1112,6 +1112,16 @@ async fn action_gate_probes(task_id: &TaskId) -> Vec<GateProbeOutcome> {
 /// [`SdlcE2eOutcome`] a caller can print or hand to
 /// [`append_scorecard_row`].
 pub async fn run_e2e_scenario() -> Result<SdlcE2eOutcome, SdlcEvalError> {
+    run_e2e_scenario_with(ScriptedModelProvider::replying(&[r#"{"verdict":"allow"}"#])).await
+}
+
+/// [`run_e2e_scenario`], with the deploy step's action-gate model provider
+/// injectable so a test can script it to `block`/`escalate` and confirm
+/// [`SdlcE2eOutcome::task_success`] actually reflects that, rather than
+/// only whether every node reached [`NodeOutcome::Dispatched`].
+async fn run_e2e_scenario_with(
+    action_provider: Arc<ScriptedModelProvider>,
+) -> Result<SdlcE2eOutcome, SdlcEvalError> {
     let work_dir = tempfile::tempdir()?;
     let bare_dir = tempfile::tempdir()?;
     init_fixture_repo(work_dir.path(), bare_dir.path())?;
@@ -1140,7 +1150,7 @@ pub async fn run_e2e_scenario() -> Result<SdlcE2eOutcome, SdlcEvalError> {
         work: work_dir.path().to_path_buf(),
         bare: bare_dir.path().to_path_buf(),
         github: FakeGithub::new(),
-        action_provider: ScriptedModelProvider::replying(&[r#"{"verdict":"allow"}"#]),
+        action_provider,
         effect_counts: effect_tally(),
         probes: Arc::new(Mutex::new(Vec::new())),
         wall_clock: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1162,11 +1172,25 @@ pub async fn run_e2e_scenario() -> Result<SdlcE2eOutcome, SdlcEvalError> {
     )
     .await?;
 
+    // `NodeOutcome::Dispatched` only means the spawn-gate allowed the node
+    // and `SpawnDispatcher::dispatch` was called -- `execute_plan` never
+    // awaits a leaf node's own terminal status (only a *dependent*'s
+    // dependency is awaited, per `first_failed_dependency`), so a
+    // dispatched node whose own step failed (an audit-gated deploy that
+    // was blocked, a rollout that never reached `Complete`, ...) would
+    // otherwise still read as `task_success = true`. Require each node's
+    // `TaskStatus` to have actually reached `Completed`.
     let mut task_success = true;
     for id in ["implement", "shepherd", "deploy"] {
-        match execution.outcome(&PlanNodeId::new(id)) {
-            Some(NodeOutcome::Dispatched { .. }) => {}
-            Some(_) | None => task_success = false,
+        let completed = match execution.outcome(&PlanNodeId::new(id)) {
+            Some(NodeOutcome::Dispatched { task_id, .. }) => matches!(
+                dispatcher.wait_terminal(task_id).await,
+                Some(TaskStatus::Completed { .. })
+            ),
+            Some(_) | None => false,
+        };
+        if !completed {
+            task_success = false;
         }
     }
 
@@ -1493,6 +1517,29 @@ mod tests {
         assert_eq!(outcome.auditor.false_blocks, 0);
         assert_eq!(outcome.auditor.false_allow_rate, 0.0);
         assert_eq!(outcome.auditor.false_block_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn task_success_is_false_when_a_dispatched_node_never_completes() {
+        // The deploy node has no dependent, so `execute_plan` never awaits
+        // its own terminal status -- only `NodeOutcome::Dispatched`, which
+        // is set as soon as the spawn-gate allows the spawn and dispatch is
+        // called, regardless of whether the dispatched work itself
+        // succeeds. Scripting the deploy step's action-gate model to
+        // `block` makes `run_deployer` fail (see
+        // `run_deployer_errors_when_the_action_gate_blocks_the_deploy`)
+        // while the plan node still reads as `Dispatched`; `task_success`
+        // must catch that via `wait_terminal`, not just node dispatch.
+        let action_provider = ScriptedModelProvider::replying(&[
+            r#"{"verdict":"block","reasons":[{"code":"other","detail":"scripted test block"}]}"#,
+        ]);
+        let outcome = run_e2e_scenario_with(action_provider).await.unwrap();
+        assert!(!outcome.task_success, "{outcome:#?}");
+        // The implementer and shepherd nodes still completed; only the
+        // leaf deploy node's own failure was previously invisible.
+        assert!(!outcome
+            .effect_counts
+            .contains_key(EffectClass::Sandbox.as_str()));
     }
 
     #[test]
