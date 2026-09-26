@@ -21,6 +21,11 @@ name = "harness-score"
 path = "src/bin/score.rs"
 required-features = ["eval-runner"]
 
+[[bin]]
+name = "harness-sdlc-eval"
+path = "src/bin/sdlc_eval.rs"
+required-features = ["eval-runner"]
+
 [features]
 # Gate the eval runner and its tempfile dependency behind this feature so that
 # production builds (the harness binary, container images) do not pull in

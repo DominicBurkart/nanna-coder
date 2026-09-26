@@ -66,7 +66,7 @@ fn invalid(file: &Path, field: &'static str, reason: String) -> DeployError {
 }
 
 fn lacks_observation_window(health: Option<&Health>) -> bool {
-    !health.is_some_and(|h| h.bake_time > Duration::zero())
+    health.is_none_or(|h| h.bake_time <= Duration::zero())
 }
 
 impl DeployTemplate {
