@@ -1,14 +1,14 @@
 use crate::action_auditor::{ActionAuditLogEntry, ActionGate};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::auditor::Allowed;
-use crate::budget::{BudgetReport, CostAccountant};
+use crate::budget::{BudgetConfig, BudgetReport, CostAccountant, InMemoryBudgetStore};
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
-use crate::escalation::{EscalationLog, EscalationSnapshot};
+use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escalator, FanoutSink};
 use crate::identity::AgentIdentity;
-use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, SystemClock};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
 use crate::scheduler::{
@@ -16,7 +16,6 @@ use crate::scheduler::{
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
 };
 use crate::scope::ScopeDenial;
-use crate::workspace::default_cost_accountant;
 use crate::workspace::TaskWorkspace;
 use crate::workspace::WorkspaceError;
 use chrono::{DateTime, Utc};
@@ -351,6 +350,31 @@ fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
     ))
 }
 
+/// A [`CostAccountant`] over [`BudgetConfig::default`] and an in-process
+/// store, escalating exhaustion into `escalations` through a record-only
+/// [`FanoutSink`] (no sinks to actually deliver to) so a real exhaustion is
+/// still visible via [`TaskManager::escalation_snapshot`]/`_meta.escalations`
+/// even when nothing further has been configured. A caller that wants real
+/// delivery (a GitHub issue, a webhook) supplies its own accountant via
+/// [`TaskManager::with_cost_accountant`].
+fn default_cost_accountant_with_escalations(
+    escalations: &Arc<EscalationLog>,
+) -> Arc<CostAccountant> {
+    let escalator = Arc::new(Escalator::new(
+        Arc::clone(escalations),
+        Arc::new(FanoutSink(vec![])),
+        Arc::new(SystemClock),
+        default_window(),
+    ));
+    Arc::new(
+        CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::default(),
+        )
+        .with_escalator(escalator),
+    )
+}
+
 /// Manages task submission, scheduling and lifecycle.
 ///
 /// Submissions beyond `max_concurrent_tasks` are queued, not rejected, and
@@ -424,6 +448,8 @@ impl TaskManager {
         default_provider: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, QueueStoreError> {
         let action_gate = default_action_gate(Arc::clone(&leases));
+        let escalations = Arc::new(EscalationLog::in_memory());
+        let cost_accountant = default_cost_accountant_with_escalations(&escalations);
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -436,11 +462,10 @@ impl TaskManager {
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::RwLock::new(Arc::new(NoopAuditHook)),
             action_gate: std::sync::RwLock::new(action_gate),
-            cost_accountant: std::sync::RwLock::new(default_cost_accountant()),
+            cost_accountant: std::sync::RwLock::new(cost_accountant),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
-        let escalations = Arc::new(EscalationLog::in_memory());
         Ok(Self {
             runner,
             dispatcher,
@@ -487,9 +512,8 @@ impl TaskManager {
         self
     }
 
-    /// The escalation log, for producers building an
-    /// [`Escalator`](crate::escalation::Escalator) and for consumers
-    /// checking [`production_held`](EscalationLog::production_held).
+    /// The escalation log, for producers building an [`Escalator`] and for
+    /// consumers checking [`production_held`](EscalationLog::production_held).
     pub fn escalations(&self) -> Arc<EscalationLog> {
         Arc::clone(&self.escalations)
     }
@@ -2439,6 +2463,26 @@ mod tests {
         assert_eq!(result.action_audit.len(), 1);
         assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
         assert!(result.action_audit[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn default_cost_accountant_escalates_budget_exhaustion_into_the_managers_own_log() {
+        use crate::budget::BudgetClass;
+        let manager = TaskManager::new(0);
+        let accountant = manager.runner.cost_accountant();
+        assert_eq!(manager.escalation_snapshot().tracked, 0);
+        // BudgetConfig::default's Sandbox per-task ceiling is tight (3); a
+        // handful of calls past it is enough to exhaust it without
+        // depending on the exact default number staying unchanged.
+        for _ in 0..8 {
+            let _ = accountant
+                .charge_count("id", "t1", "example/repo", BudgetClass::Sandbox, Utc::now())
+                .await;
+        }
+        assert!(
+            manager.escalation_snapshot().tracked >= 1,
+            "the default accountant must escalate into the same log tasks/list reports"
+        );
     }
 
     #[test]

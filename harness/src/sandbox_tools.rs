@@ -5,12 +5,18 @@
 //!
 //! Both tools are [`EffectClass::Sandbox`], so [`crate::tools::ToolRegistry::execute`]
 //! reviews every call through the action auditor before it runs: window and
-//! coordination-lease checks are already structural there
-//! ([`crate::action_auditor::RuleActionAuditor::window_and_lease_check`]
-//! acquires `sandbox:<repo>:<pr>` via [`crate::leases::LeaseName::sandbox`]
+//! coordination-lease checks are already structural there (the rule action
+//! auditor acquires `sandbox:<repo>:<pr>` via [`crate::leases::LeaseName::sandbox`]
 //! for any `Sandbox`-class call, keyed off the caller-supplied
 //! [`crate::tools::ActionSubject::pr`]), so neither tool acquires a lease
-//! itself.
+//! itself. Because that lease is keyed off `ActionSubject::pr` rather than
+//! anything either tool reads at call time, both tools take the PR number
+//! at *construction*, not as a tool argument: an argument a model chose
+//! could otherwise name a different PR than the one the auditor's lease
+//! actually covers, the same class of bypass this crate's PR tools already
+//! guard against for `repo`. [`crate::workspace::TaskWorkspace`] only
+//! registers these tools once a PR is configured
+//! ([`crate::workspace::TaskWorkspace::set_sandbox_pr`]).
 //!
 //! [`SandboxTarget`] is intentionally small and synchronous, mirroring
 //! [`crate::qa::HttpProbe`] rather than the rollout executor's
@@ -36,7 +42,7 @@ use crate::budget::{BudgetClass, CostAccountant};
 use crate::deploy::{DeployError, DeployTemplate};
 use crate::effects::EffectClass;
 use crate::onboarding::fullstack::CHECKS_FILE;
-use crate::pr_tools::{required_str, required_u64, resolve_repo};
+use crate::pr_tools::{required_str, resolve_repo};
 use crate::qa::manifest::{ContainerProbe, HttpProbe, Manifest, ManifestChecker, ProbeError};
 use crate::qa::{MANIFEST_SOURCE_DERIVED, MANIFEST_SOURCE_REPO};
 use crate::sidecar::CommandRunner;
@@ -80,6 +86,11 @@ pub struct SandboxHandle {
     pub pr: u64,
     pub url: String,
     pub deployed_at: DateTime<Utc>,
+    /// Identity that deployed it, when the deploying tool was budgeted, so
+    /// [`crate::workspace::TaskWorkspace::cleanup`]'s safety net can charge
+    /// the sandbox's lifetime to the right identity's budget.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 /// Failures deploying to, or tearing down, a sandbox.
@@ -95,6 +106,8 @@ pub enum SandboxError {
     Deploy(String),
     #[error("sandbox teardown failed: {0}")]
     Teardown(String),
+    #[error("a sandbox is already deployed for this task; call sandbox_teardown first")]
+    AlreadyDeployed,
 }
 
 fn map_sandbox_error(e: SandboxError) -> ToolError {
@@ -207,6 +220,7 @@ impl SandboxTarget for FakeSandboxTarget {
             pr,
             url: format!("http://{addr}"),
             deployed_at: Utc::now(),
+            identity: None,
         };
         self.servers
             .lock()
@@ -369,16 +383,21 @@ pub struct SandboxDeployTool {
     probe: Arc<dyn HttpProbe>,
     sandboxes: Arc<SandboxRegistry>,
     task_id: String,
+    /// Pull request this deploy is for, fixed at construction (never a tool
+    /// argument -- see the module doc for why).
+    pr: u64,
     budget: Option<BudgetContext>,
 }
 
 impl SandboxDeployTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspace_root: PathBuf,
         target: Arc<dyn SandboxTarget>,
         probe: Arc<dyn HttpProbe>,
         sandboxes: Arc<SandboxRegistry>,
         task_id: impl Into<String>,
+        pr: u64,
     ) -> Self {
         Self {
             workspace_root,
@@ -386,12 +405,15 @@ impl SandboxDeployTool {
             probe,
             sandboxes,
             task_id: task_id.into(),
+            pr,
             budget: None,
         }
     }
 
     /// Charge one `Sandbox`-class call against `accountant` before every
-    /// deploy.
+    /// deploy, and stamp `identity` onto the resulting [`SandboxHandle`] so
+    /// a later teardown can charge the sandbox's lifetime to the same
+    /// identity.
     pub fn with_budget(
         mut self,
         accountant: Arc<CostAccountant>,
@@ -405,28 +427,40 @@ impl SandboxDeployTool {
         self
     }
 
+    /// Validated inputs for a deploy: the loaded template (already confirmed
+    /// to declare a `sandbox` environment) and the image tag. Runs entirely
+    /// before any budget is charged, so a malformed call or a template
+    /// missing the `sandbox` environment never burns budget for work that
+    /// never happened.
+    fn validate<'a>(&self, args: &'a Value) -> Result<(DeployTemplate, &'a str), ToolError> {
+        let image_tag = required_str(args, "image_tag")?;
+        if self.sandboxes.get(&self.task_id).is_some() {
+            return Err(map_sandbox_error(SandboxError::AlreadyDeployed));
+        }
+        let template = DeployTemplate::load_from_repo(&self.workspace_root)
+            .map_err(|e| map_sandbox_error(SandboxError::from(e)))?;
+        let environments = &template.target.environments;
+        let has_sandbox_env = environments.iter().any(|env| env == "sandbox");
+        if !has_sandbox_env {
+            return Err(map_sandbox_error(SandboxError::NoSandboxEnvironment));
+        }
+        Ok((template, image_tag))
+    }
+
     fn deploy_and_check(
         &self,
         repo: &str,
-        pr: u64,
+        template: &DeployTemplate,
         image_tag: &str,
     ) -> Result<Value, SandboxError> {
-        let template = DeployTemplate::load_from_repo(&self.workspace_root)?;
-        if !template
-            .target
-            .environments
-            .iter()
-            .any(|env| env == "sandbox")
-        {
-            return Err(SandboxError::NoSandboxEnvironment);
-        }
         let image = format!("{}:{image_tag}", template.target.image_ref());
-        let handle = self.target.deploy(repo, pr, &image)?;
+        let mut handle = self.target.deploy(repo, self.pr, &image)?;
+        handle.identity = self.budget.as_ref().map(|ctx| ctx.identity.clone());
         self.sandboxes.insert(&self.task_id, handle.clone());
-        let (manifest, source) = load_manifest(&self.workspace_root, &template)?;
+        let (manifest, source) = load_manifest(&self.workspace_root, template)?;
         let report = ManifestChecker::new(Arc::clone(&self.probe)).run(&handle.url, &manifest);
         let mut result = report.to_json();
-        result["pr_number"] = json!(pr);
+        result["pr_number"] = json!(self.pr);
         result["url"] = json!(handle.url);
         result["manifest"] = json!(source);
         result["all_passed"] = json!(report.all_passed());
@@ -440,19 +474,18 @@ impl Tool for SandboxDeployTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "sandbox_deploy",
-            "Deploy the PR's built image (tagged image_tag, per the repository's registry/image in .nanna/deploy.toml) to a per-PR sandbox, then run the endpoint manifest QA against it. Result: { pr_number, url, manifest, checks, passed, failed, all_passed, text }.",
-            vec![
-                ("pr_number", property(SchemaType::Integer, "Pull request the sandbox is for.")),
-                ("image_tag", property(SchemaType::String, "Tag of the already-built image to deploy.")),
-            ],
-            Some(vec!["pr_number".to_string(), "image_tag".to_string()]),
+            "Deploy this task's PR's built image (tagged image_tag, per the repository's registry/image in .nanna/deploy.toml) to its sandbox, then run the endpoint manifest QA against it. Result: { pr_number, url, manifest, checks, passed, failed, all_passed, text }.",
+            vec![(
+                "image_tag",
+                property(SchemaType::String, "Tag of the already-built image to deploy."),
+            )],
+            Some(vec!["image_tag".to_string()]),
         )
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let repo = resolve_repo(&self.workspace_root)?;
-        let pr = required_u64(&args, "pr_number")?;
-        let image_tag = required_str(&args, "image_tag")?;
+        let (template, image_tag) = self.validate(&args)?;
         if let Some(ctx) = &self.budget {
             ctx.accountant
                 .charge_count(
@@ -465,7 +498,7 @@ impl Tool for SandboxDeployTool {
                 .await
                 .map_err(ToolError::BudgetExceeded)?;
         }
-        self.deploy_and_check(&repo, pr, image_tag)
+        self.deploy_and_check(&repo, &template, image_tag)
             .map_err(map_sandbox_error)
     }
 
@@ -572,6 +605,7 @@ pub fn register(
     probe: Arc<dyn HttpProbe>,
     sandboxes: Arc<SandboxRegistry>,
     task_id: &str,
+    pr: u64,
     budget: Option<(Arc<CostAccountant>, &str)>,
 ) {
     let mut deploy = SandboxDeployTool::new(
@@ -580,6 +614,7 @@ pub fn register(
         probe,
         Arc::clone(&sandboxes),
         task_id,
+        pr,
     );
     let mut teardown = SandboxTeardownTool::new(target, sandboxes, task_id);
     if let Some((accountant, identity)) = budget {
@@ -611,34 +646,12 @@ mod tests {
         );
     }
 
-    const DEPLOY_TOML: &str = r#"
-[target]
-kind = "container-registry+serverless"
-registry = "registry.example.invalid/ns"
-image = "app"
-environments = ["sandbox", "staging", "production"]
-
-[risk]
-class = "edge"
-
-[rollout]
-strategy = "gradual"
-steps = [10, 50, 100]
-min_step_duration = "8h"
-windows = "business-hours"
-
-[health]
-endpoints = ["/health/v1"]
-error_rate_max = 0.01
-latency_p99_max_ms = 800
-bake_time = "30m"
-
-[rollback]
-automatic = true
-on_breach = "rollback"
-"#;
-
-    const CHECKS: &str = "/\n/health/v1\n/api/v1/greeting\n";
+    /// The fixture monorepo's own `.nanna/deploy.toml` and `CHECKS`, loaded
+    /// verbatim rather than hand-copied: a hand-copied constant already
+    /// drifted from the real file once (a missing `windows` key), which
+    /// `cargo test` cannot catch on its own.
+    const DEPLOY_TOML: &str = include_str!("../../tests/fixtures/fullstack/.nanna/deploy.toml");
+    const CHECKS: &str = include_str!("../../tests/fixtures/fullstack/CHECKS");
 
     /// A checkout with a `.nanna/deploy.toml` declaring a `sandbox`
     /// environment and a `CHECKS` manifest, matching the fixture monorepo
@@ -687,9 +700,10 @@ on_breach = "rollback"
         dir: &Path,
         target: Arc<dyn SandboxTarget>,
         sandboxes: Arc<SandboxRegistry>,
+        pr: u64,
     ) -> SandboxDeployTool {
         let probe: Arc<dyn HttpProbe> = Arc::new(HostHttpProbe::new(Arc::new(SystemRunner)));
-        SandboxDeployTool::new(dir.to_path_buf(), target, probe, sandboxes, "t1")
+        SandboxDeployTool::new(dir.to_path_buf(), target, probe, sandboxes, "t1", pr)
     }
 
     #[tokio::test]
@@ -697,11 +711,8 @@ on_breach = "rollback"
         let dir = fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let tool = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes));
-        let result = tool
-            .execute(json!({"pr_number": 7, "image_tag": "v1"}))
-            .await
-            .unwrap();
+        let tool = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes), 7);
+        let result = tool.execute(json!({"image_tag": "v1"})).await.unwrap();
         assert_eq!(result["pr_number"], 7);
         assert_eq!(result["manifest"], "CHECKS");
         assert_eq!(result["all_passed"], true, "{result}");
@@ -733,11 +744,8 @@ on_breach = "rollback"
         );
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let tool = deploy_tool(dir.path(), target, sandboxes);
-        let result = tool
-            .execute(json!({"pr_number": 1, "image_tag": "v1"}))
-            .await
-            .unwrap();
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        let result = tool.execute(json!({"image_tag": "v1"})).await.unwrap();
         assert_eq!(result["manifest"], "derived");
         let checks = result["checks"].as_array().unwrap();
         let paths: Vec<&str> = checks.iter().map(|c| c["path"].as_str().unwrap()).collect();
@@ -749,28 +757,30 @@ on_breach = "rollback"
         let dir = no_sandbox_fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let tool = deploy_tool(dir.path(), target, sandboxes);
-        let err = tool
-            .execute(json!({"pr_number": 1, "image_tag": "v1"}))
-            .await
-            .unwrap_err();
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 
     #[tokio::test]
-    async fn deploy_requires_pr_number_and_image_tag() {
+    async fn deploy_requires_image_tag() {
         let dir = fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let tool = deploy_tool(dir.path(), target, sandboxes);
-        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        let err = tool.execute(json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments { .. }));
-        let dir2 = fixture();
-        let target2: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
-        let sandboxes2 = Arc::new(SandboxRegistry::new());
-        let tool2 = deploy_tool(dir2.path(), target2, sandboxes2);
-        let err = tool2.execute(json!({"pr_number": 1})).await.unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn deploy_refuses_a_second_deploy_while_one_is_live() {
+        let dir = fixture();
+        let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap();
+        let err = tool.execute(json!({"image_tag": "v2"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 
     #[tokio::test]
@@ -779,16 +789,13 @@ on_breach = "rollback"
         let target = Arc::new(FakeSandboxTarget::new());
         target.fail_next_deploy();
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let tool = deploy_tool(dir.path(), target, sandboxes);
-        let err = tool
-            .execute(json!({"pr_number": 1, "image_tag": "v1"}))
-            .await
-            .unwrap_err();
+        let tool = deploy_tool(dir.path(), target, sandboxes, 1);
+        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 
     #[tokio::test]
-    async fn deploy_with_budget_blocks_once_the_task_ceiling_is_reached() {
+    async fn deploy_with_budget_blocks_a_redeploy_once_the_task_ceiling_is_reached() {
         let dir = fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
@@ -804,17 +811,62 @@ on_breach = "rollback"
             config,
         ));
         let probe: Arc<dyn HttpProbe> = Arc::new(HostHttpProbe::new(Arc::new(SystemRunner)));
-        let tool = SandboxDeployTool::new(dir.path().to_path_buf(), target, probe, sandboxes, "t1")
-            .with_budget(Arc::clone(&accountant), "id");
-        tool.execute(json!({"pr_number": 1, "image_tag": "v1"}))
+        let tool = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::clone(&target),
+            probe,
+            Arc::clone(&sandboxes),
+            "t1",
+            1,
+        )
+        .with_budget(Arc::clone(&accountant), "id");
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap();
+        // Free the sandbox slot so a redeploy is only blocked by the budget,
+        // not by the one-sandbox-per-task guard.
+        SandboxTeardownTool::new(target, Arc::clone(&sandboxes), "t1")
+            .execute(json!({}))
             .await
             .unwrap();
-        let err = tool
-            .execute(json!({"pr_number": 1, "image_tag": "v1"}))
+        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::BudgetExceeded(_)));
+        assert_eq!(accountant.task_summary("t1").sandbox.count, 1);
+    }
+
+    #[tokio::test]
+    async fn deploy_with_budget_blocks_a_second_task_once_the_day_ceiling_is_reached() {
+        let dir = fixture();
+        let config = BudgetConfig {
+            ci: BudgetLimits::UNLIMITED,
+            sandbox: BudgetLimits {
+                max_count_per_day: Some(1),
+                ..BudgetLimits::UNLIMITED
+            },
+        };
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            config,
+        ));
+        let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let probe: Arc<dyn HttpProbe> = Arc::new(HostHttpProbe::new(Arc::new(SystemRunner)));
+        let first = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::clone(&target),
+            Arc::clone(&probe),
+            Arc::clone(&sandboxes),
+            "t1",
+            1,
+        )
+        .with_budget(Arc::clone(&accountant), "id");
+        first.execute(json!({"image_tag": "v1"})).await.unwrap();
+        let second =
+            SandboxDeployTool::new(dir.path().to_path_buf(), target, probe, sandboxes, "t2", 2)
+                .with_budget(Arc::clone(&accountant), "id");
+        let err = second
+            .execute(json!({"image_tag": "v1"}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::BudgetExceeded(_)));
-        assert_eq!(accountant.task_summary("t1").sandbox.count, 1);
     }
 
     #[tokio::test]
@@ -822,11 +874,8 @@ on_breach = "rollback"
         let dir = fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let deploy = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes));
-        deploy
-            .execute(json!({"pr_number": 3, "image_tag": "v1"}))
-            .await
-            .unwrap();
+        let deploy = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes), 3);
+        deploy.execute(json!({"image_tag": "v1"})).await.unwrap();
         let teardown = SandboxTeardownTool::new(Arc::clone(&target), Arc::clone(&sandboxes), "t1");
         let result = teardown.execute(json!({})).await.unwrap();
         assert_eq!(result["torn_down"], true);
@@ -834,6 +883,19 @@ on_breach = "rollback"
         assert!(sandboxes.get("t1").is_none());
         let second = teardown.execute(json!({})).await.unwrap();
         assert_eq!(second["torn_down"], false);
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeds_again_after_teardown() {
+        let dir = fixture();
+        let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let deploy = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes), 3);
+        deploy.execute(json!({"image_tag": "v1"})).await.unwrap();
+        let teardown = SandboxTeardownTool::new(Arc::clone(&target), Arc::clone(&sandboxes), "t1");
+        teardown.execute(json!({})).await.unwrap();
+        deploy.execute(json!({"image_tag": "v2"})).await.unwrap();
+        assert!(sandboxes.get("t1").is_some());
     }
 
     #[tokio::test]
@@ -854,11 +916,9 @@ on_breach = "rollback"
             dir.path(),
             Arc::clone(&target) as Arc<dyn SandboxTarget>,
             Arc::clone(&sandboxes),
+            4,
         );
-        deploy
-            .execute(json!({"pr_number": 4, "image_tag": "v1"}))
-            .await
-            .unwrap();
+        deploy.execute(json!({"image_tag": "v1"})).await.unwrap();
         target.fail_next_teardown();
         let teardown = SandboxTeardownTool::new(
             target as Arc<dyn SandboxTarget>,
@@ -881,6 +941,7 @@ on_breach = "rollback"
                 pr: 5,
                 url: "http://127.0.0.1:1".to_string(),
                 deployed_at: Utc::now() - chrono::Duration::minutes(3),
+                identity: None,
             },
         );
         let accountant = Arc::new(CostAccountant::new(
@@ -899,13 +960,13 @@ on_breach = "rollback"
         let dir = fixture();
         let target: Arc<dyn SandboxTarget> = Arc::new(FakeSandboxTarget::new());
         let sandboxes = Arc::new(SandboxRegistry::new());
-        let deploy = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes));
+        let deploy = deploy_tool(dir.path(), Arc::clone(&target), Arc::clone(&sandboxes), 1);
         assert_eq!(deploy.name(), "sandbox_deploy");
         assert_eq!(deploy.effect_class(), EffectClass::Sandbox);
         assert_eq!(deploy.definition().function.name, "sandbox_deploy");
         assert_eq!(
             deploy.definition().function.parameters.required,
-            Some(vec!["pr_number".to_string(), "image_tag".to_string()])
+            Some(vec!["image_tag".to_string()])
         );
         let teardown = SandboxTeardownTool::new(target, sandboxes, "t1");
         assert_eq!(teardown.name(), "sandbox_teardown");
@@ -972,6 +1033,7 @@ on_breach = "rollback"
             pr: 1,
             url: "http://x".to_string(),
             deployed_at: Utc::now(),
+            identity: None,
         };
         registry.insert("t1", handle.clone());
         assert_eq!(registry.get("t1"), Some(handle));
@@ -999,6 +1061,7 @@ on_breach = "rollback"
             probe,
             sandboxes,
             "t1",
+            1,
             Some((accountant, "id")),
         );
         let mut names = registry.list_tools();

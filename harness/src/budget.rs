@@ -12,7 +12,7 @@
 //! ([`BudgetConfig::default`]) rather than configurable per identity through
 //! the `AgentIdentity` TOML schema: the accounting itself is already keyed
 //! per identity name, but wiring a *limit* into the schema would ripple into
-//! [`crate::identity::narrowing`]'s widening checks and every identity
+//! `crate::identity`'s narrowing (widening) checks and every identity
 //! fixture file, disproportionate to this issue's scope. A caller that needs
 //! different limits constructs its own [`BudgetConfig`].
 
@@ -209,6 +209,18 @@ impl BudgetExceeded {
             limit,
         }
     }
+
+    /// A summary stable across occurrences of the same breach: no `used`/
+    /// `limit` figures, which change on every call and would otherwise give
+    /// every occurrence its own [`Escalation::dedupe_key`] (dedupe keys off
+    /// `source`, `repo` and the summary), defeating collapsing entirely.
+    /// The numbers still reach the escalation as evidence.
+    pub fn stable_summary(&self) -> String {
+        format!(
+            "identity `{}` exceeded its {} {} {} budget",
+            self.identity, self.scope, self.class, self.dimension
+        )
+    }
 }
 
 /// Usage for one task's `Ci` and `Sandbox` budgets, the shape
@@ -378,7 +390,7 @@ impl CostAccountant {
                 Severity::Blocked,
                 EscalationSource::Budget,
                 repo,
-                exceeded.to_string(),
+                exceeded.stable_summary(),
             )
             .with_identity(&exceeded.identity)
             .with_evidence(vec![exceeded.to_string()])
@@ -471,6 +483,30 @@ impl CostAccountant {
             },
         );
         Ok(self.task_summary(task_id))
+    }
+
+    /// Like [`Self::record_minutes`], but synchronous and without an
+    /// exhaustion check or escalation: bookkeeping only, for a caller that
+    /// cannot await (`TaskWorkspace::cleanup`'s sandbox-teardown safety net,
+    /// which runs on a task whose `Sandbox`-class tools already escalate on
+    /// every call under the default rule auditor, so the next
+    /// [`Self::charge_count`] blocks and escalates regardless).
+    pub fn record_minutes_sync(
+        &self,
+        identity: &str,
+        task_id: &str,
+        class: BudgetClass,
+        minutes: f64,
+        now: DateTime<Utc>,
+    ) -> BudgetReport {
+        self.store.record(
+            identity,
+            task_id,
+            class,
+            now.date_naive(),
+            Usage { count: 0, minutes },
+        );
+        self.task_summary(task_id)
     }
 
     /// Add `minutes` to `identity`/`task_id`'s `class` usage once a provider
@@ -617,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_task_count_ceiling_blocks_once_reached() {
+    async fn per_task_count_ceiling_blocks_once_reached_but_leaves_other_tasks_unaffected() {
         let config = BudgetConfig {
             ci: BudgetLimits {
                 max_count_per_task: Some(2),
@@ -646,7 +682,6 @@ mod tests {
             err.to_string(),
             "identity `id` exceeded its per-task ci count budget: 2 > 2"
         );
-        // A different task is unaffected.
         accountant
             .charge_count("id", "t2", "o/n", BudgetClass::Ci, now())
             .await
@@ -654,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_day_count_ceiling_spans_tasks_for_the_same_identity() {
+    async fn per_day_count_ceiling_spans_tasks_for_the_same_identity_but_not_others() {
         let config = BudgetConfig {
             ci: BudgetLimits {
                 max_count_per_day: Some(1),
@@ -673,7 +708,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.scope, BudgetScope::Day);
         assert_eq!(err.dimension, BudgetDimension::Count);
-        // A different identity is unaffected.
         accountant
             .charge_count("other", "t3", "o/n", BudgetClass::Ci, now())
             .await
@@ -746,6 +780,21 @@ mod tests {
         assert_eq!(summary.ci.minutes, 500.0);
     }
 
+    #[test]
+    fn record_minutes_sync_records_without_awaiting_or_checking_limits() {
+        let config = BudgetConfig {
+            ci: BudgetLimits::UNLIMITED,
+            sandbox: BudgetLimits {
+                max_minutes_per_task: Some(1.0),
+                ..BudgetLimits::UNLIMITED
+            },
+        };
+        let accountant = accountant(config);
+        let summary = accountant.record_minutes_sync("id", "t1", BudgetClass::Sandbox, 50.0, now());
+        assert_eq!(summary.sandbox.minutes, 50.0);
+        assert_eq!(accountant.task_summary("t1").sandbox.minutes, 50.0);
+    }
+
     #[tokio::test]
     async fn task_summary_reports_both_classes_independently() {
         let accountant = accountant(BudgetConfig::UNLIMITED);
@@ -789,6 +838,63 @@ mod tests {
         assert_eq!(err.dimension, BudgetDimension::Count);
         let snapshot = log.snapshot(Utc::now());
         assert_eq!(snapshot.tracked, 1);
+    }
+
+    #[test]
+    fn stable_summary_omits_the_changing_used_and_limit_figures() {
+        let a = BudgetExceeded::new(
+            "id",
+            BudgetClass::Ci,
+            BudgetScope::Day,
+            BudgetDimension::Minutes,
+            15.0,
+            10.0,
+        );
+        let b = BudgetExceeded::new(
+            "id",
+            BudgetClass::Ci,
+            BudgetScope::Day,
+            BudgetDimension::Minutes,
+            25.0,
+            10.0,
+        );
+        assert_eq!(a.stable_summary(), b.stable_summary());
+        assert_ne!(a.to_string(), b.to_string());
+        assert_eq!(
+            a.stable_summary(),
+            "identity `id` exceeded its per-day ci minutes budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_exhaustion_collapses_into_one_escalation_despite_the_growing_minutes() {
+        let config = BudgetConfig {
+            ci: BudgetLimits {
+                max_minutes_per_task: Some(1.0),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        };
+        let log = Arc::new(EscalationLog::in_memory());
+        let escalator = Arc::new(Escalator::new(
+            Arc::clone(&log),
+            Arc::new(FanoutSink(vec![])),
+            Arc::new(SystemClock),
+            chrono::Duration::hours(1),
+        ));
+        let accountant = CostAccountant::new(Arc::new(InMemoryBudgetStore::new()), config)
+            .with_escalator(escalator);
+        accountant
+            .record_minutes("id", "t1", "o/n", BudgetClass::Ci, 5.0, now())
+            .await;
+        accountant
+            .record_minutes("id", "t1", "o/n", BudgetClass::Ci, 5.0, now())
+            .await;
+        let snapshot = log.snapshot(Utc::now());
+        assert_eq!(
+            snapshot.tracked, 1,
+            "both breaches must dedupe to the same key despite different `used` values"
+        );
     }
 
     #[tokio::test]
