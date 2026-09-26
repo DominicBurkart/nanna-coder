@@ -28,7 +28,7 @@
 //! carries a `Nanna-Identity` marker is rejected rather than silently
 //! overridden, so a model cannot forge or displace it.
 //!
-//! ## Author allow-list for [`GithubPrCommentsTool`]
+//! ## Author allow-list for [`GithubPrCommentsTool`] and [`GithubIssueReadTool`]
 //!
 //! The allow-list is a plain constructor parameter (`Vec<String>`), sourced
 //! by [`register`] from the `NANNA_TRUSTED_PR_COMMENTERS` environment
@@ -38,6 +38,13 @@
 //! also fit; a constructor parameter was simpler and needed no schema
 //! change, and it keeps the allow-list out of the model's own tool-call
 //! arguments so an adversarial commenter cannot add themselves to it.
+//!
+//! [`GithubIssueReadTool`] applies the same filter, not a separate one:
+//! GitHub's issue-comments endpoint answers identically whether the number
+//! given names an issue or a pull request, so an allow-list enforced only
+//! on [`GithubPrCommentsTool`] is not enforced at all -- calling
+//! `github_issue_read` with a PR's number would return every comment
+//! [`GithubPrCommentsTool`] would have filtered out.
 
 use crate::backlog::{BacklogError, GithubClient, GithubComment};
 use crate::effects::EffectClass;
@@ -458,6 +465,23 @@ impl Tool for GithubPrOpenTool {
     }
 }
 
+/// Normalizes `allowed_authors` for [`comment_is_allowed`] comparisons.
+fn normalize_allowed_authors(allowed_authors: Vec<String>) -> Vec<String> {
+    allowed_authors
+        .into_iter()
+        .map(|author| author.to_lowercase())
+        .collect()
+}
+
+/// Whether `comment`'s author (case-insensitive) appears in
+/// `allowed_authors`. Shared by every tool that surfaces GitHub comment
+/// text to an agent, since `list_issue_comments` answers for a PR number
+/// exactly as it does for an issue number and a filter applied to only one
+/// caller is not a filter at all.
+fn comment_is_allowed(comment: &GithubComment, allowed_authors: &[String]) -> bool {
+    allowed_authors.contains(&comment.author.to_lowercase())
+}
+
 /// Fetches a pull request's review comments and issue (conversation)
 /// comments, filtered to a configured allow-list of authors so an arbitrary
 /// commenter cannot inject instructions into an agent's context. See the
@@ -474,20 +498,15 @@ impl GithubPrCommentsTool {
         client: Arc<dyn GithubClient>,
         allowed_authors: Vec<String>,
     ) -> Self {
-        let allowed_authors = allowed_authors
-            .into_iter()
-            .map(|author| author.to_lowercase())
-            .collect();
         Self {
             workspace_root,
             client,
-            allowed_authors,
+            allowed_authors: normalize_allowed_authors(allowed_authors),
         }
     }
 
     fn is_allowed(&self, comment: &GithubComment) -> bool {
-        self.allowed_authors
-            .contains(&comment.author.to_lowercase())
+        comment_is_allowed(comment, &self.allowed_authors)
     }
 }
 
@@ -739,16 +758,27 @@ impl Tool for GithubPrCloseTool {
 
 /// Reads a GitHub issue's title, body, labels and comments. Closes the #187
 /// ask on this branch.
+///
+/// `list_issue_comments` answers identically for a PR number as for an
+/// issue number, so this tool honors the same author allow-list as
+/// [`GithubPrCommentsTool`] — otherwise calling it with a PR's number would
+/// bypass that filter entirely.
 pub struct GithubIssueReadTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubClient>,
+    allowed_authors: Vec<String>,
 }
 
 impl GithubIssueReadTool {
-    pub fn new(workspace_root: PathBuf, client: Arc<dyn GithubClient>) -> Self {
+    pub fn new(
+        workspace_root: PathBuf,
+        client: Arc<dyn GithubClient>,
+        allowed_authors: Vec<String>,
+    ) -> Self {
         Self {
             workspace_root,
             client,
+            allowed_authors: normalize_allowed_authors(allowed_authors),
         }
     }
 }
@@ -793,13 +823,19 @@ impl Tool for GithubIssueReadTool {
             .list_issue_comments(&repo, issue_number)
             .await
             .map_err(map_backlog_error)?;
+        let total = comments.len();
+        let kept: Vec<&GithubComment> = comments
+            .iter()
+            .filter(|c| comment_is_allowed(c, &self.allowed_authors))
+            .collect();
         Ok(json!({
             "number": detail.number,
             "title": detail.title,
             "body": detail.body,
             "labels": detail.labels,
             "html_url": detail.html_url,
-            "comments": comments.iter().map(comment_json).collect::<Vec<_>>(),
+            "comments": kept.iter().map(|c| comment_json(c)).collect::<Vec<_>>(),
+            "filtered_out": total - kept.len(),
         }))
     }
 
@@ -903,7 +939,7 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
     registry.register(Box::new(GithubPrCommentsTool::new(
         workspace_root.to_path_buf(),
         Arc::clone(&client),
-        allowed_authors,
+        allowed_authors.clone(),
     )));
     registry.register(Box::new(GithubPrPromoteTool::new(
         workspace_root.to_path_buf(),
@@ -918,6 +954,7 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
     registry.register(Box::new(GithubIssueReadTool::new(
         workspace_root.to_path_buf(),
         Arc::clone(&client),
+        allowed_authors,
     )));
     registry.register(Box::new(GithubIssueCommentTool::new(
         workspace_root.to_path_buf(),
@@ -1722,7 +1759,7 @@ mod tests {
     async fn github_issue_read_definition_and_effect_class() {
         let dir = github_repo_fixture();
         let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
-        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client, vec![]);
         assert_eq!(tool.name(), "github_issue_read");
         assert_eq!(tool.effect_class(), EffectClass::Repository);
     }
@@ -1747,18 +1784,79 @@ mod tests {
             )]),
             ..Default::default()
         });
-        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), mock);
+        let tool =
+            GithubIssueReadTool::new(dir.path().to_path_buf(), mock, vec!["alice".to_string()]);
         let result = tool.execute(json!({ "issue_number": 647 })).await.unwrap();
         assert_eq!(result["title"], json!("PR lifecycle tools"));
         assert_eq!(result["labels"], json!(["enhancement"]));
         assert_eq!(result["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(result["filtered_out"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn github_issue_read_filters_comments_by_the_same_author_allow_list_as_pr_comments() {
+        // A PR's number is also a valid "issue number" on GitHub's
+        // list-comments endpoint (this is finding #2 from PR #708's
+        // review: github_issue_read was a complete bypass of the
+        // github_pr_comments allow-list for exactly this reason).
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            issue_details: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                GithubIssueDetail {
+                    number: 5,
+                    title: "A pull request".to_string(),
+                    body: None,
+                    labels: vec![],
+                    html_url: "https://example.invalid/pull/5".to_string(),
+                },
+            )]),
+            issue_comments: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                vec![comment(1, "alice", "trusted"), comment(2, "eve", "spam")],
+            )]),
+            ..Default::default()
+        });
+        let tool =
+            GithubIssueReadTool::new(dir.path().to_path_buf(), mock, vec!["alice".to_string()]);
+        let result = tool.execute(json!({ "issue_number": 5 })).await.unwrap();
+        let comments = result["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["author"], json!("alice"));
+        assert_eq!(result["filtered_out"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn github_issue_read_empty_allow_list_filters_everything() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            issue_details: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                GithubIssueDetail {
+                    number: 5,
+                    title: "An issue".to_string(),
+                    body: None,
+                    labels: vec![],
+                    html_url: "https://example.invalid/issues/5".to_string(),
+                },
+            )]),
+            issue_comments: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                vec![comment(1, "alice", "hi")],
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), mock, vec![]);
+        let result = tool.execute(json!({ "issue_number": 5 })).await.unwrap();
+        assert_eq!(result["comments"].as_array().unwrap().len(), 0);
+        assert_eq!(result["filtered_out"], json!(1));
     }
 
     #[tokio::test]
     async fn github_issue_read_surfaces_a_missing_issue_error() {
         let dir = github_repo_fixture();
         let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
-        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client, vec![]);
         let err = tool
             .execute(json!({ "issue_number": 999 }))
             .await
@@ -1770,7 +1868,7 @@ mod tests {
     async fn github_issue_read_requires_issue_number() {
         let dir = github_repo_fixture();
         let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
-        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client);
+        let tool = GithubIssueReadTool::new(dir.path().to_path_buf(), client, vec![]);
         assert!(matches!(
             tool.execute(json!({})).await.unwrap_err(),
             ToolError::InvalidArguments { .. }
