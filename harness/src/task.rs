@@ -449,6 +449,11 @@ impl TaskManager {
     /// (issue #642). A `Sandbox`/`Production` action always needs the
     /// strongest configured model per the epic, so most callers will pass a
     /// [`ModelActionAuditor`](crate::action_auditor::ModelActionAuditor) here.
+    ///
+    /// Build it over [`TaskManager::leases`], not a fresh store: a lease it
+    /// acquires is released with the rest of a task's leases only when it
+    /// shares the same store this manager's [`TaskManager::cancel`] and
+    /// terminal-transition handling release from.
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
         self
@@ -1185,7 +1190,11 @@ fn registry_for(
 /// #649) -- so `Sandbox`/`Production` calls dispatched through
 /// `TaskRunner` correctly `Block` on a missing lease context
 /// ([`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)) until
-/// then, rather than silently skipping the check.
+/// then, rather than silently skipping the check. `repo` is
+/// `queued.repo_path`'s filesystem path, not the `owner/name` form
+/// [`ActionSubject::repo`](crate::tools::ActionSubject::repo) is documented
+/// against; harmless today since no lease is ever acquired while `window`
+/// is `None`, but worth fixing alongside the PR/environment metadata.
 fn action_subject_for(
     task_id: &TaskId,
     queued: &QueuedTask,
