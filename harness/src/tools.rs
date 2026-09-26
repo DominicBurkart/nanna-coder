@@ -437,7 +437,12 @@ impl ToolRegistry {
     ///     .collect();
     /// assert_eq!(
     ///     names,
-    ///     vec!["git_push_branch", "github_pr_open", "github_pr_status"]
+    ///     vec![
+    ///         "git_push_branch",
+    ///         "github_pr_comments",
+    ///         "github_pr_open",
+    ///         "github_pr_status"
+    ///     ]
     /// );
     /// assert!(registry.with_class(EffectClass::Production).is_empty());
     /// ```
@@ -2441,12 +2446,13 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 11] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 12] = [
         ("calculate", EffectClass::None),
         ("echo", EffectClass::None),
         ("git_diff", EffectClass::None),
         ("git_push_branch", EffectClass::Repository),
         ("git_status", EffectClass::None),
+        ("github_pr_comments", EffectClass::Repository),
         ("github_pr_open", EffectClass::Repository),
         ("github_pr_status", EffectClass::Repository),
         ("list_directory", EffectClass::None),

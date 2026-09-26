@@ -27,8 +27,19 @@
 //! HTML comment, via [`crate::marker`]); a caller-supplied body that already
 //! carries a `Nanna-Identity` marker is rejected rather than silently
 //! overridden, so a model cannot forge or displace it.
+//!
+//! ## Author allow-list for [`GithubPrCommentsTool`]
+//!
+//! The allow-list is a plain constructor parameter (`Vec<String>`), sourced
+//! by [`register`] from the `NANNA_TRUSTED_PR_COMMENTERS` environment
+//! variable (a comma-separated list of GitHub logins, matched
+//! case-insensitively), mirroring how [`crate::tools::GitHubPrStatusTool`]
+//! sources its token from `GITHUB_TOKEN`. An identity-scoped TOML field would
+//! also fit; a constructor parameter was simpler and needed no schema
+//! change, and it keeps the allow-list out of the model's own tool-call
+//! arguments so an adversarial commenter cannot add themselves to it.
 
-use crate::backlog::{BacklogError, GithubClient};
+use crate::backlog::{BacklogError, GithubClient, GithubComment};
 use crate::effects::EffectClass;
 use crate::marker::{parse_identity_from_text, render_html_marker, render_trailer};
 use crate::tools::{parse_github_remote, Tool, ToolError, ToolRegistry, ToolResult};
@@ -39,6 +50,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+
+/// Environment variable naming the comma-separated GitHub logins
+/// [`GithubPrCommentsTool`] keeps comments from; unset means the allow-list
+/// is empty and every comment is filtered out.
+pub const TRUSTED_PR_COMMENTERS_ENV: &str = "NANNA_TRUSTED_PR_COMMENTERS";
 
 fn map_backlog_error(err: BacklogError) -> ToolError {
     ToolError::ExecutionFailed {
@@ -52,6 +68,23 @@ fn required_str<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
         .ok_or_else(|| ToolError::InvalidArguments {
             message: format!("missing '{key}'"),
         })
+}
+
+fn required_u64(args: &Value, key: &str) -> ToolResult<u64> {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("missing '{key}'"),
+        })
+}
+
+fn comment_json(comment: &GithubComment) -> Value {
+    json!({
+        "id": comment.id,
+        "author": comment.author,
+        "body": comment.body,
+        "html_url": comment.html_url,
+    })
 }
 
 #[cfg(test)]
@@ -390,12 +423,120 @@ impl Tool for GithubPrOpenTool {
     }
 }
 
+/// Fetches a pull request's review comments and issue (conversation)
+/// comments, filtered to a configured allow-list of authors so an arbitrary
+/// commenter cannot inject instructions into an agent's context. See the
+/// module docs for where the allow-list comes from.
+pub struct GithubPrCommentsTool {
+    workspace_root: PathBuf,
+    client: Arc<dyn GithubClient>,
+    allowed_authors: Vec<String>,
+}
+
+impl GithubPrCommentsTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        client: Arc<dyn GithubClient>,
+        allowed_authors: Vec<String>,
+    ) -> Self {
+        let allowed_authors = allowed_authors
+            .into_iter()
+            .map(|author| author.to_lowercase())
+            .collect();
+        Self {
+            workspace_root,
+            client,
+            allowed_authors,
+        }
+    }
+
+    fn is_allowed(&self, comment: &GithubComment) -> bool {
+        self.allowed_authors
+            .contains(&comment.author.to_lowercase())
+    }
+}
+
+#[async_trait]
+impl Tool for GithubPrCommentsTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_pr_comments".to_string(),
+                description: "Fetch review and issue comments on a pull request, filtered to a configured author allow-list.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "pr_number".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::Integer,
+                                description: Some("Pull request number.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["pr_number".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let pr_number = required_u64(&args, "pr_number")?;
+        let repo = resolve_repo(&self.workspace_root)?;
+        let review = self
+            .client
+            .list_review_comments(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        let issue = self
+            .client
+            .list_issue_comments(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        let total = review.len() + issue.len();
+        let review_kept: Vec<&GithubComment> =
+            review.iter().filter(|c| self.is_allowed(c)).collect();
+        let issue_kept: Vec<&GithubComment> = issue.iter().filter(|c| self.is_allowed(c)).collect();
+        let filtered_out = total - review_kept.len() - issue_kept.len();
+        Ok(json!({
+            "review_comments": review_kept.iter().map(|c| comment_json(c)).collect::<Vec<_>>(),
+            "issue_comments": issue_kept.iter().map(|c| comment_json(c)).collect::<Vec<_>>(),
+            "filtered_out": filtered_out,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "github_pr_comments"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
+/// The allow-list [`GithubPrCommentsTool`] is constructed with by
+/// [`register`]: [`TRUSTED_PR_COMMENTERS_ENV`] split on commas, trimmed,
+/// lowercased, and emptied of blanks. `None` (the variable unset) yields an
+/// empty allow-list, so every comment is filtered out until it is set.
+pub(crate) fn parse_allowed_authors(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(|author| author.trim().to_lowercase())
+        .filter(|author| !author.is_empty())
+        .collect()
+}
+
 /// Register every PR lifecycle tool against `registry`, scoped to
 /// `workspace_root` and `identity_name`.
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_name: &str) {
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client: Arc<dyn GithubClient> =
         Arc::new(crate::backlog::ReqwestGithubClient::github(token));
+    let allowed_authors =
+        parse_allowed_authors(std::env::var(TRUSTED_PR_COMMENTERS_ENV).ok().as_deref());
     registry.register(Box::new(GitPushBranchTool::new(
         workspace_root.to_path_buf(),
         identity_name,
@@ -403,7 +544,12 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
     registry.register(Box::new(GithubPrOpenTool::new(
         workspace_root.to_path_buf(),
         identity_name,
+        Arc::clone(&client),
+    )));
+    registry.register(Box::new(GithubPrCommentsTool::new(
+        workspace_root.to_path_buf(),
         client,
+        allowed_authors,
     )));
 }
 
@@ -874,5 +1020,91 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
         assert!(err.to_string().contains("422"));
+    }
+
+    // ---- github_pr_comments ----
+
+    fn comment(id: u64, author: &str, body: &str) -> GithubComment {
+        GithubComment {
+            id,
+            author: author.to_string(),
+            body: body.to_string(),
+            html_url: format!("https://example.invalid/c/{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_pr_comments_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrCommentsTool::new(dir.path().to_path_buf(), client, vec![]);
+        assert_eq!(tool.name(), "github_pr_comments");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+    }
+
+    #[tokio::test]
+    async fn github_pr_comments_filters_by_author_allow_list() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            review_comments: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                vec![comment(1, "Alice", "inline")],
+            )]),
+            issue_comments: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                vec![comment(2, "bob", "conversation"), comment(3, "eve", "spam")],
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrCommentsTool::new(
+            dir.path().to_path_buf(),
+            mock,
+            vec!["alice".to_string(), "Bob".to_string()],
+        );
+        let result = tool.execute(json!({ "pr_number": 5 })).await.unwrap();
+        assert_eq!(result["review_comments"].as_array().unwrap().len(), 1);
+        assert_eq!(result["issue_comments"].as_array().unwrap().len(), 1);
+        assert_eq!(result["filtered_out"], json!(1));
+        assert_eq!(result["review_comments"][0]["author"], json!("Alice"));
+        assert_eq!(result["issue_comments"][0]["author"], json!("bob"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_comments_empty_allow_list_filters_everything() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            issue_comments: HashMap::from([(
+                ("example/repo".to_string(), 5),
+                vec![comment(1, "alice", "hi")],
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrCommentsTool::new(dir.path().to_path_buf(), mock, vec![]);
+        let result = tool.execute(json!({ "pr_number": 5 })).await.unwrap();
+        assert_eq!(result["issue_comments"].as_array().unwrap().len(), 0);
+        assert_eq!(result["filtered_out"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn github_pr_comments_requires_pr_number() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrCommentsTool::new(dir.path().to_path_buf(), client, vec![]);
+        assert!(matches!(
+            tool.execute(json!({})).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn github_pr_comments_surfaces_a_client_error() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            fail_status: Some(403),
+            ..Default::default()
+        });
+        let tool = GithubPrCommentsTool::new(dir.path().to_path_buf(), mock, vec![]);
+        let err = tool.execute(json!({ "pr_number": 1 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 }

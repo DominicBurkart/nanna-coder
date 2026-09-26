@@ -43,7 +43,7 @@ pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
 };
-pub use pr_tools::{GitPushBranchTool, GithubPrOpenTool};
+pub use pr_tools::{GitPushBranchTool, GithubPrCommentsTool, GithubPrOpenTool};
 pub use protected::{
     AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,
 };
