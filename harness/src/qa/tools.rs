@@ -277,6 +277,10 @@ impl Tool for QaEndpointsTool {
     fn name(&self) -> &str {
         QA_ENDPOINTS_TOOL
     }
+
+    fn effect_class(&self) -> crate::effects::EffectClass {
+        crate::effects::EffectClass::Workspace
+    }
 }
 
 /// `qa_browser`: run a scripted scenario in headless Chromium inside the
@@ -315,6 +319,10 @@ impl Tool for QaBrowserTool {
 
     fn name(&self) -> &str {
         QA_BROWSER_TOOL
+    }
+
+    fn effect_class(&self) -> crate::effects::EffectClass {
+        crate::effects::EffectClass::Workspace
     }
 }
 

@@ -240,6 +240,8 @@ async fn fixture_flake_builds_dev_container_with_profile_tools() {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args: vec![],
+        network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
     let handle = start_container_with_fallback(&config)
         .await

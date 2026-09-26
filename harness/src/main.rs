@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::identity::IdentityCatalog;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
@@ -44,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Inspect the agent identity catalog
+    Agents {
+        #[command(subcommand)]
+        action: AgentsAction,
+    },
     /// Health check
     Health {
         /// Skip the on-startup pod-ensure check
@@ -91,6 +97,78 @@ enum Commands {
         #[arg(long, default_value = "100")]
         max_iterations: usize,
     },
+    /// Delegate a coding task through the MCP Tasks protocol.
+    ///
+    /// Drives an in-process MCP server as a Tasks client: submits an
+    /// `assign_task` tool call augmented with a `task`, polls `tasks/get` to
+    /// completion, and prints the `tasks/result` payload. This exercises the
+    /// same wire protocol external orchestrators use.
+    Delegate {
+        /// Description of the coding task to perform
+        #[arg(short, long)]
+        description: String,
+        /// Absolute path to the git repository
+        #[arg(short, long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base the worktree on
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+        /// The model to use
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Requested task lifetime in milliseconds
+        #[arg(long)]
+        ttl_ms: Option<u64>,
+    },
+    /// Pull open GitHub issues into the persistent task queue
+    ///
+    /// Issues already queued (by number) or already claimed by an open pull
+    /// request carrying a `Nanna-Identity:` marker are skipped. Reads
+    /// `GITHUB_TOKEN` for authentication when set. Entries land in the queue
+    /// log and are picked up when `mcp-serve` next starts.
+    BacklogSync {
+        /// GitHub repository in `owner/name` form
+        #[arg(long)]
+        repo: String,
+        /// Absolute path to the local checkout tasks run against
+        #[arg(long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base task worktrees on
+        #[arg(long, default_value = "HEAD")]
+        branch: String,
+        /// GitHub search query fragment selecting the issues
+        #[arg(long, default_value = "label:nanna")]
+        query: String,
+        /// Identity hint attached to every ingested task
+        #[arg(long)]
+        identity: String,
+        /// The model the tasks run with
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations per task
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Maximum pending tasks per repository path
+        #[arg(long)]
+        max_per_repo: Option<usize>,
+        /// Queue log location (defaults to NANNA_QUEUE_PATH or
+        /// ~/.local/state/nanna/queue.jsonl)
+        #[arg(long)]
+        queue_path: Option<std::path::PathBuf>,
+    },
+    /// Human-only escalation controls (agents have no tool for these)
+    Escalation {
+        #[command(subcommand)]
+        action: EscalationAction,
+    },
+    /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -104,6 +182,105 @@ enum Commands {
         /// Optional second JSON file for comparison report
         #[arg(long)]
         compare: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentsAction {
+    /// List identities in the catalog (name, loop, model, max_effect)
+    List {
+        /// Catalog directory. Defaults to $NANNA_CONFIG_DIR/agents,
+        /// $XDG_CONFIG_HOME/nanna/agents or ~/.config/nanna/agents.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Repository whose .nanna/agents/ overrides are layered on top.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscalationAction {
+    /// Clear the incident hold set by an `incident` escalation so
+    /// production-class work for its repository can resume
+    Resolve {
+        /// Escalation id printed in the issue body (`**Id:**`) and in
+        /// `nanna health`
+        id: String,
+        /// Escalation log location (defaults to NANNA_ESCALATION_PATH or
+        /// escalations.jsonl next to the queue log)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Print the deployment plan for an environment without executing it
+    Plan {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to plan for
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Print the plan as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a starter template for a full-stack Rust repository
+    Init {
+        /// Risk class of the system: unused, internal, edge or core
+        #[arg(long)]
+        risk: harness::deploy::RiskClass,
+        /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+    },
+    /// Execute the deployment plan for an environment as a resumable rollout
+    Run {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to roll out to
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Image reference to roll out
+        #[arg(long)]
+        image: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
+    },
+    /// Show every rollout, or one rollout with its transition history
+    Status {
+        /// Rollout id
+        id: Option<String>,
+    },
+    /// Kill switch: hold a rollout's current traffic split (human only)
+    Halt {
+        /// Rollout id
+        id: String,
+    },
+    /// Restart a halted rollout from step 0 with a fixed image
+    RollForward {
+        /// Rollout id
+        id: String,
+        /// Fixed image reference
+        #[arg(long)]
+        image: String,
+        /// Pull request that delivered the fix
+        #[arg(long)]
+        pr: String,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
     },
 }
 
@@ -160,6 +337,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
         }
+        Commands::Agents {
+            action: AgentsAction::List { dir, repo },
+        } => {
+            let catalog = match dir {
+                Some(dir) => IdentityCatalog::load(dir),
+                None => IdentityCatalog::load_default(),
+            };
+            let catalog = match repo {
+                Some(repo) => catalog.and_then(|catalog| catalog.with_repo_overrides(repo)),
+                None => catalog,
+            };
+            print!("{}", catalog.map_err(|e| e.to_string())?.render_table());
+        }
         Commands::Health { no_ensure_pod } => {
             ensure_pod_or_exit(no_ensure_pod).await;
             let provider = OllamaProvider::new(OllamaConfig::default())?;
@@ -199,6 +389,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_mcp_server(&model, max_iterations).await?;
         }
+        Commands::Delegate {
+            description,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            ttl_ms,
+        } => {
+            run_delegate(
+                &description,
+                &repo_path,
+                &branch,
+                &model,
+                max_iterations,
+                ttl_ms,
+            )
+            .await?;
+        }
+        Commands::BacklogSync {
+            repo,
+            repo_path,
+            branch,
+            query,
+            identity,
+            model,
+            max_iterations,
+            max_per_repo,
+            queue_path,
+        } => {
+            run_backlog_sync(
+                harness::backlog::BacklogConfig {
+                    sources: vec![harness::backlog::BacklogSource {
+                        repo,
+                        repo_path,
+                        branch,
+                        query,
+                        identity,
+                        model,
+                        max_iterations,
+                    }],
+                    max_per_repo,
+                },
+                queue_path,
+            )
+            .await?;
+        }
+        Commands::Escalation {
+            action: EscalationAction::Resolve { id, path },
+        } => {
+            run_escalation_resolve(&id, path)?;
+        }
+        Commands::Deploy { command } => run_deploy(command).await?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -213,6 +455,146 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn rollout_log() -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let path = harness::rollout::default_rollout_path()
+        .ok_or("no rollout log location: set NANNA_ROLLOUT_PATH or HOME")?;
+    Ok(harness::rollout::RolloutLog::open(&path)?)
+}
+
+type FakeExecutor = (
+    harness::rollout::RolloutExecutor,
+    std::sync::Arc<harness::leases::SimulatedClock>,
+);
+
+fn fake_rollout_executor(
+    repo: &std::path::Path,
+    plan: &harness::deploy::DeployPlan,
+) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
+    let windows_path = repo
+        .join(harness::deploy::DEPLOY_DIR)
+        .join(harness::windows::WINDOWS_FILE_NAME);
+    let windows = if windows_path.exists() {
+        harness::windows::WindowSet::load(&windows_path)?
+    } else {
+        harness::windows::WindowSet::default()
+    };
+    let endpoints = plan
+        .health
+        .as_ref()
+        .map(|h| h.endpoints.clone())
+        .unwrap_or_default();
+    let previous = format!("{}:previous", plan.image);
+    let (executor, _adapter, _health, _shadow, clock) =
+        harness::rollout::fake_executor(rollout_log()?, windows, &previous, &endpoints);
+    Ok((executor, clock))
+}
+
+async fn run_fake_to_a_stop(
+    executor: &harness::rollout::RolloutExecutor,
+    clock: &harness::leases::SimulatedClock,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let steps = harness::rollout::run_simulated(executor, clock, id).await?;
+    let Some((last, parked)) = steps.split_last() else {
+        return Ok(());
+    };
+    for step in parked {
+        println!("parked   {}", step.summary());
+    }
+    println!("finished {}", last.summary());
+    Ok(())
+}
+
+const NO_REAL_TARGET: &str =
+    "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DeployCommands::Run {
+            repo_path,
+            env,
+            image,
+            score,
+            fake,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let (executor, clock) = fake_rollout_executor(&repo, &plan)?;
+            let record = executor.start(plan, &image).await?;
+            println!("started  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &record.id).await?;
+        }
+        DeployCommands::Status { id } => {
+            let log = rollout_log()?;
+            match id {
+                Some(id) => {
+                    println!("{}", log.load(&id)?.summary());
+                    for transition in log.history(&id)? {
+                        println!("  {}", transition.summary());
+                    }
+                }
+                None => {
+                    for record in log.latest()?.into_values() {
+                        println!("{}", record.summary());
+                    }
+                }
+            }
+        }
+        DeployCommands::Halt { id } => {
+            let record = rollout_log()?.halt(&id, chrono::Utc::now())?;
+            println!("halted   {}", record.summary());
+        }
+        DeployCommands::RollForward {
+            id,
+            image,
+            pr,
+            fake,
+        } => {
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let log = rollout_log()?;
+            let plan = log.load(&id)?.plan;
+            let (executor, clock) = fake_rollout_executor(&std::env::current_dir()?, &plan)?;
+            let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
+            println!("forward  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &id).await?;
+        }
+        DeployCommands::Plan {
+            repo_path,
+            env,
+            score,
+            json,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if json {
+                println!("{}", plan.to_json_pretty());
+            } else {
+                print!("{plan}");
+            }
+        }
+        DeployCommands::Init { risk, repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::deploy::init(&repo, risk)?;
+            println!("Wrote {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -529,7 +911,12 @@ fn list_tools(tool_registry: &ToolRegistry) {
         for tool_name in tools {
             if let Some(tool) = tool_registry.get_tool(tool_name) {
                 let def = tool.definition();
-                println!("  - {}: {}", def.function.name, def.function.description);
+                println!(
+                    "  - {} [{}]: {}",
+                    def.function.name,
+                    tool.effect_class(),
+                    def.function.description
+                );
             }
         }
     }
@@ -550,6 +937,159 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
         }
     }
 
+    report_queue_health()?;
+    report_lease_health()?;
+    report_escalation_health()?;
+
+    Ok(())
+}
+
+/// Print the escalation counters and every live incident hold. A missing
+/// escalation log means nothing has been escalated yet.
+fn report_escalation_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::{default_escalation_path, EscalationLog};
+
+    let Some(path) = default_escalation_path() else {
+        println!(
+            "- Escalations: no log location (set NANNA_ESCALATION_PATH, NANNA_QUEUE_PATH or HOME)"
+        );
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Escalations: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let snapshot = EscalationLog::open(&path)?.snapshot(chrono::Utc::now());
+    println!("- Escalations ({}): {}", path.display(), snapshot);
+    for hold in &snapshot.holds {
+        println!(
+            "  incident {} holds production for {} since {}: {} (clear with `nanna escalation resolve {}`)",
+            hold.escalation_id, hold.repo, hold.since, hold.summary, hold.escalation_id
+        );
+    }
+    Ok(())
+}
+
+/// Escalation log location: `NANNA_ESCALATION_PATH` when set, otherwise
+/// `escalations.jsonl` next to the queue log.
+fn resolve_escalation_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::escalation::escalation_path_from(
+        std::env::var_os(harness::escalation::ESCALATION_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields an escalation path")
+}
+
+fn run_escalation_resolve(
+    id: &str,
+    path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+
+    let path = match path {
+        Some(explicit) => explicit,
+        None => resolve_escalation_path(&resolve_queue_path(None)?),
+    };
+    let hold = EscalationLog::open(&path)?.resolve(id, chrono::Utc::now())?;
+    println!(
+        "Resolved incident hold {} on {} (held since {}): {}",
+        hold.escalation_id, hold.repo, hold.since, hold.summary
+    );
+    Ok(())
+}
+
+/// Print every recorded coordination lease with live and expired counts.
+/// A missing lease log means no lease has been granted yet.
+fn report_lease_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::{default_lease_path, JsonlLeaseStore, LeaseSnapshot};
+
+    let Some(path) = default_lease_path() else {
+        println!("- Leases: no lease location (set NANNA_LEASE_PATH, NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Leases: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlLeaseStore::open(&path)?;
+    let snapshot = LeaseSnapshot::from_store(&store, chrono::Utc::now())?;
+    println!("- Leases ({}): {}", path.display(), snapshot);
+    for lease in &snapshot.leases {
+        let state = if lease.is_expired(snapshot.at) {
+            "expired"
+        } else {
+            "held"
+        };
+        println!(
+            "  {} {} by {} until {}",
+            state, lease.name, lease.holder, lease.until
+        );
+    }
+    Ok(())
+}
+
+/// Print the persisted backlog's depth, parked count and age of its oldest
+/// entry. A missing queue log means no backlog has been recorded yet.
+fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::scheduler::{default_queue_path, JsonlQueueStore, QueueMetrics};
+
+    let Some(path) = default_queue_path() else {
+        println!("- Task queue: no queue location (set NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Task queue: empty (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlQueueStore::open(&path)?;
+    let metrics = QueueMetrics::from_store(&store, chrono::Utc::now())?;
+    println!("- Task queue ({}): {}", path.display(), metrics);
+    Ok(())
+}
+
+/// Lease log location: `NANNA_LEASE_PATH` when set, otherwise
+/// `leases.jsonl` next to the queue log.
+fn resolve_lease_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::leases::lease_path_from(
+        std::env::var_os(harness::leases::LEASE_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields a lease path")
+}
+
+fn resolve_queue_path(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    explicit
+        .or_else(harness::scheduler::default_queue_path)
+        .ok_or_else(|| {
+            "no queue location: pass --queue-path or set NANNA_QUEUE_PATH or HOME".into()
+        })
+}
+
+async fn run_backlog_sync(
+    config: harness::backlog::BacklogConfig,
+    queue_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
+    use harness::scheduler::JsonlQueueStore;
+
+    let path = resolve_queue_path(queue_path)?;
+    let store = JsonlQueueStore::open(&path)?;
+    let sink = StoreSink::open(Box::new(store))?;
+    let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
+    let report = backlog_sync(&client, &sink, &config).await?;
+    println!(
+        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}",
+        path.display(),
+        report.enqueued.len(),
+        report.duplicates,
+        report.claimed,
+        report.capped
+    );
+    for origin in &report.enqueued {
+        println!("  + {origin}");
+    }
     Ok(())
 }
 
@@ -706,6 +1246,65 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+    use harness::leases::JsonlLeaseStore;
+    use harness::mcp::NannaMcpServer;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
+    use std::sync::Arc;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let queue_path = resolve_queue_path(None)?;
+    let lease_path = resolve_lease_path(&queue_path);
+    let escalation_path = resolve_escalation_path(&queue_path);
+    let task_manager = Arc::new(
+        TaskManager::restore(
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path)?),
+            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+            provider.clone(),
+        )
+        .await?
+        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+    );
+
+    info!(
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
+        model,
+        max_iterations,
+        queue_path.display(),
+        lease_path.display(),
+        escalation_path.display()
+    );
+
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
+
+    let reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let writer = tokio::io::stdout();
+    server.serve(reader, writer).await?;
+    Ok(())
+}
+
+/// Delegate a coding task through the MCP Tasks protocol by driving an
+/// in-process server as a client over an in-memory duplex. This dogfoods the
+/// exact wire protocol external orchestrators use, without spawning a child
+/// process.
+async fn run_delegate(
+    description: &str,
+    repo_path: &std::path::Path,
+    branch: &str,
+    model: &str,
+    max_iterations: usize,
+    ttl_ms: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
     use harness::task::TaskManager;
     use std::sync::Arc;
@@ -713,17 +1312,40 @@ async fn run_mcp_server(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
 
-    info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {})",
-        model, max_iterations
-    );
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let serve_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(tokio::io::BufReader::new(server_read), server_write)
+            .await;
+    });
 
-    let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
+    let (client_read, client_write) = tokio::io::split(client_side);
+    let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
 
-    let reader = tokio::io::BufReader::new(tokio::io::stdin());
-    let writer = tokio::io::stdout();
-    server.serve(reader, writer).await?;
+    client.initialize().await?;
+    let arguments = serde_json::json!({
+        "description": description,
+        "repo_path": repo_path.to_string_lossy(),
+        "branch": branch,
+        "model": model,
+        "max_iterations": max_iterations,
+    });
+    let task_id = client.submit_task(arguments, ttl_ms).await?;
+    info!("Delegated task {task_id}; awaiting completion...");
+
+    let result = client.wait_result(&task_id).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    drop(client);
+    let _ = serve_handle.await;
     Ok(())
 }
 

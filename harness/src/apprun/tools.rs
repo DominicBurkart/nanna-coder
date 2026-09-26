@@ -1,6 +1,7 @@
 //! Agent tools over [`AppContext`]: `app_start`, `app_stop`, `app_logs`.
 
 use super::{AppContext, AppError};
+use crate::effects::EffectClass;
 use crate::tools::{Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -67,6 +68,10 @@ impl Tool for AppStartTool {
     fn name(&self) -> &str {
         APP_START_TOOL
     }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
 }
 
 /// `app_stop`: kill the task's application inside the dev container and
@@ -108,6 +113,10 @@ impl Tool for AppStopTool {
 
     fn name(&self) -> &str {
         APP_STOP_TOOL
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
     }
 }
 
@@ -176,6 +185,10 @@ impl Tool for AppLogsTool {
 
     fn name(&self) -> &str {
         APP_LOGS_TOOL
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::None
     }
 }
 

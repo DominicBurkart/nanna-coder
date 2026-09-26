@@ -10,6 +10,7 @@
 //! Bump [`SCHEMA_VERSION`] on any breaking shape change.
 
 use crate::agent::AgentRunResult;
+use crate::effects::EffectRecord;
 use model::types::Usage;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -41,6 +42,10 @@ pub struct ToolCallSummary {
     pub call_id: String,
     pub arguments: serde_json::Value,
     pub result: String,
+    /// Effect attribution copied from the in-process record. Optional so
+    /// reports written before effect classification still parse.
+    #[serde(default)]
+    pub effect: Option<EffectRecord>,
 }
 
 impl From<&Usage> for TokenUsageDto {
@@ -70,6 +75,7 @@ impl From<&AgentRunResult> for AgentRunReport {
                     call_id: tc.call_id.clone(),
                     arguments: tc.arguments.clone(),
                     result: tc.result.clone(),
+                    effect: tc.effect.clone(),
                 })
                 .collect(),
         }
@@ -111,8 +117,11 @@ mod tests {
                 arguments: serde_json::json!({"path": "main.rs"}),
                 call_id: "call-1".to_string(),
                 result: "fn main(){}".to_string(),
+                effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
             }],
             conversation_snapshot: vec![ChatMessage::user("hi")],
+            denials: vec![],
+            action_audit: vec![],
             token_usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -148,6 +157,17 @@ mod tests {
         assert_eq!(tc.tool_name, "read_file");
         assert_eq!(tc.call_id, "call-1");
         assert_eq!(tc.result, "fn main(){}");
+        assert_eq!(
+            tc.effect,
+            Some(EffectRecord::new(crate::effects::EffectClass::None))
+        );
+    }
+
+    #[test]
+    fn report_without_effect_field_still_parses() {
+        let json = r#"{"schema_version":1,"task_completed":true,"iterations":1,"final_state":"Completed","result_summary":"","token_usage":null,"tool_calls":[{"tool_name":"echo","call_id":"c","arguments":{},"result":"r"}]}"#;
+        let parsed: AgentRunReport = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tool_calls[0].effect, None);
     }
 
     #[test]

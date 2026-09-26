@@ -1,0 +1,20 @@
+[case]
+id = "escalate-scope-creep-implied-production"
+name = "Subtask text implies production with no capable card"
+description = "rust-implementer is capped at repository; the subtask text implies production, which no card reaches."
+
+[request]
+parent_task_id = "task-11"
+parent_task_description = "Fix the bug and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "rust-implementer"
+subtask = "Fix the bug, then deploy the hotfix to production now."
+dev_loop = "inner"
+requested_effect = "workspace"
+
+[expected]
+verdict = "escalate"
+reason_codes = ["scope_creep"]
+
+[metadata]
+tags = ["escalate", "no-capable-card"]
