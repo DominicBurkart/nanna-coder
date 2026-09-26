@@ -45,11 +45,12 @@ use crate::marker::{parse_identity_from_text, render_html_marker, render_trailer
 use crate::tools::{parse_github_remote, Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Environment variable naming the comma-separated GitHub logins
 /// [`GithubPrCommentsTool`] keeps comments from; unset means the allow-list
@@ -85,6 +86,40 @@ fn comment_json(comment: &GithubComment) -> Value {
         "body": comment.body,
         "html_url": comment.html_url,
     })
+}
+
+/// Confirm `body` carries this identity's marker before a tool acts on the
+/// pull request it belongs to, so one identity cannot close or promote
+/// another identity's (or a human's) pull request.
+fn ensure_owned_by_identity(
+    body: Option<&str>,
+    identity_name: &str,
+    pr_number: u64,
+) -> ToolResult<()> {
+    let owner = body.and_then(parse_identity_from_text);
+    if owner.as_deref() == Some(identity_name) {
+        Ok(())
+    } else {
+        Err(ToolError::ExecutionFailed {
+            message: format!(
+                "refusing to act on pull request #{pr_number}: not owned by identity '{identity_name}'"
+            ),
+        })
+    }
+}
+
+fn issue_url_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"https://github\.com/[^/\s]+/[^/\s]+/issues/\d+")
+            .expect("issue url regex is valid")
+    })
+}
+
+/// Whether `text` references an issue as `#123` or as a full GitHub issue
+/// URL, the two forms [`GithubPrCloseTool`] accepts as a valid close reason.
+fn contains_issue_reference(text: &str) -> bool {
+    !crate::backlog::referenced_issues(text).is_empty() || issue_url_regex().is_match(text)
 }
 
 #[cfg(test)]
@@ -529,6 +564,179 @@ pub(crate) fn parse_allowed_authors(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Converts a draft pull request to ready for review. Refuses a pull
+/// request whose body marker does not name this identity.
+pub struct GithubPrPromoteTool {
+    workspace_root: PathBuf,
+    identity_name: String,
+    client: Arc<dyn GithubClient>,
+}
+
+impl GithubPrPromoteTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        identity_name: impl Into<String>,
+        client: Arc<dyn GithubClient>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            identity_name: identity_name.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubPrPromoteTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_pr_promote".to_string(),
+                description: "Convert a draft pull request this identity owns to ready for review."
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "pr_number".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::Integer,
+                                description: Some("Pull request number.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["pr_number".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let pr_number = required_u64(&args, "pr_number")?;
+        let repo = resolve_repo(&self.workspace_root)?;
+        let detail = self
+            .client
+            .get_pull_request(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        ensure_owned_by_identity(detail.body.as_deref(), &self.identity_name, pr_number)?;
+        if !detail.draft {
+            return Ok(json!({ "number": pr_number, "promoted": false, "already_ready": true }));
+        }
+        self.client
+            .mark_pull_request_ready(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        Ok(json!({ "number": pr_number, "promoted": true, "already_ready": false }))
+    }
+
+    fn name(&self) -> &str {
+        "github_pr_promote"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
+/// Closes a pull request this identity owns. Requires a `reason` that
+/// references the originating issue (`#123` or a full GitHub issue URL) and
+/// posts it as a comment before closing.
+pub struct GithubPrCloseTool {
+    workspace_root: PathBuf,
+    identity_name: String,
+    client: Arc<dyn GithubClient>,
+}
+
+impl GithubPrCloseTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        identity_name: impl Into<String>,
+        client: Arc<dyn GithubClient>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            identity_name: identity_name.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubPrCloseTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_pr_close".to_string(),
+                description: "Close a pull request this identity owns. 'reason' must reference the originating issue and is posted as a comment before closing.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "pr_number".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::Integer,
+                                description: Some("Pull request number.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "reason".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Why this pull request is being closed. Must reference the originating issue, e.g. '#123'.".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["pr_number".to_string(), "reason".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let pr_number = required_u64(&args, "pr_number")?;
+        let reason = required_str(&args, "reason")?;
+        if !contains_issue_reference(reason) {
+            return Err(ToolError::InvalidArguments {
+                message: "'reason' must reference the originating issue (e.g. '#123' or a GitHub issue URL)".to_string(),
+            });
+        }
+        let repo = resolve_repo(&self.workspace_root)?;
+        let detail = self
+            .client
+            .get_pull_request(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        ensure_owned_by_identity(detail.body.as_deref(), &self.identity_name, pr_number)?;
+        self.client
+            .comment_on_issue(&repo, pr_number, reason)
+            .await
+            .map_err(map_backlog_error)?;
+        self.client
+            .close_pull_request(&repo, pr_number)
+            .await
+            .map_err(map_backlog_error)?;
+        Ok(json!({ "number": pr_number, "closed": true, "comment_posted": true }))
+    }
+
+    fn name(&self) -> &str {
+        "github_pr_close"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
 /// Register every PR lifecycle tool against `registry`, scoped to
 /// `workspace_root` and `identity_name`.
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_name: &str) {
@@ -548,8 +756,18 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
     )));
     registry.register(Box::new(GithubPrCommentsTool::new(
         workspace_root.to_path_buf(),
-        client,
+        Arc::clone(&client),
         allowed_authors,
+    )));
+    registry.register(Box::new(GithubPrPromoteTool::new(
+        workspace_root.to_path_buf(),
+        identity_name,
+        Arc::clone(&client),
+    )));
+    registry.register(Box::new(GithubPrCloseTool::new(
+        workspace_root.to_path_buf(),
+        identity_name,
+        client,
     )));
 }
 
@@ -557,7 +775,7 @@ pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_nam
 mod tests {
     use super::*;
     use crate::backlog::test_support::MockGithub;
-    use crate::backlog::GithubPullRequestCreated;
+    use crate::backlog::{GithubPullRequestCreated, GithubPullRequestDetail};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -782,6 +1000,24 @@ mod tests {
         );
         let err = resolve_repo(dir.path()).unwrap_err();
         assert!(err.to_string().contains("not a GitHub remote"));
+    }
+
+    #[test]
+    fn parse_allowed_authors_trims_lowercases_and_drops_blanks() {
+        assert_eq!(parse_allowed_authors(None), Vec::<String>::new());
+        assert_eq!(
+            parse_allowed_authors(Some(" Alice, bob ,, Carol")),
+            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn contains_issue_reference_matches_hash_and_url_forms() {
+        assert!(contains_issue_reference("Closes #647"));
+        assert!(contains_issue_reference(
+            "see https://github.com/o/n/issues/647 for detail"
+        ));
+        assert!(!contains_issue_reference("no reference here"));
     }
 
     fn github_repo_fixture() -> TempDir {
@@ -1106,5 +1342,223 @@ mod tests {
         let tool = GithubPrCommentsTool::new(dir.path().to_path_buf(), mock, vec![]);
         let err = tool.execute(json!({ "pr_number": 1 })).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    // ---- github_pr_promote ----
+
+    fn pr_detail(number: u64, draft: bool, owner: &str) -> GithubPullRequestDetail {
+        GithubPullRequestDetail {
+            number,
+            node_id: format!("PR_{number}"),
+            draft,
+            state: "open".to_string(),
+            body: Some(format!("Closes #1\n\n<!-- Nanna-Identity: {owner} -->")),
+            html_url: format!("https://example.invalid/pr/{number}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert_eq!(tool.name(), "github_pr_promote");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_marks_an_owned_draft_ready() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 7),
+                pr_detail(7, true, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let result = tool.execute(json!({ "pr_number": 7 })).await.unwrap();
+        assert_eq!(result["promoted"], json!(true));
+        assert!(mock
+            .calls()
+            .iter()
+            .any(|c| c.contains("mark_pull_request_ready example/repo#7")));
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_is_a_no_op_when_already_ready() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 7),
+                pr_detail(7, false, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let result = tool.execute(json!({ "pr_number": 7 })).await.unwrap();
+        assert_eq!(result["already_ready"], json!(true));
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_refuses_a_pr_owned_by_another_identity() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 7),
+                pr_detail(7, true, "someone-else"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", mock);
+        let err = tool.execute(json!({ "pr_number": 7 })).await.unwrap_err();
+        assert!(err.to_string().contains("not owned by identity"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_surfaces_a_missing_pr_error() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool.execute(json!({ "pr_number": 404 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn github_pr_promote_requires_pr_number() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert!(matches!(
+            tool.execute(json!({})).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    // ---- github_pr_close ----
+
+    #[tokio::test]
+    async fn github_pr_close_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert_eq!(tool.name(), "github_pr_close");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_comments_then_closes_an_owned_pr() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 3),
+                pr_detail(3, true, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let result = tool
+            .execute(json!({ "pr_number": 3, "reason": "Misaligned with #1" }))
+            .await
+            .unwrap();
+        assert_eq!(result["closed"], json!(true));
+        let calls = mock.calls();
+        let comment_idx = calls
+            .iter()
+            .position(|c| c.starts_with("comment_on_issue"))
+            .unwrap();
+        let close_idx = calls
+            .iter()
+            .position(|c| c.starts_with("close_pull_request"))
+            .unwrap();
+        assert!(comment_idx < close_idx, "must comment before closing");
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_refuses_a_reason_without_an_issue_reference() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool
+            .execute(json!({ "pr_number": 3, "reason": "no longer needed" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_accepts_an_issue_url_reason() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 3),
+                pr_detail(3, true, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", mock);
+        let result = tool
+            .execute(json!({
+                "pr_number": 3,
+                "reason": "See https://github.com/example/repo/issues/1",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["closed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_refuses_a_pr_owned_by_another_identity() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 3),
+                pr_detail(3, true, "someone-else"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let err = tool
+            .execute(json!({ "pr_number": 3, "reason": "Closes #1" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not owned by identity"));
+        assert!(mock.calls().is_empty(), "must not comment or close");
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_surfaces_a_missing_pr_error_without_commenting() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub::default());
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let err = tool
+            .execute(json!({ "pr_number": 404, "reason": "Closes #1" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+        assert!(
+            mock.calls().is_empty(),
+            "must not comment when the PR lookup fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_pr_close_requires_pr_number_and_reason() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert!(matches!(
+            tool.execute(json!({ "reason": "Closes #1" }))
+                .await
+                .unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+        let client2: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool2 = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", client2);
+        assert!(matches!(
+            tool2.execute(json!({ "pr_number": 3 })).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
     }
 }
