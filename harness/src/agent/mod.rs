@@ -426,10 +426,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     }
 
     fn action_audit(&self) -> Vec<ActionAuditLogEntry> {
-        self.tool_registry
-            .as_ref()
-            .map(ToolRegistry::action_reviews)
-            .unwrap_or_default()
+        match self.tool_registry.as_ref() {
+            Some(registry) => registry.action_reviews(),
+            None => Vec::new(),
+        }
     }
 
     fn enrich_error(&self, error: AgentError) -> AgentError {
@@ -1139,9 +1139,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             self.conversation_history
                 .push(ChatMessage::tool_response(call_id, response_content));
             if escalated {
-                return Err(self.enrich_error(bare_state_error(format!(
-                    "action review escalated `{name}` after repeated denials; see action_audit in the task result"
-                ))));
+                let message = format!(
+                    "action review escalated `{name}`; see action_audit in the task result"
+                );
+                return Err(self.enrich_error(bare_state_error(message)));
             }
         }
         Ok(())
@@ -1216,9 +1217,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
                     if escalated {
                         let name = tc.function.name.clone();
-                        return Err(self.enrich_error(bare_state_error(format!(
-                            "action review escalated `{name}` after repeated denials; see action_audit in the task result"
-                        ))));
+                        let message = format!(
+                            "action review escalated `{name}`; see action_audit in the task result"
+                        );
+                        return Err(self.enrich_error(bare_state_error(message)));
                     }
                 }
             } else {
@@ -1472,9 +1474,16 @@ mod tests {
         }
         let audit = agent.action_audit();
         assert_eq!(audit.len(), 3);
-        assert!(audit
-            .iter()
-            .all(|entry| entry.verdict.kind() == crate::auditor::VerdictKind::Block));
+        let kinds: Vec<_> = audit.iter().map(|entry| entry.verdict.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::auditor::VerdictKind::Block,
+                crate::auditor::VerdictKind::Block,
+                crate::auditor::VerdictKind::Escalate,
+            ],
+            "the third denial's logged verdict reflects the escalation upgrade"
+        );
         let tool_replies: Vec<&str> = agent
             .conversation_history()
             .iter()
