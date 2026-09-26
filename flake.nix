@@ -295,7 +295,7 @@
           nix2containerPkgs = nix2container.packages.${system};
 
           commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git ];
+          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git curl ];
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
