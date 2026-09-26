@@ -181,19 +181,23 @@ jobs:
 
     - name: Run SDLC end-to-end eval
       id: sdlc_eval
+      env:
+        EVAL_COMMIT_SHA: ${{ github.sha }}
+        EVAL_TRIGGERED_BY: ${{ github.actor }}
+        EVAL_PR_NUMBER: ${{ inputs.pr_number }}
       run: |
         echo "## SDLC End-to-End Eval" > sdlc-eval-results.md
         echo "" >> sdlc-eval-results.md
-        echo "**Commit:** \`${{ github.sha }}\`" >> sdlc-eval-results.md
-        echo "**Triggered by:** @${{ github.actor }}" >> sdlc-eval-results.md
+        echo "**Commit:** \`$EVAL_COMMIT_SHA\`" >> sdlc-eval-results.md
+        echo "**Triggered by:** @$EVAL_TRIGGERED_BY" >> sdlc-eval-results.md
         echo "" >> sdlc-eval-results.md
         echo "### issue -> planner -> implementer PR -> shepherd promotes -> deploy" >> sdlc-eval-results.md
         echo '```' >> sdlc-eval-results.md
 
         set +e
         PR_ARGS=()
-        if [ -n "${{ inputs.pr_number }}" ]; then
-          PR_ARGS=(--pr "${{ inputs.pr_number }}")
+        if [ -n "$EVAL_PR_NUMBER" ]; then
+          PR_ARGS=(--pr "$EVAL_PR_NUMBER")
         fi
         nix develop --command ./target/release/harness-sdlc-eval \
           --scorecard-path evals/scorecards/sdlc_e2e.jsonl \
