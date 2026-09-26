@@ -6,25 +6,53 @@
 //! [`crate::tools::ToolRegistry::execute`]); classifying a tool correctly is
 //! the whole of its gating story.
 //!
-//! `git_push_branch` is the first tool in this module. It never calls
-//! GitHub: it shells out to the host `git` binary against the task's
-//! worktree, matching [`crate::tools::GitStatusTool`]/
-//! [`crate::tools::GitDiffTool`]'s existing harness-side pattern rather than
-//! running inside the dev container. It refuses to push the repository's
-//! default branch, a detached `HEAD`, or any unpushed commit whose message
-//! is missing this identity's trailer -- the commit-side half of the
-//! identity marker the epic requires (the PR-body half lands with
-//! `github_pr_open`).
+//! `git_push_branch` never calls GitHub: it shells out to the host `git`
+//! binary against the task's worktree, matching
+//! [`crate::tools::GitStatusTool`]/[`crate::tools::GitDiffTool`]'s existing
+//! harness-side pattern rather than running inside the dev container. It
+//! refuses to push the repository's default branch, a detached `HEAD`, or
+//! any unpushed commit whose message is missing this identity's trailer --
+//! the commit-side half of the identity marker the epic requires.
+//!
+//! `github_pr_open` is the first tool that calls GitHub. GitHub access goes
+//! through the [`GithubClient`] trait ([`crate::backlog`]) so it can be
+//! tested against a mock rather than a real HTTP server. Credentials follow
+//! [`crate::tools::GitHubPrStatusTool`]'s existing pattern: a `GITHUB_TOKEN`
+//! read from the harness process's environment, never passed into the dev
+//! container. No tool here accepts a `repo` argument: the repository is
+//! always resolved from the worktree's own `origin` remote, so a
+//! compromised or careless model cannot aim the harness's token at an
+//! arbitrary repository. The pull request it opens is always a draft: the
+//! body carries this identity's marker (a trailer-style line and a hidden
+//! HTML comment, via [`crate::marker`]); a caller-supplied body that already
+//! carries a `Nanna-Identity` marker is rejected rather than silently
+//! overridden, so a model cannot forge or displace it.
 
+use crate::backlog::{BacklogError, GithubClient};
 use crate::effects::EffectClass;
-use crate::marker::{parse_identity_from_text, render_trailer};
-use crate::tools::{Tool, ToolError, ToolRegistry, ToolResult};
+use crate::marker::{parse_identity_from_text, render_html_marker, render_trailer};
+use crate::tools::{parse_github_remote, Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
-use model::types::{FunctionDefinition, JsonSchema, SchemaType, ToolDefinition};
+use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+fn map_backlog_error(err: BacklogError) -> ToolError {
+    ToolError::ExecutionFailed {
+        message: err.to_string(),
+    }
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArguments {
+            message: format!("missing '{key}'"),
+        })
+}
 
 #[cfg(test)]
 thread_local! {
@@ -68,6 +96,19 @@ fn run_git(workspace_root: &Path, args: &[&str]) -> ToolResult<String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The `owner/name` GitHub repository the worktree's `origin` remote points
+/// at. Never accepted as a tool argument: always read from the worktree
+/// itself, so a tool call cannot aim the harness's token at another
+/// repository.
+fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
+    let remote_url = run_git(workspace_root, &["remote", "get-url", "origin"])?;
+    parse_github_remote(&remote_url)
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+        .ok_or_else(|| ToolError::ExecutionFailed {
+            message: "origin remote is not a GitHub remote".to_string(),
+        })
 }
 
 /// The worktree's current branch. Refuses a detached `HEAD`, since pushing
@@ -211,18 +252,166 @@ impl Tool for GitPushBranchTool {
     }
 }
 
+/// Opens a pull request. Always a draft: there is no argument that can
+/// change this. The body carries this identity's marker (a trailer-style
+/// line and a hidden HTML comment, via [`crate::marker`]); a caller-supplied
+/// body that already carries a `Nanna-Identity` marker is rejected rather
+/// than silently overridden, so a model cannot forge or displace it.
+pub struct GithubPrOpenTool {
+    workspace_root: PathBuf,
+    identity_name: String,
+    client: Arc<dyn GithubClient>,
+}
+
+impl GithubPrOpenTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        identity_name: impl Into<String>,
+        client: Arc<dyn GithubClient>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            identity_name: identity_name.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubPrOpenTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "github_pr_open".to_string(),
+                description: "Open a draft pull request from the current branch. Always a draft; there is no way to open a ready-for-review pull request with this tool.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "title".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some("Pull request title.".to_string()),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "body".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Pull request body. Must not already carry a Nanna-Identity marker.".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props.insert(
+                            "base".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Base branch (optional; defaults to the repository's default branch).".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: Some(vec!["title".to_string(), "body".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        if let Some(draft) = args.get("draft") {
+            if draft.as_bool() != Some(true) {
+                return Err(ToolError::InvalidArguments {
+                    message: "github_pr_open always creates a draft pull request; 'draft' must be true or omitted".to_string(),
+                });
+            }
+        }
+        let title = required_str(&args, "title")?;
+        let body = required_str(&args, "body")?;
+        if parse_identity_from_text(body).is_some() {
+            return Err(ToolError::InvalidArguments {
+                message: "'body' must not already carry a Nanna-Identity marker".to_string(),
+            });
+        }
+        let trailer = render_trailer(&self.identity_name);
+        let marker = render_html_marker(&self.identity_name);
+        if parse_identity_from_text(&marker).as_deref() != Some(self.identity_name.as_str()) {
+            return Err(ToolError::ExecutionFailed {
+                message: format!(
+                    "identity name '{}' does not produce a parseable identity marker",
+                    self.identity_name
+                ),
+            });
+        }
+        let repo = resolve_repo(&self.workspace_root)?;
+        let head = current_branch(&self.workspace_root)?;
+        let base = match args.get("base").and_then(|v| v.as_str()) {
+            Some(base) => base.to_string(),
+            None => default_branch(&self.workspace_root).ok_or_else(|| {
+                ToolError::InvalidArguments {
+                    message:
+                        "no 'base' given and the repository's default branch could not be determined"
+                            .to_string(),
+                }
+            })?,
+        };
+        if base == head {
+            return Err(ToolError::InvalidArguments {
+                message: "refusing to open a pull request from a branch into itself".to_string(),
+            });
+        }
+        let full_body = format!("{body}\n\n{trailer}\n{marker}\n");
+        let created = self
+            .client
+            .create_draft_pull_request(&repo, title, &full_body, &head, &base)
+            .await
+            .map_err(map_backlog_error)?;
+        Ok(json!({
+            "number": created.number,
+            "html_url": created.html_url,
+            "draft": true,
+            "head": head,
+            "base": base,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "github_pr_open"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+}
+
 /// Register every PR lifecycle tool against `registry`, scoped to
 /// `workspace_root` and `identity_name`.
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_name: &str) {
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let client: Arc<dyn GithubClient> =
+        Arc::new(crate::backlog::ReqwestGithubClient::github(token));
     registry.register(Box::new(GitPushBranchTool::new(
         workspace_root.to_path_buf(),
         identity_name,
+    )));
+    registry.register(Box::new(GithubPrOpenTool::new(
+        workspace_root.to_path_buf(),
+        identity_name,
+        client,
     )));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backlog::test_support::MockGithub;
+    use crate::backlog::GithubPullRequestCreated;
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -411,5 +600,279 @@ mod tests {
             .current_dir(work.path())
             .output();
         assert_eq!(default_branch(work.path()), Some("main".to_string()));
+    }
+
+    fn resolve_repo_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        dir
+    }
+
+    #[test]
+    fn resolve_repo_reads_the_origin_remote() {
+        let dir = resolve_repo_fixture();
+        assert_eq!(resolve_repo(dir.path()).unwrap(), "example/repo");
+    }
+
+    #[test]
+    fn resolve_repo_fails_without_an_origin_remote() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let err = resolve_repo(dir.path()).unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    #[test]
+    fn resolve_repo_fails_for_a_non_github_remote() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "https://example.invalid/o/r.git"],
+        );
+        let err = resolve_repo(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not a GitHub remote"));
+    }
+
+    fn github_repo_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "initial"]);
+        git(dir.path(), &["branch", "-M", "main"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        dir
+    }
+
+    // ---- github_pr_open ----
+
+    #[tokio::test]
+    async fn github_pr_open_definition_and_effect_class() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert_eq!(tool.name(), "github_pr_open");
+        assert_eq!(tool.effect_class(), EffectClass::Repository);
+        let def = tool.definition();
+        assert_eq!(def.function.name, "github_pr_open");
+        assert_eq!(
+            def.function.parameters.required,
+            Some(vec!["title".to_string(), "body".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_creates_a_draft_pr_with_identity_marker() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let mock = Arc::new(MockGithub {
+            created_pr: Some(GithubPullRequestCreated {
+                number: 9,
+                html_url: "https://example.invalid/pr/9".to_string(),
+                node_id: "PR_9".to_string(),
+            }),
+            ..Default::default()
+        });
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let result = tool
+            .execute(json!({ "title": "Add feature", "body": "Summary.", "base": "main" }))
+            .await
+            .unwrap();
+        assert_eq!(result["number"], json!(9));
+        assert_eq!(result["draft"], json!(true));
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("example/repo"));
+        assert!(calls[0].contains("->main"));
+
+        // Round-trip: the body the mock received carries both the trailer
+        // line and the hidden HTML comment, and marker.rs's own parser (not
+        // a bespoke one here) parses either back to the same identity.
+        let sent_body = calls[0]
+            .split("body=")
+            .nth(1)
+            .expect("call log records the body");
+        assert!(sent_body
+            .lines()
+            .any(|line| line == crate::marker::render_trailer("sdlc-dev")));
+        assert!(sent_body.contains(&crate::marker::render_html_marker("sdlc-dev")));
+        assert_eq!(
+            crate::marker::parse_identity_from_text(sent_body).as_deref(),
+            Some("sdlc-dev")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_defaults_base_to_the_default_branch() {
+        let fixture = push_fixture();
+        git(
+            fixture.work.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:example/repo.git",
+            ],
+        );
+        let mock = Arc::new(MockGithub {
+            created_pr: Some(GithubPullRequestCreated {
+                number: 1,
+                html_url: "u".to_string(),
+                node_id: "n".to_string(),
+            }),
+            ..Default::default()
+        });
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-z"]);
+        let tool =
+            GithubPrOpenTool::new(fixture.work.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let result = tool
+            .execute(json!({ "title": "t", "body": "b" }))
+            .await
+            .unwrap();
+        assert_eq!(result["base"], json!("main"));
+        assert_eq!(result["head"], json!("feature-z"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_refuses_non_draft_argument() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool
+            .execute(json!({ "title": "t", "body": "b", "draft": false }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        assert!(err.to_string().contains("draft"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_accepts_an_explicit_true_draft_argument() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let mock = Arc::new(MockGithub {
+            created_pr: Some(GithubPullRequestCreated {
+                number: 2,
+                html_url: "u".to_string(),
+                node_id: "n".to_string(),
+            }),
+            ..Default::default()
+        });
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", mock);
+        let result = tool
+            .execute(json!({ "title": "t", "body": "b", "base": "main", "draft": true }))
+            .await
+            .unwrap();
+        assert_eq!(result["number"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_refuses_a_body_that_already_carries_a_marker() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool
+            .execute(json!({
+                "title": "t",
+                "body": "forged <!-- Nanna-Identity: someone-else -->",
+                "base": "main",
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        assert!(err.to_string().contains("marker"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_requires_title_and_body() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        assert!(matches!(
+            tool.execute(json!({ "body": "b" })).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+        let client2: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool2 = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client2);
+        assert!(matches!(
+            tool2.execute(json!({ "title": "t" })).await.unwrap_err(),
+            ToolError::InvalidArguments { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_refuses_base_equal_to_head() {
+        let fixture = push_fixture();
+        git(
+            fixture.work.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:example/repo.git",
+            ],
+        );
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(fixture.work.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool
+            .execute(json!({ "title": "t", "body": "b", "base": "main" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        assert!(err.to_string().contains("itself"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_refuses_an_identity_name_that_does_not_round_trip() {
+        let dir = github_repo_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "bad/name", client);
+        let err = tool
+            .execute(json!({ "title": "t", "body": "b", "base": "main" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+        assert!(err.to_string().contains("does not produce a parseable"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_errors_when_base_is_omitted_and_no_default_branch_is_known() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let client: Arc<dyn GithubClient> = Arc::new(MockGithub::default());
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", client);
+        let err = tool
+            .execute(json!({ "title": "t", "body": "b" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        assert!(err.to_string().contains("could not be determined"));
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_surfaces_a_client_error() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let mock = Arc::new(MockGithub {
+            fail_status: Some(422),
+            ..Default::default()
+        });
+        let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", mock);
+        let err = tool
+            .execute(json!({ "title": "t", "body": "b", "base": "main" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+        assert!(err.to_string().contains("422"));
     }
 }
