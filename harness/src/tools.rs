@@ -435,7 +435,10 @@ impl ToolRegistry {
     ///     .iter()
     ///     .map(|tool| tool.name())
     ///     .collect();
-    /// assert_eq!(names, vec!["git_push_branch", "github_pr_status"]);
+    /// assert_eq!(
+    ///     names,
+    ///     vec!["git_push_branch", "github_pr_open", "github_pr_status"]
+    /// );
     /// assert!(registry.with_class(EffectClass::Production).is_empty());
     /// ```
     pub fn with_class(&self, class: EffectClass) -> Vec<&dyn Tool> {
@@ -1965,7 +1968,7 @@ fn collect_pr_status(workspace_root: &Path) -> ToolResult<PrStatusData> {
 }
 
 /// Parse a GitHub remote URL into (owner, repo).
-fn parse_github_remote(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_remote(url: &str) -> Option<(String, String)> {
     // Handle SSH: git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
@@ -2438,12 +2441,13 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 10] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 11] = [
         ("calculate", EffectClass::None),
         ("echo", EffectClass::None),
         ("git_diff", EffectClass::None),
         ("git_push_branch", EffectClass::Repository),
         ("git_status", EffectClass::None),
+        ("github_pr_open", EffectClass::Repository),
         ("github_pr_status", EffectClass::Repository),
         ("list_directory", EffectClass::None),
         ("read_file", EffectClass::None),
