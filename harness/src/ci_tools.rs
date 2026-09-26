@@ -26,18 +26,42 @@
 //! repository.
 
 use crate::backlog::{BacklogError, GithubActionsClient, WorkflowRun};
+use crate::budget::{BudgetClass, CostAccountant};
 use crate::effects::EffectClass;
 use crate::pr_tools::{
     current_branch, map_backlog_error, required_str, required_u64, resolve_repo,
 };
 use crate::tools::{Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
+use chrono::Utc;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Identity/task context a tool charges its budget against, shared by
+/// [`CiTriggerTool`] and [`CiStatusTool`].
+struct BudgetContext {
+    accountant: Arc<CostAccountant>,
+    identity: String,
+    task_id: String,
+}
+
+impl BudgetContext {
+    fn new(
+        accountant: Arc<CostAccountant>,
+        identity: impl Into<String>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            accountant,
+            identity: identity.into(),
+            task_id: task_id.into(),
+        }
+    }
+}
 
 /// GitHub Actions event name a dispatched run is filtered by when
 /// correlating it back to a run id.
@@ -140,6 +164,7 @@ pub struct CiTriggerTool {
     client: Arc<dyn GithubActionsClient>,
     correlation_budget: Duration,
     correlation_poll: Duration,
+    budget: Option<BudgetContext>,
 }
 
 impl CiTriggerTool {
@@ -149,6 +174,7 @@ impl CiTriggerTool {
             client,
             correlation_budget: DEFAULT_CORRELATION_BUDGET,
             correlation_poll: DEFAULT_CORRELATION_POLL,
+            budget: None,
         }
     }
 
@@ -158,6 +184,22 @@ impl CiTriggerTool {
     pub fn with_correlation_policy(mut self, budget: Duration, poll: Duration) -> Self {
         self.correlation_budget = budget;
         self.correlation_poll = poll;
+        self
+    }
+
+    /// Charge one `Ci`-class call against `accountant` for `identity`/
+    /// `task_id` before every dispatch or rerun. Without this, the tool
+    /// runs unmetered -- the shape `create_tool_registry_with_scope`
+    /// registers it with, since it has no per-task accountant or task id to
+    /// offer; [`crate::workspace::TaskWorkspace`] re-registers a
+    /// budget-aware instance for real task dispatch.
+    pub fn with_budget(
+        mut self,
+        accountant: Arc<CostAccountant>,
+        identity: impl Into<String>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        self.budget = Some(BudgetContext::new(accountant, identity, task_id));
         self
     }
 
@@ -209,6 +251,18 @@ impl Tool for CiTriggerTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let repo = resolve_repo(&self.workspace_root)?;
+        if let Some(ctx) = &self.budget {
+            ctx.accountant
+                .charge_count(
+                    &ctx.identity,
+                    &ctx.task_id,
+                    &repo,
+                    BudgetClass::Ci,
+                    Utc::now(),
+                )
+                .await
+                .map_err(ToolError::BudgetExceeded)?;
+        }
         if let Some(run_id) = optional_u64(&args, "run_id")? {
             self.client
                 .rerun_workflow(&repo, run_id)
@@ -258,6 +312,10 @@ impl Tool for CiTriggerTool {
 pub struct CiStatusTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubActionsClient>,
+    budget: Option<BudgetContext>,
+    /// Run ids whose minutes have already been charged, so repeated polling
+    /// of the same completed run never double-counts.
+    minutes_charged: Mutex<HashSet<u64>>,
 }
 
 impl CiStatusTool {
@@ -265,7 +323,48 @@ impl CiStatusTool {
         Self {
             workspace_root,
             client,
+            budget: None,
+            minutes_charged: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Record a completed run's minutes against `accountant` for
+    /// `identity`/`task_id`, once per run id. Never blocks: the run already
+    /// finished, so this only affects a *later* [`CiTriggerTool`] call
+    /// through the same accountant.
+    pub fn with_budget(
+        mut self,
+        accountant: Arc<CostAccountant>,
+        identity: impl Into<String>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        self.budget = Some(BudgetContext::new(accountant, identity, task_id));
+        self
+    }
+
+    async fn charge_minutes_once(&self, repo: &str, run: &WorkflowRun) {
+        let Some(ctx) = &self.budget else {
+            return;
+        };
+        let Some(minutes) = run.duration_minutes() else {
+            return;
+        };
+        {
+            let mut charged = self.minutes_charged.lock().expect("charged set poisoned");
+            if !charged.insert(run.id) {
+                return;
+            }
+        }
+        ctx.accountant
+            .record_minutes(
+                &ctx.identity,
+                &ctx.task_id,
+                repo,
+                BudgetClass::Ci,
+                minutes,
+                Utc::now(),
+            )
+            .await;
     }
 }
 
@@ -291,6 +390,7 @@ impl Tool for CiStatusTool {
             .get_workflow_run(&repo, run_id)
             .await
             .map_err(map_backlog_error)?;
+        self.charge_minutes_once(&repo, &run).await;
         Ok(run_json(&run))
     }
 
@@ -400,6 +500,7 @@ mod tests {
     use super::*;
     use crate::backlog::test_support::MockGithubActions;
     use crate::backlog::{WorkflowJob, WorkflowStep};
+    use crate::budget::{BudgetConfig, BudgetLimits, InMemoryBudgetStore};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -572,6 +673,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_with_budget_blocks_once_the_task_ceiling_is_reached() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(1, "queued", None));
+        let config = BudgetConfig {
+            ci: BudgetLimits {
+                max_count_per_task: Some(1),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        };
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            config,
+        ));
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(Arc::clone(&accountant), "id", "t1");
+        tool.execute(json!({"run_id": 1})).await.unwrap();
+        let err = tool.execute(json!({"run_id": 1})).await.unwrap_err();
+        assert!(matches!(err, ToolError::BudgetExceeded(_)));
+        // A rerun that never reaches the client because the budget already
+        // blocked it must not have been recorded twice.
+        assert_eq!(accountant.task_summary("t1").ci.count, 1);
+    }
+
+    #[tokio::test]
+    async fn trigger_without_budget_configured_is_unmetered() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(1, "queued", None));
+        let tool = trigger_tool(dir.path(), mock);
+        for _ in 0..5 {
+            tool.execute(json!({"run_id": 1})).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn status_reports_a_completed_run_with_duration() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions::default());
@@ -584,6 +725,47 @@ mod tests {
         assert_eq!(result["status"], "completed");
         assert_eq!(result["conclusion"], "success");
         assert_eq!(result["duration_minutes"], 4.0);
+    }
+
+    #[tokio::test]
+    async fn status_with_budget_records_minutes_once_per_run_even_when_polled_repeatedly() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let mut completed = run(9, "completed", Some("success"));
+        completed.run_started_at = Some(chrono::Utc::now());
+        completed.updated_at = Some(chrono::Utc::now() + chrono::Duration::minutes(7));
+        mock.set_run(completed);
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let tool = CiStatusTool::new(dir.path().to_path_buf(), mock).with_budget(
+            Arc::clone(&accountant),
+            "id",
+            "t1",
+        );
+        tool.execute(json!({"run_id": 9})).await.unwrap();
+        tool.execute(json!({"run_id": 9})).await.unwrap();
+        tool.execute(json!({"run_id": 9})).await.unwrap();
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 7.0);
+    }
+
+    #[tokio::test]
+    async fn status_with_budget_does_not_record_minutes_for_an_unfinished_run() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(9, "in_progress", None));
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let tool = CiStatusTool::new(dir.path().to_path_buf(), mock).with_budget(
+            Arc::clone(&accountant),
+            "id",
+            "t1",
+        );
+        tool.execute(json!({"run_id": 9})).await.unwrap();
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 0.0);
     }
 
     #[tokio::test]

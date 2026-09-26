@@ -3,6 +3,7 @@ pub mod agent;
 pub mod apprun;
 pub mod auditor;
 pub mod backlog;
+pub mod budget;
 pub mod capabilities;
 pub mod ci_tools;
 pub mod container;

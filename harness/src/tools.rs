@@ -2,6 +2,7 @@ use crate::action_auditor::{
     ActionAuditLogEntry, ActionContext, ActionDenied, ActionGate, ActionReview, ActionVerdict,
 };
 use crate::auditor::{Reason, ReasonCode};
+use crate::budget::BudgetExceeded;
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
@@ -51,6 +52,11 @@ pub enum ToolError {
     /// before it reached the tool.
     #[error("{0}")]
     ActionDenied(ActionDenied),
+
+    /// A `Ci`/`Sandbox` identity budget was exhausted; see
+    /// [`crate::budget::CostAccountant`].
+    #[error("{0}")]
+    BudgetExceeded(BudgetExceeded),
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
