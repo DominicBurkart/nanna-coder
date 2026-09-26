@@ -569,7 +569,7 @@ impl ToolRegistry {
     ///     .iter()
     ///     .map(|tool| tool.name())
     ///     .collect();
-    /// assert_eq!(names, vec!["github_pr_status"]);
+    /// assert_eq!(names, vec!["git_push_branch", "github_pr_status"]);
     /// assert!(registry.with_class(EffectClass::Production).is_empty());
     /// ```
     pub fn with_class(&self, class: EffectClass) -> Vec<&dyn Tool> {
@@ -3240,7 +3240,7 @@ impl Tool for GitHubPrStatusTool {
 }
 
 pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    create_tool_registry_with_scope(workspace_root, None)
+    create_tool_registry_with_scope(workspace_root, None, UNSCOPED_IDENTITY)
 }
 
 /// The default tools restricted to `identity`: file tools carry the
@@ -3251,12 +3251,16 @@ pub fn create_tool_registry_for(
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    Ok(create_tool_registry_with_scope(workspace_root, Some(scope)).scoped_for(identity))
+    Ok(
+        create_tool_registry_with_scope(workspace_root, Some(scope), identity.name())
+            .scoped_for(identity),
+    )
 }
 
 fn create_tool_registry_with_scope(
     workspace_root: &std::path::Path,
     scope: Option<PathScope>,
+    identity_name: &str,
 ) -> ToolRegistry {
     let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
@@ -3271,6 +3275,7 @@ fn create_tool_registry_with_scope(
     registry.register(Box::new(GitHubPrStatusTool::new(
         workspace_root.to_path_buf(),
     )));
+    crate::pr_tools::register(&mut registry, workspace_root, identity_name);
     registry
 }
 
@@ -3349,7 +3354,8 @@ pub fn create_container_tool_registry_for(
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope));
+    let mut registry =
+        create_tool_registry_with_scope(workspace_root, Some(scope), identity.name());
     let working_dir = Some(container_working_dir.to_string());
     registry.register(Box::new(RunCommandTool::new(container_handle, working_dir)));
     Ok(registry.scoped_for(identity))
@@ -3489,10 +3495,11 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 9] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 10] = [
         ("calculate", EffectClass::None),
         ("echo", EffectClass::None),
         ("git_diff", EffectClass::None),
+        ("git_push_branch", EffectClass::Repository),
         ("git_status", EffectClass::None),
         ("github_pr_status", EffectClass::Repository),
         ("list_directory", EffectClass::None),
@@ -3891,7 +3898,7 @@ mod tests {
         let scoped = registry.scoped_for(&identity);
         assert_eq!(
             sorted_names(&scoped),
-            vec!["git_diff", "git_status", "read_file"]
+            vec!["git_diff", "git_push_branch", "git_status", "read_file"]
         );
         assert!(scoped.get_tool("write_file").is_none());
     }
