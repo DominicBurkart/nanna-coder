@@ -153,6 +153,61 @@ pub(super) mod tests {
                 .push((number, body.to_string()));
             Ok(())
         }
+
+        async fn create_draft_pull_request(
+            &self,
+            _repo: &str,
+            _title: &str,
+            _body: &str,
+            _head: &str,
+            _base: &str,
+        ) -> Result<crate::backlog::GithubPullRequestCreated, BacklogError> {
+            unreachable!("escalation delivery never opens pull requests")
+        }
+
+        async fn get_pull_request(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<crate::backlog::GithubPullRequestDetail, BacklogError> {
+            unreachable!("escalation delivery never reads pull request detail")
+        }
+
+        async fn mark_pull_request_ready(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<(), BacklogError> {
+            unreachable!("escalation delivery never promotes pull requests")
+        }
+
+        async fn close_pull_request(&self, _repo: &str, _number: u64) -> Result<(), BacklogError> {
+            unreachable!("escalation delivery never closes pull requests")
+        }
+
+        async fn list_review_comments(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<Vec<crate::backlog::GithubComment>, BacklogError> {
+            unreachable!("escalation delivery never reads review comments")
+        }
+
+        async fn list_issue_comments(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<Vec<crate::backlog::GithubComment>, BacklogError> {
+            unreachable!("escalation delivery never reads issue comments")
+        }
+
+        async fn get_issue(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<crate::backlog::GithubIssueDetail, BacklogError> {
+            unreachable!("escalation delivery never reads issue detail")
+        }
     }
 
     fn escalation(summary: &str) -> Escalation {
