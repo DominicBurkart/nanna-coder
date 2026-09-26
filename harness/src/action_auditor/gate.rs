@@ -131,17 +131,20 @@ impl ActionGate {
     ) -> ActionVerdict {
         let verdict = match self.auditor.review_action(review, context).await {
             Ok(verdict) => verdict,
-            Err(e) => ActionVerdict::block(vec![Reason::new(
-                ReasonCode::Other,
-                format!("action auditor error: {e}"),
-            )]),
+            Err(e) => {
+                let reason = Reason::new(ReasonCode::Other, format!("action auditor error: {e}"));
+                ActionVerdict::block(vec![reason])
+            }
         };
         match self.log.append(review, &verdict) {
             Ok(()) => verdict,
-            Err(e) => ActionVerdict::block(vec![Reason::new(
-                ReasonCode::Other,
-                format!("action audit log write failed: {e}"),
-            )]),
+            Err(e) => {
+                let reason = Reason::new(
+                    ReasonCode::Other,
+                    format!("action audit log write failed: {e}"),
+                );
+                ActionVerdict::block(vec![reason])
+            }
         }
     }
 }
