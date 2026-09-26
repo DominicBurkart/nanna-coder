@@ -1,10 +1,13 @@
 pub mod agent;
 pub mod auditor;
+pub mod backlog;
 pub mod container;
 pub mod effects;
 pub mod entities;
+pub mod escalation;
 pub mod eval;
 pub mod identity;
+pub mod leases;
 pub mod marker;
 pub mod mcp;
 pub mod monitoring;
@@ -12,10 +15,12 @@ pub mod observability;
 pub mod onboarding;
 pub mod pod;
 pub mod protected;
+pub mod scheduler;
 pub mod scope;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
+pub mod windows;
 pub mod workspace;
 
 pub use container::{

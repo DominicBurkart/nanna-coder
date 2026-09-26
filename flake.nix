@@ -304,7 +304,7 @@
               (pkgs.lib.hasSuffix "\.toml" path) ||
               (pkgs.lib.hasSuffix "\.lock" path) ||
               (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
-            (pkgs.lib.hasInfix "/docs/" path) ||
+              (pkgs.lib.hasInfix "/docs/" path) ||
               (type == "directory");
           };
 
