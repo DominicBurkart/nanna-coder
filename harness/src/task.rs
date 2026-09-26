@@ -1,3 +1,4 @@
+use crate::action_auditor::{ActionAuditLogEntry, ActionGate};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::auditor::Allowed;
 use crate::container::NetworkPolicy;
@@ -105,6 +106,10 @@ pub struct TaskResult {
     /// Empty when the task ran without an identity.
     #[serde(default)]
     pub denials: Vec<ScopeDenial>,
+    /// Every effectful action the action auditor reviewed during the run,
+    /// allowed or not, in order. Empty when the run carried no action gate.
+    #[serde(default)]
+    pub action_audit: Vec<ActionAuditLogEntry>,
     pub iterations: usize,
     pub model_used: String,
     #[serde(default)]
@@ -137,6 +142,7 @@ impl TaskResult {
             "max_effect_class": self.max_effect_class(),
             "denials": self.denials,
             "denial_count": self.denial_count(),
+            "action_audit": self.action_audit,
             "iterations": self.iterations,
             "model_used": self.model_used,
             "qa_summary": self.qa_summary.to_json(),
@@ -155,6 +161,10 @@ pub struct FailureDiagnostics {
     pub conversation_snapshot: Option<Vec<ChatMessage>>,
     #[serde(default)]
     pub denials: Vec<ScopeDenial>,
+    /// Every effectful action the action auditor reviewed before the task
+    /// failed, allowed or not, in order.
+    #[serde(default)]
+    pub action_audit: Vec<ActionAuditLogEntry>,
 }
 
 impl FailureDiagnostics {
@@ -167,6 +177,7 @@ impl FailureDiagnostics {
             "tool_call_history": self.tool_call_history,
             "last_agent_state": self.last_agent_state,
             "conversation_snapshot": self.conversation_snapshot,
+            "action_audit": self.action_audit,
             "denials": self.denials,
         })
     }
@@ -176,6 +187,7 @@ fn protected_failure(
     violation: ProtectedPathViolation,
     identity: Option<&str>,
     run_result: &Result<AgentRunResult, AgentError>,
+    action_audit: Vec<ActionAuditLogEntry>,
 ) -> (String, FailureDiagnostics) {
     let (iterations_completed, tool_call_history, mut denials) = match run_result {
         Ok(result) => (
@@ -199,6 +211,7 @@ fn protected_failure(
         last_agent_state: None,
         conversation_snapshot: None,
         denials,
+        action_audit,
     };
     (violation.to_string(), diagnostics)
 }
@@ -307,6 +320,7 @@ struct TaskRunner {
     bound: RwLock<HashMap<TaskId, AgentIdentity>>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
+    action_gate: std::sync::RwLock<Option<Arc<ActionGate>>>,
 }
 
 /// Why [`TaskManager::submit_spawn`] refused to dispatch an audited spawn.
@@ -439,6 +453,7 @@ impl TaskManager {
             audit: std::sync::Mutex::new(Arc::new(NoopAuditHook)),
             bound: RwLock::new(HashMap::new()),
             escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
+            action_gate: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -455,6 +470,15 @@ impl TaskManager {
     /// instead of the in-memory default.
     pub fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
         *self.runner.escalations.write().unwrap() = escalations;
+        self
+    }
+
+    /// Review every effectful action (`effect_class() >= Repository`) a
+    /// dispatched task's agent attempts through `gate` (issue #642). Without
+    /// one, every such call is refused: this attaches the auditor, it does
+    /// not merely configure it.
+    pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
+        *self.runner.action_gate.write().unwrap() = Some(gate);
         self
     }
 
@@ -847,6 +871,10 @@ impl Launcher for Arc<TaskRunner> {
 }
 
 impl TaskRunner {
+    fn action_gate(&self) -> Option<Arc<ActionGate>> {
+        self.action_gate.read().unwrap().clone()
+    }
+
     fn escalation_log(&self) -> Arc<EscalationLog> {
         Arc::clone(&self.escalations.read().unwrap())
     }
@@ -943,6 +971,7 @@ impl TaskRunner {
                     last_agent_state: None,
                     conversation_snapshot: None,
                     denials: vec![],
+                    action_audit: vec![],
                 },
             },
         )
@@ -1093,6 +1122,13 @@ impl TaskRunner {
             }
         };
         let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
+        let tool_registry = match self.action_gate() {
+            Some(gate) => {
+                let subject = action_subject_for(&task_id, &queued, identity.as_ref());
+                tool_registry.with_action_gate(gate, subject)
+            }
+            None => tool_registry,
+        };
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -1109,6 +1145,14 @@ impl TaskRunner {
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
         let run_result = agent.run(context).await;
+        // `agent` is not consumed by `run`, so the tool registry it owns
+        // (and every action review recorded on it) is still reachable here
+        // whether the run succeeded, failed, or was cut short by an
+        // escalation -- `AgentError` itself carries no action-audit data.
+        let action_audit = agent
+            .tool_registry()
+            .map(crate::tools::ToolRegistry::action_reviews)
+            .unwrap_or_default();
 
         let extracted = workspace.extract_changes();
         let changes_patch = extracted.as_ref().ok().cloned().and_then(bound_patch);
@@ -1125,7 +1169,8 @@ impl TaskRunner {
 
         if let Err(WorkspaceError::ProtectedPath(violation)) = extracted {
             let name = identity.as_ref().map(|i| i.name());
-            let (error, diagnostics) = protected_failure(violation, name, &run_result);
+            let (error, diagnostics) =
+                protected_failure(violation, name, &run_result, action_audit);
             let finished_at = Utc::now();
             let status = TaskStatus::Failed {
                 finished_at,
@@ -1146,6 +1191,7 @@ impl TaskRunner {
                     files_modified,
                     tool_calls_made: result.tool_calls_made,
                     denials: result.denials,
+                    action_audit,
                     iterations: result.iterations,
                     model_used: queued.model,
                     qa_summary,
@@ -1176,6 +1222,7 @@ impl TaskRunner {
                     last_agent_state,
                     conversation_snapshot: Some(conversation_snapshot),
                     denials: vec![],
+                    action_audit,
                 };
                 self.set_status(
                     &task_id,
@@ -1231,6 +1278,35 @@ fn bound_patch(patch: String) -> Option<String> {
         Some(patch[..MAX_DIFF_BYTES].to_string())
     } else {
         Some(patch)
+    }
+}
+
+/// The subject a dispatched task's effectful calls are reviewed against:
+/// the identity's effect ceiling (unbounded when the task carries none),
+/// the branch this task pushes to, and no window, pull request or
+/// environment. Nothing in `Task`/`QueuedTask` names a PR or a target
+/// environment yet -- that lands with the middle/outer-loop work (#647,
+/// #649) -- so `Sandbox`/`Production` calls dispatched through
+/// `TaskRunner` correctly `Block` on a missing lease context
+/// ([`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)) until
+/// then, rather than silently skipping the check.
+fn action_subject_for(
+    task_id: &TaskId,
+    queued: &QueuedTask,
+    identity: Option<&AgentIdentity>,
+) -> crate::tools::ActionSubject {
+    let max_effect = identity
+        .map(|identity| identity.scope.max_effect)
+        .unwrap_or(EffectClass::Production);
+    crate::tools::ActionSubject {
+        task_id: task_id.clone(),
+        max_effect,
+        window: None,
+        repo: queued.repo_path.display().to_string(),
+        branch: Some(queued.branch.clone()),
+        pr: None,
+        environment: None,
+        paths: Vec::new(),
     }
 }
 
@@ -1357,6 +1433,7 @@ mod tests {
                 tool: "write_file".to_string(),
                 reason: crate::scope::DenialReason::ToolNotInScope,
             }],
+            action_audit: vec![],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
             qa_summary: QaSummary::default(),
@@ -1408,6 +1485,7 @@ mod tests {
             last_agent_state: None,
             conversation_snapshot: None,
             denials: vec![],
+            action_audit: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "MaxIterationsExceeded");
@@ -1434,6 +1512,7 @@ mod tests {
             last_agent_state: Some("Performing".to_string()),
             conversation_snapshot: Some(vec![ChatMessage::user("do something")]),
             denials: vec![],
+            action_audit: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "StateError");
@@ -1463,6 +1542,7 @@ mod tests {
             files_modified: vec![],
             tool_calls_made,
             denials: vec![],
+            action_audit: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
             qa_summary: QaSummary::default(),
@@ -3005,6 +3085,124 @@ mod identity_tests {
         assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
     }
 
+    fn repository_scoped_identity() -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Repository;
+        identity.scope.tools = vec!["github_pr_status".parse().unwrap()];
+        identity
+    }
+
+    struct AlwaysBlocksAction;
+
+    #[async_trait::async_trait]
+    impl crate::action_auditor::ActionAuditor for AlwaysBlocksAction {
+        fn name(&self) -> &str {
+            "always-blocks"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(crate::action_auditor::ActionVerdict::block(vec![
+                crate::auditor::Reason::new(crate::auditor::ReasonCode::Other, "test block"),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_action_gate_reviews_a_dispatched_tasks_calls_and_exports_the_audit() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(AlwaysBlocksAction),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_gate(gate);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 1);
+        assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
+        assert_eq!(
+            result.action_audit[0].review.effect_class,
+            EffectClass::Repository
+        );
+        assert_eq!(
+            result.action_audit[0].verdict.kind(),
+            crate::auditor::VerdictKind::Block
+        );
+        let json = result.to_json();
+        assert_eq!(
+            json["action_audit"][0]["review"]["tool"],
+            "github_pr_status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_action_gate_refuses_a_repository_class_call_by_default() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 1);
+        assert_eq!(
+            result.action_audit[0].verdict.kind(),
+            crate::auditor::VerdictKind::Block
+        );
+        assert!(result.action_audit[0]
+            .verdict
+            .reasons()
+            .iter()
+            .any(|r| r.detail.contains("no action auditor configured")));
+    }
+
     #[tokio::test]
     async fn test_registered_identity_is_resolved_by_hint() {
         let repo = repo_with_origin("https://github.com/example/repo");
@@ -3242,6 +3440,7 @@ mod identity_tests {
                 "extract_changes",
                 &violation,
             )],
+            action_audit: vec![],
         };
         let json = diagnostics.to_json();
         assert_eq!(json["denials"][0]["reason"]["kind"], "protected_path");
@@ -3253,6 +3452,7 @@ mod identity_tests {
         });
         let parsed: FailureDiagnostics = serde_json::from_value(legacy).unwrap();
         assert!(parsed.denials.is_empty());
+        assert!(parsed.action_audit.is_empty());
     }
 
     fn plant_protected_file(source_repo: &std::path::Path) {
@@ -3384,7 +3584,7 @@ mod identity_tests {
             conversation_snapshot: vec![],
             last_agent_state: crate::agent::AgentState::PerformingEntityModification,
         });
-        let (error, diagnostics) = protected_failure(violation, None, &run);
+        let (error, diagnostics) = protected_failure(violation, None, &run, vec![]);
         assert!(error.starts_with("`windows.toml` is protected"));
         assert_eq!(diagnostics.iterations_completed, 7);
         assert_eq!(diagnostics.tool_call_history.len(), 1);
@@ -3397,6 +3597,7 @@ mod identity_tests {
             diagnostics.denials[0].identity,
             crate::scope::UNSCOPED_IDENTITY
         );
+        assert!(diagnostics.action_audit.is_empty());
     }
 
     #[tokio::test]
