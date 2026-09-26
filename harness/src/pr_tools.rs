@@ -64,13 +64,15 @@ use std::sync::{Arc, OnceLock};
 /// is empty and every comment is filtered out.
 pub const TRUSTED_PR_COMMENTERS_ENV: &str = "NANNA_TRUSTED_PR_COMMENTERS";
 
-fn map_backlog_error(err: BacklogError) -> ToolError {
+/// Shared with [`crate::ci`] and [`crate::sandbox`]: every GitHub-API-backed
+/// tool in the crate translates a [`BacklogError`] the same way.
+pub(crate) fn map_backlog_error(err: BacklogError) -> ToolError {
     ToolError::ExecutionFailed {
         message: err.to_string(),
     }
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
+pub(crate) fn required_str<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
     args.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArguments {
@@ -78,7 +80,7 @@ fn required_str<'a>(args: &'a Value, key: &str) -> ToolResult<&'a str> {
         })
 }
 
-fn required_u64(args: &Value, key: &str) -> ToolResult<u64> {
+pub(crate) fn required_u64(args: &Value, key: &str) -> ToolResult<u64> {
     args.get(key)
         .and_then(|v| v.as_u64())
         .ok_or_else(|| ToolError::InvalidArguments {
@@ -176,8 +178,10 @@ fn run_git(workspace_root: &Path, args: &[&str]) -> ToolResult<String> {
 /// The `owner/name` GitHub repository the worktree's `origin` remote points
 /// at. Never accepted as a tool argument: always read from the worktree
 /// itself, so a tool call cannot aim the harness's token at another
-/// repository.
-fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
+/// repository. Shared with [`crate::ci`] and [`crate::sandbox`], whose
+/// GitHub Actions and sandbox lifecycle tools resolve the repository the
+/// same way.
+pub(crate) fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
     let remote_url = run_git(workspace_root, &["remote", "get-url", "origin"])?;
     parse_github_remote(&remote_url)
         .map(|(owner, repo)| format!("{owner}/{repo}"))
@@ -188,8 +192,9 @@ fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
 
 /// The worktree's current branch. Refuses a detached `HEAD`, since pushing
 /// one would push whatever commit `HEAD` happens to point at under no
-/// branch name at all.
-fn current_branch(workspace_root: &Path) -> ToolResult<String> {
+/// branch name at all. Shared with [`crate::ci_tools`], whose `ci_trigger`
+/// dispatches workflows against this same branch.
+pub(crate) fn current_branch(workspace_root: &Path) -> ToolResult<String> {
     let branch = run_git(workspace_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch.is_empty() || branch == "HEAD" {
         return Err(ToolError::ExecutionFailed {
