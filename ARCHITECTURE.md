@@ -69,9 +69,9 @@ The task lifecycle uses the standard Tasks methods instead of custom tools:
 
 The server advertises `capabilities.tasks: { list, cancel, requests: { tools: { call } } }` at `initialize`. Task IDs are UUIDv4 with no authorization-context binding — appropriate for a single-user local stdio server (see the Tasks spec's security considerations). `input_required`/elicitation is out of scope for this revision.
 
-Submissions beyond the concurrency limit are queued, not rejected. `harness::scheduler` orders the backlog by submission time and dispatches it with a hybrid FIFO/LIFO policy (half the slots chase the newest work, half serve the oldest, with an optional per-repository cap); queued entries are persisted to a JSON Lines log (`NANNA_QUEUE_PATH`, default `~/.local/state/nanna/queue.jsonl`) and restored when `mcp-serve` starts. Entries may be parked until a human-availability window opens (`harness::windows`). The `backlog-sync` subcommand pulls open GitHub issues into that log as tasks, skipping issues already queued or already claimed by an open pull request carrying a `Nanna-Identity:` marker.
+Submissions beyond the concurrency limit are queued, not rejected. `harness::scheduler` orders the backlog by submission time and dispatches it with a hybrid FIFO/LIFO policy (half the slots chase the newest work, half serve the oldest, with an optional per-repository cap); queued entries are persisted to a JSON Lines log (`NANNA_QUEUE_PATH`, default `~/.local/state/nanna/queue.jsonl`) and restored when `mcp-serve` starts. Entries may be parked until a human-availability window opens (`harness::windows`) — see [Availability Windows](#availability-windows) below for what that building block currently has, and lacks, in the way of a caller. The `backlog-sync` subcommand pulls open GitHub issues into that log as tasks, skipping issues already queued or already claimed by an open pull request carrying a `Nanna-Identity:` marker.
 
-When a producer (auditor verdict, rollout halt, budget exhaustion, repeated scope denials, incident postmortem) cannot proceed, it hands off through `harness::escalation`: a deterministic-title GitHub issue labelled `nanna-escalation` (repeats comment on the open issue) and/or a JSON webhook, every body redacted. Occurrences are logged to `escalations.jsonl` beside the queue log (`NANNA_ESCALATION_PATH`) and identical escalations inside a window collapse into a counter. An `incident` escalation records a hold that parks production-class work for the repository until a human runs `nanna escalation resolve <id>`; no agent tool can clear it.
+When a producer (auditor verdict, rollout halt, budget exhaustion, repeated scope denials, incident postmortem) cannot proceed, it hands off through `harness::escalation`: a deterministic-title GitHub issue labelled `nanna-escalation` (repeats comment on the open issue) and/or a JSON webhook, every body redacted. Occurrences are logged to `escalations.jsonl` beside the queue log (`NANNA_ESCALATION_PATH`) and identical escalations inside a window collapse into a counter. An `incident` escalation records a hold that parks production-class work for the repository until a human runs `nanna escalation resolve <id>`; no agent tool can clear it — see [Escalation](#escalation) below for how much of this pipeline this base actually calls today.
 
 ```mermaid
 ---
@@ -212,6 +212,8 @@ The middle and outer loops' `Ci` and `Sandbox` effect classes exist in the taxon
 - **Container networking.** `harness::container::NetworkPolicy::for_ceiling` maps `None`/`Workspace` to a network-disabled container (`--network=none`) and `Repository` and above to a networked one.
 - **The action-gate.** See [Two Auditor Gates](#two-auditor-gates) below.
 
+This module's own documentation says a tool that can reach several classes should declare the *maximum* class it can reach, but that convention is not universal: `RunCommandTool` (`run_command`, "run a shell command in the dev container workspace") declares a fixed `EffectClass::Workspace` regardless of what the command inside it actually does. That has two compounding consequences worth knowing about anywhere this doc talks about RBAC as a guarantee: `run_command` always passes the RBAC ceiling check (`Workspace` is at or below any ceiling), and because `RuleActionAuditor::evaluate` allows `None`/`Workspace` calls without consulting anything further, a `run_command` call is never reviewed by the action-gate either, no matter which shell command it runs. Any identity whose `max_effect` is `Repository` or above (so its container has network access, per the mapping above) and who is also granted `run_command` therefore has an unreviewed, networked shell — the containment for that combination rests entirely on what the container is allowed to reach (e.g. whether it holds credentials for anything sensitive), not on RBAC or the action gate. As of this read, nothing in `harness::container` injects `GITHUB_TOKEN` or another GitHub credential into a dev container by default, but this is worth treating as a design note for identity authors rather than an enforced guarantee.
+
 Note a naming mismatch worth knowing about while reading the leases code: `harness::leases::Effect` (`Local < Repository < Sandbox < Production`) is a *separate, smaller* enum from `EffectClass`, used only by `required_leases` to name which coordination lease an action needs; it has no `Ci` variant, and it is related to `EffectClass` only by matching lowercase names through `FromStr` — the two are not the same type and their cut points do not line up (`Effect::Local` is not `EffectClass::Workspace`). In practice the mapping is narrower still: `action_auditor::RuleActionAuditor::evaluate` only calls `required_leases` (and so only ever acquires a coordination lease) for `EffectClass::Sandbox` and `EffectClass::Production` actions; `Repository`/`Ci` actions are decided purely by the identity's effect ceiling and, as of this read, never acquire a lease through the action gate — `required_leases` can compute a branch lease for `Effect::Repository`, but no call site outside `leases`' own tests reaches that case.
 
 # Identity Catalog and RBAC
@@ -249,13 +251,14 @@ flowchart TD
     Planner -.-> Request["SpawnRequest: identity, subtask, loop, expected effect"]
     Request --> GateCheck["Gate::check"]
     GateCheck --> RuleAuditor["RuleAuditor: catalog membership, loop match, effect ceiling, injection heuristics"]
+    GateCheck -- auditor errored, AuditFailed --> Refused["Refused"]
     RuleAuditor -- Block --> Verdict["SpawnVerdict"]
     RuleAuditor -- Allow or Escalate --> ModelAuditor["ModelAuditor (adversarial model review, optional)"]
     ModelAuditor --> Verdict
+    Verdict --> Log["AuditLog entry, every verdict"]
     Verdict -- Allow --> Allowed["Allowed proof: request + identity"]
-    Verdict -- Block or Escalate --> Refused["Refused"]
+    Verdict -- Block or Escalate --> Refused
     Allowed --> Submit["TaskManager::submit_spawn"]
-    Refused --> Log["AuditLog entry"]
     Refused -- Escalate --> Hook["SpawnEscalationHook"]
 ```
 
