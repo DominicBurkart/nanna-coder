@@ -500,6 +500,13 @@ const DEFAULT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_mill
 /// the integration being blocked).
 const MAX_RETRY_AFTER_SECS: u64 = 60;
 
+/// Ceiling [`ReqwestGithubClient::with_retry_policy`] clamps `max_attempts`
+/// to: the exponential backoff shift in [`ReqwestGithubClient::request_json`]
+/// is only defined for shift amounts below `u32::BITS`, so an unbounded
+/// caller-supplied `max_attempts` would panic (debug) or silently wrap
+/// (release) on the last attempt before the cap kicked in anyway.
+const MAX_RETRY_ATTEMPTS: u32 = 32;
+
 /// One of the HTTP methods [`ReqwestGithubClient`] issues.
 #[derive(Debug, Clone, Copy)]
 enum HttpMethod {
@@ -671,7 +678,7 @@ impl ReqwestGithubClient {
         max_attempts: u32,
         base_backoff: std::time::Duration,
     ) -> Self {
-        self.max_attempts = max_attempts.max(1);
+        self.max_attempts = max_attempts.clamp(1, MAX_RETRY_ATTEMPTS);
         self.base_backoff = base_backoff;
         self
     }
@@ -884,6 +891,15 @@ impl GithubClient for ReqwestGithubClient {
                     .join("; ");
                 return Err(BacklogError::GraphQl { url, message });
             }
+        }
+        let is_draft = value
+            .pointer("/data/markPullRequestReadyForReview/pullRequest/isDraft")
+            .and_then(|v| v.as_bool());
+        if is_draft != Some(false) {
+            return Err(BacklogError::GraphQl {
+                url,
+                message: "markPullRequestReadyForReview reported no errors but did not confirm pullRequest.isDraft is false".to_string(),
+            });
         }
         Ok(())
     }
@@ -1687,6 +1703,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_rejects_a_silent_no_op() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": true}}}}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        assert!(err.to_string().contains("did not confirm"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_rejects_a_missing_is_draft_field() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new("POST", "/graphql", 200, r#"{"data": {}}"#),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn reqwest_client_closes_pull_request_patches_state_closed() {
         let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
             "PATCH",
@@ -1906,6 +1964,24 @@ mod tests {
             other => panic!("expected RateLimited, got {other:?}"),
         }
         server.abort();
+    }
+
+    #[test]
+    fn with_retry_policy_clamps_an_oversized_max_attempts() {
+        // The exponential backoff shift (`1u32 << (attempt - 1)`) is only
+        // defined for shift amounts below 32; an unclamped caller-supplied
+        // max_attempts would panic (debug) or wrap (release) once enough
+        // retries were exhausted to reach it.
+        let client = ReqwestGithubClient::new("http://example.invalid", None)
+            .with_retry_policy(u32::MAX, std::time::Duration::from_millis(1));
+        assert_eq!(client.max_attempts, MAX_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn with_retry_policy_still_floors_at_one() {
+        let client = ReqwestGithubClient::new("http://example.invalid", None)
+            .with_retry_policy(0, std::time::Duration::from_millis(1));
+        assert_eq!(client.max_attempts, 1);
     }
 
     #[tokio::test]

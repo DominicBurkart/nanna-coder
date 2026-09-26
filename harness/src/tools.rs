@@ -4504,9 +4504,10 @@ mod tests {
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
     }
-    const PROTECTED_EXAMPLES: [(&str, &str); 6] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 7] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
+        (".git/**", ".git/config"),
         (".github/workflows/**", ".github/workflows/ci.yml"),
         (".github/CODEOWNERS", ".github/CODEOWNERS"),
         ("codecov.yml", "codecov.yml"),
