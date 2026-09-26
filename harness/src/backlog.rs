@@ -1390,6 +1390,12 @@ pub(crate) mod test_support {
         /// distinct from what becomes visible after it.
         pub list_result_before_dispatch: Option<Vec<WorkflowRun>>,
         pub(crate) dispatched: StdMutex<bool>,
+        /// When set, only [`GithubActionsClient::dispatch_workflow`] fails,
+        /// with this status, leaving every other call (including the
+        /// pre-dispatch baseline listing) unaffected -- distinct from
+        /// `fail_status`, which fails every call and so cannot isolate "the
+        /// dispatch itself failed" from "reading the baseline failed".
+        pub fail_dispatch_status: Option<u16>,
         /// When set, every call returns this status as a
         /// [`BacklogError::Status`].
         pub fail_status: Option<u16>,
@@ -1445,6 +1451,12 @@ pub(crate) mod test_support {
                 .dispatched
                 .lock()
                 .expect("mock dispatched flag poisoned") = true;
+            if let Some(status) = self.fail_dispatch_status {
+                return Err(BacklogError::Status {
+                    url: "mock:dispatch_workflow".to_string(),
+                    status,
+                });
+            }
             self.maybe_fail("mock:dispatch_workflow")
         }
 

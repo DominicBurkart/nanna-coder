@@ -806,6 +806,10 @@ mod tests {
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
 
+    /// `fail_status` fails every mock call, including the pre-dispatch
+    /// baseline listing `max_known_run_id` reads before `dispatch_workflow`
+    /// is ever attempted; this only proves that *some* upstream call's
+    /// error surfaces correctly.
     #[tokio::test]
     async fn dispatch_surfaces_a_client_error() {
         let dir = fixture();
@@ -819,6 +823,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    /// Isolates a failure in `dispatch_workflow` itself, after a successful
+    /// baseline listing, and confirms the call was already charged: the
+    /// charge happens before the dispatch is attempted, so a dispatch that
+    /// reaches GitHub and then fails still consumes budget.
+    #[tokio::test]
+    async fn dispatch_surfaces_a_failure_from_the_dispatch_call_itself_and_still_charges() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            fail_dispatch_status: Some(422),
+            ..Default::default()
+        });
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(Arc::clone(&accountant), "id", "t1");
+        let err = tool
+            .execute(json!({"workflow": "ci.yml"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+        assert!(mock
+            .calls()
+            .iter()
+            .any(|c| c.contains("dispatch_workflow o/n ci.yml@feat/x")));
+        assert_eq!(accountant.task_summary("t1").ci.count, 1);
     }
 
     #[tokio::test]
