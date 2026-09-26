@@ -14,7 +14,7 @@
 use crate::scheduler::{QueueStore, QueueStoreError, QueuedTask, TaskOrigin, TaskQueue};
 use crate::task::TaskManager;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -190,6 +190,139 @@ pub trait GithubClient: Send + Sync {
 
     /// Fetch issue `number` of `repo`.
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
+}
+
+/// One GitHub Actions workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: u64,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `queued`, `in_progress` or `completed`.
+    pub status: String,
+    /// `success`, `failure`, `cancelled`, ... only meaningful once `status`
+    /// is `completed`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub html_url: String,
+    /// Branch the run's workflow file ran from; absent from some older
+    /// mocked payloads, hence the default rather than a hard parse failure.
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    #[serde(default)]
+    pub run_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl WorkflowRun {
+    /// Minutes between `run_started_at` and `updated_at`, when both are
+    /// known and the run has finished; the closest thing the REST API
+    /// offers to billed run duration without a separate timing call.
+    pub fn duration_minutes(&self) -> Option<f64> {
+        let started = self.run_started_at?;
+        let ended = self.updated_at?;
+        if self.status != "completed" || ended < started {
+            return None;
+        }
+        Some((ended - started).num_seconds() as f64 / 60.0)
+    }
+
+    /// Whether re-running this run's failed jobs makes sense: it belongs to
+    /// `branch` and it actually finished with a failure-like conclusion,
+    /// rather than a run from an unrelated branch (a different PR, or
+    /// `main`) or one still in progress.
+    pub fn is_rerunnable_failure_on(&self, branch: &str) -> bool {
+        self.head_branch.as_deref() == Some(branch)
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("failure") | Some("timed_out") | Some("cancelled")
+            )
+    }
+}
+
+/// One job of a [`WorkflowRun`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowJob {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowJob {
+    /// Whether this job's conclusion is a failure worth fetching logs for.
+    pub fn failed(&self) -> bool {
+        matches!(
+            self.conclusion.as_deref(),
+            Some("failure") | Some("timed_out") | Some("cancelled")
+        )
+    }
+}
+
+/// One step of a [`WorkflowJob`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub number: u64,
+}
+
+/// GitHub Actions access the CI tools need: dispatching or re-running a
+/// workflow and reading back its status, jobs and logs. Kept as a trait
+/// distinct from [`GithubClient`] (rather than added to it) so the existing
+/// issue/PR trait, its doctest and `test_support::MockGithub` are
+/// untouched; [`ReqwestGithubClient`] implements both over the same
+/// retry/rate-limit plumbing.
+#[async_trait]
+pub trait GithubActionsClient: Send + Sync {
+    /// `POST /repos/{repo}/actions/workflows/{workflow}/dispatches`.
+    /// `workflow` is the file name (`ci.yml`) or the numeric workflow id as
+    /// a string. GitHub answers `204 No Content` and does not hand back a
+    /// run id; callers resolve it with [`Self::list_workflow_runs`].
+    async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow: &str,
+        git_ref: &str,
+        inputs: serde_json::Value,
+    ) -> Result<(), BacklogError>;
+
+    /// `POST /repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs`. Reuses
+    /// `run_id`: GitHub bumps the run's attempt count rather than minting a
+    /// new run.
+    async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError>;
+
+    /// `GET /repos/{repo}/actions/workflows/{workflow}/runs`, newest first,
+    /// filtered to `branch` and `event` (for example `workflow_dispatch`).
+    /// One page (GitHub's default ordering and page size), which is enough
+    /// to find the run a dispatch just created.
+    async fn list_workflow_runs(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+        event: &str,
+    ) -> Result<Vec<WorkflowRun>, BacklogError>;
+
+    /// `GET /repos/{repo}/actions/runs/{run_id}`.
+    async fn get_workflow_run(&self, repo: &str, run_id: u64) -> Result<WorkflowRun, BacklogError>;
+
+    /// `GET /repos/{repo}/actions/runs/{run_id}/jobs`.
+    async fn list_workflow_jobs(
+        &self,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<WorkflowJob>, BacklogError>;
+
+    /// `GET /repos/{repo}/actions/jobs/{job_id}/logs`: the plain-text log of
+    /// one job, after GitHub's redirect to blob storage.
+    async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError>;
 }
 
 /// A repository whose backlog is ingested.
@@ -711,14 +844,16 @@ impl ReqwestGithubClient {
 
     /// Issue `method path`, rebuilding and resending the request on every
     /// retry attempt (a [`reqwest::RequestBuilder`] is consumed by `send`,
-    /// so it cannot be reused across attempts).
-    async fn request_json(
+    /// so it cannot be reused across attempts), and hand back the first
+    /// successful response unconsumed so callers can read it as JSON, plain
+    /// text, or not at all (`204 No Content`).
+    async fn send_with_retry(
         &self,
         method: HttpMethod,
         path: &str,
         query: &[(&str, String)],
         payload: Option<&serde_json::Value>,
-    ) -> Result<serde_json::Value, BacklogError> {
+    ) -> Result<reqwest::Response, BacklogError> {
         let url = format!("{}{}", self.base_url, path);
         let mut attempt = 0u32;
         loop {
@@ -740,7 +875,7 @@ impl ReqwestGithubClient {
             let response = request.send().await?;
             let status = response.status();
             if status.is_success() {
-                return Ok(serde_json::from_str(&response.text().await?)?);
+                return Ok(response);
             }
             let retry_after = retry_after_secs(response.headers());
             let rate_limited =
@@ -768,6 +903,42 @@ impl ReqwestGithubClient {
                 retry_after_secs: retry_after,
             });
         }
+    }
+
+    async fn request_json(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, String)],
+        payload: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let response = self.send_with_retry(method, path, query, payload).await?;
+        Ok(serde_json::from_str(&response.text().await?)?)
+    }
+
+    /// Like [`Self::request_json`], but the response body is plain text
+    /// rather than JSON (a workflow job's log).
+    async fn request_text(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, String)],
+        payload: Option<&serde_json::Value>,
+    ) -> Result<String, BacklogError> {
+        let response = self.send_with_retry(method, path, query, payload).await?;
+        Ok(response.text().await?)
+    }
+
+    /// Like [`Self::request_json`], for endpoints that answer success with
+    /// no body (`workflow_dispatch` and `rerun-failed-jobs` both do).
+    async fn request_no_content(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), BacklogError> {
+        self.send_with_retry(method, path, &[], payload).await?;
+        Ok(())
     }
 
     async fn paginate<T: for<'de> Deserialize<'de>>(
@@ -950,6 +1121,80 @@ impl GithubClient for ReqwestGithubClient {
     }
 }
 
+#[async_trait]
+impl GithubActionsClient for ReqwestGithubClient {
+    async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow: &str,
+        git_ref: &str,
+        inputs: serde_json::Value,
+    ) -> Result<(), BacklogError> {
+        let payload = serde_json::json!({ "ref": git_ref, "inputs": inputs });
+        self.request_no_content(
+            HttpMethod::Post,
+            &format!("/repos/{repo}/actions/workflows/{workflow}/dispatches"),
+            Some(&payload),
+        )
+        .await
+    }
+
+    async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError> {
+        self.request_no_content(
+            HttpMethod::Post,
+            &format!("/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"),
+            None,
+        )
+        .await
+    }
+
+    async fn list_workflow_runs(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+        event: &str,
+    ) -> Result<Vec<WorkflowRun>, BacklogError> {
+        let value = self
+            .get_json(
+                &format!("/repos/{repo}/actions/workflows/{workflow}/runs"),
+                &[("branch", branch.to_string()), ("event", event.to_string())],
+            )
+            .await?;
+        let runs = value.get("workflow_runs").cloned().unwrap_or(value);
+        Ok(serde_json::from_value(runs)?)
+    }
+
+    async fn get_workflow_run(&self, repo: &str, run_id: u64) -> Result<WorkflowRun, BacklogError> {
+        let value = self
+            .get_json(&format!("/repos/{repo}/actions/runs/{run_id}"), &[])
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn list_workflow_jobs(
+        &self,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<WorkflowJob>, BacklogError> {
+        let value = self
+            .get_json(&format!("/repos/{repo}/actions/runs/{run_id}/jobs"), &[])
+            .await?;
+        let jobs = value.get("jobs").cloned().unwrap_or(value);
+        Ok(serde_json::from_value(jobs)?)
+    }
+
+    async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError> {
+        self.request_text(
+            HttpMethod::Get,
+            &format!("/repos/{repo}/actions/jobs/{job_id}/logs"),
+            &[],
+            None,
+        )
+        .await
+    }
+}
+
 /// Test doubles shared by `backlog`'s own tests and by other modules'
 /// (`pr_tools`) tests that need a mocked [`GithubClient`], so there is one
 /// mocked-client pattern for the whole crate rather than a parallel one per
@@ -1126,6 +1371,157 @@ pub(crate) mod test_support {
                 })
         }
     }
+
+    /// A [`GithubActionsClient`] double alongside [`MockGithub`]: `jobs`,
+    /// `logs` and `list_result` are pre-seeded lookups; `runs` is mutable
+    /// through [`Self::set_run`] so a test can script a run moving from
+    /// `queued` to `completed` across successive `ci_status` polls.
+    #[derive(Default)]
+    pub(crate) struct MockGithubActions {
+        pub runs: StdMutex<HashMap<u64, WorkflowRun>>,
+        pub jobs: HashMap<u64, Vec<WorkflowJob>>,
+        pub logs: HashMap<u64, String>,
+        pub list_result: Vec<WorkflowRun>,
+        /// When set, every `list_workflow_runs` call before
+        /// [`GithubActionsClient::dispatch_workflow`] is invoked returns this
+        /// instead of `list_result`, so a test can script a run already
+        /// visible *before* a fresh dispatch (the baseline
+        /// [`crate::ci_tools::CiTriggerTool::max_known_run_id`] reads),
+        /// distinct from what becomes visible after it.
+        pub list_result_before_dispatch: Option<Vec<WorkflowRun>>,
+        pub(crate) dispatched: StdMutex<bool>,
+        /// When set, only [`GithubActionsClient::dispatch_workflow`] fails,
+        /// with this status, leaving every other call (including the
+        /// pre-dispatch baseline listing) unaffected -- distinct from
+        /// `fail_status`, which fails every call and so cannot isolate "the
+        /// dispatch itself failed" from "reading the baseline failed".
+        pub fail_dispatch_status: Option<u16>,
+        /// When set, every call returns this status as a
+        /// [`BacklogError::Status`].
+        pub fail_status: Option<u16>,
+        pub(crate) calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockGithubActions {
+        /// Every call made so far, in order, as a human-readable summary.
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("mock call log poisoned").clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .expect("mock call log poisoned")
+                .push(call.into());
+        }
+
+        fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            match self.fail_status {
+                Some(status) => Err(BacklogError::Status {
+                    url: url.to_string(),
+                    status,
+                }),
+                None => Ok(()),
+            }
+        }
+
+        /// Replace the run seen by
+        /// [`GithubActionsClient::get_workflow_run`].
+        pub(crate) fn set_run(&self, run: WorkflowRun) {
+            self.runs
+                .lock()
+                .expect("mock run table poisoned")
+                .insert(run.id, run);
+        }
+    }
+
+    #[async_trait]
+    impl GithubActionsClient for MockGithubActions {
+        async fn dispatch_workflow(
+            &self,
+            repo: &str,
+            workflow: &str,
+            git_ref: &str,
+            inputs: serde_json::Value,
+        ) -> Result<(), BacklogError> {
+            self.record(format!(
+                "dispatch_workflow {repo} {workflow}@{git_ref} {inputs}"
+            ));
+            *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned") = true;
+            if let Some(status) = self.fail_dispatch_status {
+                return Err(BacklogError::Status {
+                    url: "mock:dispatch_workflow".to_string(),
+                    status,
+                });
+            }
+            self.maybe_fail("mock:dispatch_workflow")
+        }
+
+        async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError> {
+            self.record(format!("rerun_workflow {repo}#{run_id}"));
+            self.maybe_fail("mock:rerun_workflow")
+        }
+
+        async fn list_workflow_runs(
+            &self,
+            repo: &str,
+            workflow: &str,
+            branch: &str,
+            event: &str,
+        ) -> Result<Vec<WorkflowRun>, BacklogError> {
+            self.record(format!(
+                "list_workflow_runs {repo} {workflow} {branch} {event}"
+            ));
+            self.maybe_fail("mock:list_workflow_runs")?;
+            let dispatched = *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned");
+            if !dispatched {
+                if let Some(before) = &self.list_result_before_dispatch {
+                    return Ok(before.clone());
+                }
+            }
+            Ok(self.list_result.clone())
+        }
+
+        async fn get_workflow_run(
+            &self,
+            repo: &str,
+            run_id: u64,
+        ) -> Result<WorkflowRun, BacklogError> {
+            self.record(format!("get_workflow_run {repo}#{run_id}"));
+            self.maybe_fail("mock:get_workflow_run")?;
+            self.runs
+                .lock()
+                .expect("mock run table poisoned")
+                .get(&run_id)
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:runs/{run_id}"),
+                    status: 404,
+                })
+        }
+
+        async fn list_workflow_jobs(
+            &self,
+            repo: &str,
+            run_id: u64,
+        ) -> Result<Vec<WorkflowJob>, BacklogError> {
+            self.record(format!("list_workflow_jobs {repo}#{run_id}"));
+            self.maybe_fail("mock:list_workflow_jobs")?;
+            Ok(self.jobs.get(&run_id).cloned().unwrap_or_default())
+        }
+
+        async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError> {
+            self.record(format!("get_job_logs {repo}#{job_id}"));
+            self.maybe_fail("mock:get_job_logs")?;
+            Ok(self.logs.get(&job_id).cloned().unwrap_or_default())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1133,6 +1529,7 @@ mod tests {
     use super::test_support::MockGithub;
     use super::*;
     use crate::scheduler::InMemoryQueueStore;
+    use chrono::TimeZone;
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1998,6 +2395,248 @@ mod tests {
         let err = client.get_issue("o/n", 1).await.unwrap_err();
         assert!(matches!(err, BacklogError::Status { status: 403, .. }));
         assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    fn run(id: u64, status: &str, conclusion: Option<&str>) -> WorkflowRun {
+        WorkflowRun {
+            id,
+            name: Some("ci".to_string()),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            html_url: format!("https://example.invalid/runs/{id}"),
+            head_branch: None,
+            run_started_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn is_rerunnable_failure_on_requires_a_matching_branch_and_a_failure_conclusion() {
+        let mut failed = run(1, "completed", Some("failure"));
+        failed.head_branch = Some("feat/x".to_string());
+        assert!(failed.is_rerunnable_failure_on("feat/x"));
+        assert!(!failed.is_rerunnable_failure_on("main"));
+
+        let mut succeeded = run(2, "completed", Some("success"));
+        succeeded.head_branch = Some("feat/x".to_string());
+        assert!(!succeeded.is_rerunnable_failure_on("feat/x"));
+
+        let mut timed_out = run(3, "completed", Some("timed_out"));
+        timed_out.head_branch = Some("feat/x".to_string());
+        assert!(timed_out.is_rerunnable_failure_on("feat/x"));
+
+        let no_branch = run(4, "completed", Some("failure"));
+        assert!(!no_branch.is_rerunnable_failure_on("feat/x"));
+    }
+
+    #[test]
+    fn duration_minutes_is_none_unless_completed_with_both_timestamps_in_order() {
+        let started = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
+        let ended = started + chrono::Duration::minutes(9);
+        let mut completed = run(1, "completed", Some("success"));
+        completed.run_started_at = Some(started);
+        completed.updated_at = Some(ended);
+        assert_eq!(completed.duration_minutes(), Some(9.0));
+
+        let in_progress = WorkflowRun {
+            run_started_at: Some(started),
+            updated_at: Some(ended),
+            ..run(2, "in_progress", None)
+        };
+        assert_eq!(in_progress.duration_minutes(), None);
+
+        let missing_start = WorkflowRun {
+            updated_at: Some(ended),
+            ..run(3, "completed", Some("success"))
+        };
+        assert_eq!(missing_start.duration_minutes(), None);
+
+        let missing_end = WorkflowRun {
+            run_started_at: Some(started),
+            ..run(4, "completed", Some("success"))
+        };
+        assert_eq!(missing_end.duration_minutes(), None);
+
+        let backwards = WorkflowRun {
+            run_started_at: Some(ended),
+            updated_at: Some(started),
+            ..run(5, "completed", Some("success"))
+        };
+        assert_eq!(backwards.duration_minutes(), None);
+    }
+
+    #[test]
+    fn workflow_job_failed_covers_every_terminal_conclusion() {
+        let job = |conclusion: Option<&str>| WorkflowJob {
+            id: 1,
+            name: "build".to_string(),
+            status: "completed".to_string(),
+            conclusion: conclusion.map(str::to_string),
+            steps: vec![],
+        };
+        assert!(job(Some("failure")).failed());
+        assert!(job(Some("timed_out")).failed());
+        assert!(job(Some("cancelled")).failed());
+        assert!(!job(Some("success")).failed());
+        assert!(!job(None).failed());
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_dispatches_a_workflow_with_204_no_content() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/actions/workflows/ci.yml/dispatches",
+            204,
+            "",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client
+            .dispatch_workflow("o/n", "ci.yml", "feat/x", serde_json::json!({"k": "v"}))
+            .await
+            .unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("POST /repos/o/n/actions/workflows/ci.yml/dispatches"));
+        assert!(sent[0].contains("\"ref\":\"feat/x\""));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_dispatch_workflow_surfaces_a_status_error() {
+        let (base, _requests, server) =
+            fake_github_ext(vec![MockRoute::new("POST", "/dispatches", 404, "{}")]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client
+            .dispatch_workflow("o/n", "ci.yml", "feat/x", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 404, .. }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_reruns_a_workflow_with_201_no_content() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/actions/runs/9/rerun-failed-jobs",
+            201,
+            "",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client.rerun_workflow("o/n", 9).await.unwrap();
+        assert!(requests.lock().unwrap()[0].contains("runs/9/rerun-failed-jobs"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_workflow_runs_unwraps_the_envelope() {
+        let body = serde_json::json!({
+            "total_count": 1,
+            "workflow_runs": [
+                {"id": 42, "status": "queued", "html_url": "https://example.invalid/runs/42"},
+            ],
+        })
+        .to_string();
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/workflows/ci.yml/runs",
+            200,
+            &body,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let runs = client
+            .list_workflow_runs("o/n", "ci.yml", "feat/x", "workflow_dispatch")
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, 42);
+        assert_eq!(runs[0].status, "queued");
+        assert!(requests.lock().unwrap()[0].contains("branch=feat%2Fx"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_a_workflow_run() {
+        let body = serde_json::json!({
+            "id": 42,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://example.invalid/runs/42",
+            "run_started_at": "2026-09-26T10:00:00Z",
+            "updated_at": "2026-09-26T10:09:00Z",
+        })
+        .to_string();
+        let (base, _requests, server) =
+            fake_github_ext(vec![MockRoute::new("GET", "/actions/runs/42", 200, &body)]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let run = client.get_workflow_run("o/n", 42).await.unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.conclusion.as_deref(), Some("success"));
+        assert_eq!(run.duration_minutes(), Some(9.0));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_workflow_jobs_unwraps_the_envelope() {
+        let body = serde_json::json!({
+            "jobs": [
+                {
+                    "id": 7,
+                    "name": "test",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {"name": "cargo test", "status": "completed", "conclusion": "failure", "number": 3},
+                    ],
+                },
+            ],
+        })
+        .to_string();
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/runs/42/jobs",
+            200,
+            &body,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let jobs = client.list_workflow_jobs("o/n", 42).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].failed());
+        assert_eq!(jobs[0].steps[0].name, "cargo test");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_fetches_job_logs_across_a_redirect() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/actions/jobs/7/logs", 302, "")
+                .with_headers(vec![("Location", "/blob/7")]),
+            MockRoute::new("GET", "/blob/7", 200, "cargo test failed\nsee above\n"),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let logs = client.get_job_logs("o/n", 7).await.unwrap();
+        assert!(logs.contains("cargo test failed"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_job_logs_surfaces_a_status_error() {
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/jobs/7/logs",
+            410,
+            "{}",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.get_job_logs("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 410, .. }));
         server.abort();
     }
 }

@@ -2,6 +2,7 @@ use crate::action_auditor::{
     ActionAuditLogEntry, ActionContext, ActionDenied, ActionGate, ActionReview, ActionVerdict,
 };
 use crate::auditor::{Reason, ReasonCode};
+use crate::budget::BudgetExceeded;
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
@@ -51,6 +52,11 @@ pub enum ToolError {
     /// before it reached the tool.
     #[error("{0}")]
     ActionDenied(ActionDenied),
+
+    /// A `Ci`/`Sandbox` identity budget was exhausted; see
+    /// [`crate::budget::CostAccountant`].
+    #[error("{0}")]
+    BudgetExceeded(BudgetExceeded),
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -438,6 +444,8 @@ impl ToolRegistry {
     /// assert_eq!(
     ///     names,
     ///     vec![
+    ///         "ci_logs",
+    ///         "ci_status",
     ///         "git_push_branch",
     ///         "github_issue_comment",
     ///         "github_issue_read",
@@ -465,7 +473,8 @@ impl ToolRegistry {
     /// let grouped = registry.by_class();
     /// assert_eq!(grouped.len(), EffectClass::ALL.len());
     /// assert_eq!(grouped[&EffectClass::Workspace], vec!["write_file"]);
-    /// assert!(grouped[&EffectClass::Ci].is_empty());
+    /// assert_eq!(grouped[&EffectClass::Ci], vec!["ci_trigger"]);
+    /// assert!(grouped[&EffectClass::Sandbox].is_empty());
     /// ```
     pub fn by_class(&self) -> BTreeMap<EffectClass, Vec<&str>> {
         EffectClass::ALL
@@ -3210,6 +3219,7 @@ fn create_tool_registry_with_scope(
         workspace_root.to_path_buf(),
     )));
     crate::pr_tools::register(&mut registry, workspace_root, identity_name);
+    crate::ci_tools::register(&mut registry, workspace_root);
     registry
 }
 
@@ -3348,8 +3358,11 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 16] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 19] = [
         ("calculate", EffectClass::None),
+        ("ci_logs", EffectClass::Repository),
+        ("ci_status", EffectClass::Repository),
+        ("ci_trigger", EffectClass::Ci),
         ("echo", EffectClass::None),
         ("git_diff", EffectClass::None),
         ("git_push_branch", EffectClass::Repository),

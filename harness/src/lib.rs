@@ -3,7 +3,9 @@ pub mod agent;
 pub mod apprun;
 pub mod auditor;
 pub mod backlog;
+pub mod budget;
 pub mod capabilities;
+pub mod ci_tools;
 pub mod container;
 pub mod deploy;
 pub mod effects;
@@ -22,6 +24,7 @@ pub mod pr_tools;
 pub mod protected;
 pub mod qa;
 pub mod rollout;
+pub mod sandbox_tools;
 pub mod scheduler;
 pub mod scope;
 pub mod sidecar;
@@ -35,6 +38,7 @@ pub use capabilities::{
     detect_capabilities, detect_capabilities_from_entries, detect_capability_locations,
     find_capability, CargoCapability, SignalScope, CARGO_CAPABILITIES,
 };
+pub use ci_tools::{CiLogsTool, CiStatusTool, CiTriggerTool};
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,

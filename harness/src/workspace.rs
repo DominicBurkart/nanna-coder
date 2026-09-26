@@ -2,6 +2,8 @@ use crate::apprun::{
     register_app_tools, stop_app, AppContext, AppSpec, Limits, PortAllocator, RunningApps,
     DEFAULT_POLL_INTERVAL,
 };
+use crate::budget::{BudgetClass, BudgetConfig, BudgetReport, CostAccountant, InMemoryBudgetStore};
+use crate::ci_tools::{github_actions_client, CiStatusTool, CiTriggerTool};
 use crate::container::{
     cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
     ContainerHandle, NetworkPolicy, ReadOnlyMount,
@@ -15,12 +17,14 @@ use crate::qa::{
     Manifest, ProcessSpawner, QaContext, QaLedger, QaSummary, ARTIFACT_DIR, DEFAULT_POLL,
     DEFAULT_WAIT,
 };
-use crate::scope::ScopeError;
+use crate::sandbox_tools::{self, HostHttpProbe, SandboxRegistry, SandboxTarget};
+use crate::scope::{ScopeError, UNSCOPED_IDENTITY};
 use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
     create_container_tool_registry, create_container_tool_registry_for, create_tool_registry,
     create_tool_registry_for, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
+use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -110,9 +114,24 @@ pub struct TaskWorkspace {
     qa_probe: Option<Arc<dyn HttpProbe>>,
     qa_driver: Option<Arc<dyn BrowserDriver>>,
     qa_ledger: Arc<QaLedger>,
+    sandboxes: Arc<SandboxRegistry>,
+    sandbox_target: Option<Arc<dyn SandboxTarget>>,
+    /// Pull request `sandbox_deploy`/`sandbox_teardown` are bound to; the
+    /// tools are registered only once both this and `sandbox_target` are
+    /// set, since a lease-covering PR number must come from the harness,
+    /// never from a tool argument (see `sandbox_tools`'s module doc).
+    sandbox_pr: Option<u64>,
+    cost_accountant: Arc<CostAccountant>,
     cleaned_up: bool,
     protected: ProtectedPaths,
     audit: Arc<dyn AuditHook>,
+}
+
+pub(crate) fn default_cost_accountant() -> Arc<CostAccountant> {
+    Arc::new(CostAccountant::new(
+        Arc::new(InMemoryBudgetStore::new()),
+        BudgetConfig::default(),
+    ))
 }
 
 impl TaskWorkspace {
@@ -145,6 +164,10 @@ impl TaskWorkspace {
             qa_probe: None,
             qa_driver: None,
             qa_ledger: Arc::new(QaLedger::new()),
+            sandboxes: Arc::new(SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
+            cost_accountant: default_cost_accountant(),
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
@@ -321,6 +344,10 @@ impl TaskWorkspace {
             qa_probe: None,
             qa_driver: None,
             qa_ledger: Arc::new(QaLedger::new()),
+            sandboxes: Arc::new(SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
+            cost_accountant: default_cost_accountant(),
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
@@ -391,6 +418,86 @@ impl TaskWorkspace {
     /// Applications started for this task, shared with its tool registries.
     pub fn running_apps(&self) -> Arc<RunningApps> {
         Arc::clone(&self.apps)
+    }
+
+    /// Sandbox target `sandbox_deploy`/`sandbox_teardown` deploy to and tear
+    /// down; unset by default. Silently defaulting to a fake target would
+    /// silently no-op a real deploy, so without this call neither tool is
+    /// registered at all. Like [`Self::set_app_env`], call before
+    /// [`Self::build_tool_registry`].
+    pub fn set_sandbox_target(&mut self, target: Arc<dyn SandboxTarget>) {
+        self.sandbox_target = Some(target);
+    }
+
+    /// Pull request `sandbox_deploy`/`sandbox_teardown` are bound to; unset
+    /// by default. Neither tool is registered until both this and
+    /// [`Self::set_sandbox_target`] are set, since the coordination lease
+    /// the action auditor acquires for a `Sandbox`-class call is keyed off
+    /// the PR the harness names, never one a tool argument could claim. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_sandbox_pr(&mut self, pr: u64) {
+        self.sandbox_pr = Some(pr);
+    }
+
+    /// Sandboxes deployed for this task, shared with its tool registries so
+    /// [`Self::cleanup`] can find and tear down whatever `sandbox_deploy`
+    /// left running.
+    pub fn sandboxes(&self) -> Arc<SandboxRegistry> {
+        Arc::clone(&self.sandboxes)
+    }
+
+    /// Budget accountant `ci_trigger`, `ci_status`, `sandbox_deploy` and
+    /// `sandbox_teardown` charge against; defaults to
+    /// [`BudgetConfig::default`] over an in-process-only store. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_cost_accountant(&mut self, accountant: Arc<CostAccountant>) {
+        self.cost_accountant = accountant;
+    }
+
+    /// This task's `Ci`/`Sandbox` budget usage so far, for [`crate::task::TaskResult`]
+    /// and telemetry.
+    pub fn budget_summary(&self) -> BudgetReport {
+        self.cost_accountant.task_summary(&self.task_id)
+    }
+
+    /// Re-register `ci_trigger`/`ci_status` with this workspace's cost
+    /// accountant and task id, overriding the unmetered instances
+    /// [`create_tool_registry`]/[`create_container_tool_registry`] already
+    /// registered (the same override pattern
+    /// [`create_container_tool_registry`] itself uses for `run_command`),
+    /// and register `sandbox_deploy`/`sandbox_teardown` when both
+    /// [`Self::set_sandbox_target`] and [`Self::set_sandbox_pr`] configured
+    /// one.
+    fn register_budgeted_tools(&self, registry: &mut ToolRegistry, identity_name: &str) {
+        let accountant = Arc::clone(&self.cost_accountant);
+        let client = github_actions_client();
+        registry.register(Box::new(
+            CiTriggerTool::new(self.workspace_path.clone(), Arc::clone(&client)).with_budget(
+                Arc::clone(&accountant),
+                identity_name,
+                self.task_id.clone(),
+            ),
+        ));
+        registry.register(Box::new(
+            CiStatusTool::new(self.workspace_path.clone(), client).with_budget(
+                Arc::clone(&accountant),
+                identity_name,
+                self.task_id.clone(),
+            ),
+        ));
+        if let (Some(target), Some(pr)) = (&self.sandbox_target, self.sandbox_pr) {
+            let probe: Arc<dyn HttpProbe> = Arc::new(HostHttpProbe::new(Arc::new(SystemRunner)));
+            sandbox_tools::register(
+                registry,
+                &self.workspace_path,
+                Arc::clone(target),
+                probe,
+                Arc::clone(&self.sandboxes),
+                &self.task_id,
+                pr,
+                Some((accountant, identity_name)),
+            );
+        }
     }
 
     /// App tool context when the workspace runs in a container and holds a
@@ -464,8 +571,49 @@ impl TaskWorkspace {
         }
     }
 
+    /// Tear down this task's sandbox if the agent never called
+    /// `sandbox_teardown` itself. Records the sandbox's lifetime as
+    /// `Sandbox` minutes via [`CostAccountant::record_minutes_sync`] rather
+    /// than [`CostAccountant::record_minutes`]: [`Self::cleanup`] is
+    /// synchronous (reachable from `Drop`) and cannot await it, and an
+    /// exhaustion check here would have no escalation delivery worth
+    /// awaiting anyway, since the default rule auditor already escalates
+    /// every `Sandbox`-class call regardless of budget.
+    fn teardown_forgotten_sandbox(&self) {
+        let Some(target) = &self.sandbox_target else {
+            return;
+        };
+        let Some(handle) = self.sandboxes.get(&self.task_id) else {
+            return;
+        };
+        match target.teardown(&handle) {
+            Ok(()) => {
+                self.sandboxes.remove(&self.task_id);
+                warn!(
+                    "task {}: sandbox for pr {} was still up at cleanup",
+                    self.task_id, handle.pr
+                );
+                let minutes =
+                    ((Utc::now() - handle.deployed_at).num_seconds() as f64 / 60.0).max(0.0);
+                let identity = handle.identity.as_deref().unwrap_or(UNSCOPED_IDENTITY);
+                self.cost_accountant.record_minutes_sync(
+                    identity,
+                    &self.task_id,
+                    BudgetClass::Sandbox,
+                    minutes,
+                    Utc::now(),
+                );
+            }
+            Err(e) => warn!(
+                "task {}: could not tear down sandbox at cleanup: {e}",
+                self.task_id
+            ),
+        }
+    }
+
     /// Remove the worktree, the dev container and any sidecars, stopping
-    /// the application first if the agent left it running.
+    /// the application and tearing down any sandbox first if the agent left
+    /// them running.
     ///
     /// The dev container is removed explicitly rather than through the last
     /// `Arc<ContainerHandle>` drop, because tool registries built from this
@@ -475,6 +623,7 @@ impl TaskWorkspace {
         if self.cleaned_up {
             return Ok(());
         }
+        self.teardown_forgotten_sandbox();
         if let Some(handle) = self.container_handle.take() {
             self.stop_forgotten_app(&handle);
             if handle.needs_cleanup {
@@ -506,7 +655,7 @@ impl TaskWorkspace {
     /// Returns a tool registry appropriate for this workspace: container-bound
     /// when a container handle is present, plain otherwise.
     pub fn build_tool_registry(&self) -> ToolRegistry {
-        if let Some(handle) = &self.container_handle {
+        let mut registry = if let Some(handle) = &self.container_handle {
             let mut registry = create_container_tool_registry(
                 &self.workspace_path,
                 Arc::clone(handle),
@@ -519,25 +668,35 @@ impl TaskWorkspace {
             registry
         } else {
             create_tool_registry(&self.workspace_path)
-        }
+        };
+        self.register_budgeted_tools(&mut registry, UNSCOPED_IDENTITY);
+        registry
     }
 
     /// The registry for this workspace restricted to `identity`: only tools
     /// in `scope.tools` at or below `scope.max_effect`, with file tools
     /// confined to `scope.paths` / `scope.read_paths`. `run_command` is
     /// present only with a container and a ceiling of at least `workspace`.
+    ///
+    /// Registers the budget-aware `ci_trigger`/`ci_status` and, when a
+    /// sandbox target is configured, `sandbox_deploy`/`sandbox_teardown`
+    /// after scoping, then re-scopes: [`ToolRegistry::scoped_for`] must run
+    /// last so these newly added tools are filtered by `identity` too,
+    /// exactly like every other tool.
     pub fn build_tool_registry_for(
         &self,
         identity: &AgentIdentity,
     ) -> Result<ToolRegistry, ScopeError> {
         let root = &self.workspace_path;
-        match &self.container_handle {
+        let mut registry = match &self.container_handle {
             Some(handle) => {
                 let handle = Arc::clone(handle);
-                create_container_tool_registry_for(root, handle, CONTAINER_WORKSPACE_DIR, identity)
+                create_container_tool_registry_for(root, handle, CONTAINER_WORKSPACE_DIR, identity)?
             }
-            None => create_tool_registry_for(root, identity),
-        }
+            None => create_tool_registry_for(root, identity)?,
+        };
+        self.register_budgeted_tools(&mut registry, identity.name());
+        Ok(registry.scoped_for(identity))
     }
 
     /// Stage every change except the harness artefacts under
@@ -727,6 +886,193 @@ mod tests {
             TaskWorkspace::create(source.path(), &unique_id("ws-registry"), "HEAD").unwrap();
         let registry = ws.build_tool_registry();
         assert!(registry.get_tool("read_file").is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn build_tool_registry_registers_budgeted_ci_tools() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-ci"), "HEAD").unwrap();
+        let registry = ws.build_tool_registry();
+        assert_eq!(
+            registry.get_tool("ci_trigger").unwrap().effect_class(),
+            crate::effects::EffectClass::Ci
+        );
+        assert_eq!(
+            registry.get_tool("ci_status").unwrap().effect_class(),
+            crate::effects::EffectClass::Repository
+        );
+        assert_eq!(
+            registry.get_tool("ci_logs").unwrap().effect_class(),
+            crate::effects::EffectClass::Repository
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn build_tool_registry_omits_sandbox_tools_without_a_target() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-nosandbox"), "HEAD").unwrap();
+        let registry = ws.build_tool_registry();
+        assert!(registry.get_tool("sandbox_deploy").is_none());
+        assert!(registry.get_tool("sandbox_teardown").is_none());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn build_tool_registry_omits_sandbox_tools_with_only_a_target_or_only_a_pr() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut target_only =
+            TaskWorkspace::create(source.path(), &unique_id("ws-target-only"), "HEAD").unwrap();
+        target_only.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        assert!(target_only
+            .build_tool_registry()
+            .get_tool("sandbox_deploy")
+            .is_none());
+        target_only.cleanup().unwrap();
+
+        let mut pr_only =
+            TaskWorkspace::create(source.path(), &unique_id("ws-pr-only"), "HEAD").unwrap();
+        pr_only.set_sandbox_pr(7);
+        assert!(pr_only
+            .build_tool_registry()
+            .get_tool("sandbox_deploy")
+            .is_none());
+        pr_only.cleanup().unwrap();
+    }
+
+    #[test]
+    fn build_tool_registry_registers_sandbox_tools_when_a_target_and_pr_are_configured() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sandbox"), "HEAD").unwrap();
+        ws.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        ws.set_sandbox_pr(7);
+        let registry = ws.build_tool_registry();
+        assert_eq!(
+            registry.get_tool("sandbox_deploy").unwrap().effect_class(),
+            crate::effects::EffectClass::Sandbox
+        );
+        assert_eq!(
+            registry
+                .get_tool("sandbox_teardown")
+                .unwrap()
+                .effect_class(),
+            crate::effects::EffectClass::Sandbox
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn build_tool_registry_for_reapplies_scoping_to_the_newly_registered_tools() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-scoped-sandbox"), "HEAD").unwrap();
+        ws.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        ws.set_sandbox_pr(7);
+        let mut identity = crate::identity::example();
+        identity.scope.tools = vec!["read_file".parse().unwrap()];
+        identity.scope.max_effect = crate::effects::EffectClass::Production;
+        let registry = ws.build_tool_registry_for(&identity).unwrap();
+        assert!(registry.get_tool("read_file").is_some());
+        assert!(registry.get_tool("sandbox_deploy").is_none());
+        assert!(registry.get_tool("ci_trigger").is_none());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cleanup_tears_down_a_forgotten_sandbox() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-forgotten-sandbox");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD").unwrap();
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn SandboxTarget>);
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        let handle = crate::sandbox_tools::SandboxHandle {
+            repo: "o/n".to_string(),
+            pr: 9,
+            url: "http://127.0.0.1:1".to_string(),
+            deployed_at: chrono::Utc::now() - chrono::Duration::minutes(2),
+            identity: Some("id".to_string()),
+        };
+        ws.sandboxes().insert(&task_id, handle.clone());
+        ws.cleanup().unwrap();
+        assert_eq!(target.torn_down(), vec![handle]);
+        assert!(ws.sandboxes().get(&task_id).is_none());
+        assert!(
+            accountant.task_summary(&task_id).sandbox.minutes >= 1.9,
+            "cleanup's safety net must record the sandbox's lifetime"
+        );
+    }
+
+    #[test]
+    fn cleanup_is_a_no_op_when_the_agent_already_tore_the_sandbox_down() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-clean-sandbox");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD").unwrap();
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn SandboxTarget>);
+        ws.cleanup().unwrap();
+        assert!(target.torn_down().is_empty());
+    }
+
+    #[test]
+    fn cleanup_warns_but_still_completes_when_sandbox_teardown_fails() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-failing-sandbox");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD").unwrap();
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        ws.sandboxes().insert(
+            &task_id,
+            crate::sandbox_tools::SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 1,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: chrono::Utc::now(),
+                identity: None,
+            },
+        );
+        target.fail_next_teardown();
+        ws.set_sandbox_target(target as Arc<dyn SandboxTarget>);
+        ws.cleanup().unwrap();
+        assert!(ws.sandboxes().get(&task_id).is_some());
+    }
+
+    #[test]
+    fn budget_summary_reflects_the_configured_accountant() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-budget");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD").unwrap();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        assert_eq!(ws.budget_summary(), BudgetReport::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(accountant.charge_count(
+            "id",
+            &task_id,
+            "o/n",
+            crate::budget::BudgetClass::Ci,
+            chrono::Utc::now(),
+        ))
+        .unwrap();
+        assert_eq!(ws.budget_summary().ci.count, 1);
         ws.cleanup().unwrap();
     }
 
