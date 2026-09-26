@@ -996,7 +996,9 @@ mod tests {
         assert_eq!(config.network, NetworkPolicy::Disabled);
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
-        assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
+        assert!(args
+            .iter()
+            .any(|a| a.ends_with(&format!(":{CONTAINER_WORKSPACE_DIR}:z"))));
         ws.cleanup().unwrap();
     }
 
