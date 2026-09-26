@@ -9,6 +9,7 @@ use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
+use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -111,6 +112,10 @@ pub struct TaskResult {
     pub action_audit: Vec<ActionAuditLogEntry>,
     pub iterations: usize,
     pub model_used: String,
+    /// Endpoint and browser QA the task's tools ran, empty when it ran none.
+    /// Defaulted so results recorded before this field existed still parse.
+    #[serde(default)]
+    pub qa_summary: QaSummary,
 }
 
 impl TaskResult {
@@ -142,6 +147,7 @@ impl TaskResult {
             "action_audit": self.action_audit,
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "qa_summary": self.qa_summary.to_json(),
         })
     }
 }
@@ -1062,6 +1068,7 @@ impl TaskRunner {
             Err(WorkspaceError::ProtectedPath(_)) => None,
             _ => workspace.format_patch().ok().flatten(),
         };
+        let qa_summary = workspace.qa_summary();
 
         let _ = workspace.cleanup();
 
@@ -1096,6 +1103,7 @@ impl TaskRunner {
                     action_audit,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    qa_summary,
                 };
                 self.set_status(
                     &task_id,
@@ -1361,6 +1369,7 @@ mod tests {
             action_audit: vec![],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1372,12 +1381,30 @@ mod tests {
         assert_eq!(json["denials"][0]["identity"], "rust-implementer");
         assert_eq!(json["denials"][0]["tool"], "write_file");
         assert_eq!(json["denials"][0]["reason"]["kind"], "tool_not_in_scope");
+        assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
+        assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
         let legacy: TaskResult = serde_json::from_value(serde_json::json!({
             "result_summary": "", "changes_patch": null, "format_patch": null,
             "files_modified": [], "tool_calls_made": [], "iterations": 0, "model_used": "m"
         }))
         .unwrap();
         assert_eq!(legacy.denial_count(), 0);
+    }
+
+    #[test]
+    fn test_task_result_qa_summary_defaults_when_absent_from_stored_json() {
+        let stored = serde_json::json!({
+            "result_summary": "Done",
+            "changes_patch": null,
+            "format_patch": null,
+            "files_modified": [],
+            "tool_calls_made": [],
+            "iterations": 1,
+            "model_used": "qwen3:0.6b",
+        });
+        let result: TaskResult = serde_json::from_value(stored).unwrap();
+        assert!(result.qa_summary.is_empty());
+        assert_eq!(result.qa_summary, QaSummary::default());
     }
 
     #[test]
@@ -1451,6 +1478,7 @@ mod tests {
             action_audit: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            qa_summary: QaSummary::default(),
         }
     }
 

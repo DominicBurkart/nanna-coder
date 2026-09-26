@@ -224,6 +224,7 @@ pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qa::QaSummary;
     use crate::task::{FailureDiagnostics, TaskId, TaskManager, TaskResult};
     use async_trait::async_trait;
     use chrono::Utc;
@@ -314,6 +315,7 @@ mod tests {
             action_audit: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
+            qa_summary: QaSummary::default(),
         }
     }
 

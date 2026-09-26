@@ -1,7 +1,9 @@
 pub mod action_auditor;
 pub mod agent;
+pub mod apprun;
 pub mod auditor;
 pub mod backlog;
+pub mod capabilities;
 pub mod container;
 pub mod deploy;
 pub mod effects;
@@ -18,15 +20,21 @@ pub mod onboarding;
 pub mod pod;
 pub mod pr_tools;
 pub mod protected;
+pub mod qa;
 pub mod rollout;
 pub mod scheduler;
 pub mod scope;
+pub mod sidecar;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
 pub mod windows;
 pub mod workspace;
 
+pub use capabilities::{
+    detect_capabilities, detect_capabilities_from_entries, detect_capability_locations,
+    find_capability, CargoCapability, SignalScope, CARGO_CAPABILITIES,
+};
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
@@ -53,15 +61,25 @@ pub use protected::{
     AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,
 };
 pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
+pub use sidecar::{
+    task_network_name, CommandRunner, PostgresSidecar, ReadinessConfig, RunOutput, RunningSidecar,
+    SidecarError, SidecarSet, SidecarSpec, SystemRunner, TaskNetwork, DATABASE_URL_VAR,
+    POSTGRES_ALIAS, POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_USER,
+};
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_container_tool_registry, create_container_tool_registry_for, create_tool_registry,
-    create_tool_registry_for, CalculatorTool, EchoTool, GitDiffTool, GitHubPrStatusTool,
-    GitHubStatus, GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool,
-    SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    cargo_audit_args, cargo_bench_args, cargo_build_args, cargo_check_args, cargo_deny_args,
+    cargo_run_args, cargo_test_args, create_container_tool_registry,
+    create_container_tool_registry_for, create_tool_registry, create_tool_registry_for,
+    member_working_dir, sqlx_migrate_args, trunk_build_args, CalculatorTool, CargoAuditTool,
+    CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool, CargoRunTool, CargoTestTool,
+    EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool,
+    PrStatusData, ReadFileTool, RunCommandTool, SearchTool, SqlxMigrateTool, Tool, ToolError,
+    ToolRegistry, ToolResult, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    SQLX_MIGRATE_COMMANDS,
 };
 
 // Export agent types

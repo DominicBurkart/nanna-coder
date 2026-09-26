@@ -1,0 +1,24 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "actix-web backend of the full-stack fixture"
+
+[[bin]]
+name = "api"
+path = "src/main.rs"
+
+[dependencies]
+actix-files = "0.6"
+actix-web = "4"
+serde = { workspace = true }
+shared = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

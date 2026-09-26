@@ -1,0 +1,13 @@
+[build]
+target = "index.html"
+dist = "dist"
+release = true
+
+[serve]
+port = 8000
+
+[[proxy]]
+backend = "http://127.0.0.1:8080/api/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8080/health/"

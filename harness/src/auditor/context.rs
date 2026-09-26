@@ -218,6 +218,7 @@ max_concurrent = 4
             ],
             nix_packages: vec!["pkg-config".to_string()],
             rust_version: Some("1.84.0".to_string()),
+            rust_targets: vec![],
             extra_env_vars: vec![],
         };
         let summary = AuditContext::summarize_profile(&profile);
@@ -234,6 +235,7 @@ max_concurrent = 4
             tools: vec![],
             nix_packages: vec![],
             rust_version: None,
+            rust_targets: vec![],
             extra_env_vars: vec![],
         };
         assert_eq!(

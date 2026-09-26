@@ -8,10 +8,19 @@
 //! - `ReadFileTool`: IO error on missing file; `start_line`-only (no `end_line`); line-number
 //!   prefix format in returned content
 //! - `TaskId`: `Display` / `fmt` implementation
+//! - Capability catalog: detection, uniqueness, registry gating
+//! - Arg builders: `cargo_deny_args`, `cargo_audit_args`
 
+use harness::capabilities::{detect_capabilities, find_capability, CARGO_CAPABILITIES};
+use harness::container::{ContainerHandle, ContainerRuntime};
 use harness::task::TaskId;
-use harness::tools::{CalculatorTool, ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool};
+use harness::tools::{
+    cargo_audit_args, cargo_deny_args, create_container_tool_registry, member_working_dir,
+    sqlx_migrate_args, trunk_build_args, CalculatorTool, ReadFileTool, SqlxMigrateTool, Tool,
+    ToolError, ToolRegistry, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+};
 use serde_json::json;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // CalculatorTool – missing arithmetic operations
@@ -256,4 +265,611 @@ fn task_id_new_display_is_non_empty() {
     assert!(!s.is_empty(), "TaskId display must not be empty");
     // UUID v4 is 36 chars (with hyphens)
     assert_eq!(s.len(), 36, "UUID v4 should be 36 chars, got: {s}");
+}
+
+// ---------------------------------------------------------------------------
+// Capability catalog – static correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capability_catalog_ids_are_unique() {
+    let mut ids: Vec<&str> = CARGO_CAPABILITIES.iter().map(|c| c.id).collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(before, ids.len(), "capability ids must be unique");
+}
+
+#[test]
+fn capability_catalog_entries_are_non_empty() {
+    for cap in CARGO_CAPABILITIES {
+        assert!(!cap.id.is_empty());
+        assert!(!cap.subcommand.is_empty());
+        assert!(!cap.description.is_empty());
+    }
+}
+
+#[test]
+fn capability_descriptions_contain_example_and_returns() {
+    for cap in CARGO_CAPABILITIES {
+        assert!(
+            cap.description.contains("Example"),
+            "capability '{}' description missing Example",
+            cap.id
+        );
+        assert!(
+            cap.description.contains("Returns"),
+            "capability '{}' description missing Returns",
+            cap.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability detection – filesystem signals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deny_tool_detected_when_deny_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("deny.toml"), "").unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        caps.iter().any(|c| c.id == "cargo_deny"),
+        "cargo_deny must be detected when deny.toml is present"
+    );
+}
+
+#[test]
+fn deny_tool_absent_without_deny_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        !caps.iter().any(|c| c.id == "cargo_deny"),
+        "cargo_deny must not be detected without deny.toml"
+    );
+}
+
+#[test]
+fn audit_tool_detected_when_audit_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("audit.toml"), "").unwrap();
+    let caps = detect_capabilities(dir.path());
+    assert!(
+        caps.iter().any(|c| c.id == "cargo_audit"),
+        "cargo_audit must be detected when audit.toml is present"
+    );
+}
+
+#[test]
+fn find_capability_cargo_deny_returns_correct_nix_pkg() {
+    let cap = find_capability("cargo_deny").expect("cargo_deny must exist");
+    assert_eq!(cap.nix_package, Some("pkgs.cargo-deny"));
+}
+
+// ---------------------------------------------------------------------------
+// Arg builders for new cargo tools
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cargo_deny_args_no_category() {
+    let args = cargo_deny_args(None);
+    assert_eq!(args, vec!["cargo", "deny", "check"]);
+}
+
+#[test]
+fn cargo_deny_args_with_category() {
+    let args = cargo_deny_args(Some("advisories"));
+    assert_eq!(args, vec!["cargo", "deny", "check", "advisories"]);
+}
+
+#[test]
+fn cargo_audit_args_baseline() {
+    let args = cargo_audit_args();
+    assert_eq!(args, vec!["cargo", "audit"]);
+}
+
+// ---------------------------------------------------------------------------
+// Registry gating – signal-based tool registration
+// ---------------------------------------------------------------------------
+
+fn test_container_handle() -> Arc<ContainerHandle> {
+    Arc::new(ContainerHandle {
+        name: "test-container".to_string(),
+        runtime: ContainerRuntime::None,
+        port: None,
+        needs_cleanup: false,
+    })
+}
+
+fn stub_container_handle() -> Arc<ContainerHandle> {
+    Arc::new(ContainerHandle {
+        name: "stub-container".to_string(),
+        runtime: ContainerRuntime::Stub,
+        port: None,
+        needs_cleanup: false,
+    })
+}
+
+#[test]
+fn cargo_deny_registered_when_deny_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(dir.path().join("deny.toml"), "").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_deny").is_some(),
+        "cargo_deny tool must be registered when deny.toml is present"
+    );
+}
+
+#[test]
+fn cargo_deny_absent_without_deny_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_deny").is_none(),
+        "cargo_deny tool must not be registered without deny.toml"
+    );
+}
+
+#[test]
+fn cargo_audit_registered_when_audit_toml_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    std::fs::write(dir.path().join("audit.toml"), "").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_audit").is_some(),
+        "cargo_audit tool must be registered when audit.toml is present"
+    );
+}
+
+#[test]
+fn cargo_audit_absent_without_audit_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(
+        registry.get_tool("cargo_audit").is_none(),
+        "cargo_audit tool must not be registered without audit.toml"
+    );
+}
+
+#[test]
+fn no_cargo_tools_registered_without_cargo_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    for tool_name in &[
+        "cargo_build",
+        "cargo_test",
+        "cargo_check",
+        "cargo_bench",
+        "cargo_run",
+        "cargo_deny",
+        "cargo_audit",
+    ] {
+        assert!(
+            registry.get_tool(tool_name).is_none(),
+            "{tool_name} must not be registered without Cargo.toml"
+        );
+    }
+}
+
+#[test]
+fn core_cargo_tools_always_registered_with_cargo_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    for tool_name in &[
+        "cargo_build",
+        "cargo_test",
+        "cargo_check",
+        "cargo_bench",
+        "cargo_run",
+    ] {
+        assert!(
+            registry.get_tool(tool_name).is_some(),
+            "{tool_name} must be registered when Cargo.toml is present"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cargo_deny_tool_definition_name_matches_execute_name() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    assert_eq!(tool.name(), tool.definition().function.name);
+}
+
+#[tokio::test]
+async fn cargo_audit_tool_definition_name_matches_execute_name() {
+    use harness::tools::CargoAuditTool;
+    let handle = test_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    assert_eq!(tool.name(), tool.definition().function.name);
+}
+
+// ---------------------------------------------------------------------------
+// Execute error paths — cover arg-parsing and map_err lines without a container
+//
+// ContainerRuntime::None makes exec_in_container return NoRuntimeAvailable,
+// so every execute body up to and including the `?` operator is exercised.
+// The Ok(json!{...}) success branch is covered by the #[ignore] container
+// integration tests in dev_container_integration.rs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cargo_build_execute_error_path_covered() {
+    use harness::tools::CargoBuildTool;
+    let handle = test_container_handle();
+    let tool = CargoBuildTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"package": "harness", "release": "true"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_test_execute_error_path_covered() {
+    use harness::tools::CargoTestTool;
+    let handle = test_container_handle();
+    let tool = CargoTestTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"package": "harness", "test_filter": "my_test"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_check_execute_error_path_covered() {
+    use harness::tools::CargoCheckTool;
+    let handle = test_container_handle();
+    let tool = CargoCheckTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_bench_execute_error_path_covered() {
+    use harness::tools::CargoBenchTool;
+    let handle = test_container_handle();
+    let tool = CargoBenchTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"bench_filter": "bench_foo"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_run_execute_error_path_covered() {
+    use harness::tools::CargoRunTool;
+    let handle = test_container_handle();
+    let tool = CargoRunTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"bin": "harness", "args": "--help"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_error_path_covered() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"check": "advisories"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_audit_execute_error_path_covered() {
+    use harness::tools::CargoAuditTool;
+    let handle = test_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_no_check_arg_error_path() {
+    use harness::tools::CargoDenyTool;
+    let handle = test_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Success path coverage — ContainerRuntime::Stub bypasses exec and returns an
+// empty Ok result so the Ok(json!{...}) branch in each tool's execute() is hit.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cargo_build_execute_success_path_covered() {
+    use harness::tools::CargoBuildTool;
+    let handle = stub_container_handle();
+    let tool = CargoBuildTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"package": "harness", "release": "true"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_test_execute_success_path_covered() {
+    use harness::tools::CargoTestTool;
+    let handle = stub_container_handle();
+    let tool = CargoTestTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"test_filter": "my_test"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_check_execute_success_path_covered() {
+    use harness::tools::CargoCheckTool;
+    let handle = stub_container_handle();
+    let tool = CargoCheckTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_bench_execute_success_path_covered() {
+    use harness::tools::CargoBenchTool;
+    let handle = stub_container_handle();
+    let tool = CargoBenchTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"bench_filter": "bench_foo"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_run_execute_success_path_covered() {
+    use harness::tools::CargoRunTool;
+    let handle = stub_container_handle();
+    let tool = CargoRunTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"bin": "nanna", "args": "--help"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn cargo_deny_execute_success_path_covered() {
+    use harness::tools::CargoDenyTool;
+    let handle = stub_container_handle();
+    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"check": "advisories"}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+    assert!(result.get("command").is_some());
+    assert_eq!(
+        result["command"].as_str().unwrap(),
+        "cargo deny check advisories"
+    );
+}
+
+#[tokio::test]
+async fn cargo_audit_execute_success_path_covered() {
+    use harness::tools::CargoAuditTool;
+    let handle = stub_container_handle();
+    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+    assert!(result.get("command").is_some());
+    assert_eq!(result["command"].as_str().unwrap(), "cargo audit");
+}
+
+// ---------------------------------------------------------------------------
+// trunk_build and sqlx_migrate – arg builders, gating, error and success paths
+// ---------------------------------------------------------------------------
+
+fn full_stack_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"api\", \"ui\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ui")).unwrap();
+    std::fs::write(dir.path().join("ui/Trunk.toml"), "").unwrap();
+    std::fs::create_dir_all(dir.path().join("api/migrations")).unwrap();
+    dir
+}
+
+#[test]
+fn trunk_build_args_toggle_release() {
+    assert_eq!(trunk_build_args(false), vec!["trunk", "build"]);
+    assert_eq!(trunk_build_args(true), vec!["trunk", "build", "--release"]);
+}
+
+#[test]
+fn sqlx_migrate_args_use_given_command() {
+    assert_eq!(sqlx_migrate_args("info"), vec!["sqlx", "migrate", "info"]);
+}
+
+#[test]
+fn member_working_dir_joins_relative_member_paths() {
+    assert_eq!(
+        member_working_dir("/workspace", std::path::Path::new("")),
+        "/workspace"
+    );
+    assert_eq!(
+        member_working_dir("/workspace", std::path::Path::new("ui")),
+        "/workspace/ui"
+    );
+}
+
+#[test]
+fn trunk_build_and_sqlx_migrate_registered_for_full_stack_workspace() {
+    let dir = full_stack_workspace();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(registry.get_tool("trunk_build").is_some());
+    assert!(registry.get_tool("sqlx_migrate").is_some());
+}
+
+#[test]
+fn trunk_build_and_sqlx_migrate_absent_without_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(registry.get_tool("trunk_build").is_none());
+    assert!(registry.get_tool("sqlx_migrate").is_none());
+}
+
+#[tokio::test]
+async fn trunk_build_definition_matches_name_and_catalog() {
+    let tool = TrunkBuildTool::new(test_container_handle(), None);
+    let def = tool.definition();
+    assert_eq!(tool.name(), def.function.name);
+    assert!(def.function.description.contains("frontend"));
+    assert!(def.function.description.contains("Returns"));
+}
+
+#[tokio::test]
+async fn sqlx_migrate_definition_matches_name_and_catalog() {
+    let tool = SqlxMigrateTool::new(test_container_handle(), None);
+    let def = tool.definition();
+    assert_eq!(tool.name(), def.function.name);
+    assert!(def.function.description.contains("DATABASE_URL"));
+    assert!(def.function.description.contains("Returns"));
+}
+
+#[tokio::test]
+async fn trunk_build_execute_error_path_covered() {
+    let tool = TrunkBuildTool::new(test_container_handle(), Some("/workspace/ui".to_string()));
+    let err = tool
+        .execute(json!({"release": "true"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn trunk_build_execute_success_path_runs_in_member_dir() {
+    let dir = full_stack_workspace();
+    let registry = create_container_tool_registry(
+        dir.path(),
+        stub_container_handle(),
+        CONTAINER_WORKSPACE_DIR,
+    );
+    let result = registry
+        .execute("trunk_build", json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert_eq!(result["command"], "trunk build");
+    assert_eq!(result["working_dir"], "/workspace/ui");
+    assert!(result.get("stdout").is_some());
+    assert!(result.get("stderr").is_some());
+    assert!(result.get("success").is_some());
+}
+
+#[tokio::test]
+async fn trunk_build_release_flag_is_forwarded() {
+    let tool = TrunkBuildTool::new(stub_container_handle(), None);
+    let result = tool.execute(json!({"release": "true"})).await.unwrap();
+    assert_eq!(result["command"], "trunk build --release");
+    assert!(result["working_dir"].is_null());
+}
+
+#[tokio::test]
+async fn sqlx_migrate_execute_error_path_covered() {
+    let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn sqlx_migrate_rejects_unknown_command() {
+    let tool = SqlxMigrateTool::new(stub_container_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"command": "drop"}))
+        .await
+        .expect_err("unknown command must be rejected before execution");
+    match err {
+        ToolError::InvalidArguments { message } => {
+            assert!(message.contains("drop"), "{message}");
+            assert!(message.contains("run, info, revert"), "{message}");
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
+    let dir = full_stack_workspace();
+    let registry = create_container_tool_registry(
+        dir.path(),
+        stub_container_handle(),
+        CONTAINER_WORKSPACE_DIR,
+    );
+    let result = registry
+        .execute("sqlx_migrate", json!({}))
+        .await
+        .expect("execute must succeed with Stub runtime");
+    assert_eq!(result["command"], "sqlx migrate run");
+    assert_eq!(result["working_dir"], "/workspace/api");
+    let info = registry
+        .execute("sqlx_migrate", json!({"command": "info"}))
+        .await
+        .unwrap();
+    assert_eq!(info["command"], "sqlx migrate info");
 }
