@@ -64,6 +64,7 @@ jobs:
           PROTECTED_PATTERNS=(
             ".nanna/**"
             "**/.nanna/**"
+            ".git/**"
             ".github/workflows/**"
             ".github/CODEOWNERS"
             "codecov.yml"
