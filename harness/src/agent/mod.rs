@@ -23,8 +23,10 @@ pub mod report;
 
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
+use crate::effects::EffectRecord;
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
+use crate::scope::ScopeDenial;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -229,9 +231,16 @@ pub struct AgentRunResult {
     /// Aggregated token usage across all LLM calls. `None` when the
     /// entity-based loop ran without an LLM provider.
     pub token_usage: Option<Usage>,
+    /// Every call the tool registry refused under its identity scope, in
+    /// order. Empty when the run was not scoped.
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
 }
 
-fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecord> {
+fn extract_tool_calls_from_history(
+    history: &[ChatMessage],
+    registry: Option<&ToolRegistry>,
+) -> Vec<ToolCallRecord> {
     use std::collections::HashMap;
 
     let mut call_args: HashMap<String, (String, serde_json::Value)> = HashMap::new();
@@ -259,11 +268,15 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<ToolCallRecor
         .into_iter()
         .map(|(call_id, (tool_name, arguments))| {
             let result = call_results.get(&call_id).cloned().unwrap_or_default();
+            let effect = registry
+                .and_then(|r| r.effect_class_of(&tool_name))
+                .map(EffectRecord::new);
             ToolCallRecord {
                 tool_name,
                 arguments,
                 call_id,
                 result,
+                effect,
             }
         })
         .collect()
@@ -387,8 +400,19 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         &self.state_history
     }
 
+    fn tool_call_records(&self, history: &[ChatMessage]) -> Vec<ToolCallRecord> {
+        extract_tool_calls_from_history(history, self.tool_registry.as_ref())
+    }
+
+    fn scope_denials(&self) -> Vec<ScopeDenial> {
+        self.tool_registry
+            .as_ref()
+            .map(ToolRegistry::denials)
+            .unwrap_or_default()
+    }
+
     fn enrich_error(&self, error: AgentError) -> AgentError {
-        let tool_calls = extract_tool_calls_from_history(&self.conversation_history);
+        let tool_calls = self.tool_call_records(&self.conversation_history);
         let conversation = self.conversation_history.clone();
         let state = self.state.clone();
         let iterations = self.iterations;
@@ -459,7 +483,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             if self.state == AgentState::Completed {
                 let task_description = context.user_prompt.clone();
                 let conversation = self.conversation_history.clone();
-                let tool_calls_made = extract_tool_calls_from_history(&conversation);
+                let tool_calls_made = self.tool_call_records(&conversation);
                 let result_summary = extract_result_summary(&conversation);
                 let model_used = self.config.model_name.clone();
                 let entity = ContextEntity::new(
@@ -472,6 +496,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 if let Err(e) = self.entity_store.store(Box::new(entity)).await {
                     tracing::warn!("Failed to store context entity: {}", e);
                 }
+                let denials = self.scope_denials();
                 return Ok(AgentRunResult {
                     final_state: self.state.clone(),
                     iterations: self.iterations,
@@ -480,6 +505,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     tool_calls_made,
                     conversation_snapshot: conversation,
                     token_usage: None,
+                    denials,
                 });
             }
 
@@ -1034,7 +1060,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.state = AgentState::Completed;
         let task_description = context.user_prompt.clone();
         let conversation = self.conversation_history.clone();
-        let tool_calls_made = extract_tool_calls_from_history(&conversation);
+        let tool_calls_made = self.tool_call_records(&conversation);
         let result_summary = extract_result_summary(&conversation);
         let model_used = self.config.model_name.clone();
         let entity = ContextEntity::new(
@@ -1047,6 +1073,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         if let Err(e) = self.entity_store.store(Box::new(entity)).await {
             tracing::warn!("Failed to store context entity: {}", e);
         }
+        let denials = self.scope_denials();
         AgentRunResult {
             final_state: AgentState::Completed,
             iterations: self.iterations,
@@ -1055,6 +1082,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             tool_calls_made,
             conversation_snapshot: conversation,
             token_usage: Some(total_usage),
+            denials,
         }
     }
 
@@ -1268,6 +1296,95 @@ mod tests {
                                           // UpdatingEntities: no LLM call
         responses.push(plain_response("COMPLETE - task done")); // CheckingTaskCompletion
         responses
+    }
+
+    fn scoped_write_registry(root: &std::path::Path) -> ToolRegistry {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = crate::effects::EffectClass::Workspace;
+        identity.scope.tools = vec!["write_file".parse().unwrap()];
+        crate::tools::create_tool_registry_for(root, &identity).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_reports_scope_denials_to_the_model_and_in_the_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "Cargo.toml", "content": "x"}),
+            ),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            plain_response("Gave up."),
+        ]);
+        let config = AgentConfig {
+            max_iterations: 5,
+            ..Default::default()
+        };
+        let registry = scoped_write_registry(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "edit the manifest".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+
+        assert_eq!(result.denials.len(), 2);
+        assert_eq!(result.denials[0].identity, "rust-implementer");
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(result.denials[1].tool, "github_pr_status");
+        assert!(!workspace.path().join("Cargo.toml").exists());
+        let tool_replies: Vec<&str> = agent
+            .conversation_history()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(tool_replies.len(), 2);
+        assert!(
+            tool_replies[0]
+                .contains("Scope denial: identity `rust-implementer` may not call `write_file`"),
+            "{}",
+            tool_replies[0]
+        );
+        assert!(
+            tool_replies[1].contains("tool is not in scope"),
+            "{}",
+            tool_replies[1]
+        );
+        assert_eq!(agent.tool_registry().unwrap().denial_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_run_carries_scope_denials() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "docs/x.md", "content": "x"}),
+            ),
+            plain_response("Done."),
+        ]));
+        let config = AgentConfig {
+            max_iterations: 20,
+            ..Default::default()
+        };
+        let registry = scoped_write_registry(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "write docs".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "write_file");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["denials"][0]["reason"]["kind"], "path_outside_scope");
     }
 
     #[test]
@@ -2162,7 +2279,7 @@ mod tests {
             ChatMessage::assistant("done"),
         ];
 
-        let mut records = extract_tool_calls_from_history(&history);
+        let mut records = extract_tool_calls_from_history(&history, None);
         records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
 
         assert_eq!(records.len(), 2);
@@ -2184,7 +2301,7 @@ mod tests {
             // No tool response for "orphan".
         ];
 
-        let records = extract_tool_calls_from_history(&history);
+        let records = extract_tool_calls_from_history(&history, None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].call_id, "orphan");
         assert_eq!(records[0].result, "");
@@ -2201,7 +2318,44 @@ mod tests {
             ChatMessage::assistant("ok"),
         ];
 
-        assert!(extract_tool_calls_from_history(&history).is_empty());
+        assert!(extract_tool_calls_from_history(&history, None).is_empty());
+    }
+
+    /// With a registry attached, each record carries the effect class the
+    /// tool declares; calls to unregistered tools (which never executed)
+    /// carry no attribution at all.
+    #[test]
+    fn extract_tool_calls_attributes_effects_from_registry() {
+        use crate::effects::EffectClass;
+        use crate::tools::{CalculatorTool, WriteFileTool};
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CalculatorTool::new()));
+        registry.register(Box::new(WriteFileTool::new(std::path::PathBuf::from("."))));
+        let history = vec![
+            assistant_tool_calls(vec![
+                ("call_a", "calculate", serde_json::json!({"x": 2})),
+                ("call_b", "write_file", serde_json::json!({"path": "f"})),
+                ("call_c", "unregistered", serde_json::json!({})),
+            ]),
+            ChatMessage::tool_response("call_a", "4"),
+        ];
+
+        let mut records = extract_tool_calls_from_history(&history, Some(&registry));
+        records.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+
+        assert_eq!(
+            records[0].effect,
+            Some(EffectRecord::new(EffectClass::None))
+        );
+        assert_eq!(
+            records[1].effect,
+            Some(EffectRecord::new(EffectClass::Workspace))
+        );
+        assert_eq!(records[2].effect, None);
+
+        let without_registry = extract_tool_calls_from_history(&history, None);
+        assert!(without_registry.iter().all(|r| r.effect.is_none()));
     }
 
     /// `extract_result_summary` returns the most recent assistant message

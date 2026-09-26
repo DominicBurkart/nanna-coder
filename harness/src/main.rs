@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::identity::IdentityCatalog;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
@@ -44,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Inspect the agent identity catalog
+    Agents {
+        #[command(subcommand)]
+        action: AgentsAction,
+    },
     /// Health check
     Health {
         /// Skip the on-startup pod-ensure check
@@ -175,6 +181,20 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum AgentsAction {
+    /// List identities in the catalog (name, loop, model, max_effect)
+    List {
+        /// Catalog directory. Defaults to $NANNA_CONFIG_DIR/agents,
+        /// $XDG_CONFIG_HOME/nanna/agents or ~/.config/nanna/agents.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Repository whose .nanna/agents/ overrides are layered on top.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum EscalationAction {
     /// Clear the incident hold set by an `incident` escalation so
     /// production-class work for its repository can resume
@@ -241,6 +261,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let workspace_root = std::env::current_dir()?;
             let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
+        }
+        Commands::Agents {
+            action: AgentsAction::List { dir, repo },
+        } => {
+            let catalog = match dir {
+                Some(dir) => IdentityCatalog::load(dir),
+                None => IdentityCatalog::load_default(),
+            };
+            let catalog = match repo {
+                Some(repo) => catalog.and_then(|catalog| catalog.with_repo_overrides(repo)),
+                None => catalog,
+            };
+            print!("{}", catalog.map_err(|e| e.to_string())?.render_table());
         }
         Commands::Health { no_ensure_pod } => {
             ensure_pod_or_exit(no_ensure_pod).await;
@@ -662,7 +695,12 @@ fn list_tools(tool_registry: &ToolRegistry) {
         for tool_name in tools {
             if let Some(tool) = tool_registry.get_tool(tool_name) {
                 let def = tool.definition();
-                println!("  - {}: {}", def.function.name, def.function.description);
+                println!(
+                    "  - {} [{}]: {}",
+                    def.function.name,
+                    tool.effect_class(),
+                    def.function.description
+                );
             }
         }
     }

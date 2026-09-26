@@ -1,0 +1,17 @@
+[identity]
+name = "rust-implementer"
+description = "Implements a scoped issue in the api crate only."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "This repository keeps all business logic under api/. Never edit shared/." }
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = ["api/**"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "search", "cargo_*"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 2

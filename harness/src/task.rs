@@ -1,13 +1,20 @@
-use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
+use crate::auditor::Allowed;
+use crate::container::NetworkPolicy;
+use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
+use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
 };
+use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
+use crate::workspace::WorkspaceError;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
 use model::types::ChatMessage;
@@ -93,11 +100,30 @@ pub struct TaskResult {
     pub format_patch: Option<String>,
     pub files_modified: Vec<String>,
     pub tool_calls_made: Vec<ToolCallRecord>,
+    /// Every call the identity scope refused during the run, in order.
+    /// Empty when the task ran without an identity.
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
 }
 
 impl TaskResult {
+    /// Number of refused calls; repeated denials are the auditor's signal
+    /// that the identity lacks a capability the task needs.
+    pub fn denial_count(&self) -> usize {
+        self.denials.len()
+    }
+
+    /// The widest blast radius any attributed tool call in this result
+    /// reached, or `None` when no call carried an effect attribution.
+    pub fn max_effect_class(&self) -> Option<EffectClass> {
+        self.tool_calls_made
+            .iter()
+            .filter_map(|call| call.effect.as_ref().map(|effect| effect.class))
+            .max()
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "result_summary": self.result_summary,
@@ -105,6 +131,9 @@ impl TaskResult {
             "format_patch": self.format_patch,
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
+            "max_effect_class": self.max_effect_class(),
+            "denials": self.denials,
+            "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
         })
@@ -120,6 +149,8 @@ pub struct FailureDiagnostics {
     pub tool_call_history: Vec<ToolCallRecord>,
     pub last_agent_state: Option<String>,
     pub conversation_snapshot: Option<Vec<ChatMessage>>,
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
 }
 
 impl FailureDiagnostics {
@@ -132,8 +163,40 @@ impl FailureDiagnostics {
             "tool_call_history": self.tool_call_history,
             "last_agent_state": self.last_agent_state,
             "conversation_snapshot": self.conversation_snapshot,
+            "denials": self.denials,
         })
     }
+}
+
+fn protected_failure(
+    violation: ProtectedPathViolation,
+    identity: Option<&str>,
+    run_result: &Result<AgentRunResult, AgentError>,
+) -> (String, FailureDiagnostics) {
+    let (iterations_completed, tool_call_history, mut denials) = match run_result {
+        Ok(result) => (
+            result.iterations,
+            result.tool_calls_made.clone(),
+            result.denials.clone(),
+        ),
+        Err(e) => (e.diagnostics().2, e.diagnostics().0.to_vec(), vec![]),
+    };
+    let mut denial = ScopeDenial::protected("extract_changes", &violation);
+    if let Some(identity) = identity {
+        denial.identity = identity.to_string();
+    }
+    denials.push(denial);
+    let diagnostics = FailureDiagnostics {
+        error_type: "ProtectedPathViolation".to_string(),
+        iterations_completed,
+        last_tool_call: tool_call_history.last().cloned(),
+        partial_changes: None,
+        tool_call_history,
+        last_agent_state: None,
+        conversation_snapshot: None,
+        denials,
+    };
+    (violation.to_string(), diagnostics)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +294,8 @@ struct TaskRunner {
     default_provider: Option<Arc<dyn ModelProvider>>,
     /// Coordination leases; a task's leases are released when it ends.
     leases: Arc<dyn LeaseStore>,
+    identities: RwLock<HashMap<TaskId, AgentIdentity>>,
+    audit: std::sync::RwLock<Arc<dyn AuditHook>>,
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -287,7 +352,7 @@ impl TaskManager {
     ) -> Result<Self, QueueStoreError> {
         let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
         for queued in manager.dispatcher.queued().await {
-            manager.runner.register(&queued, None).await;
+            manager.runner.register(&queued, None, None).await;
             manager.runner.recover_leases(&queued.id)?;
         }
         let reclaimed = manager.runner.leases.expired(Utc::now()).map_err(reject)?;
@@ -314,6 +379,8 @@ impl TaskManager {
             providers: RwLock::new(HashMap::new()),
             default_provider,
             leases,
+            identities: RwLock::new(HashMap::new()),
+            audit: std::sync::RwLock::new(Arc::new(NoopAuditHook)),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -329,6 +396,12 @@ impl TaskManager {
     /// instead of the in-memory default.
     pub fn with_escalations(mut self, escalations: Arc<EscalationLog>) -> Self {
         self.escalations = escalations;
+        self
+    }
+
+    /// Deliver protected-path violations from every task's workspace to `hook`.
+    pub fn with_audit_hook(self, hook: Arc<dyn AuditHook>) -> Self {
+        *self.runner.audit.write().unwrap() = hook;
         self
     }
 
@@ -472,8 +545,76 @@ impl TaskManager {
         queued: QueuedTask,
         provider: Arc<dyn ModelProvider>,
     ) -> TaskId {
+        self.submit_task_with_identity(queued, provider, None).await
+    }
+
+    /// Submit a spawn the planner obtained an [`Allowed`] proof for.
+    ///
+    /// The only entry point a planner (#640) may use: `allowed` can only
+    /// have been produced by [`crate::auditor::Gate::check`], so a spawn
+    /// that an [`Auditor`](crate::auditor::Auditor) blocked or escalated can
+    /// never reach this function. `allowed` carries both the audited
+    /// request and the exact identity it was audited against, so this
+    /// always runs under that identity's scope, exactly as
+    /// [`TaskManager::submit_with_identity`] runs an explicit identity; the
+    /// subtask text becomes the task description.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_spawn(
+        &self,
+        allowed: Allowed,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TaskId {
+        let (request, identity) = allowed.into_parts();
+        self.submit_with_identity(
+            request.subtask,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            provider,
+            Some(identity),
+        )
+        .await
+    }
+
+    /// Submit a task that, when `identity` is present, runs under that
+    /// identity's scope: the tool registry is
+    /// [`TaskWorkspace::build_tool_registry_for`] the identity and a dev
+    /// container gets [`NetworkPolicy::for_ceiling`] of its
+    /// `scope.max_effect`. Without an identity this is exactly
+    /// [`TaskManager::submit`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_with_identity(
+        &self,
+        description: String,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+        identity: Option<AgentIdentity>,
+    ) -> TaskId {
+        let identity_hint = identity.as_ref().map(|i| i.name().to_string());
+        let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
+            .with_identity_hint(identity_hint);
+        self.submit_task_with_identity(queued, provider, identity)
+            .await
+    }
+
+    async fn submit_task_with_identity(
+        &self,
+        queued: QueuedTask,
+        provider: Arc<dyn ModelProvider>,
+        identity: Option<AgentIdentity>,
+    ) -> TaskId {
         let task_id = queued.id.clone();
-        self.runner.register(&queued, Some(provider)).await;
+        self.runner
+            .register(&queued, Some(provider), identity)
+            .await;
         if let Err(e) = self.dispatcher.enqueue(queued).await {
             self.runner
                 .fail(&task_id, e.to_string(), "QueuePersistFailed")
@@ -626,7 +767,12 @@ impl Launcher for Arc<TaskRunner> {
 impl TaskRunner {
     /// Record a queued entry as a `Pending` task and open its status watch.
     /// The receiver is retained as a keep-alive (see `StatusSenders`).
-    async fn register(&self, queued: &QueuedTask, provider: Option<Arc<dyn ModelProvider>>) {
+    async fn register(
+        &self,
+        queued: &QueuedTask,
+        provider: Option<Arc<dyn ModelProvider>>,
+        identity: Option<AgentIdentity>,
+    ) {
         let task = Task {
             id: queued.id.clone(),
             description: queued.description.clone(),
@@ -653,6 +799,16 @@ impl TaskRunner {
                 .await
                 .insert(queued.id.clone(), provider);
         }
+        if let Some(identity) = identity {
+            self.identities
+                .write()
+                .await
+                .insert(queued.id.clone(), identity);
+        }
+    }
+
+    fn audit_hook(&self) -> Arc<dyn AuditHook> {
+        Arc::clone(&self.audit.read().unwrap())
     }
 
     /// Transition a task to a new status: update the stored `Task` (status +
@@ -715,6 +871,7 @@ impl TaskRunner {
                     tool_call_history: vec![],
                     last_agent_state: None,
                     conversation_snapshot: None,
+                    denials: vec![],
                 },
             },
         )
@@ -738,6 +895,7 @@ impl TaskRunner {
             .await;
             return;
         };
+        let identity = self.identities.write().await.remove(&task_id);
         tracing::info!(
             task_id = %task_id,
             side = side.label(),
@@ -783,11 +941,13 @@ impl TaskRunner {
                     return;
                 }
             };
-            TaskWorkspace::create_with_container(
+            let network = network_policy_for(identity.as_ref());
+            TaskWorkspace::create_with_container_networked(
                 &queued.repo_path,
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
+                network,
             )
             .await
             .map_err(|e| e.to_string())
@@ -795,6 +955,7 @@ impl TaskRunner {
             TaskWorkspace::create(&queued.repo_path, &task_id.0, &queued.branch)
                 .map_err(|e| e.to_string())
         };
+        let workspace_result = workspace_result.map(|ws| ws.with_audit_hook(self.audit_hook()));
 
         let mut workspace = match workspace_result {
             Ok(workspace) => workspace,
@@ -804,7 +965,14 @@ impl TaskRunner {
             }
         };
 
-        let tool_registry = workspace.build_tool_registry();
+        let tool_registry = match registry_for(&workspace, identity.as_ref()) {
+            Ok(registry) => registry,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e.to_string(), "ScopeError").await;
+                return;
+            }
+        };
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -822,13 +990,32 @@ impl TaskRunner {
         agent.set_progress_counter(Arc::clone(&progress_counter));
         let run_result = agent.run(context).await;
 
-        let changes_patch = workspace.extract_changes().ok().and_then(bound_patch);
+        let extracted = workspace.extract_changes();
+        let changes_patch = extracted.as_ref().ok().cloned().and_then(bound_patch);
 
-        let format_patch = workspace.format_patch().ok().flatten();
+        let format_patch = match &extracted {
+            Err(WorkspaceError::ProtectedPath(_)) => None,
+            _ => workspace.format_patch().ok().flatten(),
+        };
 
         let _ = workspace.cleanup();
 
         self.progress.write().await.remove(&task_id);
+
+        if let Err(WorkspaceError::ProtectedPath(violation)) = extracted {
+            let name = identity.as_ref().map(|i| i.name());
+            let (error, diagnostics) = protected_failure(violation, name, &run_result);
+            self.set_status(
+                &task_id,
+                TaskStatus::Failed {
+                    finished_at: Utc::now(),
+                    error,
+                    diagnostics,
+                },
+            )
+            .await;
+            return;
+        }
 
         match run_result {
             Ok(result) => {
@@ -839,6 +1026,7 @@ impl TaskRunner {
                     format_patch,
                     files_modified,
                     tool_calls_made: result.tool_calls_made,
+                    denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
                 };
@@ -867,6 +1055,7 @@ impl TaskRunner {
                     tool_call_history,
                     last_agent_state,
                     conversation_snapshot: Some(conversation_snapshot),
+                    denials: vec![],
                 };
                 self.set_status(
                     &task_id,
@@ -906,6 +1095,25 @@ fn bound_patch(patch: String) -> Option<String> {
     }
 }
 
+/// The network policy a task's dev container gets: the identity's ceiling
+/// when running under one, otherwise the runtime default.
+fn network_policy_for(identity: Option<&AgentIdentity>) -> NetworkPolicy {
+    match identity {
+        Some(identity) => NetworkPolicy::for_ceiling(identity.scope.max_effect),
+        None => NetworkPolicy::Enabled,
+    }
+}
+
+fn registry_for(
+    workspace: &TaskWorkspace,
+    identity: Option<&AgentIdentity>,
+) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
+    match identity {
+        Some(identity) => workspace.build_tool_registry_for(identity),
+        None => Ok(workspace.build_tool_registry()),
+    }
+}
+
 fn parse_modified_files(diff: Option<&str>) -> Vec<String> {
     let Some(diff) = diff else {
         return vec![];
@@ -929,14 +1137,25 @@ mod tests {
     };
     use std::sync::Mutex;
 
+    type ChatHook = Box<dyn Fn() + Send + Sync>;
+
     pub(super) struct MockProvider {
         responses: Mutex<Vec<ChatResponse>>,
+        on_chat: Option<ChatHook>,
     }
 
     impl MockProvider {
         pub(super) fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses),
+                on_chat: None,
+            })
+        }
+
+        fn with_hook(responses: Vec<ChatResponse>, on_chat: ChatHook) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses),
+                on_chat: Some(on_chat),
             })
         }
     }
@@ -944,6 +1163,9 @@ mod tests {
     #[async_trait]
     impl ModelProvider for MockProvider {
         async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            if let Some(hook) = &self.on_chat {
+                hook();
+            }
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Err(ModelError::Unknown {
@@ -963,6 +1185,28 @@ mod tests {
 
         fn provider_name(&self) -> &'static str {
             "mock"
+        }
+    }
+
+    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+        use model::types::{FunctionCall, ToolCall};
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function: FunctionCall {
+                            name: tool_name.to_string(),
+                            arguments: args,
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
         }
     }
 
@@ -1008,14 +1252,30 @@ mod tests {
             format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
             files_modified: vec!["foo.rs".to_string()],
             tool_calls_made: vec![],
+            denials: vec![crate::scope::ScopeDenial {
+                identity: "rust-implementer".to_string(),
+                tool: "write_file".to_string(),
+                reason: crate::scope::DenialReason::ToolNotInScope,
+            }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
         };
+        assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
         assert_eq!(json["result_summary"], "Done");
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["denial_count"], 1);
+        assert_eq!(json["denials"][0]["identity"], "rust-implementer");
+        assert_eq!(json["denials"][0]["tool"], "write_file");
+        assert_eq!(json["denials"][0]["reason"]["kind"], "tool_not_in_scope");
+        let legacy: TaskResult = serde_json::from_value(serde_json::json!({
+            "result_summary": "", "changes_patch": null, "format_patch": null,
+            "files_modified": [], "tool_calls_made": [], "iterations": 0, "model_used": "m"
+        }))
+        .unwrap();
+        assert_eq!(legacy.denial_count(), 0);
     }
 
     #[test]
@@ -1028,6 +1288,7 @@ mod tests {
             tool_call_history: vec![],
             last_agent_state: None,
             conversation_snapshot: None,
+            denials: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "MaxIterationsExceeded");
@@ -1043,6 +1304,7 @@ mod tests {
             arguments: serde_json::json!({"path": "src/main.rs"}),
             call_id: "call_1".to_string(),
             result: "fn main() {}".to_string(),
+            effect: Some(crate::effects::EffectRecord::new(EffectClass::None)),
         };
         let diag = FailureDiagnostics {
             error_type: "StateError".to_string(),
@@ -1052,6 +1314,7 @@ mod tests {
             tool_call_history: vec![tool_call],
             last_agent_state: Some("Performing".to_string()),
             conversation_snapshot: Some(vec![ChatMessage::user("do something")]),
+            denials: vec![],
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "StateError");
@@ -1060,6 +1323,54 @@ mod tests {
         assert_eq!(json["tool_call_history"].as_array().unwrap().len(), 1);
         assert_eq!(json["last_agent_state"], "Performing");
         assert!(json["conversation_snapshot"].is_array());
+        assert_eq!(json["tool_call_history"][0]["effect"]["class"], "none");
+    }
+
+    fn record(name: &str, class: Option<EffectClass>) -> ToolCallRecord {
+        ToolCallRecord {
+            tool_name: name.to_string(),
+            arguments: serde_json::json!({}),
+            call_id: format!("call_{name}"),
+            result: String::new(),
+            effect: class.map(crate::effects::EffectRecord::new),
+        }
+    }
+
+    fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
+        TaskResult {
+            result_summary: "done".to_string(),
+            changes_patch: None,
+            format_patch: None,
+            files_modified: vec![],
+            tool_calls_made,
+            denials: vec![],
+            iterations: 1,
+            model_used: "mock".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_task_result_json_exposes_effect_on_every_tool_call() {
+        let result = result_with_calls(vec![
+            record("read_file", Some(EffectClass::None)),
+            record("write_file", Some(EffectClass::Workspace)),
+            record("unregistered", None),
+        ]);
+        let json = result.to_json();
+        let calls = json["tool_calls_made"].as_array().unwrap();
+        assert_eq!(calls[0]["effect"]["class"], "none");
+        assert_eq!(calls[1]["effect"]["class"], "workspace");
+        assert!(calls[2]["effect"].is_null());
+        assert_eq!(json["max_effect_class"], "workspace");
+        assert_eq!(result.max_effect_class(), Some(EffectClass::Workspace));
+    }
+
+    #[test]
+    fn test_task_result_max_effect_class_is_none_without_attributed_calls() {
+        assert_eq!(result_with_calls(vec![]).max_effect_class(), None);
+        let unattributed = result_with_calls(vec![record("x", None)]);
+        assert_eq!(unattributed.max_effect_class(), None);
+        assert!(unattributed.to_json()["max_effect_class"].is_null());
     }
 
     #[test]
@@ -1776,6 +2087,394 @@ mod tests {
         // set_ttl on an unknown id is a no-op (does not panic).
         manager.set_ttl(&TaskId("nope".to_string()), Some(1)).await;
     }
+
+    fn scoped_identity() -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.tools = vec!["write_file".parse().unwrap(), "read_file".parse().unwrap()];
+        identity
+    }
+
+    async fn wait_for_terminal(manager: &TaskManager, task_id: &TaskId) -> TaskStatus {
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(task_id).await.unwrap();
+            if task.status.is_terminal() {
+                return task.status;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[test]
+    fn test_network_policy_follows_the_identity_ceiling() {
+        assert_eq!(network_policy_for(None), NetworkPolicy::Enabled);
+        let mut identity = scoped_identity();
+        assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Disabled);
+        identity.scope.max_effect = EffectClass::Repository;
+        assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Enabled);
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_records_denials_in_the_result() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": "README.md", "content": "x"}),
+                ),
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": "api/new.rs", "content": "ok"}),
+                ),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+
+        let status = wait_for_terminal(&manager, &task_id).await;
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.denials[0].identity, "rust-implementer");
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(
+            result.to_json()["denials"][0]["reason"]["path"],
+            "README.md"
+        );
+        assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_runs_the_audited_identity() {
+        use crate::auditor::context::tests::auditor_identity;
+        use crate::auditor::rules::tests::catalog;
+        use crate::auditor::{
+            AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary,
+        };
+        use crate::identity::DevLoop;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let audit_context = AuditContext::new(catalog(true), auditor_identity()).unwrap();
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", "github.com/example/repo"),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let allowed = gate.check(request, &audit_context).await.unwrap();
+        assert_eq!(allowed.identity().name(), "rust-implementer");
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("Task complete!")]),
+        );
+        let task_id = manager
+            .submit_spawn(
+                allowed,
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        let status = wait_for_terminal(&manager, &task_id).await;
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let task = manager.poll(&task_id).await.unwrap();
+        assert_eq!(task.description, "Add a regression test.");
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_fails_on_an_invalid_scope_glob() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let mut identity = scoped_identity();
+        identity.scope.paths = vec!["[".to_string()];
+        let task_id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed {
+                diagnostics, error, ..
+            } => {
+                assert_eq!(diagnostics.error_type, "ScopeError");
+                assert!(error.contains("scope.paths"), "{error}");
+            }
+            other => panic!("expected ScopeError failure, got {other:?}"),
+        }
+        assert!(manager.runner.progress.read().await.get(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_starts_the_container_with_its_network_policy() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo_dir.path().join(".devcontainer")).unwrap();
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.runner.image_cache.write().await;
+            cache.insert(canonical, "nanna-missing-image-for-tests:none".to_string());
+        }
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let task_id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "WorkspaceCreationFailed");
+            }
+            other => panic!("expected the missing image to fail the task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failure_diagnostics_json_carries_denials_and_tolerates_their_absence() {
+        let violation = crate::protected::ProtectedPathViolation {
+            path: "codecov.yml".to_string(),
+            rule: "codecov.yml".to_string(),
+        };
+        let diagnostics = FailureDiagnostics {
+            error_type: "ProtectedPathViolation".to_string(),
+            iterations_completed: 1,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+            denials: vec![crate::scope::ScopeDenial::protected(
+                "extract_changes",
+                &violation,
+            )],
+        };
+        let json = diagnostics.to_json();
+        assert_eq!(json["denials"][0]["reason"]["kind"], "protected_path");
+        assert_eq!(json["denials"][0]["tool"], "extract_changes");
+        let legacy = serde_json::json!({
+            "error_type": "StateError", "iterations_completed": 0, "last_tool_call": null,
+            "partial_changes": null, "tool_call_history": [], "last_agent_state": null,
+            "conversation_snapshot": null
+        });
+        let parsed: FailureDiagnostics = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.denials.is_empty());
+    }
+
+    fn plant_protected_file(source_repo: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .current_dir(source_repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let worktree = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .find(|path| path.contains("nanna-task-"))
+            .expect("task worktree present");
+        let agents = std::path::Path::new(worktree).join(".nanna/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("x.toml"), "[identity]").unwrap();
+    }
+
+    struct RecordingHook {
+        seen: std::sync::Mutex<Vec<(String, crate::protected::ProtectedPathViolation)>>,
+    }
+
+    impl crate::protected::AuditHook for RecordingHook {
+        fn on_protected_path_violation(
+            &self,
+            task_id: &str,
+            violation: &crate::protected::ProtectedPathViolation,
+        ) {
+            let entry = (task_id.to_string(), violation.clone());
+            self.seen.lock().unwrap().push(entry);
+        }
+    }
+
+    fn planting_provider(repo: std::path::PathBuf) -> Arc<dyn ModelProvider> {
+        let responses = wrap_with_state_machine_responses(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "api/new.rs", "content": "ok"}),
+            ),
+            stop_response("done"),
+        ]);
+        MockProvider::with_hook(responses, Box::new(move || plant_protected_file(&repo)))
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_touching_an_identity_file_fails_the_task_under_an_identity() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_audit_hook(hook.clone());
+        let provider = planting_provider(repo_dir.path().to_path_buf());
+        let task_id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+
+        let (error, diagnostics) = match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (error, diagnostics),
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+        assert!(
+            error.contains("`.nanna/agents/x.toml` is protected by rule `.nanna/**`"),
+            "{error}"
+        );
+        assert!(diagnostics.iterations_completed > 0);
+        assert!(!diagnostics.tool_call_history.is_empty());
+        assert!(diagnostics.last_tool_call.is_some());
+        let denial = diagnostics.denials.last().unwrap();
+        assert_eq!(denial.identity, "rust-implementer");
+        assert_eq!(denial.tool, "extract_changes");
+        assert!(
+            matches!(&denial.reason, crate::scope::DenialReason::ProtectedPath { path, .. } if path == ".nanna/agents/x.toml")
+        );
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, task_id.0);
+        assert_eq!(seen[0].1.rule, ".nanna/**");
+        assert!(manager.runner.progress.read().await.get(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_touching_an_identity_file_fails_the_task_without_an_identity() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider = planting_provider(repo_dir.path().to_path_buf());
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+                let denial = diagnostics.denials.last().unwrap();
+                assert_eq!(denial.identity, crate::scope::UNSCOPED_IDENTITY);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protected_failure_after_an_errored_run_keeps_its_iterations_and_calls() {
+        let violation = crate::protected::ProtectedPathViolation {
+            path: "windows.toml".to_string(),
+            rule: "windows.toml".to_string(),
+        };
+        let call = record("write_file", Some(EffectClass::Workspace));
+        let run: Result<AgentRunResult, AgentError> = Err(AgentError::MaxIterationsExceeded {
+            iterations_completed: 7,
+            tool_calls_made: vec![call.clone()],
+            conversation_snapshot: vec![],
+            last_agent_state: crate::agent::AgentState::PerformingEntityModification,
+        });
+        let (error, diagnostics) = protected_failure(violation, None, &run);
+        assert!(error.starts_with("`windows.toml` is protected"));
+        assert_eq!(diagnostics.iterations_completed, 7);
+        assert_eq!(diagnostics.tool_call_history.len(), 1);
+        assert_eq!(
+            diagnostics.last_tool_call.map(|c| c.tool_name),
+            Some("write_file".to_string())
+        );
+        assert_eq!(diagnostics.denials.len(), 1);
+        assert_eq!(
+            diagnostics.denials[0].identity,
+            crate::scope::UNSCOPED_IDENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_run_that_exhausts_its_iterations_fails_with_no_denials() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let responses: Vec<ChatResponse> = (0..5).map(|_| stop_response("not done yet")).collect();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(responses);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                0,
+                provider,
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "MaxIterationsExceeded");
+                assert!(diagnostics.denials.is_empty());
+                assert_eq!(diagnostics.to_json()["denials"], serde_json::json!([]));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2089,7 +2788,7 @@ mod scheduler_tests {
     async fn test_dispatched_task_without_provider_fails() {
         let manager = TaskManager::new(1);
         let entry = queued(Path::new("/nonexistent"));
-        manager.runner.register(&entry, None).await;
+        manager.runner.register(&entry, None, None).await;
         manager.dispatcher.enqueue(entry.clone()).await.unwrap();
         let task = wait_for(&manager, &entry.id, TaskStatus::is_terminal).await;
         match task.status {

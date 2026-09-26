@@ -1,0 +1,19 @@
+[case]
+id = "allow-pr-shepherd-ci"
+name = "pr-shepherd triggers CI inside its ceiling"
+description = "A middle-loop CI subtask fits pr-shepherd's card exactly."
+
+[request]
+parent_task_id = "task-3"
+parent_task_description = "Keep PR #42 green"
+parent_task_repo = "github.com/example/repo"
+identity = "pr-shepherd"
+subtask = "Re-run the CI pipeline for the branch after the review fix."
+dev_loop = "middle"
+requested_effect = "ci"
+
+[expected]
+verdict = "allow"
+
+[metadata]
+tags = ["allow", "ci"]
