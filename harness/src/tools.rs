@@ -315,11 +315,15 @@ impl ToolRegistry {
                 };
                 gate.run_gate(&review, &ctx).await
             }
-            _ => ActionVerdict::block(vec![Reason::new(
-                ReasonCode::Other,
-                "no action auditor configured for this registry; effectful tool calls are refused by default",
-            )]),
+            _ => {
+                let reason = Reason::new(
+                    ReasonCode::Other,
+                    "no action auditor configured for this registry; effectful tool calls are refused by default",
+                );
+                ActionVerdict::block(vec![reason])
+            }
         };
+        let verdict = self.apply_denial_policy(verdict);
         self.action_log
             .lock()
             .expect("action log poisoned")
@@ -335,27 +339,41 @@ impl ToolRegistry {
                     .push(class);
                 Ok(())
             }
-            ActionVerdict::Block { reasons } => Err(self.escalate_after_third_denial(reasons)),
+            ActionVerdict::Block { reasons } => Err(ActionDenied::Block { reasons }),
+            ActionVerdict::Escalate { reasons } => Err(ActionDenied::Escalate { reasons }),
+        }
+    }
+
+    /// Count a `Block`/`Escalate` verdict against this task and upgrade the
+    /// third one to `Escalate` (a `RepeatedDenials` reason is appended so
+    /// the upgrade is visible in [`Self::action_reviews`], not just in the
+    /// [`ActionDenied`] returned to the caller).
+    fn apply_denial_policy(&self, verdict: ActionVerdict) -> ActionVerdict {
+        match verdict {
+            ActionVerdict::Allow => ActionVerdict::Allow,
+            ActionVerdict::Block { mut reasons } => {
+                let mut count = self
+                    .action_denial_count
+                    .lock()
+                    .expect("action denial count poisoned");
+                *count += 1;
+                if *count < 3 {
+                    return ActionVerdict::Block { reasons };
+                }
+                let detail = format!(
+                    "{} denials recorded for this task; halting for review",
+                    *count
+                );
+                reasons.push(Reason::new(ReasonCode::RepeatedDenials, detail));
+                ActionVerdict::escalate(reasons)
+            }
             ActionVerdict::Escalate { reasons } => {
                 *self
                     .action_denial_count
                     .lock()
                     .expect("action denial count poisoned") += 1;
-                Err(ActionDenied::Escalate { reasons })
+                ActionVerdict::Escalate { reasons }
             }
-        }
-    }
-
-    fn escalate_after_third_denial(&self, reasons: Vec<Reason>) -> ActionDenied {
-        let mut count = self
-            .action_denial_count
-            .lock()
-            .expect("action denial count poisoned");
-        *count += 1;
-        if *count >= 3 {
-            ActionDenied::Escalate { reasons }
-        } else {
-            ActionDenied::Block { reasons }
         }
     }
 
@@ -3760,9 +3778,19 @@ mod tests {
         }
         let reviews = registry.action_reviews();
         assert_eq!(reviews.len(), gated_classes.len());
-        for (review, class) in reviews.iter().zip(gated_classes.iter()) {
+        let expected_kinds = [
+            crate::auditor::VerdictKind::Block,
+            crate::auditor::VerdictKind::Block,
+            crate::auditor::VerdictKind::Escalate,
+            crate::auditor::VerdictKind::Escalate,
+        ];
+        for ((review, class), expected) in reviews
+            .iter()
+            .zip(gated_classes.iter())
+            .zip(expected_kinds.iter())
+        {
             assert_eq!(&review.review.effect_class, class);
-            assert_eq!(review.verdict.kind(), crate::auditor::VerdictKind::Block);
+            assert_eq!(review.verdict.kind(), *expected, "{class}");
         }
     }
 
@@ -3800,9 +3828,66 @@ mod tests {
         }
         let third = registry.execute("push", json!({})).await.unwrap_err();
         match third {
-            ToolError::ActionDenied(ActionDenied::Escalate { .. }) => {}
+            ToolError::ActionDenied(ActionDenied::Escalate { reasons }) => {
+                assert!(reasons
+                    .iter()
+                    .any(|r| r.code == crate::auditor::ReasonCode::RepeatedDenials));
+            }
             other => panic!("expected ActionDenied::Escalate on the third denial, got {other:?}"),
         }
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), 3);
+        assert_eq!(
+            reviews[2].verdict.kind(),
+            crate::auditor::VerdictKind::Escalate,
+            "the logged verdict must reflect the escalation, not the auditor's raw block"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auditor_escalating_directly_is_returned_and_logged_as_an_escalation() {
+        struct AlwaysEscalates;
+
+        #[async_trait]
+        impl crate::action_auditor::ActionAuditor for AlwaysEscalates {
+            fn name(&self) -> &str {
+                "always-escalates"
+            }
+
+            async fn review_action(
+                &self,
+                _review: &ActionReview,
+                _context: &ActionContext<'_>,
+            ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+                Ok(ActionVerdict::escalate(vec![Reason::new(
+                    ReasonCode::Other,
+                    "escalated directly by the auditor",
+                )]))
+            }
+        }
+
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(AlwaysEscalates),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("sandbox_deploy", EffectClass::Sandbox));
+        let registry = registry.with_action_gate(gate, subject(EffectClass::Production));
+
+        let err = registry
+            .execute("sandbox_deploy", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ActionDenied(ActionDenied::Escalate { .. })
+        ));
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(
+            reviews[0].verdict.kind(),
+            crate::auditor::VerdictKind::Escalate
+        );
     }
 
     #[tokio::test]
