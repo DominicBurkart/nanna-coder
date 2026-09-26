@@ -94,7 +94,13 @@ cargo build --workspace && cargo test --workspace
 | `identities/global/prompts/*.md` | The `system_prompt` files the above cards reference by path |
 | `identities/repo/.nanna/agents/rust-implementer.toml` | A repo-local override that narrows `rust-implementer` to `paths = ["api/**"]` and `max_effect = "workspace"`, exercising `AgentIdentity::narrows` |
 
-Use it directly with `IdentityCatalog::load("harness/tests/fixtures/identities/global")` (optionally `.with_repo_overrides("harness/tests/fixtures/identities/repo")`) rather than inventing ad hoc TOML in a new test; it already covers one card per loop plus an inert auditor and a narrowing repo override.
+Use it directly rather than inventing ad hoc TOML in a new test; it already covers one card per loop plus an inert auditor and a narrowing repo override. Following `harness/tests/identity_catalog_tests.rs`'s own pattern (a Rust integration test's working directory is the crate root, `harness/`, not the repo root), resolve it from `CARGO_MANIFEST_DIR` rather than a literal relative path:
+
+```rust
+let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/identities");
+let catalog = IdentityCatalog::load(fixtures.join("global"))?
+    .with_repo_overrides(fixtures.join("repo"))?;
+```
 
 ## Fake deploy adapter and health/shadow sources
 
