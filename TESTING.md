@@ -119,7 +119,7 @@ The rollout executor's dependencies are all traits, each with an in-memory fake 
 Two independent simulated-time patterns are used, depending on what's under test:
 
 - **`harness::leases::Clock`** (`SystemClock` / `SimulatedClock`) is for anything that *sleeps and retries*: lease contention (`wait_for`/`Backoff`), the rollout executor's bake polling, and escalation dedupe windows (`Escalator`) all take a `Clock` so a test can call `clock.sleep(...)` and have it resolve instantly while still recording the requested duration (`SimulatedClock::sleeps()`). Clones of one `SimulatedClock` share the same instant.
-- **Explicit `now: DateTime<Utc>` parameters** are for anything that only *evaluates* a point in time rather than waiting: `WindowSet::is_open`/`next_open`, `scheduler::parked_until`, and `SlotState`/`HybridPolicy::next` all take `now` directly, so tests pass whatever instant they need without a shared clock object at all.
+- **Explicit `now: DateTime<Utc>` parameters** are for anything that only *evaluates* a point in time rather than waiting: `WindowSet::is_open`/`next_open`, `scheduler::parked_until`, and `SchedulingPolicy::next` (`HybridPolicy`'s dispatch decision) all take `now` directly, so tests pass whatever instant they need without a shared clock object at all.
 
 Pick whichever pattern matches the API you're extending: a component that already takes `now` as a parameter should keep doing so rather than gaining a `Clock` dependency, and vice versa.
 
