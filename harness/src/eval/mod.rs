@@ -15,6 +15,8 @@ pub mod report;
 pub mod runner;
 #[cfg(feature = "eval-runner")]
 pub mod scoring;
+#[cfg(feature = "eval-runner")]
+pub mod sdlc;
 pub mod swebench;
 pub mod swebench_report;
 pub mod swebench_results;
@@ -42,6 +44,12 @@ pub use scoring::{
     ScorecardMetadata, StoredVerdict,
     INSTANCE_STATE_SCHEMA_VERSION as SCORING_INSTANCE_STATE_SCHEMA_VERSION,
     SCORECARD_SCHEMA_VERSION as SCORING_SCORECARD_SCHEMA_VERSION,
+};
+#[cfg(feature = "eval-runner")]
+pub use sdlc::{
+    append_scorecard_row as append_sdlc_e2e_scorecard_row, run_e2e_scenario, AuditorGateSummary,
+    GateProbeOutcome, GateProbeVerdict, LoopWallClock, SdlcE2eOutcome, SdlcE2eScorecardRow,
+    SdlcEvalError, SDLC_E2E_SCORECARD_SCHEMA_VERSION,
 };
 #[cfg(feature = "eval-runner")]
 pub use swebench_verify::{InstanceVerdict, Prediction, VerifyConfig, VerifyError};

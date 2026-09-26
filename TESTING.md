@@ -38,6 +38,12 @@ cargo nextest run --workspace --test '*' --all-features
 # shell-based security & integration
 ./tests/run-all-tests.sh
 
+# end-to-end SDLC orchestrator eval (issue -> planner -> implementer PR ->
+# shepherd promotes -> deploy plan executes against the fake adapter); fully
+# scripted, no cloud credentials, appends a row to
+# evals/scorecards/sdlc_e2e.jsonl
+cargo run --release -p harness --bin harness-sdlc-eval --features eval-runner
+
 # lint + format
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
