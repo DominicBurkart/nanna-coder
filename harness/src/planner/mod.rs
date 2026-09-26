@@ -13,6 +13,8 @@ mod execute;
 mod model;
 mod plan;
 
+pub mod eval_case;
+
 pub use execute::{execute_plan, NodeOutcome, PlanExecution, SpawnDispatcher};
 pub use model::{ModelPlanner, Planner, OUTPUT_CONTRACT, PLANNER_FRAMING, TASK_CLOSE, TASK_OPEN};
 pub use plan::{Plan, PlanError, PlanNodeId, SpawnNode};
