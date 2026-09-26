@@ -254,8 +254,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// 2026-09-28 is a Monday.
     fn open_monday() -> chrono::DateTime<Utc> {
-        // 2026-09-28 is a Monday.
         Utc.with_ymd_and_hms(2026, 9, 28, 10, 0, 0).unwrap()
     }
 
