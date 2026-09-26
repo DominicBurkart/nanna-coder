@@ -39,8 +39,8 @@ pub(crate) enum RuleOutcome {
 /// calls first require the action's target availability window to be open
 /// and the coordination lease it needs to be held; a rule auditor used
 /// alone can never allow one of these, because the epic requires the
-/// strongest configured model to also sign off (see [`RuleOutcome`]), so a
-/// bare [`RuleActionAuditor`] escalates once window and lease checks pass.
+/// strongest configured model to also sign off, so a bare
+/// [`RuleActionAuditor`] escalates once window and lease checks pass.
 ///
 /// ```
 /// use harness::action_auditor::{ActionAuditor, ActionContext, ActionReview, RuleActionAuditor};
