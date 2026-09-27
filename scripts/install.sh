@@ -140,10 +140,14 @@ port_in_use_by() {
   if have ss; then
     ss -ltnp 2>/dev/null | awk -v p=":$port\$" '$4 ~ p' | head -3
   elif have lsof; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3
+    # lsof exits 1 (not just empty output) when nothing matches, which
+    # would otherwise kill the whole script via `x="$(port_in_use_by ...)"`
+    # under `set -e` on a clean host with nothing listening.
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3 || true
   elif have netstat; then
     netstat -an 2>/dev/null | awk -v p="\\.$port\$|:$port\$" '$4 ~ p && /LISTEN/' | head -3
   fi
+  return 0
 }
 
 detect_pkg_mgr() {
