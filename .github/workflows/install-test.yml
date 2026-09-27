@@ -209,7 +209,7 @@ jobs:
           podman machine stop || true
 
   windows-bringup:
-    name: Windows full bring-up (WSL2 + native apt podman)
+    name: "Windows install.sh WSL2 rejection (expected; issue 326)"
     runs-on: windows-latest
     needs: build-images
     timeout-minutes: 30
@@ -260,19 +260,62 @@ jobs:
           podman load -i _images/ollama.tar
           podman images
 
+      # `|| rc=$?` keeps the wsl-bash wrapper's inherited `-e` (setup-wsl's
+      # default shell is `bash -euo pipefail`) from skipping the rc capture;
+      # pipefail makes it install.sh's exit code, not tee's.
       - name: Run installer inside WSL
+        id: installer
+        continue-on-error: true
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          ws=$(wslpath -u '${{ github.workspace }}')
+          cd "$ws"
+          rc=0
+          bash scripts/install.sh \
+            --no-pull --skip-model-pull --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest \
+            2>&1 | tee _installer.log || rc=$?
+          echo "$rc" > _installer.rc
+          exit "$rc"
+
+      # Passes only on the known-expected result (exit 1 + the die()
+      # message); fails for real on anything else, including an unexpected
+      # success (which would mean the #326 blocker is gone).
+      - name: "Assert installer result (WSL2 early-exit; issue 326)"
+        if: always()
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
           ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
-          bash scripts/install.sh \
-            --no-pull --skip-model-pull --yes \
-            --harness-image nanna-coder-harness:latest \
-            --ollama-image  nanna-coder-ollama:latest
+          outcome='${{ steps.installer.outcome }}'
+          case "$outcome" in
+            failure) ;;
+            success)
+              echo "::error::install.sh succeeded under WSL2 (outcome=$outcome) — the is_wsl() early-exit no longer fires. If #326 has been resolved and WSL2 bring-up is now genuinely supported, replace this assertion with a must-pass bring-up check; otherwise this is a regression."
+              exit 1 ;;
+            *)
+              echo "installer step did not complete (outcome=${outcome:-unset}); see the earlier failing step for the real error."
+              exit 0 ;;
+          esac
+          rc=$(cat _installer.rc 2>/dev/null || echo "")
+          if [ "$rc" != "1" ]; then
+            echo "::error::install.sh exited $rc, expected 1 (die() from the WSL2 early-exit)."
+            cat _installer.log
+            exit 1
+          fi
+          if ! grep -qF 'WSL2 detected; not supported by install.sh' _installer.log; then
+            echo "::error::install.sh exited 1 but not with the expected WSL2 early-exit message. Full log:"
+            cat _installer.log
+            exit 1
+          fi
+          echo "install.sh correctly detected WSL2 (exit 1, expected message) and rejected it early — expected, by-design result (#326)."
 
+      # Nothing to verify unless install.sh got past the WSL2 early-exit.
       - name: Verify pod and ollama API inside WSL
-        if: always()
+        if: always() && steps.installer.outcome == 'success'
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
@@ -289,7 +332,7 @@ jobs:
           exit 1
 
       - name: Tear down inside WSL
-        if: always()
+        if: always() && steps.installer.outcome == 'success'
         shell: wsl-bash {0}
         run: |
           podman pod stop nanna-coder-pod || true
@@ -308,11 +351,12 @@ jobs:
       - macos-bringup
       - windows-bringup
     steps:
-      # Gate enforces success on Linux + the lint/build jobs.
-      # windows-bringup is intentionally allowed to fail: install.sh
-      # exits early on WSL2 with a "not supported" message (see is_wsl()
-      # in scripts/install.sh), so the Windows lane is expected to fail
-      # in CI as the documented confirmation of that path. Tracked in #326.
+      # Gate enforces success on Linux + lint/build + windows-bringup.
+      # windows-bringup's own "Assert installer result" step already
+      # verifies install.sh's WSL2 early-exit fires correctly (#326): the
+      # job reports success for that expected, by-design rejection and
+      # fails for real on a regression or an unexpected error, so no
+      # special-casing is needed here.
       # macos-bringup is allowed to fail because every podman-machine
       # provider available on free GHA macOS runners has a CI-sandbox
       # blocker: applehv/vfkit aborts on start, qemu was removed in
@@ -320,10 +364,7 @@ jobs:
       # has unbounded queue time. The macOS install path itself works
       # for real users; this is purely a runner-sandbox gap. Tracked
       # separately so the install.sh + install.ps1 code can ship.
-      - if: ${{ needs.shellcheck.result != 'success' || needs.ps1-lint.result != 'success' || needs.ps1-parse.result != 'success' || needs.build-images.result != 'success' || needs.linux-bringup.result != 'success' }}
+      - if: ${{ needs.shellcheck.result != 'success' || needs.ps1-lint.result != 'success' || needs.ps1-parse.result != 'success' || needs.build-images.result != 'success' || needs.linux-bringup.result != 'success' || needs.windows-bringup.result != 'success' }}
         run: |
-          echo "::error::Required install-test job failed (linux/lint/build)"
+          echo "::error::Required install-test job failed"
           exit 1
-      - if: ${{ needs.windows-bringup.result != 'failure' }}
-        run: |
-          echo "::warning::windows-bringup did not fail — install.sh's WSL2 early-exit may have regressed; verify is_wsl() still triggers."
