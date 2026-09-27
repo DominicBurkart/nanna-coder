@@ -483,17 +483,22 @@ install_podman_macos() {
   brew install podman
 }
 
+wants_libkrun_macos() {
+  # install.sh itself never picks a provider -- podman decides, and
+  # Homebrew's podman formula defaults that decision to applehv, not
+  # libkrun (homebrew-core#291552 was resolved by reverting podman's
+  # own libkrun-default change, not by bundling krunkit). So only
+  # install krunkit when the caller has actually opted into libkrun,
+  # explicitly or via an existing machine already configured that way.
+  [[ "${CONTAINERS_MACHINE_PROVIDER:-}" == libkrun ]] && return 0
+  podman machine list --format '{{.VMType}}' 2>/dev/null | grep -qx libkrun
+}
+
 ensure_krunkit_macos() {
-  # Upstream podman >=6 defaults new machines to the libkrun provider on
-  # Apple Silicon, but Homebrew's podman formula patches that default
-  # back to applehv (revert-libkrun-default.patch) and doesn't depend on
-  # krunkit, so anyone who opts into `--provider libkrun` explicitly (or
-  # inherits an old libkrun machine) hits "krunkit: executable file not
-  # found" (homebrew-core#291552, open).
   if have krunkit; then
     return
   fi
-  log "installing krunkit via brew (for the libkrun machine provider on Apple Silicon)..."
+  log "installing krunkit via brew (for the libkrun machine provider)..."
   brew tap libkrun/krun
   brew trust libkrun/krun || true
   brew install krunkit
@@ -522,7 +527,9 @@ if [[ "$OS" == macos ]]; then
   if [[ "${NANNA_SKIP_PODMAN_MACHINE:-0}" == "1" ]]; then
     warn "NANNA_SKIP_PODMAN_MACHINE=1: not touching podman machine (caller manages the VM, e.g. colima)."
   else
-    [[ "$ARCH" == arm64 || "$ARCH" == aarch64 ]] && ensure_krunkit_macos
+    if [[ "$ARCH" == arm64 || "$ARCH" == aarch64 ]] && wants_libkrun_macos; then
+      ensure_krunkit_macos
+    fi
     ensure_podman_machine_macos
   fi
 fi
