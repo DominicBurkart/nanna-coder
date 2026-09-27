@@ -479,6 +479,18 @@ install_podman_macos() {
   brew install podman
 }
 
+ensure_krunkit_macos() {
+  # podman >=6 defaults to the libkrun machine provider on Apple Silicon,
+  # but the podman formula doesn't depend on krunkit (homebrew-core#291552).
+  if have krunkit; then
+    return
+  fi
+  log "installing krunkit via brew (podman's default machine provider on Apple Silicon)..."
+  brew tap libkrun/krun
+  brew trust libkrun/krun || true
+  brew install krunkit
+}
+
 ensure_podman_machine_macos() {
   if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q .; then
     log "initializing podman machine (this can take a few minutes)..."
@@ -502,6 +514,7 @@ if [[ "$OS" == macos ]]; then
   if [[ "${NANNA_SKIP_PODMAN_MACHINE:-0}" == "1" ]]; then
     warn "NANNA_SKIP_PODMAN_MACHINE=1: not touching podman machine (caller manages the VM, e.g. colima)."
   else
+    [[ "$ARCH" == arm64 || "$ARCH" == aarch64 ]] && ensure_krunkit_macos
     ensure_podman_machine_macos
   fi
 fi
