@@ -563,11 +563,12 @@ pub fn exec_in_container(
     working_dir: Option<&str>,
 ) -> Result<CommandOutput, ContainerError> {
     if matches!(handle.runtime, ContainerRuntime::Stub) {
-        return Ok(CommandOutput {
+        let output = CommandOutput {
             stdout: String::new(),
             stderr: String::new(),
             success: true,
-        });
+        };
+        return Ok(output);
     }
     if !handle.runtime.is_available() {
         return Err(ContainerError::NoRuntimeAvailable);
