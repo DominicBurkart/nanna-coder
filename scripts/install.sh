@@ -484,12 +484,16 @@ install_podman_macos() {
 }
 
 ensure_krunkit_macos() {
-  # podman >=6 defaults to the libkrun machine provider on Apple Silicon,
-  # but the podman formula doesn't depend on krunkit (homebrew-core#291552).
+  # Upstream podman >=6 defaults new machines to the libkrun provider on
+  # Apple Silicon, but Homebrew's podman formula patches that default
+  # back to applehv (revert-libkrun-default.patch) and doesn't depend on
+  # krunkit, so anyone who opts into `--provider libkrun` explicitly (or
+  # inherits an old libkrun machine) hits "krunkit: executable file not
+  # found" (homebrew-core#291552, open).
   if have krunkit; then
     return
   fi
-  log "installing krunkit via brew (podman's default machine provider on Apple Silicon)..."
+  log "installing krunkit via brew (for the libkrun machine provider on Apple Silicon)..."
   brew tap libkrun/krun
   brew trust libkrun/krun || true
   brew install krunkit
