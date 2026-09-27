@@ -141,11 +141,11 @@ jobs:
     # machine provider can work here regardless of packaging. This job
     # drives the real scripts/install.sh code path and hard-fails on any
     # sign of a real regression, but its "expected gap" pass accepts any
-    # start-time failure once podman/krunkit installed and the script
-    # reached the actual machine-start attempt -- it can't distinguish
-    # this specific gap from a new, different start-time failure (a
-    # krunkit crash, an entitlements problem, etc.); only real hardware
-    # can. See docs/ci/macos-podman-bringup.md.
+    # start-time failure once podman is installed and the script reached
+    # the actual machine-start attempt -- it can't distinguish this
+    # specific gap from a new, different start-time failure (an
+    # entitlements problem, an image-pull failure, etc.); only real
+    # hardware can. See docs/ci/macos-podman-bringup.md.
     runs-on: macos-15
     timeout-minutes: 15
     env:
@@ -197,17 +197,12 @@ jobs:
             exit 1
           fi
 
-          if ! command -v krunkit >/dev/null 2>&1; then
-            echo "::error::krunkit never got installed by install.sh's ensure_krunkit_macos() on arm64 — a real regression, not the known virtualization gap. See the log above and docs/ci/macos-podman-bringup.md."
-            exit 1
-          fi
-
           if ! grep -q 'starting podman machine' "$LOG"; then
             echo "::error::install.sh never reached the podman-machine-start step at all (see the log above) — that's earlier than the known virtualization gap and is a real regression. See docs/ci/macos-podman-bringup.md."
             exit 1
           fi
 
-          echo "::notice::podman, krunkit and install.sh's own machine-bring-up step all worked; only the actual machine start failed — the known, tracked GitHub-hosted-runner virtualization gap. See docs/ci/macos-podman-bringup.md."
+          echo "::notice::podman installed and install.sh's own machine-bring-up step ran; only the actual machine start failed — the known, tracked GitHub-hosted-runner virtualization gap. See docs/ci/macos-podman-bringup.md."
 
       - name: Tear down
         if: always()
@@ -216,12 +211,13 @@ jobs:
 
   macos-intel-probe:
     name: macOS Intel virtualization probe (diagnostic, non-blocking)
-    # GitHub's nested-virtualization docs read as arm64-specific, and
-    # krunkit is arm64-only, so this checks whether Intel-hosted runners
-    # (applehv provider) behave differently. Not wired into the gate.
-    # See docs/ci/macos-podman-bringup.md.
+    # GitHub's nested-virtualization docs read as arm64-specific, so
+    # this checks whether Intel-hosted runners behave differently.
+    # Classifies its own result like macos-smoke does, but stays out of
+    # the gate: Intel-hosted runners have historically had long queue
+    # times on this repo. See docs/ci/macos-podman-bringup.md.
     runs-on: macos-15-intel
-    timeout-minutes: 25
+    timeout-minutes: 15
     env:
       CONTAINERS_MACHINE_PROVIDER: applehv
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -235,31 +231,36 @@ jobs:
           uname -m
           sysctl kern.hv_support || true
 
-      - name: Install podman
+      - name: Install podman and classify the result
         run: |
           set -x
-          # Confirmed by real runs: no macOS-Intel bottle exists (Tier
-          # 3), and --build-from-source hits a hard formula requirement
-          # ("podman: The arm64 architecture is required for this
-          # software") -- Homebrew's podman formula is arm64-only now,
-          # independent of CI. This step is expected to fail; it exists
-          # so a future Homebrew change (or a different install source)
-          # shows up here instead of going unnoticed. See
-          # docs/ci/macos-podman-bringup.md.
-          brew install podman
-          podman --version
-
-      - name: Attempt podman machine bring-up (applehv provider)
-        run: |
-          set -x
+          LOG="$(mktemp)"
           set +e
-          podman machine init --cpus=2 --memory=3072 --disk-size=10
-          podman machine start
+          brew install podman >"$LOG" 2>&1
           status=$?
           set -e
-          podman machine list || true
-          podman info | head -40 || true
-          exit "$status"
+          cat "$LOG"
+
+          if [ "$status" -eq 0 ]; then
+            echo "::warning::brew install podman SUCCEEDED on macos-15-intel. Homebrew's podman formula previously required arm64 -- if this keeps happening, promote this job into a real Intel full bring-up lane. See docs/ci/macos-podman-bringup.md."
+            podman --version
+            set +e
+            podman machine init --cpus=2 --memory=3072 --disk-size=10
+            podman machine start
+            bringup_status=$?
+            set -e
+            podman machine list || true
+            podman info | head -40 || true
+            exit "$bringup_status"
+          fi
+
+          if grep -qiE 'no bottle available|arm64 architecture is required' "$LOG"; then
+            echo "::notice::Homebrew's podman formula still doesn't support macOS Intel (the known, tracked packaging gap -- independent of GitHub Actions, this also affects real Intel Mac users). See docs/ci/macos-podman-bringup.md."
+            exit 0
+          fi
+
+          echo "::error::brew install podman failed with an error that doesn't match the known Intel packaging gap -- may be a new, different regression. See the log above and docs/ci/macos-podman-bringup.md."
+          exit 1
 
       - name: Tear down
         if: always()
@@ -367,13 +368,13 @@ jobs:
       - windows-bringup
     steps:
       # Gate enforces success on Linux + the lint/build jobs, plus
-      # macos-smoke: its classifier has now been checked against a real
-      # macos-15 run (podman + krunkit installed cleanly from Homebrew
-      # bottles, install.sh reached and logged "starting podman
-      # machine", and the classifier correctly emitted the "expected
-      # gap" notice and exited 0), so a passing run means something real
-      # and it belongs in the required set. See docs/ci/macos-podman-bringup.md
-      # for that run's actual output.
+      # macos-smoke: its classifier has now been checked against real
+      # macos-15 runs (podman installed cleanly from a Homebrew bottle,
+      # install.sh reached and logged "starting podman machine", and the
+      # classifier correctly emitted the "expected gap" notice and
+      # exited 0), so a passing run means something real and it belongs
+      # in the required set. See docs/ci/macos-podman-bringup.md for
+      # those runs' actual output.
       #
       # windows-bringup is intentionally allowed to fail: install.sh
       # exits early on WSL2 with a "not supported" message (see is_wsl()
