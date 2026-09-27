@@ -209,7 +209,7 @@ jobs:
           podman machine stop || true
 
   windows-bringup:
-    name: Windows install.sh WSL2 rejection (expected; #326)
+    name: "Windows install.sh WSL2 rejection (expected; issue 326)"
     runs-on: windows-latest
     needs: build-images
     timeout-minutes: 30
@@ -283,7 +283,7 @@ jobs:
       # Passes only on the known-expected result (exit 1 + the die()
       # message); fails for real on anything else, including an unexpected
       # success (which would mean the #326 blocker is gone).
-      - name: Assert installer result (WSL2 early-exit; #326)
+      - name: "Assert installer result (WSL2 early-exit; issue 326)"
         if: always()
         shell: wsl-bash {0}
         run: |
