@@ -51,8 +51,19 @@ The job's failure was masking two separate problems:
    itself was just installed — so a real Apple Silicon user (who *does*
    have working Hypervisor.framework access, unlike a GitHub-hosted
    runner) gets a working podman machine instead of this error.
+3. **A third, previously-unreachable bug**, found by the first real
+   `macos-smoke` run against this fix: `scripts/install.sh`'s
+   `port_in_use_by()` uses `lsof -nP -iTCP:"$port" -sTCP:LISTEN`, which
+   exits `1` (not just empty output) when nothing is listening on that
+   port. Under `set -euo pipefail`, `AUDIT_PORT_8080_HOLDER="$(port_in_use_by
+   8080)"` then kills the whole script instantly and silently on any
+   clean macOS host — including this CI runner, which is why the first
+   real run produced a completely empty log before `install_status: 1`.
+   Linux never hit this because `port_in_use_by` prefers `ss`, whose
+   `awk` filter exits `0` even with no match; macOS has no `ss`, so it
+   always took the `lsof` branch. Fixed by appending `|| true`.
 
-Fixing (1) and (2) does **not** make `macos-smoke` a full bring-up test
+Fixing (1)-(3) does **not** make `macos-smoke` a full bring-up test
 again. It makes the job fail for the right reason.
 
 ## Why no provider works on GitHub-hosted arm64 runners
@@ -81,24 +92,32 @@ Hypervisor.framework access these runners don't expose, so trying
 Hypervisor.framework on arm64"), so it was never going to be usable on
 an Intel runner regardless of the above.
 
-### Open question: Intel-hosted runners
+### Intel-hosted runners: virtualization works, packaging doesn't (yet)
 
 GitHub's docs hedge the nested-virtualization limitation as an `arm64`
-constraint, and GitHub-hosted macOS Intel runners
-(`macos-15-intel`/`macos-26-intel`) are free for this public repo. It's
-not yet established whether Intel-hosted runners expose real
-Hypervisor.framework access (podman's `applehv` provider is not
-`libkrun`/Apple-Silicon-specific — `qemu` was removed in podman 5.x, so
-`applehv` is the only remaining option to test on Intel). The
-`macos-intel-probe` job in `install-test.yml` checks this empirically
-(`sysctl kern.hv_support`, then a real `podman machine init && start`
-with `CONTAINERS_MACHINE_PROVIDER=applehv`). It is intentionally **not**
-wired into `install-test-gate`: as of this writing no run of it has
-been observed to succeed, so its result carries no signal either way.
-If a run of `macos-intel-probe` does succeed, that changes this
-document's conclusion for the Intel case specifically, and the job
-should be promoted into a real full bring-up lane (mirroring
-`linux-bringup`) and folded into the gate.
+constraint. **Confirmed empirically** by the first real `macos-intel-probe`
+run on `macos-15-intel`: `sysctl kern.hv_support` returns `1`
+(Hypervisor.framework *is* available) — unlike Apple Silicon, where the
+`kern.hv_support` OID doesn't exist at all ("unknown oid"). This is a
+real, meaningful difference between the two architectures on GitHub's
+hosted fleet, not a documentation-wording ambiguity.
+
+That run still failed, but on an unrelated packaging gap: Homebrew's
+`podman` formula ships bottles for `arm64_sequoia`/`arm64_tahoe` and
+Linux, but **no bottle for macOS Intel at all** — `brew install podman`
+errors with `podman: no bottle available!` and flags it as a Homebrew
+"Tier 3" (unsupported, build-from-source-only) configuration. `krunkit`
+is `arm64`-only by its own formula, so a working Intel lane would use
+the `applehv` provider — the workflow now tries
+`brew install --build-from-source podman` on `macos-15-intel` to get
+past this. Whether that build completes and `podman machine start`
+actually works with real Hypervisor.framework access is what the next
+`macos-intel-probe` run needs to confirm; see its own job's CI result
+on this PR for the latest status. It is intentionally **not** wired
+into `install-test-gate` yet. If it succeeds, promote it into a real
+full bring-up lane (mirroring `linux-bringup`) and fold it into the
+gate — that would mean **a genuine macOS full-bring-up CI lane is
+possible on GitHub-hosted infrastructure**, just not on `arm64`.
 
 ## What would actually give a real signal
 
@@ -168,12 +187,18 @@ that sounds plausible **must not be used**:
   well-known "pwn request" pattern. It should never gate a self-hosted
   job on a public repo, approval setting or not.
 
-Restricting the job's own `on:` trigger to `push`/`workflow_dispatch`
-only (no `pull_request`, no `pull_request_target`) is the actual,
-necessary control: it's not that the trigger keyword is magic, it's
-that a self-hosted runner must never evaluate code from an
-unreviewed/unmerged fork PR at all, and only `push`-on-protected-branch
-and manual `workflow_dispatch` guarantee that. Beyond that:
+Restricting *this specific job's* `on:` trigger to `push`/`workflow_dispatch`
+only is **necessary but not sufficient**, and it's important to be
+precise about why: a self-hosted runner registered on this repo will
+pick up *any* queued job whose labels match, from *any* workflow file
+in the repo — including one a fork PR adds itself. A contributor can
+open a PR that adds a brand-new `.github/workflows/evil.yml` with its
+own `on: pull_request` trigger and `runs-on: [self-hosted, macOS, ...]`.
+Restricting the *existing* macOS job's trigger does nothing to stop
+that new file from targeting the same runner. There is no workflow-YAML
+setting that closes this by itself — it's why GitHub's guidance is "use
+GitHub-hosted runners for public repos," not "restrict your triggers."
+Two things actually reduce the exposure:
 
 - **The repo-level "Approval for running fork pull request workflows
   from contributors" setting** (Settings → Actions → General), set to
