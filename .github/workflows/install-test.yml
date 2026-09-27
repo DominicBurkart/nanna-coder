@@ -260,12 +260,9 @@ jobs:
           podman load -i _images/ollama.tar
           podman images
 
-      # install.sh's WSL2 die() (see is_wsl() in scripts/install.sh) is the
-      # correct outcome here, not a bug — #326. `|| rc=$?` keeps the
-      # wsl-bash wrapper's inherited `-e` from short-circuiting before we
-      # capture install.sh's own exit code (pipefail makes `$?` reflect
-      # install.sh, not tee) for the assertion step below to check,
-      # mirroring `expected-failure (negative test)` in ci-integration.yml.
+      # `|| rc=$?` keeps the wsl-bash wrapper's inherited `-e` (setup-wsl's
+      # default shell is `bash -euo pipefail`) from skipping the rc capture;
+      # pipefail makes it install.sh's exit code, not tee's.
       - name: Run installer inside WSL
         id: installer
         continue-on-error: true
@@ -294,14 +291,15 @@ jobs:
           ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
           outcome='${{ steps.installer.outcome }}'
-          if [ -z "$outcome" ]; then
-            echo "installer step did not run (an earlier step failed) — nothing to assert."
-            exit 0
-          fi
-          if [ "$outcome" != failure ]; then
-            echo "::error::install.sh succeeded under WSL2 (outcome=$outcome) — the is_wsl() early-exit no longer fires. If #326 has been resolved and WSL2 bring-up is now genuinely supported, replace this assertion with a must-pass bring-up check; otherwise this is a regression."
-            exit 1
-          fi
+          case "$outcome" in
+            failure) ;;
+            success)
+              echo "::error::install.sh succeeded under WSL2 (outcome=$outcome) — the is_wsl() early-exit no longer fires. If #326 has been resolved and WSL2 bring-up is now genuinely supported, replace this assertion with a must-pass bring-up check; otherwise this is a regression."
+              exit 1 ;;
+            *)
+              echo "installer step did not complete (outcome=${outcome:-unset}); see the earlier failing step for the real error."
+              exit 0 ;;
+          esac
           rc=$(cat _installer.rc 2>/dev/null || echo "")
           if [ "$rc" != "1" ]; then
             echo "::error::install.sh exited $rc, expected 1 (die() from the WSL2 early-exit)."
