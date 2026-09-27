@@ -153,6 +153,9 @@ jobs:
           set -x
           sw_vers
           uname -m
+          # kern.hv_support is an Intel-only sysctl OID; it doesn't exist
+          # on Apple Silicon at all (confirmed: "unknown oid" there), so
+          # it can't be used to detect Hypervisor.framework access here.
           sysctl kern.hv_support || true
           brew --version
           command -v podman || true
@@ -160,34 +163,43 @@ jobs:
       - name: Run installer and classify the result
         run: |
           set -x
-          hv_support="$(sysctl -n kern.hv_support 2>/dev/null || echo unknown)"
           LOG="$(mktemp)"
           set +e
           bash scripts/install.sh --no-pull --skip-model-pull --yes --no-start >"$LOG" 2>&1
           install_status=$?
           set -e
           cat "$LOG"
-          echo "install.sh exit status: $install_status, kern.hv_support: $hv_support"
+          echo "install.sh exit status: $install_status"
+          podman machine list --format '{{.Name}} {{.VMType}}' 2>/dev/null || true
 
           if podman machine list --format '{{.Running}}' 2>/dev/null | grep -qi true; then
-            echo "::warning::podman machine is RUNNING on a GitHub-hosted arm64 runner (kern.hv_support=$hv_support). This isn't supposed to be possible today per GitHub's docs — see docs/ci/macos-podman-bringup.md. If this keeps happening, promote this job into a full pod bring-up test."
+            echo "::warning::podman machine is RUNNING on a GitHub-hosted arm64 runner. This isn't supposed to be possible today per GitHub's docs — see docs/ci/macos-podman-bringup.md. If this keeps happening, promote this job into a full pod bring-up test."
             podman machine list
             podman info | head -40
             exit 0
           fi
 
-          if grep -q 'krunkit: executable file not found' "$LOG"; then
-            echo "::error::krunkit is missing from PATH even though scripts/install.sh's ensure_krunkit_macos() should have installed it. This is a real regression, not the known virtualization gap — see docs/ci/macos-podman-bringup.md."
+          if grep -qE 'executable file not found|could not find "' "$LOG"; then
+            echo "::error::install.sh is missing a binary it should have installed itself (see the log above) — a real packaging regression, not the known virtualization gap. See docs/ci/macos-podman-bringup.md."
             exit 1
           fi
 
-          if [ "$hv_support" = "0" ]; then
-            echo "::notice::podman machine did not come up because kern.hv_support=0 (no Hypervisor.framework access on this runner) — the known, tracked gap. See docs/ci/macos-podman-bringup.md."
-            exit 0
+          if ! command -v podman >/dev/null 2>&1; then
+            echo "::error::podman itself never got installed by install.sh — a real regression, not the known virtualization gap. See the log above and docs/ci/macos-podman-bringup.md."
+            exit 1
           fi
 
-          echo "::error::podman machine did not come up, and kern.hv_support=$hv_support (not the known 0 case). This may be a real regression — see the log above and docs/ci/macos-podman-bringup.md."
-          exit 1
+          if ! command -v krunkit >/dev/null 2>&1; then
+            echo "::error::krunkit never got installed by install.sh's ensure_krunkit_macos() on arm64 — a real regression, not the known virtualization gap. See the log above and docs/ci/macos-podman-bringup.md."
+            exit 1
+          fi
+
+          if ! grep -q 'starting podman machine' "$LOG"; then
+            echo "::error::install.sh never reached the podman-machine-start step at all (see the log above) — that's earlier than the known virtualization gap and is a real regression. See docs/ci/macos-podman-bringup.md."
+            exit 1
+          fi
+
+          echo "::notice::podman, krunkit and install.sh's own machine-bring-up step all worked; only the actual machine start failed — the known, tracked GitHub-hosted-runner virtualization gap. See docs/ci/macos-podman-bringup.md."
 
       - name: Tear down
         if: always()
@@ -201,7 +213,7 @@ jobs:
     # (applehv provider) behave differently. Not wired into the gate.
     # See docs/ci/macos-podman-bringup.md.
     runs-on: macos-15-intel
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       CONTAINERS_MACHINE_PROVIDER: applehv
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -218,7 +230,10 @@ jobs:
       - name: Install podman
         run: |
           set -x
-          brew install podman
+          # No podman formula bottle exists for macOS Intel (Tier 3,
+          # confirmed by a real run: "podman: no bottle available!") --
+          # only arm64 and Linux are bottled. Build from source instead.
+          brew install --build-from-source podman
           podman --version
 
       - name: Attempt podman machine bring-up (applehv provider)
