@@ -2,8 +2,9 @@
 //!
 //! A commit made by an agent ends with the trailer
 //! `Nanna-Identity: <name>`; a pull request body carries the same name in
-//! a hidden HTML comment. The CI guard in `docs/ci/protected-paths-guard.yml`
-//! and the scheduler read it back with [`parse_identity_from_text`].
+//! a hidden HTML comment. The CI guard in
+//! `.github/workflows/protected-paths-guard.yml` and the scheduler read it
+//! back with [`parse_identity_from_text`].
 //!
 //! ```
 //! use harness::marker::{parse_identity_from_text, render_html_marker, render_trailer};

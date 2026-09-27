@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn the_ci_guard_lists_every_protected_pattern_and_reads_the_identity_marker() {
-        let guard = include_str!("../../docs/ci/protected-paths-guard.yml");
+        let guard = include_str!("../../.github/workflows/protected-paths-guard.yml");
         for pattern in PROTECTED_PATTERNS {
             let quoted = format!("\"{pattern}\"");
             assert!(
