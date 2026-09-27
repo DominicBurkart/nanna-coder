@@ -209,7 +209,7 @@ jobs:
           podman machine stop || true
 
   windows-bringup:
-    name: Windows full bring-up (WSL2 + native apt podman)
+    name: Windows install.sh WSL2 rejection (expected; #326)
     runs-on: windows-latest
     needs: build-images
     timeout-minutes: 30
@@ -260,13 +260,12 @@ jobs:
           podman load -i _images/ollama.tar
           podman images
 
-      # install.sh's is_wsl() (scripts/install.sh) correctly detects WSL2 and
-      # dies before touching podman: WSL2's kernel doesn't provide the
-      # /run/netns/ bind-mount path podman pod creation needs. That die() is
-      # the CORRECT outcome for this job, not a bug — see #326. `tee` +
-      # PIPESTATUS captures install.sh's own exit code (not tee's) so the
-      # assertion step below can check it precisely, mirroring the
-      # `expected-failure (negative test)` pattern in ci-integration.yml.
+      # install.sh's WSL2 die() (see is_wsl() in scripts/install.sh) is the
+      # correct outcome here, not a bug — #326. `|| rc=$?` keeps the
+      # wsl-bash wrapper's inherited `-e` from short-circuiting before we
+      # capture install.sh's own exit code (pipefail makes `$?` reflect
+      # install.sh, not tee) for the assertion step below to check,
+      # mirroring `expected-failure (negative test)` in ci-integration.yml.
       - name: Run installer inside WSL
         id: installer
         continue-on-error: true
@@ -275,21 +274,18 @@ jobs:
           set -uo pipefail
           ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
+          rc=0
           bash scripts/install.sh \
             --no-pull --skip-model-pull --yes \
             --harness-image nanna-coder-harness:latest \
             --ollama-image  nanna-coder-ollama:latest \
-            2>&1 | tee _installer.log
-          rc=${PIPESTATUS[0]}
+            2>&1 | tee _installer.log || rc=$?
           echo "$rc" > _installer.rc
           exit "$rc"
 
-      # Passes when install.sh's WSL2 early-exit fires exactly as designed
-      # (exit 1 + the expected die() message): that's the correct, by-design
-      # result today. Fails for real if install.sh unexpectedly succeeds
-      # (the netns blocker may be gone — #326's acceptance criteria says to
-      # flip this job to a must-pass bring-up check at that point) or if it
-      # fails for any other reason.
+      # Passes only on the known-expected result (exit 1 + the die()
+      # message); fails for real on anything else, including an unexpected
+      # success (which would mean the #326 blocker is gone).
       - name: Assert installer result (WSL2 early-exit; #326)
         if: always()
         shell: wsl-bash {0}
@@ -319,9 +315,7 @@ jobs:
           fi
           echo "install.sh correctly detected WSL2 (exit 1, expected message) and rejected it early — expected, by-design result (#326)."
 
-      # Only meaningful once install.sh actually starts the pod, which
-      # happens only if the WSL2 early-exit above did NOT fire (i.e. the
-      # unexpected-success branch that the assertion step already flags).
+      # Nothing to verify unless install.sh got past the WSL2 early-exit.
       - name: Verify pod and ollama API inside WSL
         if: always() && steps.installer.outcome == 'success'
         shell: wsl-bash {0}
