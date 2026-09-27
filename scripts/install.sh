@@ -611,8 +611,42 @@ wait_for_ollama() {
   ok "ollama API is up"
 }
 
+check_ollama_version() {
+  local raw version
+  raw=$(podman exec ollama-service ollama --version 2>/dev/null || true)
+  version=$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [[ -z "$version" ]]; then
+    warn "could not determine Ollama version in the container — proceeding anyway"
+    return 0
+  fi
+  local major minor
+  major=$(printf '%s' "$version" | cut -d. -f1)
+  minor=$(printf '%s' "$version" | cut -d. -f2)
+  if [[ "$major" -eq 0 && "$minor" -lt 16 ]]; then
+    cat >&2 <<EOF
+
+${C_RED}${C_BOLD}✗ Ollama version too old ($version) to pull $MODEL${C_RESET}
+
+  The $MODEL model requires Ollama ≥ 0.16. The container running in the pod
+  has Ollama $version, which means the published image in the registry is stale.
+
+  Fix: rebuild and republish the ollama container image from the nanna-coder
+  repo (nix build .#ollamaImage then push to the registry), or pull a model
+  compatible with Ollama $version instead:
+
+    podman exec ollama-service ollama pull qwen3:0.6b
+
+  You can also override the image at install time:
+    --ollama-image docker.io/ollama/ollama:latest
+
+EOF
+    exit 1
+  fi
+}
+
 pull_model() {
   log "pulling model $MODEL into the running ollama container (this is the multi-GB step)..."
+  check_ollama_version
   podman exec ollama-service ollama pull "$MODEL"
   ok "model $MODEL ready"
 }
