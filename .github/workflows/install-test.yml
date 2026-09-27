@@ -133,6 +133,17 @@ jobs:
           podman pod stop nanna-coder-pod || true
           podman pod rm   nanna-coder-pod || true
 
+  fast-checks-passed:
+    name: Fast checks passed (gates macOS/Windows runners)
+    runs-on: ubuntu-latest
+    needs:
+      - shellcheck
+      - ps1-lint
+      - ps1-parse
+      - linux-bringup
+    steps:
+      - run: echo "shellcheck, ps1-lint, ps1-parse and linux-bringup all passed."
+
   macos-smoke:
     name: macOS install smoke test (arm64, expected virtualization gap)
     # GitHub-hosted arm64 macOS runners don't expose Hypervisor.framework
@@ -147,6 +158,7 @@ jobs:
     # entitlements problem, an image-pull failure, etc.); only real
     # hardware can. See docs/ci/macos-podman-bringup.md.
     runs-on: macos-15
+    needs: fast-checks-passed
     timeout-minutes: 15
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -217,6 +229,7 @@ jobs:
     # the gate: Intel-hosted runners have historically had long queue
     # times on this repo. See docs/ci/macos-podman-bringup.md.
     runs-on: macos-15-intel
+    needs: fast-checks-passed
     timeout-minutes: 15
     env:
       CONTAINERS_MACHINE_PROVIDER: applehv
@@ -270,7 +283,7 @@ jobs:
   windows-bringup:
     name: "Windows install.sh WSL2 rejection (expected; issue 326)"
     runs-on: windows-latest
-    needs: build-images
+    needs: fast-checks-passed
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -407,11 +420,32 @@ jobs:
       - ps1-parse
       - build-images
       - linux-bringup
+      - fast-checks-passed
       - macos-smoke
       - windows-bringup
     steps:
-      # Gate enforces success on Linux + the lint/build jobs, plus
-      # macos-smoke and windows-bringup, both now required outright:
+      - uses: actions/checkout@v4
+
+      - name: Verify gate covers every job
+        run: |
+          set -euo pipefail
+          # macos-intel-probe is deliberately non-blocking; see its job comment.
+          excluded=(install-test-gate macos-intel-probe)
+          all_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/install-test.yml | sort)
+          gate_needs=$(yq -r '.jobs["install-test-gate"].needs | .[]' .github/workflows/install-test.yml | sort)
+          expected=$(comm -23 <(echo "$all_jobs") <(printf '%s\n' "${excluded[@]}" | sort))
+          missing=$(comm -23 <(echo "$expected") <(echo "$gate_needs") || true)
+          if [ -n "$missing" ]; then
+            echo "::error::Jobs missing from 'install-test-gate'.needs:"
+            echo "$missing"
+            echo "Add them to .github/workflows/install-test.yml under jobs.install-test-gate.needs (or to the excluded list above if they're intentionally non-blocking)"
+            exit 1
+          fi
+          echo "OK: all $(echo "$expected" | wc -l | tr -d ' ') required jobs covered"
+
+      # fast-checks-passed transitively covers shellcheck/ps1-lint/ps1-parse/
+      # build-images/linux-bringup; macos-smoke and windows-bringup are
+      # checked directly since they're not upstream of fast-checks-passed:
       #
       # macos-smoke: its classifier has now been checked against real
       # macos-15 runs (podman installed cleanly from a Homebrew bottle,
@@ -432,7 +466,7 @@ jobs:
       # runners have historically had long queue times on this repo, so
       # the gate shouldn't wait on it. Its result is still visible as its
       # own check on the PR.
-      - if: ${{ needs.shellcheck.result != 'success' || needs.ps1-lint.result != 'success' || needs.ps1-parse.result != 'success' || needs.build-images.result != 'success' || needs.linux-bringup.result != 'success' || needs.macos-smoke.result != 'success' || needs.windows-bringup.result != 'success' }}
+      - if: ${{ needs.fast-checks-passed.result != 'success' || needs.macos-smoke.result != 'success' || needs.windows-bringup.result != 'success' }}
         run: |
           echo "::error::Required install-test job failed"
           exit 1
