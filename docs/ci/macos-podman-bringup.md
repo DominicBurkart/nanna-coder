@@ -18,48 +18,37 @@ Homebrew formula name).
 
 ## What was actually broken
 
-The job's failure was masking two separate problems:
+The job's failure was masking three separate problems:
 
 1. **A typo'd formula name.** `brew install podman libkrun` failed in
    ~30 seconds because no Homebrew formula named `libkrun` has ever
-   existed. The correct package for a libkrun-backed podman machine
-   provider is `krunkit`, from a dedicated tap:
-   ```
-   brew tap libkrun/krun
-   brew install krunkit
-   ```
-   (verified against the tap's own `Formula/krunkit.rb` at
-   [libkrun/homebrew-krun](https://github.com/libkrun/homebrew-krun) —
-   note the tap moved from the older `slp/krun` name; even
-   [krunkit's own README](https://github.com/containers/krunkit/blob/main/README.md)
-   still documents the stale `slp/krun` tap as of this writing, so trust
-   the tap repo's own README over krunkit's). Homebrew 6.0 (June 2026)
-   also requires trusting
-   third-party taps before installing from them
-   ([docs.brew.sh/Tap-Trust](https://docs.brew.sh/Tap-Trust)):
-   `brew trust libkrun/krun`.
-2. **A real, still-open gap for the `libkrun` opt-in path.** Upstream
-   podman 6 changed the *default* macOS machine provider to `libkrun`,
-   but **Homebrew's own `podman` formula patches that back out** — its
-   build log (from the first real `macos-intel-probe` run) shows it
-   downloading `Patches/podman/revert-libkrun-default.patch` before
-   building. Confirmed independently: the first real `macos-smoke` run's
-   `podman machine list --format '{{.Name}} {{.VMType}}'` reported
-   `podman-machine-default* applehv` — a bare `podman machine init` on
-   Homebrew's podman 6.1.1 still creates an `applehv` machine, not
-   `libkrun`, even with `krunkit` already on `PATH`. So this is *not*
-   what breaks a default install. What it *does* break: Homebrew's
-   `podman` formula still doesn't depend on `krunkit`, so anyone who
-   explicitly runs `podman machine init --provider libkrun` (or inherits
-   an old machine already configured that way) hits
-   `krunkit: executable file not found in $PATH`
-   ([Homebrew/homebrew-core#291552](https://github.com/homebrew/homebrew-core/issues/291552),
-   open, unresolved as of this writing — and reproduced by a real
-   `macos-intel-probe` build log, not just the issue report).
-   `scripts/install.sh` now has a standalone `ensure_krunkit_macos()`
-   step that installs `krunkit` on `arm64` whenever it's missing, so
-   that opt-in path works. It doesn't change what a default install
-   does (see finding 3's actual failure below).
+   existed.
+2. **A real, but narrower than it first looked, gap for the `libkrun`
+   opt-in path.** Upstream podman 6 briefly changed the *default* macOS
+   machine provider to `libkrun`, which broke installs missing the
+   separate `krunkit` binary
+   ([Homebrew/homebrew-core#291552](https://github.com/homebrew/homebrew-core/issues/291552)).
+   That issue is **closed/completed**, not open — Homebrew's maintainers
+   explicitly rejected bundling `krunkit` ("We will not accept a
+   non-core dependency (krunkit) on a core formula (podman)") and
+   instead reverted the default back to `applehv`
+   ([homebrew-core#292238](https://github.com/Homebrew/homebrew-core/pull/292238)).
+   Confirmed independently by two real runs: a `macos-intel-probe`
+   build log shows Homebrew downloading
+   `Patches/podman/revert-libkrun-default.patch`, and a `macos-smoke`
+   run's `podman machine list --format '{{.Name}} {{.VMType}}'` reports
+   `podman-machine-default* applehv` for a bare `podman machine init`
+   with no provider flag. So **`scripts/install.sh` never actually hit
+   this on a default install** — it only affects someone who explicitly
+   opts into `--provider libkrun`, or inherits an old machine already
+   configured that way. `scripts/install.sh`'s `ensure_krunkit_macos()`
+   now installs `krunkit` only when `CONTAINERS_MACHINE_PROVIDER=libkrun`
+   is set or an existing machine's `VMType` is already `libkrun` — not
+   unconditionally on every Apple Silicon install, which would have
+   meant tapping a third-party repo, auto-running `brew trust` (a
+   decision Homebrew 6 deliberately puts in the user's hands), and
+   pulling ~140MB of dependencies for a provider the script never
+   actually selects.
 3. **A third, previously-unreachable bug**, found by the first real
    `macos-smoke` run against this fix: `scripts/install.sh`'s
    `port_in_use_by()` uses `lsof -nP -iTCP:"$port" -sTCP:LISTEN`, which
@@ -75,12 +64,13 @@ The job's failure was masking two separate problems:
 Fixing (1)-(3) does **not** make `macos-smoke` a full bring-up test
 again. It makes the job fail for the right reason.
 
-## What the fixed job actually shows (real `macos-15` run)
+## What the fixed job actually shows (real `macos-15` runs)
 
-With (1)-(3) fixed, `macos-smoke` passes, and its log is the real
-confirmation this document is built on: `podman` (6.1.1) and `krunkit`
-(1.3.2, plus its 7 dependencies) both installed cleanly from Homebrew
-bottles in seconds, `podman machine init` succeeded, and then:
+With (1) and (3) fixed, `macos-smoke` passes. The run that pinned this
+down installed `podman` (6.1.1) and (under the since-corrected
+unconditional `ensure_krunkit_macos()`) `krunkit` (1.3.2, plus its 7
+dependencies) cleanly from Homebrew bottles in seconds, then
+`podman machine init` succeeded, and then:
 
 ```
 ==> starting podman machine...
@@ -93,7 +83,10 @@ described before this job started dying on the formula typo first
 ("applehv/vfkit aborts on start ... verified rounds 7/8") — now
 independently reconfirmed with real evidence instead of institutional
 memory. `podman machine list --format '{{.Name}} {{.VMType}}'` reported
-`podman-machine-default* applehv`, matching finding (2) above.
+`podman-machine-default* applehv`, matching finding (2) above. (Later
+runs, after `ensure_krunkit_macos()` was gated on actually wanting
+`libkrun`, don't install `krunkit` at all on this path — consistent
+with `VMType: applehv` being what actually gets used.)
 
 ## Why no provider works on GitHub-hosted arm64 runners
 
@@ -163,14 +156,12 @@ diagnostic, not (yet) a working bring-up.
 
 ### Option A: the maintainer's own Apple Silicon hardware
 
-Run the real install path by hand on real hardware:
+Run `scripts/install.sh` itself, on a Mac with no existing podman
+machine, exactly as a real user would — this exercises the script's own
+`install_podman_macos()`/`ensure_podman_machine_macos()` path (and
+`wants_libkrun_macos()`'s decision), not a hand-rolled substitute for it:
 
 ```
-brew tap libkrun/krun
-brew trust libkrun/krun
-brew install podman krunkit
-podman machine init --cpus=2 --memory=3072 --disk-size=10
-podman machine start
 bash scripts/install.sh --no-pull --skip-model-pull --yes \
   --harness-image <ref> --ollama-image <ref>
 ```
@@ -178,9 +169,12 @@ bash scripts/install.sh --no-pull --skip-model-pull --yes \
 This is the fastest, lowest-risk way to confirm the real macOS install
 path works, since it needs no GitHub configuration and carries none of
 the security exposure of Option B. It's a one-time manual check, not
-something that needs to become recurring CI — the actual podman machine
-provider logic in `scripts/install.sh` doesn't otherwise differ by OS
-version in a way that would silently regress between checks.
+something that needs to become recurring CI — but it *is* worth
+re-running after any Homebrew-side change to podman: this investigation
+found three unannounced Homebrew packaging changes in 2026 alone (the
+libkrun-default flip and its revert, Intel macOS support dropping from
+the `podman` formula, and third-party-tap trust becoming mandatory in
+Homebrew 6.0), so "doesn't change" is not a safe assumption here.
 
 ### Option B: a self-hosted runner on real Apple Silicon hardware
 
