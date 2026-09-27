@@ -137,3 +137,94 @@ jobs:
           eval-results.md
           eval-output.txt
         if-no-files-found: warn
+
+  sdlc-e2e:
+    name: Run SDLC End-to-End Eval
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\.tar\.gz$)"
+
+    - name: Build harness-sdlc-eval
+      run: nix develop --command cargo build --release -p harness --bin harness-sdlc-eval --features eval-runner
+
+    - name: Run SDLC end-to-end eval
+      id: sdlc_eval
+      env:
+        EVAL_COMMIT_SHA: ${{ github.sha }}
+        EVAL_TRIGGERED_BY: ${{ github.actor }}
+        EVAL_PR_NUMBER: ${{ inputs.pr_number }}
+      run: |
+        echo "## SDLC End-to-End Eval" > sdlc-eval-results.md
+        echo "" >> sdlc-eval-results.md
+        echo "**Commit:** \`$EVAL_COMMIT_SHA\`" >> sdlc-eval-results.md
+        echo "**Triggered by:** @$EVAL_TRIGGERED_BY" >> sdlc-eval-results.md
+        echo "" >> sdlc-eval-results.md
+        echo "### issue -> planner -> implementer PR -> shepherd promotes -> deploy" >> sdlc-eval-results.md
+        echo '```' >> sdlc-eval-results.md
+
+        set +e
+        PR_ARGS=()
+        if [ -n "$EVAL_PR_NUMBER" ]; then
+          PR_ARGS=(--pr "$EVAL_PR_NUMBER")
+        fi
+        nix develop --command ./target/release/harness-sdlc-eval \
+          --scorecard-path evals/scorecards/sdlc_e2e.jsonl \
+          "${PR_ARGS[@]}" \
+          2>&1 | tee sdlc-eval-output.txt
+        EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+
+        cat sdlc-eval-output.txt >> sdlc-eval-results.md
+        echo '```' >> sdlc-eval-results.md
+
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+          echo "" >> sdlc-eval-results.md
+          echo "**Status: PASSED**" >> sdlc-eval-results.md
+        else
+          echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          echo "" >> sdlc-eval-results.md
+          echo "**Status: FAILED** (see logs above)" >> sdlc-eval-results.md
+        fi
+
+    - name: Write SDLC eval summary
+      if: always()
+      run: cat sdlc-eval-results.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post SDLC eval results as PR comment
+      if: inputs.pr_number != ''
+      uses: peter-evans/create-or-update-comment@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        issue-number: ${{ inputs.pr_number }}
+        body-path: sdlc-eval-results.md
+
+    - name: Upload SDLC eval results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdlc-eval-results
+        path: |
+          sdlc-eval-results.md
+          sdlc-eval-output.txt
+          evals/scorecards/sdlc_e2e.jsonl
+        if-no-files-found: warn
+
+    - name: Fail if the scenario did not succeed
+      if: steps.sdlc_eval.outputs.outcome != 'success'
+      run: exit 1
