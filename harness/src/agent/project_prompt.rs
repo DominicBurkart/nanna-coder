@@ -36,6 +36,7 @@
 //! body and `frontmatter` is [`Default`]. Unknown keys in the front-matter
 //! are rejected (`#[serde(deny_unknown_fields)]`) so typos surface early.
 
+use crate::onboarding::fullstack::FullStackRust;
 use serde::Deserialize;
 use std::fs;
 use std::io;
@@ -101,6 +102,85 @@ pub fn load(workspace_root: &Path) -> io::Result<Option<ProjectPromptDoc>> {
 
     let raw = fs::read_to_string(&path)?;
     parse(&raw).map(Some)
+}
+
+/// Short description of a full-stack Rust workspace for the system prompt:
+/// which member serves the API, which is the frontend, how the frontend
+/// reaches the backend, whether a database is present and where the health
+/// endpoint is.
+///
+/// ```
+/// use harness::agent::project_prompt::topology_paragraph;
+/// use harness::onboarding::fullstack::FullStackRust;
+/// use std::path::Path;
+///
+/// let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+/// let profile = FullStackRust::detect(&fixture).unwrap().unwrap();
+/// let text = topology_paragraph(&profile);
+/// assert!(text.contains("`api` crate"));
+/// assert!(text.contains("`trunk build`"));
+/// assert!(text.contains("DATABASE_URL"));
+/// ```
+pub fn topology_paragraph(profile: &FullStackRust) -> String {
+    let api = &profile.api;
+    let frontend = &profile.frontend;
+    let mut text = format!(
+        "This repository is a full-stack Rust workspace. The `{}` crate (`{}/`) is the actix-web \
+         backend binary; start it with `cargo run --bin {}`. The `{}` crate (`{}/`) is the dioxus \
+         web frontend, compiled to WebAssembly with `trunk build` inside `{}/` into static assets \
+         that the backend serves.",
+        api.name,
+        api.path.display(),
+        api.name,
+        frontend.name,
+        frontend.path.display(),
+        frontend.path.display()
+    );
+    if profile.proxy_backends.is_empty() {
+        text.push_str(" The frontend calls the backend over HTTP on the same origin.");
+    } else {
+        let proxies = profile.proxy_backends.join(", ");
+        text.push_str(&format!(
+            " In development `trunk serve` proxies {proxies} to the backend; the built frontend \
+             calls the backend over HTTP on the same origin."
+        ));
+    }
+    if !profile.shared.is_empty() {
+        let names: Vec<String> = profile
+            .shared
+            .iter()
+            .map(|m| format!("`{}`", m.name))
+            .collect();
+        text.push_str(&format!(" Shared code lives in {}.", names.join(", ")));
+    }
+    match &profile.database {
+        Some(db) => {
+            text.push_str(" The backend uses a Postgres database");
+            if db.sqlx_postgres {
+                text.push_str(" through sqlx");
+            }
+            if let Some(dir) = &db.migrations_dir {
+                text.push_str(&format!(" with migrations in `{}/`", dir.display()));
+            }
+            text.push_str(
+                "; `DATABASE_URL` in this container points at a database reserved for this task.",
+            );
+        }
+        None => text.push_str(" There is no database."),
+    }
+    text.push_str(&format!(
+        " The health endpoint is `{}`.",
+        profile.health_path()
+    ));
+    text
+}
+
+/// Topology paragraph for `workspace_root`, or `None` when the workspace is
+/// not a full-stack Rust workspace.
+pub fn topology_for_workspace(workspace_root: &Path) -> io::Result<Option<String>> {
+    let profile = FullStackRust::detect(workspace_root)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(profile.as_ref().map(topology_paragraph))
 }
 
 /// Parse a raw prompt-file string into a [`ProjectPromptDoc`].
@@ -206,6 +286,94 @@ mod tests {
         let nanna = dir.join(".nanna");
         fs::create_dir_all(&nanna).unwrap();
         fs::write(nanna.join("prompt.md"), contents).unwrap();
+    }
+
+    fn fixture_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack")
+    }
+
+    fn write_workspace(dir: &Path, ui_manifest_extra: &str) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"api\", \"ui\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("api/src")).unwrap();
+        fs::write(
+            dir.join("api/Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n\n[dependencies]\nactix-web = \"4\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("api/src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(dir.join("ui")).unwrap();
+        fs::write(
+            dir.join("ui/Cargo.toml"),
+            format!(
+                "[package]\nname = \"ui\"\nversion = \"0.1.0\"\n\n[dependencies]\ndioxus = {{ version = \"0.7\", features = [\"web\"] }}\n{ui_manifest_extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("ui/index.html"), "").unwrap();
+    }
+
+    #[test]
+    fn topology_paragraph_for_fixture_names_every_part() {
+        let text = topology_for_workspace(&fixture_root()).unwrap().unwrap();
+        assert!(text.contains("The `api` crate (`api/`) is the actix-web backend binary"));
+        assert!(text.contains("`cargo run --bin api`"));
+        assert!(text.contains("The `ui` crate (`ui/`) is the dioxus web frontend"));
+        assert!(text.contains("`trunk build` inside `ui/`"));
+        assert!(text.contains(
+            "`trunk serve` proxies http://127.0.0.1:8080/api/, http://127.0.0.1:8080/health/ to the backend"
+        ));
+        assert!(text.contains("Shared code lives in `shared`."));
+        assert!(text.contains(
+            "uses a Postgres database through sqlx with migrations in `migrations/`; `DATABASE_URL`"
+        ));
+        assert!(text.contains("The health endpoint is `/health/v1`."));
+    }
+
+    #[test]
+    fn topology_paragraph_without_database_proxies_or_shared_crates() {
+        let dir = tempdir().unwrap();
+        write_workspace(dir.path(), "");
+        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        assert!(text.contains("calls the backend over HTTP on the same origin."));
+        assert!(!text.contains("trunk serve"));
+        assert!(!text.contains("Shared code"));
+        assert!(text.contains(" There is no database."));
+        assert!(text.contains("The health endpoint is `/health/v1`."));
+    }
+
+    #[test]
+    fn topology_paragraph_describes_migrations_without_sqlx() {
+        let dir = tempdir().unwrap();
+        write_workspace(dir.path(), "");
+        fs::create_dir_all(dir.path().join("migrations")).unwrap();
+        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        assert!(text.contains("uses a Postgres database with migrations in `migrations/`;"));
+        assert!(!text.contains("through sqlx"));
+    }
+
+    #[test]
+    fn topology_paragraph_describes_sqlx_without_migrations() {
+        let dir = tempdir().unwrap();
+        write_workspace(
+            dir.path(),
+            "sqlx = { version = \"0.8\", features = [\"postgres\"] }\n",
+        );
+        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        assert!(text.contains("uses a Postgres database through sqlx; `DATABASE_URL`"));
+        assert!(!text.contains("migrations in"));
+    }
+
+    #[test]
+    fn topology_is_none_for_plain_workspace_and_error_for_bad_manifest() {
+        let dir = tempdir().unwrap();
+        assert!(topology_for_workspace(dir.path()).unwrap().is_none());
+        fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
+        let err = topology_for_workspace(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

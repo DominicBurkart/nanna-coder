@@ -1,6 +1,8 @@
 use crate::container::{
-    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle,
+    cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
+    ContainerHandle,
 };
+use crate::sidecar::SidecarSet;
 use crate::tools::{
     create_container_tool_registry, create_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR,
 };
@@ -9,6 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -51,6 +54,7 @@ pub struct TaskWorkspace {
     pub source_repo: PathBuf,
     pub task_id: String,
     container_handle: Option<Arc<crate::container::ContainerHandle>>,
+    sidecars: Option<SidecarSet>,
     cleaned_up: bool,
 }
 
@@ -74,6 +78,7 @@ impl TaskWorkspace {
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: None,
+            sidecars: None,
             cleaned_up: false,
         })
     }
@@ -84,11 +89,27 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_container_and_sidecars(source_repo, task_id, branch, image_ref, None)
+            .await
+    }
+
+    /// Like [`Self::create_with_container`], but the dev container joins the
+    /// network of an already started [`SidecarSet`] and receives the
+    /// environment the sidecars export (for example `DATABASE_URL`). The
+    /// workspace owns the set and tears it down in [`Self::cleanup`].
+    pub async fn create_with_container_and_sidecars(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        sidecars: Option<SidecarSet>,
+    ) -> Result<Self, WorkspaceError> {
         Self::create_with_container_using(
             source_repo,
             task_id,
             branch,
             image_ref,
+            sidecars,
             |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
         )
         .await
@@ -105,6 +126,7 @@ impl TaskWorkspace {
         task_id: &str,
         branch: &str,
         image_ref: &str,
+        sidecars: Option<SidecarSet>,
         start_fn: F,
     ) -> Result<Self, WorkspaceError>
     where
@@ -143,10 +165,15 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let additional_args = vec![format!(
-            "-v={}:{CONTAINER_WORKSPACE_DIR}",
+        let mut additional_args = vec![format!(
+            "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
             workspace_path.display()
         )];
+        let mut env_vars = vec![];
+        if let Some(set) = &sidecars {
+            additional_args.extend(set.container_args());
+            env_vars.extend(set.exports().iter().cloned());
+        }
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),
@@ -156,7 +183,7 @@ impl TaskWorkspace {
             model_to_pull: None,
             startup_timeout: Duration::from_secs(30),
             health_check_timeout: Duration::from_secs(10),
-            env_vars: vec![],
+            env_vars,
             additional_args,
         };
 
@@ -173,15 +200,38 @@ impl TaskWorkspace {
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: Some(Arc::new(handle)),
+            sidecars,
             cleaned_up: false,
         })
     }
 
+    /// Environment the sidecars export into the dev container, empty when
+    /// the workspace has no sidecars.
+    pub fn sidecar_env(&self) -> &[(String, String)] {
+        self.sidecars.as_ref().map_or(&[], |s| s.exports())
+    }
+
+    /// Remove the worktree, the dev container and any sidecars.
+    ///
+    /// The dev container is removed explicitly rather than through the last
+    /// `Arc<ContainerHandle>` drop, because tool registries built from this
+    /// workspace keep their own reference to the handle and may outlive it;
+    /// the sidecar network can only be removed once the container has left it.
     pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
         if self.cleaned_up {
             return Ok(());
         }
-        drop(self.container_handle.take());
+        if let Some(handle) = self.container_handle.take() {
+            if handle.needs_cleanup {
+                if let Err(e) = cleanup_container(&handle) {
+                    warn!(
+                        "dev container cleanup for task {} failed: {e}",
+                        self.task_id
+                    );
+                }
+            }
+        }
+        drop(self.sidecars.take());
         let output = git_cmd(&self.source_repo)
             .args([
                 "worktree",
@@ -468,6 +518,7 @@ mod tests {
             &unique_id("ws-using-ok"),
             "HEAD",
             "mock-image:latest",
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Ok(ContainerHandle {
                     name: "mock-container".to_string(),
@@ -499,6 +550,7 @@ mod tests {
             &unique_id("ws-using-fail"),
             "HEAD",
             "bad-image:latest",
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
             },
@@ -525,6 +577,7 @@ mod tests {
             &unique_id("ws-worktree-fail"),
             "HEAD",
             "mock-image:latest",
+            None,
             |_config: crate::container::ContainerConfig| async {
                 use crate::container::{ContainerHandle, ContainerRuntime};
                 Ok(ContainerHandle {
@@ -541,6 +594,106 @@ mod tests {
             result,
             Err(WorkspaceError::GitWorktreeCreateFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_sidecars_injects_env_and_network() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::sidecar::{PostgresSidecar, ReadinessConfig, SidecarSet};
+        use std::sync::Mutex;
+
+        struct RecordingRunner;
+        impl crate::sidecar::CommandRunner for RecordingRunner {
+            fn run(&self, _: &str, _: &[String]) -> std::io::Result<crate::sidecar::RunOutput> {
+                Ok(crate::sidecar::RunOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-sidecars");
+        let specs = vec![PostgresSidecar::with_password(&task_id, "pw").spec()];
+        let set = SidecarSet::start(
+            ContainerRuntime::Stub,
+            Arc::new(RecordingRunner),
+            &task_id,
+            &specs,
+            ReadinessConfig::default(),
+        )
+        .await
+        .unwrap();
+        let expected_network = format!("--network={}", set.network_name());
+        let seen = Arc::new(Mutex::new(None));
+        let seen_in_start = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+            Some(set),
+            |config: ContainerConfig| async move {
+                *seen_in_start.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().take().unwrap();
+        assert!(config.additional_args.contains(&expected_network));
+        assert_eq!(config.env_vars, specs[0].exports);
+        assert_eq!(ws.sidecar_env(), specs[0].exports.as_slice());
+        ws.cleanup().unwrap();
+        assert!(ws.sidecars.is_none());
+        assert!(ws.sidecar_env().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_removes_container_even_when_registry_holds_a_reference() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-stub"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "stub-handle".to_string(),
+            runtime: ContainerRuntime::Stub,
+            port: None,
+            needs_cleanup: true,
+        }));
+        let registry = ws.build_tool_registry();
+        ws.cleanup().unwrap();
+        assert!(ws.container_handle.is_none());
+        assert!(registry.get_tool("run_command").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_tolerates_container_removal_failure() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-fail"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Docker,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
     }
 
     #[test]

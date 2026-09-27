@@ -1,4 +1,5 @@
 use super::OnboardingError;
+use crate::onboarding::fullstack::{FullStackRust, WASM_TARGET};
 use crate::onboarding::profile::{
     BuildSystem, ProjectProfile, ToolCategory, ToolSpec, DEFAULT_RUST_VERSION,
 };
@@ -19,6 +20,8 @@ pub struct ProjectSignals {
     pub has_makefile: bool,
     pub has_flake_nix: bool,
     pub top_level_entries: Vec<String>,
+    /// Present when the workspace matches the full-stack Rust profile.
+    pub full_stack: Option<FullStackRust>,
 }
 
 pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
@@ -44,12 +47,15 @@ pub fn scan_project(source: &Path) -> Result<ProjectSignals, OnboardingError> {
         None
     };
 
+    let full_stack = FullStackRust::detect(source)?;
+
     Ok(ProjectSignals {
         cargo_toml,
         has_build_file,
         has_makefile,
         has_flake_nix,
         top_level_entries,
+        full_stack,
     })
 }
 
@@ -182,6 +188,12 @@ impl ProjectSignals {
             nix_packages.push("pkgs.openssl".to_string());
         }
 
+        let mut rust_targets = vec![];
+        if let Some(full_stack) = &self.full_stack {
+            nix_packages.extend(full_stack_packages(full_stack.has_database()));
+            rust_targets.push(WASM_TARGET.to_string());
+        }
+
         let tools = vec![
             ToolSpec::new(
                 "build",
@@ -219,9 +231,25 @@ impl ProjectSignals {
             tools,
             nix_packages,
             rust_version: Some(rust_version),
+            rust_targets,
             extra_env_vars: vec![],
         })
     }
+}
+
+/// Nix packages the full-stack profile adds to the dev container: the trunk
+/// bundler and wasm-bindgen for the frontend, plus the sqlx CLI and the
+/// Postgres client when the workspace uses a database.
+pub fn full_stack_packages(has_database: bool) -> Vec<String> {
+    let mut packages = vec![
+        "pkgs.trunk".to_string(),
+        "pkgs.wasm-bindgen-cli".to_string(),
+    ];
+    if has_database {
+        packages.push("pkgs.sqlx-cli".to_string());
+        packages.push("pkgs.postgresql".to_string());
+    }
+    packages
 }
 
 #[cfg(test)]
@@ -380,6 +408,48 @@ openssl = "0.10"
             .nix_packages
             .contains(&"pkgs.pkg-config".to_string()));
         assert!(profile.nix_packages.contains(&"pkgs.openssl".to_string()));
+    }
+
+    #[test]
+    fn to_cargo_profile_has_no_full_stack_packages_for_plain_crate() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "Cargo.toml",
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        );
+        let profile = scan_project(dir.path())
+            .unwrap()
+            .to_cargo_profile()
+            .unwrap();
+        assert!(!profile.nix_packages.iter().any(|p| p == "pkgs.trunk"));
+        assert!(profile.rust_targets.is_empty());
+    }
+
+    #[test]
+    fn to_cargo_profile_adds_full_stack_packages_and_wasm_target() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+        let profile = scan_project(&fixture).unwrap().to_cargo_profile().unwrap();
+        for pkg in [
+            "pkgs.trunk",
+            "pkgs.wasm-bindgen-cli",
+            "pkgs.sqlx-cli",
+            "pkgs.postgresql",
+        ] {
+            assert!(
+                profile.nix_packages.iter().any(|p| p == pkg),
+                "missing {pkg}"
+            );
+        }
+        assert_eq!(profile.rust_targets, vec![WASM_TARGET.to_string()]);
+    }
+
+    #[test]
+    fn full_stack_packages_without_database_skip_sqlx_and_postgres() {
+        let packages = full_stack_packages(false);
+        assert_eq!(packages, vec!["pkgs.trunk", "pkgs.wasm-bindgen-cli"]);
+        assert_eq!(full_stack_packages(true).len(), 4);
     }
 
     #[test]
