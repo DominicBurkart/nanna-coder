@@ -775,4 +775,18 @@ mod tests {
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
     }
+
+    #[test]
+    fn test_exec_in_container_stub_runtime() {
+        let handle = ContainerHandle {
+            name: "test".to_string(),
+            runtime: ContainerRuntime::Stub,
+            port: None,
+            needs_cleanup: false,
+        };
+        let result = exec_in_container(&handle, &["echo", "hello"], None).unwrap();
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "");
+        assert!(result.success);
+    }
 }
