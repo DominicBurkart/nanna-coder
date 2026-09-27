@@ -1,7 +1,8 @@
-# Ready-to-apply workflow for issue #639. Agents may not write under
-# .github/workflows/**, so a maintainer must copy this file to
-# .github/workflows/protected-paths-guard.yml (and add that path to the
-# repository ruleset's path restriction) for it to run.
+# For issue #639. Fails a PR authored by a Nanna identity (a spawned or
+# orchestrated agent, once Nanna is running against a target repository)
+# that touches a path in harness::protected::PROTECTED_PATTERNS. This
+# guards Nanna's own spawned/orchestrated agents, not dev agents working on
+# nanna-coder's own source — those already have ordinary repository access.
 #
 # A pull request authored by a Nanna identity carries the marker from
 # harness::marker (a `Nanna-Identity: <name>` commit trailer or a
