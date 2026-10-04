@@ -54,6 +54,18 @@ impl QaSummary {
         }
     }
 
+    /// The same totals with every artifact path under `from` moved under
+    /// `to`; paths elsewhere are kept.
+    pub fn rebase_artifacts(&self, from: &Path, to: &Path) -> Self {
+        let mut moved = self.clone();
+        for artifact in &mut moved.artifacts {
+            if let Ok(rest) = Path::new(artifact.as_str()).strip_prefix(from) {
+                *artifact = to.join(rest).display().to_string();
+            }
+        }
+        moved
+    }
+
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).expect("QaSummary serialises")
     }
@@ -179,6 +191,35 @@ mod tests {
         let back: QaSummary = serde_json::from_value(json).unwrap();
         assert_eq!(back, summary);
         assert!(format!("{ledger:?}").contains("endpoint_runs: 2"));
+    }
+
+    #[test]
+    fn rebase_artifacts_moves_only_paths_under_the_source_root() {
+        let ledger = QaLedger::new();
+        ledger.record_endpoints(
+            &endpoint_report(),
+            Path::new("/w/.nanna-artifacts/qa/endpoints-1.json"),
+        );
+        ledger.record_browser(
+            &browser_report(),
+            Path::new("/w/.nanna-artifacts/qa/browser-1/report.json"),
+        );
+        let mut summary = ledger.snapshot();
+        summary.artifacts.push("/elsewhere/x.png".to_string());
+        let moved = summary.rebase_artifacts(
+            Path::new("/w/.nanna-artifacts/qa"),
+            Path::new("/store/t/qa"),
+        );
+        assert_eq!(
+            moved.artifacts,
+            vec![
+                "/store/t/qa/endpoints-1.json",
+                "/store/t/qa/browser-1/report.json",
+                "/a/browser-1/s.png",
+                "/elsewhere/x.png"
+            ]
+        );
+        assert_eq!(moved.endpoint_runs, summary.endpoint_runs);
     }
 
     #[test]

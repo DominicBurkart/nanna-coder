@@ -142,6 +142,44 @@ fn index_of(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
         .ok()
 }
 
+/// Copy the QA evidence of `workspace_root` to `dest`, which must lie outside
+/// the workspace so it survives the worktree's removal. Returns `None` when
+/// the workspace has no QA directory. Symlinks inside the tree, and a
+/// symlinked `.nanna-artifacts` or `qa` directory, are never followed: a task
+/// controls the workspace and could otherwise point them at host files.
+pub fn persist_qa_artifacts(
+    workspace_root: &Path,
+    dest: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    let artifact_dir = workspace_root.join(ARTIFACT_DIR);
+    let source = artifact_dir.join(QA_DIR);
+    for dir in [&artifact_dir, &source] {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return Ok(None),
+        }
+    }
+    copy_tree(&source, dest)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(dest, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    Ok(Some(dest.to_path_buf()))
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = dest.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write `value` as pretty JSON to `path`.
 pub fn write_json(path: &Path, value: &Value) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(value)?;
@@ -153,6 +191,73 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn persist_copies_the_qa_tree_outside_the_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let artifacts = QaArtifacts::new(workspace.path());
+        let report = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report, "{}").unwrap();
+        let browser = artifacts.next_browser_dir().unwrap();
+        std::fs::write(browser.join("home.png"), [1u8, 2, 3]).unwrap();
+        let dest = store.path().join("task-1").join("qa");
+        let persisted = persist_qa_artifacts(workspace.path(), &dest).unwrap();
+        assert_eq!(persisted, Some(dest.clone()));
+        assert_eq!(std::fs::read(dest.join("endpoints-1.json")).unwrap(), b"{}");
+        assert_eq!(
+            std::fs::read(dest.join("browser-1/home.png")).unwrap(),
+            [1u8, 2, 3]
+        );
+        drop(workspace);
+        assert!(dest.join("browser-1/home.png").exists());
+    }
+
+    #[test]
+    fn persist_without_artifacts_is_a_no_op() {
+        let workspace = TempDir::new().unwrap();
+        let store = TempDir::new().unwrap();
+        let dest = store.path().join("task-2").join("qa");
+        assert_eq!(persist_qa_artifacts(workspace.path(), &dest).unwrap(), None);
+        assert!(!dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_skips_symlinks_planted_by_the_task() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), "s3cret").unwrap();
+        let artifacts = QaArtifacts::new(workspace.path());
+        let report = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report, "{}").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            artifacts.root().join("leak.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), artifacts.root().join("dir-leak")).unwrap();
+        let store = TempDir::new().unwrap();
+        let dest = store.path().join("t").join("qa");
+        persist_qa_artifacts(workspace.path(), &dest).unwrap();
+        assert!(dest.join("endpoints-1.json").exists());
+        assert!(!dest.join("leak.txt").exists());
+        assert!(!dest.join("dir-leak").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_refuses_a_symlinked_artifact_directory() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir_all(outside.path().join("qa")).unwrap();
+        std::fs::write(outside.path().join("qa/endpoints-1.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(ARTIFACT_DIR)).unwrap();
+        let store = TempDir::new().unwrap();
+        let dest = store.path().join("t").join("qa");
+        assert_eq!(persist_qa_artifacts(workspace.path(), &dest).unwrap(), None);
+        assert!(!dest.exists());
+    }
 
     #[test]
     fn reports_and_run_directories_are_numbered_in_creation_order() {

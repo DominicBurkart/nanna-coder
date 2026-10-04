@@ -9,9 +9,9 @@ use crate::container::{
 use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
 use crate::onboarding::OnboardingError;
 use crate::qa::{
-    register_qa_tools, trunk_asset_roots, BrowserDriver, ChromiumDriver, ContainerProbe, HttpProbe,
-    Manifest, ProcessSpawner, QaContext, QaLedger, QaSummary, ARTIFACT_DIR, DEFAULT_POLL,
-    DEFAULT_WAIT,
+    persist_qa_artifacts, register_qa_tools, trunk_asset_roots, BrowserDriver, ChromiumDriver,
+    ContainerProbe, HttpProbe, Manifest, ProcessSpawner, QaContext, QaLedger, QaSummary,
+    ARTIFACT_DIR, DEFAULT_POLL, DEFAULT_WAIT, QA_DIR,
 };
 use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
@@ -40,6 +40,23 @@ pub enum WorkspaceError {
     ContainerSetupFailed(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn default_artifact_store() -> PathBuf {
+    std::env::temp_dir().join("nanna-task-artifacts")
+}
+
+fn sanitize_task_dir(task_id: &str) -> String {
+    task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn git_cmd(cwd: &Path) -> Command {
@@ -104,6 +121,7 @@ pub struct TaskWorkspace {
     qa_probe: Option<Arc<dyn HttpProbe>>,
     qa_driver: Option<Arc<dyn BrowserDriver>>,
     qa_ledger: Arc<QaLedger>,
+    artifact_store: PathBuf,
     cleaned_up: bool,
 }
 
@@ -136,6 +154,7 @@ impl TaskWorkspace {
             qa_probe: None,
             qa_driver: None,
             qa_ledger: Arc::new(QaLedger::new()),
+            artifact_store: default_artifact_store(),
             cleaned_up: false,
         })
     }
@@ -263,6 +282,7 @@ impl TaskWorkspace {
             qa_probe: None,
             qa_driver: None,
             qa_ledger: Arc::new(QaLedger::new()),
+            artifact_store: default_artifact_store(),
             cleaned_up: false,
         })
     }
@@ -307,6 +327,46 @@ impl TaskWorkspace {
     /// Totals of the QA the task's tools have run so far.
     pub fn qa_summary(&self) -> QaSummary {
         self.qa_ledger.snapshot()
+    }
+
+    /// Directory under which each task's QA evidence is kept after the
+    /// worktree is removed; default `<temp>/nanna-task-artifacts`.
+    pub fn set_artifact_store(&mut self, root: PathBuf) {
+        self.artifact_store = root;
+    }
+
+    /// Where this task's QA evidence lives once persisted:
+    /// `<artifact store>/<task id>/qa`.
+    pub fn persisted_qa_dir(&self) -> PathBuf {
+        self.artifact_store
+            .join(sanitize_task_dir(&self.task_id))
+            .join(QA_DIR)
+    }
+
+    /// Copy the QA evidence out of the worktree into the task-scoped
+    /// artifact store and return the QA totals with artifact paths pointing
+    /// at the copies. Call before [`Self::cleanup`], which deletes the
+    /// worktree. When the copy fails the error is logged and the totals keep
+    /// their worktree paths.
+    pub fn persist_qa_summary(&self) -> QaSummary {
+        let summary = self.qa_summary();
+        if summary.artifacts.is_empty() {
+            return summary;
+        }
+        let dest = self.persisted_qa_dir();
+        match persist_qa_artifacts(&self.workspace_path, &dest) {
+            Ok(Some(_)) => summary
+                .rebase_artifacts(&self.workspace_path.join(ARTIFACT_DIR).join(QA_DIR), &dest),
+            Ok(None) => summary,
+            Err(e) => {
+                warn!(
+                    "task {}: could not persist QA artifacts to {}: {e}",
+                    self.task_id,
+                    dest.display()
+                );
+                summary
+            }
+        }
     }
 
     /// Limits for the app tools; `None` restores the defaults.
@@ -651,6 +711,83 @@ mod tests {
             "QA artefacts must not enter the patch: {diff}"
         );
         ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn qa_artifacts_survive_worktree_cleanup_and_summary_points_at_the_copies() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-persist"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let artifacts = crate::qa::QaArtifacts::new(&ws.workspace_path);
+        let report_path = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report_path, "{\"ok\":true}").unwrap();
+        let browser = artifacts.next_browser_dir().unwrap();
+        let shot = browser.join("home.png");
+        std::fs::write(&shot, [9u8, 9]).unwrap();
+        ws.qa_ledger.record_endpoints(
+            &crate::qa::ManifestReport {
+                base_url: "http://app".to_string(),
+                checks: vec![],
+                passed: 0,
+                failed: 0,
+            },
+            &report_path,
+        );
+        ws.qa_ledger.record_browser(
+            &crate::qa::BrowserReport {
+                frontend_url: "http://app".to_string(),
+                steps: vec![],
+                passed: true,
+                screenshots: vec![shot.clone()],
+                console_errors: vec![],
+            },
+            &browser.join("report.json"),
+        );
+
+        let summary = ws.persist_qa_summary();
+        let worktree = ws.workspace_path.clone();
+        ws.cleanup().unwrap();
+
+        assert!(!worktree.exists(), "worktree must be gone");
+        assert_eq!(summary.artifacts.len(), 3);
+        let persisted = store.path().join(&ws.task_id).join("qa");
+        assert_eq!(ws.persisted_qa_dir(), persisted);
+        for artifact in &summary.artifacts {
+            assert!(
+                Path::new(artifact).starts_with(&persisted),
+                "{artifact} is not under {}",
+                persisted.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(persisted.join("browser-1/home.png")).unwrap(),
+            [9u8, 9]
+        );
+        assert!(Path::new(&summary.artifacts[0]).exists());
+        assert!(Path::new(&summary.artifacts[2]).exists());
+    }
+
+    #[test]
+    fn persist_qa_summary_without_qa_runs_leaves_the_store_untouched() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-none"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let summary = ws.persist_qa_summary();
+        assert!(summary.is_empty());
+        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn task_artifact_directory_names_are_sanitised() {
+        assert_eq!(sanitize_task_dir("a-b_c1"), "a-b_c1");
+        assert_eq!(sanitize_task_dir("../x/y"), "___x_y");
     }
 
     #[test]

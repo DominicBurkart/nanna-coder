@@ -5,6 +5,7 @@ use super::browser::{BrowserDriver, BrowserScenario, ScenarioError, ScenarioRunn
 use super::manifest::{HttpProbe, Manifest, ManifestChecker, ManifestError};
 use super::summary::QaLedger;
 use crate::apprun::{AppInstance, RunningApps};
+use crate::effects::EffectClass;
 use crate::tools::{Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -253,6 +254,10 @@ impl QaEndpointsTool {
 
 #[async_trait]
 impl Tool for QaEndpointsTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         definition(
             QA_ENDPOINTS_TOOL,
@@ -294,6 +299,10 @@ impl QaBrowserTool {
 
 #[async_trait]
 impl Tool for QaBrowserTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         definition(
             QA_BROWSER_TOOL,
@@ -410,6 +419,20 @@ mod tests {
             { "step": "expect_text", "selector": "#greeting", "text": "Hello" },
             { "step": "screenshot", "name": "home" }
         ] })
+    }
+
+    #[test]
+    fn qa_tools_declare_workspace_effects() {
+        let f = fixture(probe(&[]), vec![]);
+        let mut registry = ToolRegistry::new();
+        register_qa_tools(&mut registry, f.ctx.clone());
+        for name in [QA_ENDPOINTS_TOOL, QA_BROWSER_TOOL] {
+            assert_eq!(
+                registry.effect_class_of(name),
+                Some(EffectClass::Workspace),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

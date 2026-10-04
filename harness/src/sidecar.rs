@@ -11,9 +11,10 @@
 //! testable without a container runtime; [`SystemRunner`] is the production
 //! implementation.
 
-use crate::container::{ContainerHandle, ContainerRuntime};
+use crate::container::{ContainerHandle, ContainerRuntime, EnvFile};
 use rand::distr::Alphanumeric;
 use rand::Rng;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,7 +102,7 @@ pub struct SidecarSpec {
 
 impl SidecarSpec {
     /// Arguments for `<runtime> run` that start this sidecar on `network`.
-    pub fn run_args(&self, network: &str) -> Vec<String> {
+    pub fn run_args(&self, network: &str, env_file: &Path) -> Vec<String> {
         let mut args: Vec<String> = [
             "run",
             "-d",
@@ -116,10 +117,8 @@ impl SidecarSpec {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        for (key, value) in &self.env {
-            args.push("-e".to_string());
-            args.push(format!("{key}={value}"));
-        }
+        args.push("--env-file".to_string());
+        args.push(env_file.display().to_string());
         args.push(self.image.clone());
         args
     }
@@ -353,8 +352,13 @@ impl SidecarSet {
         let network = TaskNetwork::create(runtime.clone(), Arc::clone(&runner), task_id)?;
         let mut sidecars = Vec::with_capacity(specs.len());
         for spec in specs {
-            let args = spec.run_args(network.name());
+            let env_file = EnvFile::create(&spec.env).map_err(|e| SidecarError::Spawn {
+                command: format!("write env file for {}", spec.name),
+                source: e,
+            })?;
+            let args = spec.run_args(network.name(), env_file.path());
             let output = run_or_spawn_error(runner.as_ref(), runtime.command(), &args)?;
+            drop(env_file);
             if !output.success {
                 return Err(SidecarError::Start {
                     name: spec.name.clone(),
@@ -559,9 +563,9 @@ mod tests {
     }
 
     #[test]
-    fn run_args_attach_to_network_with_alias_env_and_image() {
+    fn run_args_attach_to_network_with_alias_env_file_and_image() {
         let spec = PostgresSidecar::with_password("t", "pw").spec();
-        let args = spec.run_args("nanna-task-t-net");
+        let args = spec.run_args("nanna-task-t-net", Path::new("/run/env"));
         assert_eq!(
             args,
             vec![
@@ -574,12 +578,8 @@ mod tests {
                 "nanna-task-t-net",
                 "--network-alias",
                 "postgres",
-                "-e",
-                "POSTGRES_USER=postgres",
-                "-e",
-                "POSTGRES_PASSWORD=pw",
-                "-e",
-                "POSTGRES_DB=task_t",
+                "--env-file",
+                "/run/env",
                 "docker.io/library/postgres:16",
             ]
         );
@@ -764,6 +764,114 @@ mod tests {
             matches!(err, SidecarError::NotReady { ref name, .. } if name == "never-ready"),
             "{err}"
         );
+    }
+
+    const SENTINEL: &str = "Sentinel-Pw-9f3a";
+
+    struct InspectingRunner {
+        calls: Mutex<Vec<String>>,
+        seen_env_files: Mutex<Vec<(std::path::PathBuf, u32, String)>>,
+        fail_run: bool,
+    }
+
+    impl InspectingRunner {
+        fn new(fail_run: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                seen_env_files: Mutex::new(Vec::new()),
+                fail_run,
+            })
+        }
+    }
+
+    impl CommandRunner for InspectingRunner {
+        fn run(&self, _program: &str, args: &[String]) -> std::io::Result<RunOutput> {
+            self.calls.lock().unwrap().push(args.join(" "));
+            if let Some(pos) = args.iter().position(|a| a == "--env-file") {
+                let path = std::path::PathBuf::from(&args[pos + 1]);
+                let content = std::fs::read_to_string(&path).unwrap();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::PermissionsExt::mode(
+                    &std::fs::metadata(&path).unwrap().permissions(),
+                ) & 0o777;
+                #[cfg(not(unix))]
+                let mode = 0o600;
+                self.seen_env_files
+                    .lock()
+                    .unwrap()
+                    .push((path, mode, content));
+            }
+            let is_run = args.first().is_some_and(|a| a == "run");
+            let success = !(self.fail_run && is_run);
+            Ok(RunOutput {
+                success,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn password_never_appears_in_runtime_argv() {
+        let runner = FakeRunner::new(None, None);
+        let specs = vec![PostgresSidecar::with_password("t9", SENTINEL).spec()];
+        let set = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t9",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap();
+        for call in runner.calls() {
+            assert!(!call.contains(SENTINEL), "password leaked in argv: {call}");
+        }
+        drop(set);
+    }
+
+    #[tokio::test]
+    async fn sidecar_env_file_is_private_holds_password_and_is_removed() {
+        let runner = InspectingRunner::new(false);
+        let specs = vec![PostgresSidecar::with_password("t10", SENTINEL).spec()];
+        let set = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t10",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap();
+        let seen = runner.seen_env_files.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (path, mode, content) = &seen[0];
+        assert_eq!(*mode, 0o600);
+        assert!(content.contains(&format!("POSTGRES_PASSWORD={SENTINEL}\n")));
+        assert!(!path.exists());
+        for call in runner.calls.lock().unwrap().iter() {
+            assert!(!call.contains(SENTINEL));
+        }
+        drop(set);
+    }
+
+    #[tokio::test]
+    async fn sidecar_env_file_is_removed_when_start_fails() {
+        let runner = InspectingRunner::new(true);
+        let specs = vec![PostgresSidecar::with_password("t11", SENTINEL).spec()];
+        let err = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t11",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SidecarError::Start { .. }));
+        let seen = runner.seen_env_files.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].0.exists());
     }
 
     #[test]

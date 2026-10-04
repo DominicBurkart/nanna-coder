@@ -10,8 +10,8 @@ pub mod summary;
 pub mod tools;
 
 pub use artifacts::{
-    next_index, write_json, QaArtifacts, ARTIFACT_DIR, BROWSER_PREFIX, BROWSER_REPORT_FILE,
-    ENDPOINT_PREFIX, QA_DIR,
+    next_index, persist_qa_artifacts, write_json, QaArtifacts, ARTIFACT_DIR, BROWSER_PREFIX,
+    BROWSER_REPORT_FILE, ENDPOINT_PREFIX, QA_DIR,
 };
 pub use browser::{
     click_expression, step_name, text_expression, type_expression, BrowserDriver, BrowserPage,
