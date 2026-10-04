@@ -64,7 +64,10 @@ mod template;
 mod validate;
 
 pub use init::{init, starter_template};
-pub use plan::{format_duration, plan_for_repo, DeployPlan, DeployStep, Precondition, StepKind};
+pub use plan::{
+    format_duration, plan_for_repo, plan_for_repo_checked, DeployPlan, DeployStep, Precondition,
+    StepKind,
+};
 pub use template::{
     DeployTemplate, Health, OnBreach, RiskClass, RiskSpec, RiskThresholds, Rollback, Rollout,
     Shadow, ShadowCompare, Strategy, Target, TargetKind,
@@ -82,6 +85,26 @@ pub const DEPLOY_FILE_NAME: &str = "deploy.toml";
 
 /// The environment name that requires availability windows and health gates.
 pub const PRODUCTION_ENV: &str = "production";
+
+/// True when `env` names the production environment, ignoring ASCII case.
+///
+/// A deploy template author who writes `environments = ["Production"]` means
+/// the same thing as `"production"`; comparing case-sensitively would let a
+/// capitalisation mismatch silently skip the window and health gates that
+/// [`PRODUCTION_ENV`] exists to enforce.
+///
+/// ```
+/// use harness::deploy::is_production_env;
+///
+/// assert!(is_production_env("production"));
+/// assert!(is_production_env("Production"));
+/// assert!(is_production_env("PRODUCTION"));
+/// assert!(!is_production_env("staging"));
+/// assert!(!is_production_env("prod"));
+/// ```
+pub fn is_production_env(env: &str) -> bool {
+    env.eq_ignore_ascii_case(PRODUCTION_ENV)
+}
 
 /// Errors produced while loading, validating or planning a deployment template.
 #[derive(Debug, Error)]
@@ -130,5 +153,14 @@ pub enum DeployError {
     AlreadyExists {
         /// The existing template.
         path: PathBuf,
+    },
+    /// A co-located `windows.toml` exists but failed to load.
+    #[error("failed to load {}: {source}", path.display())]
+    WindowSet {
+        /// Path of the window set that failed to load.
+        path: PathBuf,
+        /// Underlying window-loading failure.
+        #[source]
+        source: crate::windows::WindowError,
     },
 }
