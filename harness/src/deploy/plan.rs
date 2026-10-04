@@ -165,7 +165,7 @@ impl DeployPlan {
     /// ```
     pub fn render_text(&self) -> String {
         let mut out = format!(
-            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\n",
+            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\nadvisory only: preconditions are declared, not enforced (#650, #737, #734)\n",
             self.image, self.environment, self.risk_class, self.strategy, self.lease
         );
         for step in &self.steps {
@@ -206,6 +206,7 @@ impl DeployPlan {
     /// ```
     pub fn to_json(&self) -> Value {
         let mut value = json!({
+            "advisory": true,
             "environment": self.environment,
             "image": self.image,
             "risk_class": self.risk_class.name(),
@@ -249,13 +250,14 @@ pub fn plan_for_repo(
 /// Load `<repo>/.nanna/deploy.toml`, validate `rollout.windows` against
 /// `<repo>/.nanna/windows.toml` when that file exists, and plan a rollout.
 ///
-/// This is what the `nanna deploy plan` CLI command uses: it is the
-/// human-facing preflight check, so a `rollout.windows` naming a window that
-/// will never open must be caught here rather than surfacing only once a
-/// rollout executor tries to act on the plan. When no `windows.toml` is
-/// co-located with the template, window names are not checked, matching
-/// [`plan_for_repo`] (Nanna's own window set may live outside the target
-/// repository).
+/// This is what the `nanna deploy plan` CLI command uses. The result is
+/// advisory only: `windows.toml` lives in the target repository, which agents
+/// can write, so this check must not be read as an enforced gate until the
+/// executor (#650), lease enforcement (#737) and the windows fix (#734) land.
+/// It does catch a `rollout.windows` naming a window that will never open.
+/// When no `windows.toml` is co-located with the template, window names are
+/// not checked, matching [`plan_for_repo`] (Nanna's own window set may live
+/// outside the target repository).
 ///
 /// ```
 /// use harness::deploy::{plan_for_repo_checked, DeployError};
@@ -689,6 +691,7 @@ mod tests {
         let expected = "\
 deploy plan: registry.example.invalid/ns/fullstack-fixture -> production
 risk class: edge | strategy: gradual | lease: deploy:fullstack-fixture:production
+advisory only: preconditions are declared, not enforced (#650, #737, #734)
   1. traffic 10%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
   2. traffic 50%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
   3. traffic 100%   hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
@@ -759,6 +762,7 @@ minimum total: 1d 1h 30m
             "[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\n",
         );
         let json = t.plan("production").unwrap().to_json();
+        assert_eq!(json["advisory"], true);
         assert_eq!(json["environment"], "production");
         assert_eq!(json["image"], "registry.example.invalid/ns/app");
         assert_eq!(json["risk_class"], "core");
@@ -811,7 +815,7 @@ minimum total: 1d 1h 30m
         ));
         let pretty = plan.to_json_pretty();
         assert!(
-            pretty.starts_with("{\n  \"environment\": \"staging\""),
+            pretty.starts_with("{\n  \"advisory\": true,\n  \"environment\": \"staging\""),
             "{pretty}"
         );
         assert_eq!(
