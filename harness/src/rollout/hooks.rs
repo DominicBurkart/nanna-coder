@@ -1,4 +1,5 @@
 use super::health::HealthBreach;
+use super::incident::{Incident, Postmortem, ProposedAction};
 use super::state::RolloutRecord;
 use crate::deploy::DeployStep;
 use async_trait::async_trait;
@@ -13,8 +14,10 @@ pub struct AuditDenied {
     pub reason: String,
 }
 
-/// Reviews each step before its traffic is applied. The action auditor
-/// provides the real implementation; [`NoAudit`] approves everything.
+/// Reviews each step before its traffic is applied, and each incident
+/// remediation before it acts. The action auditor provides the real
+/// implementation; [`NoAudit`] approves every step and denies every incident
+/// action, because no action reviewer exists until the auditor is wired.
 #[async_trait]
 pub trait AuditHook: Send + Sync {
     /// Approve `step` of `record`, or deny it with a reason.
@@ -23,6 +26,21 @@ pub trait AuditHook: Send + Sync {
         record: &RolloutRecord,
         step: &DeployStep,
     ) -> Result<(), AuditDenied>;
+
+    /// Approve an [`IncidentResponder`](super::IncidentResponder)'s
+    /// `action` for `incident`, or deny it with a reason. `review_step`
+    /// cannot see the proposed remediation, so this is a separate review
+    /// point. The default denies: an implementation that does not override
+    /// this method never lets a remediation act.
+    async fn review_action(
+        &self,
+        _incident: &Incident,
+        _action: &ProposedAction,
+    ) -> Result<(), AuditDenied> {
+        Err(AuditDenied {
+            reason: "no incident action reviewer is configured".into(),
+        })
+    }
 }
 
 /// Approves every step.
@@ -40,11 +58,14 @@ impl AuditHook for NoAudit {
     }
 }
 
-/// Records every review and can deny from a given step on.
+/// Records every review and can deny from a given step on, or deny the
+/// next incident action.
 #[derive(Debug, Default)]
 pub struct RecordingAudit {
     reviews: Mutex<Vec<(String, usize)>>,
     deny_from: Mutex<Option<(usize, String)>>,
+    action_reviews: Mutex<Vec<(String, ProposedAction)>>,
+    deny_next_action: Mutex<Option<String>>,
 }
 
 impl RecordingAudit {
@@ -56,6 +77,17 @@ impl RecordingAudit {
     /// Every `(rollout id, step index)` reviewed so far.
     pub fn reviews(&self) -> Vec<(String, usize)> {
         self.reviews.lock().unwrap().clone()
+    }
+
+    /// Deny the next incident action reviewed, giving `reason`. One-shot:
+    /// cleared once it has denied a review.
+    pub fn deny_next_action(&self, reason: &str) {
+        *self.deny_next_action.lock().unwrap() = Some(reason.to_string());
+    }
+
+    /// Every `(deploy id, proposed action)` reviewed so far.
+    pub fn action_reviews(&self) -> Vec<(String, ProposedAction)> {
+        self.action_reviews.lock().unwrap().clone()
     }
 }
 
@@ -75,6 +107,21 @@ impl AuditHook for RecordingAudit {
                 reason: reason.clone(),
             }),
             _ => Ok(()),
+        }
+    }
+
+    async fn review_action(
+        &self,
+        incident: &Incident,
+        action: &ProposedAction,
+    ) -> Result<(), AuditDenied> {
+        self.action_reviews
+            .lock()
+            .unwrap()
+            .push((incident.deploy_id.clone(), action.clone()));
+        match self.deny_next_action.lock().unwrap().take() {
+            Some(reason) => Err(AuditDenied { reason }),
+            None => Ok(()),
         }
     }
 }
@@ -98,6 +145,9 @@ pub struct RolloutEscalation {
     pub summary: String,
     /// The breach, when a health gate caused the halt.
     pub breach: Option<HealthBreach>,
+    /// The rendered postmortem, when an incident responder acted on the
+    /// breach, ready to be filed.
+    pub postmortem: Option<Postmortem>,
 }
 
 /// Receives halt-and-escalate events. The escalation paths work provides
@@ -157,6 +207,17 @@ mod tests {
     use crate::rollout::state::tests::record;
 
     #[tokio::test]
+    async fn no_audit_denies_incident_actions_by_default() {
+        let r = record("production");
+        let err = NoAudit
+            .review_action(&incident(), &ProposedAction::Rollback)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, "no incident action reviewer is configured");
+        assert!(NoAudit.review_step(&r, &r.plan.steps[0]).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn no_audit_approves_and_recording_audit_denies_from_a_step() {
         let r = record("production");
         assert!(NoAudit.review_step(&r, &r.plan.steps[2]).await.is_ok());
@@ -176,6 +237,47 @@ mod tests {
         );
     }
 
+    fn incident() -> Incident {
+        Incident {
+            breach: HealthBreach {
+                threshold: crate::rollout::health::HealthThreshold::ErrorRateMax(0.01),
+                observed: crate::rollout::health::HealthObservation::ErrorRate(0.5),
+                step: 0,
+                evidence: vec![],
+            },
+            evidence: vec![],
+            step: 0,
+            deploy_id: "rollout-1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_audit_approves_then_denies_the_next_action() {
+        let audit = RecordingAudit::default();
+        assert!(audit
+            .review_action(&incident(), &ProposedAction::Rollback)
+            .await
+            .is_ok());
+        audit.deny_next_action("too soon to tell");
+        let err = audit
+            .review_action(&incident(), &ProposedAction::Escalate)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "audit denied step: too soon to tell");
+        assert!(audit
+            .review_action(&incident(), &ProposedAction::Escalate)
+            .await
+            .is_ok());
+        assert_eq!(
+            audit.action_reviews(),
+            vec![
+                ("rollout-1".to_string(), ProposedAction::Rollback),
+                ("rollout-1".to_string(), ProposedAction::Escalate),
+                ("rollout-1".to_string(), ProposedAction::Escalate),
+            ]
+        );
+    }
+
     fn escalation() -> RolloutEscalation {
         RolloutEscalation {
             rollout_id: "rollout-1".into(),
@@ -186,6 +288,7 @@ mod tests {
             traffic_percent: 50,
             summary: "health breach".into(),
             breach: None,
+            postmortem: None,
         }
     }
 
