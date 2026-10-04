@@ -84,6 +84,45 @@ cargo build --workspace && cargo test --workspace
 (cd ui && trunk build)
 ```
 
+## Identity fixture catalog
+
+[`harness/tests/fixtures/identities/`](harness/tests/fixtures/identities/) is the fixture identity catalog the identity/RBAC and auditor test suites read through `IdentityCatalog::load` and `IdentityCatalog::with_repo_overrides`:
+
+| Path | Contents |
+|---|---|
+| `identities/global/*.toml` | One card per dev loop: `auditor` (inner, inert — `max_effect = "none"`, no tools), `rust-implementer` (inner, `max_effect = "repository"`), `pr-shepherd` (middle, `max_effect = "ci"`), `deployer` (outer, `max_effect = "sandbox"`), `incident-responder` (outer, `max_effect = "production"`, scoped to `rollout_rollback`/`rollout_roll_forward_pr`/`read_logs`) |
+| `identities/global/prompts/*.md` | The `system_prompt` files the above cards reference by path |
+| `identities/repo/.nanna/agents/rust-implementer.toml` | A repo-local override that narrows `rust-implementer` to `paths = ["api/**"]` and `max_effect = "workspace"`, exercising `AgentIdentity::narrows` |
+
+Use it directly rather than inventing ad hoc TOML in a new test; it already covers one card per loop plus an inert auditor and a narrowing repo override. Following `harness/tests/identity_catalog_tests.rs`'s own pattern (a Rust integration test's working directory is the crate root, `harness/`, not the repo root), resolve it from `CARGO_MANIFEST_DIR` rather than a literal relative path:
+
+```rust
+let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/identities");
+let catalog = IdentityCatalog::load(fixtures.join("global"))?
+    .with_repo_overrides(fixtures.join("repo"))?;
+```
+
+## Fake deploy adapter and health/shadow sources
+
+The rollout executor's dependencies are all traits, each with an in-memory fake used across the rollout, leases and eval test suites:
+
+| Trait | Fake | Notes |
+|---|---|---|
+| `TargetAdapter` | `FakeAdapter` | Starts serving `current_image` at 100% from `slot-0`; records every call as an `AdapterCall` (`calls()`); `fail(op)` / `succeed(op)` script a specific operation to error, for testing failure handling mid-rollout. |
+| `HealthSource` | `FakeHealthSource` | `healthy(endpoints)` always reports `2xx`; `push(sample)` queues one scripted sample for the next poll, `push_after(n, sample)` queues `n` healthy polls then a breach, letting a test control exactly which bake poll trips a threshold. |
+| `ShadowSource` | `FakeShadowSource` | `agreeing(pairs)` answers with `pairs` identical comparison samples, for shadow-deploy steps that must see no divergence. |
+
+`harness::rollout::fake_executor(log, windows, current_image, endpoints)` wires all three together with an `InMemoryLeaseStore` and a `SimulatedClock` and returns `(RolloutExecutor, Arc<FakeAdapter>, Arc<FakeHealthSource>, Arc<FakeShadowSource>, Arc<SimulatedClock>)`, which is the fixture most rollout tests build on rather than constructing a `RolloutExecutor` by hand. `harness::rollout::run_simulated(executor, clock, id)` drives a rollout past every `Parked { until, .. }` state by advancing the returned clock to `until` and re-running, collecting each intermediate record — the way to run a whole gated rollout to completion in a test without a real sleep. The full-stack fixture's own `.nanna/deploy.toml` (a fake `container-registry+serverless` target on a reserved `.invalid` registry) is what deployment-executor and eval tests plan rollouts from, and — notably — is also the only kind of target the harness CLI's `deploy run`/`deploy roll-forward` subcommands can run against today: they require an explicit `--fake` flag and build a `fake_rollout_executor` (`harness/src/main.rs`); without `--fake` they refuse outright, since the CLI does not wire in the real `ServerlessAdapter` behind the `serverless-adapter` cargo feature at all.
+
+## Simulated time
+
+Two independent simulated-time patterns are used, depending on what's under test:
+
+- **`harness::leases::Clock`** (`SystemClock` / `SimulatedClock`) is for anything that *sleeps and retries*: lease contention (`wait_for`/`Backoff`), the rollout executor's bake polling, and escalation dedupe windows (`Escalator`) all take a `Clock` so a test can call `clock.sleep(...)` and have it resolve instantly while still recording the requested duration (`SimulatedClock::sleeps()`). Clones of one `SimulatedClock` share the same instant.
+- **Explicit `now: DateTime<Utc>` parameters** are for anything that only *evaluates* a point in time rather than waiting: `WindowSet::is_open`/`next_open`, `scheduler::parked_until`, and `SchedulingPolicy::next` (`HybridPolicy`'s dispatch decision) all take `now` directly, so tests pass whatever instant they need without a shared clock object at all.
+
+Pick whichever pattern matches the API you're extending: a component that already takes `now` as a parameter should keep doing so rather than gaining a `Clock` dependency, and vice versa.
+
 ## Adding a new test
 
 1. **Rust unit test** -- add `#[cfg(test)] mod tests` in the relevant `harness/src/` module.
