@@ -6,7 +6,7 @@
 //! issues), so the whole flow is testable with a stub runner.
 
 use super::{AppInstance, Limits, PortAllocator, PortError, RunningApps};
-use crate::container::ContainerHandle;
+use crate::container::{ContainerHandle, EnvFile};
 use crate::onboarding::fullstack::FullStackRust;
 use crate::onboarding::OnboardingError;
 use crate::sidecar::{CommandRunner, RunOutput};
@@ -147,29 +147,12 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The `sh -c` script that starts `executable` detached with `env`, both
-/// output streams appended to `log_path`, and prints its pid.
-fn env_name_word(name: &str) -> String {
-    let plain = name
-        .chars()
-        .next()
-        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-        && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
-    if plain {
-        name.to_string()
-    } else {
-        shell_quote(name)
-    }
-}
-
-pub fn start_script(executable: &str, env: &[(String, String)], log_path: &str) -> String {
-    let assignments: Vec<String> = env
-        .iter()
-        .map(|(k, v)| format!("{}={}", env_name_word(k), shell_quote(v)))
-        .collect();
+/// The `sh -c` script that starts `executable` detached, both output streams
+/// appended to `log_path`, and prints its pid. The environment is supplied
+/// out of band through `exec --env-file`, never in this script.
+pub fn start_script(executable: &str, log_path: &str) -> String {
     format!(
-        "{} nohup {} >{} 2>&1 & echo $!",
-        assignments.join(" "),
+        "nohup {} >{} 2>&1 & echo $!",
         shell_quote(executable),
         shell_quote(log_path)
     )
@@ -240,7 +223,22 @@ pub fn exec_args(
     argv: &[String],
     working_dir: Option<&str>,
 ) -> Vec<String> {
+    exec_args_with_env_file(handle, argv, working_dir, None)
+}
+
+/// Like [`exec_args`], with the environment read from `env_file` so values
+/// never appear on the command line.
+pub fn exec_args_with_env_file(
+    handle: &ContainerHandle,
+    argv: &[String],
+    working_dir: Option<&str>,
+    env_file: Option<&Path>,
+) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
+    if let Some(path) = env_file {
+        args.push("--env-file".to_string());
+        args.push(path.display().to_string());
+    }
     if let Some(dir) = working_dir {
         args.push("-w".to_string());
         args.push(dir.to_string());
@@ -270,7 +268,17 @@ fn run(
     argv: &[String],
     working_dir: Option<&str>,
 ) -> Result<RunOutput, AppError> {
-    let args = exec_args(handle, argv, working_dir);
+    run_with_env(runner, handle, argv, working_dir, None)
+}
+
+fn run_with_env(
+    runner: &dyn CommandRunner,
+    handle: &ContainerHandle,
+    argv: &[String],
+    working_dir: Option<&str>,
+    env_file: Option<&Path>,
+) -> Result<RunOutput, AppError> {
+    let args = exec_args_with_env_file(handle, argv, working_dir, env_file);
     let program = handle.runtime.command();
     runner
         .run(program, &args)
@@ -287,7 +295,18 @@ fn run_step(
     argv: &[String],
     working_dir: Option<&str>,
 ) -> Result<RunOutput, AppError> {
-    let output = run(runner, handle, argv, working_dir)?;
+    run_step_with_env(runner, handle, step, argv, working_dir, None)
+}
+
+fn run_step_with_env(
+    runner: &dyn CommandRunner,
+    handle: &ContainerHandle,
+    step: &str,
+    argv: &[String],
+    working_dir: Option<&str>,
+    env_file: Option<&Path>,
+) -> Result<RunOutput, AppError> {
+    let output = run_with_env(runner, handle, argv, working_dir, env_file)?;
     if output.success {
         return Ok(output);
     }
@@ -406,13 +425,23 @@ impl AppContext {
             })?;
         let lease = self.ports.allocate(&self.task_id)?;
         let log_path = app_log_path(&self.task_id);
-        let script = start_script(
-            &executable,
-            &app_env(&self.spec, lease.port(), &self.env),
-            &log_path,
-        );
+        let env_file =
+            EnvFile::create(&app_env(&self.spec, lease.port(), &self.env)).map_err(|source| {
+                AppError::Spawn {
+                    command: "write app env file".to_string(),
+                    source,
+                }
+            })?;
+        let script = start_script(&executable, &log_path);
         let argv = vec!["sh".to_string(), "-c".to_string(), script];
-        let started = self.step("start", deadline, &argv, &self.spec.workspace_dir)?;
+        let started = self.step_with_env(
+            "start",
+            deadline,
+            &argv,
+            &self.spec.workspace_dir,
+            Some(env_file.path()),
+        )?;
+        drop(env_file);
         let pid = parse_pid(&started.stdout).ok_or_else(|| AppError::NoPid {
             output: started.stdout.clone(),
         })?;
@@ -461,12 +490,24 @@ impl AppContext {
         argv: &[String],
         working_dir: &str,
     ) -> Result<RunOutput, AppError> {
-        let result = run_step(
+        self.step_with_env(step, deadline, argv, working_dir, None)
+    }
+
+    fn step_with_env(
+        &self,
+        step: &str,
+        deadline: Instant,
+        argv: &[String],
+        working_dir: &str,
+        env_file: Option<&Path>,
+    ) -> Result<RunOutput, AppError> {
+        let result = run_step_with_env(
             self.runner.as_ref(),
             &self.handle,
             step,
             argv,
             Some(working_dir),
+            env_file,
         );
         if result.is_err() && Instant::now() >= deadline {
             return Err(AppError::WallClock {
@@ -810,18 +851,39 @@ mod tests {
         let env = app_env(&spec(), 1, &with_log);
         assert_eq!(env.iter().filter(|(k, _)| k == "RUST_LOG").count(), 1);
         assert!(env.contains(&("RUST_LOG".to_string(), "debug".to_string())));
-        let script = start_script("/cache/target/debug/api", &extra, "/tmp/app.log");
-        assert_eq!(script, "DATABASE_URL='postgres://x' nohup '/cache/target/debug/api' >'/tmp/app.log' 2>&1 & echo $!");
+        let script = start_script("/cache/target/debug/api", "/tmp/app.log");
+        assert_eq!(
+            script,
+            "nohup '/cache/target/debug/api' >'/tmp/app.log' 2>&1 & echo $!"
+        );
     }
 
     #[test]
-    fn start_script_quotes_env_names_that_are_not_plain_identifiers() {
-        let hostile = vec![("A;touch /tmp/pwned".to_string(), "v".to_string())];
-        let script = start_script("/bin/api", &hostile, "/tmp/app.log");
-        assert!(
-            script.starts_with("'A;touch /tmp/pwned'='v' nohup "),
-            "{script}"
+    fn exec_args_with_env_file_place_the_file_before_the_container() {
+        let handle = ContainerHandle {
+            name: "c".to_string(),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: false,
+        };
+        assert_eq!(
+            exec_args_with_env_file(
+                &handle,
+                &["ls".to_string()],
+                Some("/w"),
+                Some(Path::new("/tmp/e"))
+            ),
+            ["exec", "--env-file", "/tmp/e", "-w", "/w", "c", "ls"]
         );
+    }
+
+    #[tokio::test]
+    async fn start_rejects_environment_names_that_an_env_file_cannot_hold() {
+        let runner = StubRunner::new(healthy_after(1));
+        let (mut ctx, _dir) = context(Arc::clone(&runner), 120);
+        ctx.env = vec![("A=B".to_string(), "v".to_string())];
+        let err = ctx.start().await.unwrap_err();
+        assert!(matches!(err, AppError::Spawn { .. }), "{err}");
     }
 
     #[test]
@@ -841,6 +903,49 @@ mod tests {
     fn tail_chars_keeps_the_end() {
         assert_eq!(tail_chars("abcdef", 3), "def");
         assert_eq!(tail_chars("ab", 3), "ab");
+    }
+
+    #[tokio::test]
+    async fn start_env_file_is_private_complete_and_removed() {
+        let seen: Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u32, String)>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let inner = healthy_after(1);
+        let runner = StubRunner::new(Box::new(move |args, probes| {
+            if let Some(pos) = args.iter().position(|a| a == "--env-file") {
+                let path = std::path::PathBuf::from(&args[pos + 1]);
+                let content = std::fs::read_to_string(&path).unwrap();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::PermissionsExt::mode(
+                    &std::fs::metadata(&path).unwrap().permissions(),
+                ) & 0o777;
+                #[cfg(not(unix))]
+                let mode = 0o600;
+                sink.lock().unwrap().push((path, mode, content));
+            }
+            inner(args, probes)
+        }));
+        let (ctx, _dir) = context(Arc::clone(&runner), 120);
+        ctx.start().await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (path, mode, content) = &seen[0];
+        assert_eq!(*mode, 0o600);
+        assert!(content.contains("DATABASE_URL=postgres://u:p@postgres:5432/db\n"));
+        assert!(content.contains("BIND_ADDR=0.0.0.0:41000\n"));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn start_keeps_environment_values_out_of_argv() {
+        let runner = StubRunner::new(healthy_after(1));
+        let (ctx, _dir) = context(Arc::clone(&runner), 120);
+        ctx.start().await.unwrap();
+        for call in runner.calls() {
+            assert!(
+                !call.join(" ").contains("postgres://u:p@"),
+                "credential leaked in argv: {call:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -883,13 +988,14 @@ mod tests {
                 "--message-format=json-render-diagnostics"
             ]
         );
+        assert_eq!(&calls[2][..2], ["exec", "--env-file"]);
         assert_eq!(
-            &calls[2][..6],
-            ["exec", "-w", "/workspace", "nanna-task-t", "sh", "-c"]
+            &calls[2][3..8],
+            ["-w", "/workspace", "nanna-task-t", "sh", "-c"]
         );
         assert_eq!(
-            calls[2][6],
-            "BIND_ADDR='0.0.0.0:41000' FRONTEND_DIST='/workspace/ui/dist' RUST_LOG='info' DATABASE_URL='postgres://u:p@postgres:5432/db' nohup '/cache/target/debug/api' >'/tmp/nanna-app-t.log' 2>&1 & echo $!"
+            calls[2][8],
+            "nohup '/cache/target/debug/api' >'/tmp/nanna-app-t.log' 2>&1 & echo $!"
         );
         let probes = calls
             .iter()

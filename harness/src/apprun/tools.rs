@@ -1,6 +1,7 @@
 //! Agent tools over [`AppContext`]: `app_start`, `app_stop`, `app_logs`.
 
 use super::{AppContext, AppError};
+use crate::effects::EffectClass;
 use crate::tools::{Tool, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -52,6 +53,10 @@ impl AppStartTool {
 
 #[async_trait]
 impl Tool for AppStartTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         definition(
             APP_START_TOOL,
@@ -85,6 +90,10 @@ impl AppStopTool {
 
 #[async_trait]
 impl Tool for AppStopTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         definition(
             APP_STOP_TOOL,
@@ -143,6 +152,10 @@ pub fn parse_tail(args: &Value) -> ToolResult<usize> {
 
 #[async_trait]
 impl Tool for AppLogsTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         let mut def = definition(
             APP_LOGS_TOOL,
@@ -251,6 +264,22 @@ mod tests {
             poll_interval: Duration::from_millis(1),
         };
         (ctx, dir)
+    }
+
+    #[test]
+    fn app_tools_declare_workspace_effects() {
+        let (ctx, _dir) = context(true);
+        let mut registry = ToolRegistry::new();
+        register_app_tools(&mut registry, ctx);
+        for name in [APP_START_TOOL, APP_STOP_TOOL, APP_LOGS_TOOL] {
+            assert_eq!(
+                registry.effect_class_of(name),
+                Some(EffectClass::Workspace),
+                "{name}"
+            );
+        }
+        assert!(registry.at_most(EffectClass::None).is_empty());
+        assert_eq!(registry.at_most(EffectClass::Workspace).len(), 3);
     }
 
     #[tokio::test]
