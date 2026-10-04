@@ -7,8 +7,12 @@
 //! frontend's `Trunk.toml`; it never runs cargo or touches the network.
 
 use super::OnboardingError;
-use crate::sidecar::{PostgresSidecar, SidecarSpec};
+use crate::container::ContainerRuntime;
+use crate::sidecar::{
+    CommandRunner, PostgresSidecar, ReadinessConfig, SidecarError, SidecarSet, SidecarSpec,
+};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Endpoint manifest at the workspace root, one absolute path per line.
 pub const CHECKS_FILE: &str = "CHECKS";
@@ -164,6 +168,36 @@ impl FullStackRust {
             Vec::new()
         }
     }
+}
+
+/// Start the sidecars the repository at `repo_path` needs for task `task_id`:
+/// a Postgres database when it is a full-stack workspace that uses one,
+/// `None` for every other repository.
+pub async fn start_task_sidecars(
+    runtime: ContainerRuntime,
+    runner: Arc<dyn CommandRunner>,
+    repo_path: &Path,
+    task_id: &str,
+    readiness: ReadinessConfig,
+) -> Result<Option<SidecarSet>, SidecarError> {
+    let profile = match FullStackRust::detect(repo_path) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                "full-stack detection failed for {}: {e}",
+                repo_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let specs = profile.sidecars(task_id);
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    SidecarSet::start(runtime, runner, task_id, &specs, readiness)
+        .await
+        .map(Some)
 }
 
 /// Resolve the `[workspace].members` patterns of the manifest at `root`
@@ -432,6 +466,99 @@ dioxus = { version = "0.7", features = ["web"] }
         let dir = minimal_workspace();
         let profile = FullStackRust::detect(dir.path()).unwrap().unwrap();
         assert!(profile.sidecars("task-9").is_empty());
+    }
+
+    struct RecordingRunner(std::sync::Mutex<Vec<String>>);
+
+    impl crate::sidecar::CommandRunner for RecordingRunner {
+        fn run(
+            &self,
+            _program: &str,
+            args: &[String],
+        ) -> std::io::Result<crate::sidecar::RunOutput> {
+            self.0.lock().unwrap().push(args.join(" "));
+            Ok(crate::sidecar::RunOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn quick_readiness() -> crate::sidecar::ReadinessConfig {
+        crate::sidecar::ReadinessConfig {
+            budget: std::time::Duration::from_millis(50),
+            interval: std::time::Duration::from_millis(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_sidecars_start_a_postgres_for_a_database_workspace() {
+        let runner = std::sync::Arc::new(RecordingRunner(Default::default()));
+        let set = start_task_sidecars(
+            crate::container::ContainerRuntime::Podman,
+            runner.clone(),
+            &fixture_root(),
+            "task-9",
+            quick_readiness(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(set.network_name(), "nanna-task-task-9-net");
+        assert_eq!(set.exports()[0].0, "DATABASE_URL");
+        let calls = runner.0.lock().unwrap().clone();
+        assert_eq!(calls[0], "network create nanna-task-task-9-net");
+        assert!(calls[1].contains("--name nanna-task-task-9-postgres"));
+    }
+
+    #[tokio::test]
+    async fn task_sidecars_are_skipped_without_a_database() {
+        let dir = minimal_workspace();
+        let runner = std::sync::Arc::new(RecordingRunner(Default::default()));
+        let set = start_task_sidecars(
+            crate::container::ContainerRuntime::Podman,
+            runner.clone(),
+            dir.path(),
+            "task-9",
+            quick_readiness(),
+        )
+        .await
+        .unwrap();
+        assert!(set.is_none());
+        assert!(runner.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_sidecars_are_skipped_for_other_repositories() {
+        let dir = TempDir::new().unwrap();
+        let runner = std::sync::Arc::new(RecordingRunner(Default::default()));
+        let set = start_task_sidecars(
+            crate::container::ContainerRuntime::Podman,
+            runner.clone(),
+            dir.path(),
+            "task-9",
+            quick_readiness(),
+        )
+        .await
+        .unwrap();
+        assert!(set.is_none());
+        assert!(runner.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_sidecars_need_a_runtime_when_a_database_is_declared() {
+        let runner = std::sync::Arc::new(RecordingRunner(Default::default()));
+        let err = start_task_sidecars(
+            crate::container::ContainerRuntime::None,
+            runner,
+            &fixture_root(),
+            "task-9",
+            quick_readiness(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::sidecar::SidecarError::NoRuntime));
     }
 
     #[test]

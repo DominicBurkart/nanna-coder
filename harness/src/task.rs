@@ -766,11 +766,28 @@ impl TaskRunner {
                     return;
                 }
             };
-            TaskWorkspace::create_with_container(
+            let sidecars = match crate::onboarding::fullstack::start_task_sidecars(
+                crate::container::detect_runtime(),
+                Arc::new(crate::sidecar::SystemRunner),
+                &queued.repo_path,
+                &task_id.0,
+                crate::sidecar::ReadinessConfig::default(),
+            )
+            .await
+            {
+                Ok(sidecars) => sidecars,
+                Err(e) => {
+                    self.fail(&task_id, e.to_string(), "SidecarSetupFailed")
+                        .await;
+                    return;
+                }
+            };
+            TaskWorkspace::create_with_container_and_sidecars(
                 &queued.repo_path,
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
+                sidecars,
             )
             .await
             .map_err(|e| e.to_string())
