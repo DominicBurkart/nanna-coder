@@ -766,3 +766,19 @@ async fn cargo_test_rejects_option_like_filter() {
         .expect_err("an option-like test filter must not reach cargo's argv");
     assert!(matches!(err, ToolError::InvalidArguments { .. }));
 }
+
+#[test]
+fn cargo_deny_declares_repository_effect_class() {
+    use harness::tools::CargoDenyTool;
+    use harness::EffectClass;
+    let tool = CargoDenyTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
+}
+
+#[test]
+fn cargo_audit_declares_repository_effect_class() {
+    use harness::tools::CargoAuditTool;
+    use harness::EffectClass;
+    let tool = CargoAuditTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
+}
