@@ -922,6 +922,15 @@ impl TaskRunner {
             return;
         };
         let identity = self.identities.write().await.remove(&task_id);
+        if let (Some(name), None) = (queued.identity_hint.as_deref(), identity.as_ref()) {
+            self.fail(
+                &task_id,
+                format!("identity {name} is not registered for the task"),
+                "IdentityUnavailable",
+            )
+            .await;
+            return;
+        }
         tracing::info!(
             task_id = %task_id,
             side = side.label(),
@@ -2833,6 +2842,37 @@ mod scheduler_tests {
             .load()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_fails_closed_for_hinted_task_without_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let manager = TaskManager::restore(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        let id = manager
+            .submit_task(
+                queued(Path::new("/nonexistent"))
+                    .with_identity_hint(Some("rust-implementer".to_string())),
+                Arc::clone(&provider),
+            )
+            .await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        match done.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "IdentityUnavailable");
+            }
+            other => panic!("expected IdentityUnavailable, got {other:?}"),
+        }
     }
 
     #[tokio::test]
