@@ -51,7 +51,8 @@
 //! until [`WindowSet::next_open`] is out of scope for this module.
 
 use chrono::{
-    DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
+    DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveTime, TimeZone, Timelike, Utc,
+    Weekday,
 };
 use chrono_tz::Tz;
 use serde::Deserialize;
@@ -370,12 +371,32 @@ impl TryFrom<RawWindow> for Window {
     }
 }
 
-fn first_instant_at_or_after(tz: &Tz, date: NaiveDate, time: NaiveTime) -> Option<DateTime<Utc>> {
+/// Every UTC instant `date`'s local wall clock resolves to at or after
+/// `time`, in local-time order.
+///
+/// Usually a single instant. Two when `time` falls inside a fall-back
+/// overlap, since that local reading occurs twice on the same date, at two
+/// different UTC instants -- both are real candidates a search for "the
+/// next opening" must consider, not just the earlier one, or a `now` that
+/// falls between the two occurrences would wrongly skip the whole date.
+/// Empty when `time` falls inside a spring-forward gap and no later local
+/// minute on `date` resolves either (vanishingly rare: only the last local
+/// minute of a date whose very last hour is skipped).
+fn candidates_at_or_after(tz: &Tz, date: NaiveDate, time: NaiveTime) -> Vec<DateTime<Utc>> {
     let first_minute = time.num_seconds_from_midnight() / 60;
     (first_minute..MINUTES_PER_DAY)
         .filter_map(|minute| NaiveTime::from_hms_opt(minute / 60, minute % 60, 0))
-        .find_map(|candidate| tz.from_local_datetime(&date.and_time(candidate)).earliest())
-        .map(|local| local.with_timezone(&Utc))
+        .find_map(
+            |candidate| match tz.from_local_datetime(&date.and_time(candidate)) {
+                LocalResult::None => None,
+                LocalResult::Single(instant) => Some(vec![instant.with_timezone(&Utc)]),
+                LocalResult::Ambiguous(earliest, latest) => Some(vec![
+                    earliest.with_timezone(&Utc),
+                    latest.with_timezone(&Utc),
+                ]),
+            },
+        )
+        .unwrap_or_default()
 }
 
 impl Window {
@@ -440,8 +461,12 @@ impl Window {
         (0..=NEXT_OPEN_HORIZON_DAYS)
             .map(|offset| today + Duration::days(offset))
             .filter(|date| self.day_eligible(*date))
-            .filter_map(|date| first_instant_at_or_after(&self.timezone, date, self.start))
-            .find(|instant| *instant > now && self.is_open_at(*instant))
+            .find_map(|date| {
+                candidates_at_or_after(&self.timezone, date, self.start)
+                    .into_iter()
+                    .filter(|instant| *instant > now && self.is_open_at(*instant))
+                    .min()
+            })
     }
 }
 
@@ -817,6 +842,46 @@ applies_to = ["production"]
         assert!(set
             .is_open("business-hours", utc(2026, 10, 26, 8, 30))
             .unwrap());
+    }
+
+    #[test]
+    fn next_open_queried_inside_the_fall_back_gap_finds_the_second_occurrence() {
+        // Europe/Paris falls back at 2026-10-25 03:00 CEST -> 02:00 CET
+        // (UTC 01:00). Local 02:30 -- the window's start -- therefore
+        // happens twice that date: once at UTC 00:30 (still CEST) and
+        // again at UTC 01:30 (now CET). A `now` that lands between those
+        // two occurrences must find the *second* one on the same date,
+        // not skip the whole date because the first already passed.
+        let set = single("\"sun\"", "02:30", "03:30");
+        let inside_the_gap = utc(2026, 10, 25, 1, 0);
+        assert_eq!(
+            set.next_open("w", inside_the_gap).unwrap(),
+            utc(2026, 10, 25, 1, 30)
+        );
+    }
+
+    #[test]
+    fn next_open_queried_inside_a_fall_back_gap_in_other_timezones() {
+        // America/New_York falls back 2026-11-01 02:00 EDT -> 01:00 EST
+        // (UTC 06:00). Local 01:15 occurs at UTC 05:15 and again at UTC
+        // 06:15.
+        let src = "[[window]]\nname = \"w\"\ntimezone = \"America/New_York\"\ndays = [\"sun\"]\nstart = \"01:15\"\nend = \"01:45\"\napplies_to = [\"production\"]\n";
+        let set = WindowSet::parse(src).unwrap();
+        assert_eq!(
+            set.next_open("w", utc(2026, 11, 1, 6, 0)).unwrap(),
+            utc(2026, 11, 1, 6, 15)
+        );
+
+        // Australia/Lord_Howe uses a half-hour DST offset and falls back
+        // on the morning of 2026-04-05 local (transition instant UTC
+        // 2026-04-04 15:00, still April 4 in UTC but already April 5
+        // local). Local 01:40 occurs at UTC 14:40 and again at UTC 15:10.
+        let src = "[[window]]\nname = \"w\"\ntimezone = \"Australia/Lord_Howe\"\ndays = [\"sun\"]\nstart = \"01:40\"\nend = \"01:50\"\napplies_to = [\"production\"]\n";
+        let set = WindowSet::parse(src).unwrap();
+        assert_eq!(
+            set.next_open("w", utc(2026, 4, 4, 15, 0)).unwrap(),
+            utc(2026, 4, 4, 15, 10)
+        );
     }
 
     #[test]

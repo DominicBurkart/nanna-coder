@@ -261,15 +261,6 @@ impl RolloutExecutor {
         let record = self.log.load(id)?;
         let mut next = record.clone();
         next.transition(RolloutState::Step(0), self.clock.now())?;
-        if let Some(retained) = &record.retained_slot {
-            self.adapter.set_traffic(retained, 100).await?;
-        }
-        if let Some(slot) = &record.slot {
-            self.adapter.set_traffic(slot, 0).await?;
-            self.adapter.mirror(slot, 0).await?;
-            self.adapter.clear_fallback(slot).await?;
-            self.adapter.retire(slot).await?;
-        }
         next.image = image.to_string();
         next.pr = Some(pr.to_string());
         next.slot = None;
@@ -279,6 +270,15 @@ impl RolloutExecutor {
         next.traffic_percent = 0;
         next.breach = None;
         self.log.append(Some(&record.state), &next)?;
+        if let Some(retained) = &record.retained_slot {
+            self.adapter.set_traffic(retained, 100).await?;
+        }
+        if let Some(slot) = &record.slot {
+            self.adapter.set_traffic(slot, 0).await?;
+            self.adapter.mirror(slot, 0).await?;
+            self.adapter.clear_fallback(slot).await?;
+            self.adapter.retire(slot).await?;
+        }
         Ok(next)
     }
 
@@ -390,6 +390,14 @@ impl RolloutExecutor {
             }
             None => return Err(RolloutError::NoSlot(record.id.clone())),
         };
+        if matches!(step.kind, StepKind::Traffic | StepKind::Swap) {
+            if let Some(health) = &record.plan.health {
+                let sample = self.health.sample(&slot, self.config.poll_interval).await?;
+                if let Some(breach) = check_health(health, &sample, n) {
+                    return self.on_breach(record, breach).await;
+                }
+            }
+        }
         match step.kind {
             StepKind::Traffic => {
                 record.set_traffic(step.traffic_percent)?;
@@ -470,6 +478,7 @@ impl RolloutExecutor {
         };
         let bake_end = since + step.bake_time;
         let hold_end = bake_end + step.min_duration;
+        let mut observed_pairs = 0usize;
         loop {
             let now = self.clock.now();
             if now >= bake_end {
@@ -483,6 +492,7 @@ impl RolloutExecutor {
             }
             if let Some(comparator) = &comparator {
                 let samples = self.shadow.sample(&slot, self.config.poll_interval).await?;
+                observed_pairs += samples.len();
                 if let Some(breach) = comparator.check(&samples, n) {
                     return self.on_breach(record, breach).await;
                 }
@@ -493,6 +503,11 @@ impl RolloutExecutor {
             if !self.unchanged(&record)? {
                 return Ok(());
             }
+        }
+        if comparator.is_some() && observed_pairs == 0 {
+            let summary = "shadow bake observed no mirrored pairs; refusing to promote unobserved"
+                .to_string();
+            return self.halt_and_escalate(record, n, summary, None).await;
         }
         let now = self.clock.now();
         if now < hold_end {
@@ -597,7 +612,7 @@ mod tests {
     use crate::rollout::adapter::{AdapterCall, AdapterOp, FallbackPolicy, FallbackSupport, Slot};
     use crate::rollout::health::{HealthError, HealthObservation, HealthSample, HealthThreshold};
     use crate::rollout::hooks::{RecordingAudit, RecordingEscalation};
-    use crate::rollout::shadow::ShadowSample;
+    use crate::rollout::shadow::{FakeShadowSource, ShadowSample};
     use crate::rollout::state::tests::{plan, t0, GRADUAL};
     use async_trait::async_trait;
     use chrono::TimeZone;
@@ -723,7 +738,7 @@ mod tests {
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
         );
-        assert_eq!(rig.health.calls().len(), 3);
+        assert_eq!(rig.health.calls().len(), 6);
         assert_eq!(rig.audit.reviews().len(), 3);
         assert!(rig.leases.snapshot().unwrap().is_empty());
         assert_eq!(
@@ -739,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn breach_at_step_3_rolls_back_to_the_previous_image() {
         let rig = rig();
-        rig.health.push_after(2, breach_sample());
+        rig.health.push_after(5, breach_sample());
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
         let done = rig.executor.run(&record.id).await.unwrap();
         assert_eq!(done.state, RolloutState::RolledBack);
@@ -769,11 +784,21 @@ mod tests {
     #[tokio::test]
     async fn crash_mid_bake_resumes_at_the_same_step_with_the_same_slot() {
         let rig = rig();
-        rig.health
-            .push(HealthSample::healthy(&["/health/v1".to_string()]));
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
-        rig.health.set_failing(true);
-        let err = rig.executor.run(&record.id).await.unwrap_err();
+        let failing = Arc::new(FailAfter {
+            healthy_polls: 1,
+            polls: std::sync::Mutex::new(0),
+        });
+        let crashing = RolloutExecutor::new(
+            RolloutLog::open(&rig.path).unwrap(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            failing,
+        )
+        .with_config(one_poll_per_step());
+        let err = crashing.run(&record.id).await.unwrap_err();
         assert!(matches!(err, RolloutError::Health(HealthError(_))), "{err}");
         let crashed = rig.executor.log().load(&record.id).unwrap();
         let RolloutState::Baking { step: 0, since } = crashed.state else {
@@ -884,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn halt_and_escalate_holds_the_split_and_calls_the_hook() {
         let rig = rig();
-        rig.health.push_after(1, breach_sample());
+        rig.health.push_after(3, breach_sample());
         let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
         let record = rig.executor.start(plan, V2).await.unwrap();
         let halted = rig.executor.run(&record.id).await.unwrap();
@@ -920,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn manual_rollback_policy_halts_on_breach() {
         let rig = rig();
-        rig.health.push(breach_sample());
+        rig.health.push_after(1, breach_sample());
         let plan = plan_with("[rollback]\nautomatic = false\non_breach = \"rollback\"\n");
         let record = rig.executor.start(plan, V2).await.unwrap();
         let halted = rig.executor.run(&record.id).await.unwrap();
@@ -1045,6 +1070,27 @@ mod tests {
         );
     }
 
+    struct FailAfter {
+        healthy_polls: usize,
+        polls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl HealthSource for FailAfter {
+        async fn sample(
+            &self,
+            _slot: &Slot,
+            _window: Duration,
+        ) -> Result<HealthSample, HealthError> {
+            let mut polls = self.polls.lock().unwrap();
+            *polls += 1;
+            if *polls > self.healthy_polls {
+                return Err(HealthError("scripted failure".into()));
+            }
+            Ok(HealthSample::healthy(&["/health/v1".to_string()]))
+        }
+    }
+
     struct HaltOnPoll {
         log: RolloutLog,
         after: usize,
@@ -1078,7 +1124,7 @@ mod tests {
         let log = RolloutLog::open(&rig.path).unwrap();
         let health = Arc::new(HaltOnPoll {
             log: log.clone(),
-            after: 2,
+            after: 3,
             polls: std::sync::Mutex::new(0),
         });
         let executor = RolloutExecutor::new(
@@ -1214,6 +1260,43 @@ mod tests {
             rig.executor.start(plan("sandbox"), V2).await.unwrap_err(),
             RolloutError::Adapter(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn no_traffic_moves_before_the_first_health_sample() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        rig.executor.run(&record.id).await.unwrap();
+        assert!(
+            !rig.adapter
+                .calls()
+                .iter()
+                .any(|c| matches!(c, AdapterCall::SetTraffic(_, 10))),
+            "{:?}",
+            rig.adapter.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn roll_forward_is_persisted_before_adapter_effects() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = false\non_breach = \"rollback\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap().state,
+            RolloutState::Halted
+        );
+        rig.adapter.fail(AdapterOp::Retire);
+        assert!(rig
+            .executor
+            .roll_forward(&record.id, V3, Some("pr-1"))
+            .await
+            .is_err());
+        let persisted = rig.executor.status(&record.id).unwrap();
+        assert_eq!(persisted.image, V3);
+        assert_eq!(persisted.state, RolloutState::Step(0));
     }
 
     #[tokio::test]
@@ -1404,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_after_swap_restores_the_retained_slot() {
         let rig = rig();
-        rig.health.push(breach_sample());
+        rig.health.push_after(1, breach_sample());
         let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
         let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
         let record = rig.executor.start(plan, V2).await.unwrap();
@@ -1442,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn roll_forward_after_a_swap_restores_the_retained_slot_before_draining_the_bad_one() {
         let rig = rig();
-        rig.health.push(breach_sample());
+        rig.health.push_after(1, breach_sample());
         let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"roll-forward\"\nretain_for = \"2d\"\n";
         let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
         let record = rig.executor.start(plan, V2).await.unwrap();
@@ -1536,7 +1619,7 @@ mod tests {
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
         );
-        assert_eq!(rig.health.calls().len(), 3);
+        assert_eq!(rig.health.calls().len(), 5);
         assert_eq!(
             rig.shadow.calls().len(),
             1,
@@ -1576,6 +1659,33 @@ mod tests {
         assert_eq!(breach.observed, HealthObservation::ShadowDivergence(1.0));
         assert_eq!(rig.adapter.current(), V1);
         assert_eq!(rig.adapter.traffic(&Slot::new("slot-0")), Some(100));
+    }
+
+    #[tokio::test]
+    async fn an_unobserved_shadow_window_refuses_to_promote() {
+        let rig = rig();
+        let executor = RolloutExecutor::new(
+            RolloutLog::open(&rig.path).unwrap(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            rig.health.clone(),
+        )
+        .with_shadow_source(Arc::new(FakeShadowSource::new(Vec::new())))
+        .with_escalation(rig.escalation.clone())
+        .with_config(one_poll_per_step());
+        let record = executor.start(shadow_plan(), V2).await.unwrap();
+        let done = executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Halted);
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::SetTraffic(_, 50 | 100))));
+        assert!(rig.escalation.escalations()[0]
+            .summary
+            .contains("unobserved"));
     }
 
     #[tokio::test]
@@ -1653,6 +1763,6 @@ mod tests {
             RolloutState::Complete
         );
         assert_eq!(adapter.current(), V2);
-        assert_eq!(health.calls().len(), 3 * 30);
+        assert_eq!(health.calls().len(), 3 * 31);
     }
 }

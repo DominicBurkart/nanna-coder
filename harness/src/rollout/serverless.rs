@@ -47,9 +47,10 @@ impl CommandRunner for ProcessRunner {
 /// `deploy_inactive` must print the new slot's name; `current_image` must
 /// print the live image reference; `swap` must print the new active slot
 /// and the retired candidate, in that order; `set_fallback` must print
-/// `native` or `best-effort`. The two fallback templates are optional: a
-/// provider without an edge retry leaves them unset and every rollout on
-/// it records its fallback as [`FallbackSupport::BestEffort`].
+/// `native` or `best-effort`. The `set_fallback` template is required in
+/// practice: without it [`TargetAdapter::set_fallback`] refuses, so a
+/// rollout never proceeds silently without edge retries. The
+/// `clear_fallback` template is optional and clearing without one is a no-op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerlessConfig {
     /// Template for [`TargetAdapter::deploy_inactive`].
@@ -106,8 +107,8 @@ impl ServerlessConfig {
 
     /// Build from `lookup`, which resolves each [`SERVERLESS_ENV`] and
     /// [`SERVERLESS_FALLBACK_ENV`] name. A missing or blank required
-    /// template is an error naming the operation; a missing or blank
-    /// fallback template means the provider has no edge retry.
+    /// template is an error naming the operation. A missing or blank
+    /// fallback template is accepted here; `set_fallback` then refuses.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, AdapterError> {
         let mut templates = Vec::with_capacity(SERVERLESS_ENV.len());
         for (name, op) in SERVERLESS_ENV {
@@ -172,8 +173,7 @@ impl ServerlessConfig {
 /// assert_eq!(runner.0.lock().unwrap()[1], ["cloudctl", "mirror", "green", "5"]);
 /// let swapped = adapter.swap().await.unwrap();
 /// assert_eq!((swapped.active.name(), swapped.retired_candidate.name()), ("green", "blue"));
-/// let support = adapter.set_fallback(&slot, &FallbackPolicy::default()).await.unwrap();
-/// assert_eq!(support, FallbackSupport::BestEffort, "no fallback template: best effort");
+/// assert!(adapter.set_fallback(&slot, &FallbackPolicy::default()).await.is_err(), "no fallback template: refuse");
 /// assert_eq!(runner.0.lock().unwrap().len(), 3);
 /// # });
 /// ```
@@ -317,7 +317,12 @@ impl TargetAdapter for ServerlessAdapter {
         policy: &FallbackPolicy,
     ) -> Result<FallbackSupport, AdapterError> {
         let Some(template) = &self.config.set_fallback else {
-            return Ok(FallbackSupport::BestEffort);
+            return Err(AdapterError {
+                op: AdapterOp::SetFallback,
+                reason:
+                    "no set_fallback template configured; refusing to roll out without edge retries"
+                        .into(),
+            });
         };
         let retries = policy.retries.to_string();
         let statuses = format!("{}-{}", policy.status_min, policy.status_max);
@@ -535,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_reports_support_and_is_best_effort_without_a_template() {
+    async fn fallback_refuses_without_a_template_instead_of_best_effort() {
         let runner = Scripted::ok("native\n");
         let adapter = ServerlessAdapter::new(config(), runner.clone());
         let slot = Slot::new("green");
@@ -576,12 +581,16 @@ mod tests {
         without.clear_fallback = None;
         let adapter = ServerlessAdapter::new(without, runner.clone());
         let before = runner.count();
-        assert_eq!(
-            adapter.set_fallback(&slot, &policy).await.unwrap(),
-            FallbackSupport::BestEffort
-        );
-        adapter.clear_fallback(&slot).await.unwrap();
+        let refused = adapter.set_fallback(&slot, &policy).await.unwrap_err();
+        assert_eq!(refused.op, AdapterOp::SetFallback);
+        assert!(refused.reason.contains("refusing"), "{refused}");
         assert_eq!(runner.count(), before, "no template, no command");
+        adapter.clear_fallback(&slot).await.unwrap();
+        assert_eq!(
+            runner.count(),
+            before,
+            "clearing without a template is a no-op"
+        );
     }
 
     #[tokio::test]
