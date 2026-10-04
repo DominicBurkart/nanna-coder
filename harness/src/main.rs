@@ -573,7 +573,12 @@ fn list_tools(tool_registry: &ToolRegistry) {
         for tool_name in tools {
             if let Some(tool) = tool_registry.get_tool(tool_name) {
                 let def = tool.definition();
-                println!("  - {}: {}", def.function.name, def.function.description);
+                println!(
+                    "  - {} [{}]: {}",
+                    def.function.name,
+                    tool.effect_class(),
+                    def.function.description
+                );
             }
         }
     }

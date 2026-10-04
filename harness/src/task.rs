@@ -1,4 +1,5 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::workspace::TaskWorkspace;
@@ -92,6 +93,15 @@ pub struct TaskResult {
 }
 
 impl TaskResult {
+    /// The widest blast radius any attributed tool call in this result
+    /// reached, or `None` when no call carried an effect attribution.
+    pub fn max_effect_class(&self) -> Option<EffectClass> {
+        self.tool_calls_made
+            .iter()
+            .filter_map(|call| call.effect.as_ref().map(|effect| effect.class))
+            .max()
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "result_summary": self.result_summary,
@@ -99,6 +109,7 @@ impl TaskResult {
             "format_patch": self.format_patch,
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
+            "max_effect_class": self.max_effect_class(),
             "iterations": self.iterations,
             "model_used": self.model_used,
         })
@@ -874,6 +885,7 @@ mod tests {
             arguments: serde_json::json!({"path": "src/main.rs"}),
             call_id: "call_1".to_string(),
             result: "fn main() {}".to_string(),
+            effect: Some(crate::effects::EffectRecord::new(EffectClass::None)),
         };
         let diag = FailureDiagnostics {
             error_type: "StateError".to_string(),
@@ -891,6 +903,53 @@ mod tests {
         assert_eq!(json["tool_call_history"].as_array().unwrap().len(), 1);
         assert_eq!(json["last_agent_state"], "Performing");
         assert!(json["conversation_snapshot"].is_array());
+        assert_eq!(json["tool_call_history"][0]["effect"]["class"], "none");
+    }
+
+    fn record(name: &str, class: Option<EffectClass>) -> ToolCallRecord {
+        ToolCallRecord {
+            tool_name: name.to_string(),
+            arguments: serde_json::json!({}),
+            call_id: format!("call_{name}"),
+            result: String::new(),
+            effect: class.map(crate::effects::EffectRecord::new),
+        }
+    }
+
+    fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
+        TaskResult {
+            result_summary: "done".to_string(),
+            changes_patch: None,
+            format_patch: None,
+            files_modified: vec![],
+            tool_calls_made,
+            iterations: 1,
+            model_used: "mock".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_task_result_json_exposes_effect_on_every_tool_call() {
+        let result = result_with_calls(vec![
+            record("read_file", Some(EffectClass::None)),
+            record("write_file", Some(EffectClass::Workspace)),
+            record("unregistered", None),
+        ]);
+        let json = result.to_json();
+        let calls = json["tool_calls_made"].as_array().unwrap();
+        assert_eq!(calls[0]["effect"]["class"], "none");
+        assert_eq!(calls[1]["effect"]["class"], "workspace");
+        assert!(calls[2]["effect"].is_null());
+        assert_eq!(json["max_effect_class"], "workspace");
+        assert_eq!(result.max_effect_class(), Some(EffectClass::Workspace));
+    }
+
+    #[test]
+    fn test_task_result_max_effect_class_is_none_without_attributed_calls() {
+        assert_eq!(result_with_calls(vec![]).max_effect_class(), None);
+        let unattributed = result_with_calls(vec![record("x", None)]);
+        assert_eq!(unattributed.max_effect_class(), None);
+        assert!(unattributed.to_json()["max_effect_class"].is_null());
     }
 
     #[test]
