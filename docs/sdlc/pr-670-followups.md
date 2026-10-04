@@ -10,7 +10,7 @@ output and docs must describe the plan as advisory. #799 does that.
 - Case-insensitive production gate: `Production` requires window and health
   preconditions the same as `production` (#776, fix present, issue open).
 - Plan-time validation in `plan_with_score` (#775, fix present, issue open).
-- `nanna deploy plan` labels its output and JSON as advisory (#799, draft).
+- `nanna deploy plan` labels its output and JSON as advisory (#799, merged).
 
 ## Not enforced on main
 
