@@ -61,8 +61,13 @@ impl RolloutTransition {
             .from
             .as_ref()
             .map_or_else(|| "created".to_string(), ToString::to_string);
+        let retained = self
+            .record
+            .retained_slot
+            .as_ref()
+            .map_or_else(String::new, |slot| format!("  retained: {slot}"));
         format!(
-            "{}  {from} -> {}  traffic {}%",
+            "{}  {from} -> {}  traffic {}%{retained}",
             self.at, self.record.state, self.record.traffic_percent
         )
     }

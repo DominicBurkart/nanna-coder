@@ -1,5 +1,5 @@
 use super::adapter::Slot;
-use crate::deploy::Health;
+use crate::deploy::{Health, ShadowCompare};
 use async_trait::async_trait;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,13 @@ pub enum HealthThreshold {
     LatencyP99MaxMs(u32),
     /// An endpoint in `endpoints` must answer with a `2xx`.
     EndpointOk(String),
+    /// `[shadow].max_divergence` for one compared attribute.
+    ShadowDivergenceMax {
+        /// Attribute whose divergence rate is bounded.
+        compare: ShadowCompare,
+        /// The bound.
+        max: f64,
+    },
 }
 
 /// The value that breached a [`HealthThreshold`].
@@ -70,6 +77,8 @@ pub enum HealthObservation {
     EndpointStatus(u16),
     /// The sample had no data for the endpoint.
     EndpointMissing,
+    /// Observed share of mirrored pairs that diverged.
+    ShadowDivergence(f64),
 }
 
 /// A health gate breached during step `step`; what `[rollback].on_breach`
@@ -90,12 +99,16 @@ impl fmt::Display for HealthBreach {
             HealthThreshold::ErrorRateMax(max) => format!("error_rate_max {max}"),
             HealthThreshold::LatencyP99MaxMs(max) => format!("latency_p99_max_ms {max}"),
             HealthThreshold::EndpointOk(path) => format!("endpoint {path} ok"),
+            HealthThreshold::ShadowDivergenceMax { compare, max } => {
+                format!("shadow {} divergence max {max}", compare.name())
+            }
         };
         let observed = match &self.observed {
             HealthObservation::ErrorRate(rate) => format!("error rate {rate}"),
             HealthObservation::LatencyP99Ms(ms) => format!("p99 {ms} ms"),
             HealthObservation::EndpointStatus(status) => format!("status {status}"),
             HealthObservation::EndpointMissing => "no sample".to_string(),
+            HealthObservation::ShadowDivergence(rate) => format!("divergence rate {rate}"),
         };
         write!(f, "step {}: {threshold} breached by {observed}", self.step)
     }

@@ -21,10 +21,14 @@ mod hooks;
 mod log;
 #[cfg(feature = "serverless-adapter")]
 mod serverless;
+mod shadow;
 mod state;
 
-pub use adapter::{AdapterCall, AdapterError, AdapterOp, FakeAdapter, Slot, TargetAdapter};
-pub use executor::{fake_executor, RolloutConfig, RolloutExecutor};
+pub use adapter::{
+    AdapterCall, AdapterError, AdapterOp, FakeAdapter, FallbackPolicy, FallbackSupport, Slot,
+    Swapped, TargetAdapter,
+};
+pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
 pub use health::{
     check_health, FakeHealthSource, HealthBreach, HealthError, HealthObservation, HealthSample,
     HealthSource, HealthThreshold,
@@ -39,7 +43,11 @@ pub use log::{
 #[cfg(feature = "serverless-adapter")]
 pub use serverless::{
     CommandOutput, CommandRunner, ProcessRunner, ServerlessAdapter, ServerlessConfig,
-    SERVERLESS_ENV,
+    SERVERLESS_ENV, SERVERLESS_FALLBACK_ENV,
+};
+pub use shadow::{
+    FakeShadowSource, NoShadowSource, ShadowComparator, ShadowDivergence, ShadowError,
+    ShadowSample, ShadowSource, DEFAULT_LATENCY_SLACK,
 };
 pub use state::{RolloutRecord, RolloutState};
 
@@ -82,12 +90,15 @@ pub enum RolloutError {
     /// The plan's lease string is not `deploy:<repo>:<env>`.
     #[error("plan lease `{0}` is not of the form deploy:<repo>:<env>")]
     BadLeaseName(String),
-    /// A step kind this executor does not implement yet.
-    #[error("step kind `{0}` is not supported by the rollout executor yet")]
-    UnsupportedStep(&'static str),
     /// A step beyond the first found no deployed slot to route to.
     #[error("rollout {0} has no deployed slot")]
     NoSlot(String),
+    /// A `Retire` step found no slot a prior `Swap` had retained.
+    #[error("rollout {0} has no slot retained by a swap to retire")]
+    NoRetainedSlot(String),
+    /// A `Shadow` step found no `[shadow]` section on the plan.
+    #[error("rollout {0} is at a shadow step but its plan has no [shadow] section")]
+    NoShadowConfig(String),
     /// A persisted state names a step the plan does not have.
     #[error("rollout {id} is at step {step}, which its plan does not have")]
     NoSuchStep {
@@ -105,6 +116,9 @@ pub enum RolloutError {
     /// The health source failed.
     #[error(transparent)]
     Health(#[from] HealthError),
+    /// The shadow source failed.
+    #[error(transparent)]
+    Shadow(#[from] ShadowError),
     /// The lease store failed.
     #[error(transparent)]
     Lease(#[from] LeaseError),
