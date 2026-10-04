@@ -1,17 +1,24 @@
 pub mod agent;
+pub mod backlog;
 pub mod capabilities;
 pub mod container;
+pub mod deploy;
+pub mod effects;
 pub mod entities;
 pub mod eval;
+pub mod identity;
+pub mod leases;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod scheduler;
 pub mod sidecar;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
+pub mod windows;
 pub mod workspace;
 
 pub use capabilities::{
@@ -23,6 +30,8 @@ pub use container::{
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
+pub use effects::{EffectClass, UnknownEffectClass};
+pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,

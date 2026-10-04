@@ -1,0 +1,17 @@
+[identity]
+name = "deployer"
+description = "Rolls a merged change out to the sandbox environment inside an open availability window."
+loop = "outer"
+model = "gemma4:e4b"
+system_prompt = { inline = "You deploy exactly one already-merged change to the sandbox environment. Stop and escalate on any health-check regression." }
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = []
+max_effect = "sandbox"
+tools = ["read_file", "run_command"]
+
+[limits]
+max_iterations = 50
+max_wall_clock_secs = 900
+max_concurrent = 1
