@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod effects;
 pub mod entities;
 pub mod eval;
+pub mod identity;
 pub mod leases;
 pub mod mcp;
 pub mod monitoring;
@@ -29,6 +30,7 @@ pub use container::{
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
 pub use effects::{EffectClass, UnknownEffectClass};
+pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
