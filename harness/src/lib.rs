@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod backlog;
 pub mod container;
+pub mod effects;
 pub mod entities;
 pub mod eval;
 pub mod leases;
@@ -21,6 +22,7 @@ pub use container::{
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
+pub use effects::{EffectClass, UnknownEffectClass};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
