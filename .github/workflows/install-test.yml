@@ -133,85 +133,157 @@ jobs:
           podman pod stop nanna-coder-pod || true
           podman pod rm   nanna-coder-pod || true
 
-  macos-bringup:
-    name: macOS full bring-up (M-series + libkrun provider)
-    # GHA-hosted M-series runners ship `applehv` (Apple Virtualization
-    # framework + vfkit) as the default podman machine provider. vfkit
-    # fails with `exited unexpectedly with exit code 1` in the GHA
-    # sandbox (verified rounds 7/8). Round 11 tried the qemu provider
-    # but podman 5.x removed qemu — only `applehv` and `libkrun` are
-    # supported. libkrun is the last option: it's a Hypervisor.framework
-    # backend that doesn't depend on vfkit. macos-13 (Intel) is the
-    # alternative but its runner queue is heavily congested (40+ min).
-    runs-on: macos-14
-    needs: build-images
-    timeout-minutes: 45
+  fast-checks-passed:
+    name: Fast checks passed (gates macOS/Windows runners)
+    runs-on: ubuntu-latest
+    needs:
+      - shellcheck
+      - ps1-lint
+      - ps1-parse
+      - linux-bringup
+    steps:
+      - run: echo "shellcheck, ps1-lint, ps1-parse and linux-bringup all passed."
+
+  macos-smoke:
+    name: macOS install smoke test (arm64, expected virtualization gap)
+    # GitHub-hosted arm64 macOS runners don't expose Hypervisor.framework
+    # to the guest at all (confirmed by GitHub's own docs and by
+    # actions/runner-images#13505, closed "not planned"), so no podman
+    # machine provider can work here regardless of packaging. This job
+    # drives the real scripts/install.sh code path and hard-fails on any
+    # sign of a real regression, but its "expected gap" pass accepts any
+    # start-time failure once podman is installed and the script reached
+    # the actual machine-start attempt -- it can't distinguish this
+    # specific gap from a new, different start-time failure (an
+    # entitlements problem, an image-pull failure, etc.); only real
+    # hardware can. See docs/ci/macos-podman-bringup.md.
+    runs-on: macos-15
+    needs: fast-checks-passed
+    timeout-minutes: 15
     env:
-      CONTAINERS_MACHINE_PROVIDER: libkrun
+      HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: container-images
-          path: _images
 
-      - name: Install podman + libkrun
+      - name: Diagnostics
         run: |
           set -x
-          brew install podman libkrun
-          podman --version
+          sw_vers
+          uname -m
+          # kern.hv_support reports "unknown oid" on this GitHub-hosted
+          # arm64 guest (confirmed by a real run), so it can't classify
+          # anything below -- kept here only as a diagnostic breadcrumb.
+          # Whether that OID is genuinely absent on Apple Silicon in
+          # general, or just in this hosted guest, is unconfirmed; check
+          # on real hardware before reading anything into it either way.
+          sysctl kern.hv_support || true
+          brew --version
+          command -v podman || true
 
-      - name: Initialize and start podman machine (libkrun provider)
+      - name: Run installer and classify the result
         run: |
           set -x
-          df -h /
-          podman machine init --cpus=2 --memory=3072 --disk-size=10
-          podman machine start
-          podman machine list
-          podman info | head -40
+          LOG="$(mktemp)"
+          set +e
+          bash scripts/install.sh --no-pull --skip-model-pull --yes --no-start >"$LOG" 2>&1
+          install_status=$?
+          set -e
+          cat "$LOG"
+          echo "install.sh exit status: $install_status"
+          podman machine list --format '{{.Name}} {{.VMType}}' 2>/dev/null || true
 
-      - name: Load images
-        run: |
-          set -x
-          podman load -i _images/harness.tar
-          podman load -i _images/ollama.tar
-          podman images
+          if podman machine list --format '{{.Running}}' 2>/dev/null | grep -qi true; then
+            echo "::warning::podman machine is RUNNING on a GitHub-hosted arm64 runner. This isn't supposed to be possible today per GitHub's docs — see docs/ci/macos-podman-bringup.md. If this keeps happening, promote this job into a full pod bring-up test."
+            podman machine list
+            podman info | head -40
+            exit 0
+          fi
 
-      - name: Run installer
-        run: |
-          # install.sh's ensure_podman_machine_macos() is idempotent.
-          bash scripts/install.sh \
-            --no-pull --skip-model-pull --yes \
-            --harness-image nanna-coder-harness:latest \
-            --ollama-image  nanna-coder-ollama:latest
+          if grep -qE 'executable file not found|could not find "' "$LOG"; then
+            echo "::error::install.sh is missing a binary it should have installed itself (see the log above) — a real packaging regression, not the known virtualization gap. See docs/ci/macos-podman-bringup.md."
+            exit 1
+          fi
 
-      - name: Verify pod and ollama API
+          if ! command -v podman >/dev/null 2>&1; then
+            echo "::error::podman itself never got installed by install.sh — a real regression, not the known virtualization gap. See the log above and docs/ci/macos-podman-bringup.md."
+            exit 1
+          fi
+
+          if ! grep -q 'starting podman machine' "$LOG"; then
+            echo "::error::install.sh never reached the podman-machine-start step at all (see the log above) — that's earlier than the known virtualization gap and is a real regression. See docs/ci/macos-podman-bringup.md."
+            exit 1
+          fi
+
+          echo "::notice::podman installed and install.sh's own machine-bring-up step ran; only the actual machine start failed — the known, tracked GitHub-hosted-runner virtualization gap. See docs/ci/macos-podman-bringup.md."
+
+      - name: Tear down
         if: always()
         run: |
-          podman pod ps
-          podman ps -a
-          # qemu-emulated x86_64 startup can be slow; allow 4 min.
-          for i in $(seq 1 120); do
-            if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-              echo "ollama API up"; exit 0
-            fi
-            sleep 2
-          done
-          echo "ollama did not come up in 240s"
-          podman logs ollama-service || true
+          podman machine stop || true
+
+  macos-intel-probe:
+    name: macOS Intel virtualization probe (diagnostic, non-blocking)
+    # GitHub's nested-virtualization docs read as arm64-specific, so
+    # this checks whether Intel-hosted runners behave differently.
+    # Classifies its own result like macos-smoke does, but stays out of
+    # the gate: Intel-hosted runners have historically had long queue
+    # times on this repo. See docs/ci/macos-podman-bringup.md.
+    runs-on: macos-15-intel
+    needs: fast-checks-passed
+    timeout-minutes: 15
+    env:
+      CONTAINERS_MACHINE_PROVIDER: applehv
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diagnostics
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          sysctl kern.hv_support || true
+
+      - name: Install podman and classify the result
+        run: |
+          set -x
+          LOG="$(mktemp)"
+          set +e
+          brew install podman >"$LOG" 2>&1
+          status=$?
+          set -e
+          cat "$LOG"
+
+          if [ "$status" -eq 0 ]; then
+            echo "::warning::brew install podman SUCCEEDED on macos-15-intel. Homebrew's podman formula previously required arm64 -- if this keeps happening, promote this job into a real Intel full bring-up lane. See docs/ci/macos-podman-bringup.md."
+            podman --version
+            set +e
+            podman machine init --cpus=2 --memory=3072 --disk-size=10
+            podman machine start
+            bringup_status=$?
+            set -e
+            podman machine list || true
+            podman info | head -40 || true
+            exit "$bringup_status"
+          fi
+
+          if grep -qiE 'no bottle available|arm64 architecture is required' "$LOG"; then
+            echo "::notice::Homebrew's podman formula still doesn't support macOS Intel (the known, tracked packaging gap -- independent of GitHub Actions, this also affects real Intel Mac users). See docs/ci/macos-podman-bringup.md."
+            exit 0
+          fi
+
+          echo "::error::brew install podman failed with an error that doesn't match the known Intel packaging gap -- may be a new, different regression. See the log above and docs/ci/macos-podman-bringup.md."
           exit 1
 
       - name: Tear down
         if: always()
         run: |
-          podman pod stop nanna-coder-pod || true
-          podman pod rm   nanna-coder-pod || true
           podman machine stop || true
 
   windows-bringup:
-    name: Windows full bring-up (WSL2 + native apt podman)
+    name: "Windows install.sh WSL2 rejection (expected; issue 326)"
     runs-on: windows-latest
-    needs: build-images
+    needs: fast-checks-passed
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -260,19 +332,62 @@ jobs:
           podman load -i _images/ollama.tar
           podman images
 
+      # `|| rc=$?` keeps the wsl-bash wrapper's inherited `-e` (setup-wsl's
+      # default shell is `bash -euo pipefail`) from skipping the rc capture;
+      # pipefail makes it install.sh's exit code, not tee's.
       - name: Run installer inside WSL
+        id: installer
+        continue-on-error: true
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          ws=$(wslpath -u '${{ github.workspace }}')
+          cd "$ws"
+          rc=0
+          bash scripts/install.sh \
+            --no-pull --skip-model-pull --yes \
+            --harness-image nanna-coder-harness:latest \
+            --ollama-image  nanna-coder-ollama:latest \
+            2>&1 | tee _installer.log || rc=$?
+          echo "$rc" > _installer.rc
+          exit "$rc"
+
+      # Passes only on the known-expected result (exit 1 + the die()
+      # message); fails for real on anything else, including an unexpected
+      # success (which would mean the #326 blocker is gone).
+      - name: "Assert installer result (WSL2 early-exit; issue 326)"
+        if: always()
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
           ws=$(wslpath -u '${{ github.workspace }}')
           cd "$ws"
-          bash scripts/install.sh \
-            --no-pull --skip-model-pull --yes \
-            --harness-image nanna-coder-harness:latest \
-            --ollama-image  nanna-coder-ollama:latest
+          outcome='${{ steps.installer.outcome }}'
+          case "$outcome" in
+            failure) ;;
+            success)
+              echo "::error::install.sh succeeded under WSL2 (outcome=$outcome) — the is_wsl() early-exit no longer fires. If #326 has been resolved and WSL2 bring-up is now genuinely supported, replace this assertion with a must-pass bring-up check; otherwise this is a regression."
+              exit 1 ;;
+            *)
+              echo "installer step did not complete (outcome=${outcome:-unset}); see the earlier failing step for the real error."
+              exit 0 ;;
+          esac
+          rc=$(cat _installer.rc 2>/dev/null || echo "")
+          if [ "$rc" != "1" ]; then
+            echo "::error::install.sh exited $rc, expected 1 (die() from the WSL2 early-exit)."
+            cat _installer.log
+            exit 1
+          fi
+          if ! grep -qF 'WSL2 detected; not supported by install.sh' _installer.log; then
+            echo "::error::install.sh exited 1 but not with the expected WSL2 early-exit message. Full log:"
+            cat _installer.log
+            exit 1
+          fi
+          echo "install.sh correctly detected WSL2 (exit 1, expected message) and rejected it early — expected, by-design result (#326)."
 
+      # Nothing to verify unless install.sh got past the WSL2 early-exit.
       - name: Verify pod and ollama API inside WSL
-        if: always()
+        if: always() && steps.installer.outcome == 'success'
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
@@ -289,7 +404,7 @@ jobs:
           exit 1
 
       - name: Tear down inside WSL
-        if: always()
+        if: always() && steps.installer.outcome == 'success'
         shell: wsl-bash {0}
         run: |
           podman pod stop nanna-coder-pod || true
@@ -305,25 +420,53 @@ jobs:
       - ps1-parse
       - build-images
       - linux-bringup
-      - macos-bringup
+      - fast-checks-passed
+      - macos-smoke
       - windows-bringup
     steps:
-      # Gate enforces success on Linux + the lint/build jobs.
-      # windows-bringup is intentionally allowed to fail: install.sh
-      # exits early on WSL2 with a "not supported" message (see is_wsl()
-      # in scripts/install.sh), so the Windows lane is expected to fail
-      # in CI as the documented confirmation of that path. Tracked in #326.
-      # macos-bringup is allowed to fail because every podman-machine
-      # provider available on free GHA macOS runners has a CI-sandbox
-      # blocker: applehv/vfkit aborts on start, qemu was removed in
-      # podman 5, libkrun has no homebrew formula, and macos-13 (Intel)
-      # has unbounded queue time. The macOS install path itself works
-      # for real users; this is purely a runner-sandbox gap. Tracked
-      # separately so the install.sh + install.ps1 code can ship.
-      - if: ${{ needs.shellcheck.result != 'success' || needs.ps1-lint.result != 'success' || needs.ps1-parse.result != 'success' || needs.build-images.result != 'success' || needs.linux-bringup.result != 'success' }}
+      - uses: actions/checkout@v4
+
+      - name: Verify gate covers every job
         run: |
-          echo "::error::Required install-test job failed (linux/lint/build)"
+          set -euo pipefail
+          # macos-intel-probe is deliberately non-blocking; see its job comment.
+          excluded=(install-test-gate macos-intel-probe)
+          all_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/install-test.yml | sort)
+          gate_needs=$(yq -r '.jobs["install-test-gate"].needs | .[]' .github/workflows/install-test.yml | sort)
+          expected=$(comm -23 <(echo "$all_jobs") <(printf '%s\n' "${excluded[@]}" | sort))
+          missing=$(comm -23 <(echo "$expected") <(echo "$gate_needs") || true)
+          if [ -n "$missing" ]; then
+            echo "::error::Jobs missing from 'install-test-gate'.needs:"
+            echo "$missing"
+            echo "Add them to .github/workflows/install-test.yml under jobs.install-test-gate.needs (or to the excluded list above if they're intentionally non-blocking)"
+            exit 1
+          fi
+          echo "OK: all $(echo "$expected" | wc -l | tr -d ' ') required jobs covered"
+
+      # fast-checks-passed transitively covers shellcheck/ps1-lint/ps1-parse/
+      # build-images/linux-bringup; macos-smoke and windows-bringup are
+      # checked directly since they're not upstream of fast-checks-passed:
+      #
+      # macos-smoke: its classifier has now been checked against real
+      # macos-15 runs (podman installed cleanly from a Homebrew bottle,
+      # install.sh reached and logged "starting podman machine", and the
+      # classifier correctly emitted the "expected gap" notice and
+      # exited 0), so a passing run means something real and it belongs
+      # in the required set. See docs/ci/macos-podman-bringup.md for
+      # those runs' actual output.
+      #
+      # windows-bringup's own "Assert installer result" step already
+      # verifies install.sh's WSL2 early-exit fires correctly (#326): the
+      # job reports success for that expected, by-design rejection and
+      # fails for real on a regression or an unexpected error, so no
+      # special-casing is needed here either.
+      #
+      # macos-intel-probe is deliberately left out of `needs:` entirely:
+      # it's purely exploratory (see its job comment), and Intel-hosted
+      # runners have historically had long queue times on this repo, so
+      # the gate shouldn't wait on it. Its result is still visible as its
+      # own check on the PR.
+      - if: ${{ needs.fast-checks-passed.result != 'success' || needs.macos-smoke.result != 'success' || needs.windows-bringup.result != 'success' }}
+        run: |
+          echo "::error::Required install-test job failed"
           exit 1
-      - if: ${{ needs.windows-bringup.result != 'failure' }}
-        run: |
-          echo "::warning::windows-bringup did not fail — install.sh's WSL2 early-exit may have regressed; verify is_wsl() still triggers."

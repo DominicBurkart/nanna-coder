@@ -12,6 +12,7 @@ pub mod pod;
 pub mod task;
 pub mod telemetry;
 pub mod tools;
+pub mod windows;
 pub mod workspace;
 
 pub use container::{
