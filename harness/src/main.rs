@@ -521,7 +521,7 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
-            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
             if json {
                 println!("{}", plan.to_json_pretty());
             } else {
@@ -853,7 +853,12 @@ fn list_tools(tool_registry: &ToolRegistry) {
         for tool_name in tools {
             if let Some(tool) = tool_registry.get_tool(tool_name) {
                 let def = tool.definition();
-                println!("  - {}: {}", def.function.name, def.function.description);
+                println!(
+                    "  - {} [{}]: {}",
+                    def.function.name,
+                    tool.effect_class(),
+                    def.function.description
+                );
             }
         }
     }

@@ -140,10 +140,14 @@ port_in_use_by() {
   if have ss; then
     ss -ltnp 2>/dev/null | awk -v p=":$port\$" '$4 ~ p' | head -3
   elif have lsof; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3
+    # lsof exits 1 (not just empty output) when nothing matches, which
+    # would otherwise kill the whole script via `x="$(port_in_use_by ...)"`
+    # under `set -e` on a clean host with nothing listening.
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | head -3 || true
   elif have netstat; then
     netstat -an 2>/dev/null | awk -v p="\\.$port\$|:$port\$" '$4 ~ p && /LISTEN/' | head -3
   fi
+  return 0
 }
 
 detect_pkg_mgr() {
@@ -479,6 +483,27 @@ install_podman_macos() {
   brew install podman
 }
 
+wants_libkrun_macos() {
+  # install.sh itself never picks a provider -- podman decides, and
+  # Homebrew's podman formula defaults that decision to applehv, not
+  # libkrun (homebrew-core#291552 was resolved by reverting podman's
+  # own libkrun-default change, not by bundling krunkit). So only
+  # install krunkit when the caller has actually opted into libkrun,
+  # explicitly or via an existing machine already configured that way.
+  [[ "${CONTAINERS_MACHINE_PROVIDER:-}" == libkrun ]] && return 0
+  podman machine list --format '{{.VMType}}' 2>/dev/null | grep -qx libkrun
+}
+
+ensure_krunkit_macos() {
+  if have krunkit; then
+    return
+  fi
+  log "installing krunkit via brew (for the libkrun machine provider)..."
+  brew tap libkrun/krun
+  brew trust libkrun/krun || true
+  brew install krunkit
+}
+
 ensure_podman_machine_macos() {
   if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q .; then
     log "initializing podman machine (this can take a few minutes)..."
@@ -502,6 +527,9 @@ if [[ "$OS" == macos ]]; then
   if [[ "${NANNA_SKIP_PODMAN_MACHINE:-0}" == "1" ]]; then
     warn "NANNA_SKIP_PODMAN_MACHINE=1: not touching podman machine (caller manages the VM, e.g. colima)."
   else
+    if [[ "$ARCH" == arm64 || "$ARCH" == aarch64 ]] && wants_libkrun_macos; then
+      ensure_krunkit_macos
+    fi
     ensure_podman_machine_macos
   fi
 fi

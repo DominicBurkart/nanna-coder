@@ -1,5 +1,5 @@
 use super::template::{DeployTemplate, Health, RiskClass, Strategy};
-use super::{DeployError, PRODUCTION_ENV};
+use super::{is_production_env, DeployError, PRODUCTION_ENV};
 use crate::windows::WindowSet;
 use chrono::Duration;
 use std::path::Path;
@@ -109,7 +109,12 @@ impl DeployTemplate {
         if span < min_span(class) {
             return Err(invalid(file, "rollout.min_step_duration", format!("risk class `{class}` requires a rollout span of at least {}, got {} ({steps} steps x {})", describe(min_span(class)), describe(span), describe(self.rollout.min_step_duration))));
         }
-        if self.target.environments.iter().any(|e| e == PRODUCTION_ENV) {
+        if self
+            .target
+            .environments
+            .iter()
+            .any(|e| is_production_env(e))
+        {
             if self.rollout.windows.is_none() {
                 return Err(invalid(
                     file,
@@ -482,5 +487,15 @@ mod tests {
             );
         let template = DeployTemplate::parse(&src).unwrap();
         template.validate_against(&WindowSet::default()).unwrap();
+    }
+
+    #[test]
+    fn production_gate_matches_environment_case_insensitively() {
+        let src = template(RiskClass::Unused, Strategy::Instant, "[100]", "0m")
+            .replace("windows = \"business-hours\"\n", "")
+            .replace("\"production\"", "\"Production\"");
+        let (field, reason) = field_error(&src);
+        assert_eq!(field, "rollout.windows");
+        assert!(reason.contains("production"), "{reason}");
     }
 }

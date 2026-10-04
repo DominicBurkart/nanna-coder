@@ -16,7 +16,8 @@ pub struct AuditDenied {
 
 /// Reviews each step before its traffic is applied, and each incident
 /// remediation before it acts. The action auditor provides the real
-/// implementation; [`NoAudit`] approves everything.
+/// implementation; [`NoAudit`] approves every step and denies every incident
+/// action, because no action reviewer exists until the auditor is wired.
 #[async_trait]
 pub trait AuditHook: Send + Sync {
     /// Approve `step` of `record`, or deny it with a reason.
@@ -29,14 +30,16 @@ pub trait AuditHook: Send + Sync {
     /// Approve an [`IncidentResponder`](super::IncidentResponder)'s
     /// `action` for `incident`, or deny it with a reason. `review_step`
     /// cannot see the proposed remediation, so this is a separate review
-    /// point; the default approves everything, matching `NoAudit`'s
-    /// `review_step`.
+    /// point. The default denies: an implementation that does not override
+    /// this method never lets a remediation act.
     async fn review_action(
         &self,
         _incident: &Incident,
         _action: &ProposedAction,
     ) -> Result<(), AuditDenied> {
-        Ok(())
+        Err(AuditDenied {
+            reason: "no incident action reviewer is configured".into(),
+        })
     }
 }
 
@@ -201,6 +204,17 @@ mod tests {
     use crate::rollout::state::tests::record;
 
     #[tokio::test]
+    async fn no_audit_denies_incident_actions_by_default() {
+        let r = record("production");
+        let err = NoAudit
+            .review_action(&incident(), &ProposedAction::Rollback)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, "no incident action reviewer is configured");
+        assert!(NoAudit.review_step(&r, &r.plan.steps[0]).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn no_audit_approves_and_recording_audit_denies_from_a_step() {
         let r = record("production");
         assert!(NoAudit.review_step(&r, &r.plan.steps[2]).await.is_ok());
@@ -235,11 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_audit_approves_any_action_and_recording_audit_denies_the_next_one() {
-        assert!(NoAudit
-            .review_action(&incident(), &ProposedAction::Rollback)
-            .await
-            .is_ok());
+    async fn recording_audit_approves_then_denies_the_next_action() {
         let audit = RecordingAudit::default();
         assert!(audit
             .review_action(&incident(), &ProposedAction::Rollback)

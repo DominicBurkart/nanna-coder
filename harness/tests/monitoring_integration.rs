@@ -9,10 +9,10 @@
 //! stands up its own minimal HTTP stub instead, following the same raw
 //! `tokio::net::TcpListener` pattern already used for Ollama stubs in
 //! `harness/src/eval/runner.rs`. The stub answers `/health/v1` with `200`
-//! for the first request and `500` (playing the role of
-//! `FIXTURE_BREAK_ROUTE=1`) for every one after that, so the rollout is
-//! seen healthy on its first poll and only regresses on the next one, the
-//! way a real deploy-then-break would look.
+//! for the first two requests and `500` (playing the role of
+//! `FIXTURE_BREAK_ROUTE=1`) for every one after that. The pre-traffic gate
+//! and the first bake poll are healthy, so the rollout only regresses on
+//! the next poll, the way a real deploy-then-break would look.
 
 use chrono::{Duration, Utc};
 use harness::deploy::DeployTemplate;
@@ -31,7 +31,7 @@ const PLAN: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry
 
 /// Answers `GET /health/v1` (and anything else) with `200` for the first
 /// request, `500` after that.
-async fn spawn_stub_that_breaks_after_the_first_request() -> std::net::SocketAddr {
+async fn spawn_stub_that_breaks_after_two_requests() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -45,7 +45,7 @@ async fn spawn_stub_that_breaks_after_the_first_request() -> std::net::SocketAdd
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 1024];
                 let _ = socket.read(&mut buf).await;
-                let response = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                let response = if requests.fetch_add(1, Ordering::SeqCst) < 2 {
                     "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 } else {
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -59,7 +59,7 @@ async fn spawn_stub_that_breaks_after_the_first_request() -> std::net::SocketAdd
 
 #[tokio::test]
 async fn a_broken_endpoint_breaches_health_within_one_poll_interval_and_rolls_back() {
-    let addr = spawn_stub_that_breaks_after_the_first_request().await;
+    let addr = spawn_stub_that_breaks_after_two_requests().await;
     let dir = tempfile::tempdir().unwrap();
     let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
     let clock = Arc::new(SimulatedClock::new(Utc::now()));
