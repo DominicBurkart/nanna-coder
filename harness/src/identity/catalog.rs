@@ -335,13 +335,11 @@ mod tests {
     fn missing_directory_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        match IdentityCatalog::load(&missing) {
-            Err(IdentityError::Io { file, source }) => {
-                assert_eq!(file, missing);
-                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected Io error, got {other:?}"),
-        }
+        let err = IdentityCatalog::load(&missing).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::Io { file, source } if *file == missing && source.kind() == std::io::ErrorKind::NotFound),
+            "expected Io error, got {err:?}"
+        );
     }
 
     #[test]
@@ -367,18 +365,11 @@ mod tests {
             "zz-copy.toml",
             &identity_toml("deployer", "outer", "sandbox", "\"read_file\""),
         );
-        match IdentityCatalog::load(dir.path()) {
-            Err(IdentityError::DuplicateName {
-                name,
-                first,
-                second,
-            }) => {
-                assert_eq!(name, "deployer");
-                assert_eq!(first, dir.path().join("deployer.toml"));
-                assert_eq!(second, dir.path().join("zz-copy.toml"));
-            }
-            other => panic!("expected DuplicateName, got {other:?}"),
-        }
+        let err = IdentityCatalog::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::DuplicateName { name, first, second } if name == "deployer" && *first == dir.path().join("deployer.toml") && *second == dir.path().join("zz-copy.toml")),
+            "expected DuplicateName, got {err:?}"
+        );
     }
 
     #[test]
@@ -446,13 +437,10 @@ mod tests {
             .unwrap()
             .with_repo_overrides(repo.path())
             .unwrap_err();
-        match err {
-            IdentityError::NoBaseIdentity { name, file } => {
-                assert_eq!(name, "newcomer");
-                assert_eq!(file, local);
-            }
-            other => panic!("expected NoBaseIdentity, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, IdentityError::NoBaseIdentity { name, file } if name == "newcomer" && *file == local),
+            "expected NoBaseIdentity, got {err:?}"
+        );
     }
 
     #[test]
@@ -545,6 +533,20 @@ mod tests {
             None => std::env::remove_var(key),
         }
         result
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_config_dir_env)]
+    fn with_env_restores_the_previous_value_on_both_branches() {
+        let key = "NANNA_IDENTITY_WITH_ENV_PROBE";
+        std::env::set_var(key, "outer");
+        let unset_inside = with_env(key, None, || std::env::var_os(key));
+        let set_inside = with_env(key, Some(Path::new("inner")), || std::env::var_os(key));
+        let restored = std::env::var_os(key);
+        std::env::remove_var(key);
+        assert_eq!(unset_inside, None);
+        assert_eq!(set_inside, Some("inner".into()));
+        assert_eq!(restored, Some("outer".into()));
     }
 
     #[test]
