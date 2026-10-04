@@ -1042,6 +1042,13 @@ async fn run_mcp_server(
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
     let escalation_path = resolve_escalation_path(&queue_path);
+    let identities = match harness::identity::IdentityCatalog::load_default() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            tracing::warn!(%error, "identity catalog unavailable; restored tasks with an identity will fail closed");
+            harness::identity::IdentityCatalog::default()
+        }
+    };
     let task_manager = Arc::new(
         TaskManager::restore(
             DEFAULT_MAX_CONCURRENT_TASKS,
@@ -1049,6 +1056,7 @@ async fn run_mcp_server(
             Box::new(JsonlQueueStore::open(&queue_path)?),
             Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
+            &identities,
         )
         .await?
         .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
