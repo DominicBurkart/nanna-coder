@@ -1,5 +1,5 @@
-use super::adapter::{FakeAdapter, FallbackPolicy, TargetAdapter};
-use super::health::{check_health, FakeHealthSource, HealthBreach, HealthSource};
+use super::adapter::{FakeAdapter, FallbackPolicy, Slot, TargetAdapter};
+use super::health::{check_health, FakeHealthSource, HealthBreach, HealthError, HealthSource};
 use super::hooks::{AuditHook, EscalationHook, LogEscalation, NoAudit, RolloutEscalation};
 use super::incident::{Incident, IncidentResponder, ProposedAction};
 use super::log::RolloutLog;
@@ -13,6 +13,12 @@ use crate::leases::{
 use crate::windows::WindowSet;
 use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
+
+enum Verdict {
+    Healthy,
+    Breach(HealthBreach),
+    Unavailable(HealthError),
+}
 
 /// Tunables of the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +378,12 @@ impl RolloutExecutor {
             Err(e) => return Err(e.into()),
         }
         for precondition in &step.preconditions {
+            if matches!(precondition, Precondition::HealthOk) && record.plan.health.is_none() {
+                let summary = format!(
+                    "step {n} requires {precondition} but the plan has no [health] thresholds to evaluate it against"
+                );
+                return self.halt_and_escalate(record, n, summary, None).await;
+            }
             let Precondition::WindowOpen(name) = precondition else {
                 continue;
             };
@@ -387,26 +399,38 @@ impl RolloutExecutor {
             let summary = format!("audit denied step {n}: {}", denied.reason);
             return self.halt_and_escalate(record, n, summary, None).await;
         }
+        let freshly_deployed = record.slot.is_none();
         let slot = match record.slot.clone() {
             Some(slot) => slot,
             None if n == 0 => {
                 let slot = self.adapter.deploy_inactive(&record.image).await?;
                 record.slot = Some(slot.clone());
-                let support = self
-                    .adapter
-                    .set_fallback(&slot, &FallbackPolicy::default())
-                    .await?;
-                record.fallback = Some(support);
-                self.log.append(Some(&record.state), &record)?;
                 slot
             }
             None => return Err(RolloutError::NoSlot(record.id.clone())),
         };
+        if n == 0 && record.fallback.is_none() {
+            match self
+                .adapter
+                .set_fallback(&slot, &FallbackPolicy::default())
+                .await
+            {
+                Ok(support) => record.fallback = Some(support),
+                Err(refused) => {
+                    if freshly_deployed {
+                        self.log.append(Some(&record.state), &record)?;
+                    }
+                    return Err(refused.into());
+                }
+            }
+            self.log.append(Some(&record.state), &record)?;
+        }
         if matches!(step.kind, StepKind::Traffic | StepKind::Swap) {
-            if let Some(health) = &record.plan.health {
-                let sample = self.health.sample(&slot, self.config.poll_interval).await?;
-                if let Some(breach) = check_health(health, &sample, n) {
-                    return self.on_breach(record, breach).await;
+            match self.check(&record, &slot, n).await {
+                Verdict::Healthy => {}
+                Verdict::Breach(breach) => return self.on_breach(record, breach).await,
+                Verdict::Unavailable(error) => {
+                    return self.health_unavailable(record, n, error).await
                 }
             }
         }
@@ -496,10 +520,11 @@ impl RolloutExecutor {
             if now >= bake_end {
                 break;
             }
-            if let Some(health) = &record.plan.health {
-                let sample = self.health.sample(&slot, self.config.poll_interval).await?;
-                if let Some(breach) = check_health(health, &sample, n) {
-                    return self.on_breach(record, breach).await;
+            match self.check(&record, &slot, n).await {
+                Verdict::Healthy => {}
+                Verdict::Breach(breach) => return self.on_breach(record, breach).await,
+                Verdict::Unavailable(error) => {
+                    return self.health_unavailable(record, n, error).await
                 }
             }
             if let Some(comparator) = &comparator {
@@ -532,6 +557,30 @@ impl RolloutExecutor {
             self.adapter.mirror(&slot, 0).await?;
         }
         self.advance_or_complete(record, n).await
+    }
+
+    async fn check(&self, record: &RolloutRecord, slot: &Slot, n: usize) -> Verdict {
+        let Some(health) = &record.plan.health else {
+            return Verdict::Healthy;
+        };
+        match self.health.sample(slot, self.config.poll_interval).await {
+            Ok(sample) => {
+                check_health(health, &sample, n).map_or(Verdict::Healthy, Verdict::Breach)
+            }
+            Err(error) => Verdict::Unavailable(error),
+        }
+    }
+
+    async fn health_unavailable(
+        &self,
+        record: RolloutRecord,
+        n: usize,
+        error: HealthError,
+    ) -> Result<(), RolloutError> {
+        tracing::warn!(rollout = %record.id, step = n, %error, "Health source unavailable; halting");
+        let summary =
+            format!("step {n}: health source unavailable ({error}); the split is held for a human");
+        self.halt_and_escalate(record, n, summary, None).await
     }
 
     async fn on_breach(
@@ -855,7 +904,7 @@ mod tests {
     async fn crash_mid_bake_resumes_at_the_same_step_with_the_same_slot() {
         let rig = rig();
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
-        let failing = Arc::new(FailAfter {
+        let hanging = Arc::new(HangAfter {
             healthy_polls: 1,
             polls: std::sync::Mutex::new(0),
         });
@@ -865,11 +914,15 @@ mod tests {
             WindowSet::default(),
             rig.clock.clone(),
             rig.adapter.clone(),
-            failing,
+            hanging,
         )
         .with_config(one_poll_per_step());
-        let err = crashing.run(&record.id).await.unwrap_err();
-        assert!(matches!(err, RolloutError::Health(HealthError(_))), "{err}");
+        let crashed_run = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            crashing.run(&record.id),
+        )
+        .await;
+        assert!(crashed_run.is_err());
         let crashed = rig.executor.log().load(&record.id).unwrap();
         let RolloutState::Baking { step: 0, since } = crashed.state else {
             panic!("{}", crashed.state)
@@ -1249,6 +1302,30 @@ mod tests {
         }
     }
 
+    struct HangAfter {
+        healthy_polls: usize,
+        polls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl HealthSource for HangAfter {
+        async fn sample(
+            &self,
+            _slot: &Slot,
+            _window: Duration,
+        ) -> Result<HealthSample, HealthError> {
+            let hang = {
+                let mut polls = self.polls.lock().unwrap();
+                *polls += 1;
+                *polls > self.healthy_polls
+            };
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(HealthSample::healthy(&["/health/v1".to_string()]))
+        }
+    }
+
     struct HaltOnPoll {
         log: RolloutLog,
         after: usize,
@@ -1421,6 +1498,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_set_fallback_leaves_the_deployed_slot_recorded_and_reused() {
+        let rig = rig();
+        rig.adapter.fail(AdapterOp::SetFallback);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                rig.executor.run(&record.id).await.unwrap_err(),
+                RolloutError::Adapter(_)
+            ));
+        }
+        let stuck = rig.executor.status(&record.id).unwrap();
+        assert_eq!(stuck.state, RolloutState::Step(0));
+        assert_eq!(stuck.slot, Some(Slot::new("slot-1")));
+        assert_eq!(stuck.fallback, None);
+        assert_eq!(
+            rig.adapter
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, AdapterCall::DeployInactive(_)))
+                .count(),
+            1,
+            "every refusal deployed another untracked slot"
+        );
+        rig.adapter.succeed(AdapterOp::SetFallback);
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.slot, Some(Slot::new("slot-1")));
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
+    }
+
+    #[tokio::test]
     async fn no_traffic_moves_before_the_first_health_sample() {
         let rig = rig();
         rig.health.push(breach_sample());
@@ -1434,6 +1542,76 @@ mod tests {
             "{:?}",
             rig.adapter.calls()
         );
+    }
+
+    fn executor_with_health(rig: &Rig, health: Arc<dyn HealthSource>) -> RolloutExecutor {
+        RolloutExecutor::new(
+            RolloutLog::open(&rig.path).unwrap(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            health,
+        )
+        .with_escalation(rig.escalation.clone())
+        .with_config(one_poll_per_step())
+    }
+
+    #[tokio::test]
+    async fn health_ok_precondition_without_thresholds_halts_before_traffic() {
+        let rig = rig();
+        let mut unthresholded = plan("sandbox");
+        unthresholded.health = None;
+        assert!(unthresholded.steps[0]
+            .preconditions
+            .contains(&Precondition::HealthOk));
+        let record = rig.executor.start(unthresholded, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 0);
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::SetTraffic(..))));
+        assert_eq!(rig.escalation.escalations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn health_source_error_before_traffic_halts_and_escalates() {
+        let rig = rig();
+        rig.health.set_failing(true);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 0);
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::SetTraffic(..))));
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("scripted failure"));
+    }
+
+    #[tokio::test]
+    async fn health_source_error_mid_bake_halts_holding_the_split() {
+        let rig = rig();
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let failing = Arc::new(FailAfter {
+            healthy_polls: 1,
+            polls: std::sync::Mutex::new(0),
+        });
+        let executor = executor_with_health(&rig, failing);
+        let halted = executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 10);
+        assert_eq!(rig.adapter.traffic(&Slot::new("slot-1")), Some(10));
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert_eq!(escalations[0].traffic_percent, 10);
+        assert!(escalations[0].summary.contains("scripted failure"));
     }
 
     #[tokio::test]
