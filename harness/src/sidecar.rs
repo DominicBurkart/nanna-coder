@@ -766,6 +766,71 @@ mod tests {
         );
     }
 
+    struct FlakyReadinessRunner {
+        probes: Mutex<usize>,
+        failures: usize,
+    }
+
+    impl CommandRunner for FlakyReadinessRunner {
+        fn run(&self, _program: &str, _args: &[String]) -> std::io::Result<RunOutput> {
+            let mut probes = self.probes.lock().unwrap();
+            *probes += 1;
+            Ok(RunOutput {
+                success: *probes > self.failures,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_ready_polls_until_the_probe_succeeds() {
+        let runner = FlakyReadinessRunner {
+            probes: Mutex::new(0),
+            failures: 2,
+        };
+        wait_ready(
+            &runner,
+            &ContainerRuntime::Podman,
+            "slow-start",
+            &["pg_isready".to_string()],
+            ReadinessConfig {
+                budget: Duration::from_secs(30),
+                interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*runner.probes.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn sidecar_set_rejects_unwritable_env_and_removes_network() {
+        let runner = FakeRunner::new(None, None);
+        let mut spec = PostgresSidecar::with_password("t6", "pw").spec();
+        spec.env.push(("BAD=KEY".to_string(), "v".to_string()));
+        let err = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t6",
+            &[spec],
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::Spawn { ref command, .. } if command == "write env file for nanna-task-t6-postgres"),
+            "{err}"
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![
+                "network create nanna-task-t6-net",
+                "network rm nanna-task-t6-net"
+            ]
+        );
+    }
+
     const SENTINEL: &str = "Sentinel-Pw-9f3a";
 
     struct InspectingRunner {
