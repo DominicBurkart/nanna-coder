@@ -26,6 +26,7 @@ pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION}
 use crate::effects::EffectRecord;
 use crate::entities::context::types::{ContextEntity, ToolCallRecord};
 use crate::entities::{EntityStore, InMemoryEntityStore};
+use crate::scope::ScopeDenial;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -230,6 +231,10 @@ pub struct AgentRunResult {
     /// Aggregated token usage across all LLM calls. `None` when the
     /// entity-based loop ran without an LLM provider.
     pub token_usage: Option<Usage>,
+    /// Every call the tool registry refused under its identity scope, in
+    /// order. Empty when the run was not scoped.
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
 }
 
 fn extract_tool_calls_from_history(
@@ -399,6 +404,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         extract_tool_calls_from_history(history, self.tool_registry.as_ref())
     }
 
+    fn scope_denials(&self) -> Vec<ScopeDenial> {
+        self.tool_registry
+            .as_ref()
+            .map(ToolRegistry::denials)
+            .unwrap_or_default()
+    }
+
     fn enrich_error(&self, error: AgentError) -> AgentError {
         let tool_calls = self.tool_call_records(&self.conversation_history);
         let conversation = self.conversation_history.clone();
@@ -484,6 +496,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 if let Err(e) = self.entity_store.store(Box::new(entity)).await {
                     tracing::warn!("Failed to store context entity: {}", e);
                 }
+                let denials = self.scope_denials();
                 return Ok(AgentRunResult {
                     final_state: self.state.clone(),
                     iterations: self.iterations,
@@ -492,6 +505,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     tool_calls_made,
                     conversation_snapshot: conversation,
                     token_usage: None,
+                    denials,
                 });
             }
 
@@ -1059,6 +1073,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         if let Err(e) = self.entity_store.store(Box::new(entity)).await {
             tracing::warn!("Failed to store context entity: {}", e);
         }
+        let denials = self.scope_denials();
         AgentRunResult {
             final_state: AgentState::Completed,
             iterations: self.iterations,
@@ -1067,6 +1082,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             tool_calls_made,
             conversation_snapshot: conversation,
             token_usage: Some(total_usage),
+            denials,
         }
     }
 
@@ -1280,6 +1296,95 @@ mod tests {
                                           // UpdatingEntities: no LLM call
         responses.push(plain_response("COMPLETE - task done")); // CheckingTaskCompletion
         responses
+    }
+
+    fn scoped_write_registry(root: &std::path::Path) -> ToolRegistry {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = crate::effects::EffectClass::Workspace;
+        identity.scope.tools = vec!["write_file".parse().unwrap()];
+        crate::tools::create_tool_registry_for(root, &identity).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tool_loop_reports_scope_denials_to_the_model_and_in_the_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "Cargo.toml", "content": "x"}),
+            ),
+            tool_call_response("github_pr_status", serde_json::json!({})),
+            plain_response("Gave up."),
+        ]);
+        let config = AgentConfig {
+            max_iterations: 5,
+            ..Default::default()
+        };
+        let registry = scoped_write_registry(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "edit the manifest".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run_tool_loop(context).await.unwrap();
+
+        assert_eq!(result.denials.len(), 2);
+        assert_eq!(result.denials[0].identity, "rust-implementer");
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(result.denials[1].tool, "github_pr_status");
+        assert!(!workspace.path().join("Cargo.toml").exists());
+        let tool_replies: Vec<&str> = agent
+            .conversation_history()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(tool_replies.len(), 2);
+        assert!(
+            tool_replies[0]
+                .contains("Scope denial: identity `rust-implementer` may not call `write_file`"),
+            "{}",
+            tool_replies[0]
+        );
+        assert!(
+            tool_replies[1].contains("tool is not in scope"),
+            "{}",
+            tool_replies[1]
+        );
+        assert_eq!(agent.tool_registry().unwrap().denial_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_run_carries_scope_denials() {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "docs/x.md", "content": "x"}),
+            ),
+            plain_response("Done."),
+        ]));
+        let config = AgentConfig {
+            max_iterations: 20,
+            ..Default::default()
+        };
+        let registry = scoped_write_registry(workspace.path());
+        let store = InMemoryEntityStore::new();
+        let mut agent = AgentLoop::with_tools(config, store, provider, registry);
+        let context = AgentContext {
+            user_prompt: "write docs".to_string(),
+            conversation_history: vec![],
+            app_state_id: "test".to_string(),
+        };
+
+        let result = agent.run(context).await.unwrap();
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "write_file");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["denials"][0]["reason"]["kind"], "path_outside_scope");
     }
 
     #[test]

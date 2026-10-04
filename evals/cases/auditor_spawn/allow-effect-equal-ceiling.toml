@@ -1,0 +1,19 @@
+[case]
+id = "allow-effect-equal-ceiling"
+name = "Sandbox deploy exactly at the deployer's ceiling"
+description = "The requested effect equals scope.max_effect exactly, which must still be allowed."
+
+[request]
+parent_task_id = "task-2"
+parent_task_description = "Ship the approved release"
+parent_task_repo = "github.com/example/repo"
+identity = "deployer"
+subtask = "Deploy build 42 to the sandbox environment."
+dev_loop = "outer"
+requested_effect = "sandbox"
+
+[expected]
+verdict = "allow"
+
+[metadata]
+tags = ["allow", "boundary"]
