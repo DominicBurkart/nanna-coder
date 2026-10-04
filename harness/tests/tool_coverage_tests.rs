@@ -858,28 +858,31 @@ async fn trunk_build_execute_error_path_covered() {
 #[tokio::test]
 async fn trunk_build_execute_success_path_runs_in_member_dir() {
     let dir = full_stack_workspace();
-    let registry = create_container_tool_registry(
-        dir.path(),
-        stub_container_handle(),
-        CONTAINER_WORKSPACE_DIR,
-    );
+    let registry =
+        create_container_tool_registry(dir.path(), fake_podman_handle(), CONTAINER_WORKSPACE_DIR);
     let result = registry
         .execute("trunk_build", json!({}))
         .await
-        .expect("execute must succeed with Stub runtime");
+        .expect("execute must succeed with fake podman");
     assert_eq!(result["command"], "trunk build");
     assert_eq!(result["working_dir"], "/workspace/ui");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec -w /workspace/ui fake-container trunk build"));
+    assert_eq!(result["success"], json!(true));
 }
 
 #[tokio::test]
 async fn trunk_build_release_flag_is_forwarded() {
-    let tool = TrunkBuildTool::new(stub_container_handle(), None);
+    let tool = TrunkBuildTool::new(fake_podman_handle(), None);
     let result = tool.execute(json!({"release": "true"})).await.unwrap();
     assert_eq!(result["command"], "trunk build --release");
     assert!(result["working_dir"].is_null());
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec fake-container trunk build --release"));
 }
 
 #[tokio::test]
@@ -894,7 +897,7 @@ async fn sqlx_migrate_execute_error_path_covered() {
 
 #[tokio::test]
 async fn sqlx_migrate_rejects_unknown_command() {
-    let tool = SqlxMigrateTool::new(stub_container_handle(), Some("/workspace".to_string()));
+    let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
     let err = tool
         .execute(json!({"command": "drop"}))
         .await
@@ -911,17 +914,18 @@ async fn sqlx_migrate_rejects_unknown_command() {
 #[tokio::test]
 async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
     let dir = full_stack_workspace();
-    let registry = create_container_tool_registry(
-        dir.path(),
-        stub_container_handle(),
-        CONTAINER_WORKSPACE_DIR,
-    );
+    let registry =
+        create_container_tool_registry(dir.path(), fake_podman_handle(), CONTAINER_WORKSPACE_DIR);
     let result = registry
         .execute("sqlx_migrate", json!({}))
         .await
-        .expect("execute must succeed with Stub runtime");
+        .expect("execute must succeed with fake podman");
     assert_eq!(result["command"], "sqlx migrate run");
     assert_eq!(result["working_dir"], "/workspace/api");
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec -w /workspace/api fake-container sqlx migrate run"));
     let info = registry
         .execute("sqlx_migrate", json!({"command": "info"}))
         .await
