@@ -1,7 +1,7 @@
 use harness::agent::{AgentConfig, AgentContext, AgentLoop};
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig,
+    ContainerConfig, ContainerRuntime,
 };
 use harness::entities::InMemoryEntityStore;
 use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -22,6 +22,14 @@ const MAX_TURNS: usize = 32;
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 const E2E_MODEL: &str = "gemma4:e4b";
 
+fn require_runtime(runtime: ContainerRuntime) -> ContainerRuntime {
+    assert!(
+        runtime.is_available(),
+        "no container runtime available: podman or docker is required to run this ignored test"
+    );
+    runtime
+}
+
 fn example_repo_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -41,11 +49,7 @@ async fn test_dev_container_fibonacci_to_primes() {
 
     let image_path = build_dev_container(&repo_path).expect("failed to build dev container image");
 
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
+    let runtime = require_runtime(detect_runtime());
 
     let image_ref =
         load_image_from_path(&runtime, &image_path).expect("failed to load dev container image");
@@ -195,20 +199,14 @@ async fn test_task_manager_submit_with_dev_container() {
         repo_path
     );
 
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
+    require_runtime(detect_runtime());
 
-    // Skip if Ollama is not reachable (e.g. CI without a local model server).
-    if tokio::net::TcpStream::connect("127.0.0.1:11434")
-        .await
-        .is_err()
-    {
-        eprintln!("Ollama not reachable on 127.0.0.1:11434, skipping test");
-        return;
-    }
+    assert!(
+        tokio::net::TcpStream::connect("127.0.0.1:11434")
+            .await
+            .is_ok(),
+        "Ollama not reachable on 127.0.0.1:11434: required to run this ignored test"
+    );
 
     let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
 
@@ -284,11 +282,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
         "deny.toml must exist at nanna workspace root"
     );
 
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
+    let runtime = require_runtime(detect_runtime());
 
     let image_path = build_dev_container(&root).expect("failed to build nanna dev container image");
     let image_ref =
@@ -334,11 +328,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
 #[ignore]
 async fn cargo_deny_tool_output_has_command_field() {
     let root = nanna_workspace_root();
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
+    let runtime = require_runtime(detect_runtime());
 
     let image_path = build_dev_container(&root).expect("failed to build dev container");
     let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
@@ -399,11 +389,7 @@ async fn cargo_deny_tool_output_has_command_field() {
 #[ignore]
 async fn cargo_check_tool_succeeds_in_nanna_container() {
     let root = nanna_workspace_root();
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
+    let runtime = require_runtime(detect_runtime());
 
     let image_path = build_dev_container(&root).expect("failed to build dev container");
     let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
@@ -455,4 +441,18 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
         }
     }
     Ok(())
+}
+
+#[test]
+#[should_panic(expected = "no container runtime available")]
+fn require_runtime_fails_loudly_when_none_available() {
+    require_runtime(ContainerRuntime::None);
+}
+
+#[test]
+fn require_runtime_passes_through_available_runtime() {
+    assert!(matches!(
+        require_runtime(ContainerRuntime::Podman),
+        ContainerRuntime::Podman
+    ));
 }
