@@ -196,6 +196,7 @@ impl DeployPlan {
     /// ```
     pub fn to_json(&self) -> Value {
         json!({
+            "advisory": true,
             "environment": self.environment,
             "image": self.image,
             "risk_class": self.risk_class.name(),
@@ -234,10 +235,10 @@ pub fn plan_for_repo(
 /// advisory only: `windows.toml` lives in the target repository, which agents
 /// can write, so this check must not be read as an enforced gate until the
 /// executor (#650), lease enforcement (#737) and the windows fix (#734) land.
-/// It does catch a `rollout.windows` naming a window that will never open. When no `windows.toml` is
-/// co-located with the template, window names are not checked, matching
-/// [`plan_for_repo`] (Nanna's own window set may live outside the target
-/// repository).
+/// It does catch a `rollout.windows` naming a window that will never open.
+/// When no `windows.toml` is co-located with the template, window names are
+/// not checked, matching [`plan_for_repo`] (Nanna's own window set may live
+/// outside the target repository).
 ///
 /// ```
 /// use harness::deploy::{plan_for_repo_checked, DeployError};
@@ -707,6 +708,7 @@ minimum total: 1d 1h 30m
             "[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\n",
         );
         let json = t.plan("production").unwrap().to_json();
+        assert_eq!(json["advisory"], true);
         assert_eq!(json["environment"], "production");
         assert_eq!(json["image"], "registry.example.invalid/ns/app");
         assert_eq!(json["risk_class"], "core");
@@ -759,7 +761,7 @@ minimum total: 1d 1h 30m
         ));
         let pretty = plan.to_json_pretty();
         assert!(
-            pretty.starts_with("{\n  \"environment\": \"staging\""),
+            pretty.starts_with("{\n  \"advisory\": true,\n  \"environment\": \"staging\""),
             "{pretty}"
         );
         assert_eq!(
