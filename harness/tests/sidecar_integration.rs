@@ -266,3 +266,62 @@ async fn fixture_flake_builds_dev_container_with_profile_tools() {
         targets.stdout
     );
 }
+
+#[test]
+fn fixture_root_is_the_fullstack_fixture() {
+    let root = fixture_root();
+    assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+}
+
+#[test]
+fn init_repo_commits_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "b").unwrap();
+    init_repo(dir.path());
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let tracked: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(tracked, vec!["a.txt", "sub/b.txt"]);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn git_helper_panics_on_a_failing_command() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["rev-parse", "HEAD"]);
+}
+
+#[test]
+fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("api/src")).unwrap();
+    std::fs::write(src.path().join("api/src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(src.path().join("Cargo.toml"), "[workspace]").unwrap();
+    for skipped in ["target", "dist", ".git"] {
+        std::fs::create_dir_all(src.path().join(skipped)).unwrap();
+        std::fs::write(src.path().join(skipped).join("junk"), "x").unwrap();
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let out = dst.path().join("copy");
+    copy_dir_all(src.path(), &out);
+    assert_eq!(
+        std::fs::read_to_string(out.join("api/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert!(out.join("Cargo.toml").is_file());
+    for skipped in ["target", "dist", ".git"] {
+        assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
+    }
+}
