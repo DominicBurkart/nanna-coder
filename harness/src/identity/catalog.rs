@@ -70,11 +70,11 @@ impl IdentityCatalog {
     /// `$NANNA_CONFIG_DIR/agents`, else `$XDG_CONFIG_HOME/nanna/agents`,
     /// else `$HOME/.config/nanna/agents`. `None` when none of those is set.
     pub fn default_global_dir() -> Option<PathBuf> {
-        Self::global_dir_from(|key| std::env::var_os(key))
+        Self::global_dir_from(&|key| std::env::var_os(key))
     }
 
     /// [`IdentityCatalog::default_global_dir`] over an arbitrary environment lookup.
-    pub fn global_dir_from(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    pub fn global_dir_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         let non_empty = |key: &str| lookup(key).filter(|value| !value.is_empty());
         if let Some(config) = non_empty(CONFIG_DIR_ENV) {
             return Some(PathBuf::from(config).join(AGENTS_SUBDIR));
@@ -504,21 +504,24 @@ mod tests {
             ("HOME", "/home/u"),
         ]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(all),
+            IdentityCatalog::global_dir_from(&all),
             Some(PathBuf::from("/cfg/agents"))
         );
         let xdg = env(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/home/u")]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(xdg),
+            IdentityCatalog::global_dir_from(&xdg),
             Some(PathBuf::from("/xdg/nanna/agents"))
         );
         let home = env(&[("NANNA_CONFIG_DIR", ""), ("HOME", "/home/u")]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(home),
+            IdentityCatalog::global_dir_from(&home),
             Some(PathBuf::from("/home/u/.config/nanna/agents"))
         );
-        assert_eq!(IdentityCatalog::global_dir_from(env(&[])), None);
-        assert_eq!(IdentityCatalog::global_dir_from(env(&[("HOME", "")])), None);
+        assert_eq!(IdentityCatalog::global_dir_from(&env(&[])), None);
+        assert_eq!(
+            IdentityCatalog::global_dir_from(&env(&[("HOME", "")])),
+            None
+        );
     }
 
     fn with_env<T>(key: &str, value: Option<&Path>, body: impl FnOnce() -> T) -> T {
@@ -586,5 +589,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_config_dir_env)]
+    fn default_global_dir_falls_back_to_home_config() {
+        let home = std::env::var_os("HOME").expect("HOME is set in the test environment");
+        let derived = with_env(CONFIG_DIR_ENV, None, || {
+            with_env("XDG_CONFIG_HOME", None, IdentityCatalog::default_global_dir)
+        });
+        assert_eq!(
+            derived,
+            Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("nanna")
+                    .join(AGENTS_SUBDIR)
+            )
+        );
     }
 }
