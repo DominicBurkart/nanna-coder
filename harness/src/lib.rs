@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auditor;
 pub mod backlog;
 pub mod container;
+pub mod deploy;
 pub mod effects;
 pub mod entities;
 pub mod escalation;
