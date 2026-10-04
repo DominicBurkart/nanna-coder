@@ -387,21 +387,32 @@ impl RolloutExecutor {
             let summary = format!("audit denied step {n}: {}", denied.reason);
             return self.halt_and_escalate(record, n, summary, None).await;
         }
+        let freshly_deployed = record.slot.is_none();
         let slot = match record.slot.clone() {
             Some(slot) => slot,
             None if n == 0 => {
                 let slot = self.adapter.deploy_inactive(&record.image).await?;
                 record.slot = Some(slot.clone());
-                let support = self
-                    .adapter
-                    .set_fallback(&slot, &FallbackPolicy::default())
-                    .await?;
-                record.fallback = Some(support);
-                self.log.append(Some(&record.state), &record)?;
                 slot
             }
             None => return Err(RolloutError::NoSlot(record.id.clone())),
         };
+        if n == 0 && record.fallback.is_none() {
+            match self
+                .adapter
+                .set_fallback(&slot, &FallbackPolicy::default())
+                .await
+            {
+                Ok(support) => record.fallback = Some(support),
+                Err(refused) => {
+                    if freshly_deployed {
+                        self.log.append(Some(&record.state), &record)?;
+                    }
+                    return Err(refused.into());
+                }
+            }
+            self.log.append(Some(&record.state), &record)?;
+        }
         if matches!(step.kind, StepKind::Traffic | StepKind::Swap) {
             match self.check(&record, &slot, n).await {
                 Verdict::Healthy => {}
@@ -1326,6 +1337,37 @@ mod tests {
             rig.executor.start(plan("sandbox"), V2).await.unwrap_err(),
             RolloutError::Adapter(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_set_fallback_leaves_the_deployed_slot_recorded_and_reused() {
+        let rig = rig();
+        rig.adapter.fail(AdapterOp::SetFallback);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                rig.executor.run(&record.id).await.unwrap_err(),
+                RolloutError::Adapter(_)
+            ));
+        }
+        let stuck = rig.executor.status(&record.id).unwrap();
+        assert_eq!(stuck.state, RolloutState::Step(0));
+        assert_eq!(stuck.slot, Some(Slot::new("slot-1")));
+        assert_eq!(stuck.fallback, None);
+        assert_eq!(
+            rig.adapter
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, AdapterCall::DeployInactive(_)))
+                .count(),
+            1,
+            "every refusal deployed another untracked slot"
+        );
+        rig.adapter.succeed(AdapterOp::SetFallback);
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert_eq!(done.slot, Some(Slot::new("slot-1")));
+        assert_eq!(done.fallback, Some(FallbackSupport::Native));
     }
 
     #[tokio::test]
