@@ -1,6 +1,12 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
+use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::scheduler::{
+    BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
+    QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
+};
 use crate::workspace::TaskWorkspace;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
@@ -10,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex, RwLock, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
@@ -92,6 +98,15 @@ pub struct TaskResult {
 }
 
 impl TaskResult {
+    /// The widest blast radius any attributed tool call in this result
+    /// reached, or `None` when no call carried an effect attribution.
+    pub fn max_effect_class(&self) -> Option<EffectClass> {
+        self.tool_calls_made
+            .iter()
+            .filter_map(|call| call.effect.as_ref().map(|effect| effect.class))
+            .max()
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "result_summary": self.result_summary,
@@ -99,6 +114,7 @@ impl TaskResult {
             "format_patch": self.format_patch,
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
+            "max_effect_class": self.max_effect_class(),
             "iterations": self.iterations,
             "model_used": self.model_used,
         })
@@ -133,6 +149,7 @@ impl FailureDiagnostics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum TaskStatus {
+    /// Accepted and queued (possibly parked) until the scheduler starts it.
     Pending,
     Running {
         started_at: DateTime<Utc>,
@@ -182,6 +199,16 @@ pub struct Task {
     /// Requested task lifetime in milliseconds (`None` = unlimited). Surfaced
     /// as `ttl` in the MCP Tasks wire representation.
     pub ttl_ms: Option<u64>,
+    /// Earliest instant the scheduler may start the task; `None` when the
+    /// task is not parked.
+    #[serde(default)]
+    pub not_before: Option<DateTime<Utc>>,
+    /// Agent identity the task should run under, when known.
+    #[serde(default)]
+    pub identity_hint: Option<String>,
+    /// Backlog origin, when the task was ingested from GitHub.
+    #[serde(default)]
+    pub origin: Option<TaskOrigin>,
 }
 
 /// Per-task terminal-completion channels. `wait_terminal` subscribes to the
@@ -199,51 +226,122 @@ pub struct Task {
 type StatusSenders =
     Arc<RwLock<HashMap<TaskId, (watch::Sender<TaskStatus>, watch::Receiver<TaskStatus>)>>>;
 
-pub struct TaskManager {
+/// Runtime state of dispatched tasks, shared between the [`TaskManager`]
+/// that reads it and the scheduler's dispatcher that launches through it.
+struct TaskRunner {
     tasks: Arc<RwLock<HashMap<TaskId, Task>>>,
-    handles: Arc<RwLock<HashMap<TaskId, tokio::task::AbortHandle>>>,
-    max_concurrent: Arc<Semaphore>,
     progress: Arc<RwLock<HashMap<TaskId, Arc<AtomicUsize>>>>,
     image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
     /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
     build_locks: BuildLocks,
     status_senders: StatusSenders,
+    /// Provider supplied at submission, consumed when the task starts.
+    providers: RwLock<HashMap<TaskId, Arc<dyn ModelProvider>>>,
+    /// Provider for tasks restored from the queue store, which carry none.
+    default_provider: Option<Arc<dyn ModelProvider>>,
+    /// Coordination leases; a task's leases are released when it ends.
+    leases: Arc<dyn LeaseStore>,
+}
+
+/// Manages task submission, scheduling and lifecycle.
+///
+/// Submissions beyond `max_concurrent_tasks` are queued, not rejected, and
+/// started by the scheduler as slots free (see [`crate::scheduler`]). The
+/// queue is held in a [`QueueStore`]; [`TaskManager::restore`] rebuilds a
+/// manager from a persisted store so queued work survives a restart.
+pub struct TaskManager {
+    runner: Arc<TaskRunner>,
+    dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
 }
 
 impl TaskManager {
+    /// An in-memory manager with the default hybrid policy.
     pub fn new(max_concurrent_tasks: usize) -> Self {
-        Self {
+        Self::with_stores(
+            max_concurrent_tasks,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+        )
+        .expect("an empty in-memory queue store always loads")
+    }
+
+    /// A manager over explicit stores whose queue is empty or whose entries
+    /// will be submitted afresh; use [`restore`](Self::restore) to resume a
+    /// persisted backlog.
+    pub fn with_stores(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+    ) -> Result<Self, QueueStoreError> {
+        Self::build(max_concurrent_tasks, policy, store, leases, None)
+    }
+
+    /// Build a manager over `store`, re-queue every entry the store still
+    /// holds and start dispatching. Restored entries run with `provider`;
+    /// entries submitted later carry their own.
+    ///
+    /// Crash recovery for `leases`: every lease held by a restored task is
+    /// released, since the task will start over, and every expired lease is
+    /// reclaimed. Recovery failures surface as `QueueStoreError::Rejected`.
+    pub async fn restore(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<Self, QueueStoreError> {
+        let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
+        for queued in manager.dispatcher.queued().await {
+            manager.runner.register(&queued, None).await;
+            manager.runner.recover_leases(&queued.id)?;
+        }
+        let reclaimed = manager.runner.leases.expired(Utc::now()).map_err(reject)?;
+        for lease in reclaimed {
+            tracing::info!(lease = %lease.name, holder = %lease.holder, "Reclaimed expired lease on restore");
+        }
+        manager.dispatcher.dispatch().await;
+        Ok(manager)
+    }
+
+    fn build(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        default_provider: Option<Arc<dyn ModelProvider>>,
+    ) -> Result<Self, QueueStoreError> {
+        let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
-            handles: Arc::new(RwLock::new(HashMap::new())),
-            max_concurrent: Arc::new(Semaphore::new(max_concurrent_tasks)),
             progress: Arc::new(RwLock::new(HashMap::new())),
             image_cache: Arc::new(RwLock::new(HashMap::new())),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             status_senders: Arc::new(RwLock::new(HashMap::new())),
-        }
+            providers: RwLock::new(HashMap::new()),
+            default_provider,
+            leases,
+        });
+        let dispatcher =
+            Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
+        Ok(Self { runner, dispatcher })
     }
 
-    /// Transition a task to a new status: update the stored `Task` (status +
-    /// `last_updated_at`) and broadcast the new status to any `wait_terminal`
-    /// subscribers. This is the single choke point for status changes so the
-    /// watch channel can never drift from the stored task.
-    async fn set_status(
-        tasks: &Arc<RwLock<HashMap<TaskId, Task>>>,
-        senders: &StatusSenders,
-        task_id: &TaskId,
-        status: TaskStatus,
-    ) {
-        {
-            let mut tasks = tasks.write().await;
-            if let Some(task) = tasks.get_mut(task_id) {
-                task.status = status.clone();
-                task.last_updated_at = Utc::now();
-            }
-        }
-        let senders = senders.read().await;
-        if let Some((tx, _keepalive)) = senders.get(task_id) {
-            let _ = tx.send(status);
-        }
+    /// Backlog depth, parked count, age of the oldest queued task and
+    /// per-side dispatch counts.
+    pub async fn queue_metrics(&self) -> QueueMetrics {
+        self.dispatcher.metrics(Utc::now()).await
+    }
+
+    /// The coordination lease store. Acquire with the task id as holder so
+    /// the leases are released when the task ends.
+    pub fn leases(&self) -> Arc<dyn LeaseStore> {
+        Arc::clone(&self.runner.leases)
+    }
+
+    /// Every recorded lease with live and expired counts as of now.
+    pub fn lease_snapshot(&self) -> Result<LeaseSnapshot, LeaseError> {
+        LeaseSnapshot::from_store(&*self.runner.leases, Utc::now())
     }
 
     async fn get_or_build_image(
@@ -329,6 +427,7 @@ impl TaskManager {
         Ok(image_ref)
     }
 
+    /// Submit a task that runs as soon as a slot is free.
     pub async fn submit(
         &self,
         description: String,
@@ -338,277 +437,41 @@ impl TaskManager {
         max_iterations: usize,
         provider: Arc<dyn ModelProvider>,
     ) -> TaskId {
-        let task_id = TaskId::new();
-        let now = Utc::now();
-        let task = Task {
-            id: task_id.clone(),
-            description: description.clone(),
-            repo_path: repo_path.clone(),
-            branch: branch.clone(),
-            model: model.clone(),
-            status: TaskStatus::Pending,
-            created_at: now,
-            last_updated_at: now,
-            ttl_ms: None,
-        };
-        {
-            let mut tasks = self.tasks.write().await;
-            tasks.insert(task_id.clone(), task);
+        self.submit_task(
+            QueuedTask::new(description, repo_path, branch, model, max_iterations),
+            provider,
+        )
+        .await
+    }
+
+    /// Submit a fully described queue entry, which may be parked with
+    /// `not_before` or carry an identity hint and backlog origin.
+    ///
+    /// The task is `Pending` until the scheduler starts it. If the queue
+    /// store rejects the entry the task is recorded as `Failed` with error
+    /// type `QueuePersistFailed` rather than dropped silently.
+    pub async fn submit_task(
+        &self,
+        queued: QueuedTask,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TaskId {
+        let task_id = queued.id.clone();
+        self.runner.register(&queued, Some(provider)).await;
+        if let Err(e) = self.dispatcher.enqueue(queued).await {
+            self.runner
+                .fail(&task_id, e.to_string(), "QueuePersistFailed")
+                .await;
         }
-
-        // Register the terminal-completion watch (seeded with `Pending`) so
-        // `wait_terminal` callers can await this task's terminal transition.
-        // The receiver is retained as a keep-alive (see `StatusSenders`).
-        {
-            let (tx, rx) = watch::channel(TaskStatus::Pending);
-            let mut senders = self.status_senders.write().await;
-            senders.insert(task_id.clone(), (tx, rx));
-        }
-
-        let progress_counter = Arc::new(AtomicUsize::new(0));
-        {
-            let mut progress = self.progress.write().await;
-            progress.insert(task_id.clone(), Arc::clone(&progress_counter));
-        }
-
-        let tasks_ref = Arc::clone(&self.tasks);
-        let handles_ref = Arc::clone(&self.handles);
-        let progress_ref = Arc::clone(&self.progress);
-        let senders_ref = Arc::clone(&self.status_senders);
-        let semaphore = Arc::clone(&self.max_concurrent);
-        let image_cache_ref = Arc::clone(&self.image_cache);
-        let build_locks_ref = Arc::clone(&self.build_locks);
-        let task_id_clone = task_id.clone();
-
-        let mut handles_guard = self.handles.write().await;
-        let join_handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire_owned().await.expect("Semaphore closed");
-
-            // Require both flake.nix AND .devcontainer/ to opt in to the
-            // container path, so that repos that merely happen to have a
-            // flake.nix are not affected. Use tokio::fs to avoid blocking.
-            let use_container = tokio::fs::try_exists(repo_path.join("flake.nix"))
-                .await
-                .unwrap_or(false)
-                && tokio::fs::try_exists(repo_path.join(".devcontainer"))
-                    .await
-                    .unwrap_or(false);
-
-            Self::set_status(
-                &tasks_ref,
-                &senders_ref,
-                &task_id_clone,
-                TaskStatus::Running {
-                    started_at: Utc::now(),
-                    iterations: 0,
-                },
-            )
-            .await;
-
-            let workspace_result = if use_container {
-                let image_result =
-                    Self::get_or_build_image(&image_cache_ref, &build_locks_ref, &repo_path).await;
-                let image_ref = match image_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        {
-                            let mut h = handles_ref.write().await;
-                            h.remove(&task_id_clone);
-                        }
-                        {
-                            let mut p = progress_ref.write().await;
-                            p.remove(&task_id_clone);
-                        }
-                        Self::set_status(
-                            &tasks_ref,
-                            &senders_ref,
-                            &task_id_clone,
-                            TaskStatus::Failed {
-                                finished_at: Utc::now(),
-                                error: e.clone(),
-                                diagnostics: FailureDiagnostics {
-                                    error_type: "ContainerSetupFailed".to_string(),
-                                    iterations_completed: 0,
-                                    last_tool_call: None,
-                                    partial_changes: None,
-                                    tool_call_history: vec![],
-                                    last_agent_state: None,
-                                    conversation_snapshot: None,
-                                },
-                            },
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                TaskWorkspace::create_with_container(
-                    &repo_path,
-                    &task_id_clone.0,
-                    &branch,
-                    &image_ref,
-                )
-                .await
-                .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
-            } else {
-                TaskWorkspace::create(&repo_path, &task_id_clone.0, &branch)
-                    .map_err(|e| (e.to_string(), "WorkspaceCreationFailed"))
-            };
-
-            match workspace_result {
-                Err((e, error_type)) => {
-                    {
-                        let mut handles = handles_ref.write().await;
-                        handles.remove(&task_id_clone);
-                    }
-                    {
-                        let mut progress = progress_ref.write().await;
-                        progress.remove(&task_id_clone);
-                    }
-                    Self::set_status(
-                        &tasks_ref,
-                        &senders_ref,
-                        &task_id_clone,
-                        TaskStatus::Failed {
-                            finished_at: Utc::now(),
-                            error: e,
-                            diagnostics: FailureDiagnostics {
-                                error_type: error_type.to_string(),
-                                iterations_completed: 0,
-                                last_tool_call: None,
-                                partial_changes: None,
-                                tool_call_history: vec![],
-                                last_agent_state: None,
-                                conversation_snapshot: None,
-                            },
-                        },
-                    )
-                    .await;
-                }
-                Ok(mut workspace) => {
-                    let tool_registry = workspace.build_tool_registry();
-                    let entity_store = InMemoryEntityStore::new();
-                    let agent_config = AgentConfig {
-                        max_iterations,
-                        verbose: false,
-                        system_prompt: build_task_system_prompt(&workspace.workspace_path),
-                        model_name: model.clone(),
-                    };
-                    let context = AgentContext {
-                        user_prompt: description.clone(),
-                        conversation_history: vec![ChatMessage::user(&description)],
-                        app_state_id: task_id_clone.0.clone(),
-                    };
-
-                    let mut agent =
-                        AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
-                    agent.set_progress_counter(Arc::clone(&progress_counter));
-                    let run_result = agent.run(context).await;
-
-                    let changes_patch = workspace.extract_changes().ok().and_then(|patch| {
-                        if patch.is_empty() {
-                            None
-                        } else if patch.len() > MAX_DIFF_BYTES {
-                            Some(patch[..MAX_DIFF_BYTES].to_string())
-                        } else {
-                            Some(patch)
-                        }
-                    });
-
-                    let format_patch = workspace.format_patch().ok().flatten();
-
-                    let _ = workspace.cleanup();
-
-                    {
-                        let mut handles = handles_ref.write().await;
-                        handles.remove(&task_id_clone);
-                    }
-                    {
-                        let mut progress = progress_ref.write().await;
-                        progress.remove(&task_id_clone);
-                    }
-
-                    match run_result {
-                        Ok(result) => {
-                            let files_modified = parse_modified_files(changes_patch.as_deref());
-                            let task_result = TaskResult {
-                                result_summary: result.result_summary,
-                                changes_patch,
-                                format_patch,
-                                files_modified,
-                                tool_calls_made: result.tool_calls_made,
-                                iterations: result.iterations,
-                                model_used: model,
-                            };
-                            Self::set_status(
-                                &tasks_ref,
-                                &senders_ref,
-                                &task_id_clone,
-                                TaskStatus::Completed {
-                                    finished_at: Utc::now(),
-                                    result: task_result,
-                                },
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            let partial_changes = changes_patch;
-                            let (tool_calls_slice, conv_slice, diag_iters, diag_state) =
-                                e.diagnostics();
-                            let tool_call_history: Vec<ToolCallRecord> = tool_calls_slice.to_vec();
-                            let conversation_snapshot: Vec<ChatMessage> = conv_slice.to_vec();
-                            let last_agent_state = Some(format!("{:?}", diag_state));
-                            let last_tool_call = tool_call_history.last().cloned();
-                            let (error_type, iterations_completed) = match &e {
-                                AgentError::MaxIterationsExceeded {
-                                    iterations_completed,
-                                    ..
-                                } => ("MaxIterationsExceeded".to_string(), *iterations_completed),
-                                AgentError::StateError { .. } => {
-                                    ("StateError".to_string(), diag_iters)
-                                }
-                                AgentError::TaskCheckFailed { .. } => {
-                                    ("TaskCheckFailed".to_string(), diag_iters)
-                                }
-                            };
-                            let diagnostics = FailureDiagnostics {
-                                error_type,
-                                iterations_completed,
-                                last_tool_call,
-                                partial_changes,
-                                tool_call_history,
-                                last_agent_state,
-                                conversation_snapshot: Some(conversation_snapshot),
-                            };
-                            Self::set_status(
-                                &tasks_ref,
-                                &senders_ref,
-                                &task_id_clone,
-                                TaskStatus::Failed {
-                                    finished_at: Utc::now(),
-                                    error: e.to_string(),
-                                    diagnostics,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-        });
-
-        handles_guard.insert(task_id.clone(), join_handle.abort_handle());
-        drop(handles_guard);
-
         task_id
     }
 
     pub async fn poll(&self, task_id: &TaskId) -> Option<Task> {
-        let tasks = self.tasks.read().await;
+        let tasks = self.runner.tasks.read().await;
         let mut task = tasks.get(task_id)?.clone();
         drop(tasks);
 
         if let TaskStatus::Running { started_at, .. } = task.status {
-            let progress = self.progress.read().await;
+            let progress = self.runner.progress.read().await;
             if let Some(counter) = progress.get(task_id) {
                 let current_iterations = counter.load(Ordering::Relaxed);
                 task.status = TaskStatus::Running {
@@ -622,7 +485,7 @@ impl TaskManager {
     }
 
     pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
-        let tasks = self.tasks.read().await;
+        let tasks = self.runner.tasks.read().await;
         tasks.get(task_id).and_then(|t| {
             if let TaskStatus::Completed { result, .. } = &t.status {
                 Some(result.clone())
@@ -633,23 +496,21 @@ impl TaskManager {
     }
 
     pub async fn list(&self) -> Vec<Task> {
-        let tasks = self.tasks.read().await;
+        let tasks = self.runner.tasks.read().await;
         tasks.values().cloned().collect()
     }
 
+    /// Cancel a queued or running task. A queued task leaves the queue and
+    /// the store; a running one is aborted and its slot handed to the next
+    /// entry.
     pub async fn cancel(&self, task_id: &TaskId) -> Result<Task, String> {
-        let had_handle = {
-            let mut handles = self.handles.write().await;
-            if let Some(handle) = handles.remove(task_id) {
-                handle.abort();
-                true
-            } else {
-                false
-            }
-        };
+        self.dispatcher
+            .cancel(task_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let iterations_completed = {
-            let mut progress = self.progress.write().await;
+            let mut progress = self.runner.progress.write().await;
             let count = progress
                 .get(task_id)
                 .map(|c| c.load(Ordering::Relaxed))
@@ -659,13 +520,12 @@ impl TaskManager {
         };
 
         let cancelled = {
-            let mut tasks = self.tasks.write().await;
+            let mut tasks = self.runner.tasks.write().await;
             let task = tasks
                 .get_mut(task_id)
                 .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
             if task.status.is_terminal() {
-                let _ = had_handle;
                 return Err(format!(
                     "Task {} cannot be cancelled: already finished",
                     task_id
@@ -680,10 +540,11 @@ impl TaskManager {
             task.last_updated_at = now;
             task.clone()
         };
+        self.runner.release_leases(task_id);
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
-            let senders = self.status_senders.read().await;
+            let senders = self.runner.status_senders.read().await;
             if let Some((tx, _keepalive)) = senders.get(task_id) {
                 let _ = tx.send(cancelled.status.clone());
             }
@@ -696,7 +557,7 @@ impl TaskManager {
     /// after `submit` to record the client-requested lifetime so `tasks/get`
     /// can echo the actual `ttl`.
     pub async fn set_ttl(&self, task_id: &TaskId, ttl_ms: Option<u64>) {
-        let mut tasks = self.tasks.write().await;
+        let mut tasks = self.runner.tasks.write().await;
         if let Some(task) = tasks.get_mut(task_id) {
             task.ttl_ms = ttl_ms;
         }
@@ -709,7 +570,7 @@ impl TaskManager {
     /// block until the underlying request reaches a terminal state.
     pub async fn wait_terminal(&self, task_id: &TaskId) -> Option<TaskStatus> {
         let mut rx = {
-            let senders = self.status_senders.read().await;
+            let senders = self.runner.status_senders.read().await;
             senders.get(task_id)?.0.subscribe()
         };
         loop {
@@ -724,7 +585,7 @@ impl TaskManager {
             // effectively infallible, but fall back to the stored status rather
             // than hanging if it ever does.
             if rx.changed().await.is_err() {
-                let tasks = self.tasks.read().await;
+                let tasks = self.runner.tasks.read().await;
                 return tasks.get(task_id).map(|t| t.status.clone());
             }
         }
@@ -734,6 +595,297 @@ impl TaskManager {
 impl Default for TaskManager {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_CONCURRENT_TASKS)
+    }
+}
+
+impl Launcher for Arc<TaskRunner> {
+    fn launch(&self, task: &QueuedTask, side: Side) -> BoxFuture {
+        let runner = Arc::clone(self);
+        let task = task.clone();
+        Box::pin(async move { runner.run(task, side).await })
+    }
+}
+
+impl TaskRunner {
+    /// Record a queued entry as a `Pending` task and open its status watch.
+    /// The receiver is retained as a keep-alive (see `StatusSenders`).
+    async fn register(&self, queued: &QueuedTask, provider: Option<Arc<dyn ModelProvider>>) {
+        let task = Task {
+            id: queued.id.clone(),
+            description: queued.description.clone(),
+            repo_path: queued.repo_path.clone(),
+            branch: queued.branch.clone(),
+            model: queued.model.clone(),
+            status: TaskStatus::Pending,
+            created_at: queued.submitted_at,
+            last_updated_at: queued.submitted_at,
+            ttl_ms: None,
+            not_before: queued.not_before,
+            identity_hint: queued.identity_hint.clone(),
+            origin: queued.origin.clone(),
+        };
+        self.tasks.write().await.insert(queued.id.clone(), task);
+        let (tx, rx) = watch::channel(TaskStatus::Pending);
+        self.status_senders
+            .write()
+            .await
+            .insert(queued.id.clone(), (tx, rx));
+        if let Some(provider) = provider {
+            self.providers
+                .write()
+                .await
+                .insert(queued.id.clone(), provider);
+        }
+    }
+
+    /// Transition a task to a new status: update the stored `Task` (status +
+    /// `last_updated_at`) and broadcast the new status to any `wait_terminal`
+    /// subscribers. This is the single choke point for status changes so the
+    /// watch channel can never drift from the stored task.
+    async fn set_status(&self, task_id: &TaskId, status: TaskStatus) {
+        {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = status.clone();
+                task.last_updated_at = Utc::now();
+            }
+        }
+        if status.is_terminal() {
+            self.release_leases(task_id);
+        }
+        let senders = self.status_senders.read().await;
+        if let Some((tx, _keepalive)) = senders.get(task_id) {
+            let _ = tx.send(status);
+        }
+    }
+
+    /// Give back every lease the task holds. A store failure is logged: the
+    /// task is already terminal and the leases lapse at their TTL.
+    fn release_leases(&self, task_id: &TaskId) {
+        match self.leases.release_all(&task_id.0) {
+            Ok(released) => {
+                for lease in released {
+                    tracing::info!(task_id = %task_id, lease = %lease.name, "Released lease at task end");
+                }
+            }
+            Err(e) => {
+                tracing::error!(task_id = %task_id, error = %e, "Failed to release leases at task end");
+            }
+        }
+    }
+
+    /// Release the leases a restored task held before the crash.
+    fn recover_leases(&self, task_id: &TaskId) -> Result<(), QueueStoreError> {
+        for lease in self.leases.release_all(&task_id.0).map_err(reject)? {
+            tracing::info!(task_id = %task_id, lease = %lease.name, "Released lease of restored task");
+        }
+        Ok(())
+    }
+
+    /// Mark a task `Failed` before any agent iteration ran.
+    async fn fail(&self, task_id: &TaskId, error: String, error_type: &str) {
+        self.progress.write().await.remove(task_id);
+        self.set_status(
+            task_id,
+            TaskStatus::Failed {
+                finished_at: Utc::now(),
+                error,
+                diagnostics: FailureDiagnostics {
+                    error_type: error_type.to_string(),
+                    iterations_completed: 0,
+                    last_tool_call: None,
+                    partial_changes: None,
+                    tool_call_history: vec![],
+                    last_agent_state: None,
+                    conversation_snapshot: None,
+                },
+            },
+        )
+        .await;
+    }
+
+    async fn run(self: Arc<Self>, queued: QueuedTask, side: Side) {
+        let task_id = queued.id.clone();
+        let provider = {
+            let mut providers = self.providers.write().await;
+            providers
+                .remove(&task_id)
+                .or_else(|| self.default_provider.clone())
+        };
+        let Some(provider) = provider else {
+            self.fail(
+                &task_id,
+                "no model provider registered for the task".to_string(),
+                "NoProvider",
+            )
+            .await;
+            return;
+        };
+        tracing::info!(
+            task_id = %task_id,
+            side = side.label(),
+            identity_hint = ?queued.identity_hint,
+            "Starting dispatched task"
+        );
+        let progress_counter = Arc::new(AtomicUsize::new(0));
+        self.progress
+            .write()
+            .await
+            .insert(task_id.clone(), Arc::clone(&progress_counter));
+
+        // Require both flake.nix AND .devcontainer/ to opt in to the
+        // container path, so that repos that merely happen to have a
+        // flake.nix are not affected. Use tokio::fs to avoid blocking.
+        let use_container = tokio::fs::try_exists(queued.repo_path.join("flake.nix"))
+            .await
+            .unwrap_or(false)
+            && tokio::fs::try_exists(queued.repo_path.join(".devcontainer"))
+                .await
+                .unwrap_or(false);
+
+        self.set_status(
+            &task_id,
+            TaskStatus::Running {
+                started_at: Utc::now(),
+                iterations: 0,
+            },
+        )
+        .await;
+
+        let workspace_result = if use_container {
+            let image_result = TaskManager::get_or_build_image(
+                &self.image_cache,
+                &self.build_locks,
+                &queued.repo_path,
+            )
+            .await;
+            let image_ref = match image_result {
+                Ok(r) => r,
+                Err(e) => {
+                    self.fail(&task_id, e, "ContainerSetupFailed").await;
+                    return;
+                }
+            };
+            TaskWorkspace::create_with_container(
+                &queued.repo_path,
+                &task_id.0,
+                &queued.branch,
+                &image_ref,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        } else {
+            TaskWorkspace::create(&queued.repo_path, &task_id.0, &queued.branch)
+                .map_err(|e| e.to_string())
+        };
+
+        let mut workspace = match workspace_result {
+            Ok(workspace) => workspace,
+            Err(e) => {
+                self.fail(&task_id, e, "WorkspaceCreationFailed").await;
+                return;
+            }
+        };
+
+        let tool_registry = workspace.build_tool_registry();
+        let entity_store = InMemoryEntityStore::new();
+        let agent_config = AgentConfig {
+            max_iterations: queued.max_iterations,
+            verbose: false,
+            system_prompt: build_task_system_prompt(&workspace.workspace_path),
+            model_name: queued.model.clone(),
+        };
+        let context = AgentContext {
+            user_prompt: queued.description.clone(),
+            conversation_history: vec![ChatMessage::user(&queued.description)],
+            app_state_id: task_id.0.clone(),
+        };
+
+        let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
+        agent.set_progress_counter(Arc::clone(&progress_counter));
+        let run_result = agent.run(context).await;
+
+        let changes_patch = workspace.extract_changes().ok().and_then(bound_patch);
+
+        let format_patch = workspace.format_patch().ok().flatten();
+
+        let _ = workspace.cleanup();
+
+        self.progress.write().await.remove(&task_id);
+
+        match run_result {
+            Ok(result) => {
+                let files_modified = parse_modified_files(changes_patch.as_deref());
+                let task_result = TaskResult {
+                    result_summary: result.result_summary,
+                    changes_patch,
+                    format_patch,
+                    files_modified,
+                    tool_calls_made: result.tool_calls_made,
+                    iterations: result.iterations,
+                    model_used: queued.model,
+                };
+                self.set_status(
+                    &task_id,
+                    TaskStatus::Completed {
+                        finished_at: Utc::now(),
+                        result: task_result,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                let partial_changes = changes_patch;
+                let (tool_calls_slice, conv_slice, iterations_completed, diag_state) =
+                    e.diagnostics();
+                let tool_call_history: Vec<ToolCallRecord> = tool_calls_slice.to_vec();
+                let conversation_snapshot: Vec<ChatMessage> = conv_slice.to_vec();
+                let last_agent_state = Some(format!("{:?}", diag_state));
+                let last_tool_call = tool_call_history.last().cloned();
+                let diagnostics = FailureDiagnostics {
+                    error_type: agent_error_type(&e).to_string(),
+                    iterations_completed,
+                    last_tool_call,
+                    partial_changes,
+                    tool_call_history,
+                    last_agent_state,
+                    conversation_snapshot: Some(conversation_snapshot),
+                };
+                self.set_status(
+                    &task_id,
+                    TaskStatus::Failed {
+                        finished_at: Utc::now(),
+                        error: e.to_string(),
+                        diagnostics,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+}
+
+fn reject(e: crate::leases::LeaseError) -> QueueStoreError {
+    QueueStoreError::Rejected(format!("lease recovery failed: {e}"))
+}
+
+/// Stable `error_type` label for an agent failure.
+fn agent_error_type(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::MaxIterationsExceeded { .. } => "MaxIterationsExceeded",
+        AgentError::StateError { .. } => "StateError",
+        AgentError::TaskCheckFailed { .. } => "TaskCheckFailed",
+    }
+}
+
+/// Drop an empty patch and truncate one larger than `MAX_DIFF_BYTES`.
+fn bound_patch(patch: String) -> Option<String> {
+    if patch.is_empty() {
+        None
+    } else if patch.len() > MAX_DIFF_BYTES {
+        Some(patch[..MAX_DIFF_BYTES].to_string())
+    } else {
+        Some(patch)
     }
 }
 
@@ -760,12 +912,12 @@ mod tests {
     };
     use std::sync::Mutex;
 
-    struct MockProvider {
+    pub(super) struct MockProvider {
         responses: Mutex<Vec<ChatResponse>>,
     }
 
     impl MockProvider {
-        fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
+        pub(super) fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses),
             })
@@ -797,7 +949,7 @@ mod tests {
         }
     }
 
-    fn stop_response(content: &str) -> ChatResponse {
+    pub(super) fn stop_response(content: &str) -> ChatResponse {
         ChatResponse {
             choices: vec![Choice {
                 message: ChatMessage {
@@ -874,6 +1026,7 @@ mod tests {
             arguments: serde_json::json!({"path": "src/main.rs"}),
             call_id: "call_1".to_string(),
             result: "fn main() {}".to_string(),
+            effect: Some(crate::effects::EffectRecord::new(EffectClass::None)),
         };
         let diag = FailureDiagnostics {
             error_type: "StateError".to_string(),
@@ -891,6 +1044,53 @@ mod tests {
         assert_eq!(json["tool_call_history"].as_array().unwrap().len(), 1);
         assert_eq!(json["last_agent_state"], "Performing");
         assert!(json["conversation_snapshot"].is_array());
+        assert_eq!(json["tool_call_history"][0]["effect"]["class"], "none");
+    }
+
+    fn record(name: &str, class: Option<EffectClass>) -> ToolCallRecord {
+        ToolCallRecord {
+            tool_name: name.to_string(),
+            arguments: serde_json::json!({}),
+            call_id: format!("call_{name}"),
+            result: String::new(),
+            effect: class.map(crate::effects::EffectRecord::new),
+        }
+    }
+
+    fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
+        TaskResult {
+            result_summary: "done".to_string(),
+            changes_patch: None,
+            format_patch: None,
+            files_modified: vec![],
+            tool_calls_made,
+            iterations: 1,
+            model_used: "mock".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_task_result_json_exposes_effect_on_every_tool_call() {
+        let result = result_with_calls(vec![
+            record("read_file", Some(EffectClass::None)),
+            record("write_file", Some(EffectClass::Workspace)),
+            record("unregistered", None),
+        ]);
+        let json = result.to_json();
+        let calls = json["tool_calls_made"].as_array().unwrap();
+        assert_eq!(calls[0]["effect"]["class"], "none");
+        assert_eq!(calls[1]["effect"]["class"], "workspace");
+        assert!(calls[2]["effect"].is_null());
+        assert_eq!(json["max_effect_class"], "workspace");
+        assert_eq!(result.max_effect_class(), Some(EffectClass::Workspace));
+    }
+
+    #[test]
+    fn test_task_result_max_effect_class_is_none_without_attributed_calls() {
+        assert_eq!(result_with_calls(vec![]).max_effect_class(), None);
+        let unattributed = result_with_calls(vec![record("x", None)]);
+        assert_eq!(unattributed.max_effect_class(), None);
+        assert!(unattributed.to_json()["max_effect_class"].is_null());
     }
 
     #[test]
@@ -900,6 +1100,45 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"src/main.rs".to_string()));
         assert!(files.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn test_agent_error_type_labels_every_variant() {
+        use crate::agent::AgentState;
+        let state_error = AgentError::StateError {
+            message: "m".to_string(),
+            iterations_completed: 1,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PlanningEntityModification,
+        };
+        let check_failed = AgentError::TaskCheckFailed {
+            message: "m".to_string(),
+            iterations_completed: 2,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::CheckingTaskCompletion,
+        };
+        let exceeded = AgentError::MaxIterationsExceeded {
+            iterations_completed: 3,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PerformingEntityModification,
+        };
+        assert_eq!(agent_error_type(&state_error), "StateError");
+        assert_eq!(agent_error_type(&check_failed), "TaskCheckFailed");
+        assert_eq!(agent_error_type(&exceeded), "MaxIterationsExceeded");
+        assert_eq!(state_error.diagnostics().2, 1);
+        assert_eq!(check_failed.diagnostics().2, 2);
+        assert_eq!(exceeded.diagnostics().2, 3);
+    }
+
+    #[test]
+    fn test_bound_patch_drops_empty_and_truncates_large() {
+        assert_eq!(bound_patch(String::new()), None);
+        assert_eq!(bound_patch("+x".to_string()).as_deref(), Some("+x"));
+        let huge = "a".repeat(MAX_DIFF_BYTES + 10);
+        assert_eq!(bound_patch(huge).unwrap().len(), MAX_DIFF_BYTES);
     }
 
     #[test]
@@ -947,36 +1186,18 @@ mod tests {
             created_at: Utc::now(),
             last_updated_at: Utc::now(),
             ttl_ms: None,
+            not_before: None,
+            identity_hint: None,
+            origin: None,
         };
         {
-            let mut tasks = manager.tasks.write().await;
+            let mut tasks = manager.runner.tasks.write().await;
             tasks.insert(task_id.clone(), task);
-        }
-        let dummy = tokio::spawn(std::future::pending::<()>());
-        let abort_handle = dummy.abort_handle();
-        {
-            let mut handles = manager.handles.write().await;
-            handles.insert(task_id.clone(), abort_handle);
         }
         let result = manager.cancel(&task_id).await;
         assert!(result.is_ok());
         let task = result.unwrap();
         assert!(matches!(&task.status, TaskStatus::Cancelled { .. }));
-        dummy.abort();
-    }
-
-    #[tokio::test]
-    async fn test_queued_task_starts_after_completion() {
-        let sem = Arc::new(Semaphore::new(1));
-        let permit = sem.clone().acquire_owned().await.unwrap();
-        let sem2 = Arc::clone(&sem);
-        let handle = tokio::spawn(async move {
-            let _p = sem2.acquire_owned().await.unwrap();
-        });
-        tokio::task::yield_now().await;
-        assert!(!handle.is_finished());
-        drop(permit);
-        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -1351,7 +1572,7 @@ mod tests {
     /// Initialise a temporary directory as a git repo with a single initial
     /// commit so it can be used as the source repository for
     /// `TaskManager::submit` in tests. Mirrors `workspace::tests::init_git_repo`.
-    fn init_test_git_repo(dir: &std::path::Path) {
+    pub(super) fn init_test_git_repo(dir: &std::path::Path) {
         for args in &[
             vec!["init"],
             vec!["config", "user.email", "test@test.com"],
@@ -1467,7 +1688,7 @@ mod tests {
         // run nix.
         let canonical = repo_dir.path().canonicalize().unwrap();
         {
-            let mut cache = manager.image_cache.write().await;
+            let mut cache = manager.runner.image_cache.write().await;
             cache.insert(canonical, "pre-built:latest".to_string());
         }
 
@@ -1560,7 +1781,7 @@ mod tests {
         tokio::task::yield_now().await;
         // Drop the sender (and its keep-alive receiver) out from under the waiter.
         {
-            let mut senders = manager.status_senders.write().await;
+            let mut senders = manager.runner.status_senders.write().await;
             senders.remove(&id);
         }
         let status = waiter.await.unwrap();
@@ -1585,5 +1806,529 @@ mod tests {
         assert_eq!(manager.poll(&id).await.unwrap().ttl_ms, Some(1234));
         // set_ttl on an unknown id is a no-op (does not panic).
         manager.set_ttl(&TaskId("nope".to_string()), Some(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::tests::{stop_response, MockProvider};
+    use super::*;
+    use crate::leases::{JsonlLeaseStore, Lease, LeaseError, LeaseName};
+    use crate::scheduler::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
+    use async_trait::async_trait;
+    use model::provider::{ModelError, ModelResult};
+    use model::types::{ChatRequest, ChatResponse, ModelInfo};
+    use std::path::Path;
+
+    struct GatedProvider {
+        gate: watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedProvider {
+        async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            let mut gate = self.gate.clone();
+            gate.wait_for(|open| *open)
+                .await
+                .map_err(|e| ModelError::Unknown {
+                    message: e.to_string(),
+                })?;
+            Ok(stop_response("COMPLETE - task done"))
+        }
+
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "gated"
+        }
+    }
+
+    struct RejectingStore;
+
+    impl QueueStore for RejectingStore {
+        fn load(&self) -> Result<Vec<QueuedTask>, QueueStoreError> {
+            Ok(vec![])
+        }
+        fn insert(&self, _task: &QueuedTask) -> Result<(), QueueStoreError> {
+            Err(QueueStoreError::Rejected("disk full".to_string()))
+        }
+        fn remove(&self, _id: &TaskId) -> Result<(), QueueStoreError> {
+            Ok(())
+        }
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        super::tests::init_test_git_repo(dir.path());
+        dir
+    }
+
+    async fn wait_for(
+        manager: &TaskManager,
+        id: &TaskId,
+        pred: impl Fn(&TaskStatus) -> bool,
+    ) -> Task {
+        let mut last = None;
+        for _ in 0..200 {
+            let task = manager.poll(id).await.unwrap();
+            if pred(&task.status) {
+                return task;
+            }
+            last = Some(task.status);
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+        panic!("task {id} did not reach the expected status within 5s; last status: {last:?}");
+    }
+
+    fn queued(repo: &std::path::Path) -> QueuedTask {
+        QueuedTask::new("task", repo.to_path_buf(), "HEAD", "mock", 10)
+    }
+
+    #[tokio::test]
+    async fn test_queued_task_starts_after_completion() {
+        let repo = git_repo();
+        let manager = TaskManager::new(1);
+        let (open, gate) = watch::channel(false);
+        let provider: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let first = manager
+            .submit_task(queued(repo.path()), Arc::clone(&provider))
+            .await;
+        let second = manager
+            .submit_task(queued(repo.path()), Arc::clone(&provider))
+            .await;
+
+        wait_for(&manager, &first, |s| {
+            matches!(s, TaskStatus::Running { .. })
+        })
+        .await;
+        assert!(matches!(
+            manager.poll(&second).await.unwrap().status,
+            TaskStatus::Pending
+        ));
+        let metrics = manager.queue_metrics().await;
+        assert_eq!(metrics.queued, 1);
+        assert_eq!(metrics.running, 1);
+        assert_eq!(metrics.dispatched_newest, 1);
+        assert_eq!(manager.lease_snapshot().unwrap().held, 0);
+
+        open.send(true).unwrap();
+        let done = wait_for(&manager, &first, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Completed { .. }));
+        let done = wait_for(&manager, &second, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Completed { .. }));
+        assert!(manager.get_result(&second).await.is_some());
+        let metrics = manager.queue_metrics().await;
+        assert_eq!(metrics.queued, 0);
+        assert_eq!(metrics.running, 0);
+        assert_eq!(metrics.dispatched_newest + metrics.dispatched_oldest, 2);
+    }
+
+    #[tokio::test]
+    async fn test_agent_failure_records_diagnostics_and_no_result() {
+        let repo = git_repo();
+        let manager = TaskManager::new(1);
+        let (open, gate) = watch::channel(true);
+        let provider: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let mut entry = queued(repo.path());
+        entry.max_iterations = 1;
+        let id = manager.submit_task(entry, provider).await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        match done.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "MaxIterationsExceeded");
+                assert!(diagnostics.conversation_snapshot.is_some());
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.get_result(&id).await.is_none());
+        assert!(manager
+            .get_result(&TaskId("missing".to_string()))
+            .await
+            .is_none());
+        drop(open);
+    }
+
+    #[tokio::test]
+    async fn test_restore_requeues_tasks_from_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let a = first
+            .submit_task(
+                queued(Path::new("/nonexistent")).with_identity_hint(Some("dev".to_string())),
+                Arc::clone(&provider),
+            )
+            .await;
+        let b = first
+            .submit(
+                "b".to_string(),
+                PathBuf::from("/nonexistent"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                Arc::clone(&provider),
+            )
+            .await;
+        assert_eq!(first.queue_metrics().await.queued, 2);
+        drop(first);
+
+        let second = TaskManager::restore(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<TaskId> = second.list().await.into_iter().map(|t| t.id).collect();
+        ids.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(ids, expected);
+        assert_eq!(
+            second.poll(&a).await.unwrap().identity_hint.as_deref(),
+            Some("dev")
+        );
+        for id in [&a, &b] {
+            let done = wait_for(&second, id, TaskStatus::is_terminal).await;
+            assert!(matches!(done.status, TaskStatus::Failed { .. }));
+        }
+        assert!(JsonlQueueStore::open(&path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restore_propagates_store_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        std::fs::write(&path, "garbage\n").unwrap();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let result = TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parked_task_does_not_consume_slot() {
+        let manager = TaskManager::new(1);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let parked = manager
+            .submit_task(
+                queued(Path::new("/nonexistent")).with_not_before(Some(later)),
+                Arc::clone(&provider),
+            )
+            .await;
+        let ready = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        wait_for(&manager, &ready, TaskStatus::is_terminal).await;
+        let parked_task = manager.poll(&parked).await.unwrap();
+        assert!(matches!(parked_task.status, TaskStatus::Pending));
+        assert_eq!(parked_task.not_before, Some(later));
+        let metrics = manager.queue_metrics().await;
+        assert_eq!(metrics.queued, 1);
+        assert_eq!(metrics.parked, 1);
+        assert_eq!(metrics.running, 0);
+        let cancelled = manager.cancel(&parked).await.unwrap();
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
+        assert_eq!(manager.queue_metrics().await.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn test_submit_records_queue_persist_failure() {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let manager = TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(RejectingStore),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        let task = manager.poll(&id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => {
+                assert_eq!(diagnostics.error_type, "QueuePersistFailed");
+                assert!(error.contains("disk full"));
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.cancel(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatched_task_without_provider_fails() {
+        let manager = TaskManager::new(1);
+        let entry = queued(Path::new("/nonexistent"));
+        manager.runner.register(&entry, None).await;
+        manager.dispatcher.enqueue(entry.clone()).await.unwrap();
+        let task = wait_for(&manager, &entry.id, TaskStatus::is_terminal).await;
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "NoProvider");
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_queued_task_removes_it_from_store() {
+        let store = InMemoryQueueStore::default();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("unused")]);
+        let manager = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        assert_eq!(store.load().unwrap().len(), 1);
+        let cancelled = manager.cancel(&id).await.unwrap();
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
+        assert!(store.load().unwrap().is_empty());
+        assert_eq!(
+            manager.wait_terminal(&id).await.map(|s| s.is_terminal()),
+            Some(true)
+        );
+    }
+
+    fn lease(name: &str) -> LeaseName {
+        LeaseName::branch("example/repo", name)
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_cancelled_task() {
+        let manager = TaskManager::new(0);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let entry = queued(Path::new("/nonexistent"));
+        let holder = entry.id.0.clone();
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &holder,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let other = leases
+            .acquire(
+                &lease("dev"),
+                "someone-else",
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        assert_eq!(leases.snapshot().unwrap().len(), 2);
+        manager.cancel(&id).await.unwrap();
+        assert_eq!(leases.snapshot().unwrap(), vec![other]);
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_failed_task() {
+        let manager = TaskManager::new(1);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let entry = queued(Path::new("/nonexistent"));
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &entry.id.0,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Failed { .. }));
+        assert!(leases.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_leases_die_with_a_completed_task() {
+        let repo = git_repo();
+        let manager = TaskManager::new(1);
+        let (_open, gate) = watch::channel(true);
+        let provider: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let entry = queued(repo.path());
+        let leases = manager.leases();
+        leases
+            .acquire(
+                &lease("main"),
+                &entry.id.0,
+                chrono::Duration::hours(1),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = manager.submit_task(entry, provider).await;
+        let done = wait_for(&manager, &id, TaskStatus::is_terminal).await;
+        assert!(matches!(done.status, TaskStatus::Completed { .. }));
+        assert!(leases.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restore_releases_crashed_task_leases_and_reclaims_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue.jsonl");
+        let lease_path = dir.path().join("leases.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
+            Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let entry = queued(Path::new("/nonexistent"));
+        let crashed = entry.id.0.clone();
+        let now = Utc::now();
+        let leases = first.leases();
+        leases
+            .acquire(&lease("main"), &crashed, chrono::Duration::hours(1), now)
+            .unwrap();
+        leases
+            .acquire(
+                &lease("stale"),
+                "gone",
+                chrono::Duration::seconds(1),
+                now - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let live = leases
+            .acquire(&lease("live"), "elsewhere", chrono::Duration::hours(1), now)
+            .unwrap();
+        first.submit_task(entry, Arc::clone(&provider)).await;
+        drop(first);
+
+        let second = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
+            Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
+            provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.list().await.len(), 1);
+        assert_eq!(second.leases().snapshot().unwrap(), vec![live]);
+    }
+
+    struct BrokenLeases;
+
+    impl LeaseStore for BrokenLeases {
+        fn acquire(
+            &self,
+            _name: &LeaseName,
+            _holder: &str,
+            _ttl: chrono::Duration,
+            _now: DateTime<Utc>,
+        ) -> Result<Lease, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn renew(
+            &self,
+            _lease: &Lease,
+            _ttl: chrono::Duration,
+            _now: DateTime<Utc>,
+        ) -> Result<Lease, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn release(&self, _lease: &Lease) -> Result<(), LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn release_all(&self, _holder: &str) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn expired(&self, _now: DateTime<Utc>) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+        fn snapshot(&self) -> Result<Vec<Lease>, LeaseError> {
+            Err(LeaseError::Io("broken".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_surfaces_lease_recovery_failures() {
+        let store = InMemoryQueueStore::default();
+        store.insert(&queued(Path::new("/nonexistent"))).unwrap();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let err = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(BrokenLeases),
+            Arc::clone(&provider),
+        )
+        .await
+        .err()
+        .expect("restore must fail when lease recovery fails");
+        assert!(err.to_string().contains("lease recovery failed"));
+        assert!(err.to_string().contains("broken"));
+
+        let empty = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+            Arc::clone(&provider),
+        )
+        .await
+        .err()
+        .expect("restore must fail when expired-lease reclamation fails");
+        assert!(matches!(empty, QueueStoreError::Rejected(_)));
+
+        let manager = TaskManager::with_stores(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+        )
+        .unwrap();
+        assert!(manager.lease_snapshot().is_err());
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        let cancelled = manager.cancel(&id).await.unwrap();
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
     }
 }
