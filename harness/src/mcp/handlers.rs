@@ -311,6 +311,7 @@ mod tests {
             files_modified: vec!["a.rs".to_string()],
             tool_calls_made: vec![],
             denials: vec![],
+            action_audit: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
         }
@@ -326,6 +327,7 @@ mod tests {
             last_agent_state: None,
             conversation_snapshot: None,
             denials: vec![],
+            action_audit: vec![],
         }
     }
 

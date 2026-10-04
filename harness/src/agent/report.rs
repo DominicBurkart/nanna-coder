@@ -121,6 +121,7 @@ mod tests {
             }],
             conversation_snapshot: vec![ChatMessage::user("hi")],
             denials: vec![],
+            action_audit: vec![],
             token_usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
