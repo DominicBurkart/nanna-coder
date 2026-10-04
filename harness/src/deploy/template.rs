@@ -1,7 +1,7 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
 use crate::windows;
 use chrono::Duration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -61,7 +61,8 @@ impl Target {
 ///
 /// Classes are ordered from least to most consequential; a higher class
 /// demands a more cautious rollout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
     /// Nothing depends on the system yet.
     Unused,
@@ -182,7 +183,8 @@ pub enum RiskSpec {
 }
 
 /// Rollout strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Strategy {
     /// Route all traffic to the new version at once.
     Instant,
@@ -252,7 +254,7 @@ impl Rollout {
 }
 
 /// The `[health]` section.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Health {
     /// HTTP paths polled during the bake.
     pub endpoints: Vec<String>,
@@ -265,7 +267,8 @@ pub struct Health {
 }
 
 /// What to do when a health gate is breached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OnBreach {
     /// Restore the previous version at 100%.
     Rollback,
@@ -306,7 +309,7 @@ impl FromStr for OnBreach {
 
 /// The `[rollback]` section. Absent sections default to manual handling:
 /// not automatic, `halt-and-escalate`, nothing retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rollback {
     /// Whether a health breach triggers `on_breach` without a human.
     pub automatic: bool,
