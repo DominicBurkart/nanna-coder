@@ -25,6 +25,7 @@ but never actually attaches the tree, so a real browser sees an empty
 Chromium; a plain `.wasm` substring check on `index.html`, as
 `apprun_integration` does, does not catch this).
 
+
 ## Environment hooks
 
 | Variable | Effect |

@@ -428,12 +428,8 @@ impl TaskWorkspace {
         }
         drop(self.sidecars.take());
         let output = git_cmd(&self.source_repo)
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                self.workspace_path.to_str().expect("non-UTF8 path"),
-            ])
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.workspace_path)
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -848,7 +844,7 @@ mod tests {
         let task_id = unique_id("ws-sidecars");
         let specs = vec![PostgresSidecar::with_password(&task_id, "pw").spec()];
         let set = SidecarSet::start(
-            ContainerRuntime::Stub,
+            ContainerRuntime::Podman,
             Arc::new(RecordingRunner),
             &task_id,
             &specs,
@@ -903,8 +899,8 @@ mod tests {
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-stub"), "HEAD").unwrap();
         ws.container_handle = Some(Arc::new(ContainerHandle {
-            name: "stub-handle".to_string(),
-            runtime: ContainerRuntime::Stub,
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Podman,
             port: None,
             needs_cleanup: true,
         }));
@@ -1056,8 +1052,8 @@ mod tests {
 
         fn stub_handle() -> Arc<ContainerHandle> {
             Arc::new(ContainerHandle {
-                name: "stub".to_string(),
-                runtime: ContainerRuntime::Stub,
+                name: "app-test-container".to_string(),
+                runtime: ContainerRuntime::Podman,
                 port: None,
                 needs_cleanup: false,
             })

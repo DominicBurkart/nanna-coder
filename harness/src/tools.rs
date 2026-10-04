@@ -1172,6 +1172,36 @@ pub fn cargo_run_args(
     args
 }
 
+fn reject_option_like(field: &str, value: Option<&str>) -> ToolResult<()> {
+    match value {
+        Some(v) if v.starts_with('-') => Err(ToolError::InvalidArguments {
+            message: format!("'{field}' must not start with '-': {v}"),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn run_cargo_argv(
+    handle: &crate::container::ContainerHandle,
+    working_dir: Option<&str>,
+    argv: &[String],
+) -> ToolResult<Value> {
+    let command = argv.join(" ");
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let result =
+        crate::container::exec_in_container(handle, &argv_refs, working_dir).map_err(|e| {
+            ToolError::ExecutionFailed {
+                message: e.to_string(),
+            }
+        })?;
+    Ok(json!({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.success,
+        "command": command,
+    }))
+}
+
 pub struct CargoBuildTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
     working_dir: Option<String>,
@@ -1231,21 +1261,9 @@ impl Tool for CargoBuildTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+        reject_option_like("package", package)?;
         let argv = cargo_build_args(package, release);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1310,21 +1328,10 @@ impl Tool for CargoTestTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let test_filter = args.get("test_filter").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
+        reject_option_like("test_filter", test_filter)?;
         let argv = cargo_test_args(package, test_filter);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1378,21 +1385,9 @@ impl Tool for CargoCheckTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
         let argv = cargo_check_args(package);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1459,21 +1454,10 @@ impl Tool for CargoBenchTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let bench_filter = args.get("bench_filter").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
+        reject_option_like("bench_filter", bench_filter)?;
         let argv = cargo_bench_args(package, bench_filter);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1554,21 +1538,10 @@ impl Tool for CargoRunTool {
             .and_then(|v| v.as_str())
             .map(|s| s.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
+        reject_option_like("package", package)?;
+        reject_option_like("bin", bin)?;
         let argv = cargo_run_args(package, bin, &extra_args);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1631,23 +1604,9 @@ impl Tool for CargoDenyTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let check = args.get("check").and_then(|v| v.as_str());
+        reject_option_like("check", check)?;
         let argv = cargo_deny_args(check);
-        let command = argv.join(" ");
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-            "command": command,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
@@ -1693,22 +1652,7 @@ impl Tool for CargoAuditTool {
 
     async fn execute(&self, _args: Value) -> ToolResult<Value> {
         let argv = cargo_audit_args();
-        let command = argv.join(" ");
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-            "command": command,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {

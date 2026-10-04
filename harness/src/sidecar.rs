@@ -11,7 +11,7 @@
 //! testable without a container runtime; [`SystemRunner`] is the production
 //! implementation.
 
-use crate::container::{exec_in_container, ContainerHandle, ContainerRuntime};
+use crate::container::{ContainerHandle, ContainerRuntime};
 use rand::distr::Alphanumeric;
 use rand::Rng;
 use std::process::Command;
@@ -367,7 +367,14 @@ impl SidecarSet {
                 port: None,
                 needs_cleanup: true,
             };
-            wait_ready(&handle, &spec.readiness, readiness).await?;
+            wait_ready(
+                runner.as_ref(),
+                &runtime,
+                &spec.name,
+                &spec.readiness,
+                readiness,
+            )
+            .await?;
             sidecars.push(RunningSidecar {
                 handle,
                 spec: spec.clone(),
@@ -406,19 +413,22 @@ impl SidecarSet {
 }
 
 async fn wait_ready(
-    handle: &ContainerHandle,
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    name: &str,
     readiness: &[String],
     cfg: ReadinessConfig,
 ) -> Result<(), SidecarError> {
-    let argv: Vec<&str> = readiness.iter().map(String::as_str).collect();
+    let mut args = vec!["exec".to_string(), name.to_string()];
+    args.extend(readiness.iter().cloned());
     let start = Instant::now();
     loop {
-        if matches!(exec_in_container(handle, &argv, None), Ok(o) if o.success) {
+        if matches!(runner.run(runtime.command(), &args), Ok(o) if o.success) {
             return Ok(());
         }
         if start.elapsed() >= cfg.budget {
             return Err(SidecarError::NotReady {
-                name: handle.name.clone(),
+                name: name.to_string(),
                 budget: cfg.budget,
             });
         }
@@ -592,7 +602,7 @@ mod tests {
     #[test]
     fn task_network_is_created_and_removed_on_drop() {
         let runner = FakeRunner::new(None, None);
-        let net = TaskNetwork::create(ContainerRuntime::Stub, runner.clone(), "t1").unwrap();
+        let net = TaskNetwork::create(ContainerRuntime::Podman, runner.clone(), "t1").unwrap();
         assert_eq!(net.name(), "nanna-task-t1-net");
         drop(net);
         assert_eq!(
@@ -607,16 +617,16 @@ mod tests {
     #[test]
     fn task_network_debug_shows_name_and_runtime() {
         let runner = FakeRunner::new(None, None);
-        let net = TaskNetwork::create(ContainerRuntime::Stub, runner, "dbg").unwrap();
+        let net = TaskNetwork::create(ContainerRuntime::Podman, runner, "dbg").unwrap();
         let rendered = format!("{net:?}");
         assert!(rendered.contains("nanna-task-dbg-net"), "{rendered}");
-        assert!(rendered.contains("Stub"), "{rendered}");
+        assert!(rendered.contains("Podman"), "{rendered}");
     }
 
     #[test]
     fn task_network_create_failure_is_reported() {
         let runner = FakeRunner::new(Some("network create"), None);
-        let err = TaskNetwork::create(ContainerRuntime::Stub, runner, "t1").unwrap_err();
+        let err = TaskNetwork::create(ContainerRuntime::Podman, runner, "t1").unwrap_err();
         assert!(
             matches!(err, SidecarError::NetworkCreate { ref stderr, .. } if stderr == "boom"),
             "{err}"
@@ -626,7 +636,7 @@ mod tests {
     #[test]
     fn task_network_spawn_failure_is_reported() {
         let runner = FakeRunner::new(None, Some("network create"));
-        let err = TaskNetwork::create(ContainerRuntime::Stub, runner, "t1").unwrap_err();
+        let err = TaskNetwork::create(ContainerRuntime::Podman, runner, "t1").unwrap_err();
         assert!(matches!(err, SidecarError::Spawn { .. }), "{err}");
         assert!(err.to_string().contains("network create nanna-task-t1-net"));
     }
@@ -634,7 +644,7 @@ mod tests {
     #[test]
     fn task_network_drop_tolerates_removal_failure() {
         let runner = FakeRunner::new(Some("network rm"), None);
-        let net = TaskNetwork::create(ContainerRuntime::Stub, runner.clone(), "t1").unwrap();
+        let net = TaskNetwork::create(ContainerRuntime::Podman, runner.clone(), "t1").unwrap();
         drop(net);
         assert_eq!(runner.calls().len(), 2);
     }
@@ -652,9 +662,15 @@ mod tests {
     async fn sidecar_set_starts_specs_on_task_network_and_collects_exports() {
         let runner = FakeRunner::new(None, None);
         let specs = vec![PostgresSidecar::with_password("t2", "pw").spec()];
-        let set = SidecarSet::start(ContainerRuntime::Stub, runner.clone(), "t2", &specs, fast())
-            .await
-            .unwrap();
+        let set = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t2",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap();
         assert_eq!(set.network_name(), "nanna-task-t2-net");
         assert_eq!(set.container_args(), vec!["--network=nanna-task-t2-net"]);
         assert_eq!(set.exports(), specs[0].exports.as_slice());
@@ -676,9 +692,15 @@ mod tests {
     async fn sidecar_set_start_failure_tears_down_network() {
         let runner = FakeRunner::new(Some("run"), None);
         let specs = vec![PostgresSidecar::with_password("t3", "pw").spec()];
-        let err = SidecarSet::start(ContainerRuntime::Stub, runner.clone(), "t3", &specs, fast())
-            .await
-            .unwrap_err();
+        let err = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t3",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, SidecarError::Start { ref name, .. } if name == "nanna-task-t3-postgres"),
             "{err}"
@@ -693,7 +715,7 @@ mod tests {
     async fn sidecar_set_spawn_failure_is_reported() {
         let runner = FakeRunner::new(None, Some("run"));
         let specs = vec![PostgresSidecar::with_password("t4", "pw").spec()];
-        let err = SidecarSet::start(ContainerRuntime::Stub, runner, "t4", &specs, fast())
+        let err = SidecarSet::start(ContainerRuntime::Podman, runner, "t4", &specs, fast())
             .await
             .unwrap_err();
         assert!(matches!(err, SidecarError::Spawn { .. }), "{err}");
@@ -702,23 +724,42 @@ mod tests {
     #[tokio::test]
     async fn sidecar_set_network_failure_is_reported() {
         let runner = FakeRunner::new(Some("network create"), None);
-        let err = SidecarSet::start(ContainerRuntime::Stub, runner, "t5", &[], fast())
+        let err = SidecarSet::start(ContainerRuntime::Podman, runner, "t5", &[], fast())
             .await
             .unwrap_err();
         assert!(matches!(err, SidecarError::NetworkCreate { .. }), "{err}");
     }
 
     #[tokio::test]
+    async fn wait_ready_probes_through_the_injected_runner() {
+        let runner = FakeRunner::new(None, None);
+        wait_ready(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "nanna-task-x-postgres",
+            &["pg_isready".to_string()],
+            fast(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec!["exec nanna-task-x-postgres pg_isready".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn wait_ready_times_out_when_readiness_never_succeeds() {
-        let handle = ContainerHandle {
-            name: "never-ready".to_string(),
-            runtime: ContainerRuntime::None,
-            port: None,
-            needs_cleanup: false,
-        };
-        let err = wait_ready(&handle, &["pg_isready".to_string()], fast())
-            .await
-            .unwrap_err();
+        let runner = FakeRunner::new(Some("exec"), None);
+        let err = wait_ready(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "never-ready",
+            &["pg_isready".to_string()],
+            fast(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, SidecarError::NotReady { ref name, .. } if name == "never-ready"),
             "{err}"
