@@ -117,6 +117,47 @@ enum Commands {
         #[arg(long)]
         ttl_ms: Option<u64>,
     },
+    /// Pull open GitHub issues into the persistent task queue
+    ///
+    /// Issues already queued (by number) or already claimed by an open pull
+    /// request carrying a `Nanna-Identity:` marker are skipped. Reads
+    /// `GITHUB_TOKEN` for authentication when set. Entries land in the queue
+    /// log and are picked up when `mcp-serve` next starts.
+    BacklogSync {
+        /// GitHub repository in `owner/name` form
+        #[arg(long)]
+        repo: String,
+        /// Absolute path to the local checkout tasks run against
+        #[arg(long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base task worktrees on
+        #[arg(long, default_value = "HEAD")]
+        branch: String,
+        /// GitHub search query fragment selecting the issues
+        #[arg(long, default_value = "label:nanna")]
+        query: String,
+        /// Identity hint attached to every ingested task
+        #[arg(long)]
+        identity: String,
+        /// The model the tasks run with
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations per task
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Maximum pending tasks per repository path
+        #[arg(long)]
+        max_per_repo: Option<usize>,
+        /// Queue log location (defaults to NANNA_QUEUE_PATH or
+        /// ~/.local/state/nanna/queue.jsonl)
+        #[arg(long)]
+        queue_path: Option<std::path::PathBuf>,
+    },
+    /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -130,6 +171,34 @@ enum Commands {
         /// Optional second JSON file for comparison report
         #[arg(long)]
         compare: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Print the deployment plan for an environment without executing it
+    Plan {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to plan for
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Print the plan as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a starter template for a full-stack Rust repository
+    Init {
+        /// Risk class of the system: unused, internal, edge or core
+        #[arg(long)]
+        risk: harness::deploy::RiskClass,
+        /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -243,6 +312,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::BacklogSync {
+            repo,
+            repo_path,
+            branch,
+            query,
+            identity,
+            model,
+            max_iterations,
+            max_per_repo,
+            queue_path,
+        } => {
+            run_backlog_sync(
+                harness::backlog::BacklogConfig {
+                    sources: vec![harness::backlog::BacklogSource {
+                        repo,
+                        repo_path,
+                        branch,
+                        query,
+                        identity,
+                        model,
+                        max_iterations,
+                    }],
+                    max_per_repo,
+                },
+                queue_path,
+            )
+            .await?;
+        }
+        Commands::Deploy { command } => run_deploy(command)?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -257,6 +355,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DeployCommands::Plan {
+            repo_path,
+            env,
+            score,
+            json,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
+            if json {
+                println!("{}", plan.to_json_pretty());
+            } else {
+                print!("{plan}");
+            }
+        }
+        DeployCommands::Init { risk, repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::deploy::init(&repo, risk)?;
+            println!("Wrote {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -573,7 +702,12 @@ fn list_tools(tool_registry: &ToolRegistry) {
         for tool_name in tools {
             if let Some(tool) = tool_registry.get_tool(tool_name) {
                 let def = tool.definition();
-                println!("  - {}: {}", def.function.name, def.function.description);
+                println!(
+                    "  - {} [{}]: {}",
+                    def.function.name,
+                    tool.effect_class(),
+                    def.function.description
+                );
             }
         }
     }
@@ -594,6 +728,104 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
         }
     }
 
+    report_queue_health()?;
+    report_lease_health()?;
+
+    Ok(())
+}
+
+/// Print every recorded coordination lease with live and expired counts.
+/// A missing lease log means no lease has been granted yet.
+fn report_lease_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::{default_lease_path, JsonlLeaseStore, LeaseSnapshot};
+
+    let Some(path) = default_lease_path() else {
+        println!("- Leases: no lease location (set NANNA_LEASE_PATH, NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Leases: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlLeaseStore::open(&path)?;
+    let snapshot = LeaseSnapshot::from_store(&store, chrono::Utc::now())?;
+    println!("- Leases ({}): {}", path.display(), snapshot);
+    for lease in &snapshot.leases {
+        let state = if lease.is_expired(snapshot.at) {
+            "expired"
+        } else {
+            "held"
+        };
+        println!(
+            "  {} {} by {} until {}",
+            state, lease.name, lease.holder, lease.until
+        );
+    }
+    Ok(())
+}
+
+/// Print the persisted backlog's depth, parked count and age of its oldest
+/// entry. A missing queue log means no backlog has been recorded yet.
+fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::scheduler::{default_queue_path, JsonlQueueStore, QueueMetrics};
+
+    let Some(path) = default_queue_path() else {
+        println!("- Task queue: no queue location (set NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Task queue: empty (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlQueueStore::open(&path)?;
+    let metrics = QueueMetrics::from_store(&store, chrono::Utc::now())?;
+    println!("- Task queue ({}): {}", path.display(), metrics);
+    Ok(())
+}
+
+/// Lease log location: `NANNA_LEASE_PATH` when set, otherwise
+/// `leases.jsonl` next to the queue log.
+fn resolve_lease_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::leases::lease_path_from(
+        std::env::var_os(harness::leases::LEASE_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields a lease path")
+}
+
+fn resolve_queue_path(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    explicit
+        .or_else(harness::scheduler::default_queue_path)
+        .ok_or_else(|| {
+            "no queue location: pass --queue-path or set NANNA_QUEUE_PATH or HOME".into()
+        })
+}
+
+async fn run_backlog_sync(
+    config: harness::backlog::BacklogConfig,
+    queue_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
+    use harness::scheduler::JsonlQueueStore;
+
+    let path = resolve_queue_path(queue_path)?;
+    let store = JsonlQueueStore::open(&path)?;
+    let sink = StoreSink::open(Box::new(store))?;
+    let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
+    let report = backlog_sync(&client, &sink, &config).await?;
+    println!(
+        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}",
+        path.display(),
+        report.enqueued.len(),
+        report.duplicates,
+        report.claimed,
+        report.capped
+    );
+    for origin in &report.enqueued {
+        println!("  + {origin}");
+    }
     Ok(())
 }
 
@@ -750,17 +982,33 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let queue_path = resolve_queue_path(None)?;
+    let lease_path = resolve_lease_path(&queue_path);
+    let task_manager = Arc::new(
+        TaskManager::restore(
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path)?),
+            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+            provider.clone(),
+        )
+        .await?,
+    );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {})",
-        model, max_iterations
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {})",
+        model,
+        max_iterations,
+        queue_path.display(),
+        lease_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
