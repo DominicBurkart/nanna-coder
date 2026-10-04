@@ -459,4 +459,14 @@ mod tests {
         let template = DeployTemplate::parse(&src).unwrap();
         template.validate_against(&WindowSet::default()).unwrap();
     }
+
+    #[test]
+    fn production_gate_matches_environment_case_insensitively() {
+        let src = template(RiskClass::Unused, Strategy::Instant, "[100]", "0m")
+            .replace("windows = \"business-hours\"\n", "")
+            .replace("\"production\"", "\"Production\"");
+        let (field, reason) = field_error(&src);
+        assert_eq!(field, "rollout.windows");
+        assert!(reason.contains("production"), "{reason}");
+    }
 }

@@ -823,6 +823,33 @@ minimum total: 1d 1h 30m
         assert!(err.to_string().contains("windows.toml"), "{err}");
     }
 
+    #[test]
+    fn production_gates_apply_to_any_casing() {
+        let src = FIXTURE.replace("\"production\"", "\"Production\"");
+        let plan = DeployTemplate::parse(&src)
+            .unwrap()
+            .plan("Production")
+            .unwrap();
+        assert_eq!(
+            plan.steps[0].preconditions,
+            [
+                Precondition::LeaseHeld("deploy:fullstack-fixture:Production".into()),
+                Precondition::WindowOpen("business-hours".into()),
+                Precondition::HealthOk
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_revalidates_after_fields_are_mutated() {
+        let mut template = DeployTemplate::parse(FIXTURE).unwrap();
+        template.rollout.strategy = Strategy::Instant;
+        assert!(matches!(
+            template.plan("production"),
+            Err(DeployError::InvalidField { .. })
+        ));
+    }
+
     fn arb_steps(min: usize) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
         (min..=10usize)
             .prop_flat_map(|n| proptest::collection::btree_set(1u8..100, n - 1))
