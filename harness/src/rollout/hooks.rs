@@ -1,5 +1,5 @@
 use super::health::HealthBreach;
-use super::incident::{Incident, ProposedAction};
+use super::incident::{Incident, Postmortem, ProposedAction};
 use super::state::RolloutRecord;
 use crate::deploy::DeployStep;
 use async_trait::async_trait;
@@ -145,6 +145,9 @@ pub struct RolloutEscalation {
     pub summary: String,
     /// The breach, when a health gate caused the halt.
     pub breach: Option<HealthBreach>,
+    /// The rendered postmortem, when an incident responder acted on the
+    /// breach, ready to be filed.
+    pub postmortem: Option<Postmortem>,
 }
 
 /// Receives halt-and-escalate events. The escalation paths work provides
@@ -285,6 +288,7 @@ mod tests {
             traffic_percent: 50,
             summary: "health breach".into(),
             breach: None,
+            postmortem: None,
         }
     }
 

@@ -5,9 +5,9 @@
 # The schema here mirrors that lane's `AgentIdentity` TOML shape
 # (`[identity]`/`[scope]`/`[limits]`) so it parses unchanged once the
 # identity and RBAC lanes merge into this one; until then it is read
-# directly, as a plain fixture, by
-# `harness::rollout::IncidentIdentity::from_fixture` and its enumeration
-# test in `harness/src/rollout/incident.rs`. Wiring it into a real
+# directly, as a plain fixture, only by a test in
+# `harness/src/rollout/incident.rs` that pins
+# `harness::rollout::IncidentIdentity::incident_responder` to it. Wiring it into a real
 # `IdentityCatalog` is a follow-up noted in the PR that adds this file.
 #
 # Scope: `outer` loop, `max_effect = "production"`, limited to rolling a

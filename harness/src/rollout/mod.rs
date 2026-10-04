@@ -41,7 +41,7 @@ pub use hooks::{
 };
 pub use incident::{
     collect_evidence, Incident, IncidentIdentity, IncidentResponder, Postmortem, ProposedAction,
-    INCIDENT_RESPONDER_FIXTURE_TOML, READ_LOGS_TOOL, ROLLBACK_TOOL, ROLL_FORWARD_PR_TOOL,
+    READ_LOGS_TOOL, ROLLBACK_TOOL, ROLL_FORWARD_PR_TOOL,
 };
 pub use log::{
     default_rollout_path, rollout_path_from, RolloutLog, RolloutTransition, ROLLOUT_PATH_ENV,

@@ -635,7 +635,7 @@ impl RolloutExecutor {
     /// persists `Halted` before doing anything else that can fail.
     async fn respond_to_incident(
         &self,
-        mut record: RolloutRecord,
+        record: RolloutRecord,
         breach: HealthBreach,
         step: usize,
         responder: Arc<IncidentResponder>,
@@ -654,12 +654,61 @@ impl RolloutExecutor {
                 .await;
         }
         if action == ProposedAction::Rollback && responder.permits(&action) {
-            return self.persist(&mut record, RolloutState::RollingBack);
+            return self
+                .roll_back_and_report(record, incident, action, breach)
+                .await;
         }
         let summary =
             format!("{breach}; incident responder proposes to {action}: escalating for a human");
         self.halt_and_escalate(record, step, summary, Some(breach))
             .await
+    }
+
+    async fn roll_back_and_report(
+        &self,
+        mut record: RolloutRecord,
+        incident: Incident,
+        action: ProposedAction,
+        breach: HealthBreach,
+    ) -> Result<(), RolloutError> {
+        let id = record.id.clone();
+        let step = incident.step;
+        let environment = record.plan.environment.clone();
+        let image = record.image.clone();
+        let previous_image = record.previous_image.clone();
+        self.persist(&mut record, RolloutState::RollingBack)?;
+        let outcome = self.roll_back(record).await;
+        let (verdict, summary) = match &outcome {
+            Ok(()) => (
+                "rolled back automatically".to_string(),
+                format!("{breach}; incident responder rolled back automatically"),
+            ),
+            Err(error) => (
+                format!("automatic rollback failed: {error}"),
+                format!(
+                    "{breach}; incident responder's rollback failed ({error}): a human must finish it"
+                ),
+            ),
+        };
+        let current = self.log.load(&id)?;
+        let postmortem = incident.postmortem(&action, &self.log.history(&id)?, &verdict);
+        let escalation = RolloutEscalation {
+            rollout_id: id,
+            environment,
+            image,
+            previous_image,
+            step,
+            traffic_percent: current.traffic_percent,
+            summary,
+            breach: Some(breach),
+            postmortem: Some(postmortem),
+        };
+        let escalated = self
+            .escalation
+            .escalate(&escalation)
+            .await
+            .map_err(RolloutError::Escalation);
+        outcome.and(escalated)
     }
 
     async fn roll_back(&self, mut record: RolloutRecord) -> Result<(), RolloutError> {
@@ -697,6 +746,7 @@ impl RolloutExecutor {
             traffic_percent: record.traffic_percent,
             summary,
             breach,
+            postmortem: None,
         };
         self.escalation
             .escalate(&escalation)
@@ -1078,7 +1128,7 @@ mod tests {
         )
         .with_escalation(rig.escalation.clone())
         .with_incident_responder(Arc::new(IncidentResponder::new(
-            IncidentIdentity::from_fixture(),
+            IncidentIdentity::incident_responder(),
         )))
         .with_config(one_poll_per_step());
         rig.health.push_after(1, breach_sample());
@@ -1098,14 +1148,26 @@ mod tests {
 
     #[tokio::test]
     async fn incident_responder_rolls_back_an_approved_action_instead_of_halting() {
-        let rig = rig_with_responder(IncidentIdentity::from_fixture());
+        let rig = rig_with_responder(IncidentIdentity::incident_responder());
         rig.health.push_after(1, breach_sample());
         let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
         let record = rig.executor.start(plan, V2).await.unwrap();
         let done = rig.executor.run(&record.id).await.unwrap();
         assert_eq!(done.state, RolloutState::RolledBack);
         assert_eq!(rig.adapter.current(), V1);
-        assert!(rig.escalation.escalations().is_empty());
+        let escalations = rig.escalation.escalations();
+        assert_eq!(
+            escalations.len(),
+            1,
+            "an automatic rollback must be reported"
+        );
+        assert!(escalations[0].summary.contains("rolled back automatically"));
+        assert_eq!(escalations[0].rollout_id, record.id);
+        assert_eq!(escalations[0].traffic_percent, 0);
+        let postmortem = escalations[0].postmortem.as_ref().expect("postmortem");
+        assert!(postmortem.title.contains(&record.id));
+        assert!(postmortem.body.contains("rolled back automatically"));
+        assert!(postmortem.body.contains("rolled-back"));
         assert_eq!(
             rig.leases.snapshot().unwrap().len(),
             0,
@@ -1114,8 +1176,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_responder_rollback_is_still_escalated_with_a_postmortem() {
+        let rig = rig_with_responder(IncidentIdentity::incident_responder());
+        rig.adapter.fail(AdapterOp::RollbackTo);
+        rig.health.push_after(1, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let err = rig.executor.run(&record.id).await.unwrap_err();
+        assert!(matches!(err, RolloutError::Adapter(_)), "{err}");
+        assert_eq!(
+            rig.executor.status(&record.id).unwrap().state,
+            RolloutState::RollingBack
+        );
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("rollback failed"));
+        assert!(escalations[0]
+            .postmortem
+            .as_ref()
+            .unwrap()
+            .body
+            .contains("automatic rollback failed"));
+    }
+
+    #[tokio::test]
+    async fn responder_actions_that_escalate_carry_no_postmortem_and_a_denied_one_neither() {
+        let rig = rig_with_responder(IncidentIdentity::incident_responder());
+        rig.audit.deny_next_action("no");
+        rig.health.push_after(1, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(rig.escalation.escalations()[0].postmortem, None);
+    }
+
+    #[tokio::test]
     async fn incident_responder_action_denied_by_audit_halts_and_escalates() {
-        let rig = rig_with_responder(IncidentIdentity::from_fixture());
+        let rig = rig_with_responder(IncidentIdentity::incident_responder());
         rig.audit.deny_next_action("evidence is inconclusive");
         rig.health.push_after(1, breach_sample());
         let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
