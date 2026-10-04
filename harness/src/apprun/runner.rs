@@ -149,10 +149,23 @@ pub fn shell_quote(s: &str) -> String {
 
 /// The `sh -c` script that starts `executable` detached with `env`, both
 /// output streams appended to `log_path`, and prints its pid.
+fn env_name_word(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if plain {
+        name.to_string()
+    } else {
+        shell_quote(name)
+    }
+}
+
 pub fn start_script(executable: &str, env: &[(String, String)], log_path: &str) -> String {
     let assignments: Vec<String> = env
         .iter()
-        .map(|(k, v)| format!("{k}={}", shell_quote(v)))
+        .map(|(k, v)| format!("{}={}", env_name_word(k), shell_quote(v)))
         .collect();
     format!(
         "{} nohup {} >{} 2>&1 & echo $!",
@@ -367,7 +380,10 @@ impl AppContext {
     /// is already registered for the task.
     pub async fn start(&self) -> Result<AppInstance, AppError> {
         if let Some(running) = self.apps.get(&self.task_id) {
-            return Ok(running);
+            if self.probe(&running)? {
+                return Ok(running);
+            }
+            self.stop()?;
         }
         let deadline = Instant::now() + self.limits.max_wall_clock();
         let budget = self.remaining("trunk build", deadline)?;
@@ -603,6 +619,10 @@ mod tests {
     }
 
     fn healthy_after(n: usize) -> Responder {
+        health_probes(move |probes| probes >= n)
+    }
+
+    fn health_probes(healthy: impl Fn(usize) -> bool + Send + Sync + 'static) -> Responder {
         Box::new(move |args, probes| {
             if has(args, "trunk") || script(args).starts_with("kill") {
                 ok("")
@@ -611,7 +631,7 @@ mod tests {
             } else if script(args).contains("nohup") {
                 ok("4242\n")
             } else if has(args, "curl") {
-                if probes >= n {
+                if healthy(probes) {
                     ok("")
                 } else {
                     failed("")
@@ -795,6 +815,16 @@ mod tests {
     }
 
     #[test]
+    fn start_script_quotes_env_names_that_are_not_plain_identifiers() {
+        let hostile = vec![("A;touch /tmp/pwned".to_string(), "v".to_string())];
+        let script = start_script("/bin/api", &hostile, "/tmp/app.log");
+        assert!(
+            script.starts_with("'A;touch /tmp/pwned'='v' nohup "),
+            "{script}"
+        );
+    }
+
+    #[test]
     fn executable_is_taken_from_the_last_artifact_with_one() {
         assert_eq!(
             executable_from_build_output(BUILD_JSON),
@@ -886,15 +916,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_start_returns_the_running_instance_without_commands() {
+    async fn second_start_probes_the_running_instance_and_returns_it() {
         let runner = StubRunner::new(healthy_after(1));
         let (ctx, _dir) = context(Arc::clone(&runner), 120);
         let first = ctx.start().await.unwrap();
         let before = runner.calls().len();
         let again = ctx.start().await.unwrap();
         assert_eq!(first, again);
-        assert_eq!(runner.calls().len(), before);
+        let new_calls: Vec<Vec<String>> = runner.calls().into_iter().skip(before).collect();
+        assert_eq!(new_calls.len(), 1, "cached start: {new_calls:?}");
+        assert!(has(&new_calls[0], "curl"), "{new_calls:?}");
         assert_eq!(ctx.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_after_the_app_died_stops_the_stale_pid_and_restarts() {
+        let runner = StubRunner::new(health_probes(|probes| probes != 2));
+        let (ctx, _dir) = context(Arc::clone(&runner), 120);
+        ctx.start().await.unwrap();
+        let again = ctx.start().await.unwrap();
+        assert_eq!(runner.calls().iter().filter(|c| has(c, "trunk")).count(), 2);
+        assert!(runner.calls().iter().any(|c| script(c) == "kill 4242"));
+        assert_eq!(ctx.apps.len(), 1);
+        assert_eq!(ctx.apps.get(&ctx.task_id), Some(again));
     }
 
     #[tokio::test]

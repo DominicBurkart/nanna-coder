@@ -91,6 +91,32 @@ enum Commands {
         #[arg(long, default_value = "100")]
         max_iterations: usize,
     },
+    /// Delegate a coding task through the MCP Tasks protocol.
+    ///
+    /// Drives an in-process MCP server as a Tasks client: submits an
+    /// `assign_task` tool call augmented with a `task`, polls `tasks/get` to
+    /// completion, and prints the `tasks/result` payload. This exercises the
+    /// same wire protocol external orchestrators use.
+    Delegate {
+        /// Description of the coding task to perform
+        #[arg(short, long)]
+        description: String,
+        /// Absolute path to the git repository
+        #[arg(short, long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base the worktree on
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+        /// The model to use
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Requested task lifetime in milliseconds
+        #[arg(long)]
+        ttl_ms: Option<u64>,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -198,6 +224,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
         } => {
             run_mcp_server(&model, max_iterations).await?;
+        }
+        Commands::Delegate {
+            description,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            ttl_ms,
+        } => {
+            run_delegate(
+                &description,
+                &repo_path,
+                &branch,
+                &model,
+                max_iterations,
+                ttl_ms,
+            )
+            .await?;
         }
         Commands::SweBenchReport {
             input,
@@ -719,11 +763,73 @@ async fn run_mcp_server(
         model, max_iterations
     );
 
-    let server = NannaMcpServer::new(task_manager, provider, model.to_string(), max_iterations);
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
     server.serve(reader, writer).await?;
+    Ok(())
+}
+
+/// Delegate a coding task through the MCP Tasks protocol by driving an
+/// in-process server as a client over an in-memory duplex. This dogfoods the
+/// exact wire protocol external orchestrators use, without spawning a child
+/// process.
+async fn run_delegate(
+    description: &str,
+    repo_path: &std::path::Path,
+    branch: &str,
+    model: &str,
+    max_iterations: usize,
+    ttl_ms: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::mcp::client::NannaMcpClient;
+    use harness::mcp::NannaMcpServer;
+    use harness::task::TaskManager;
+    use std::sync::Arc;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let task_manager = Arc::new(TaskManager::default());
+    let server = Arc::new(NannaMcpServer::new(
+        task_manager,
+        provider,
+        model.to_string(),
+        max_iterations,
+    ));
+
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let serve_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(tokio::io::BufReader::new(server_read), server_write)
+            .await;
+    });
+
+    let (client_read, client_write) = tokio::io::split(client_side);
+    let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
+
+    client.initialize().await?;
+    let arguments = serde_json::json!({
+        "description": description,
+        "repo_path": repo_path.to_string_lossy(),
+        "branch": branch,
+        "model": model,
+        "max_iterations": max_iterations,
+    });
+    let task_id = client.submit_task(arguments, ttl_ms).await?;
+    info!("Delegated task {task_id}; awaiting completion...");
+
+    let result = client.wait_result(&task_id).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    drop(client);
+    let _ = serve_handle.await;
     Ok(())
 }
 

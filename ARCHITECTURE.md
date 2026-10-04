@@ -53,16 +53,21 @@ flowchart TD
 
 # API
 
-The harness exposes six CLI subcommands: `chat`, `agent`, `mcp-serve`, `models`, `tools`, and `health`. The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol, exposing six MCP tools for task orchestration. External orchestrators connect to Nanna exclusively through this MCP interface.
+The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implements the Model Context Protocol (protocol revision `2025-11-25`), including the [MCP Tasks extension](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) for long-running operations. External orchestrators connect to Nanna exclusively through this MCP interface. The `delegate` CLI subcommand is a first-party client of the same interface (it drives an in-process server over an in-memory channel), so the CLI and external orchestrators exercise identical wire semantics.
 
-The six MCP tools form a complete task-delegation surface:
+Nanna exposes its coding capability as a **task-augmented tool** rather than a bespoke poll/result tool surface. `tools/list` advertises:
 
-- **`assign_task`** — submit a new task (natural-language description plus target repo) and receive a `task_id`. Nanna spawns an agent loop in an isolated worktree on the designated repository.
-- **`poll_task`** — query the current status of a task by `task_id` without blocking. Returns one of `running`, `completed`, `failed`, or `cancelled`, allowing orchestrators to interleave work on multiple tasks.
-- **`get_result`** — fetch the final result for a completed task (conversation snapshot, tool calls made, result summary, and any written artefacts). Safe to call repeatedly.
-- **`list_tasks`** — enumerate all tasks Nanna is currently tracking along with their states, giving orchestrators a view over in-flight work without needing to remember every `task_id` they dispatched.
-- **`cancel_task`** — request termination of a running task by `task_id`. Nanna stops its agent loop at the next safe checkpoint and transitions the task to the `cancelled` state so subsequent `get_result` calls return a consistent terminal record.
-- **`onboard_repo`** — register a new repository with Nanna (clone, index entities, and prepare a reusable worktree pool) so that later `assign_task` calls against that repo start immediately instead of paying cold-start cost.
+- **`assign_task`** — declared with `execution.taskSupport: "required"`. Submit a coding task (natural-language description plus target repo); Nanna spawns an agent loop in an isolated worktree. Because task support is *required*, clients MUST augment the `tools/call` with a `task` field (per the Tasks extension); a non-augmented call returns `-32601`. The response is a `CreateTaskResult` carrying a `taskId` and initial `working` status.
+- **`onboard_repo`** — an ordinary synchronous tool (no task augmentation) that generates a `flake.nix` for a pure-Cargo Rust repository that lacks one.
+
+The task lifecycle uses the standard Tasks methods instead of custom tools:
+
+- **`tasks/get`** — poll a task's status by `taskId` (`working`, `completed`, `failed`, or `cancelled`) with `createdAt`/`lastUpdatedAt`/`ttl`/`pollInterval` metadata. Non-blocking.
+- **`tasks/result`** — retrieve the terminal `CallToolResult` (result summary, patch, tool calls, model). Blocks until the task reaches a terminal state; carries the `io.modelcontextprotocol/related-task` metadata.
+- **`tasks/list`** — enumerate all tasks Nanna is tracking with their statuses.
+- **`tasks/cancel`** — request cancellation by `taskId`; the task transitions to `cancelled`. Cancelling an already-terminal task returns `-32602`.
+
+The server advertises `capabilities.tasks: { list, cancel, requests: { tools: { call } } }` at `initialize`. Task IDs are UUIDv4 with no authorization-context binding — appropriate for a single-user local stdio server (see the Tasks spec's security considerations). `input_required`/elicitation and durable cross-restart task storage are out of scope for this revision.
 
 ```mermaid
 ---
@@ -74,42 +79,44 @@ flowchart LR
     subgraph CLI["CLI (harness)"]
         chat
         agent
+        delegate
         mcpserve["mcp-serve"]
         models
         tools
         health
     end
-    subgraph MCP["MCP (stdio, via mcp-serve)"]
-        assign_task
-        poll_task
-        get_result
-        list_tasks
-        cancel_task
+    subgraph MCP["MCP (stdio, via mcp-serve) — Tasks extension"]
+        assign_task["assign_task (taskSupport: required)"]
         onboard_repo
+        tget["tasks/get"]
+        tresult["tasks/result"]
+        tlist["tasks/list"]
+        tcancel["tasks/cancel"]
     end
     mcpserve --> MCP
+    delegate -.->|in-process client| MCP
     classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,mcpserve,models,tools,health cli
-    class assign_task,poll_task,get_result,list_tasks,cancel_task,onboard_repo mcp
+    class chat,agent,delegate,mcpserve,models,tools,health cli
+    class assign_task,onboard_repo,tget,tresult,tlist,tcancel mcp
 ```
 
 # Delegation Sequence
 
 ```mermaid
 sequenceDiagram
-    participant O as Orchestrator
-    participant N as Nanna
-    O->>N: assign_task(description, repo_path)
-    N-->>O: task_id
+    participant O as Orchestrator (Requestor)
+    participant N as Nanna (Receiver)
+    O->>N: tools/call assign_task (task: {ttl})
+    N-->>O: CreateTaskResult (taskId, status: working)
     Note over O: continues other tasks
     Note over N: agent loop in worktree
-    O->>N: poll_task(task_id)
-    N-->>O: running
-    O->>N: poll_task(task_id)
+    O->>N: tasks/get(taskId)
+    N-->>O: working
+    O->>N: tasks/get(taskId)
     N-->>O: completed
-    O->>N: get_result(task_id)
-    N-->>O: result
+    O->>N: tasks/result(taskId)
+    N-->>O: CallToolResult (summary, patch, ...)
 ```
 
 # Harness Control Flow
