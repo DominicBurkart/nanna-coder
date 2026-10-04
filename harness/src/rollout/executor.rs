@@ -425,7 +425,28 @@ impl RolloutExecutor {
             }
             self.log.append(Some(&record.state), &record)?;
         }
-        if matches!(step.kind, StepKind::Traffic | StepKind::Swap) {
+        let retained = if matches!(step.kind, StepKind::Retire) {
+            let (retained, retained_since) =
+                match (record.retained_slot.clone(), record.retained_since) {
+                    (Some(retained), Some(retained_since)) => (retained, retained_since),
+                    _ => return Err(RolloutError::NoRetainedSlot(record.id.clone())),
+                };
+            let ready_at = retained_since + step.min_duration;
+            if now < ready_at {
+                self.leases.release_all(&record.id)?;
+                return self.park(record, ready_at);
+            }
+            Some(retained)
+        } else {
+            None
+        };
+        let sampled = match step.kind {
+            StepKind::Traffic | StepKind::Swap => true,
+            StepKind::Shadow { .. } | StepKind::Retire => {
+                step.preconditions.contains(&Precondition::HealthOk)
+            }
+        };
+        if sampled {
             match self.check(&record, &slot, n).await {
                 Verdict::Healthy => {}
                 Verdict::Breach(breach) => return self.on_breach(record, breach).await,
@@ -453,16 +474,8 @@ impl RolloutExecutor {
                 record.retained_since = Some(self.clock.now());
             }
             StepKind::Retire => {
-                let (retained, retained_since) =
-                    match (record.retained_slot.clone(), record.retained_since) {
-                        (Some(retained), Some(retained_since)) => (retained, retained_since),
-                        _ => return Err(RolloutError::NoRetainedSlot(record.id.clone())),
-                    };
-                let ready_at = retained_since + step.min_duration;
-                if now < ready_at {
-                    self.leases.release_all(&record.id)?;
-                    return self.park(record, ready_at);
-                }
+                let retained =
+                    retained.ok_or_else(|| RolloutError::NoRetainedSlot(record.id.clone()))?;
                 self.adapter.clear_fallback(&retained).await?;
                 self.adapter.retire(&retained).await?;
                 record.retained_slot = None;
@@ -2052,7 +2065,7 @@ mod tests {
             states(&rig.executor, &record.id),
             ["pending", "step", "step", "baking", "step", "baking", "step", "baking", "complete"]
         );
-        assert_eq!(rig.health.calls().len(), 5);
+        assert_eq!(rig.health.calls().len(), 6);
         assert_eq!(
             rig.shadow.calls().len(),
             1,
@@ -2062,6 +2075,61 @@ mod tests {
             rig.clock.now(),
             t0() + Duration::minutes(10) * 3 + Duration::hours(1) * 3
         );
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_source_before_the_shadow_step_halts_without_mirroring() {
+        let rig = rig();
+        rig.health.push(breach_sample());
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::RolledBack);
+        assert_eq!(done.breach.as_ref().unwrap().step, 0);
+        assert!(
+            !rig.adapter
+                .calls()
+                .iter()
+                .any(|c| matches!(c, AdapterCall::Mirror(_, percent) if *percent > 0)),
+            "{:?}",
+            rig.adapter.calls()
+        );
+        assert_eq!(rig.shadow.calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failing_health_source_before_the_shadow_step_halts_and_escalates_without_mirroring()
+    {
+        let rig = rig();
+        rig.health.set_failing(true);
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Halted);
+        assert_eq!(rig.escalation.escalations().len(), 1);
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::Mirror(_, percent) if *percent > 0)));
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_source_before_retire_leaves_the_retained_slot_in_place() {
+        let rig = rig();
+        rig.health.push_after(2, breach_sample());
+        let src = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+        let plan = DeployTemplate::parse(src).unwrap().plan("sandbox").unwrap();
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        let parked = rig.executor.run(&record.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        rig.clock.advance(Duration::days(2));
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::RolledBack);
+        assert_eq!(done.breach.as_ref().unwrap().step, 1);
+        assert!(!rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::Retire(_))));
     }
 
     #[tokio::test]
