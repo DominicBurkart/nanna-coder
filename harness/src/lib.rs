@@ -13,6 +13,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod rollout;
 pub mod scheduler;
 pub mod sidecar;
 pub mod task;
