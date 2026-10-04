@@ -39,6 +39,7 @@
 //! enabled = false
 //! mirror_percent = 0
 //! compare = ["status", "latency"]
+//! max_divergence = 0.05
 //! ```
 //!
 //! The risk class sets a floor on how cautious the rollout must be:
@@ -70,7 +71,7 @@ pub use plan::{
 };
 pub use template::{
     DeployTemplate, Health, OnBreach, RiskClass, RiskSpec, RiskThresholds, Rollback, Rollout,
-    Shadow, ShadowCompare, Strategy, Target, TargetKind,
+    Shadow, ShadowCompare, Strategy, Target, TargetKind, DEFAULT_MAX_DIVERGENCE,
 };
 pub use validate::{min_span, min_steps, strategy_allowed};
 
