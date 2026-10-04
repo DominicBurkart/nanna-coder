@@ -129,6 +129,17 @@ impl IdentityCatalog {
         Ok(self)
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_identities(
+        identities: impl IntoIterator<Item = AgentIdentity>,
+    ) -> Result<Self, IdentityError> {
+        let mut catalog = Self::default();
+        for identity in identities {
+            catalog.insert_unique(identity)?;
+        }
+        Ok(catalog)
+    }
+
     fn insert_unique(&mut self, identity: AgentIdentity) -> Result<(), IdentityError> {
         if let Some(first) = self.identities.get(identity.name()) {
             return Err(IdentityError::DuplicateName {

@@ -6,7 +6,7 @@ use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
-use crate::identity::AgentIdentity;
+use crate::identity::{AgentIdentity, IdentityCatalog};
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::scheduler::{
@@ -376,6 +376,12 @@ impl TaskManager {
     /// holds and start dispatching. Restored entries run with `provider`;
     /// entries submitted later carry their own.
     ///
+    /// A restored entry that names an identity (`identity_hint`) runs under
+    /// that identity from `identities`, re-resolved by name, so its scope
+    /// survives the restart. An entry whose identity is not in `identities`
+    /// is removed from the queue and failed with `IdentityUnavailable`; it
+    /// never runs unscoped.
+    ///
     /// Crash recovery for `leases`: every lease held by a restored task is
     /// released, since the task will start over, and every expired lease is
     /// reclaimed. Recovery failures surface as `QueueStoreError::Rejected`.
@@ -385,11 +391,31 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
+        identities: &IdentityCatalog,
     ) -> Result<Self, QueueStoreError> {
         let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
         for queued in manager.dispatcher.queued().await {
-            manager.runner.register(&queued, None, None).await;
+            let identity = match queued.identity_hint.as_deref() {
+                None => None,
+                Some(name) => identities.get(name).cloned(),
+            };
+            let unresolved = queued.identity_hint.is_some() && identity.is_none();
+            manager.runner.register(&queued, None, identity).await;
             manager.runner.recover_leases(&queued.id)?;
+            if unresolved {
+                manager.dispatcher.cancel(&queued.id).await?;
+                manager
+                    .runner
+                    .fail(
+                        &queued.id,
+                        format!(
+                            "identity {} is not in the catalog on restore",
+                            queued.identity_hint.as_deref().unwrap_or_default()
+                        ),
+                        "IdentityUnavailable",
+                    )
+                    .await;
+            }
         }
         let reclaimed = manager.runner.leases.expired(Utc::now()).map_err(reject)?;
         for lease in reclaimed {
@@ -2877,6 +2903,7 @@ mod scheduler_tests {
             Box::new(JsonlQueueStore::open(&path).unwrap()),
             Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -2905,6 +2932,7 @@ mod scheduler_tests {
             Box::new(JsonlQueueStore::open(&path).unwrap()),
             Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -2929,6 +2957,101 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
+    async fn test_restore_keeps_the_identity_of_a_queued_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        let id = first
+            .submit_task(
+                queued(Path::new("/nonexistent"))
+                    .with_identity_hint(Some("rust-implementer".to_string())),
+                Arc::clone(&provider),
+            )
+            .await;
+        drop(first);
+
+        let mut scoped = crate::identity::example();
+        scoped.scope.max_effect = EffectClass::Workspace;
+        let catalog = IdentityCatalog::from_identities(vec![scoped]).unwrap();
+        let second = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let restored = second.runner.identities.read().await;
+        let identity = restored
+            .get(&id)
+            .expect("a restored task keeps the identity it was submitted under");
+        assert_eq!(identity.name(), "rust-implementer");
+        assert_eq!(identity.scope.max_effect, EffectClass::Workspace);
+        assert_eq!(network_policy_for(Some(identity)), NetworkPolicy::Disabled);
+    }
+
+    #[tokio::test]
+    async fn test_restore_fails_closed_when_the_identity_is_not_in_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        let id = first
+            .submit_task(
+                queued(Path::new("/nonexistent"))
+                    .with_identity_hint(Some("rust-implementer".to_string())),
+                Arc::clone(&provider),
+            )
+            .await;
+        drop(first);
+
+        let second = TaskManager::restore(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&path).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        assert!(second.runner.identities.read().await.get(&id).is_none());
+        let task = second.poll(&id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "IdentityUnavailable");
+            }
+            other => panic!("expected a fail-closed restore, got {other:?}"),
+        }
+        assert!(JsonlQueueStore::open(&path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn test_restore_propagates_store_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.jsonl");
@@ -2940,6 +3063,7 @@ mod scheduler_tests {
             Box::new(JsonlQueueStore::open(&path).unwrap()),
             Arc::new(InMemoryLeaseStore::default()),
             provider,
+            &IdentityCatalog::default(),
         )
         .await;
         assert!(result.is_err());
@@ -2981,6 +3105,7 @@ mod scheduler_tests {
             Box::new(RejectingStore),
             Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -3025,6 +3150,7 @@ mod scheduler_tests {
             Box::new(store.clone()),
             Arc::new(InMemoryLeaseStore::default()),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -3128,6 +3254,7 @@ mod scheduler_tests {
             Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
             Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -3158,6 +3285,7 @@ mod scheduler_tests {
             Box::new(JsonlQueueStore::open(&queue_path).unwrap()),
             Arc::new(JsonlLeaseStore::open(&lease_path).unwrap()),
             provider,
+            &IdentityCatalog::default(),
         )
         .await
         .unwrap();
@@ -3210,6 +3338,7 @@ mod scheduler_tests {
             Box::new(store.clone()),
             Arc::new(BrokenLeases),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .err()
@@ -3223,6 +3352,7 @@ mod scheduler_tests {
             Box::new(InMemoryQueueStore::default()),
             Arc::new(BrokenLeases),
             Arc::clone(&provider),
+            &IdentityCatalog::default(),
         )
         .await
         .err()
