@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
@@ -147,6 +147,24 @@ pub enum TaskStatus {
         error: String,
         diagnostics: FailureDiagnostics,
     },
+    Cancelled {
+        finished_at: DateTime<Utc>,
+        iterations_completed: usize,
+    },
+}
+
+impl TaskStatus {
+    /// Whether this status is terminal — the task will not transition further.
+    ///
+    /// Maps onto the MCP Tasks spec's terminal states (`completed`, `failed`,
+    /// `cancelled`); `Pending`/`Running` correspond to the non-terminal
+    /// `working` status.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed { .. } | TaskStatus::Failed { .. } | TaskStatus::Cancelled { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,7 +176,28 @@ pub struct Task {
     pub model: String,
     pub status: TaskStatus,
     pub created_at: DateTime<Utc>,
+    /// Timestamp of the most recent status transition. Surfaced as
+    /// `lastUpdatedAt` in the MCP Tasks wire representation.
+    pub last_updated_at: DateTime<Utc>,
+    /// Requested task lifetime in milliseconds (`None` = unlimited). Surfaced
+    /// as `ttl` in the MCP Tasks wire representation.
+    pub ttl_ms: Option<u64>,
 }
+
+/// Per-task terminal-completion channels. `wait_terminal` subscribes to the
+/// watch for a task and awaits a terminal status; every status transition
+/// broadcasts the new status here. A `watch` (rather than `Notify`) is used
+/// deliberately: it retains the latest value, so a waiter that subscribes
+/// after the terminal transition still observes it — there is no lost-wakeup
+/// race.
+///
+/// The retained [`watch::Receiver`] in each entry is a deliberate keep-alive:
+/// `watch::Sender::send` is a no-op (returns `Err`) when there are no live
+/// receivers, so without it a status broadcast sent before any
+/// `wait_terminal` subscriber existed would silently fail to update the
+/// stored value, and a later subscriber would observe a stale status forever.
+type StatusSenders =
+    Arc<RwLock<HashMap<TaskId, (watch::Sender<TaskStatus>, watch::Receiver<TaskStatus>)>>>;
 
 pub struct TaskManager {
     tasks: Arc<RwLock<HashMap<TaskId, Task>>>,
@@ -168,6 +207,7 @@ pub struct TaskManager {
     image_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
     /// Per-repo-path mutex to prevent concurrent image builds for the same repo.
     build_locks: BuildLocks,
+    status_senders: StatusSenders,
 }
 
 impl TaskManager {
@@ -179,6 +219,30 @@ impl TaskManager {
             progress: Arc::new(RwLock::new(HashMap::new())),
             image_cache: Arc::new(RwLock::new(HashMap::new())),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
+            status_senders: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Transition a task to a new status: update the stored `Task` (status +
+    /// `last_updated_at`) and broadcast the new status to any `wait_terminal`
+    /// subscribers. This is the single choke point for status changes so the
+    /// watch channel can never drift from the stored task.
+    async fn set_status(
+        tasks: &Arc<RwLock<HashMap<TaskId, Task>>>,
+        senders: &StatusSenders,
+        task_id: &TaskId,
+        status: TaskStatus,
+    ) {
+        {
+            let mut tasks = tasks.write().await;
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = status.clone();
+                task.last_updated_at = Utc::now();
+            }
+        }
+        let senders = senders.read().await;
+        if let Some((tx, _keepalive)) = senders.get(task_id) {
+            let _ = tx.send(status);
         }
     }
 
@@ -275,6 +339,7 @@ impl TaskManager {
         provider: Arc<dyn ModelProvider>,
     ) -> TaskId {
         let task_id = TaskId::new();
+        let now = Utc::now();
         let task = Task {
             id: task_id.clone(),
             description: description.clone(),
@@ -282,11 +347,22 @@ impl TaskManager {
             branch: branch.clone(),
             model: model.clone(),
             status: TaskStatus::Pending,
-            created_at: Utc::now(),
+            created_at: now,
+            last_updated_at: now,
+            ttl_ms: None,
         };
         {
             let mut tasks = self.tasks.write().await;
             tasks.insert(task_id.clone(), task);
+        }
+
+        // Register the terminal-completion watch (seeded with `Pending`) so
+        // `wait_terminal` callers can await this task's terminal transition.
+        // The receiver is retained as a keep-alive (see `StatusSenders`).
+        {
+            let (tx, rx) = watch::channel(TaskStatus::Pending);
+            let mut senders = self.status_senders.write().await;
+            senders.insert(task_id.clone(), (tx, rx));
         }
 
         let progress_counter = Arc::new(AtomicUsize::new(0));
@@ -298,6 +374,7 @@ impl TaskManager {
         let tasks_ref = Arc::clone(&self.tasks);
         let handles_ref = Arc::clone(&self.handles);
         let progress_ref = Arc::clone(&self.progress);
+        let senders_ref = Arc::clone(&self.status_senders);
         let semaphore = Arc::clone(&self.max_concurrent);
         let image_cache_ref = Arc::clone(&self.image_cache);
         let build_locks_ref = Arc::clone(&self.build_locks);
@@ -317,15 +394,16 @@ impl TaskManager {
                     .await
                     .unwrap_or(false);
 
-            {
-                let mut tasks = tasks_ref.write().await;
-                if let Some(task) = tasks.get_mut(&task_id_clone) {
-                    task.status = TaskStatus::Running {
-                        started_at: Utc::now(),
-                        iterations: 0,
-                    };
-                }
-            }
+            Self::set_status(
+                &tasks_ref,
+                &senders_ref,
+                &task_id_clone,
+                TaskStatus::Running {
+                    started_at: Utc::now(),
+                    iterations: 0,
+                },
+            )
+            .await;
 
             let workspace_result = if use_container {
                 let image_result =
@@ -341,9 +419,11 @@ impl TaskManager {
                             let mut p = progress_ref.write().await;
                             p.remove(&task_id_clone);
                         }
-                        let mut tasks = tasks_ref.write().await;
-                        if let Some(task) = tasks.get_mut(&task_id_clone) {
-                            task.status = TaskStatus::Failed {
+                        Self::set_status(
+                            &tasks_ref,
+                            &senders_ref,
+                            &task_id_clone,
+                            TaskStatus::Failed {
                                 finished_at: Utc::now(),
                                 error: e.clone(),
                                 diagnostics: FailureDiagnostics {
@@ -355,8 +435,9 @@ impl TaskManager {
                                     last_agent_state: None,
                                     conversation_snapshot: None,
                                 },
-                            };
-                        }
+                            },
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -383,9 +464,11 @@ impl TaskManager {
                         let mut progress = progress_ref.write().await;
                         progress.remove(&task_id_clone);
                     }
-                    let mut tasks = tasks_ref.write().await;
-                    if let Some(task) = tasks.get_mut(&task_id_clone) {
-                        task.status = TaskStatus::Failed {
+                    Self::set_status(
+                        &tasks_ref,
+                        &senders_ref,
+                        &task_id_clone,
+                        TaskStatus::Failed {
                             finished_at: Utc::now(),
                             error: e,
                             diagnostics: FailureDiagnostics {
@@ -397,8 +480,9 @@ impl TaskManager {
                                 last_agent_state: None,
                                 conversation_snapshot: None,
                             },
-                        };
-                    }
+                        },
+                    )
+                    .await;
                 }
                 Ok(mut workspace) => {
                     let tool_registry = workspace.build_tool_registry();
@@ -455,13 +539,16 @@ impl TaskManager {
                                 iterations: result.iterations,
                                 model_used: model,
                             };
-                            let mut tasks = tasks_ref.write().await;
-                            if let Some(task) = tasks.get_mut(&task_id_clone) {
-                                task.status = TaskStatus::Completed {
+                            Self::set_status(
+                                &tasks_ref,
+                                &senders_ref,
+                                &task_id_clone,
+                                TaskStatus::Completed {
                                     finished_at: Utc::now(),
                                     result: task_result,
-                                };
-                            }
+                                },
+                            )
+                            .await;
                         }
                         Err(e) => {
                             let partial_changes = changes_patch;
@@ -492,14 +579,17 @@ impl TaskManager {
                                 last_agent_state,
                                 conversation_snapshot: Some(conversation_snapshot),
                             };
-                            let mut tasks = tasks_ref.write().await;
-                            if let Some(task) = tasks.get_mut(&task_id_clone) {
-                                task.status = TaskStatus::Failed {
+                            Self::set_status(
+                                &tasks_ref,
+                                &senders_ref,
+                                &task_id_clone,
+                                TaskStatus::Failed {
                                     finished_at: Utc::now(),
                                     error: e.to_string(),
                                     diagnostics,
-                                };
-                            }
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
@@ -568,37 +658,76 @@ impl TaskManager {
             count
         };
 
-        let mut tasks = self.tasks.write().await;
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| format!("Task not found: {}", task_id))?;
+        let cancelled = {
+            let mut tasks = self.tasks.write().await;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
-        match &task.status {
-            TaskStatus::Completed { .. } | TaskStatus::Failed { .. } => {
+            if task.status.is_terminal() {
                 let _ = had_handle;
                 return Err(format!(
                     "Task {} cannot be cancelled: already finished",
                     task_id
                 ));
             }
-            _ => {}
-        }
 
-        task.status = TaskStatus::Failed {
-            finished_at: Utc::now(),
-            error: "Task cancelled".to_string(),
-            diagnostics: FailureDiagnostics {
-                error_type: "Cancelled".to_string(),
+            let now = Utc::now();
+            task.status = TaskStatus::Cancelled {
+                finished_at: now,
                 iterations_completed,
-                last_tool_call: None,
-                partial_changes: None,
-                tool_call_history: vec![],
-                last_agent_state: None,
-                conversation_snapshot: None,
-            },
+            };
+            task.last_updated_at = now;
+            task.clone()
         };
 
-        Ok(task.clone())
+        // Broadcast the terminal transition to any `wait_terminal` subscribers.
+        {
+            let senders = self.status_senders.read().await;
+            if let Some((tx, _keepalive)) = senders.get(task_id) {
+                let _ = tx.send(cancelled.status.clone());
+            }
+        }
+
+        Ok(cancelled)
+    }
+
+    /// Set the requested TTL (milliseconds) for a task. Called by the MCP layer
+    /// after `submit` to record the client-requested lifetime so `tasks/get`
+    /// can echo the actual `ttl`.
+    pub async fn set_ttl(&self, task_id: &TaskId, ttl_ms: Option<u64>) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(task_id) {
+            task.ttl_ms = ttl_ms;
+        }
+    }
+
+    /// Await the terminal status of a task, returning it once reached.
+    ///
+    /// Returns immediately if the task is already terminal, and `None` if the
+    /// task id is unknown. Backs the MCP `tasks/result` method, which must
+    /// block until the underlying request reaches a terminal state.
+    pub async fn wait_terminal(&self, task_id: &TaskId) -> Option<TaskStatus> {
+        let mut rx = {
+            let senders = self.status_senders.read().await;
+            senders.get(task_id)?.0.subscribe()
+        };
+        loop {
+            {
+                let current = rx.borrow_and_update();
+                if current.is_terminal() {
+                    return Some(current.clone());
+                }
+            }
+            // `changed()` only errors if every sender has dropped; the sender is
+            // retained in `status_senders` for the task's lifetime, so this is
+            // effectively infallible, but fall back to the stored status rather
+            // than hanging if it ever does.
+            if rx.changed().await.is_err() {
+                let tasks = self.tasks.read().await;
+                return tasks.get(task_id).map(|t| t.status.clone());
+            }
+        }
     }
 }
 
@@ -816,6 +945,8 @@ mod tests {
                 iterations: 0,
             },
             created_at: Utc::now(),
+            last_updated_at: Utc::now(),
+            ttl_ms: None,
         };
         {
             let mut tasks = manager.tasks.write().await;
@@ -830,9 +961,7 @@ mod tests {
         let result = manager.cancel(&task_id).await;
         assert!(result.is_ok());
         let task = result.unwrap();
-        assert!(
-            matches!(&task.status, TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled")
-        );
+        assert!(matches!(&task.status, TaskStatus::Cancelled { .. }));
         dummy.abort();
     }
 
@@ -870,9 +999,7 @@ mod tests {
         let result = manager.cancel(&id).await;
         assert!(result.is_ok());
         let task = result.unwrap();
-        assert!(
-            matches!(&task.status, TaskStatus::Failed { diagnostics, .. } if diagnostics.error_type == "Cancelled")
-        );
+        assert!(matches!(&task.status, TaskStatus::Cancelled { .. }));
     }
 
     #[tokio::test]
@@ -1376,5 +1503,87 @@ mod tests {
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_wait_terminal_unknown_id_returns_none() {
+        let manager = TaskManager::default();
+        let unknown = TaskId("does-not-exist".to_string());
+        assert!(manager.wait_terminal(&unknown).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_terminal_returns_terminal_status() {
+        // Zero permits keeps the task queued; cancelling drives it terminal and
+        // `wait_terminal` observes the `Cancelled` transition.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "t".to_string(),
+                PathBuf::from("/tmp"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                provider,
+            )
+            .await;
+        let m = Arc::clone(&manager);
+        let idc = id.clone();
+        let waiter = tokio::spawn(async move { m.wait_terminal(&idc).await });
+        tokio::task::yield_now().await;
+        manager.cancel(&id).await.unwrap();
+        let status = waiter.await.unwrap();
+        assert!(matches!(status, Some(TaskStatus::Cancelled { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_wait_terminal_falls_back_to_store_if_sender_dropped() {
+        // Exercises the defensive fallback: if the status watch sender is
+        // dropped while a waiter is blocked, `wait_terminal` returns the last
+        // stored status instead of hanging.
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "t".to_string(),
+                PathBuf::from("/tmp"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                provider,
+            )
+            .await;
+        let m = Arc::clone(&manager);
+        let idc = id.clone();
+        let waiter = tokio::spawn(async move { m.wait_terminal(&idc).await });
+        tokio::task::yield_now().await;
+        // Drop the sender (and its keep-alive receiver) out from under the waiter.
+        {
+            let mut senders = manager.status_senders.write().await;
+            senders.remove(&id);
+        }
+        let status = waiter.await.unwrap();
+        assert!(matches!(status, Some(TaskStatus::Pending)));
+    }
+
+    #[tokio::test]
+    async fn test_set_ttl_updates_task() {
+        let manager = Arc::new(TaskManager::new(0));
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "t".to_string(),
+                PathBuf::from("/tmp"),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                1,
+                provider,
+            )
+            .await;
+        manager.set_ttl(&id, Some(1234)).await;
+        assert_eq!(manager.poll(&id).await.unwrap().ttl_ms, Some(1234));
+        // set_ttl on an unknown id is a no-op (does not panic).
+        manager.set_ttl(&TaskId("nope".to_string()), Some(1)).await;
     }
 }
