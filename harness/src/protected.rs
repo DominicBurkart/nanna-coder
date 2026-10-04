@@ -2,11 +2,20 @@
 //!
 //! [`ProtectedPaths`] is a fixed set of repository-relative globs (agent
 //! identities under `.nanna/`, deployment and availability templates, the
-//! CI workflows and `CODEOWNERS` that guard them, `codecov.yml`) plus
-//! Nanna's own configuration directory when it happens to lie inside the
-//! repository. It sits above [`crate::scope::PathScope`]: no identity can
-//! widen it, and every write-capable tool, the dev container mounts and the
-//! patch extraction in [`crate::workspace::TaskWorkspace`] consult it.
+//! CI workflows and `CODEOWNERS` that guard them, `codecov.yml`, and the
+//! repository's own `.git` directory) plus Nanna's own configuration
+//! directory when it happens to lie inside the repository. It sits above
+//! [`crate::scope::PathScope`]: no identity can widen it, and every
+//! write-capable tool, the dev container mounts and the patch extraction in
+//! [`crate::workspace::TaskWorkspace`] consult it.
+//!
+//! `.git/**` matters even though it is a `Workspace`-class write (no action
+//! auditor reviews it): the PR/issue tools in [`crate::pr_tools`] are
+//! `Repository`-class and audited, but they resolve which repository to act
+//! on by reading the worktree's live `origin` remote. Without this entry, an
+//! unaudited `write_file` to `.git/config` could redirect that remote before
+//! an audited tool call ever runs, silently aiming Nanna's GitHub credentials
+//! at a different repository than the one the auditor approved.
 
 use crate::identity::IdentityCatalog;
 use glob::{MatchOptions, Pattern};
@@ -20,6 +29,7 @@ use thiserror::Error;
 pub const PROTECTED_PATTERNS: &[&str] = &[
     ".nanna/**",
     "**/.nanna/**",
+    ".git/**",
     ".github/workflows/**",
     ".github/CODEOWNERS",
     "codecov.yml",
@@ -225,6 +235,8 @@ mod tests {
             (".nanna/**", ".nanna"),
             ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
             ("**/.nanna/**", "crates/api/.nanna"),
+            (".git/**", ".git/config"),
+            (".git/**", ".git/hooks/pre-commit"),
             (".github/workflows/**", ".github/workflows/ci.yml"),
             (".github/workflows/**", ".github/workflows"),
             (".github/CODEOWNERS", ".github/CODEOWNERS"),
@@ -330,6 +342,7 @@ mod tests {
             protected.mount_roots(),
             vec![
                 PathBuf::from(".nanna"),
+                PathBuf::from(".git"),
                 PathBuf::from(".github/workflows"),
                 PathBuf::from(".github/CODEOWNERS"),
                 PathBuf::from("codecov.yml"),

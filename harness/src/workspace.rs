@@ -1005,6 +1005,7 @@ mod tests {
             config.read_only_mounts,
             vec![
                 ReadOnlyMount::new(root.join(".nanna"), "/workspace/.nanna"),
+                ReadOnlyMount::new(root.join(".git"), "/workspace/.git"),
                 ReadOnlyMount::new(root.join("codecov.yml"), "/workspace/codecov.yml"),
             ]
         );
