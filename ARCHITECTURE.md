@@ -85,6 +85,7 @@ flowchart LR
         mcpserve["mcp-serve"]
         models
         tools
+        agents
         health
         backlogsync["backlog-sync"]
     end
@@ -100,7 +101,7 @@ flowchart LR
     delegate -.->|in-process client| MCP
     classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,delegate,mcpserve,models,tools,health,backlogsync cli
+    class chat,agent,delegate,mcpserve,models,tools,agents,health,backlogsync cli
     class assign_task,onboard_repo,tget,tresult,tlist,tcancel mcp
 ```
 
