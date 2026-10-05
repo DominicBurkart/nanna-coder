@@ -17,10 +17,11 @@ pub mod onboarding;
 pub mod pod;
 pub mod rollout;
 pub mod scheduler;
+pub mod scope;
 pub mod sidecar;
 pub mod task;
 pub mod telemetry;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
 pub mod windows;
@@ -33,7 +34,8 @@ pub use capabilities::{
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
-    ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
+    ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, NetworkPolicy,
+    SharedModelPool,
 };
 pub use effects::{EffectClass, UnknownEffectClass};
 pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
@@ -46,6 +48,7 @@ pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
 };
+pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
 pub use sidecar::{
     build_image_from_containerfile, container_exists, network_exists, task_network_name,
     CommandRunner, PostgresSidecar, ReadinessConfig, RunOutput, RunningSidecar, SidecarError,
@@ -58,7 +61,8 @@ pub use telemetry::{
 };
 pub use tools::{
     cargo_audit_args, cargo_bench_args, cargo_build_args, cargo_check_args, cargo_deny_args,
-    cargo_run_args, cargo_test_args, create_container_tool_registry, create_tool_registry,
+    cargo_run_args, cargo_test_args, create_container_tool_registry,
+    create_container_tool_registry_for, create_tool_registry, create_tool_registry_for,
     member_working_dir, sqlx_migrate_args, trunk_build_args, CalculatorTool, CargoAuditTool,
     CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool, CargoRunTool, CargoTestTool,
     EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool,

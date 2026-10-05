@@ -3,6 +3,7 @@
 //! available; run them with
 //! `cargo test -p harness --test sidecar_integration -- --ignored --test-threads=1`.
 
+use harness::container::NetworkPolicy;
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
     ContainerConfig,
@@ -110,6 +111,7 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
         &task_id,
         "HEAD",
         DEV_IMAGE_TAG,
+        NetworkPolicy::Enabled,
         Some(set),
     )
     .await
@@ -209,6 +211,7 @@ async fn fixture_flake_builds_dev_container_with_profile_tools() {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args: vec![],
+        network: NetworkPolicy::Enabled,
     };
     let handle = start_container_with_fallback(&config)
         .await
