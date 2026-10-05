@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 
-const HONOURS: &[&str] = &[
-    "NANNA_REQUIRE_RUNTIME",
-    "skip_or_panic",
-    "ensure_runtime_or_skip",
-];
+const HELPERS: &[&str] = &["skip_or_panic", "ensure_runtime_or_skip"];
+
+const IGNORE_PREFIXES: &[&str] = &["container_", "ollama_", "manual_"];
 
 const ALLOWED_SKIPS: &[(&str, &str)] = &[
     (
@@ -20,6 +18,7 @@ const ALLOWED_SKIPS: &[(&str, &str)] = &[
         "no fixture at",
     ),
     ("harness/src/pod.rs", "in-container env"),
+    ("harness/src/pod.rs", "InsideContainer skip"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,13 +29,6 @@ struct Violation {
 
 fn is_comment(line: &str) -> bool {
     line.trim_start().starts_with("//")
-}
-
-fn is_fn_start(line: &str) -> bool {
-    let t = line.trim_start();
-    let t = t.strip_prefix("pub ").unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
-    t.starts_with("fn ")
 }
 
 const RUNTIME_WORDS: &[&str] = &[
@@ -50,18 +42,70 @@ const RUNTIME_WORDS: &[&str] = &[
     "model",
 ];
 
-fn skips_early(line: &str, previous: &str) -> bool {
-    if !(line.to_lowercase().contains("skipping") || line.contains("SKIPPED")) {
+const GUARD_WORDS: &[&str] = &["runtime", "podman", "docker", "ollama", "11434", "provider"];
+
+const GUARD_SHAPES: &[&str] = &["if ", "else", "match ", "err(", "none"];
+
+fn has_helper(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|l| !is_comment(l) && HELPERS.iter().any(|h| l.contains(h)))
+}
+
+fn has_early_return(lines: &[&str]) -> bool {
+    lines.iter().any(|l| {
+        !is_comment(l)
+            && (l.contains("return;")
+                || l.contains("return Ok(")
+                || l.contains("return ()")
+                || l.contains("return }")
+                || l.contains("return,"))
+    })
+}
+
+fn prose(line: &str) -> String {
+    let mut out: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+    if let Some(pos) = line.find("//") {
+        out.push(&line[pos..]);
+    }
+    out.join(" ").to_lowercase()
+}
+
+fn skip_wording_near_runtime(lines: &[&str], idx: usize) -> bool {
+    let line = prose(lines[idx]);
+    if !line.contains("skip") {
         return false;
     }
+    let previous = if idx > 0 { lines[idx - 1] } else { "" };
     let context = format!("{previous} {line}").to_lowercase();
     RUNTIME_WORDS.iter().any(|w| context.contains(w))
 }
 
-fn checks_runtime_and_returns(body: &[&str]) -> bool {
-    body.iter()
-        .any(|l| !is_comment(l) && l.contains("is_available()"))
-        && body.iter().any(|l| l.trim() == "return;")
+fn guard_window<'a>(lines: &'a [&'a str], idx: usize) -> &'a [&'a str] {
+    let cap = (idx + 6).min(lines.len());
+    let mut end = idx + 1;
+    while end < cap {
+        let closes = lines[end].trim_start().starts_with('}');
+        end += 1;
+        if closes {
+            break;
+        }
+    }
+    &lines[idx..end]
+}
+
+fn silent_runtime_exit(lines: &[&str], idx: usize) -> bool {
+    let lower = lines[idx].to_lowercase();
+    let runtime_related = if lower.contains("is_available") {
+        lower.contains('!')
+    } else {
+        GUARD_WORDS.iter().any(|w| lower.contains(w))
+    };
+    if !GUARD_SHAPES.iter().any(|s| lower.contains(s)) || !runtime_related {
+        return false;
+    }
+    let window = guard_window(lines, idx);
+    has_early_return(window) && !has_helper(window)
 }
 
 fn violations(rel_path: &str, source: &str, is_test_file: bool) -> Vec<Violation> {
@@ -75,49 +119,72 @@ fn violations(rel_path: &str, source: &str, is_test_file: bool) -> Vec<Violation
         }
     };
     let mut out = Vec::new();
-    let mut idx = first;
-    while idx < lines.len() {
-        if !is_fn_start(lines[idx]) {
-            idx += 1;
+    for idx in first..lines.len() {
+        let line = lines[idx];
+        if is_comment(line) {
             continue;
         }
-        let start = idx;
-        let mut end = idx + 1;
-        while end < lines.len() && !is_fn_start(lines[end]) {
-            end += 1;
-        }
-        let body = &lines[start..end];
-        let honoured = body
+        let allowed = ALLOWED_SKIPS
             .iter()
-            .any(|l| !is_comment(l) && HONOURS.iter().any(|h| l.contains(h)));
-        if !honoured {
-            for (offset, line) in body.iter().enumerate() {
-                if is_comment(line) {
-                    continue;
-                }
-                let allowed = ALLOWED_SKIPS
-                    .iter()
-                    .any(|(f, m)| *f == rel_path && line.contains(m));
-                let previous = if offset > 0 { body[offset - 1] } else { "" };
-                if skips_early(line, previous) && !allowed {
-                    out.push(Violation {
-                        line: start + offset + 1,
-                        text: line.trim().to_string(),
-                    });
-                }
+            .any(|(f, m)| *f == rel_path && line.contains(m));
+        if allowed {
+            continue;
+        }
+        let near_helper = has_helper(&lines[idx.saturating_sub(2)..=idx]);
+        let skip_without_helper = skip_wording_near_runtime(&lines, idx) && !near_helper;
+        if skip_without_helper || silent_runtime_exit(&lines, idx) {
+            out.push(Violation {
+                line: idx + 1,
+                text: line.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+fn ignored_tests_outside_convention(source: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if is_comment(line) || !line.trim_start().starts_with("#[ignore") {
+            continue;
+        }
+        let name = lines[idx + 1..].iter().find_map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("#[") || t.starts_with("//") {
+                return None;
             }
-            if is_test_file && checks_runtime_and_returns(body) {
-                out.push(Violation {
-                    line: start + 1,
-                    text: lines[start].trim().to_string(),
-                });
+            let t = t.strip_prefix("pub ").unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            t.strip_prefix("fn ")
+                .map(|r| r.split('(').next().unwrap_or("").trim().to_string())
+        });
+        if let Some(name) = name {
+            if !IGNORE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+                out.push(name);
             }
         }
-        idx = end;
     }
-    out.sort_by_key(|v| v.line);
-    out.dedup();
     out
+}
+
+fn job_section<'a>(workflow: &'a str, job: &str) -> Option<&'a str> {
+    let header = format!("  {job}:");
+    let mut offset = 0;
+    let mut start = None;
+    for line in workflow.split_inclusive('\n') {
+        let top_level_key =
+            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
+        if let Some(s) = start {
+            if top_level_key {
+                return Some(&workflow[s..offset]);
+            }
+        } else if line.trim_end() == header {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    start.map(|s| &workflow[s..])
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -135,11 +202,42 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
+fn flags_plain_skip_wording_near_runtime() {
+    let src = "fn t() {\n    eprintln!(\"no docker, skip\");\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
+}
+
+#[test]
+fn flags_skip_colon_no_docker() {
+    let src = "fn t() {\n    println!(\"SKIP: no docker\");\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
+}
+
+#[test]
 fn flags_skip_without_runtime_gate() {
     let src = "#[test]\nfn t() {\n    eprintln!(\"no runtime, skipping\");\n    return;\n}\n";
     let v = violations("x/tests/a.rs", src, true);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].line, 3);
+}
+
+#[test]
+fn flags_silent_which_is_err_return() {
+    let src = "fn t() {\n    if which::which(\"podman\").is_err() {\n        return;\n    }\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
+}
+
+#[test]
+fn flags_silent_let_else_return() {
+    let src =
+        "fn t() {\n    let Ok(p) = which::which(\"podman\") else {\n        return;\n    };\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
+}
+
+#[test]
+fn flags_one_line_negated_return() {
+    let src = "fn t() {\n    if !runtime.is_available() { return; }\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
 }
 
 #[test]
@@ -149,15 +247,41 @@ fn flags_early_return_on_unavailable_runtime_without_message() {
 }
 
 #[test]
+fn flags_silent_match_err_return_for_provider() {
+    let src = "fn t() {\n    let p = match OllamaProvider::new() {\n        Ok(p) => p,\n        Err(_) => return,\n    };\n}\n";
+    let v = violations("x/tests/a.rs", src, true);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].line, 2);
+}
+
+#[test]
 fn accepts_helper_gate() {
     let src = "#[test]\nfn t() {\n    if !ensure_runtime_or_skip(&rt, \"t\") {\n        return;\n    }\n}\n";
     assert!(violations("x/tests/a.rs", src, true).is_empty());
 }
 
 #[test]
-fn accepts_explicit_env_gate() {
-    let src = "fn t() {\n    if std::env::var(\"NANNA_REQUIRE_RUNTIME\").is_ok() { panic!(); }\n    eprintln!(\"skipping\");\n}\n";
+fn accepts_skip_or_panic_before_return() {
+    let src = "fn t() {\n    if which::which(\"podman\").is_err() {\n        skip_or_panic(\"podman not on PATH\");\n        return;\n    }\n}\n";
     assert!(violations("x/tests/a.rs", src, true).is_empty());
+}
+
+#[test]
+fn accepts_multiline_helper_call_with_skip_wording() {
+    let src = "fn t() {\n    if r.is_err() {\n        skip_or_panic(\n            \"ollama skipping reason\",\n        );\n        return;\n    }\n}\n";
+    assert!(violations("x/tests/a.rs", src, true).is_empty());
+}
+
+#[test]
+fn mentioning_a_honour_word_does_not_exempt_the_function() {
+    let src = "fn t() {\n    let _ = \"NANNA_REQUIRE_RUNTIME skip_or_panic\";\n    if !rt.is_available() {\n        eprintln!(\"skipping\");\n        return;\n    }\n}\n";
+    assert!(!violations("x/tests/a.rs", src, true).is_empty());
+}
+
+#[test]
+fn honouring_one_fn_does_not_excuse_the_next() {
+    let src = "fn a() {\n    skip_or_panic(\"x\");\n}\nfn b() {\n    eprintln!(\"ollama down, skipping\");\n}\n";
+    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
 }
 
 #[test]
@@ -182,9 +306,73 @@ fn only_scans_after_cfg_test_in_src() {
 }
 
 #[test]
-fn honouring_one_fn_does_not_excuse_the_next() {
-    let src = "fn a() {\n    skip_or_panic(\"x\");\n}\nfn b() {\n    eprintln!(\"ollama down, skipping\");\n}\n";
-    assert_eq!(violations("x/tests/a.rs", src, true).len(), 1);
+fn ignored_tests_need_a_convention_prefix() {
+    let src = "#[tokio::test]\n#[ignore]\nasync fn test_thing() {}\n#[ignore = \"x\"]\n#[test]\nfn container_ok() {}\n#[ignore]\nfn ollama_ok() {}\n#[ignore]\nfn manual_ok() {}\n";
+    assert_eq!(ignored_tests_outside_convention(src), vec!["test_thing"]);
+}
+
+#[test]
+fn ignore_inside_comments_is_not_counted() {
+    let src = "// #[ignore]\nfn test_thing() {}\n";
+    assert!(ignored_tests_outside_convention(src).is_empty());
+}
+
+#[test]
+fn job_section_isolates_one_job() {
+    let wf = "jobs:\n  a:\n    name: A\n    steps: []\n  b:\n    name: B\n";
+    let a = job_section(wf, "a").unwrap();
+    assert!(a.contains("name: A") && !a.contains("name: B"));
+    assert!(job_section(wf, "b").unwrap().contains("name: B"));
+    assert!(job_section(wf, "c").is_none());
+}
+
+#[test]
+fn every_ignored_test_follows_a_prefix_convention() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut files = Vec::new();
+    for dir in ["harness/src", "harness/tests", "model/src", "model/tests"] {
+        rust_files(&root.join(dir), &mut files);
+    }
+    let mut report = Vec::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if rel == "harness/tests/runtime_skip_lint.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).unwrap();
+        for name in ignored_tests_outside_convention(&source) {
+            report.push(format!("{rel}: {name}"));
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "#[ignore]d tests must be named with one of {IGNORE_PREFIXES:?} so a CI job selects them:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn ci_selects_ignored_tests_by_prefix_convention() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let wf = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let required = job_section(&wf, "container-runtime-required").expect("required job");
+    let ollama = job_section(&wf, "container-ollama").expect("ollama job");
+    assert!(required.contains("NANNA_REQUIRE_RUNTIME: \"1\""));
+    assert!(required.contains("container_"));
+    assert!(!required.contains("11434") && !required.to_lowercase().contains("ollama"));
+    assert!(!required.contains("continue-on-error"));
+    assert!(ollama.contains("ollama_") && ollama.contains("11434"));
+    assert!(ollama.contains("continue-on-error: true"));
+    assert!(required.contains("if: always()") && ollama.contains("if: always()"));
+    for job in [required, ollama] {
+        assert!(job.contains("permissions:") && !job.contains("environment:"));
+    }
+    let gate = job_section(&wf, "all-checks").expect("gate job");
+    assert!(gate.contains("- container-runtime-required") && gate.contains("- container-ollama"));
 }
 
 #[test]
