@@ -328,16 +328,21 @@ impl RolloutExecutor {
     pub async fn run(&self, id: &str) -> Result<RolloutRecord, RolloutError> {
         loop {
             let mut record = self.log.load(id)?;
-            match record.state.clone() {
-                RolloutState::Pending => self.persist(&mut record, RolloutState::Step(0))?,
-                RolloutState::Step(n) => self.step(record, n).await?,
-                RolloutState::Baking { step, since } => self.bake(record, step, since).await?,
+            let outcome = match record.state.clone() {
+                RolloutState::Pending => self.persist(&mut record, RolloutState::Step(0)),
+                RolloutState::Step(n) => self.step(record, n).await,
+                RolloutState::Baking { step, since } => self.bake(record, step, since).await,
                 RolloutState::RollingBack => {
                     let stalled = record.clone();
-                    if let Err(error) = self.roll_back(record).await {
-                        let step = stalled.breach.as_ref().map_or(0, |b| b.step);
-                        let summary = format!("rollback failed ({error}): a human must finish it");
-                        return Err(self.stop_with(&stalled, step, summary, error).await);
+                    match self.roll_back(record).await {
+                        Err(error @ RolloutError::Conflict { .. }) => Err(error),
+                        Err(error) => {
+                            let step = stalled.breach.as_ref().map_or(0, |b| b.step);
+                            let summary =
+                                format!("rollback failed ({error}): a human must finish it");
+                            return Err(self.stop_with(&stalled, step, summary, error).await);
+                        }
+                        Ok(()) => Ok(()),
                     }
                 }
                 RolloutState::Parked {
@@ -347,11 +352,21 @@ impl RolloutExecutor {
                     if self.clock.now() < until {
                         return Ok(record);
                     }
-                    self.persist(&mut record, *resume_state)?;
+                    self.persist(&mut record, *resume_state)
                 }
                 RolloutState::Complete | RolloutState::RolledBack | RolloutState::Halted => {
                     return Ok(record)
                 }
+            };
+            match outcome {
+                Err(RolloutError::Conflict {
+                    id,
+                    expected,
+                    actual,
+                }) => {
+                    tracing::warn!(rollout = %id, %expected, %actual, "Rollout changed concurrently; re-reading");
+                }
+                other => other?,
             }
         }
     }
@@ -935,6 +950,14 @@ mod tests {
             escalation,
             executor,
         }
+    }
+
+    fn overwrite(rig: &Rig, crafted: &RolloutRecord) {
+        let current = rig.executor.log().load(&crafted.id).unwrap();
+        rig.executor
+            .log()
+            .append(Some(&current.state), crafted)
+            .unwrap();
     }
 
     fn rig_with_responder(identity: IncidentIdentity) -> Rig {
@@ -1580,6 +1603,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn operator_halt_during_a_step_is_not_overwritten_by_the_step_result() {
+        let rig = rig();
+        let log = RolloutLog::open(&rig.path).unwrap();
+        let health = Arc::new(HaltOnPoll {
+            log: log.clone(),
+            after: 1,
+            polls: std::sync::Mutex::new(0),
+        });
+        let executor = RolloutExecutor::new(
+            log.clone(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            health,
+        )
+        .with_config(RolloutConfig {
+            poll_interval: Duration::minutes(10),
+            lease_grace: Duration::hours(1),
+        });
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
+        let outcome = executor.run(&record.id).await.unwrap();
+        assert_eq!(outcome.state, RolloutState::Halted);
+        let history = log.history(&record.id).unwrap();
+        let last = history.last().unwrap();
+        assert_eq!(last.record.state, RolloutState::Halted);
+        assert!(
+            history
+                .iter()
+                .skip_while(|t| t.record.state != RolloutState::Halted)
+                .all(|t| t.record.state == RolloutState::Halted),
+            "nothing may follow the halt: {history:?}"
+        );
+    }
+
     struct HaltOnSleep {
         inner: Arc<SimulatedClock>,
         log: RolloutLog,
@@ -1867,12 +1926,12 @@ mod tests {
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
         let mut crafted = record.clone();
         crafted.state = RolloutState::Step(1);
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(
             matches!(rig.executor.run(&record.id).await.unwrap_err(), RolloutError::NoSlot(id) if id == record.id)
         );
         crafted.state = RolloutState::Step(7);
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
             RolloutError::NoSuchStep { step: 7, .. }
@@ -1881,7 +1940,7 @@ mod tests {
             step: 9,
             since: t0(),
         };
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
             RolloutError::NoSuchStep { step: 9, .. }
@@ -1890,7 +1949,7 @@ mod tests {
             step: 0,
             since: t0(),
         };
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
             RolloutError::NoSlot(_)
@@ -2285,7 +2344,7 @@ mod tests {
             since: t0(),
         };
         crafted.plan.shadow = None;
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
             RolloutError::NoShadowConfig(id) if id == record.id
@@ -2298,7 +2357,7 @@ mod tests {
         crafted.slot = Some(Slot::new("slot-2"));
         crafted.retained_slot = None;
         crafted.state = RolloutState::Step(1);
-        rig.executor.log().append(None, &crafted).unwrap();
+        overwrite(&rig, &crafted);
         assert!(matches!(
             rig.executor.run(&record.id).await.unwrap_err(),
             RolloutError::NoRetainedSlot(id) if id == record.id

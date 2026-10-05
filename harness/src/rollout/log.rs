@@ -123,7 +123,12 @@ impl RolloutLog {
         &self.path
     }
 
-    /// Append `record` as the result of a transition from `from`.
+    /// Append `record` as the result of a transition from `from`, only if
+    /// the log still holds the rollout in state `from` (`None` meaning the
+    /// rollout does not exist yet). The check and the write happen under an
+    /// exclusive file lock, so concurrent writers, in this process or
+    /// another, cannot both succeed from the same state; the loser gets
+    /// [`RolloutError::Conflict`] and must re-read.
     pub fn append(
         &self,
         from: Option<&RolloutState>,
@@ -136,7 +141,32 @@ impl RolloutLog {
         };
         let mut line = serde_json::to_string(&transition)?;
         line.push('\n');
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        file.lock()?;
+        let mut current = None;
+        for existing in BufReader::new(&file).lines() {
+            let existing = existing?;
+            if existing.trim().is_empty() {
+                continue;
+            }
+            let logged: RolloutTransition = serde_json::from_str(&existing)?;
+            if logged.record.id == record.id {
+                current = Some(logged.record.state);
+            }
+        }
+        if current.as_ref() != from {
+            let describe = |s: Option<&RolloutState>| {
+                s.map_or_else(|| "created".to_string(), ToString::to_string)
+            };
+            return Err(RolloutError::Conflict {
+                id: record.id.clone(),
+                expected: describe(from),
+                actual: describe(current.as_ref()),
+            });
+        }
         file.write_all(line.as_bytes())?;
         file.flush()?;
         Ok(())
@@ -188,16 +218,21 @@ impl RolloutLog {
     /// traffic split. Needs no adapter, so the CLI can do it from any
     /// process; a running executor notices at its next poll.
     pub fn halt(&self, id: &str, now: DateTime<Utc>) -> Result<RolloutRecord, RolloutError> {
-        let mut record = self.load(id)?;
-        let from = record.state.clone();
-        record.transition(RolloutState::Halted, now)?;
-        self.append(Some(&from), &record)?;
-        tracing::warn!(
-            rollout = id,
-            traffic = record.traffic_percent,
-            "Rollout halted by operator"
-        );
-        Ok(record)
+        loop {
+            let mut record = self.load(id)?;
+            let from = record.state.clone();
+            record.transition(RolloutState::Halted, now)?;
+            match self.append(Some(&from), &record) {
+                Err(RolloutError::Conflict { .. }) => continue,
+                other => other?,
+            }
+            tracing::warn!(
+                rollout = id,
+                traffic = record.traffic_percent,
+                "Rollout halted by operator"
+            );
+            return Ok(record);
+        }
     }
 }
 
@@ -269,6 +304,87 @@ mod tests {
             log.halt("rollout-2", later).unwrap_err(),
             RolloutError::UnknownRollout(_)
         ));
+    }
+
+    #[test]
+    fn append_from_a_stale_state_conflicts_and_leaves_the_log_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        let mut r = record("sandbox");
+        log.append(None, &r).unwrap();
+        log.halt("rollout-1", t0()).unwrap();
+        r.transition(RolloutState::Step(0), t0()).unwrap();
+        let err = log.append(Some(&RolloutState::Pending), &r).unwrap_err();
+        assert!(
+            matches!(&err, RolloutError::Conflict { id, .. } if id == "rollout-1"),
+            "{err}"
+        );
+        assert_eq!(log.load("rollout-1").unwrap().state, RolloutState::Halted);
+        assert_eq!(log.history("rollout-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn creating_an_existing_id_or_updating_a_missing_one_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        let r = record("sandbox");
+        assert!(matches!(
+            log.append(Some(&RolloutState::Pending), &r).unwrap_err(),
+            RolloutError::Conflict { .. }
+        ));
+        log.append(None, &r).unwrap();
+        assert!(matches!(
+            log.append(None, &r).unwrap_err(),
+            RolloutError::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn concurrent_appends_from_one_state_admit_exactly_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        log.append(None, &record("sandbox")).unwrap();
+        let outcomes: Vec<_> = (0..8)
+            .map(|_| {
+                let log = RolloutLog::open(log.path()).unwrap();
+                std::thread::spawn(move || {
+                    let mut next = log.load("rollout-1").unwrap();
+                    next.transition(RolloutState::Step(0), t0()).unwrap();
+                    log.append(Some(&RolloutState::Pending), &next)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
+        assert_eq!(log.history("rollout-1").unwrap().len(), 2);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn append_succeeds_iff_from_matches_the_logged_state(
+            logged in 0usize..4,
+            claimed in 0usize..4,
+        ) {
+            let states = [
+                RolloutState::Pending,
+                RolloutState::Step(0),
+                RolloutState::Step(1),
+                RolloutState::Halted,
+            ];
+            let dir = tempfile::tempdir().unwrap();
+            let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+            let mut r = record("sandbox");
+            r.state = states[logged].clone();
+            log.append(None, &r).unwrap();
+            let outcome = log.append(Some(&states[claimed]), &r);
+            proptest::prop_assert_eq!(outcome.is_ok(), logged == claimed);
+            proptest::prop_assert_eq!(
+                log.history("rollout-1").unwrap().len(),
+                if logged == claimed { 2 } else { 1 }
+            );
+        }
     }
 
     #[test]
