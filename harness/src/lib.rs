@@ -6,6 +6,7 @@ pub mod container;
 pub mod deploy;
 pub mod effects;
 pub mod entities;
+pub mod escalation;
 pub mod eval;
 pub mod identity;
 pub mod leases;
@@ -19,7 +20,7 @@ pub mod scheduler;
 pub mod sidecar;
 pub mod task;
 pub mod telemetry;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_support;
 pub mod tools;
 pub mod windows;
