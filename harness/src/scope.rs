@@ -767,6 +767,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_path_within_workspace_rejects_a_symlink_escape() {
         let ws = workspace();
