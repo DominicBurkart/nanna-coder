@@ -247,3 +247,42 @@ pub enum DeployError {
         source: crate::windows::WindowError,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_urls_reduce_to_owner_and_name() {
+        for (url, slug) in [
+            ("https://github.com/Org/repo.git", Some("Org/repo")),
+            ("https://github.com/Org/repo", Some("Org/repo")),
+            ("https://github.com/Org/repo/\n", Some("Org/repo")),
+            ("ssh://git@host:22/Org/repo.git", Some("Org/repo")),
+            ("git@github.com:Org/repo.git", Some("Org/repo")),
+            ("https://host/group/sub/repo.git", Some("sub/repo")),
+            ("https://host", None),
+            ("https://host/repo", None),
+            ("https://host//repo", None),
+            ("/srv/git/repo", None),
+            ("", None),
+        ] {
+            assert_eq!(repo_slug_from_remote(url).as_deref(), slug, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn host_windows_are_absent_without_a_config_dir_or_file() {
+        assert!(host_windows_from(&|_| None).unwrap().is_none());
+        let empty = tempfile::tempdir().unwrap();
+        let lookup = |key: &str| (key == "NANNA_CONFIG_DIR").then(|| empty.path().into());
+        assert!(host_windows_from(&lookup).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_checkout_without_an_origin_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(repo_identity(dir.path()), None);
+        assert_eq!(repo_identity(&dir.path().join("missing")), None);
+    }
+}
