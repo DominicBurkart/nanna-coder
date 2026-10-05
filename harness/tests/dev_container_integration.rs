@@ -109,7 +109,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
-        read_only_mounts: vec![],
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = start_container_with_fallback(&config)
@@ -304,7 +304,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
-        read_only_mounts: vec![],
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(
@@ -351,7 +351,7 @@ async fn cargo_deny_tool_output_has_command_field() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
-        read_only_mounts: vec![],
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(
@@ -414,7 +414,7 @@ async fn cargo_check_tool_succeeds_in_nanna_container() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
-        read_only_mounts: vec![],
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(

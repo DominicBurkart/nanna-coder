@@ -12,12 +12,12 @@
 //! on SELinux-enforcing hosts; the read-only mounts need no label because
 //! the `ro` flag refuses the write first.
 //!
-//! Like the other container tests, it skips (loudly) when no container
-//! runtime is available or the image cannot be pulled.
+//! It skips (loudly) when no container runtime is available and fails when
+//! the runtime cannot start the image.
 
 use harness::container::{
-    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerError,
-    ContainerHandle, NetworkPolicy, ReadOnlyMount,
+    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
+    ReadOnlyMount,
 };
 use harness::protected::ProtectedPaths;
 use harness::tools::{create_container_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR};
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 const IMAGE: &str = "docker.io/library/alpine:latest";
 
-async fn start(workspace: &Path, mounts: Vec<ReadOnlyMount>) -> Option<Arc<ContainerHandle>> {
+async fn start(workspace: &Path, mounts: Vec<ReadOnlyMount>) -> Arc<ContainerHandle> {
     let workspace_mount = format!("-v={}:{CONTAINER_WORKSPACE_DIR}:z", workspace.display());
     let config = ContainerConfig {
         base_image: IMAGE.to_string(),
@@ -44,14 +44,10 @@ async fn start(workspace: &Path, mounts: Vec<ReadOnlyMount>) -> Option<Arc<Conta
         network: NetworkPolicy::Disabled,
         read_only_mounts: mounts,
     };
-    match start_container_with_fallback(&config).await {
-        Ok(handle) => Some(Arc::new(handle)),
-        Err(ContainerError::ImageNotFound { image, suggestion }) => {
-            eprintln!("SKIPPED: image {image} unavailable: {suggestion}");
-            None
-        }
-        Err(e) => panic!("container start failed: {e}"),
-    }
+    let handle = start_container_with_fallback(&config)
+        .await
+        .expect("container start failed; the alpine image must be available");
+    Arc::new(handle)
 }
 
 async fn run(registry: &ToolRegistry, command: &str) -> Value {
@@ -99,9 +95,7 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
     assert_eq!(mounts.len(), 2, "{mounts:?}");
     assert!(mounts.iter().all(|m| !m.host.starts_with(&config_dir)));
 
-    let Some(handle) = start(&workspace, mounts).await else {
-        return;
-    };
+    let handle = start(&workspace, mounts).await;
     let registry = create_container_tool_registry(&workspace, handle, CONTAINER_WORKSPACE_DIR);
 
     let config_path = config_dir.display().to_string();
@@ -191,9 +185,7 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let protected = ProtectedPaths::with_config_dir(&workspace, None);
     let shielded = protected_mounts(&protected, &workspace).unwrap();
 
-    let Some(handle) = start(&workspace, shielded.mounts).await else {
-        return;
-    };
+    let handle = start(&workspace, shielded.mounts).await;
     let registry = create_container_tool_registry(&workspace, handle, CONTAINER_WORKSPACE_DIR);
 
     assert_refused(&registry, "mkdir -p /workspace/.nanna/agents").await;

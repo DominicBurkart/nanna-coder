@@ -190,16 +190,15 @@ impl TaskWorkspace {
             workspace_path.display()
         )];
         let protected = ProtectedPaths::for_repo(&workspace_path);
-        let ProtectedMounts {
-            mounts: read_only_mounts,
-            placeholders,
-        } = match protected_mounts(&protected, &workspace_path) {
-            Ok(mounts) => mounts,
+        let shielded = match protected_mounts(&protected, &workspace_path) {
+            Ok(shielded) => shielded,
             Err(e) => {
                 cleanup_worktree();
                 return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
             }
         };
+        let read_only_mounts = shielded.mounts;
+        let placeholders = shielded.placeholders;
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),

@@ -135,6 +135,9 @@ impl NetworkPolicy {
     }
 }
 
+/// A [`ContainerConfig::read_only_mounts`] value that mounts nothing.
+pub const NO_READ_ONLY_MOUNTS: Vec<ReadOnlyMount> = Vec::new();
+
 /// A host path bind-mounted read-only at a path inside the container.
 ///
 /// ```
