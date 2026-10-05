@@ -142,7 +142,7 @@ impl RolloutLog {
             .read(true)
             .append(true)
             .open(&self.path)?;
-        file.lock()?;
+        fs4::FileExt::lock(&file)?;
         let mut current = None;
         let mut count = 0u64;
         for existing in BufReader::new(&file).lines() {
