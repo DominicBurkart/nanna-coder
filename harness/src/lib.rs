@@ -1,17 +1,20 @@
 pub mod agent;
 pub mod backlog;
+pub mod capabilities;
 pub mod container;
 pub mod deploy;
 pub mod effects;
 pub mod entities;
 pub mod escalation;
 pub mod eval;
+pub mod identity;
 pub mod leases;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod rollout;
 pub mod scheduler;
 pub mod task;
 pub mod telemetry;
@@ -19,12 +22,17 @@ pub mod tools;
 pub mod windows;
 pub mod workspace;
 
+pub use capabilities::{
+    detect_capabilities, detect_capabilities_from_entries, find_capability, CargoCapability,
+    CARGO_CAPABILITIES,
+};
 pub use container::{
     cleanup_container, detect_runtime, exec_in_container, health_check_container,
     load_image_from_path, start_container_with_fallback, verify_image_exists, CommandOutput,
     ContainerConfig, ContainerError, ContainerHandle, ContainerRuntime, SharedModelPool,
 };
 pub use effects::{EffectClass, UnknownEffectClass};
+pub use identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, ToolPattern};
 pub use monitoring::{
     AlertManager, AlertSeverity, AlertThresholds, DefaultAlertManager, DefaultHealthMonitor,
     DefaultMetricsCollector, HealthMonitor, HealthStatus, MetricsCollector, MetricsFormat,
@@ -39,10 +47,12 @@ pub use telemetry::{
     TelemetryError, TelemetryExporter, TelemetrySystem, TraceContext, TraceGuard,
 };
 pub use tools::{
-    create_container_tool_registry, create_tool_registry, CalculatorTool, EchoTool, GitDiffTool,
-    GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool, PrStatusData, ReadFileTool,
-    RunCommandTool, SearchTool, Tool, ToolError, ToolRegistry, ToolResult, WriteFileTool,
-    CONTAINER_WORKSPACE_DIR,
+    cargo_audit_args, cargo_bench_args, cargo_build_args, cargo_check_args, cargo_deny_args,
+    cargo_run_args, cargo_test_args, create_container_tool_registry, create_tool_registry,
+    CalculatorTool, CargoAuditTool, CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool,
+    CargoRunTool, CargoTestTool, EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus,
+    GitStatusTool, ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, Tool,
+    ToolError, ToolRegistry, ToolResult, WriteFileTool, CONTAINER_WORKSPACE_DIR,
 };
 
 // Export agent types

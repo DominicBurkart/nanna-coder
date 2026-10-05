@@ -1,13 +1,15 @@
-use super::template::{DeployTemplate, RiskClass, Strategy};
+use super::template::{DeployTemplate, Health, RiskClass, Rollback, Shadow, Strategy};
 use super::{is_production_env, DeployError};
 use crate::windows::WINDOWS_FILE_NAME;
 use chrono::Duration;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 use std::path::Path;
 
 /// Something that must hold before a step may start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Precondition {
     /// The named availability window must be open.
     WindowOpen(String),
@@ -38,7 +40,8 @@ impl fmt::Display for Precondition {
 }
 
 /// What a step does to the target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepKind {
     /// Route `traffic_percent` of live traffic to the new version.
     Traffic,
@@ -66,7 +69,7 @@ impl StepKind {
 }
 
 /// One ordered step of a [`DeployPlan`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployStep {
     /// Position in the plan, starting at 0.
     pub index: usize,
@@ -108,7 +111,7 @@ impl DeployStep {
 }
 
 /// The ordered steps a rollout executor performs for one environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployPlan {
     /// Environment the plan targets.
     pub environment: String,
@@ -120,6 +123,13 @@ pub struct DeployPlan {
     pub strategy: Strategy,
     /// Coordination lease every step requires, `deploy:<repo>:<env>`.
     pub lease: String,
+    /// Health gates polled while a step bakes, when the template has `[health]`.
+    pub health: Option<Health>,
+    /// What a health breach triggers.
+    pub rollback: Rollback,
+    /// The template's `[shadow]` section when mirroring is enabled: what a
+    /// `Shadow` step compares and the divergence rate that breaches.
+    pub shadow: Option<Shadow>,
     /// Steps in execution order.
     pub steps: Vec<DeployStep>,
 }
@@ -155,7 +165,7 @@ impl DeployPlan {
     /// ```
     pub fn render_text(&self) -> String {
         let mut out = format!(
-            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\n",
+            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\nadvisory only: preconditions are declared, not enforced (#650, #737, #734)\n",
             self.image, self.environment, self.risk_class, self.strategy, self.lease
         );
         for step in &self.steps {
@@ -195,15 +205,25 @@ impl DeployPlan {
     /// assert_eq!(json["steps"][0]["preconditions"][0]["lease_held"], "deploy:app:sandbox");
     /// ```
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
+            "advisory": true,
             "environment": self.environment,
             "image": self.image,
             "risk_class": self.risk_class.name(),
             "strategy": self.strategy.name(),
             "lease": self.lease,
+            "on_breach": self.rollback.on_breach.name(),
             "total_min_duration_seconds": self.total_min_duration().num_seconds(),
             "steps": self.steps.iter().map(DeployStep::to_json).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(shadow) = &self.shadow {
+            value["shadow"] = json!({
+                "mirror_percent": shadow.mirror_percent,
+                "compare": shadow.compare.iter().map(|c| c.name()).collect::<Vec<_>>(),
+                "max_divergence": shadow.max_divergence,
+            });
+        }
+        value
     }
 
     /// Pretty-printed [`DeployPlan::to_json`] for the CLI.
@@ -230,13 +250,14 @@ pub fn plan_for_repo(
 /// Load `<repo>/.nanna/deploy.toml`, validate `rollout.windows` against
 /// `<repo>/.nanna/windows.toml` when that file exists, and plan a rollout.
 ///
-/// This is what the `nanna deploy plan` CLI command uses: it is the
-/// human-facing preflight check, so a `rollout.windows` naming a window that
-/// will never open must be caught here rather than surfacing only once a
-/// rollout executor tries to act on the plan. When no `windows.toml` is
-/// co-located with the template, window names are not checked, matching
-/// [`plan_for_repo`] (Nanna's own window set may live outside the target
-/// repository).
+/// This is what the `nanna deploy plan` CLI command uses. The result is
+/// advisory only: `windows.toml` lives in the target repository, which agents
+/// can write, so this check must not be read as an enforced gate until the
+/// executor (#650), lease enforcement (#737) and the windows fix (#734) land.
+/// It does catch a `rollout.windows` naming a window that will never open.
+/// When no `windows.toml` is co-located with the template, window names are
+/// not checked, matching [`plan_for_repo`] (Nanna's own window set may live
+/// outside the target repository).
 ///
 /// ```
 /// use harness::deploy::{plan_for_repo_checked, DeployError};
@@ -338,7 +359,7 @@ impl DeployTemplate {
     /// use harness::deploy::{DeployTemplate, RiskClass, StepKind};
     ///
     /// let template = DeployTemplate::parse(
-    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\nedge = 50\n[rollout]\nstrategy = \"shadow-then-gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\", \"latency\"]\n",
     /// )
     /// .unwrap();
     /// let plan = template.plan_with_score("staging", Some(75)).unwrap();
@@ -420,6 +441,9 @@ impl DeployTemplate {
             risk_class,
             strategy: self.rollout.strategy,
             lease,
+            health: self.health.clone(),
+            rollback: self.rollback.clone(),
+            shadow: self.shadow.clone().filter(|s| s.enabled),
             steps,
         })
     }
@@ -428,6 +452,7 @@ impl DeployTemplate {
 #[cfg(test)]
 mod tests {
     use super::super::template::tests::FIXTURE;
+    use super::super::template::OnBreach;
     use super::super::validate::{min_span, min_steps, strategy_allowed};
     use super::*;
     use proptest::prelude::{any, prop_assert, prop_assert_eq, proptest, Strategy as _};
@@ -487,6 +512,37 @@ mod tests {
             plan.total_min_duration(),
             Duration::hours(25) + Duration::minutes(30)
         );
+    }
+
+    #[test]
+    fn plan_round_trips_through_serde_and_carries_health_and_rollback() {
+        let plan = DeployTemplate::parse(FIXTURE)
+            .unwrap()
+            .plan("production")
+            .unwrap();
+        let health = plan.health.as_ref().unwrap();
+        assert_eq!(health.endpoints, ["/health/v1"]);
+        assert_eq!(health.latency_p99_max_ms, 800);
+        assert_eq!(plan.rollback.on_breach, OnBreach::Rollback);
+        assert!(plan.rollback.automatic);
+        assert_eq!(plan.to_json()["on_breach"], "rollback");
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: DeployPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plan);
+        assert!(json.contains("\"window_open\":\"business-hours\""));
+        assert!(json.contains("\"health_ok\""));
+        let shadow = template(
+            "edge",
+            "shadow-then-gradual",
+            "[10, 50, 100]",
+            "8h",
+            "[shadow]\nenabled = true\nmirror_percent = 5\ncompare = [\"status\"]\n",
+        )
+        .plan("production")
+        .unwrap();
+        let json = serde_json::to_string(&shadow).unwrap();
+        assert!(json.contains("\"kind\":{\"shadow\":{\"mirror_percent\":5}}"));
+        assert_eq!(serde_json::from_str::<DeployPlan>(&json).unwrap(), shadow);
     }
 
     #[test]
@@ -635,6 +691,7 @@ mod tests {
         let expected = "\
 deploy plan: registry.example.invalid/ns/fullstack-fixture -> production
 risk class: edge | strategy: gradual | lease: deploy:fullstack-fixture:production
+advisory only: preconditions are declared, not enforced (#650, #737, #734)
   1. traffic 10%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
   2. traffic 50%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
   3. traffic 100%   hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
@@ -705,6 +762,7 @@ minimum total: 1d 1h 30m
             "[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\n",
         );
         let json = t.plan("production").unwrap().to_json();
+        assert_eq!(json["advisory"], true);
         assert_eq!(json["environment"], "production");
         assert_eq!(json["image"], "registry.example.invalid/ns/app");
         assert_eq!(json["risk_class"], "core");
@@ -757,7 +815,7 @@ minimum total: 1d 1h 30m
         ));
         let pretty = plan.to_json_pretty();
         assert!(
-            pretty.starts_with("{\n  \"environment\": \"staging\""),
+            pretty.starts_with("{\n  \"advisory\": true,\n  \"environment\": \"staging\""),
             "{pretty}"
         );
         assert_eq!(

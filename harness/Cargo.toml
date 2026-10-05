@@ -26,6 +26,9 @@ required-features = ["eval-runner"]
 # production builds (the harness binary, container images) do not pull in
 # tempfile unless explicitly requested.
 eval-runner = ["tempfile"]
+# Shells out to a configured CLI for container-registry+serverless targets;
+# no cloud SDK enters the core crate.
+serverless-adapter = []
 
 [dependencies]
 async-trait = "0.1"

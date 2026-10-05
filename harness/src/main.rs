@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use harness::entities::ast::WorkspaceScanner;
 use harness::entities::git::GitRepository;
 use harness::entities::{EntityStore, InMemoryEntityStore};
+use harness::identity::IdentityCatalog;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
@@ -44,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Inspect the agent identity catalog
+    Agents {
+        #[command(subcommand)]
+        action: AgentsAction,
+    },
     /// Health check
     Health {
         /// Skip the on-startup pod-ensure check
@@ -195,6 +201,20 @@ enum EscalationAction {
 }
 
 #[derive(Subcommand)]
+enum AgentsAction {
+    /// List identities in the catalog (name, loop, model, max_effect)
+    List {
+        /// Catalog directory. Defaults to $NANNA_CONFIG_DIR/agents,
+        /// $XDG_CONFIG_HOME/nanna/agents or ~/.config/nanna/agents.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Repository whose .nanna/agents/ overrides are layered on top.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DeployCommands {
     /// Print the deployment plan for an environment without executing it
     Plan {
@@ -219,6 +239,48 @@ enum DeployCommands {
         /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
         #[arg(long)]
         repo_path: Option<std::path::PathBuf>,
+    },
+    /// Execute the deployment plan for an environment as a resumable rollout
+    Run {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to roll out to
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Image reference to roll out
+        #[arg(long)]
+        image: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
+    },
+    /// Show every rollout, or one rollout with its transition history
+    Status {
+        /// Rollout id
+        id: Option<String>,
+    },
+    /// Kill switch: hold a rollout's current traffic split (human only)
+    Halt {
+        /// Rollout id
+        id: String,
+    },
+    /// Restart a halted rollout from step 0 with a fixed image
+    RollForward {
+        /// Rollout id
+        id: String,
+        /// Fixed image reference
+        #[arg(long)]
+        image: String,
+        /// Pull request that delivered the fix
+        #[arg(long)]
+        pr: String,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
     },
 }
 
@@ -274,6 +336,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let workspace_root = std::env::current_dir()?;
             let tool_registry = create_tool_registry(&workspace_root);
             list_tools(&tool_registry);
+        }
+        Commands::Agents {
+            action: AgentsAction::List { dir, repo },
+        } => {
+            let catalog = match dir {
+                Some(dir) => IdentityCatalog::load(dir),
+                None => IdentityCatalog::load_default(),
+            };
+            let catalog = match repo {
+                Some(repo) => catalog.and_then(|catalog| catalog.with_repo_overrides(repo)),
+                None => catalog,
+            };
+            print!("{}", catalog.map_err(|e| e.to_string())?.render_table());
         }
         Commands::Health { no_ensure_pod } => {
             ensure_pod_or_exit(no_ensure_pod).await;
@@ -365,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_escalation_resolve(&id, path)?;
         }
-        Commands::Deploy { command } => run_deploy(command)?,
+        Commands::Deploy { command } => run_deploy(command).await?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -383,8 +458,133 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+fn rollout_log() -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let path = harness::rollout::default_rollout_path()
+        .ok_or("no rollout log location: set NANNA_ROLLOUT_PATH or HOME")?;
+    Ok(harness::rollout::RolloutLog::open(&path)?)
+}
+
+type FakeExecutor = (
+    harness::rollout::RolloutExecutor,
+    std::sync::Arc<harness::leases::SimulatedClock>,
+);
+
+fn fake_rollout_log(
+    seed: Option<&harness::rollout::RolloutRecord>,
+) -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("nanna-fake-rollout-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
+    if let Some(record) = seed {
+        log.append(None, record)?;
+    }
+    Ok(log)
+}
+
+fn fake_rollout_executor(
+    repo: &std::path::Path,
+    plan: &harness::deploy::DeployPlan,
+    log: harness::rollout::RolloutLog,
+) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
+    let windows_path = repo
+        .join(harness::deploy::DEPLOY_DIR)
+        .join(harness::windows::WINDOWS_FILE_NAME);
+    let windows = if windows_path.exists() {
+        harness::windows::WindowSet::load(&windows_path)?
+    } else {
+        harness::windows::WindowSet::default()
+    };
+    let endpoints = plan
+        .health
+        .as_ref()
+        .map(|h| h.endpoints.clone())
+        .unwrap_or_default();
+    let previous = format!("{}:previous", plan.image);
+    let (executor, _adapter, _health, _shadow, clock) =
+        harness::rollout::fake_executor(log, windows, &previous, &endpoints);
+    Ok((executor, clock))
+}
+
+async fn run_fake_to_a_stop(
+    executor: &harness::rollout::RolloutExecutor,
+    clock: &harness::leases::SimulatedClock,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let steps = harness::rollout::run_simulated(executor, clock, id).await?;
+    let Some((last, parked)) = steps.split_last() else {
+        return Ok(());
+    };
+    for step in parked {
+        println!("parked   {}", step.summary());
+    }
+    println!("finished {}", last.summary());
+    Ok(())
+}
+
+const NO_REAL_TARGET: &str =
+    "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        DeployCommands::Run {
+            repo_path,
+            env,
+            image,
+            score,
+            fake,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let (executor, clock) = fake_rollout_executor(&repo, &plan, fake_rollout_log(None)?)?;
+            let record = executor.start(plan, &image).await?;
+            println!("started  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &record.id).await?;
+        }
+        DeployCommands::Status { id } => {
+            let log = rollout_log()?;
+            match id {
+                Some(id) => {
+                    println!("{}", log.load(&id)?.summary());
+                    for transition in log.history(&id)? {
+                        println!("  {}", transition.summary());
+                    }
+                }
+                None => {
+                    for record in log.latest()?.into_values() {
+                        println!("{}", record.summary());
+                    }
+                }
+            }
+        }
+        DeployCommands::Halt { id } => {
+            let record = rollout_log()?.halt(&id, chrono::Utc::now())?;
+            println!("halted   {}", record.summary());
+        }
+        DeployCommands::RollForward {
+            id,
+            image,
+            pr,
+            fake,
+        } => {
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let real = rollout_log()?.load(&id)?;
+            let (executor, clock) = fake_rollout_executor(
+                &std::env::current_dir()?,
+                &real.plan,
+                fake_rollout_log(Some(&real))?,
+            )?;
+            let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
+            println!("forward  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &id).await?;
+        }
         DeployCommands::Plan {
             repo_path,
             env,
@@ -1258,5 +1458,77 @@ mod tests {
             Some(missing_compare.as_path()),
         );
         assert!(result.is_err(), "expected error on missing compare file");
+    }
+
+    const FAKE_TEMPLATE: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"edge\"\n[rollout]\nstrategy = \"gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n";
+
+    static ROLLOUT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn fake_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FAKE_TEMPLATE).unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn fake_deploy_run_never_writes_the_real_rollout_log() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        run_deploy(DeployCommands::Run {
+            repo_path: Some(repo.path().to_path_buf()),
+            env: "sandbox".into(),
+            image: "registry.example.invalid/ns/app:v2".into(),
+            score: None,
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(!real_path.exists(), "fake run touched the real log");
+    }
+
+    #[tokio::test]
+    async fn fake_roll_forward_leaves_the_real_record_untouched() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        let plan = harness::deploy::plan_for_repo(repo.path(), "sandbox", None).unwrap();
+        let mut record = harness::rollout::RolloutRecord::new(
+            "rollout-real",
+            plan,
+            "registry.example.invalid/ns/app:v2",
+            "registry.example.invalid/ns/app:v1",
+            chrono::Utc::now(),
+        );
+        let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
+        log.append(None, &record).unwrap();
+        let pending = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&pending), &record).unwrap();
+        let stepping = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&stepping), &record).unwrap();
+        let before = std::fs::read_to_string(&real_path).unwrap();
+        run_deploy(DeployCommands::RollForward {
+            id: "rollout-real".into(),
+            image: "registry.example.invalid/ns/app:v3".into(),
+            pr: "https://example.invalid/pr/1".into(),
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&real_path).unwrap() == before,
+            "fake roll-forward rewrote the real log"
+        );
     }
 }
