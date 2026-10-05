@@ -61,10 +61,8 @@ async fn assert_refused(registry: &ToolRegistry, command: &str) {
     let result = run(registry, command).await;
     assert_eq!(result["success"], false, "{command}: {result}");
     let stderr = result["stderr"].as_str().unwrap_or_default();
-    assert!(
-        stderr.contains("Read-only file system") || stderr.contains("read-only"),
-        "{command}: {result}"
-    );
+    let read_only = stderr.contains("Read-only file system") || stderr.contains("read-only");
+    assert!(read_only, "{command}: {result}");
 }
 
 #[tokio::test]
