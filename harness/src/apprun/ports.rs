@@ -165,7 +165,13 @@ impl std::fmt::Debug for PortAllocator {
 }
 
 fn create_lease(path: &Path, content: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap_or(path))?;
+    std::fs::create_dir_all(path.parent().unwrap_or(path)).map_err(|e| {
+        if e.kind() == ErrorKind::AlreadyExists {
+            std::io::Error::other(e)
+        } else {
+            e
+        }
+    })?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(content.as_bytes())
 }
@@ -294,6 +300,16 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
         let allocator = Arc::new(PortAllocator::new(36000..=36000, file.join("leases")));
+        let err = allocator.allocate("a").unwrap_err();
+        assert!(matches!(err, PortError::Lease { .. }), "{err}");
+    }
+
+    #[test]
+    fn lease_dir_that_is_a_file_is_a_lease_error_not_a_taken_port() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("leases");
+        std::fs::write(&file, "x").unwrap();
+        let allocator = Arc::new(PortAllocator::new(36100..=36100, &file));
         let err = allocator.allocate("a").unwrap_err();
         assert!(matches!(err, PortError::Lease { .. }), "{err}");
     }
