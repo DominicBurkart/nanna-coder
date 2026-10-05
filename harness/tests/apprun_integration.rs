@@ -10,7 +10,8 @@
 
 use harness::apprun::{Limits, DEFAULT_PORT_RANGE};
 use harness::apprun::{PortAllocator, APP_LOGS_TOOL, APP_START_TOOL, APP_STOP_TOOL};
-use harness::container::{detect_runtime, ContainerRuntime};
+use harness::container::detect_runtime;
+use harness::sidecar::{build_image_from_containerfile, container_exists, SystemRunner};
 use harness::tools::ToolRegistry;
 use harness::workspace::TaskWorkspace;
 use serde_json::{json, Value};
@@ -72,9 +73,33 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-fn build_dev_image(runtime: &ContainerRuntime) {
-    let dir = tempfile::tempdir().unwrap();
-    copy_dir_all(&fixture_root(), &dir.path().join("fixture"));
+#[tokio::test]
+#[ignore]
+async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+    async fn curl(registry: &ToolRegistry, url: &str) -> Value {
+        registry
+            .execute(
+                "run_command",
+                json!({ "command": format!("curl -sf {url}") }),
+            )
+            .await
+            .expect("run_command must execute")
+    }
+
+    async fn app(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
+        registry
+            .execute(tool, args)
+            .await
+            .unwrap_or_else(|e| panic!("{tool} failed: {e}"))
+    }
+
+    let image_context = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
     let containerfile = format!(
         "FROM docker.io/library/rust:1-bookworm\n\
          RUN rustup target add wasm32-unknown-unknown \\\n\
@@ -86,53 +111,14 @@ fn build_dev_image(runtime: &ContainerRuntime) {
          \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
          CMD [\"sleep\", \"infinity\"]\n"
     );
-    std::fs::write(dir.path().join("Containerfile"), containerfile).unwrap();
-    let out = Command::new(runtime.command())
-        .args(["build", "-q", "-t", DEV_IMAGE_TAG])
-        .arg(dir.path())
-        .output()
-        .expect("runtime must be runnable");
-    assert!(
-        out.status.success(),
-        "image build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn container_exists(runtime: &ContainerRuntime, name: &str) -> bool {
-    Command::new(runtime.command())
-        .args(["container", "exists", name])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-async fn curl(registry: &ToolRegistry, url: &str) -> Value {
-    registry
-        .execute(
-            "run_command",
-            json!({ "command": format!("curl -sf {url}") }),
-        )
-        .await
-        .expect("run_command must execute")
-}
-
-async fn app(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
-    registry
-        .execute(tool, args)
-        .await
-        .unwrap_or_else(|e| panic!("{tool} failed: {e}"))
-}
-
-#[tokio::test]
-#[ignore]
-async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
-    build_dev_image(&runtime);
+    build_image_from_containerfile(
+        &SystemRunner,
+        &runtime,
+        DEV_IMAGE_TAG,
+        image_context.path(),
+        &containerfile,
+    )
+    .unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -249,7 +235,66 @@ async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
     );
     assert!(!PortAllocator::shared().lease_path(restarted_port).exists());
     assert!(
-        !container_exists(&runtime, &container_name),
+        !container_exists(&SystemRunner, &runtime, &container_name),
         "dev container must be removed"
     );
+}
+
+#[test]
+fn fixture_root_is_the_fullstack_fixture() {
+    let root = fixture_root();
+    assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+}
+
+#[test]
+fn init_repo_commits_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "b").unwrap();
+    init_repo(dir.path());
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let tracked: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(tracked, vec!["a.txt", "sub/b.txt"]);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn git_helper_panics_on_a_failing_command() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["rev-parse", "HEAD"]);
+}
+
+#[test]
+fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("api/src")).unwrap();
+    std::fs::write(src.path().join("api/src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(src.path().join("Cargo.toml"), "[workspace]").unwrap();
+    for skipped in ["target", "dist", ".git"] {
+        std::fs::create_dir_all(src.path().join(skipped)).unwrap();
+        std::fs::write(src.path().join(skipped).join("junk"), "x").unwrap();
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let out = dst.path().join("copy");
+    copy_dir_all(src.path(), &out);
+    assert_eq!(
+        std::fs::read_to_string(out.join("api/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert!(out.join("Cargo.toml").is_file());
+    for skipped in ["target", "dist", ".git"] {
+        assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
+    }
 }

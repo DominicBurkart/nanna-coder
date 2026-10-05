@@ -316,6 +316,20 @@ pub fn network_exists(runner: &dyn CommandRunner, runtime: &ContainerRuntime, na
     matches!(runner.run(runtime.command(), &args), Ok(o) if o.success)
 }
 
+/// Whether the container `name` exists.
+pub fn container_exists(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    name: &str,
+) -> bool {
+    let args = vec![
+        "container".to_string(),
+        "exists".to_string(),
+        name.to_string(),
+    ];
+    matches!(runner.run(runtime.command(), &args), Ok(o) if o.success)
+}
+
 /// Write `containerfile` into `context_dir` and build it as image `tag`.
 pub fn build_image_from_containerfile(
     runner: &dyn CommandRunner,
@@ -994,6 +1008,29 @@ mod tests {
         let seen = runner.seen_env_files.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].0.exists());
+    }
+
+    #[test]
+    fn container_exists_reports_exists_outcome() {
+        let ok = FakeRunner::new(None, None);
+        assert!(container_exists(
+            ok.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
+        assert_eq!(ok.calls(), vec!["container exists c1".to_string()]);
+        let missing = FakeRunner::new(Some("container exists"), None);
+        assert!(!container_exists(
+            missing.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
+        let broken = FakeRunner::new(None, Some("container exists"));
+        assert!(!container_exists(
+            broken.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
     }
 
     #[test]
