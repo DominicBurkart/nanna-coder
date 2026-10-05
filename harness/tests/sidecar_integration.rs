@@ -5,11 +5,12 @@
 
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig, ContainerRuntime,
+    ContainerConfig,
 };
 use harness::onboarding::{DeterministicOnboarder, Onboarder};
 use harness::sidecar::{
-    build_image_from_containerfile, PostgresSidecar, ReadinessConfig, SidecarSet, SystemRunner,
+    build_image_from_containerfile, network_exists, PostgresSidecar, ReadinessConfig, SidecarSet,
+    SystemRunner,
 };
 use harness::workspace::TaskWorkspace;
 use image_builder::build_dev_container;
@@ -68,24 +69,6 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-/// A stand-in dev container image: the Postgres image (which ships `psql`)
-/// with an idle command, so the test does not depend on a Nix build.
-fn build_psql_dev_image(runtime: &ContainerRuntime) {
-    let dir = tempfile::tempdir().unwrap();
-    build_image_from_containerfile(
-        &SystemRunner,
-        runtime,
-        DEV_IMAGE_TAG,
-        dir.path(),
-        "FROM docker.io/library/postgres:16\nCMD [\"sleep\", \"infinity\"]\n",
-    )
-    .unwrap();
-}
-
-fn network_exists(runtime: &ContainerRuntime, name: &str) -> bool {
-    harness::sidecar::network_exists(&SystemRunner, runtime, name)
-}
-
 /// Queries over TCP inside the sidecar, like the dev container would; the
 /// unix socket is also served by the image's temporary init server.
 fn current_database_in_sidecar(set: &SidecarSet, pg: &PostgresSidecar) -> String {
@@ -111,7 +94,15 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    build_psql_dev_image(&runtime);
+    let image_context = tempfile::tempdir().unwrap();
+    build_image_from_containerfile(
+        &SystemRunner,
+        &runtime,
+        DEV_IMAGE_TAG,
+        image_context.path(),
+        "FROM docker.io/library/postgres:16\nCMD [\"sleep\", \"infinity\"]\n",
+    )
+    .unwrap();
 
     let source = tempfile::tempdir().unwrap();
     std::fs::write(source.path().join("README.md"), "sidecar test").unwrap();
@@ -129,7 +120,7 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
     .await
     .expect("postgres sidecar must start");
     let network = set.network_name().to_string();
-    assert!(network_exists(&runtime, &network));
+    assert!(network_exists(&SystemRunner, &runtime, &network));
 
     let mut ws = TaskWorkspace::create_with_container_and_sidecars(
         source.path(),
@@ -164,7 +155,7 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
 
     ws.cleanup().unwrap();
     assert!(
-        !network_exists(&runtime, &network),
+        !network_exists(&SystemRunner, &runtime, &network),
         "task network must be removed with the workspace"
     );
 }
