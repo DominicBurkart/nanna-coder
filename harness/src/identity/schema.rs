@@ -93,9 +93,13 @@ pub enum SystemPrompt {
 pub struct ScopeSection {
     /// Repositories the identity may be spawned against.
     pub repos: Vec<String>,
-    /// Writable globs relative to the worktree root.
+    /// Writable globs relative to the worktree root. Enforced by the file
+    /// tools only: `run_command` cannot be confined to globs, so it is
+    /// withheld from any identity whose paths do not include `**`.
     pub paths: Vec<String>,
     /// Readable globs; `None` leaves reads unrestricted inside the worktree.
+    /// Enforced by the file tools only; setting it at all withholds
+    /// `run_command` from the identity.
     pub read_paths: Option<Vec<String>>,
     /// Highest [`EffectClass`] any tool call may reach.
     pub max_effect: EffectClass,
@@ -427,6 +431,42 @@ impl AgentIdentity {
             .tools
             .iter()
             .any(|pattern| pattern.matches(tool_name))
+    }
+
+    /// Whether `[scope]` restricts paths: `scope.paths` does not include
+    /// `**`, or `scope.read_paths` is set at all. Tools that run arbitrary
+    /// shell commands cannot be confined to globs, so the registry refuses
+    /// them for such an identity (see [`crate::tools::PATH_UNSCOPABLE_TOOLS`]).
+    ///
+    /// ```
+    /// use harness::identity::AgentIdentity;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "narrow"
+    /// description = "Writes under src only."
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "Write." }
+    ///
+    /// [scope]
+    /// repos = ["github.com/example/repo"]
+    /// paths = ["src/**"]
+    /// max_effect = "workspace"
+    /// tools = ["run_command"]
+    ///
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let narrow = AgentIdentity::from_toml_str(toml, "narrow.toml").unwrap();
+    /// assert!(narrow.restricts_paths());
+    /// let open = AgentIdentity::from_toml_str(&toml.replace("src/**", "**"), "open.toml").unwrap();
+    /// assert!(!open.restricts_paths());
+    /// ```
+    pub fn restricts_paths(&self) -> bool {
+        self.scope.read_paths.is_some() || !self.scope.paths.iter().any(|glob| glob == "**")
     }
 
     /// Whether `class` is at or below `scope.max_effect`.
