@@ -165,10 +165,11 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![format!(
+        let workspace_mount = format!(
             "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
             workspace_path.display()
-        )];
+        );
+        let mut additional_args = vec![workspace_mount];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
             additional_args.extend(set.container_args());

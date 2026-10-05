@@ -8,7 +8,9 @@ use harness::container::{
     ContainerConfig, ContainerRuntime,
 };
 use harness::onboarding::{DeterministicOnboarder, Onboarder};
-use harness::sidecar::{PostgresSidecar, ReadinessConfig, SidecarSet, SystemRunner};
+use harness::sidecar::{
+    build_image_from_containerfile, PostgresSidecar, ReadinessConfig, SidecarSet, SystemRunner,
+};
 use harness::workspace::TaskWorkspace;
 use image_builder::build_dev_container;
 use std::path::{Path, PathBuf};
@@ -70,29 +72,18 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 /// with an idle command, so the test does not depend on a Nix build.
 fn build_psql_dev_image(runtime: &ContainerRuntime) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Containerfile"),
+    build_image_from_containerfile(
+        &SystemRunner,
+        runtime,
+        DEV_IMAGE_TAG,
+        dir.path(),
         "FROM docker.io/library/postgres:16\nCMD [\"sleep\", \"infinity\"]\n",
     )
     .unwrap();
-    let out = Command::new(runtime.command())
-        .args(["build", "-q", "-t", DEV_IMAGE_TAG])
-        .arg(dir.path())
-        .output()
-        .expect("runtime must be runnable");
-    assert!(
-        out.status.success(),
-        "image build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 fn network_exists(runtime: &ContainerRuntime, name: &str) -> bool {
-    Command::new(runtime.command())
-        .args(["network", "inspect", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    harness::sidecar::network_exists(&SystemRunner, runtime, name)
 }
 
 /// Queries over TCP inside the sidecar, like the dev container would; the

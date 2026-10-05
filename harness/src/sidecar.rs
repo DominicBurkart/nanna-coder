@@ -51,6 +51,8 @@ pub enum SidecarError {
     Start { name: String, stderr: String },
     #[error("sidecar {name} not ready after {budget:?}")]
     NotReady { name: String, budget: Duration },
+    #[error("building image {tag} failed: {stderr}")]
+    ImageBuild { tag: String, stderr: String },
 }
 
 /// Result of one runtime command.
@@ -288,6 +290,47 @@ impl Drop for TaskNetwork {
             warn!("could not remove task network {}", self.name);
         }
     }
+}
+
+/// Whether the container network `name` exists.
+pub fn network_exists(runner: &dyn CommandRunner, runtime: &ContainerRuntime, name: &str) -> bool {
+    let args = vec![
+        "network".to_string(),
+        "inspect".to_string(),
+        name.to_string(),
+    ];
+    matches!(runner.run(runtime.command(), &args), Ok(o) if o.success)
+}
+
+/// Write `containerfile` into `context_dir` and build it as image `tag`.
+pub fn build_image_from_containerfile(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    tag: &str,
+    context_dir: &Path,
+    containerfile: &str,
+) -> Result<(), SidecarError> {
+    std::fs::write(context_dir.join("Containerfile"), containerfile).map_err(|e| {
+        SidecarError::Spawn {
+            command: format!("write Containerfile for {tag}"),
+            source: e,
+        }
+    })?;
+    let args = vec![
+        "build".to_string(),
+        "-q".to_string(),
+        "-t".to_string(),
+        tag.to_string(),
+        context_dir.display().to_string(),
+    ];
+    let output = run_or_spawn_error(runner, runtime.command(), &args)?;
+    if !output.success {
+        return Err(SidecarError::ImageBuild {
+            tag: tag.to_string(),
+            stderr: output.stderr,
+        });
+    }
+    Ok(())
 }
 
 fn run_or_spawn_error(
@@ -937,6 +980,110 @@ mod tests {
         let seen = runner.seen_env_files.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].0.exists());
+    }
+
+    #[test]
+    fn network_exists_reports_inspect_outcome() {
+        let ok = FakeRunner::new(None, None);
+        assert!(network_exists(
+            ok.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+        assert_eq!(ok.calls(), vec!["network inspect net-a".to_string()]);
+        let missing = FakeRunner::new(Some("network inspect"), None);
+        assert!(!network_exists(
+            missing.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+    }
+
+    #[test]
+    fn network_exists_is_false_when_runtime_cannot_spawn() {
+        let runner = FakeRunner::new(None, Some("network inspect"));
+        assert!(!network_exists(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+    }
+
+    #[test]
+    fn build_image_writes_containerfile_and_builds_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, None);
+        build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Containerfile")).unwrap(),
+            "FROM scratch\n"
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![format!(
+                "build -q -t localhost/t:latest {}",
+                dir.path().display()
+            )]
+        );
+    }
+
+    #[test]
+    fn build_image_reports_failed_build_with_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(Some("build"), None);
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::ImageBuild { ref tag, ref stderr } if tag == "localhost/t:latest" && stderr == "boom"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_image_reports_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, Some("build"));
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, SidecarError::Spawn { .. }), "{err}");
+    }
+
+    #[test]
+    fn build_image_reports_unwritable_context_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, None);
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            &dir.path().join("missing"),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::Spawn { ref command, .. } if command == "write Containerfile for localhost/t:latest"),
+            "{err}"
+        );
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
