@@ -9,6 +9,7 @@ pub mod entities;
 pub mod escalation;
 pub mod eval;
 pub mod identity;
+pub mod impact;
 pub mod leases;
 pub mod mcp;
 pub mod monitoring;
