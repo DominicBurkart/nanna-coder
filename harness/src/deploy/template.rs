@@ -1,4 +1,5 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
+use crate::ci_policy::CiPolicy;
 use crate::windows;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -379,6 +380,7 @@ struct RawTemplate {
     health: Option<RawHealth>,
     rollback: Option<RawRollback>,
     shadow: Option<RawShadow>,
+    ci: Option<CiPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +458,7 @@ pub struct DeployTemplate {
     pub rollback: Rollback,
     /// The `[shadow]` section, if present.
     pub shadow: Option<Shadow>,
+    pub ci: CiPolicy,
 }
 
 impl DeployTemplate {
@@ -563,6 +566,7 @@ impl DeployTemplate {
                     retain_for: Duration::zero(),
                 }),
             shadow: raw.shadow.map(|s| convert_shadow(file, s)).transpose()?,
+            ci: raw.ci.unwrap_or_default(),
         };
         template.validate()?;
         Ok(template)
@@ -1138,6 +1142,27 @@ compare = ["status", "latency"]
             assert_eq!(t.rollback.on_breach, expected);
             assert_eq!(expected.name(), name);
         }
+    }
+
+    #[test]
+    fn ci_section_defaults_to_denying_every_workflow() {
+        let t = DeployTemplate::parse(FIXTURE).unwrap();
+        assert_eq!(t.ci, CiPolicy::deny_all());
+    }
+
+    #[test]
+    fn ci_section_declares_allowlisted_workflows_and_input_schemas() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"ci.yml\"]\n\n[ci.workflows.\"sandbox.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\"]\n"
+        );
+        let t = DeployTemplate::parse(&src).unwrap();
+        assert!(t.ci.permits("ci.yml"));
+        assert!(t.ci.permits("sandbox.yml"));
+        assert!(!t.ci.permits("release.yml"));
+        assert!(t
+            .ci
+            .validate_dispatch("sandbox.yml", &serde_json::json!({"env": "production"}))
+            .is_err());
     }
 
     #[test]
