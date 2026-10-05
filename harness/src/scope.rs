@@ -111,6 +111,15 @@ pub enum ScopeError {
         /// The glob parser's explanation.
         reason: String,
     },
+    /// The task's target repository is not listed in `scope.repos`.
+    #[error("identity `{identity}` may not run against `{repo}`: not in scope.repos")]
+    RepoOutsideScope {
+        /// Identity the task was dispatched under.
+        identity: String,
+        /// The repository the task targets, or the path when it has no
+        /// recognisable `origin` remote.
+        repo: String,
+    },
 }
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -264,6 +273,109 @@ impl PathScope {
             reason,
         }
     }
+}
+
+/// Normalise a git remote URL to `host/owner/name`, the form `scope.repos`
+/// entries use. Handles `https://`, `ssh://` and scp-style remotes, drops
+/// credentials, ports and a trailing `.git`, and lowercases nothing but the
+/// host.
+///
+/// ```
+/// use harness::scope::repo_slug;
+///
+/// assert_eq!(
+///     repo_slug("git@GitHub.com:example/repo.git").as_deref(),
+///     Some("github.com/example/repo")
+/// );
+/// assert_eq!(
+///     repo_slug("https://token@github.com/example/repo/").as_deref(),
+///     Some("github.com/example/repo")
+/// );
+/// assert_eq!(repo_slug("/srv/git/repo"), None);
+/// ```
+pub fn repo_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
+            let (authority, path) = rest.split_once('/')?;
+            (authority.split(':').next()?, path)
+        }
+        None => {
+            let rest = url.rsplit_once('@').map_or(url, |(_, after)| after);
+            rest.split_once(':')?
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let valid = |part: &str| !part.is_empty() && !part.contains('/');
+    if host.is_empty() || !valid(owner) || !valid(name) {
+        return None;
+    }
+    Some(format!("{}/{owner}/{name}", host.to_ascii_lowercase()))
+}
+
+fn origin_slug(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    repo_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Refuse a task whose target repository is not in the identity's
+/// `scope.repos`. The repository is named by its `origin` remote; without a
+/// recognisable one it cannot be named, so the check fails closed.
+///
+/// ```
+/// use harness::identity::AgentIdentity;
+/// use harness::scope::check_repo;
+///
+/// let toml = r#"
+/// [identity]
+/// name = "reader"
+/// description = "Reads."
+/// loop = "inner"
+/// model = "m"
+/// system_prompt = { inline = "Read." }
+///
+/// [scope]
+/// repos = ["github.com/example/repo"]
+/// paths = []
+/// max_effect = "none"
+/// tools = ["read_file"]
+///
+/// [limits]
+/// max_iterations = 1
+/// max_wall_clock_secs = 1
+/// max_concurrent = 1
+/// "#;
+/// let identity = AgentIdentity::from_toml_str(toml, "reader.toml").unwrap();
+/// let not_a_repo = tempfile::tempdir().unwrap();
+/// assert!(check_repo(&identity, not_a_repo.path()).is_err());
+/// ```
+pub fn check_repo(identity: &AgentIdentity, repo_path: &Path) -> Result<(), ScopeError> {
+    let slug = origin_slug(repo_path);
+    let allowed = slug.as_deref().is_some_and(|slug| {
+        identity
+            .scope
+            .repos
+            .iter()
+            .any(|repo| repo.eq_ignore_ascii_case(slug))
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(ScopeError::RepoOutsideScope {
+        identity: identity.name().to_string(),
+        repo: slug.unwrap_or_else(|| repo_path.display().to_string()),
+    })
 }
 
 /// `path` relative to `workspace_root`, or `path` itself when it is not
@@ -1005,5 +1117,74 @@ mod tests {
             prop_assert!(!scoped.permits(PathAccess::Write, Path::new(&outside)));
             prop_assert!(!scoped.permits(PathAccess::Write, Path::new(&dir)));
         }
+    }
+
+    #[test]
+    fn repo_slug_normalises_every_remote_shape() {
+        let slug = |url: &str| repo_slug(url);
+        let expected = Some("github.com/example/repo".to_string());
+        assert_eq!(slug("https://github.com/example/repo.git"), expected);
+        assert_eq!(slug("https://user:pw@GITHUB.com/example/repo"), expected);
+        assert_eq!(slug("ssh://git@github.com:22/example/repo.git"), expected);
+        assert_eq!(slug("git@github.com:example/repo.git"), expected);
+        assert_eq!(slug("  https://github.com/example/repo/  "), expected);
+        assert_eq!(slug("https://github.com/example"), None);
+        assert_eq!(slug("https://github.com"), None);
+        assert_eq!(slug("https://github.com/a/b/c"), None);
+        assert_eq!(slug("https:///example/repo"), None);
+        assert_eq!(slug("https://github.com//repo"), None);
+        assert_eq!(slug("/srv/git/repo"), None);
+        assert_eq!(slug(""), None);
+    }
+
+    fn repo_with_origin(url: Option<&str>) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&["init", "-q"]);
+        if let Some(url) = url {
+            git(&["remote", "add", "origin", url]);
+        }
+        dir
+    }
+
+    #[test]
+    fn check_repo_allows_only_listed_repositories() {
+        let identity = example();
+        let listed = repo_with_origin(Some("git@github.com:Example/Repo.git"));
+        assert_eq!(check_repo(&identity, listed.path()), Ok(()));
+
+        let other = repo_with_origin(Some("https://github.com/example/other"));
+        assert_eq!(
+            check_repo(&identity, other.path()),
+            Err(ScopeError::RepoOutsideScope {
+                identity: "rust-implementer".to_string(),
+                repo: "github.com/example/other".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_repo_fails_closed_without_a_nameable_origin() {
+        let identity = example();
+        let no_remote = repo_with_origin(None);
+        let err = check_repo(&identity, no_remote.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&no_remote.path().display().to_string()));
+
+        let local_remote = repo_with_origin(Some("/srv/git/repo"));
+        assert!(check_repo(&identity, local_remote.path()).is_err());
+
+        let mut open_identity = example();
+        open_identity.scope.repos.clear();
+        let listed = repo_with_origin(Some("https://github.com/example/repo"));
+        assert!(check_repo(&open_identity, listed.path()).is_err());
     }
 }

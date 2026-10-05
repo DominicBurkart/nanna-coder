@@ -70,11 +70,11 @@ impl IdentityCatalog {
     /// `$NANNA_CONFIG_DIR/agents`, else `$XDG_CONFIG_HOME/nanna/agents`,
     /// else `$HOME/.config/nanna/agents`. `None` when none of those is set.
     pub fn default_global_dir() -> Option<PathBuf> {
-        Self::global_dir_from(|key| std::env::var_os(key))
+        Self::global_dir_from(&|key| std::env::var_os(key))
     }
 
     /// [`IdentityCatalog::default_global_dir`] over an arbitrary environment lookup.
-    pub fn global_dir_from(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    pub fn global_dir_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         let non_empty = |key: &str| lookup(key).filter(|value| !value.is_empty());
         if let Some(config) = non_empty(CONFIG_DIR_ENV) {
             return Some(PathBuf::from(config).join(AGENTS_SUBDIR));
@@ -335,13 +335,11 @@ mod tests {
     fn missing_directory_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        match IdentityCatalog::load(&missing) {
-            Err(IdentityError::Io { file, source }) => {
-                assert_eq!(file, missing);
-                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected Io error, got {other:?}"),
-        }
+        let err = IdentityCatalog::load(&missing).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::Io { file, source } if *file == missing && source.kind() == std::io::ErrorKind::NotFound),
+            "expected Io error, got {err:?}"
+        );
     }
 
     #[test]
@@ -367,18 +365,11 @@ mod tests {
             "zz-copy.toml",
             &identity_toml("deployer", "outer", "sandbox", "\"read_file\""),
         );
-        match IdentityCatalog::load(dir.path()) {
-            Err(IdentityError::DuplicateName {
-                name,
-                first,
-                second,
-            }) => {
-                assert_eq!(name, "deployer");
-                assert_eq!(first, dir.path().join("deployer.toml"));
-                assert_eq!(second, dir.path().join("zz-copy.toml"));
-            }
-            other => panic!("expected DuplicateName, got {other:?}"),
-        }
+        let err = IdentityCatalog::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::DuplicateName { name, first, second } if name == "deployer" && *first == dir.path().join("deployer.toml") && *second == dir.path().join("zz-copy.toml")),
+            "expected DuplicateName, got {err:?}"
+        );
     }
 
     #[test]
@@ -446,13 +437,10 @@ mod tests {
             .unwrap()
             .with_repo_overrides(repo.path())
             .unwrap_err();
-        match err {
-            IdentityError::NoBaseIdentity { name, file } => {
-                assert_eq!(name, "newcomer");
-                assert_eq!(file, local);
-            }
-            other => panic!("expected NoBaseIdentity, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, IdentityError::NoBaseIdentity { name, file } if name == "newcomer" && *file == local),
+            "expected NoBaseIdentity, got {err:?}"
+        );
     }
 
     #[test]
@@ -516,21 +504,24 @@ mod tests {
             ("HOME", "/home/u"),
         ]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(all),
+            IdentityCatalog::global_dir_from(&all),
             Some(PathBuf::from("/cfg/agents"))
         );
         let xdg = env(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/home/u")]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(xdg),
+            IdentityCatalog::global_dir_from(&xdg),
             Some(PathBuf::from("/xdg/nanna/agents"))
         );
         let home = env(&[("NANNA_CONFIG_DIR", ""), ("HOME", "/home/u")]);
         assert_eq!(
-            IdentityCatalog::global_dir_from(home),
+            IdentityCatalog::global_dir_from(&home),
             Some(PathBuf::from("/home/u/.config/nanna/agents"))
         );
-        assert_eq!(IdentityCatalog::global_dir_from(env(&[])), None);
-        assert_eq!(IdentityCatalog::global_dir_from(env(&[("HOME", "")])), None);
+        assert_eq!(IdentityCatalog::global_dir_from(&env(&[])), None);
+        assert_eq!(
+            IdentityCatalog::global_dir_from(&env(&[("HOME", "")])),
+            None
+        );
     }
 
     fn with_env<T>(key: &str, value: Option<&Path>, body: impl FnOnce() -> T) -> T {
@@ -545,6 +536,20 @@ mod tests {
             None => std::env::remove_var(key),
         }
         result
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_config_dir_env)]
+    fn with_env_restores_the_previous_value_on_both_branches() {
+        let key = "NANNA_IDENTITY_WITH_ENV_PROBE";
+        std::env::set_var(key, "outer");
+        let unset_inside = with_env(key, None, || std::env::var_os(key));
+        let set_inside = with_env(key, Some(Path::new("inner")), || std::env::var_os(key));
+        let restored = std::env::var_os(key);
+        std::env::remove_var(key);
+        assert_eq!(unset_inside, None);
+        assert_eq!(set_inside, Some("inner".into()));
+        assert_eq!(restored, Some("outer".into()));
     }
 
     #[test]
@@ -584,5 +589,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_config_dir_env)]
+    fn default_global_dir_falls_back_to_home_config() {
+        let home = std::env::var_os("HOME").expect("HOME is set in the test environment");
+        let derived = with_env(CONFIG_DIR_ENV, None, || {
+            with_env("XDG_CONFIG_HOME", None, IdentityCatalog::default_global_dir)
+        });
+        assert_eq!(
+            derived,
+            Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("nanna")
+                    .join(AGENTS_SUBDIR)
+            )
+        );
     }
 }

@@ -177,13 +177,10 @@ mod tests {
     #[test]
     fn rejects_invalid_glob_syntax() {
         let err = ToolPattern::new("cargo_[").unwrap_err();
-        match &err {
-            ToolPatternError::InvalidGlob { pattern, reason } => {
-                assert_eq!(pattern, "cargo_[");
-                assert!(!reason.is_empty());
-            }
-            other => panic!("unexpected error {other:?}"),
-        }
+        assert!(
+            matches!(&err, ToolPatternError::InvalidGlob { pattern, reason } if pattern == "cargo_[" && !reason.is_empty()),
+            "unexpected error {err:?}"
+        );
         assert!(err
             .to_string()
             .starts_with("tool pattern `cargo_[` is not a valid glob: "));
