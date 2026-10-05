@@ -69,23 +69,6 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-/// Queries over TCP inside the sidecar, like the dev container would; the
-/// unix socket is also served by the image's temporary init server.
-fn current_database_in_sidecar(set: &SidecarSet, pg: &PostgresSidecar) -> String {
-    let url = format!(
-        "postgres://{}:{}@127.0.0.1:5432/{}",
-        pg.user, pg.password, pg.database
-    );
-    let out = exec_in_container(
-        &set.sidecars()[0].handle,
-        &["psql", &url, "-tAc", "select current_database()"],
-        None,
-    )
-    .unwrap();
-    assert!(out.success, "psql in sidecar failed: {}", out.stderr);
-    out.stdout.trim().to_string()
-}
-
 #[tokio::test]
 #[ignore]
 async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
@@ -184,7 +167,11 @@ async fn two_tasks_get_distinct_databases() {
         )
         .await
         .expect("postgres sidecar must start");
-        let name = current_database_in_sidecar(&set, &pg);
+        let probe = pg.current_database_probe();
+        let probe: Vec<&str> = probe.iter().map(String::as_str).collect();
+        let out = exec_in_container(&set.sidecars()[0].handle, &probe, None).unwrap();
+        assert!(out.success, "psql in sidecar failed: {}", out.stderr);
+        let name = out.stdout.trim().to_string();
         assert_eq!(name, pg.database);
         names.push(name);
     }

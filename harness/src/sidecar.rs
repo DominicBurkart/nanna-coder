@@ -194,6 +194,20 @@ impl PostgresSidecar {
         )
     }
 
+    /// Command that prints the current database, run inside the sidecar over
+    /// TCP (the image's temporary init server only serves the unix socket).
+    pub fn current_database_probe(&self) -> Vec<String> {
+        vec![
+            "psql".to_string(),
+            format!(
+                "postgres://{}:{}@127.0.0.1:{POSTGRES_PORT}/{}",
+                self.user, self.password, self.database
+            ),
+            "-tAc".to_string(),
+            "select current_database()".to_string(),
+        ]
+    }
+
     /// The sidecar specification: the Postgres image creates `database` at
     /// first start and `pg_isready` over TCP gates readiness. The probe must
     /// use TCP because the image's entrypoint first runs a temporary,
@@ -980,6 +994,20 @@ mod tests {
         let seen = runner.seen_env_files.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].0.exists());
+    }
+
+    #[test]
+    fn current_database_probe_queries_over_tcp_with_credentials() {
+        let pg = PostgresSidecar::with_password("t1", "pw");
+        assert_eq!(
+            pg.current_database_probe(),
+            vec![
+                "psql".to_string(),
+                format!("postgres://{}:pw@127.0.0.1:5432/task_t1", pg.user),
+                "-tAc".to_string(),
+                "select current_database()".to_string(),
+            ]
+        );
     }
 
     #[test]
