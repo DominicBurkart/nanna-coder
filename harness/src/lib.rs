@@ -5,6 +5,7 @@ pub mod container;
 pub mod deploy;
 pub mod effects;
 pub mod entities;
+pub mod escalation;
 pub mod eval;
 pub mod identity;
 pub mod leases;

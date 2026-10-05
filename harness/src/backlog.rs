@@ -76,6 +76,23 @@ pub trait GithubClient: Send + Sync {
 
     /// Open pull requests of `repo`.
     async fn open_pull_requests(&self, repo: &str) -> Result<Vec<GithubPullRequest>, BacklogError>;
+
+    /// Create an issue in `repo` with `labels` and return it.
+    async fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<GithubIssue, BacklogError>;
+
+    /// Add a comment to issue `number` of `repo`.
+    async fn comment_on_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), BacklogError>;
 }
 
 /// A repository whose backlog is ingested.
@@ -182,6 +199,12 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn open_pull_requests(&self, _: &str) -> Result<Vec<GithubPullRequest>, BacklogError> {
 ///         Ok(vec![])
+///     }
+///     async fn create_issue(&self, _: &str, _: &str, _: &str, _: &[String]) -> Result<GithubIssue, BacklogError> {
+///         unreachable!("ingestion never creates issues")
+///     }
+///     async fn comment_on_issue(&self, _: &str, _: u64, _: &str) -> Result<(), BacklogError> {
+///         unreachable!("ingestion never comments")
 ///     }
 /// }
 ///
@@ -374,10 +397,26 @@ impl ReqwestGithubClient {
         query: &[(&str, String)],
     ) -> Result<serde_json::Value, BacklogError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self
-            .http
-            .get(&url)
-            .query(query)
+        let request = self.http.get(&url).query(query);
+        self.send(url, request).await
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self.http.post(&url).json(payload);
+        self.send(url, request).await
+    }
+
+    async fn send(
+        &self,
+        url: String,
+        request: reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let mut request = request
             .header(reqwest::header::USER_AGENT, "nanna-coder")
             .header(reqwest::header::ACCEPT, "application/vnd.github+json");
         if let Some(token) = &self.token {
@@ -437,6 +476,32 @@ impl GithubClient for ReqwestGithubClient {
         )
         .await
     }
+
+    async fn create_issue(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<GithubIssue, BacklogError> {
+        let payload = serde_json::json!({ "title": title, "body": body, "labels": labels });
+        let value = self
+            .post_json(&format!("/repos/{repo}/issues"), &payload)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn comment_on_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), BacklogError> {
+        let payload = serde_json::json!({ "body": body });
+        self.post_json(&format!("/repos/{repo}/issues/{number}/comments"), &payload)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +531,25 @@ mod tests {
             repo: &str,
         ) -> Result<Vec<GithubPullRequest>, BacklogError> {
             Ok(self.pulls.get(repo).cloned().unwrap_or_default())
+        }
+
+        async fn create_issue(
+            &self,
+            _repo: &str,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> Result<GithubIssue, BacklogError> {
+            unreachable!("ingestion never creates issues")
+        }
+
+        async fn comment_on_issue(
+            &self,
+            _repo: &str,
+            _number: u64,
+            _body: &str,
+        ) -> Result<(), BacklogError> {
+            unreachable!("ingestion never comments")
         }
     }
 
@@ -770,6 +854,30 @@ mod tests {
                 body: Some("Nanna-Identity: x".to_string())
             }]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_creates_issues_and_comments() {
+        let (base, server) = fake_github(vec![
+            ("/repos/o/n/issues/7/comments", 201, "{}".to_string()),
+            ("/repos/o/n/issues", 201, r#"{"number": 7, "title": "t", "body": "b", "html_url": "https://example.invalid/i/7"}"#.to_string()),
+            ("/repos/o/bad/issues", 422, "{}".to_string()),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some("token".to_string()));
+        let issue = client
+            .create_issue("o/n", "t", "b", &["nanna-escalation".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(issue.number, 7);
+        assert_eq!(issue.html_url, "https://example.invalid/i/7");
+        client.comment_on_issue("o/n", 7, "again").await.unwrap();
+        let err = client
+            .create_issue("o/bad", "t", "b", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 422, .. }));
         server.abort();
     }
 
