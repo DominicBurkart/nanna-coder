@@ -1,4 +1,5 @@
 use crate::effects::EffectClass;
+use crate::escalation::EscalationLog;
 use crate::identity::AgentIdentity;
 use crate::scope::{
     canonical_root, relative_to, resolve_path, validate_path_within_workspace, DenialReason,
@@ -9,6 +10,7 @@ use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, T
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -34,6 +36,13 @@ pub enum ToolError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Production effects are held for {repo} by incident {escalation_id}: {summary}")]
+    ProductionHeld {
+        repo: String,
+        escalation_id: String,
+        summary: String,
+    },
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -56,6 +65,12 @@ pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     identity: Option<String>,
     denials: Mutex<Vec<ScopeDenial>>,
+    production_hold: Option<ProductionHold>,
+}
+
+struct ProductionHold {
+    log: Arc<EscalationLog>,
+    repo: Option<String>,
 }
 
 /// Tools whose reach cannot be confined to path globs. `run_command` hands
@@ -70,6 +85,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             identity: None,
             denials: Mutex::new(Vec::new()),
+            production_hold: None,
         }
     }
 
@@ -149,6 +165,13 @@ impl ToolRegistry {
         log.push(denial);
     }
 
+    /// Refuse every `Production`-class call while `log` holds an incident
+    /// for `repo`, or for any repository when `repo` is `None`.
+    pub fn with_production_hold(mut self, log: Arc<EscalationLog>, repo: Option<String>) -> Self {
+        self.production_hold = Some(ProductionHold { log, repo });
+        self
+    }
+
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
         self.tools.insert(name, tool);
@@ -168,7 +191,10 @@ impl ToolRegistry {
 
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult<Value> {
         let outcome = match (self.tools.get(name), &self.identity) {
-            (Some(tool), _) => tool.execute(args).await,
+            (Some(tool), _) => {
+                self.check_production_hold(tool.effect_class())?;
+                tool.execute(args).await
+            }
             (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
                 identity: identity.clone(),
                 tool: name.to_string(),
@@ -182,6 +208,23 @@ impl ToolRegistry {
             self.record(denial.clone());
         }
         outcome
+    }
+
+    fn check_production_hold(&self, class: EffectClass) -> ToolResult<()> {
+        if class != EffectClass::Production {
+            return Ok(());
+        }
+        let Some(gate) = &self.production_hold else {
+            return Ok(());
+        };
+        match gate.log.production_hold(gate.repo.as_deref()) {
+            Some(hold) => Err(ToolError::ProductionHeld {
+                repo: hold.repo,
+                escalation_id: hold.escalation_id,
+                summary: hold.summary,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Effect class declared by the named tool, or `None` when no such tool
@@ -2849,6 +2892,60 @@ mod tests {
         fn effect_class(&self) -> EffectClass {
             self.class
         }
+    }
+
+    fn held_log(repo: &str) -> Arc<EscalationLog> {
+        use crate::escalation::{Escalation, EscalationSource, Severity};
+        let log = Arc::new(EscalationLog::in_memory());
+        let incident = Escalation::new(
+            Severity::Incident,
+            EscalationSource::Rollout,
+            repo,
+            "p99 breached",
+        )
+        .with_id("inc-1");
+        log.hold(&incident, chrono::Utc::now()).unwrap();
+        log
+    }
+
+    fn gated(log: Arc<EscalationLog>, repo: Option<&str>) -> ToolRegistry {
+        let mut registry = ToolRegistry::new().with_production_hold(log, repo.map(str::to_string));
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry
+    }
+
+    #[tokio::test]
+    async fn production_hold_refuses_production_tools_and_names_the_incident() {
+        let registry = gated(held_log("example/repo"), Some("example/repo"));
+        let err = registry.execute("deploy", json!({})).await.unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ProductionHeld { repo, escalation_id, .. } if repo == "example/repo" && escalation_id == "inc-1")
+        );
+        assert!(err.to_string().contains("inc-1"));
+        assert!(err.to_string().contains("p99 breached"));
+        assert!(registry.execute("push", json!({})).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_hold_scopes_to_the_repo_unless_unscoped() {
+        let other = gated(held_log("example/repo"), Some("example/other"));
+        assert!(other.execute("deploy", json!({})).await.is_ok());
+        let any = gated(held_log("example/repo"), None);
+        assert!(any.execute("deploy", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn production_tools_run_once_the_hold_is_resolved_or_absent() {
+        let log = held_log("example/repo");
+        let registry = gated(log.clone(), Some("example/repo"));
+        assert!(registry.execute("deploy", json!({})).await.is_err());
+        let grant = crate::escalation::ResolveGrant::check(true, None).unwrap();
+        log.resolve(&grant, "inc-1", chrono::Utc::now()).unwrap();
+        assert!(registry.execute("deploy", json!({})).await.is_ok());
+        let mut ungated = ToolRegistry::new();
+        ungated.register(StubTool::boxed("deploy", EffectClass::Production));
+        assert!(ungated.execute("deploy", json!({})).await.is_ok());
     }
 
     fn names(tools: &[&dyn Tool]) -> Vec<String> {
