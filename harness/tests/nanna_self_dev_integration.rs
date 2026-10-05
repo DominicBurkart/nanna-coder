@@ -29,7 +29,7 @@ fn workspace_root() -> PathBuf {
 
 #[tokio::test]
 #[ignore]
-async fn test_nanna_self_dev_translate_help_to_french() {
+async fn ollama_nanna_self_dev_translate_help_to_french() {
     let root = workspace_root();
     assert!(
         root.join("flake.nix").exists(),

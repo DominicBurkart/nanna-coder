@@ -723,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn bring_up_command_picks_podman_fallback_when_pod_config_set() {
+    async fn container_bring_up_command_picks_podman_fallback_when_pod_config_set() {
         // When `nix` is unavailable OR no flake.nix is present in the
         // lookup dir, but `podman` is installed AND NANNA_POD_CONFIG is
         // set, bring_up_command must return the podman fallback. This
@@ -756,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
+    async fn container_ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
         // Drive the full bring-up branch with a real `podman play kube`
         // call against /dev/null. podman will fail to parse the empty
         // file, surfacing as PodError::BringUpFailed. This exercises the

@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_planning() {
+    async fn ollama_llm_planning() {
         use model::OllamaProvider;
 
         let provider = match OllamaProvider::with_default_config() {
@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_completion_check() {
+    async fn ollama_llm_completion_check() {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
         use model::OllamaProvider;
@@ -1878,7 +1878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_decision_making() {
+    async fn ollama_llm_decision_making() {
         use model::OllamaProvider;
 
         let provider = match OllamaProvider::with_default_config() {
@@ -1912,7 +1912,7 @@ mod tests {
 
     /// Task 8: Full LLM Agent Control Loop Integration Test
     #[tokio::test]
-    async fn test_full_llm_agent_control_loop() {
+    async fn ollama_full_llm_agent_control_loop() {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
         use model::OllamaProvider;
@@ -2011,7 +2011,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn test_agent_loop_with_ollama_and_tools() {
+    async fn ollama_agent_loop_with_ollama_and_tools() {
         use crate::tools::{CalculatorTool, EchoTool};
         use model::OllamaProvider;
 

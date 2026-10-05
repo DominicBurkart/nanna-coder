@@ -81,7 +81,7 @@ async fn interfaces(registry: &harness::tools::ToolRegistry) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn run_command_under_a_workspace_ceiling_cannot_reach_the_network() {
+async fn container_run_command_under_a_workspace_ceiling_cannot_reach_the_network() {
     if !harness::container::ensure_runtime_or_skip(&detect_runtime(), "network scope test") {
         return;
     }
@@ -110,7 +110,7 @@ async fn run_command_under_a_workspace_ceiling_cannot_reach_the_network() {
 }
 
 #[tokio::test]
-async fn run_command_under_a_repository_ceiling_keeps_its_network_interface() {
+async fn container_run_command_under_a_repository_ceiling_keeps_its_network_interface() {
     if !harness::container::ensure_runtime_or_skip(&detect_runtime(), "network scope test") {
         return;
     }

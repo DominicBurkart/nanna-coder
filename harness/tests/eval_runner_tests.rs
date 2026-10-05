@@ -17,7 +17,7 @@ fn cases_dir() -> PathBuf {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_returns_result() {
+async fn ollama_run_eval_returns_result() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
@@ -28,7 +28,7 @@ async fn test_run_eval_returns_result() {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
             harness::container::skip_or_panic(&format!(
-                "test_run_eval_returns_result: model provider unavailable ({msg})"
+                "ollama_run_eval_returns_result: model provider unavailable ({msg})"
             ));
             return;
         }
@@ -41,7 +41,7 @@ async fn test_run_eval_returns_result() {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_timeout() {
+async fn ollama_run_eval_timeout() {
     let toml_str = r#"
 [case]
 id = "timeout-test"
@@ -77,7 +77,7 @@ timeout_secs = 1
             // rather than panic so the failure mode is distinct from a real
             // timeout-plumbing regression.
             harness::container::skip_or_panic(&format!(
-                "test_run_eval_timeout: model provider unavailable ({msg})"
+                "ollama_run_eval_timeout: model provider unavailable ({msg})"
             ));
         }
         other => panic!("expected Err(Timeout) (or ModelProvider unavailable), got {other:?}"),
@@ -86,7 +86,7 @@ timeout_secs = 1
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_isolation() {
+async fn ollama_run_eval_isolation() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
@@ -97,7 +97,7 @@ async fn test_run_eval_isolation() {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
             harness::container::skip_or_panic(&format!(
-                "test_run_eval_isolation: model provider unavailable ({msg})"
+                "ollama_run_eval_isolation: model provider unavailable ({msg})"
             ));
             return;
         }
@@ -114,7 +114,7 @@ async fn test_run_eval_isolation() {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_discover_and_run_all_cases() {
+async fn ollama_discover_and_run_all_cases() {
     let cases_dir = cases_dir();
     let cases = EvalCase::discover(&cases_dir).unwrap();
     assert!(
@@ -130,7 +130,7 @@ async fn test_discover_and_run_all_cases() {
             Ok(result) => assert_eq!(result.case_id, eval_case.case.id),
             Err(EvalRunnerError::ModelProvider(msg)) => {
                 harness::container::skip_or_panic(&format!(
-                    "test_discover_and_run_all_cases: model provider unavailable ({msg})"
+                    "ollama_discover_and_run_all_cases: model provider unavailable ({msg})"
                 ));
                 return;
             }
