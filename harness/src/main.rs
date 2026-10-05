@@ -1497,6 +1497,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deploy_release_refuses_without_a_terminal_grant() {
+        let real = tempfile::tempdir().unwrap();
+        std::env::set_var(
+            harness::rollout::ROLLOUT_PATH_ENV,
+            real.path().join("rollouts.jsonl"),
+        );
+        let err = run_deploy(DeployCommands::Release {
+            id: "rollout-1".into(),
+        })
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
     async fn fake_roll_forward_leaves_the_real_record_untouched() {
         let _env = ROLLOUT_ENV.lock().await;
         let repo = fake_repo();
