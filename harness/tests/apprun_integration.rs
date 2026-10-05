@@ -10,8 +10,11 @@
 
 use harness::apprun::{Limits, DEFAULT_PORT_RANGE};
 use harness::apprun::{PortAllocator, APP_LOGS_TOOL, APP_START_TOOL, APP_STOP_TOOL};
-use harness::container::detect_runtime;
-use harness::sidecar::{build_image_from_containerfile, container_exists, SystemRunner};
+use harness::container::{detect_runtime, ContainerRuntime};
+use harness::sidecar::{
+    build_image_from_containerfile, container_exists, CommandRunner, RunOutput, SidecarError,
+    SystemRunner,
+};
 use harness::tools::ToolRegistry;
 use harness::workspace::TaskWorkspace;
 use serde_json::{json, Value};
@@ -73,34 +76,25 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-#[tokio::test]
-#[ignore]
-async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
-    let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
-        return;
-    }
-    async fn curl(registry: &ToolRegistry, url: &str) -> Value {
-        registry
-            .execute(
-                "run_command",
-                json!({ "command": format!("curl -sf {url}") }),
-            )
-            .await
-            .expect("run_command must execute")
-    }
+async fn curl(registry: &ToolRegistry, url: &str) -> Value {
+    registry
+        .execute(
+            "run_command",
+            json!({ "command": format!("curl -sf {url}") }),
+        )
+        .await
+        .expect("run_command must execute")
+}
 
-    async fn app(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
-        registry
-            .execute(tool, args)
-            .await
-            .unwrap_or_else(|e| panic!("{tool} failed: {e}"))
-    }
+async fn app(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
+    registry
+        .execute(tool, args)
+        .await
+        .unwrap_or_else(|e| panic!("{tool} failed: {e}"))
+}
 
-    let image_context = tempfile::tempdir().unwrap();
-    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
-    let containerfile = format!(
+fn dev_containerfile() -> String {
+    format!(
         "FROM docker.io/library/rust:1-bookworm\n\
          RUN rustup target add wasm32-unknown-unknown \\\n\
          \x20&& curl -fsSL {TRUNK_URL} | tar -xz -C /usr/local/bin trunk \\\n\
@@ -113,15 +107,33 @@ async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
          RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
          \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
          CMD [\"sleep\", \"infinity\"]\n"
-    );
-    build_image_from_containerfile(
-        &SystemRunner,
-        &runtime,
-        DEV_IMAGE_TAG,
-        image_context.path(),
-        &containerfile,
     )
-    .unwrap();
+}
+
+fn build_dev_image(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+) -> Result<(), SidecarError> {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), &dir.path().join("fixture"));
+    build_image_from_containerfile(
+        runner,
+        runtime,
+        DEV_IMAGE_TAG,
+        dir.path(),
+        &dev_containerfile(),
+    )
+}
+
+#[tokio::test]
+#[ignore]
+async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+    build_dev_image(&SystemRunner, &runtime).unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -300,4 +312,148 @@ fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
     for skipped in ["target", "dist", ".git"] {
         assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
     }
+}
+
+struct StubTool {
+    name: &'static str,
+    reply: Value,
+    seen: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl harness::tools::Tool for StubTool {
+    fn definition(&self) -> model::types::ToolDefinition {
+        model::types::ToolDefinition {
+            function: model::types::FunctionDefinition {
+                name: self.name.to_string(),
+                description: "stub".to_string(),
+                parameters: model::types::JsonSchema {
+                    schema_type: model::types::SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> harness::tools::ToolResult<Value> {
+        self.seen.lock().unwrap().push(args);
+        Ok(self.reply.clone())
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn effect_class(&self) -> harness::effects::EffectClass {
+        harness::effects::EffectClass::Workspace
+    }
+}
+
+fn registry_with(name: &'static str, reply: Value) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(StubTool {
+        name,
+        reply,
+        seen: std::sync::Mutex::new(vec![]),
+    }));
+    registry
+}
+
+#[tokio::test]
+async fn curl_runs_a_silent_failing_curl_through_run_command() {
+    let registry = registry_with("run_command", json!({ "success": true, "stdout": "ok" }));
+    let out = curl(&registry, "http://127.0.0.1:1/x").await;
+    assert_eq!(out["stdout"], "ok");
+}
+
+#[tokio::test]
+#[should_panic(expected = "run_command must execute")]
+async fn curl_panics_when_run_command_is_missing() {
+    curl(&ToolRegistry::new(), "http://127.0.0.1:1/x").await;
+}
+
+#[tokio::test]
+async fn app_returns_the_tool_result() {
+    let registry = registry_with("app_start", json!({ "port": 1 }));
+    assert_eq!(app(&registry, "app_start", Value::Null).await["port"], 1);
+}
+
+#[tokio::test]
+#[should_panic(expected = "app_stop failed")]
+async fn app_panics_naming_the_failing_tool() {
+    app(&ToolRegistry::new(), "app_stop", Value::Null).await;
+}
+
+#[test]
+fn stub_tool_describes_itself_by_name() {
+    let registry = registry_with("probe", Value::Null);
+    let tool = registry.get_tool("probe").unwrap();
+    assert_eq!(tool.definition().function.name, "probe");
+    assert_eq!(tool.definition().function.description, "stub");
+}
+
+#[test]
+fn dev_containerfile_installs_the_toolchain_and_prebuilds_the_fixture() {
+    let containerfile = dev_containerfile();
+    assert!(containerfile.starts_with("FROM docker.io/library/rust:1-bookworm\n"));
+    assert!(containerfile.contains("rustup target add wasm32-unknown-unknown"));
+    assert!(containerfile.contains(TRUNK_URL));
+    assert!(containerfile.contains("COPY fixture /src"));
+    assert!(containerfile.contains("trunk build"));
+    assert!(containerfile.contains("cargo build --package api"));
+    assert!(containerfile.ends_with("CMD [\"sleep\", \"infinity\"]\n"));
+}
+
+type BuildCall = (String, Vec<String>, String, bool);
+
+struct RecordingBuildRunner {
+    success: bool,
+    seen: std::sync::Mutex<Vec<BuildCall>>,
+}
+
+impl CommandRunner for RecordingBuildRunner {
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<RunOutput> {
+        let context = Path::new(args.last().unwrap());
+        let containerfile = std::fs::read_to_string(context.join("Containerfile")).unwrap();
+        let fixture_copied = context.join("fixture/Cargo.toml").is_file();
+        self.seen.lock().unwrap().push((
+            program.to_string(),
+            args.to_vec(),
+            containerfile,
+            fixture_copied,
+        ));
+        Ok(RunOutput {
+            success: self.success,
+            stdout: String::new(),
+            stderr: "boom".to_string(),
+        })
+    }
+}
+
+#[test]
+fn build_dev_image_builds_the_tagged_image_from_the_copied_fixture() {
+    let runner = RecordingBuildRunner {
+        success: true,
+        seen: std::sync::Mutex::new(vec![]),
+    };
+    build_dev_image(&runner, &ContainerRuntime::Podman).unwrap();
+    let seen = runner.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (program, args, containerfile, fixture_copied) = &seen[0];
+    assert_eq!(program, "podman");
+    assert_eq!(&args[..3], ["build", "-q", "-t"]);
+    assert_eq!(args[3], DEV_IMAGE_TAG);
+    assert_eq!(containerfile, &dev_containerfile());
+    assert!(fixture_copied, "fixture must be copied into the context");
+}
+
+#[test]
+fn build_dev_image_surfaces_a_failed_build() {
+    let runner = RecordingBuildRunner {
+        success: false,
+        seen: std::sync::Mutex::new(vec![]),
+    };
+    let err = build_dev_image(&runner, &ContainerRuntime::Podman).unwrap_err();
+    assert!(err.to_string().contains("boom"), "{err}");
 }
