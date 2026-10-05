@@ -10,8 +10,14 @@ use thiserror::Error;
 /// adapter chooses it.
 pub const BROKER_SOCKET_CONTAINER_PATH: &str = "/nanna/broker.sock";
 
-const ALLOWED_ENV_NAMES: [&str; 3] = ["HOME", "LANG", "PI_CODING_AGENT_DIR"];
-const ALLOWED_ENV_PREFIX: &str = "NANNA_";
+const ALLOWED_ENV_NAMES: [&str; 5] = [
+    "HOME",
+    "LANG",
+    "PI_CODING_AGENT_DIR",
+    "NANNA_BROKER_SOCKET",
+    "NANNA_CAPABILITIES",
+];
+const SECRET_MARKERS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "COOKIE"];
 
 /// A way a plan breaks the isolation contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -73,8 +79,9 @@ pub enum IsolationViolation {
 ///
 /// The contract: the only mount is the broker socket; the only network
 /// endpoint is the agent's model gateway; the capabilities exposed are a
-/// subset of those granted; environment names are on a fixed allowlist
-/// (`NANNA_*`, `HOME`, `LANG`, `PI_CODING_AGENT_DIR`); the agent's limits and
+/// subset of those granted; environment names are an exact-name allowlist
+/// (`HOME`, `LANG`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`,
+/// `NANNA_CAPABILITIES`) that must also pass a secret-marker check; the agent's limits and
 /// scope are carried unchanged; files are placed
 /// at absolute paths without `..`; the image is the one the agent resolved
 /// with.
@@ -179,7 +186,8 @@ fn path_is_contained(path: &Path) -> bool {
 }
 
 fn env_allowed(name: &str) -> bool {
-    ALLOWED_ENV_NAMES.contains(&name) || name.starts_with(ALLOWED_ENV_PREFIX)
+    let upper = name.to_ascii_uppercase();
+    ALLOWED_ENV_NAMES.contains(&name) && !SECRET_MARKERS.iter().any(|m| upper.contains(m))
 }
 
 #[cfg(test)]
@@ -348,6 +356,9 @@ max_concurrent = 1
             "SSH_AUTH_SOCK",
             "NANNA",
             "LD_PRELOAD",
+            "NANNA_GITHUB_TOKEN",
+            "NANNA_API_KEY",
+            "NANNA_ANYTHING",
         ] {
             let mut plan = good_plan();
             plan.env.push((name.into(), "x".into()));
@@ -364,10 +375,16 @@ max_concurrent = 1
     #[test]
     fn accepts_allowlisted_env() {
         let mut plan = good_plan();
-        plan.env = ["HOME", "LANG", "PI_CODING_AGENT_DIR", "NANNA_ANYTHING"]
-            .iter()
-            .map(|n| (n.to_string(), "x".to_string()))
-            .collect();
+        plan.env = [
+            "HOME",
+            "LANG",
+            "PI_CODING_AGENT_DIR",
+            "NANNA_BROKER_SOCKET",
+            "NANNA_CAPABILITIES",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), "x".to_string()))
+        .collect();
         assert_eq!(IsolationPolicy::check(&plan, &agent()), Ok(()));
     }
 
