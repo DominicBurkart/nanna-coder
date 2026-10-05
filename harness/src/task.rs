@@ -1772,6 +1772,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_submit_records_sidecar_setup_failure() {
         let fake = crate::test_support::FakePodman::install_async(Some("network create")).await;

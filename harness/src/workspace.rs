@@ -693,6 +693,7 @@ mod tests {
         assert!(!ws.workspace_path.exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_create_with_container_starts_through_the_runtime_and_cleans_up() {
         let fake = crate::test_support::FakePodman::install_async(None).await;
@@ -726,6 +727,7 @@ mod tests {
         assert!(!ws.workspace_path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_cleanup_tolerates_failing_container_removal() {
         use crate::container::{ContainerHandle, ContainerRuntime};
