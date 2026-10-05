@@ -6,7 +6,7 @@ static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) struct FakePodman {
     dir: TempDir,
-    old_path: Option<OsString>,
+    old_path: Option<Option<OsString>>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -53,7 +53,7 @@ impl FakePodman {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         Self {
             dir,
-            old_path,
+            old_path: Some(old_path),
             _guard: guard,
         }
     }
@@ -75,12 +75,19 @@ fn read_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+impl FakePodman {
+    fn restore_path(&mut self) {
+        match self.old_path.take() {
+            Some(Some(old)) => std::env::set_var("PATH", old),
+            Some(None) => std::env::remove_var("PATH"),
+            None => {}
+        }
+    }
+}
+
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        match &self.old_path {
-            Some(old) => std::env::set_var("PATH", old),
-            None => std::env::remove_var("PATH"),
-        }
+        self.restore_path();
     }
 }
 
@@ -93,13 +100,14 @@ mod tests {
         let guard = PATH_LOCK.blocking_lock();
         let original = std::env::var_os("PATH");
         std::env::remove_var("PATH");
-        let fake = FakePodman::with_guard(guard, None);
+        let mut fake = FakePodman::with_guard(guard, None);
         assert!(std::env::var_os("PATH").is_some());
-        drop(fake);
+        fake.restore_path();
         let restored = std::env::var_os("PATH");
         if let Some(original) = original {
             std::env::set_var("PATH", original);
         }
+        drop(fake);
         assert_eq!(restored, None);
     }
 
