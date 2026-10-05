@@ -57,7 +57,7 @@ The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implemen
 
 Nanna exposes its coding capability as a **task-augmented tool** rather than a bespoke poll/result tool surface. `tools/list` advertises:
 
-- **`assign_task`** — declared with `execution.taskSupport: "required"`. Submit a coding task (natural-language description plus target repo); Nanna spawns an agent loop in an isolated worktree. Because task support is *required*, clients MUST augment the `tools/call` with a `task` field (per the Tasks extension); a non-augmented call returns `-32601`. The response is a `CreateTaskResult` carrying a `taskId` and initial `working` status.
+- **`assign_task`** — declared with `execution.taskSupport: "required"`. Submit a coding task (natural-language description, target repo and the required `identity` name); Nanna spawns an agent loop in an isolated worktree under that registered identity's scope. A missing `identity` is rejected with `-32602`; an unregistered one fails the task closed with `IdentityUnavailable`; a repository outside `scope.repos` fails it with `ScopeError`. Because task support is *required*, clients MUST augment the `tools/call` with a `task` field (per the Tasks extension); a non-augmented call returns `-32601`. The response is a `CreateTaskResult` carrying a `taskId` and initial `working` status.
 - **`onboard_repo`** — an ordinary synchronous tool (no task augmentation) that generates a `flake.nix` for a pure-Cargo Rust repository that lacks one.
 
 The task lifecycle uses the standard Tasks methods instead of custom tools:
@@ -173,3 +173,7 @@ flowchart TD
     C -- Can compile binary for --> n2(["Sandbox"])
     n2 -- Can be promoted to --> n3(["Release"])
 ```
+
+### Identity scope limits
+
+`run_command` executes `sh -c` in the dev container, so `scope.paths` and `scope.read_paths` cannot be applied to it. An identity whose `scope.paths` does not include `**`, or that sets `scope.read_paths` at all, never receives `run_command`, even when `scope.tools` names it. Only an identity with `paths = ["**"]` and no `read_paths` can run shell commands, and it is bounded by its effect ceiling and network policy alone. The network reach of a `repository`-ceiling identity holding `run_command` is tracked in #714.

@@ -656,6 +656,7 @@ mod tests {
         let mut identity = crate::identity::example();
         identity.scope.max_effect = ceiling;
         identity.scope.tools = vec!["*".parse().unwrap()];
+        identity.scope.paths = vec!["**".to_string()];
         identity
     }
 

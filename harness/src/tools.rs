@@ -58,6 +58,12 @@ pub struct ToolRegistry {
     denials: Mutex<Vec<ScopeDenial>>,
 }
 
+/// Tools whose reach cannot be confined to path globs. `run_command` hands
+/// the model `sh -c` inside the container, so `scope.paths` and
+/// `scope.read_paths` cannot apply to it; [`ToolRegistry::scoped_for`] removes
+/// these tools for any identity where [`AgentIdentity::restricts_paths`] holds.
+pub const PATH_UNSCOPABLE_TOOLS: &[&str] = &["run_command"];
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -72,6 +78,9 @@ impl ToolRegistry {
     /// `scope.max_effect`. Everything else is dropped, so it never appears in
     /// the definitions sent to the model. Calls to dropped or unknown tools
     /// are refused with [`ToolError::ScopeDenied`] and recorded.
+    ///
+    /// A tool in [`PATH_UNSCOPABLE_TOOLS`] is also dropped when the identity
+    /// restricts paths, because path globs cannot be applied to a shell.
     ///
     /// ```
     /// use harness::effects::EffectClass;
@@ -109,8 +118,11 @@ impl ToolRegistry {
     /// assert_eq!(scoped.denial_count(), 0);
     /// ```
     pub fn scoped_for(mut self, identity: &AgentIdentity) -> Self {
+        let restricted = identity.restricts_paths();
         let keep = |name: &String, tool: &mut Box<dyn Tool>| {
-            identity.allows_tool(name) && identity.allows_effect(tool.effect_class())
+            identity.allows_tool(name)
+                && identity.allows_effect(tool.effect_class())
+                && !(restricted && PATH_UNSCOPABLE_TOOLS.contains(&name.as_str()))
         };
         self.tools.retain(keep);
         self.identity = Some(identity.name().to_string());
@@ -3333,7 +3345,8 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        let mut identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        identity.scope.paths = vec!["**".to_string()];
         let registry = create_container_tool_registry_for(
             Path::new("."),
             std::sync::Arc::clone(&handle),
@@ -3342,6 +3355,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sorted_names(&registry), vec!["read_file", "run_command"]);
+
+        let path_scoped = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        assert!(path_scoped.restricts_paths());
+        let registry = create_container_tool_registry_for(
+            Path::new("."),
+            std::sync::Arc::clone(&handle),
+            CONTAINER_WORKSPACE_DIR,
+            &path_scoped,
+        )
+        .unwrap();
+        assert_eq!(sorted_names(&registry), vec!["read_file"]);
 
         let read_only = identity_with(EffectClass::None, &["run_command", "read_file"]);
         let registry = create_container_tool_registry_for(
@@ -4268,6 +4292,52 @@ mod tests {
         assert!(registry.get_tool("cargo_check").is_none());
         assert!(registry.get_tool("cargo_bench").is_none());
         assert!(registry.get_tool("cargo_run").is_none());
+    }
+
+    fn shell_identity(paths: &[&str], read_paths: Option<&[&str]>) -> AgentIdentity {
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.tools = vec!["run_command".parse().unwrap(), "echo".parse().unwrap()];
+        identity.scope.paths = strings(paths);
+        identity.scope.read_paths = read_paths.map(strings);
+        identity
+    }
+
+    fn shell_registry(identity: &AgentIdentity) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
+        registry.register(StubTool::boxed("echo", EffectClass::None));
+        registry.scoped_for(identity)
+    }
+
+    #[tokio::test]
+    async fn run_command_is_refused_for_an_identity_with_a_path_restriction() {
+        let restricted = [
+            shell_identity(&["src/**"], None),
+            shell_identity(&[], None),
+            shell_identity(&["**"], Some(&["src/**"])),
+            shell_identity(&["**"], Some(&["**"])),
+        ];
+        for identity in restricted {
+            let registry = shell_registry(&identity);
+            assert!(registry.get_tool("run_command").is_none(), "{identity:?}");
+            assert!(registry.get_tool("echo").is_some());
+            let err = registry
+                .execute("run_command", serde_json::json!({"command": "cat secrets"}))
+                .await
+                .unwrap_err();
+            assert_eq!(denial(err).reason, DenialReason::ToolNotInScope);
+            assert_eq!(registry.denial_count(), 1);
+        }
+    }
+
+    #[test]
+    fn run_command_is_kept_for_an_identity_without_a_path_restriction() {
+        for paths in [&["**"][..], &["api/**", "**"][..]] {
+            let registry = shell_registry(&shell_identity(paths, None));
+            assert!(registry.get_tool("run_command").is_some(), "{paths:?}");
+        }
     }
 }
 
