@@ -5,9 +5,11 @@
 #
 # A pull request authored by a Nanna identity carries the marker from
 # harness::marker (a `Nanna-Identity: <name>` commit trailer or a
-# `<!-- Nanna-Identity: <name> -->` comment in the PR body). When the marker
-# is present and the PR touches a protected path, the check fails. Human PRs
-# (no marker) are not affected. The pattern list mirrors
+# `<!-- Nanna-Identity: <name> -->` comment in the PR body). The check fails
+# closed: any PR touching a protected path fails, marker or not, unless it has
+# no marker and its author is listed in the repository variable
+# PROTECTED_PATTERNS_HUMAN_AUTHORS (comma-separated logins). Matching is
+# case-insensitive. The pattern list mirrors
 # harness::protected::PROTECTED_PATTERNS; a unit test keeps them in sync.
 
 name: protected-paths-guard
@@ -46,19 +48,15 @@ jobs:
             | grep -oE "(^Nanna-Identity:[[:blank:]]*${NAME_RE}[[:blank:]]*$)|(<!--[[:space:]]*Nanna-Identity:[[:space:]]*${NAME_RE}[[:space:]]*-->)" \
             | head -n 1 || true)"
           IDENTITY="$(printf '%s' "$MARKER" | sed -E "s/.*Nanna-Identity:[[:space:]]*(${NAME_RE}).*/\1/")"
-          if [ -z "$IDENTITY" ]; then
-            echo "no Nanna-Identity marker: not an agent PR, protected paths are not enforced here"
-          else
-            echo "agent PR authored by identity '$IDENTITY'"
-          fi
           echo "name=$IDENTITY" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse protected paths in an agent PR
-        if: steps.identity.outputs.name != ''
+      - name: Refuse protected paths unless a listed human authored the PR
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IDENTITY: ${{ steps.identity.outputs.name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PROTECTED_PATTERNS_HUMAN_AUTHORS: ${{ vars.PROTECTED_PATTERNS_HUMAN_AUTHORS }}
         run: |
           set -euo pipefail
           PROTECTED_PATTERNS=(
@@ -69,7 +67,20 @@ jobs:
             ".github/CODEOWNERS"
             "codecov.yml"
             "windows.toml"
+            "tarpaulin.toml"
+            "deny.toml"
+            "flake.nix"
+            "flake.lock"
+            ".github/rulesets/**"
+            ".githooks/**"
+            ".cargo/**"
+            ".devcontainer/**"
+            "AGENTS.md"
+            "evals/cases/**"
+            "harness/src/protected.rs"
+            "auditor/**"
           )
+          shopt -s nocasematch
           VIOLATIONS=()
           while IFS= read -r -d '' path; do
             [ -z "$path" ] && continue
@@ -87,12 +98,23 @@ jobs:
           done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
 
           if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
-            echo "identity '$IDENTITY' touched no protected path"
+            echo "no protected path touched"
             exit 0
           fi
 
+          if [ -z "$IDENTITY" ]; then
+            IFS=',' read -r -a HUMANS <<< "$PROTECTED_PATTERNS_HUMAN_AUTHORS"
+            for human in "${HUMANS[@]}"; do
+              human="${human//[[:space:]]/}"
+              if [ -n "$human" ] && [ "${human,,}" = "${PR_AUTHOR,,}" ]; then
+                echo "protected paths touched by listed human author '$PR_AUTHOR'"
+                exit 0
+              fi
+            done
+          fi
+
           {
-            echo "::error::PR authored by Nanna identity '$IDENTITY' touches protected paths:"
+            echo "::error::PR (identity marker: '${IDENTITY:-none}', author: '$PR_AUTHOR') touches protected paths:"
             for v in "${VIOLATIONS[@]}"; do echo "  - $v"; done
             echo ""
             echo "Nanna may not modify its own configuration (identities, RBAC policy,"
