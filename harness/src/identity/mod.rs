@@ -23,6 +23,13 @@
 //! max_concurrent = 4
 //! ```
 //!
+//! `scope.paths` and `scope.read_paths` are enforced by the file tools
+//! (`read_file`, `write_file`, `list_directory`, `search`) and cannot be
+//! enforced for `run_command`, which runs `sh -c`. An identity whose
+//! `scope.paths` does not include `**`, or that sets `scope.read_paths`,
+//! therefore never receives `run_command`, even if `scope.tools` lists it
+//! ([`AgentIdentity::restricts_paths`]).
+//!
 //! [`AgentIdentity::from_toml_str`] parses and validates a single file;
 //! [`IdentityCatalog`] loads a directory of them and applies repo-local
 //! overrides, which may only narrow the global identity they shadow.
@@ -38,6 +45,9 @@ mod narrowing;
 mod schema;
 
 pub use schema::{AgentIdentity, IdentitySection, LimitsSection, ScopeSection, SystemPrompt};
+
+#[cfg(test)]
+pub(crate) use schema::tests::example;
 
 use std::path::PathBuf;
 use thiserror::Error;

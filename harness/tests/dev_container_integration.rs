@@ -108,6 +108,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args,
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let handle = start_container_with_fallback(&config)
@@ -301,6 +302,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args,
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let handle = Arc::new(
@@ -346,6 +348,7 @@ async fn cargo_deny_tool_output_has_command_field() {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args,
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let handle = Arc::new(
@@ -407,6 +410,7 @@ async fn cargo_check_tool_succeeds_in_nanna_container() {
         health_check_timeout: Duration::from_secs(5),
         env_vars: vec![],
         additional_args,
+        network: harness::container::NetworkPolicy::Enabled,
     };
 
     let handle = Arc::new(
