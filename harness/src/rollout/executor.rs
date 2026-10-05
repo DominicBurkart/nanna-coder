@@ -16,6 +16,8 @@ use crate::windows::WindowSet;
 use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
 
+const LIVE_SPLIT_LEASE_TTL: Duration = Duration::days(36_500);
+
 enum Verdict {
     Healthy,
     Breach(HealthBreach),
@@ -286,7 +288,7 @@ impl RolloutExecutor {
     /// Human-only: no agent tool exposes this.
     pub fn halt(&self, id: &str) -> Result<RolloutRecord, RolloutError> {
         let record = self.log.halt(id, self.clock.now())?;
-        self.leases.release_all(id)?;
+        self.settle_lease(&record)?;
         Ok(record)
     }
 
@@ -349,11 +351,27 @@ impl RolloutExecutor {
                     self.persist(&mut record, *resume_state)?;
                 }
                 RolloutState::Complete | RolloutState::RolledBack | RolloutState::Halted => {
-                    self.leases.release_all(&record.id)?;
+                    self.settle_lease(&record)?;
                     return Ok(record);
                 }
             }
         }
+    }
+
+    fn settle_lease(&self, record: &RolloutRecord) -> Result<(), RolloutError> {
+        if record.state == RolloutState::Halted && record.traffic_percent > 0 {
+            let now = self.clock.now();
+            acquire_all(
+                &*self.leases,
+                &[record.lease_name()?],
+                &record.id,
+                LIVE_SPLIT_LEASE_TTL,
+                now,
+            )?;
+            return Ok(());
+        }
+        self.leases.release_all(&record.id)?;
+        Ok(())
     }
 
     fn persist(&self, record: &mut RolloutRecord, next: RolloutState) -> Result<(), RolloutError> {
@@ -790,7 +808,7 @@ impl RolloutExecutor {
         breach: Option<HealthBreach>,
     ) -> Result<(), RolloutError> {
         self.persist(&mut record, RolloutState::Halted)?;
-        self.leases.release_all(&record.id)?;
+        self.settle_lease(&record)?;
         let escalation = RolloutEscalation {
             rollout_id: record.id.clone(),
             environment: record.plan.environment.clone(),
@@ -1161,9 +1179,10 @@ mod tests {
             "step 1: error_rate_max 0.01 breached by error rate 0.2"
         );
         assert_eq!(escalations[0].breach, halted.breach);
-        assert!(
-            rig.leases.snapshot().unwrap().is_empty(),
-            "a halted rollout releases the deploy lease"
+        assert_eq!(
+            rig.leases.snapshot().unwrap().len(),
+            1,
+            "a halted rollout with a live split keeps the deploy lease"
         );
         assert_eq!(rig.executor.run(&record.id).await.unwrap(), halted);
     }
@@ -2363,29 +2382,34 @@ mod tests {
         assert!(held_by(&rig).is_empty());
     }
 
+    fn set_traffic_calls(rig: &Rig) -> usize {
+        rig.adapter
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, AdapterCall::SetTraffic(..)))
+            .count()
+    }
+
     #[tokio::test]
-    async fn the_lease_is_released_when_the_rollout_halts() {
+    async fn a_halt_with_zero_traffic_releases_the_lease() {
         let rig = rig();
-        rig.audit.deny_from(1, "no");
+        rig.audit.deny_from(0, "no");
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
-        assert_eq!(
-            rig.executor.run(&record.id).await.unwrap().state,
-            RolloutState::Halted
-        );
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 0);
         assert!(held_by(&rig).is_empty());
 
         let rig = self::rig();
         rig.health.set_failing(true);
         let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
-        assert_eq!(
-            rig.executor.run(&record.id).await.unwrap().state,
-            RolloutState::Halted
-        );
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.traffic_percent, 0);
         assert!(held_by(&rig).is_empty());
     }
 
     #[tokio::test]
-    async fn the_lease_is_released_when_escalation_fails_after_a_halt() {
+    async fn a_halt_with_zero_traffic_releases_the_lease_even_when_escalation_fails() {
         let rig = rig();
         rig.escalation.set_failing(true);
         rig.audit.deny_from(0, "no");
@@ -2395,35 +2419,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_lease_is_released_after_a_rollback_and_after_an_operator_halt() {
+    async fn a_halt_with_a_live_split_keeps_the_lease_and_refuses_a_second_rollout() {
+        let rig = rig();
+        rig.audit.deny_from(1, "no");
+        let first = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let halted = rig.executor.run(&first.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 10);
+        assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+        assert_eq!(rig.executor.run(&first.id).await.unwrap(), halted);
+        assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+
+        let before = set_traffic_calls(&rig);
+        let second = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+        let parked = rig.executor.run(&second.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        assert_eq!(parked.traffic_percent, 0);
+        assert_eq!(set_traffic_calls(&rig), before);
+        assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+    }
+
+    #[tokio::test]
+    async fn a_halt_with_a_live_split_keeps_the_lease_when_escalation_fails() {
+        let rig = rig();
+        rig.escalation.set_failing(true);
+        rig.audit.deny_from(1, "no");
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        assert!(rig.executor.run(&record.id).await.is_err());
+        assert_eq!(held_by(&rig), std::slice::from_ref(&record.id));
+    }
+
+    #[tokio::test]
+    async fn lease_expiry_does_not_free_a_live_split() {
+        let rig = rig();
+        rig.audit.deny_from(1, "no");
+        let first = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        rig.executor.run(&first.id).await.unwrap();
+        rig.clock.advance(Duration::days(365));
+        let second = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+        let parked = rig.executor.run(&second.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        assert_eq!(
+            rig.leases.expired(rig.clock.now()).unwrap(),
+            vec![],
+            "the held lease has not lapsed"
+        );
+        assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+    }
+
+    #[tokio::test]
+    async fn rollback_releases_the_lease_and_a_second_rollout_starts() {
         let rig = rig();
         rig.health.push_after(3, breach_sample());
-        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let first = rig.executor.start(plan("sandbox"), V2).await.unwrap();
         assert_eq!(
-            rig.executor.run(&record.id).await.unwrap().state,
+            rig.executor.run(&first.id).await.unwrap().state,
             RolloutState::RolledBack
         );
         assert!(held_by(&rig).is_empty());
+        let second = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&second.id).await.unwrap().state,
+            RolloutState::Complete
+        );
+    }
 
-        let rig = self::rig();
-        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
-        rig.executor.run(&record.id).await.unwrap();
-        let log = RolloutLog::open(&rig.path).unwrap();
-        let other = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+    #[tokio::test]
+    async fn roll_forward_from_a_held_split_is_the_human_release_path() {
+        let rig = rig();
+        rig.audit.deny_from(1, "no");
+        let first = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        rig.executor.run(&first.id).await.unwrap();
+        assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+        rig.audit.deny_from(99, "reset");
+        rig.executor
+            .roll_forward(&first.id, V3, Some("https://example.invalid/pr/1"))
+            .await
+            .unwrap();
+        let done = rig.executor.run(&first.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        assert!(held_by(&rig).is_empty());
+        let second = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&second.id).await.unwrap().state,
+            RolloutState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_halt_keeps_the_lease_only_while_traffic_is_routed() {
+        let rig = rig();
+        let mut live = RolloutRecord::new("rollout-live", plan("sandbox"), V2, V1, t0());
+        live.state = RolloutState::Step(1);
+        live.traffic_percent = 10;
+        rig.executor.log().append(None, &live).unwrap();
         rig.leases
             .acquire(
-                &LeaseName::deploy("registry.example.invalid/ns/app", "sandbox"),
-                &other.id,
-                Duration::hours(1),
-                rig.clock.now(),
+                &live.lease_name().unwrap(),
+                "rollout-live",
+                Duration::minutes(5),
+                t0(),
             )
             .unwrap();
-        rig.executor.halt(&other.id).unwrap();
-        assert_eq!(log.load(&other.id).unwrap().state, RolloutState::Halted);
-        assert_eq!(
-            rig.executor.run(&other.id).await.unwrap().state,
-            RolloutState::Halted
-        );
+        rig.executor.halt("rollout-live").unwrap();
+        rig.clock.advance(Duration::days(30));
+        assert_eq!(held_by(&rig), ["rollout-live".to_string()]);
+        assert!(rig.leases.expired(rig.clock.now()).unwrap().is_empty());
+
+        let rig = self::rig();
+        let idle = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        rig.leases
+            .acquire(
+                &idle.lease_name().unwrap(),
+                &idle.id,
+                Duration::minutes(5),
+                t0(),
+            )
+            .unwrap();
+        rig.executor.halt(&idle.id).unwrap();
         assert!(held_by(&rig).is_empty());
     }
 
