@@ -59,24 +59,35 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn implementer_only_gate() -> SpawnGate {
+        gate_over(&["rust-implementer"], Box::new(super::NoopEscalationHook))
+    }
+
+    pub(crate) fn gate_over(
+        identities: &[&str],
+        hook: Box<dyn super::SpawnEscalationHook>,
+    ) -> SpawnGate {
         let source = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/identities/global"
         ));
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("prompts")).unwrap();
-        for file in [
-            "auditor.toml",
-            "rust-implementer.toml",
-            "prompts/auditor.md",
-            "prompts/rust-implementer.md",
-        ] {
-            std::fs::copy(source.join(file), dir.path().join(file)).unwrap();
+        for name in identities.iter().chain(&["auditor"]) {
+            for file in [format!("{name}.toml"), format!("prompts/{name}.md")] {
+                if source.join(&file).exists() {
+                    std::fs::copy(source.join(&file), dir.path().join(&file)).unwrap();
+                }
+            }
         }
         let catalog = IdentityCatalog::load(dir.path()).unwrap();
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
-        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+        SpawnGate::with_hook(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context,
+            hook,
+        )
     }
 
     pub(crate) fn repo_with_origin(url: &str) -> tempfile::TempDir {

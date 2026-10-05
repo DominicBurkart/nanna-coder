@@ -5,9 +5,7 @@
 //! work (`assign_task`, `onboard_repo`), and the mappers that turn an internal
 //! [`Task`] into its MCP Tasks wire representation.
 
-use crate::auditor::{SpawnGate, SpawnRequest, TaskSummary};
-use crate::effects::EffectClass;
-use crate::identity::DevLoop;
+use crate::auditor::{SpawnGate, TaskSummary};
 use crate::onboarding::DeterministicOnboarder;
 use crate::onboarding::Onboarder;
 use crate::task::{Task, TaskManager, TaskStatus};
@@ -79,20 +77,17 @@ pub async fn handle_assign_task(
         .to_string();
 
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
-    let card = spawn_gate.context().catalog().get(&identity);
     let repo =
         crate::scope::origin_slug(&repo_path).unwrap_or_else(|| repo_path.display().to_string());
-    let request = SpawnRequest {
-        parent_task: TaskSummary::new(
+    let request = spawn_gate.request(
+        TaskSummary::new(
             format!("mcp-{}", uuid::Uuid::new_v4()),
             description.clone(),
             repo,
         ),
         identity,
-        subtask: description,
-        dev_loop: card.map_or(DevLoop::Inner, |card| card.identity.dev_loop),
-        requested_effect: card.map_or(EffectClass::None, |card| card.scope.max_effect),
-    };
+        description,
+    );
     let allowed = spawn_gate
         .check(request)
         .await
@@ -528,7 +523,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assign_task_escalates_a_production_request_and_queues_nothing() {
+    async fn test_assign_task_blocks_a_production_request_from_an_inner_loop_card_and_queues_nothing(
+    ) {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
@@ -549,7 +545,10 @@ mod tests {
         assert!(manager.list().await.is_empty());
         let log = gate.log().entries().unwrap();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Escalate);
+        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Block);
+        let codes: Vec<_> = log[0].verdict.reasons().iter().map(|r| r.code).collect();
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
     }
 
     #[tokio::test]

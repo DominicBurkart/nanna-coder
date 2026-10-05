@@ -23,6 +23,7 @@ mod log;
 mod model;
 mod redact;
 mod sink;
+mod spawn_hook;
 mod webhook;
 
 pub use card::{CardRequest, MODEL_PLACEHOLDER};
@@ -37,4 +38,5 @@ pub use redact::{marker, redact, redact_value};
 pub use sink::{
     DeliveryOutcome, DeliveryReceipt, EscalationError, EscalationSink, FanoutSink, SinkFailure,
 };
+pub use spawn_hook::EscalatorSpawnHook;
 pub use webhook::WebhookSink;
