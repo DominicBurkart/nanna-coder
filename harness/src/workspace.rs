@@ -456,7 +456,10 @@ pub fn protected_mounts(
                 placeholders.push(root.path.clone());
             }
         }
-        let container = Path::new(CONTAINER_WORKSPACE_DIR).join(&root.path);
+        let container = PathBuf::from(format!(
+            "{CONTAINER_WORKSPACE_DIR}/{}",
+            crate::scope::denial_path(&root.path)
+        ));
         mounts.push(ReadOnlyMount::new(host, container));
     }
     Ok(ProtectedMounts {
