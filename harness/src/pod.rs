@@ -507,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     fn bring_up_command_requires_flake_for_nix_path() {
         // Non-existent dir → no flake.nix → nix path NOT chosen even when
         // `nix` is on PATH. (The fallback may still kick in via
@@ -527,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     fn bring_up_command_picks_nix_when_flake_present() {
         // Skip if `nix` is not on PATH (CI without nix shouldn't false-fail).
         if which::which("nix").is_err() {
@@ -541,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(container_env_var)]
     fn skip_reason_is_inside_container_does_not_panic() {
         // Just exercise the helper for coverage. Behaviour depends on the
         // host so we only assert the call doesn't panic and returns a bool.
@@ -701,6 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(container_env_var)]
     async fn ensure_running_returns_already_up_when_probe_succeeds() {
         let url = start_ok_http_server().await;
         let cfg = EnsureConfig {
