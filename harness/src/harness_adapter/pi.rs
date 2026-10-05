@@ -10,7 +10,7 @@
 
 use super::isolation::BROKER_SOCKET_CONTAINER_PATH;
 use super::{
-    HarnessAdapter, HarnessKind, LaunchPlan, Mount, NetworkPolicy, PlanFile, ResolvedAgent,
+    HarnessAdapter, HarnessKind, LaunchPlan, Mount, PlanFile, PlanNetwork, ResolvedAgent,
     Unsupported,
 };
 use std::path::PathBuf;
@@ -147,13 +147,15 @@ impl HarnessAdapter for PiAdapter {
                 container: PathBuf::from(BROKER_SOCKET_CONTAINER_PATH),
                 read_only: false,
             }],
-            network: NetworkPolicy::Only(vec![agent.endpoint.clone()]),
+            network: PlanNetwork::Only(vec![agent.endpoint.clone()]),
             stdin: vec![prompt],
             exposed_capabilities: agent
                 .capability_names()
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            limits: agent.limits,
+            scope: agent.scope.clone(),
         })
     }
 }
@@ -286,7 +288,7 @@ max_concurrent = 1
         assert_eq!(json["providers"]["nanna"]["models"][0]["id"], "gemma4:e4b");
         assert_eq!(
             plan.network,
-            NetworkPolicy::Only(vec![Endpoint::new("model-gateway", 11434).unwrap()])
+            PlanNetwork::Only(vec![Endpoint::new("model-gateway", 11434).unwrap()])
         );
     }
 

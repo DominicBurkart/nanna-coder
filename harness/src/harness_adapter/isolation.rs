@@ -1,7 +1,7 @@
 //! The isolation contract every [`LaunchPlan`] must satisfy, whatever runtime
 //! it targets.
 
-use super::{LaunchPlan, NetworkPolicy, ResolvedAgent};
+use super::{LaunchPlan, PlanNetwork, ResolvedAgent};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
@@ -10,8 +10,8 @@ use thiserror::Error;
 /// adapter chooses it.
 pub const BROKER_SOCKET_CONTAINER_PATH: &str = "/nanna/broker.sock";
 
-const SECRET_MARKERS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "COOKIE"];
-const SECRET_PREFIXES: [&str; 4] = ["GH_", "GITHUB_", "AWS_", "SSH_"];
+const ALLOWED_ENV_NAMES: [&str; 3] = ["HOME", "LANG", "PI_CODING_AGENT_DIR"];
+const ALLOWED_ENV_PREFIX: &str = "NANNA_";
 
 /// A way a plan breaks the isolation contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -46,9 +46,9 @@ pub enum IsolationViolation {
         /// Capability name.
         name: String,
     },
-    /// The plan passes something that looks like a secret into the container.
-    #[error("environment variable `{name}` looks like a secret")]
-    SecretEnv {
+    /// The plan sets an environment variable outside the allowlist.
+    #[error("environment variable `{name}` is not on the allowlist")]
+    EnvNotAllowed {
         /// Variable name.
         name: String,
     },
@@ -58,6 +58,12 @@ pub enum IsolationViolation {
         /// Offending path.
         path: PathBuf,
     },
+    /// The plan's limits differ from the agent's, so a ceiling would go unenforced.
+    #[error("plan limits differ from the agent's")]
+    LimitsDropped,
+    /// The plan's scope differs from the agent's, so the broker would not enforce it.
+    #[error("plan scope differs from the agent's")]
+    ScopeDropped,
     /// The plan has no command to run.
     #[error("plan has an empty argv")]
     EmptyArgv,
@@ -67,12 +73,14 @@ pub enum IsolationViolation {
 ///
 /// The contract: the only mount is the broker socket; the only network
 /// endpoint is the agent's model gateway; the capabilities exposed are a
-/// subset of those granted; no secret-looking environment; files are placed
+/// subset of those granted; environment names are on a fixed allowlist
+/// (`NANNA_*`, `HOME`, `LANG`, `PI_CODING_AGENT_DIR`); the agent's limits and
+/// scope are carried unchanged; files are placed
 /// at absolute paths without `..`; the image is the one the agent resolved
 /// with.
 ///
 /// ```
-/// use harness::harness_adapter::{IsolationPolicy, IsolationViolation, LaunchPlan, NetworkPolicy};
+/// use harness::harness_adapter::{IsolationPolicy, IsolationViolation, LaunchPlan, PlanNetwork};
 ///
 /// let plan = LaunchPlan {
 ///     image: "img".into(),
@@ -80,9 +88,11 @@ pub enum IsolationViolation {
 ///     argv: vec![],
 ///     env: vec![],
 ///     mounts: vec![],
-///     network: NetworkPolicy::None,
+///     network: PlanNetwork::None,
 ///     stdin: vec![],
 ///     exposed_capabilities: vec![],
+///     limits: harness::identity::LimitsSection { max_iterations: 1, max_wall_clock_secs: 1, max_concurrent: 1 },
+///     scope: harness::harness_adapter::ScopeGrant { repos: vec![], paths: vec![], read_paths: None },
 /// };
 /// assert_eq!(IsolationPolicy::violations(&plan, None).first(), Some(&IsolationViolation::EmptyArgv));
 /// ```
@@ -104,8 +114,8 @@ impl IsolationPolicy {
             }
         }
         for (name, _) in &plan.env {
-            if looks_secret(name) {
-                found.push(IsolationViolation::SecretEnv { name: name.clone() });
+            if !env_allowed(name) {
+                found.push(IsolationViolation::EnvNotAllowed { name: name.clone() });
             }
         }
         let Some(agent) = agent else {
@@ -127,13 +137,19 @@ impl IsolationPolicy {
                 });
             }
         }
-        if let NetworkPolicy::Only(endpoints) = &plan.network {
+        if let PlanNetwork::Only(endpoints) = &plan.network {
             for endpoint in endpoints.iter().filter(|e| **e != agent.endpoint) {
                 found.push(IsolationViolation::Network {
                     host: endpoint.host().to_string(),
                     port: endpoint.port(),
                 });
             }
+        }
+        if plan.limits != agent.limits {
+            found.push(IsolationViolation::LimitsDropped);
+        }
+        if plan.scope != agent.scope {
+            found.push(IsolationViolation::ScopeDropped);
         }
         let granted: BTreeSet<&str> = agent.capability_names().into_iter().collect();
         for name in plan
@@ -162,10 +178,8 @@ fn path_is_contained(path: &Path) -> bool {
             .all(|c| !matches!(c, Component::ParentDir))
 }
 
-fn looks_secret(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    SECRET_MARKERS.iter().any(|m| upper.contains(m))
-        || SECRET_PREFIXES.iter().any(|p| upper.starts_with(p))
+fn env_allowed(name: &str) -> bool {
+    ALLOWED_ENV_NAMES.contains(&name) || name.starts_with(ALLOWED_ENV_PREFIX)
 }
 
 #[cfg(test)]
@@ -225,9 +239,11 @@ max_concurrent = 1
                 container: BROKER_SOCKET_CONTAINER_PATH.into(),
                 read_only: false,
             }],
-            network: NetworkPolicy::Only(vec![Endpoint::new("gw", 11434).unwrap()]),
+            network: PlanNetwork::Only(vec![Endpoint::new("gw", 11434).unwrap()]),
             stdin: vec![],
             exposed_capabilities: vec!["read_file".into()],
+            limits: agent().limits,
+            scope: agent().scope,
         }
     }
 
@@ -239,7 +255,7 @@ max_concurrent = 1
     #[test]
     fn no_network_passes() {
         let mut plan = good_plan();
-        plan.network = NetworkPolicy::None;
+        plan.network = PlanNetwork::None;
         assert_eq!(IsolationPolicy::check(&plan, &agent()), Ok(()));
     }
 
@@ -290,7 +306,7 @@ max_concurrent = 1
     #[test]
     fn rejects_extra_network_endpoint() {
         let mut plan = good_plan();
-        plan.network = NetworkPolicy::Only(vec![
+        plan.network = PlanNetwork::Only(vec![
             Endpoint::new("gw", 11434).unwrap(),
             Endpoint::new("api.github.com", 443).unwrap(),
         ]);
@@ -323,25 +339,74 @@ max_concurrent = 1
     }
 
     #[test]
-    fn rejects_secret_like_env() {
+    fn rejects_env_outside_the_allowlist() {
         for name in [
             "GITHUB_TOKEN",
             "api_key",
-            "DB_PASSWORD",
+            "PATH",
             "AWS_REGION",
             "SSH_AUTH_SOCK",
-            "SESSION_COOKIE",
+            "NANNA",
+            "LD_PRELOAD",
         ] {
             let mut plan = good_plan();
             plan.env.push((name.into(), "x".into()));
             assert!(
                 matches!(
                     IsolationPolicy::check(&plan, &agent()),
-                    Err(IsolationViolation::SecretEnv { .. })
+                    Err(IsolationViolation::EnvNotAllowed { .. })
                 ),
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_allowlisted_env() {
+        let mut plan = good_plan();
+        plan.env = ["HOME", "LANG", "PI_CODING_AGENT_DIR", "NANNA_ANYTHING"]
+            .iter()
+            .map(|n| (n.to_string(), "x".to_string()))
+            .collect();
+        assert_eq!(IsolationPolicy::check(&plan, &agent()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_dropped_limits() {
+        for tweak in [0, 1] {
+            let mut plan = good_plan();
+            if tweak == 0 {
+                plan.limits.max_iterations += 1;
+            } else {
+                plan.limits.max_wall_clock_secs += 1;
+            }
+            assert_eq!(
+                IsolationPolicy::check(&plan, &agent()),
+                Err(IsolationViolation::LimitsDropped)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dropped_scope() {
+        let mut plan = good_plan();
+        plan.scope.paths.clear();
+        assert_eq!(
+            IsolationPolicy::check(&plan, &agent()),
+            Err(IsolationViolation::ScopeDropped)
+        );
+        let mut plan = good_plan();
+        plan.scope.read_paths = Some(vec![]);
+        assert_eq!(
+            IsolationPolicy::check(&plan, &agent()),
+            Err(IsolationViolation::ScopeDropped)
+        );
+        let mut plan = good_plan();
+        plan.scope.repos.push("other".into());
+        assert_eq!(
+            IsolationPolicy::check(&plan, &agent()),
+            Err(IsolationViolation::ScopeDropped)
+        );
     }
 
     #[test]
