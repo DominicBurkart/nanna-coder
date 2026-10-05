@@ -75,12 +75,27 @@ fn read_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PathRestore {
+    Set(OsString),
+    Remove,
+    Keep,
+}
+
+fn restore_action(old: Option<Option<OsString>>) -> PathRestore {
+    match old {
+        Some(Some(old)) => PathRestore::Set(old),
+        Some(None) => PathRestore::Remove,
+        None => PathRestore::Keep,
+    }
+}
+
 impl FakePodman {
     fn restore_path(&mut self) {
-        match self.old_path.take() {
-            Some(Some(old)) => std::env::set_var("PATH", old),
-            Some(None) => std::env::remove_var("PATH"),
-            None => {}
+        match restore_action(self.old_path.take()) {
+            PathRestore::Set(old) => std::env::set_var("PATH", old),
+            PathRestore::Remove => std::env::remove_var("PATH"),
+            PathRestore::Keep => {}
         }
     }
 }
@@ -96,19 +111,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dropping_restores_an_originally_absent_path() {
-        let guard = PATH_LOCK.blocking_lock();
-        let original = std::env::var_os("PATH");
-        std::env::remove_var("PATH");
-        let mut fake = FakePodman::with_guard(guard, None);
-        assert!(std::env::var_os("PATH").is_some());
-        fake.restore_path();
-        let restored = std::env::var_os("PATH");
-        if let Some(original) = original {
-            std::env::set_var("PATH", original);
-        }
-        drop(fake);
-        assert_eq!(restored, None);
+    fn restore_action_removes_an_originally_absent_path() {
+        assert_eq!(restore_action(Some(None)), PathRestore::Remove);
+    }
+
+    #[test]
+    fn restore_action_sets_an_originally_present_path() {
+        assert_eq!(
+            restore_action(Some(Some(OsString::from("/usr/bin")))),
+            PathRestore::Set(OsString::from("/usr/bin"))
+        );
+    }
+
+    #[test]
+    fn restore_action_keeps_when_already_restored() {
+        assert_eq!(restore_action(None), PathRestore::Keep);
     }
 
     #[test]
