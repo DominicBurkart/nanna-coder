@@ -306,6 +306,54 @@ impl Drop for TaskNetwork {
     }
 }
 
+/// Remove container `name` through `runner`, whether or not it started: a
+/// failed `run` can still leave a created container behind.
+fn remove_container(runner: &dyn CommandRunner, runtime: &ContainerRuntime, name: &str) {
+    let args = vec!["rm".to_string(), "-f".to_string(), name.to_string()];
+    let removed = matches!(runner.run(runtime.command(), &args), Ok(o) if o.success);
+    if !removed {
+        warn!("could not remove container {name}");
+    }
+}
+
+/// Containers and networks whose name contains `task_id` and starts with
+/// `nanna-task-`: what a task leaves behind when its teardown did not run.
+pub fn task_leftovers(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    task_id: &str,
+) -> Vec<String> {
+    let prefix = format!("nanna-task-{task_id}");
+    let listings = [
+        vec![
+            "ps".to_string(),
+            "-a".to_string(),
+            "--format".to_string(),
+            "{{.Names}}".to_string(),
+        ],
+        vec![
+            "network".to_string(),
+            "ls".to_string(),
+            "--format".to_string(),
+            "{{.Name}}".to_string(),
+        ],
+    ];
+    let mut found = Vec::new();
+    for args in &listings {
+        if let Ok(output) = runner.run(runtime.command(), args) {
+            found.extend(
+                output
+                    .stdout
+                    .lines()
+                    .map(str::trim)
+                    .filter(|name| name.starts_with(&prefix))
+                    .map(str::to_string),
+            );
+        }
+    }
+    found
+}
+
 /// Whether the container network `name` exists.
 pub fn network_exists(runner: &dyn CommandRunner, runtime: &ContainerRuntime, name: &str) -> bool {
     let args = vec![
@@ -414,9 +462,16 @@ impl SidecarSet {
                 source: e,
             })?;
             let args = spec.run_args(network.name(), env_file.path());
-            let output = run_or_spawn_error(runner.as_ref(), runtime.command(), &args)?;
+            let output = match run_or_spawn_error(runner.as_ref(), runtime.command(), &args) {
+                Ok(output) => output,
+                Err(e) => {
+                    remove_container(runner.as_ref(), &runtime, &spec.name);
+                    return Err(e);
+                }
+            };
             drop(env_file);
             if !output.success {
+                remove_container(runner.as_ref(), &runtime, &spec.name);
                 return Err(SidecarError::Start {
                     name: spec.name.clone(),
                     stderr: output.stderr,
@@ -428,14 +483,18 @@ impl SidecarSet {
                 port: None,
                 needs_cleanup: true,
             };
-            wait_ready(
+            if let Err(e) = wait_ready(
                 runner.as_ref(),
                 &runtime,
                 &spec.name,
                 &spec.readiness,
                 readiness,
             )
-            .await?;
+            .await
+            {
+                remove_container(runner.as_ref(), &runtime, &spec.name);
+                return Err(e);
+            }
             sidecars.push(RunningSidecar {
                 handle,
                 spec: spec.clone(),
@@ -767,6 +826,119 @@ mod tests {
             runner.calls().last().unwrap(),
             "network rm nanna-task-t3-net"
         );
+    }
+
+    #[tokio::test]
+    async fn sidecar_set_start_failure_removes_the_created_container_before_the_network() {
+        let runner = FakeRunner::new(Some("run"), None);
+        let specs = vec![PostgresSidecar::with_password("t3b", "pw").spec()];
+        SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t3b",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        let calls = runner.calls();
+        let rm = calls
+            .iter()
+            .position(|c| c == "rm -f nanna-task-t3b-postgres")
+            .expect("created container removed");
+        let net = calls
+            .iter()
+            .position(|c| c == "network rm nanna-task-t3b-net")
+            .expect("network removed");
+        assert!(rm < net, "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn sidecar_set_spawn_failure_removes_the_container() {
+        let runner = FakeRunner::new(None, Some("run"));
+        let specs = vec![PostgresSidecar::with_password("t3c", "pw").spec()];
+        SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t3c",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(runner
+            .calls()
+            .contains(&"rm -f nanna-task-t3c-postgres".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sidecar_set_not_ready_removes_the_started_container() {
+        let runner = FakeRunner::new(Some("exec"), None);
+        let specs = vec![PostgresSidecar::with_password("t3d", "pw").spec()];
+        let err = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t3d",
+            &specs,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SidecarError::NotReady { .. }), "{err}");
+        let calls = runner.calls();
+        let rm = calls
+            .iter()
+            .position(|c| c == "rm -f nanna-task-t3d-postgres")
+            .expect("started container removed");
+        let net = calls
+            .iter()
+            .position(|c| c == "network rm nanna-task-t3d-net")
+            .expect("network removed");
+        assert!(rm < net, "{calls:?}");
+    }
+
+    #[test]
+    fn remove_container_tolerates_a_failing_runtime() {
+        let runner = FakeRunner::new(Some("rm"), None);
+        remove_container(runner.as_ref(), &ContainerRuntime::Podman, "c1");
+        assert_eq!(runner.calls(), vec!["rm -f c1".to_string()]);
+    }
+
+    struct ListingRunner;
+
+    impl CommandRunner for ListingRunner {
+        fn run(&self, _program: &str, args: &[String]) -> std::io::Result<RunOutput> {
+            let stdout = if args[0] == "ps" {
+                "nanna-task-t9\nnanna-task-t9-postgres\nnanna-task-other\nunrelated\n"
+            } else {
+                "nanna-task-t9-net\npodman\n"
+            };
+            Ok(RunOutput {
+                success: true,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn task_leftovers_lists_this_tasks_containers_and_networks_only() {
+        let found = task_leftovers(&ListingRunner, &ContainerRuntime::Podman, "t9");
+        assert_eq!(
+            found,
+            vec![
+                "nanna-task-t9",
+                "nanna-task-t9-postgres",
+                "nanna-task-t9-net"
+            ]
+        );
+    }
+
+    #[test]
+    fn task_leftovers_is_empty_when_the_runtime_cannot_be_queried() {
+        let runner = FakeRunner::new(None, Some("ps"));
+        let found = task_leftovers(runner.as_ref(), &ContainerRuntime::Podman, "t9");
+        assert!(found.is_empty());
     }
 
     #[tokio::test]

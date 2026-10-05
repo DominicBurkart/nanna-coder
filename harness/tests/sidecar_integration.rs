@@ -10,8 +10,8 @@ use harness::container::{
 };
 use harness::onboarding::{DeterministicOnboarder, Onboarder};
 use harness::sidecar::{
-    build_image_from_containerfile, network_exists, PostgresSidecar, ReadinessConfig, SidecarSet,
-    SystemRunner,
+    build_image_from_containerfile, network_exists, task_leftovers, PostgresSidecar,
+    ReadinessConfig, SidecarSet, SystemRunner,
 };
 use harness::workspace::TaskWorkspace;
 use image_builder::build_dev_container;
@@ -143,6 +143,11 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
         !network_exists(&SystemRunner, &runtime, &network),
         "task network must be removed with the workspace"
     );
+    assert_eq!(
+        task_leftovers(&SystemRunner, &runtime, &task_id),
+        Vec::<String>::new(),
+        "no nanna-task resource may outlive the workspace"
+    );
 }
 
 #[tokio::test]
@@ -176,6 +181,12 @@ async fn two_tasks_get_distinct_databases() {
         let name = out.stdout.trim().to_string();
         assert_eq!(name, pg.database);
         names.push(name);
+        drop(set);
+        assert_eq!(
+            task_leftovers(&SystemRunner, &runtime, task_id),
+            Vec::<String>::new(),
+            "dropping the sidecar set must remove its containers and network"
+        );
     }
     assert_ne!(names[0], names[1]);
 }
