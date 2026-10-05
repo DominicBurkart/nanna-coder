@@ -7,6 +7,7 @@ use super::shadow::{FakeShadowSource, NoShadowSource, ShadowComparator, ShadowSo
 use super::state::{RolloutRecord, RolloutState};
 use super::RolloutError;
 use crate::deploy::{DeployPlan, DeployStep, OnBreach, Precondition, StepKind};
+use crate::escalation::EscalationLog;
 use crate::leases::{
     acquire_all, Clock, InMemoryLeaseStore, LeaseError, LeaseStore, SimulatedClock,
 };
@@ -78,6 +79,7 @@ pub struct RolloutExecutor {
     audit: Arc<dyn AuditHook>,
     escalation: Arc<dyn EscalationHook>,
     incident_responder: Option<Arc<IncidentResponder>>,
+    production_hold: Option<(Arc<EscalationLog>, Option<String>)>,
     config: RolloutConfig,
 }
 
@@ -186,6 +188,7 @@ impl RolloutExecutor {
             audit: Arc::new(NoAudit),
             escalation: Arc::new(LogEscalation),
             incident_responder: None,
+            production_hold: None,
             config: RolloutConfig::default(),
         }
     }
@@ -214,6 +217,22 @@ impl RolloutExecutor {
     /// unchanged from before this existed.
     pub fn with_incident_responder(mut self, responder: Arc<IncidentResponder>) -> Self {
         self.incident_responder = Some(responder);
+        self
+    }
+
+    /// Wire every stop of this executor to `escalator` and park production
+    /// rollouts while the escalator's log holds an incident for `repo`
+    /// (`owner/name`, the repository the sinks file in).
+    pub fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>, repo: &str) -> Self {
+        let log = Arc::clone(escalator.log());
+        self.with_escalation(Arc::new(super::EscalatorHook::new(escalator, repo)))
+            .with_production_hold(log, Some(repo.to_string()))
+    }
+
+    /// Park production rollouts while `log` holds an incident for `repo`
+    /// (any repository when `None`).
+    pub fn with_production_hold(mut self, log: Arc<EscalationLog>, repo: Option<String>) -> Self {
+        self.production_hold = Some((log, repo));
         self
     }
 
@@ -313,7 +332,14 @@ impl RolloutExecutor {
                 RolloutState::Pending => self.persist(&mut record, RolloutState::Step(0))?,
                 RolloutState::Step(n) => self.step(record, n).await?,
                 RolloutState::Baking { step, since } => self.bake(record, step, since).await?,
-                RolloutState::RollingBack => self.roll_back(record).await?,
+                RolloutState::RollingBack => {
+                    let stalled = record.clone();
+                    if let Err(error) = self.roll_back(record).await {
+                        let step = stalled.breach.as_ref().map_or(0, |b| b.step);
+                        let summary = format!("rollback failed ({error}): a human must finish it");
+                        return Err(self.stop_with(&stalled, step, summary, error).await);
+                    }
+                }
                 RolloutState::Parked {
                     until,
                     resume_state,
@@ -367,6 +393,10 @@ impl RolloutExecutor {
     async fn step(&self, mut record: RolloutRecord, n: usize) -> Result<(), RolloutError> {
         let step = Self::step_of(&record, n)?;
         let now = self.clock.now();
+        if let Some(hold) = self.production_hold_for(&record) {
+            tracing::warn!(rollout = %record.id, incident = %hold.escalation_id, "Incident hold active; parking production rollout");
+            return self.park(record, now + self.config.poll_interval);
+        }
         let lease = record.lease_name()?;
         let ttl = step.min_duration + step.bake_time + self.config.lease_grace;
         match acquire_all(&*self.leases, &[lease], &record.id, ttl, now) {
@@ -375,7 +405,10 @@ impl RolloutExecutor {
                 tracing::warn!(rollout = %record.id, lease = %name, held_by = %by, %until, "Deploy lease held; parking");
                 return self.park(record, until);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                let summary = format!("step {n}: lease store failed ({e})");
+                return Err(self.stop_with(&record, n, summary, e.into()).await);
+            }
         }
         for precondition in &step.preconditions {
             if matches!(precondition, Precondition::HealthOk) && record.plan.health.is_none() {
@@ -387,10 +420,18 @@ impl RolloutExecutor {
             let Precondition::WindowOpen(name) = precondition else {
                 continue;
             };
-            if self.windows.is_open(name, now)? {
-                continue;
-            }
-            let until = self.windows.next_open(name, now)?;
+            let window = self
+                .windows
+                .is_open(name, now)
+                .and_then(|open| Ok((open, self.windows.next_open(name, now)?)));
+            let until = match window {
+                Ok((true, _)) => continue,
+                Ok((false, until)) => until,
+                Err(e) => {
+                    let summary = format!("step {n}: window `{name}` unusable ({e})");
+                    return Err(self.stop_with(&record, n, summary, e.into()).await);
+                }
+            };
             tracing::warn!(rollout = %record.id, window = %name, %until, "Window closed; parking");
             self.leases.release_all(&record.id)?;
             return self.park(record, until);
@@ -541,7 +582,16 @@ impl RolloutExecutor {
                 }
             }
             if let Some(comparator) = &comparator {
-                let samples = self.shadow.sample(&slot, self.config.poll_interval).await?;
+                let samples = match self.shadow.sample(&slot, self.config.poll_interval).await {
+                    Ok(samples) => samples,
+                    Err(error) => {
+                        tracing::warn!(rollout = %record.id, step = n, %error, "Shadow source unavailable; halting");
+                        let summary = format!(
+                            "step {n}: shadow source unavailable ({error}); the split is held for a human"
+                        );
+                        return self.halt_and_escalate(record, n, summary, None).await;
+                    }
+                };
                 observed_pairs += samples.len();
                 if let Some(breach) = comparator.check(&samples, n) {
                     return self.on_breach(record, breach).await;
@@ -740,6 +790,41 @@ impl RolloutExecutor {
         self.persist(&mut record, RolloutState::RolledBack)?;
         self.leases.release_all(&record.id)?;
         Ok(())
+    }
+
+    fn production_hold_for(
+        &self,
+        record: &RolloutRecord,
+    ) -> Option<crate::escalation::IncidentHold> {
+        let (log, repo) = self.production_hold.as_ref()?;
+        if !crate::deploy::is_production_env(&record.plan.environment) {
+            return None;
+        }
+        log.production_hold(repo.as_deref())
+    }
+
+    async fn stop_with(
+        &self,
+        record: &RolloutRecord,
+        step: usize,
+        summary: String,
+        error: RolloutError,
+    ) -> RolloutError {
+        let escalation = RolloutEscalation {
+            rollout_id: record.id.clone(),
+            environment: record.plan.environment.clone(),
+            image: record.image.clone(),
+            previous_image: record.previous_image.clone(),
+            step,
+            traffic_percent: record.traffic_percent,
+            summary,
+            breach: record.breach.clone(),
+            postmortem: None,
+        };
+        if let Err(failure) = self.escalation.escalate(&escalation).await {
+            tracing::error!(rollout = %record.id, %failure, "Escalation of a stopped rollout failed");
+        }
+        error
     }
 
     async fn halt_and_escalate(
@@ -2246,6 +2331,195 @@ mod tests {
             executor.run(&record.id).await.unwrap_err(),
             RolloutError::Lease(LeaseError::NonPositiveTtl(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_rollback_on_the_rollback_policy_escalates() {
+        let rig = rig();
+        rig.health.push_after(5, breach_sample());
+        rig.adapter.fail(AdapterOp::RollbackTo);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let err = rig.executor.run(&record.id).await.unwrap_err();
+        assert!(matches!(err, RolloutError::Adapter(_)));
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("rollback failed"));
+        assert_eq!(
+            rig.executor.status(&record.id).unwrap().state,
+            RolloutState::RollingBack
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_shadow_source_halts_and_escalates() {
+        let rig = rig();
+        rig.shadow.set_failing(true);
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let done = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Halted);
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("shadow"));
+    }
+
+    #[tokio::test]
+    async fn a_lease_store_failure_escalates_and_still_surfaces() {
+        let rig = rig();
+        let executor = rig.executor.with_config(RolloutConfig {
+            poll_interval: Duration::minutes(1),
+            lease_grace: Duration::hours(-9),
+        });
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
+        assert!(matches!(
+            executor.run(&record.id).await.unwrap_err(),
+            RolloutError::Lease(LeaseError::NonPositiveTtl(_))
+        ));
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("lease"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_window_escalates_and_still_surfaces() {
+        let rig = rig();
+        let executor = RolloutExecutor::new(
+            RolloutLog::open(&rig.path).unwrap(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            rig.health.clone(),
+        )
+        .with_escalation(rig.escalation.clone());
+        let record = executor.start(plan("production"), V2).await.unwrap();
+        assert!(matches!(
+            executor.run(&record.id).await.unwrap_err(),
+            RolloutError::Window(_)
+        ));
+        let escalations = rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("window"));
+    }
+
+    fn held(repo: &str) -> Arc<EscalationLog> {
+        use crate::escalation::{Escalation, EscalationSource, Severity};
+        let log = Arc::new(EscalationLog::in_memory());
+        let incident = Escalation::new(
+            Severity::Incident,
+            EscalationSource::Rollout,
+            repo,
+            "p99 breached",
+        )
+        .with_id("inc-1");
+        log.hold(&incident, t0()).unwrap();
+        log
+    }
+
+    #[tokio::test]
+    async fn an_incident_hold_parks_a_production_rollout_before_any_effect() {
+        let rig = rig();
+        let log = held("example/repo");
+        let executor = rig
+            .executor
+            .with_production_hold(log.clone(), Some("example/repo".into()));
+        let record = executor.start(plan("production"), V2).await.unwrap();
+        let parked = executor.run(&record.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        assert!(rig
+            .adapter
+            .calls()
+            .iter()
+            .all(|c| *c == AdapterCall::CurrentImage));
+        assert!(rig.leases.snapshot().unwrap().is_empty());
+        assert!(rig.escalation.escalations().is_empty());
+        let grant = crate::escalation::ResolveGrant::check(true, None).unwrap();
+        log.resolve(&grant, "inc-1", t0()).unwrap();
+        let RolloutState::Parked { until, .. } = parked.state else {
+            unreachable!()
+        };
+        rig.clock.advance(until - rig.clock.now());
+        let resumed = executor.run(&record.id).await.unwrap();
+        assert!(rig
+            .adapter
+            .calls()
+            .iter()
+            .any(|c| matches!(c, AdapterCall::DeployInactive(_))));
+        assert_ne!(resumed.state, RolloutState::Step(0));
+    }
+
+    #[tokio::test]
+    async fn a_production_halt_reaches_the_sink_and_parks_the_next_production_rollout() {
+        use crate::escalation::{
+            DeliveryOutcome, DeliveryReceipt, Escalation, EscalationError, EscalationSink,
+            Escalator,
+        };
+        struct Capture(std::sync::Mutex<Vec<Escalation>>);
+        #[async_trait]
+        impl EscalationSink for Capture {
+            fn name(&self) -> &str {
+                "capture"
+            }
+            async fn deliver(&self, e: &Escalation) -> Result<DeliveryReceipt, EscalationError> {
+                self.0.lock().unwrap().push(e.clone());
+                Ok(DeliveryReceipt {
+                    sink: "capture".into(),
+                    reference: e.id.clone(),
+                    outcome: DeliveryOutcome::Posted,
+                })
+            }
+        }
+        let rig = rig();
+        let sink = Arc::new(Capture(Default::default()));
+        let log = Arc::new(EscalationLog::in_memory());
+        let escalator = Arc::new(Escalator::new(
+            log.clone(),
+            sink.clone(),
+            rig.clock.clone(),
+            Duration::minutes(30),
+        ));
+        let executor = rig.executor.with_escalator(escalator, "example/repo");
+        rig.health.push_after(3, breach_sample());
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let mut production = plan.clone();
+        production.environment = "production".into();
+        production.lease = DeployPlan::lease_name("app", "production");
+        for step in &mut production.steps {
+            step.preconditions.clear();
+        }
+        let first = executor.start(production.clone(), V2).await.unwrap();
+        let halted = executor.run(&first.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(log.production_held("example/repo"));
+        let second = executor.start(production, V3).await.unwrap();
+        let parked = executor.run(&second.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_incident_hold_leaves_other_repos_and_other_environments_alone() {
+        let rig = rig();
+        let other = rig
+            .executor
+            .with_production_hold(held("example/repo"), Some("example/other".into()));
+        let record = other.start(plan("sandbox"), V2).await.unwrap();
+        assert_eq!(
+            other.run(&record.id).await.unwrap().state,
+            RolloutState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_hold_does_not_stop_a_sandbox_rollout() {
+        let rig = rig();
+        let executor = rig
+            .executor
+            .with_production_hold(held("example/repo"), None);
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
+        assert_eq!(
+            executor.run(&record.id).await.unwrap().state,
+            RolloutState::Complete
+        );
     }
 
     #[tokio::test]

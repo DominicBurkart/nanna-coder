@@ -15,6 +15,7 @@
 //! [`FakeAdapter`], which records every call.
 
 mod adapter;
+mod escalator_hook;
 mod executor;
 mod health;
 mod hooks;
@@ -30,6 +31,7 @@ pub use adapter::{
     AdapterCall, AdapterError, AdapterOp, FakeAdapter, FallbackPolicy, FallbackSupport, Slot,
     Swapped, TargetAdapter,
 };
+pub use escalator_hook::EscalatorHook;
 pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
 pub use health::{
     check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
