@@ -177,6 +177,18 @@ enum Commands {
         #[command(subcommand)]
         command: EffectsCommands,
     },
+    /// Print the blast radius of the working tree against a git revision
+    Impact {
+        /// Revision to diff the working tree against
+        #[arg(long)]
+        diff: String,
+        /// Repository root containing .nanna/effects.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -482,6 +494,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+        Commands::Impact {
+            diff,
+            repo_path,
+            json,
+        } => {
+            if let Err(err) = run_impact(&diff, repo_path, json) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -564,6 +586,24 @@ async fn run_fake_to_a_stop(
 
 const NO_REAL_TARGET: &str =
     "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+fn run_impact(
+    rev: &str,
+    repo_path: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = match repo_path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let radius = harness::impact::impact_of_diff(&repo, rev)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&radius)?);
+    } else {
+        print!("{}", radius.render_text());
+    }
+    Ok(())
+}
 
 fn run_effects(command: EffectsCommands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
