@@ -57,17 +57,19 @@ The `mcp-serve` subcommand starts a JSON-RPC 2.0 server over stdio that implemen
 
 Nanna exposes its coding capability as a **task-augmented tool** rather than a bespoke poll/result tool surface. `tools/list` advertises:
 
-- **`assign_task`** — declared with `execution.taskSupport: "required"`. Submit a coding task (natural-language description plus target repo); Nanna spawns an agent loop in an isolated worktree. Because task support is *required*, clients MUST augment the `tools/call` with a `task` field (per the Tasks extension); a non-augmented call returns `-32601`. The response is a `CreateTaskResult` carrying a `taskId` and initial `working` status.
+- **`assign_task`** — declared with `execution.taskSupport: "required"`. Submit a coding task (natural-language description, target repo and the required `identity` name); Nanna spawns an agent loop in an isolated worktree under that registered identity's scope. A missing `identity` is rejected with `-32602`. The request is then reviewed by the spawn auditor (`auditor::SpawnGate`): a `Block`, an `Escalate` (escalations are refused until the sink of #656 is wired) or an auditor failure is refused with `-32602` and nothing is queued. Only an `Allowed` proof reaches `TaskManager::submit_spawn`, which runs the task under the audited identity, and refuses a target repository other than the audited one, a repository outside the identity's `scope.repos`, or a model other than the identity's. The card chooses the model; an explicit `model` argument must equal it. Because task support is *required*, clients MUST augment the `tools/call` with a `task` field (per the Tasks extension); a non-augmented call returns `-32601`. The response is a `CreateTaskResult` carrying a `taskId` and initial `working` status.
 - **`onboard_repo`** — an ordinary synchronous tool (no task augmentation) that generates a `flake.nix` for a pure-Cargo Rust repository that lacks one.
 
 The task lifecycle uses the standard Tasks methods instead of custom tools:
 
 - **`tasks/get`** — poll a task's status by `taskId` (`working`, `completed`, `failed`, or `cancelled`) with `createdAt`/`lastUpdatedAt`/`ttl`/`pollInterval` metadata. Non-blocking.
 - **`tasks/result`** — retrieve the terminal `CallToolResult` (result summary, patch, tool calls, model). Blocks until the task reaches a terminal state; carries the `io.modelcontextprotocol/related-task` metadata.
-- **`tasks/list`** — enumerate all tasks Nanna is tracking with their statuses.
+- **`tasks/list`** — enumerate all tasks Nanna is tracking with their statuses. The result's `_meta.queue` carries the scheduler's backlog metrics (depth, parked, running, age of the oldest entry, per-side dispatch counts).
 - **`tasks/cancel`** — request cancellation by `taskId`; the task transitions to `cancelled`. Cancelling an already-terminal task returns `-32602`.
 
-The server advertises `capabilities.tasks: { list, cancel, requests: { tools: { call } } }` at `initialize`. Task IDs are UUIDv4 with no authorization-context binding — appropriate for a single-user local stdio server (see the Tasks spec's security considerations). `input_required`/elicitation and durable cross-restart task storage are out of scope for this revision.
+The server advertises `capabilities.tasks: { list, cancel, requests: { tools: { call } } }` at `initialize`. Task IDs are UUIDv4 with no authorization-context binding — appropriate for a single-user local stdio server (see the Tasks spec's security considerations). `input_required`/elicitation is out of scope for this revision.
+
+Submissions beyond the concurrency limit are queued, not rejected. `harness::scheduler` orders the backlog by submission time and dispatches it with a hybrid FIFO/LIFO policy (half the slots chase the newest work, half serve the oldest, with an optional per-repository cap); queued entries are persisted to a JSON Lines log (`NANNA_QUEUE_PATH`, default `~/.local/state/nanna/queue.jsonl`) and restored when `mcp-serve` starts. Entries may be parked until a human-availability window opens (`harness::windows`). The `backlog-sync` subcommand pulls open GitHub issues into that log as tasks, skipping issues already queued or already claimed by an open pull request carrying a `Nanna-Identity:` marker.
 
 ```mermaid
 ---
@@ -85,6 +87,7 @@ flowchart LR
         tools
         agents
         health
+        backlogsync["backlog-sync"]
     end
     subgraph MCP["MCP (stdio, via mcp-serve) — Tasks extension"]
         assign_task["assign_task (taskSupport: required)"]
@@ -98,7 +101,7 @@ flowchart LR
     delegate -.->|in-process client| MCP
     classDef cli stroke:#46EDC8,fill:#DEFFF8,color:#378E7A
     classDef mcp stroke:#FFB703,fill:#FFE8B6,color:#8B4513
-    class chat,agent,delegate,mcpserve,models,tools,agents,health cli
+    class chat,agent,delegate,mcpserve,models,tools,agents,health,backlogsync cli
     class assign_task,onboard_repo,tget,tresult,tlist,tcancel mcp
 ```
 
@@ -170,3 +173,7 @@ flowchart TD
     C -- Can compile binary for --> n2(["Sandbox"])
     n2 -- Can be promoted to --> n3(["Release"])
 ```
+
+### Identity scope limits
+
+`run_command` executes `sh -c` in the dev container, so `scope.paths` and `scope.read_paths` cannot be applied to it. An identity whose `scope.paths` does not include `**`, or that sets `scope.read_paths` at all, never receives `run_command`, even when `scope.tools` names it. Only an identity with `paths = ["**"]` and no `read_paths` can run shell commands, and it is bounded by its effect ceiling and network policy alone. The network reach of a `repository`-ceiling identity holding `run_command` is tracked in #714.

@@ -27,7 +27,9 @@ pub(crate) mod rules;
 mod verdict;
 
 pub use context::AuditContext;
-pub use gate::{Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook};
+pub use gate::{
+    Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook, SpawnGate,
+};
 pub use llm::{ModelAuditor, AUDITOR_FRAMING, OUTPUT_CONTRACT, SUBTASK_CLOSE, SUBTASK_OPEN};
 pub use log::{AuditLog, AuditLogEntry};
 pub use record::{content_hash, AuditOutcome, AuditRecord};
@@ -37,6 +39,72 @@ pub use verdict::{
     CardSuggestion, Reason, ReasonCode, SpawnVerdict, UnknownReasonCode, UnknownVerdictKind,
     VerdictKind,
 };
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{AuditContext, AuditLog, RuleAuditor, SpawnGate};
+    use crate::identity::IdentityCatalog;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    pub(crate) fn fixture_gate() -> SpawnGate {
+        let catalog = IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        let context = AuditContext::new(catalog, auditor).unwrap();
+        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+    }
+
+    pub(crate) fn implementer_only_gate() -> SpawnGate {
+        let source = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("prompts")).unwrap();
+        for file in [
+            "auditor.toml",
+            "rust-implementer.toml",
+            "prompts/auditor.md",
+            "prompts/rust-implementer.md",
+        ] {
+            std::fs::copy(source.join(file), dir.path().join(file)).unwrap();
+        }
+        let catalog = IdentityCatalog::load(dir.path()).unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        let context = AuditContext::new(catalog, auditor).unwrap();
+        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+    }
+
+    pub(crate) fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+            vec!["remote", "add", "origin", url],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        dir
+    }
+
+    pub(crate) fn shared_repo() -> &'static Path {
+        static REPO: OnceLock<tempfile::TempDir> = OnceLock::new();
+        REPO.get_or_init(|| repo_with_origin("https://github.com/example/repo.git"))
+            .path()
+    }
+}
 
 use crate::identity::IdentityError;
 use async_trait::async_trait;
@@ -66,6 +134,29 @@ pub enum AuditError {
     /// An audit log entry could not be (de)serialized.
     #[error("audit log entry serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+#[async_trait]
+impl Auditor for Box<dyn Auditor> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    async fn review_spawn(
+        &self,
+        request: &SpawnRequest,
+        context: &AuditContext,
+    ) -> Result<SpawnVerdict, AuditError> {
+        (**self).review_spawn(request, context).await
+    }
+
+    async fn audit_spawn(
+        &self,
+        request: &SpawnRequest,
+        context: &AuditContext,
+    ) -> Result<AuditOutcome, AuditError> {
+        (**self).audit_spawn(request, context).await
+    }
 }
 
 /// Reviews proposed spawns.

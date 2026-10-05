@@ -122,6 +122,9 @@ pub(crate) mod tests {
             created_at: now,
             last_updated_at: now,
             ttl_ms: None,
+            not_before: None,
+            identity_hint: None,
+            origin: None,
         };
         let summary = TaskSummary::from(&task);
         assert_eq!(

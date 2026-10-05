@@ -23,6 +23,13 @@
 //! max_concurrent = 4
 //! ```
 //!
+//! `scope.paths` and `scope.read_paths` are enforced by the file tools
+//! (`read_file`, `write_file`, `list_directory`, `search`) and cannot be
+//! enforced for `run_command`, which runs `sh -c`. An identity whose
+//! `scope.paths` does not include `**`, or that sets `scope.read_paths`,
+//! therefore never receives `run_command`, even if `scope.tools` lists it
+//! ([`AgentIdentity::restricts_paths`]).
+//!
 //! [`AgentIdentity::from_toml_str`] parses and validates a single file;
 //! [`IdentityCatalog`] loads a directory of them and applies repo-local
 //! overrides, which may only narrow the global identity they shadow.
@@ -31,7 +38,9 @@ mod catalog;
 mod dev_loop;
 mod pattern;
 
-pub use catalog::{IdentityCatalog, AGENTS_SUBDIR, CONFIG_DIR_ENV, REPO_AGENTS_DIR};
+pub use catalog::{
+    IdentityCatalog, AGENTS_SUBDIR, AUDITOR_IDENTITY, CONFIG_DIR_ENV, REPO_AGENTS_DIR,
+};
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
 mod narrowing;
@@ -99,6 +108,15 @@ pub enum IdentityError {
     #[error("{file}: repo-local identity `{name}` has no global identity to narrow")]
     NoBaseIdentity {
         /// The unmatched name.
+        name: String,
+        /// Repo-local file that declared it.
+        file: PathBuf,
+    },
+    /// A repo-local file tries to override an identity a repository may not
+    /// reshape, such as the auditor.
+    #[error("{file}: repo-local identity `{name}` may not override a protected identity")]
+    ProtectedIdentity {
+        /// The protected name.
         name: String,
         /// Repo-local file that declared it.
         file: PathBuf,

@@ -210,7 +210,7 @@ mod tests {
         let server = Arc::new(NannaMcpServer::new(
             Arc::new(TaskManager::new(0)),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         ));
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
@@ -239,7 +239,7 @@ mod tests {
 
         let task_id = client
             .submit_task(
-                serde_json::json!({ "description": "d", "repo_path": "/tmp" }),
+                serde_json::json!({ "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" }),
                 Some(5000),
             )
             .await

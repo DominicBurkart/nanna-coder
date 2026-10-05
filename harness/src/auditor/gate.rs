@@ -34,11 +34,33 @@ use std::fmt;
 pub struct Allowed {
     request: SpawnRequest,
     identity: AgentIdentity,
+    repo: String,
+    model: String,
 }
 
 impl Allowed {
     fn new(request: SpawnRequest, identity: AgentIdentity) -> Self {
-        Self { request, identity }
+        let repo = request.parent_task.repo.clone();
+        let model = identity.identity.model.clone();
+        Self {
+            request,
+            identity,
+            repo,
+            model,
+        }
+    }
+
+    /// The repository the spawn was audited against: the parent task's
+    /// `repo` as the auditor saw it. A spawn may only be dispatched against
+    /// this repository.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The model the spawn was audited against: the identity card's `model`.
+    /// A spawn may only be dispatched with this model.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// The request that was allowed.
@@ -250,6 +272,41 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
             record: record.clone(),
         };
         self.hook.on_escalate(&escalation).await;
+    }
+}
+
+/// A [`Gate`] bundled with the [`AuditContext`] it always reviews against.
+///
+/// This is what an entry point that dispatches spawns holds, so that it can
+/// neither reach the task manager without an [`Allowed`] proof nor audit
+/// against a catalog of its own choosing.
+pub struct SpawnGate {
+    gate: Gate<Box<dyn Auditor>>,
+    context: AuditContext,
+}
+
+impl SpawnGate {
+    /// A gate over `auditor`, appending to `log`, reviewing against `context`.
+    pub fn new(auditor: Box<dyn Auditor>, log: AuditLog, context: AuditContext) -> Self {
+        Self {
+            gate: Gate::new(auditor, log),
+            context,
+        }
+    }
+
+    /// The context every request is reviewed against.
+    pub fn context(&self) -> &AuditContext {
+        &self.context
+    }
+
+    /// The audit log this gate appends every verdict to.
+    pub fn log(&self) -> &AuditLog {
+        self.gate.log()
+    }
+
+    /// [`Gate::check`] against this gate's own context.
+    pub async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
+        self.gate.check(request, &self.context).await
     }
 }
 
@@ -467,5 +524,51 @@ mod tests {
         let gate = Gate::new(RuleAuditor::new(), log);
         let refused = gate.check(fitting(), &context(true)).await.unwrap_err();
         assert!(matches!(refused, Refused::AuditFailed(AuditError::Log(_))));
+    }
+
+    #[tokio::test]
+    async fn spawn_gate_checks_against_its_own_context_and_logs() {
+        let spawn_gate = SpawnGate::new(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context(true),
+        );
+        assert_eq!(spawn_gate.context().auditor().name(), "auditor");
+        let allowed = spawn_gate.check(fitting()).await.unwrap();
+        assert_eq!(allowed.identity().name(), "rust-implementer");
+        let refused = spawn_gate
+            .check(request(
+                "rust-implementer",
+                "Add a test.",
+                DevLoop::Outer,
+                EffectClass::Workspace,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, Refused::Verdict { .. }));
+        assert_eq!(spawn_gate.log().entries().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_boxed_auditor_delegates_every_method() {
+        let boxed: Box<dyn Auditor> = Box::new(RuleAuditor::new());
+        assert_eq!(boxed.name(), crate::auditor::RULE_AUDITOR_NAME);
+        let request = fitting();
+        let verdict = boxed.review_spawn(&request, &context(true)).await.unwrap();
+        assert!(verdict.is_allow());
+        let outcome = boxed.audit_spawn(&request, &context(true)).await.unwrap();
+        assert!(outcome.verdict.is_allow());
+    }
+
+    #[test]
+    fn allowed_exposes_the_audited_repo_and_model() {
+        let identity = context(true)
+            .catalog()
+            .get("rust-implementer")
+            .unwrap()
+            .clone();
+        let allowed = Allowed::new(fitting(), identity);
+        assert_eq!(allowed.repo(), fitting().parent_task.repo);
+        assert_eq!(allowed.model(), "gemma4:e4b");
     }
 }

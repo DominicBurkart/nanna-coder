@@ -6,12 +6,11 @@
 //! has no interface but loopback and cannot connect anywhere. A control
 //! container under a `repository` ceiling keeps its network interface.
 //!
-//! Like the other container tests, it skips (loudly) when no container
-//! runtime is available or the image cannot be pulled.
+//! It skips (loudly) when no container runtime is available and fails when
+//! the runtime cannot start the image.
 
 use harness::container::{
-    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerError,
-    ContainerHandle, NetworkPolicy,
+    detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
 };
 use harness::effects::EffectClass;
 use harness::identity::AgentIdentity;
@@ -47,7 +46,7 @@ max_concurrent = 1
     AgentIdentity::from_toml_str(&toml, "shell-runner.toml").unwrap()
 }
 
-async fn start(network: NetworkPolicy) -> Option<Arc<ContainerHandle>> {
+async fn start(network: NetworkPolicy) -> Arc<ContainerHandle> {
     let config = ContainerConfig {
         base_image: IMAGE.to_string(),
         test_image: None,
@@ -60,14 +59,10 @@ async fn start(network: NetworkPolicy) -> Option<Arc<ContainerHandle>> {
         additional_args: vec!["-i".to_string(), "-t".to_string()],
         network,
     };
-    match start_container_with_fallback(&config).await {
-        Ok(handle) => Some(Arc::new(handle)),
-        Err(ContainerError::ImageNotFound { image, suggestion }) => {
-            eprintln!("SKIPPED: image {image} unavailable: {suggestion}");
-            None
-        }
-        Err(e) => panic!("container start failed: {e}"),
-    }
+    let handle = start_container_with_fallback(&config)
+        .await
+        .expect("container start failed; the alpine image must be available");
+    Arc::new(handle)
 }
 
 async fn interfaces(registry: &harness::tools::ToolRegistry) -> Vec<String> {
@@ -95,9 +90,7 @@ async fn run_command_under_a_workspace_ceiling_cannot_reach_the_network() {
     let network = NetworkPolicy::for_ceiling(identity.scope.max_effect);
     assert_eq!(network, NetworkPolicy::Disabled);
 
-    let Some(handle) = start(network).await else {
-        return;
-    };
+    let handle = start(network).await;
     let registry =
         create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap();
     assert!(registry.get_tool("run_command").is_some());
@@ -127,9 +120,7 @@ async fn run_command_under_a_repository_ceiling_keeps_its_network_interface() {
     let network = NetworkPolicy::for_ceiling(identity.scope.max_effect);
     assert_eq!(network, NetworkPolicy::Enabled);
 
-    let Some(handle) = start(network).await else {
-        return;
-    };
+    let handle = start(network).await;
     let registry =
         create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap();
 
