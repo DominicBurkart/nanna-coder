@@ -195,7 +195,60 @@ jobs:
   container-runtime-required:
     name: Container runtime (required)
     runs-on: ubuntu-latest
-    environment: codecov
+    permissions:
+      contents: read
+    env:
+      NANNA_REQUIRE_RUNTIME: "1"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+
+    - name: Optimize CI cache settings (Nix)
+      run: nix run .#ci-cache-optimize
+
+    - name: Verify container runtime is present
+      run: |
+        if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+          echo "::error::No container runtime (podman or docker) on this runner"
+          exit 1
+        fi
+
+    - name: Pre-build dev container image
+      run: nix build path:tests/integration/repo#devContainerImage --no-link
+
+    - name: Run container-only suites
+      run: |
+        nix develop --command cargo nextest run --workspace --all-features \
+          --run-ignored all --test-threads=1 --no-fail-fast \
+          -E 'test(/(^|::)container_/)'
+
+    - name: Remove leftover task containers
+      if: always()
+      run: |
+        for rt in podman docker; do
+          if command -v "$rt" >/dev/null 2>&1; then
+            "$rt" ps -aq --filter name=nanna-task- | xargs -r "$rt" rm -f
+          fi
+        done
+
+  container-ollama:
+    name: Container and Ollama (non-required)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
     env:
       NANNA_REQUIRE_RUNTIME: "1"
 
@@ -231,11 +284,20 @@ jobs:
     - name: Pre-build dev container image
       run: nix build path:tests/integration/repo#devContainerImage --no-link
 
-    - name: Run real-container suites
+    - name: Run Ollama-dependent suites
       run: |
         nix develop --command cargo nextest run --workspace --all-features \
           --run-ignored all --test-threads=1 --no-fail-fast \
-          -E 'binary(integration_tests) | binary(scope_network_integration) | binary(dev_container_integration) | binary(nanna_self_dev_integration) | binary(eval_runner_tests)'
+          -E 'test(/(^|::)ollama_/)'
+
+    - name: Remove leftover task containers
+      if: always()
+      run: |
+        for rt in podman docker; do
+          if command -v "$rt" >/dev/null 2>&1; then
+            "$rt" ps -aq --filter name=nanna-task- | xargs -r "$rt" rm -f
+          fi
+        done
 
   build-matrix:
     name: Build ${{ matrix.target }}
@@ -659,6 +721,7 @@ jobs:
     needs:
       - test-matrix
       - container-runtime-required
+      - container-ollama
       - build-matrix
       - build-containers
       - security-scan
