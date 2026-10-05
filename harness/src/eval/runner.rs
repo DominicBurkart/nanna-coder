@@ -543,6 +543,12 @@ fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
     which::which("nanna").map_err(|_| EvalRunnerError::BinaryNotFound)
 }
 
+#[cfg(test)]
+fn which_nanna_in(search_path: &std::ffi::OsStr) -> Result<PathBuf, EvalRunnerError> {
+    let cwd = std::env::current_dir().map_err(|_| EvalRunnerError::BinaryNotFound)?;
+    which::which_in("nanna", Some(search_path), cwd).map_err(|_| EvalRunnerError::BinaryNotFound)
+}
+
 // ---------------------------------------------------------------------------
 // SWE-bench helpers
 // ---------------------------------------------------------------------------
@@ -1701,17 +1707,11 @@ tags = ["{tag}"]
         let key = "NANNA_HARNESS_BIN";
         let saved_bin = std::env::var(key).ok();
         std::env::remove_var(key);
-        let saved_path = std::env::var("PATH").ok();
         let empty_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PATH", empty_dir.path());
-        let result = locate_nanna_binary();
+        let result = which_nanna_in(empty_dir.path().as_os_str());
         match saved_bin {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
-        }
-        match saved_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
         }
         assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
     }
