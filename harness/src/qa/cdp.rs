@@ -96,7 +96,7 @@ impl PipeTransport {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| std::io::Error::other("child has no stdout"))?;
+            .ok_or(std::io::Error::other("child has no stdout"))?;
         Ok(Self {
             child,
             stdin,

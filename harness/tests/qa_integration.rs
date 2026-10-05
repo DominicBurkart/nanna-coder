@@ -11,8 +11,9 @@
 //! needed to produce it.
 
 use harness::apprun::{Limits, APP_START_TOOL};
-use harness::container::{detect_runtime, ContainerRuntime};
+use harness::container::detect_runtime;
 use harness::qa::{QA_BROWSER_TOOL, QA_ENDPOINTS_TOOL};
+use harness::sidecar::{build_image_from_containerfile, SystemRunner};
 use harness::tools::ToolRegistry;
 use harness::workspace::TaskWorkspace;
 use serde_json::{json, Value};
@@ -22,6 +23,18 @@ use std::process::Command;
 const DEV_IMAGE_TAG: &str = "localhost/nanna-qa-test-dev:latest";
 const TRUNK_URL: &str =
     "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz";
+const DEV_CONTAINERFILE: &str = "FROM docker.io/library/rust:1-bookworm\n\
+         RUN rustup target add wasm32-unknown-unknown \\\n\
+         \x20&& curl -fsSL @TRUNK_URL@ | tar -xz -C /usr/local/bin trunk \\\n\
+         \x20&& mkdir -p /home/dev /cache \\\n\
+         \x20&& apt-get update \\\n\
+         \x20&& apt-get install -y --no-install-recommends chromium \\\n\
+         \x20&& rm -rf /var/lib/apt/lists/*\n\
+         ENV HOME=/home/dev CARGO_TARGET_DIR=/cache/target\n\
+         COPY fixture /src\n\
+         RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
+         \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
+         CMD [\"sleep\", \"infinity\"]\n";
 const COLD_BUILD_LIMIT: Limits = Limits {
     max_wall_clock_secs: 1800,
 };
@@ -74,59 +87,6 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-fn build_dev_image(runtime: &ContainerRuntime) {
-    let dir = tempfile::tempdir().unwrap();
-    copy_dir_all(&fixture_root(), &dir.path().join("fixture"));
-    let containerfile = format!(
-        "FROM docker.io/library/rust:1-bookworm\n\
-         RUN rustup target add wasm32-unknown-unknown \\\n\
-         \x20&& curl -fsSL {TRUNK_URL} | tar -xz -C /usr/local/bin trunk \\\n\
-         \x20&& mkdir -p /home/dev /cache \\\n\
-         \x20&& apt-get update \\\n\
-         \x20&& apt-get install -y --no-install-recommends chromium \\\n\
-         \x20&& rm -rf /var/lib/apt/lists/*\n\
-         ENV HOME=/home/dev CARGO_TARGET_DIR=/cache/target\n\
-         COPY fixture /src\n\
-         RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
-         \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
-         CMD [\"sleep\", \"infinity\"]\n"
-    );
-    std::fs::write(dir.path().join("Containerfile"), containerfile).unwrap();
-    let out = Command::new(runtime.command())
-        .args(["build", "-q", "-t", DEV_IMAGE_TAG])
-        .arg(dir.path())
-        .output()
-        .expect("runtime must be runnable");
-    assert!(
-        out.status.success(),
-        "image build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
-    registry
-        .execute(name, args)
-        .await
-        .unwrap_or_else(|e| panic!("{name} failed: {e}"))
-}
-
-async fn start_workspace(
-    source: &Path,
-    task_prefix: &str,
-    env: Vec<(String, String)>,
-) -> TaskWorkspace {
-    let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
-    let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
-        .await
-        .expect("dev container must start");
-    ws.set_app_limits(Some(COLD_BUILD_LIMIT));
-    if !env.is_empty() {
-        ws.set_app_env(env);
-    }
-    ws
-}
-
 #[tokio::test]
 #[ignore]
 async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
@@ -135,7 +95,39 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    build_dev_image(&runtime);
+    async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
+        registry
+            .execute(name, args)
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+    }
+
+    async fn start_workspace(
+        source: &Path,
+        task_prefix: &str,
+        env: Vec<(String, String)>,
+    ) -> TaskWorkspace {
+        let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
+        let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
+            .await
+            .expect("dev container must start");
+        ws.set_app_limits(Some(COLD_BUILD_LIMIT));
+        if !env.is_empty() {
+            ws.set_app_env(env);
+        }
+        ws
+    }
+
+    let image_context = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
+    build_image_from_containerfile(
+        &SystemRunner,
+        &runtime,
+        DEV_IMAGE_TAG,
+        image_context.path(),
+        &DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL),
+    )
+    .unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -215,7 +207,39 @@ async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    build_dev_image(&runtime);
+    async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
+        registry
+            .execute(name, args)
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+    }
+
+    async fn start_workspace(
+        source: &Path,
+        task_prefix: &str,
+        env: Vec<(String, String)>,
+    ) -> TaskWorkspace {
+        let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
+        let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
+            .await
+            .expect("dev container must start");
+        ws.set_app_limits(Some(COLD_BUILD_LIMIT));
+        if !env.is_empty() {
+            ws.set_app_env(env);
+        }
+        ws
+    }
+
+    let image_context = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
+    build_image_from_containerfile(
+        &SystemRunner,
+        &runtime,
+        DEV_IMAGE_TAG,
+        image_context.path(),
+        &DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL),
+    )
+    .unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -251,4 +275,63 @@ async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
     );
 
     ws.cleanup().expect("cleanup must succeed");
+}
+
+#[test]
+fn fixture_root_is_the_fullstack_fixture() {
+    let root = fixture_root();
+    assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+}
+
+#[test]
+fn init_repo_commits_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "b").unwrap();
+    init_repo(dir.path());
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let tracked: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(tracked, vec!["a.txt", "sub/b.txt"]);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn git_helper_panics_on_a_failing_command() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["rev-parse", "HEAD"]);
+}
+
+#[test]
+fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("api/src")).unwrap();
+    std::fs::write(src.path().join("api/src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(src.path().join("Cargo.toml"), "[workspace]").unwrap();
+    for skipped in ["target", "dist", ".git"] {
+        std::fs::create_dir_all(src.path().join(skipped)).unwrap();
+        std::fs::write(src.path().join(skipped).join("junk"), "x").unwrap();
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let out = dst.path().join("copy");
+    copy_dir_all(src.path(), &out);
+    assert_eq!(
+        std::fs::read_to_string(out.join("api/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert!(out.join("Cargo.toml").is_file());
+    for skipped in ["target", "dist", ".git"] {
+        assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
+    }
 }

@@ -770,6 +770,67 @@ mod tests {
         assert!(Path::new(&summary.artifacts[2]).exists());
     }
 
+    fn record_empty_endpoint_report(ws: &mut TaskWorkspace, report_path: &Path) {
+        ws.qa_ledger.record_endpoints(
+            &crate::qa::ManifestReport {
+                base_url: "http://app".to_string(),
+                checks: vec![],
+                passed: 0,
+                failed: 0,
+            },
+            report_path,
+        );
+    }
+
+    #[test]
+    fn persist_qa_summary_keeps_worktree_paths_when_no_artifact_directory_exists() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-nodir"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let report_path = ws
+            .workspace_path
+            .join(".nanna-artifacts/qa/endpoints-1.json");
+        record_empty_endpoint_report(&mut ws, &report_path);
+
+        let summary = ws.persist_qa_summary();
+
+        assert_eq!(
+            summary.artifacts,
+            vec![report_path.to_string_lossy().into_owned()]
+        );
+        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn persist_qa_summary_keeps_worktree_paths_when_the_copy_fails() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let blocker = store.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-copyfail"), "HEAD").unwrap();
+        ws.set_artifact_store(blocker.clone());
+        let artifacts = crate::qa::QaArtifacts::new(&ws.workspace_path);
+        let report_path = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report_path, "{}").unwrap();
+        record_empty_endpoint_report(&mut ws, &report_path);
+
+        let summary = ws.persist_qa_summary();
+
+        assert_eq!(
+            summary.artifacts,
+            vec![report_path.to_string_lossy().into_owned()]
+        );
+        assert!(!ws.persisted_qa_dir().exists());
+        assert!(report_path.exists());
+        ws.cleanup().unwrap();
+    }
+
     #[test]
     fn persist_qa_summary_without_qa_runs_leaves_the_store_untouched() {
         let source = TempDir::new().unwrap();
