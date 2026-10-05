@@ -61,6 +61,7 @@ pub struct TaskWorkspace {
     cleaned_up: bool,
     protected: ProtectedPaths,
     audit: Arc<dyn AuditHook>,
+    placeholders: Vec<PathBuf>,
 }
 
 impl TaskWorkspace {
@@ -87,6 +88,7 @@ impl TaskWorkspace {
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
+            placeholders: Vec::new(),
         })
     }
 
@@ -188,7 +190,16 @@ impl TaskWorkspace {
             workspace_path.display()
         )];
         let protected = ProtectedPaths::for_repo(&workspace_path);
-        let read_only_mounts = read_only_mounts(&protected, &workspace_path);
+        let ProtectedMounts {
+            mounts: read_only_mounts,
+            placeholders,
+        } = match protected_mounts(&protected, &workspace_path) {
+            Ok(mounts) => mounts,
+            Err(e) => {
+                cleanup_worktree();
+                return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
+            }
+        };
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),
@@ -220,6 +231,7 @@ impl TaskWorkspace {
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
+            placeholders,
         })
     }
 
@@ -261,7 +273,9 @@ impl TaskWorkspace {
     /// The registry for this workspace restricted to `identity`: only tools
     /// in `scope.tools` at or below `scope.max_effect`, with file tools
     /// confined to `scope.paths` / `scope.read_paths`. `run_command` is
-    /// present only with a container and a ceiling of at least `workspace`.
+    /// present only with a container, a ceiling of at least `workspace` and
+    /// an identity that does not restrict paths (see
+    /// [`AgentIdentity::restricts_paths`]).
     pub fn build_tool_registry_for(
         &self,
         identity: &AgentIdentity,
@@ -277,8 +291,13 @@ impl TaskWorkspace {
     }
 
     fn stage_all(&self) -> Result<(), WorkspaceError> {
+        let excludes = self
+            .placeholders
+            .iter()
+            .map(|path| format!(":(exclude,literal){}", path.display()));
         let add_output = git_cmd(&self.workspace_path)
-            .args(["add", "--all"])
+            .args(["add", "--all", "--", "."])
+            .args(excludes)
             .output()?;
         if !add_output.status.success() {
             let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
@@ -389,15 +408,62 @@ impl TaskWorkspace {
     }
 }
 
-fn read_only_mounts(protected: &ProtectedPaths, workspace_path: &Path) -> Vec<ReadOnlyMount> {
-    protected
-        .existing_roots(workspace_path)
-        .into_iter()
-        .map(|root| {
-            let container = Path::new(CONTAINER_WORKSPACE_DIR).join(&root);
-            ReadOnlyMount::new(workspace_path.join(root), container)
-        })
-        .collect()
+/// The read-only mounts that shield every protected root of a worktree, and
+/// the empty files created so those roots exist to be mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedMounts {
+    /// One read-only bind mount per protected root.
+    pub mounts: Vec<ReadOnlyMount>,
+    /// Worktree-relative files that did not exist and were created empty
+    /// as mount points; they are excluded from the staged patch.
+    pub placeholders: Vec<PathBuf>,
+}
+
+/// Make every protected root of `workspace_path` exist, then mount each
+/// read-only, so a shell in the container cannot create or change anything
+/// under it even when the root was absent when the container started.
+/// Missing directory roots are created empty; missing file roots are
+/// created as empty placeholder files and reported in
+/// [`ProtectedMounts::placeholders`].
+///
+/// ```
+/// use harness::protected::ProtectedPaths;
+/// use harness::workspace::protected_mounts;
+///
+/// let workspace = tempfile::tempdir().unwrap();
+/// let protected = ProtectedPaths::with_config_dir(workspace.path(), None);
+/// let shielded = protected_mounts(&protected, workspace.path()).unwrap();
+/// assert!(workspace.path().join(".nanna").is_dir());
+/// assert!(workspace.path().join("codecov.yml").is_file());
+/// assert!(shielded.placeholders.iter().any(|p| p.ends_with("codecov.yml")));
+/// assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
+/// ```
+pub fn protected_mounts(
+    protected: &ProtectedPaths,
+    workspace_path: &Path,
+) -> Result<ProtectedMounts, WorkspaceError> {
+    let mut mounts = Vec::new();
+    let mut placeholders = Vec::new();
+    for root in protected.mount_targets() {
+        let host = workspace_path.join(&root.path);
+        if host.symlink_metadata().is_err() {
+            if root.directory {
+                std::fs::create_dir_all(&host)?;
+            } else {
+                if let Some(parent) = host.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&host)?;
+                placeholders.push(root.path.clone());
+            }
+        }
+        let container = Path::new(CONTAINER_WORKSPACE_DIR).join(&root.path);
+        mounts.push(ReadOnlyMount::new(host, container));
+    }
+    Ok(ProtectedMounts {
+        mounts,
+        placeholders,
+    })
 }
 
 impl Drop for TaskWorkspace {
@@ -737,6 +803,7 @@ mod tests {
         let mut identity = crate::identity::example();
         identity.scope.max_effect = ceiling;
         identity.scope.tools = vec!["*".parse().unwrap()];
+        identity.scope.paths = vec!["**".to_string()];
         identity
     }
 
@@ -963,6 +1030,175 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    fn every_protected_root_mount(root: &Path) -> Vec<ReadOnlyMount> {
+        [
+            ".nanna",
+            ".git",
+            ".github/workflows",
+            ".github/CODEOWNERS",
+            "codecov.yml",
+            "windows.toml",
+        ]
+        .iter()
+        .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
+        .collect()
+    }
+
+    async fn workspace_capturing_config(
+        source: &Path,
+        id: &str,
+    ) -> Result<(TaskWorkspace, ContainerConfig), WorkspaceError> {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let ws = TaskWorkspace::create_with_container_using(
+            source,
+            &unique_id(id),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await?;
+        let config = seen.lock().unwrap().clone().unwrap();
+        Ok((ws, config))
+    }
+
+    #[tokio::test]
+    async fn test_protected_roots_absent_at_container_start_are_created_and_mounted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, config) = workspace_capturing_config(source.path(), "ws-absent")
+            .await
+            .unwrap();
+        let root = ws.workspace_path.clone();
+
+        assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
+        assert!(root.join(".nanna").is_dir());
+        assert!(root.join(".github/workflows").is_dir());
+        for file in ["codecov.yml", "windows.toml", ".github/CODEOWNERS"] {
+            let meta = std::fs::metadata(root.join(file)).unwrap();
+            assert!(meta.is_file() && meta.len() == 0, "{file}");
+        }
+        let mut placeholders = ws.placeholders.clone();
+        placeholders.sort();
+        assert_eq!(
+            placeholders,
+            vec![
+                PathBuf::from(".github/CODEOWNERS"),
+                PathBuf::from("codecov.yml"),
+                PathBuf::from("windows.toml"),
+            ]
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_task_that_touches_nothing_extracts_a_clean_patch_despite_placeholders() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-clean")
+            .await
+            .unwrap();
+
+        assert_eq!(ws.extract_changes().unwrap(), "");
+        assert!(ws.changed_paths().unwrap().is_empty());
+        assert!(ws.format_patch().unwrap().is_none());
+
+        std::fs::write(ws.workspace_path.join("docs.md"), "fine").unwrap();
+        let patch = ws.extract_changes().unwrap();
+        assert!(patch.contains("docs.md"));
+        assert!(!patch.contains("codecov.yml"));
+        assert_eq!(ws.changed_paths().unwrap(), vec!["docs.md"]);
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_edits_under_a_protected_root_are_still_refused_with_placeholders_present() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-edit")
+            .await
+            .unwrap();
+        std::fs::write(ws.workspace_path.join(".nanna/agents.toml"), "x").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, ".nanna/**");
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_unpreparable_protected_root_fails_container_setup_and_removes_the_worktree() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::write(source.path().join(".github"), "not a directory").unwrap();
+        git_cmd(source.path()).args(["add", "."]).output().unwrap();
+        git_cmd(source.path())
+            .args(["commit", "-m", "github is a file"])
+            .output()
+            .unwrap();
+
+        let result = workspace_capturing_config(source.path(), "ws-unpreparable").await;
+        let err = result.err().expect("setup must fail");
+        assert!(
+            matches!(&err, WorkspaceError::ContainerSetupFailed(_)),
+            "{err:?}"
+        );
+        let listing = git_cmd(source.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("ws-unpreparable"));
+    }
+
+    #[test]
+    fn test_protected_mounts_leave_existing_roots_untouched() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna/agents")).unwrap();
+        std::fs::write(dir.path().join(".nanna/agents/x.toml"), "keep").unwrap();
+        std::fs::write(dir.path().join("codecov.yml"), "coverage: {}").unwrap();
+        let protected = ProtectedPaths::with_config_dir(dir.path(), None);
+
+        let shielded = protected_mounts(&protected, dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".nanna/agents/x.toml")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("codecov.yml")).unwrap(),
+            "coverage: {}"
+        );
+        let mut placeholders = shielded.placeholders.clone();
+        placeholders.sort();
+        assert_eq!(
+            placeholders,
+            vec![
+                PathBuf::from(".github/CODEOWNERS"),
+                PathBuf::from("windows.toml"),
+            ]
+        );
+        assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
+    }
+
+    #[test]
+    fn test_protected_mounts_report_an_unwritable_parent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".github"), "file").unwrap();
+        let protected = ProtectedPaths::with_config_dir(dir.path(), None);
+        let err = protected_mounts(&protected, dir.path()).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");
+    }
+
     #[tokio::test]
     async fn test_create_with_container_using_mounts_protected_roots_read_only() {
         use crate::container::{ContainerHandle, ContainerRuntime};
@@ -1001,14 +1237,7 @@ mod tests {
 
         let config = seen.lock().unwrap().clone().unwrap();
         let root = ws.workspace_path.clone();
-        assert_eq!(
-            config.read_only_mounts,
-            vec![
-                ReadOnlyMount::new(root.join(".nanna"), "/workspace/.nanna"),
-                ReadOnlyMount::new(root.join(".git"), "/workspace/.git"),
-                ReadOnlyMount::new(root.join("codecov.yml"), "/workspace/codecov.yml"),
-            ]
-        );
+        assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         let workspace_mount = args
             .iter()

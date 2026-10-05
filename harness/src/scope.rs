@@ -141,6 +141,15 @@ pub enum ScopeError {
         /// The glob parser's explanation.
         reason: String,
     },
+    /// The task's target repository is not listed in `scope.repos`.
+    #[error("identity `{identity}` may not run against `{repo}`: not in scope.repos")]
+    RepoOutsideScope {
+        /// Identity the task was dispatched under.
+        identity: String,
+        /// The repository the task targets, or the path when it has no
+        /// recognisable `origin` remote.
+        repo: String,
+    },
 }
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -296,6 +305,109 @@ impl PathScope {
     }
 }
 
+/// Normalise a git remote URL to `host/owner/name`, the form `scope.repos`
+/// entries use. Handles `https://`, `ssh://` and scp-style remotes, drops
+/// credentials, ports and a trailing `.git`, and lowercases nothing but the
+/// host.
+///
+/// ```
+/// use harness::scope::repo_slug;
+///
+/// assert_eq!(
+///     repo_slug("git@GitHub.com:example/repo.git").as_deref(),
+///     Some("github.com/example/repo")
+/// );
+/// assert_eq!(
+///     repo_slug("https://token@github.com/example/repo/").as_deref(),
+///     Some("github.com/example/repo")
+/// );
+/// assert_eq!(repo_slug("/srv/git/repo"), None);
+/// ```
+pub fn repo_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
+            let (authority, path) = rest.split_once('/')?;
+            (authority.split(':').next()?, path)
+        }
+        None => {
+            let rest = url.rsplit_once('@').map_or(url, |(_, after)| after);
+            rest.split_once(':')?
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let valid = |part: &str| !part.is_empty() && !part.contains('/');
+    if host.is_empty() || !valid(owner) || !valid(name) {
+        return None;
+    }
+    Some(format!("{}/{owner}/{name}", host.to_ascii_lowercase()))
+}
+
+fn origin_slug(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    repo_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Refuse a task whose target repository is not in the identity's
+/// `scope.repos`. The repository is named by its `origin` remote; without a
+/// recognisable one it cannot be named, so the check fails closed.
+///
+/// ```
+/// use harness::identity::AgentIdentity;
+/// use harness::scope::check_repo;
+///
+/// let toml = r#"
+/// [identity]
+/// name = "reader"
+/// description = "Reads."
+/// loop = "inner"
+/// model = "m"
+/// system_prompt = { inline = "Read." }
+///
+/// [scope]
+/// repos = ["github.com/example/repo"]
+/// paths = []
+/// max_effect = "none"
+/// tools = ["read_file"]
+///
+/// [limits]
+/// max_iterations = 1
+/// max_wall_clock_secs = 1
+/// max_concurrent = 1
+/// "#;
+/// let identity = AgentIdentity::from_toml_str(toml, "reader.toml").unwrap();
+/// let not_a_repo = tempfile::tempdir().unwrap();
+/// assert!(check_repo(&identity, not_a_repo.path()).is_err());
+/// ```
+pub fn check_repo(identity: &AgentIdentity, repo_path: &Path) -> Result<(), ScopeError> {
+    let slug = origin_slug(repo_path);
+    let allowed = slug.as_deref().is_some_and(|slug| {
+        identity
+            .scope
+            .repos
+            .iter()
+            .any(|repo| repo.eq_ignore_ascii_case(slug))
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(ScopeError::RepoOutsideScope {
+        identity: identity.name().to_string(),
+        repo: slug.unwrap_or_else(|| repo_path.display().to_string()),
+    })
+}
+
 /// `path` relative to `workspace_root`, or `path` itself when it is not
 /// beneath the root.
 pub fn relative_to<'a>(path: &'a Path, workspace_root: &Path) -> &'a Path {
@@ -308,6 +420,10 @@ fn violation(message: String) -> ToolError {
 
 fn cannot_resolve(path: &Path, e: std::io::Error) -> ToolError {
     violation(format!("Cannot resolve path '{}': {}", path.display(), e))
+}
+
+fn canonicalize(path: &Path, resolved: &Path) -> ToolResult<PathBuf> {
+    resolved.canonicalize().map_err(|e| cannot_resolve(path, e))
 }
 
 fn outside_root(path: &Path) -> ToolError {
@@ -339,9 +455,7 @@ fn canonical_within_workspace(
 ) -> ToolResult<(PathBuf, PathBuf)> {
     let root = canonical_root(workspace_root)?;
     let resolved = join_root(path, workspace_root);
-    let canonical = resolved
-        .canonicalize()
-        .map_err(|e| cannot_resolve(path, e))?;
+    let canonical = canonicalize(path, &resolved)?;
     if !canonical.starts_with(&root) {
         return Err(outside_root(path));
     }
@@ -383,9 +497,7 @@ fn resolve_for_write(path: &Path, workspace_root: &Path) -> ToolResult<(PathBuf,
     }
     let resolved = join_root(path, workspace_root);
     let (ancestor, remainder) = existing_ancestor(&resolved);
-    let canonical_ancestor = ancestor
-        .canonicalize()
-        .map_err(|e| cannot_resolve(path, e))?;
+    let canonical_ancestor = canonicalize(path, &ancestor)?;
     let canonical = canonical_ancestor.join(remainder);
     let relative = canonical
         .strip_prefix(&root)
@@ -436,9 +548,26 @@ fn resolve(
 ) -> ToolResult<PathBuf> {
     let (resolved, relative) = match access {
         PathAccess::Read => {
-            let (root, canonical) = canonical_within_workspace(path, workspace_root)?;
-            let relative = relative_to(&canonical, &root).to_path_buf();
-            (canonical, relative)
+            let root = canonical_root(workspace_root)?;
+            let joined = join_root(path, workspace_root);
+            match joined.canonicalize() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(denial) =
+                        deny_missing_read_uniformly(scope, tool, path, workspace_root)
+                    {
+                        return Err(denial);
+                    }
+                    return Err(cannot_resolve(path, e));
+                }
+                canonicalized => {
+                    let canonical = canonicalized.map_err(|e| cannot_resolve(path, e))?;
+                    if !canonical.starts_with(&root) {
+                        return Err(outside_root(path));
+                    }
+                    let relative = relative_to(&canonical, &root).to_path_buf();
+                    (canonical, relative)
+                }
+            }
         }
         PathAccess::Write => resolve_for_write(path, workspace_root)?,
     };
@@ -455,6 +584,39 @@ fn resolve(
         }
     }
     Ok(resolved)
+}
+
+/// When a read target does not exist, decide whether to report that
+/// directly or to deny it as out-of-scope instead.
+///
+/// Without this, a scoped identity could distinguish "exists but outside
+/// `scope.read_paths`" ([`ToolError::ScopeDenied`]) from "does not exist"
+/// ([`ToolError::PathSecurityViolation`]), using `read_file` as an oracle
+/// for the existence of files it has no business knowing about. A relative,
+/// non-traversing path that a scope would deny anyway is denied uniformly
+/// instead, so both outcomes look identical to the caller; the raw I/O
+/// error `canonical_within_workspace` produced is used everywhere else
+/// (traversal attempts, absolute paths, and any read a scope would permit).
+fn deny_missing_read_uniformly(
+    scope: Option<&PathScope>,
+    tool: &str,
+    path: &Path,
+    workspace_root: &Path,
+) -> Option<ToolError> {
+    let scope = scope?;
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    let relative = relative_to(&join_root(path, workspace_root), workspace_root).to_path_buf();
+    if scope.permits(PathAccess::Read, &relative) {
+        return None;
+    }
+    let path = relative.to_string_lossy().into_owned();
+    let reason = DenialReason::PathOutsideScope {
+        access: PathAccess::Read,
+        path,
+    };
+    Some(ToolError::ScopeDenied(scope.deny(tool, reason)))
 }
 
 #[cfg(test)]
@@ -657,6 +819,31 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_path_within_workspace_reports_a_missing_path() {
+        let dir = workspace();
+        let err = validate_path_within_workspace(Path::new("missing.rs"), dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::PathSecurityViolation { message } if message.contains("Cannot resolve path 'missing.rs'")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_path_within_workspace_rejects_a_symlink_escape() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+        let escape = validate_path_within_workspace(Path::new("escape/secret"), root);
+        assert!(
+            matches!(escape, Err(ToolError::PathSecurityViolation { .. })),
+            "{escape:?}"
+        );
+    }
+
     #[test]
     fn scoped_writes_outside_paths_are_denied_with_the_relative_path() {
         let ws = workspace();
@@ -758,6 +945,115 @@ mod tests {
             }
             other => panic!("expected ScopeDenied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_missing_out_of_scope_read_does_not_leak_whether_it_exists() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let existing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("docs/README.md"),
+            root,
+        );
+        let missing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("docs/does_not_exist.md"),
+            root,
+        );
+        for (label, result) in [("existing", existing), ("missing", missing)] {
+            match result {
+                Err(ToolError::ScopeDenied(denial)) => {
+                    assert_eq!(
+                        denial.reason,
+                        DenialReason::PathOutsideScope {
+                            access: PathAccess::Read,
+                            path: format!(
+                                "docs/{}",
+                                if label == "existing" {
+                                    "README.md"
+                                } else {
+                                    "does_not_exist.md"
+                                }
+                            ),
+                        },
+                        "{label}"
+                    );
+                }
+                other => panic!("{label}: expected ScopeDenied, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_in_scope_read_still_reports_it_is_missing() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let missing = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("api/does_not_exist.rs"),
+            root,
+        );
+        match &missing {
+            Err(ToolError::PathSecurityViolation { message }) => {
+                assert!(message.contains("does_not_exist.rs"), "{message}");
+            }
+            other => panic!("expected PathSecurityViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_scoped_read_with_a_traversal_or_absolute_path_is_not_masked_as_a_scope_denial() {
+        let ws = workspace();
+        let root = ws.path();
+        let scope = scope(&["api/**"], Some(&["api/**"]));
+        let traversal = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("api/../does_not_exist.rs"),
+            root,
+        );
+        assert!(
+            matches!(traversal, Err(ToolError::PathSecurityViolation { .. })),
+            "{traversal:?}"
+        );
+        let absolute = resolve_path(
+            Some(&scope),
+            "read_file",
+            PathAccess::Read,
+            Path::new("/definitely/not/here.rs"),
+            root,
+        );
+        assert!(
+            matches!(absolute, Err(ToolError::PathSecurityViolation { .. })),
+            "{absolute:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_unscoped_read_still_reports_it_is_missing() {
+        let ws = workspace();
+        let root = ws.path();
+        let missing = resolve_path(
+            None,
+            "read_file",
+            PathAccess::Read,
+            Path::new("nope.rs"),
+            root,
+        );
+        assert!(matches!(
+            missing,
+            Err(ToolError::PathSecurityViolation { .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -1055,5 +1351,74 @@ mod tests {
             let violation = protected_error(guarded(Some(&scoped), PathAccess::Write, &path, root));
             prop_assert_eq!(violation.path, path);
         }
+    }
+
+    #[test]
+    fn repo_slug_normalises_every_remote_shape() {
+        let slug = |url: &str| repo_slug(url);
+        let expected = Some("github.com/example/repo".to_string());
+        assert_eq!(slug("https://github.com/example/repo.git"), expected);
+        assert_eq!(slug("https://user:pw@GITHUB.com/example/repo"), expected);
+        assert_eq!(slug("ssh://git@github.com:22/example/repo.git"), expected);
+        assert_eq!(slug("git@github.com:example/repo.git"), expected);
+        assert_eq!(slug("  https://github.com/example/repo/  "), expected);
+        assert_eq!(slug("https://github.com/example"), None);
+        assert_eq!(slug("https://github.com"), None);
+        assert_eq!(slug("https://github.com/a/b/c"), None);
+        assert_eq!(slug("https:///example/repo"), None);
+        assert_eq!(slug("https://github.com//repo"), None);
+        assert_eq!(slug("/srv/git/repo"), None);
+        assert_eq!(slug(""), None);
+    }
+
+    fn repo_with_origin(url: Option<&str>) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&["init", "-q"]);
+        if let Some(url) = url {
+            git(&["remote", "add", "origin", url]);
+        }
+        dir
+    }
+
+    #[test]
+    fn check_repo_allows_only_listed_repositories() {
+        let identity = example();
+        let listed = repo_with_origin(Some("git@github.com:Example/Repo.git"));
+        assert_eq!(check_repo(&identity, listed.path()), Ok(()));
+
+        let other = repo_with_origin(Some("https://github.com/example/other"));
+        assert_eq!(
+            check_repo(&identity, other.path()),
+            Err(ScopeError::RepoOutsideScope {
+                identity: "rust-implementer".to_string(),
+                repo: "github.com/example/other".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn check_repo_fails_closed_without_a_nameable_origin() {
+        let identity = example();
+        let no_remote = repo_with_origin(None);
+        let err = check_repo(&identity, no_remote.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&no_remote.path().display().to_string()));
+
+        let local_remote = repo_with_origin(Some("/srv/git/repo"));
+        assert!(check_repo(&identity, local_remote.path()).is_err());
+
+        let mut open_identity = example();
+        open_identity.scope.repos.clear();
+        let listed = repo_with_origin(Some("https://github.com/example/repo"));
+        assert!(check_repo(&open_identity, listed.path()).is_err());
     }
 }

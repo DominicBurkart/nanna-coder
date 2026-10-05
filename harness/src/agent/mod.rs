@@ -405,10 +405,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     }
 
     fn scope_denials(&self) -> Vec<ScopeDenial> {
-        self.tool_registry
-            .as_ref()
-            .map(ToolRegistry::denials)
-            .unwrap_or_default()
+        match &self.tool_registry {
+            Some(registry) => registry.denials(),
+            None => Vec::new(),
+        }
     }
 
     fn enrich_error(&self, error: AgentError) -> AgentError {

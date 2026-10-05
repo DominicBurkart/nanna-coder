@@ -109,6 +109,15 @@ impl Rule {
     }
 }
 
+/// A literal protected root that can be mounted read-only into a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountRoot {
+    /// The repository-relative path of the root.
+    pub path: PathBuf,
+    /// Whether the root is a directory (a `/**` rule) rather than a file.
+    pub directory: bool,
+}
+
 /// The set of paths no agent may write, regardless of identity.
 ///
 /// ```
@@ -194,18 +203,29 @@ impl ProtectedPaths {
     }
 
     /// The repository-relative directories and files that, mounted
-    /// read-only, cover every rule with a literal prefix. Nested roots are
-    /// folded into their ancestor.
-    pub fn mount_roots(&self) -> Vec<PathBuf> {
-        let candidates: Vec<PathBuf> = self.rules.iter().filter_map(Rule::mount_root).collect();
-        let mut roots: Vec<PathBuf> = Vec::new();
-        for candidate in candidates {
-            let covered = roots.iter().any(|root| candidate.starts_with(root));
-            if !covered && !roots.contains(&candidate) {
-                roots.push(candidate);
+    /// read-only, cover every rule with a literal prefix, with whether each
+    /// is a directory. Nested roots are folded into their ancestor.
+    pub fn mount_targets(&self) -> Vec<MountRoot> {
+        let mut roots: Vec<MountRoot> = Vec::new();
+        for rule in &self.rules {
+            let Some(path) = rule.mount_root() else {
+                continue;
+            };
+            if roots.iter().any(|root| path.starts_with(&root.path)) {
+                continue;
             }
+            let directory = rule.glob.ends_with(RECURSIVE_SUFFIX);
+            roots.push(MountRoot { path, directory });
         }
         roots
+    }
+
+    /// The repository-relative paths of [`ProtectedPaths::mount_targets`].
+    pub fn mount_roots(&self) -> Vec<PathBuf> {
+        self.mount_targets()
+            .into_iter()
+            .map(|root| root.path)
+            .collect()
     }
 
     /// The [`ProtectedPaths::mount_roots`] that exist under `repo_root`.
@@ -348,6 +368,26 @@ mod tests {
                 PathBuf::from("codecov.yml"),
                 PathBuf::from("windows.toml"),
                 PathBuf::from("cfg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mount_targets_say_which_roots_are_directories() {
+        let targets = protected().mount_targets();
+        let kinds: Vec<(String, bool)> = targets
+            .iter()
+            .map(|t| (t.path.display().to_string(), t.directory))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (".nanna".to_string(), true),
+                (".git".to_string(), true),
+                (".github/workflows".to_string(), true),
+                (".github/CODEOWNERS".to_string(), false),
+                ("codecov.yml".to_string(), false),
+                ("windows.toml".to_string(), false),
             ]
         );
     }

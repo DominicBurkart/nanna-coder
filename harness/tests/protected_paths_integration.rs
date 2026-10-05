@@ -21,6 +21,7 @@ use harness::container::{
 };
 use harness::protected::ProtectedPaths;
 use harness::tools::{create_container_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR};
+use harness::workspace::protected_mounts;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
@@ -143,5 +144,96 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
         std::fs::read_to_string(workspace.join("README.md")).unwrap(),
         "edited\n"
     );
+    assert_eq!(registry.denial_count(), 0);
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+async fn assert_blocked(registry: &ToolRegistry, command: &str) {
+    let result = run(registry, command).await;
+    assert_eq!(result["success"], false, "{command}: {result}");
+}
+
+#[tokio::test]
+async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_shell() {
+    if !detect_runtime().is_available() {
+        eprintln!("SKIPPED: no container runtime available");
+        return;
+    }
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    let workspace = host.path().join("worktree");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-q"]);
+    git(&source, &["config", "user.email", "t@t.com"]);
+    git(&source, &["config", "user.name", "T"]);
+    git(&source, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(source.join("README.md"), "# repo").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "init"]);
+    git(
+        &source,
+        &["worktree", "add", "-q", workspace.to_str().unwrap(), "HEAD"],
+    );
+    for absent in [".nanna", ".github", "codecov.yml", "windows.toml"] {
+        assert!(!workspace.join(absent).exists(), "{absent}");
+    }
+    let gitlink = std::fs::read_to_string(workspace.join(".git")).unwrap();
+    assert!(gitlink.starts_with("gitdir:"), "{gitlink}");
+
+    let protected = ProtectedPaths::with_config_dir(&workspace, None);
+    let shielded = protected_mounts(&protected, &workspace).unwrap();
+
+    let Some(handle) = start(&workspace, shielded.mounts).await else {
+        return;
+    };
+    let registry = create_container_tool_registry(&workspace, handle, CONTAINER_WORKSPACE_DIR);
+
+    assert_refused(&registry, "mkdir -p /workspace/.nanna/agents").await;
+    assert_refused(&registry, "echo x > /workspace/.nanna/new.toml").await;
+    assert_refused(&registry, "mkdir -p /workspace/.github/workflows/sub").await;
+    assert_refused(&registry, "echo x > /workspace/.github/workflows/ci.yml").await;
+    assert_refused(&registry, "echo x > /workspace/.github/CODEOWNERS").await;
+    assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
+    assert_refused(&registry, "echo x > /workspace/windows.toml").await;
+    assert_blocked(&registry, "echo 'gitdir: /tmp/evil' > /workspace/.git").await;
+    assert_blocked(&registry, "rm -f /workspace/.git").await;
+    assert_blocked(&registry, "mkdir -p /workspace/.git/hooks").await;
+    assert_blocked(&registry, "echo x > /workspace/.git/hooks/pre-commit").await;
+    assert_blocked(&registry, "echo x > /workspace/.git/config").await;
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.join(".git")).unwrap(),
+        gitlink
+    );
+    assert_eq!(
+        std::fs::read_dir(workspace.join(".nanna")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(workspace.join(".github/workflows"))
+            .unwrap()
+            .count(),
+        0
+    );
+    for placeholder in ["codecov.yml", "windows.toml", ".github/CODEOWNERS"] {
+        assert_eq!(
+            std::fs::metadata(workspace.join(placeholder))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+    git(&workspace, &["status", "--porcelain"]);
+
+    let ordinary = run(&registry, "echo edited > /workspace/README.md").await;
+    assert_eq!(ordinary["success"], true, "{ordinary}");
     assert_eq!(registry.denial_count(), 0);
 }

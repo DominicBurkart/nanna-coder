@@ -122,6 +122,50 @@ enum Commands {
         /// Requested task lifetime in milliseconds
         #[arg(long)]
         ttl_ms: Option<u64>,
+        /// Name of the agent identity the task runs under
+        #[arg(short, long)]
+        identity: String,
+    },
+    /// Pull open GitHub issues into the persistent task queue
+    ///
+    /// Issues already queued (by number) or already claimed by an open pull
+    /// request carrying a `Nanna-Identity:` marker are skipped. Reads
+    /// `GITHUB_TOKEN` for authentication when set. Entries land in the queue
+    /// log and are picked up when `mcp-serve` next starts.
+    BacklogSync {
+        /// GitHub repository in `owner/name` form
+        #[arg(long)]
+        repo: String,
+        /// Absolute path to the local checkout tasks run against
+        #[arg(long)]
+        repo_path: std::path::PathBuf,
+        /// Branch or ref to base task worktrees on
+        #[arg(long, default_value = "HEAD")]
+        branch: String,
+        /// GitHub search query fragment selecting the issues
+        #[arg(long, default_value = "label:nanna")]
+        query: String,
+        /// Identity hint attached to every ingested task
+        #[arg(long)]
+        identity: String,
+        /// The model the tasks run with
+        #[arg(short, long, default_value = "qwen3:0.6b")]
+        model: String,
+        /// Maximum agent iterations per task
+        #[arg(long, default_value = "100")]
+        max_iterations: usize,
+        /// Maximum pending tasks per repository path
+        #[arg(long)]
+        max_per_repo: Option<usize>,
+        /// Queue log location (defaults to NANNA_QUEUE_PATH or
+        /// ~/.local/state/nanna/queue.jsonl)
+        #[arg(long)]
+        queue_path: Option<std::path::PathBuf>,
+    },
+    /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
     },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
@@ -150,6 +194,76 @@ enum AgentsAction {
         /// Repository whose .nanna/agents/ overrides are layered on top.
         #[arg(long)]
         repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Print the deployment plan for an environment without executing it
+    Plan {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to plan for
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Print the plan as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a starter template for a full-stack Rust repository
+    Init {
+        /// Risk class of the system: unused, internal, edge or core
+        #[arg(long)]
+        risk: harness::deploy::RiskClass,
+        /// Repository root to write .nanna/deploy.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+    },
+    /// Execute the deployment plan for an environment as a resumable rollout
+    Run {
+        /// Repository root containing .nanna/deploy.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Environment to roll out to
+        #[arg(long, default_value = "production")]
+        env: String,
+        /// Image reference to roll out
+        #[arg(long)]
+        image: String,
+        /// Blast-radius score of the change, required when risk.class = "derived"
+        #[arg(long)]
+        score: Option<u32>,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
+    },
+    /// Show every rollout, or one rollout with its transition history
+    Status {
+        /// Rollout id
+        id: Option<String>,
+    },
+    /// Kill switch: hold a rollout's current traffic split (human only)
+    Halt {
+        /// Rollout id
+        id: String,
+    },
+    /// Restart a halted rollout from step 0 with a fixed image
+    RollForward {
+        /// Rollout id
+        id: String,
+        /// Fixed image reference
+        #[arg(long)]
+        image: String,
+        /// Pull request that delivered the fix
+        #[arg(long)]
+        pr: String,
+        /// Dry run against an in-memory fake target on a simulated clock
+        #[arg(long)]
+        fake: bool,
     },
 }
 
@@ -265,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
             ttl_ms,
+            identity,
         } => {
             run_delegate(
                 &description,
@@ -273,9 +388,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &model,
                 max_iterations,
                 ttl_ms,
+                &identity,
             )
             .await?;
         }
+        Commands::BacklogSync {
+            repo,
+            repo_path,
+            branch,
+            query,
+            identity,
+            model,
+            max_iterations,
+            max_per_repo,
+            queue_path,
+        } => {
+            run_backlog_sync(
+                harness::backlog::BacklogConfig {
+                    sources: vec![harness::backlog::BacklogSource {
+                        repo,
+                        repo_path,
+                        branch,
+                        query,
+                        identity,
+                        model,
+                        max_iterations,
+                    }],
+                    max_per_repo,
+                },
+                queue_path,
+            )
+            .await?;
+        }
+        Commands::Deploy { command } => run_deploy(command).await?,
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -290,6 +435,162 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn rollout_log() -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let path = harness::rollout::default_rollout_path()
+        .ok_or("no rollout log location: set NANNA_ROLLOUT_PATH or HOME")?;
+    Ok(harness::rollout::RolloutLog::open(&path)?)
+}
+
+type FakeExecutor = (
+    harness::rollout::RolloutExecutor,
+    std::sync::Arc<harness::leases::SimulatedClock>,
+);
+
+fn fake_rollout_log(
+    seed: Option<&harness::rollout::RolloutRecord>,
+) -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("nanna-fake-rollout-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
+    if let Some(record) = seed {
+        log.append(None, record)?;
+    }
+    Ok(log)
+}
+
+fn fake_rollout_executor(
+    repo: &std::path::Path,
+    plan: &harness::deploy::DeployPlan,
+    log: harness::rollout::RolloutLog,
+) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
+    let windows_path = repo
+        .join(harness::deploy::DEPLOY_DIR)
+        .join(harness::windows::WINDOWS_FILE_NAME);
+    let windows = if windows_path.exists() {
+        harness::windows::WindowSet::load(&windows_path)?
+    } else {
+        harness::windows::WindowSet::default()
+    };
+    let endpoints = plan
+        .health
+        .as_ref()
+        .map(|h| h.endpoints.clone())
+        .unwrap_or_default();
+    let previous = format!("{}:previous", plan.image);
+    let (executor, _adapter, _health, _shadow, clock) =
+        harness::rollout::fake_executor(log, windows, &previous, &endpoints);
+    Ok((executor, clock))
+}
+
+async fn run_fake_to_a_stop(
+    executor: &harness::rollout::RolloutExecutor,
+    clock: &harness::leases::SimulatedClock,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let steps = harness::rollout::run_simulated(executor, clock, id).await?;
+    let Some((last, parked)) = steps.split_last() else {
+        return Ok(());
+    };
+    for step in parked {
+        println!("parked   {}", step.summary());
+    }
+    println!("finished {}", last.summary());
+    Ok(())
+}
+
+const NO_REAL_TARGET: &str =
+    "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DeployCommands::Run {
+            repo_path,
+            env,
+            image,
+            score,
+            fake,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let (executor, clock) = fake_rollout_executor(&repo, &plan, fake_rollout_log(None)?)?;
+            let record = executor.start(plan, &image).await?;
+            println!("started  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &record.id).await?;
+        }
+        DeployCommands::Status { id } => {
+            let log = rollout_log()?;
+            match id {
+                Some(id) => {
+                    println!("{}", log.load(&id)?.summary());
+                    for transition in log.history(&id)? {
+                        println!("  {}", transition.summary());
+                    }
+                }
+                None => {
+                    for record in log.latest()?.into_values() {
+                        println!("{}", record.summary());
+                    }
+                }
+            }
+        }
+        DeployCommands::Halt { id } => {
+            let record = rollout_log()?.halt(&id, chrono::Utc::now())?;
+            println!("halted   {}", record.summary());
+        }
+        DeployCommands::RollForward {
+            id,
+            image,
+            pr,
+            fake,
+        } => {
+            if !fake {
+                return Err(NO_REAL_TARGET.into());
+            }
+            let real = rollout_log()?.load(&id)?;
+            let (executor, clock) = fake_rollout_executor(
+                &std::env::current_dir()?,
+                &real.plan,
+                fake_rollout_log(Some(&real))?,
+            )?;
+            let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
+            println!("forward  {}", record.summary());
+            run_fake_to_a_stop(&executor, &clock, &id).await?;
+        }
+        DeployCommands::Plan {
+            repo_path,
+            env,
+            score,
+            json,
+        } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
+            if json {
+                println!("{}", plan.to_json_pretty());
+            } else {
+                print!("{plan}");
+            }
+        }
+        DeployCommands::Init { risk, repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::deploy::init(&repo, risk)?;
+            println!("Wrote {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -632,6 +933,104 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
         }
     }
 
+    report_queue_health()?;
+    report_lease_health()?;
+
+    Ok(())
+}
+
+/// Print every recorded coordination lease with live and expired counts.
+/// A missing lease log means no lease has been granted yet.
+fn report_lease_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::{default_lease_path, JsonlLeaseStore, LeaseSnapshot};
+
+    let Some(path) = default_lease_path() else {
+        println!("- Leases: no lease location (set NANNA_LEASE_PATH, NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Leases: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlLeaseStore::open(&path)?;
+    let snapshot = LeaseSnapshot::from_store(&store, chrono::Utc::now())?;
+    println!("- Leases ({}): {}", path.display(), snapshot);
+    for lease in &snapshot.leases {
+        let state = if lease.is_expired(snapshot.at) {
+            "expired"
+        } else {
+            "held"
+        };
+        println!(
+            "  {} {} by {} until {}",
+            state, lease.name, lease.holder, lease.until
+        );
+    }
+    Ok(())
+}
+
+/// Print the persisted backlog's depth, parked count and age of its oldest
+/// entry. A missing queue log means no backlog has been recorded yet.
+fn report_queue_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::scheduler::{default_queue_path, JsonlQueueStore, QueueMetrics};
+
+    let Some(path) = default_queue_path() else {
+        println!("- Task queue: no queue location (set NANNA_QUEUE_PATH or HOME)");
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Task queue: empty (no log at {})", path.display());
+        return Ok(());
+    }
+    let store = JsonlQueueStore::open(&path)?;
+    let metrics = QueueMetrics::from_store(&store, chrono::Utc::now())?;
+    println!("- Task queue ({}): {}", path.display(), metrics);
+    Ok(())
+}
+
+/// Lease log location: `NANNA_LEASE_PATH` when set, otherwise
+/// `leases.jsonl` next to the queue log.
+fn resolve_lease_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::leases::lease_path_from(
+        std::env::var_os(harness::leases::LEASE_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields a lease path")
+}
+
+fn resolve_queue_path(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    explicit
+        .or_else(harness::scheduler::default_queue_path)
+        .ok_or_else(|| {
+            "no queue location: pass --queue-path or set NANNA_QUEUE_PATH or HOME".into()
+        })
+}
+
+async fn run_backlog_sync(
+    config: harness::backlog::BacklogConfig,
+    queue_path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
+    use harness::scheduler::JsonlQueueStore;
+
+    let path = resolve_queue_path(queue_path)?;
+    let store = JsonlQueueStore::open(&path)?;
+    let sink = StoreSink::open(Box::new(store))?;
+    let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
+    let report = backlog_sync(&client, &sink, &config).await?;
+    println!(
+        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}",
+        path.display(),
+        report.enqueued.len(),
+        report.duplicates,
+        report.claimed,
+        report.capped
+    );
+    for origin in &report.enqueued {
+        println!("  + {origin}");
+    }
     Ok(())
 }
 
@@ -784,21 +1183,46 @@ async fn run_agent(
     Ok(())
 }
 
+fn load_identities() -> IdentityCatalog {
+    IdentityCatalog::load_default().unwrap_or_else(|e| {
+        tracing::warn!("No agent identities registered ({e}); every assign_task will fail closed");
+        IdentityCatalog::default()
+    })
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let queue_path = resolve_queue_path(None)?;
+    let lease_path = resolve_lease_path(&queue_path);
+    let catalog = load_identities();
+    let task_manager = Arc::new(
+        TaskManager::restore_with_identities(
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(&queue_path)?),
+            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+            provider.clone(),
+            &catalog,
+        )
+        .await?,
+    );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {})",
-        model, max_iterations
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {})",
+        model,
+        max_iterations,
+        queue_path.display(),
+        lease_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
@@ -825,6 +1249,7 @@ async fn run_delegate(
     model: &str,
     max_iterations: usize,
     ttl_ms: Option<u64>,
+    identity: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
@@ -834,6 +1259,7 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
+    task_manager.register_catalog(&load_identities()).await;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
@@ -859,6 +1285,7 @@ async fn run_delegate(
         "branch": branch,
         "model": model,
         "max_iterations": max_iterations,
+        "identity": identity,
     });
     let task_id = client.submit_task(arguments, ttl_ms).await?;
     info!("Delegated task {task_id}; awaiting completion...");
@@ -964,5 +1391,77 @@ mod tests {
             Some(missing_compare.as_path()),
         );
         assert!(result.is_err(), "expected error on missing compare file");
+    }
+
+    const FAKE_TEMPLATE: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"edge\"\n[rollout]\nstrategy = \"gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n";
+
+    static ROLLOUT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn fake_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FAKE_TEMPLATE).unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn fake_deploy_run_never_writes_the_real_rollout_log() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        run_deploy(DeployCommands::Run {
+            repo_path: Some(repo.path().to_path_buf()),
+            env: "sandbox".into(),
+            image: "registry.example.invalid/ns/app:v2".into(),
+            score: None,
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(!real_path.exists(), "fake run touched the real log");
+    }
+
+    #[tokio::test]
+    async fn fake_roll_forward_leaves_the_real_record_untouched() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        let plan = harness::deploy::plan_for_repo(repo.path(), "sandbox", None).unwrap();
+        let mut record = harness::rollout::RolloutRecord::new(
+            "rollout-real",
+            plan,
+            "registry.example.invalid/ns/app:v2",
+            "registry.example.invalid/ns/app:v1",
+            chrono::Utc::now(),
+        );
+        let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
+        log.append(None, &record).unwrap();
+        let pending = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&pending), &record).unwrap();
+        let stepping = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&stepping), &record).unwrap();
+        let before = std::fs::read_to_string(&real_path).unwrap();
+        run_deploy(DeployCommands::RollForward {
+            id: "rollout-real".into(),
+            image: "registry.example.invalid/ns/app:v3".into(),
+            pr: "https://example.invalid/pr/1".into(),
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&real_path).unwrap() == before,
+            "fake roll-forward rewrote the real log"
+        );
     }
 }

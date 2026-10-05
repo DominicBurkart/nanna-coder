@@ -239,7 +239,7 @@ mod tests {
 
         let task_id = client
             .submit_task(
-                serde_json::json!({ "description": "d", "repo_path": "/tmp" }),
+                serde_json::json!({ "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" }),
                 Some(5000),
             )
             .await

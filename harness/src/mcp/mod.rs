@@ -177,9 +177,13 @@ impl NannaMcpServer {
                         "max_iterations": {
                             "type": "integer",
                             "description": "Maximum agent iterations (default: server default)"
+                        },
+                        "identity": {
+                            "type": "string",
+                            "description": "Name of a registered agent identity. The task runs under that identity's scope (tools, effect ceiling, paths, repos); an unregistered identity, or a repository outside scope.repos, fails the task."
                         }
                     },
-                    "required": ["description", "repo_path"]
+                    "required": ["description", "repo_path", "identity"]
                 },
                 "execution": { "taskSupport": "required" }
             },
@@ -326,11 +330,25 @@ impl NannaMcpServer {
         }
     }
 
-    /// `tasks/list` — return all tasks (v1 returns the full set, no pagination).
+    /// `tasks/list` — return all tasks (v1 returns the full set, no pagination)
+    /// plus the scheduler's queue metrics under `_meta.queue` and the lease
+    /// snapshot under `_meta.leases`. A lease store that cannot be read is
+    /// reported as `_meta.leases.error` rather than hidden.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
         let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
-        JsonRpcResponse::success(id, serde_json::json!({ "tasks": wire }))
+        let queue = self.task_manager.queue_metrics().await.to_json();
+        let leases = match self.task_manager.lease_snapshot() {
+            Ok(snapshot) => snapshot.to_json(),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read lease store for tasks/list");
+                serde_json::json!({ "error": e.to_string() })
+            }
+        };
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue, "leases": leases } }),
+        )
     }
 
     /// `tasks/cancel` — cancel a task; already-terminal tasks yield -32602.
@@ -426,6 +444,14 @@ mod tests {
             .find(|t| t["name"] == "assign_task")
             .expect("assign_task present");
         assert_eq!(assign["execution"]["taskSupport"], "required");
+        let required: Vec<&str> = assign["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"identity"));
+        assert!(assign["inputSchema"]["properties"]["identity"].is_object());
         // onboard_repo does not declare task support (forbidden by default).
         let onboard = arr
             .iter()
@@ -616,7 +642,7 @@ mod tests {
                 11,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": { "ttl": 5000 }
                 }),
             ))
@@ -627,6 +653,24 @@ mod tests {
         assert_eq!(task["ttl"], 5000);
         assert!(task["taskId"].is_string());
         assert_eq!(task["pollInterval"], handlers::POLL_INTERVAL_MS);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_without_identity_is_invalid_params() {
+        let server = make_server();
+        let resp = server
+            .handle_request(tools_call(
+                40,
+                serde_json::json!({
+                    "name": "assign_task",
+                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "task": {}
+                }),
+            ))
+            .await;
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("identity"), "{}", error.message);
     }
 
     #[tokio::test]
@@ -811,7 +855,7 @@ mod tests {
                 19,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
@@ -833,10 +877,26 @@ mod tests {
         assert_eq!(task["status"], "working");
         assert!(task["ttl"].is_null());
 
+        let holder = server.task_manager.leases();
+        let name = crate::leases::LeaseName::branch("example/repo", "main");
+        holder
+            .acquire(
+                &name,
+                &task_id,
+                chrono::Duration::hours(1),
+                chrono::Utc::now(),
+            )
+            .unwrap();
         let listed = server
             .handle_request(method_call(21, "tasks/list", serde_json::json!({})))
-            .await;
-        assert_eq!(listed.result.unwrap()["tasks"].as_array().unwrap().len(), 1);
+            .await
+            .result
+            .unwrap();
+        assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["_meta"]["queue"]["queued"], 1);
+        assert_eq!(listed["_meta"]["queue"]["running"], 0);
+        assert_eq!(listed["_meta"]["leases"]["held"], 1);
+        assert_eq!(listed["_meta"]["leases"]["leases"][0]["holder"], task_id);
 
         // tasks/cancel transitions it to cancelled and returns the task.
         let cancelled = server
@@ -847,6 +907,73 @@ mod tests {
             ))
             .await;
         assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
+        assert!(holder.snapshot().unwrap().is_empty());
+    }
+
+    struct BrokenLeases;
+
+    impl crate::leases::LeaseStore for BrokenLeases {
+        fn acquire(
+            &self,
+            _name: &crate::leases::LeaseName,
+            _holder: &str,
+            _ttl: chrono::Duration,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::leases::Lease, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn renew(
+            &self,
+            _lease: &crate::leases::Lease,
+            _ttl: chrono::Duration,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::leases::Lease, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn release(&self, _lease: &crate::leases::Lease) -> Result<(), crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn release_all(
+            &self,
+            _holder: &str,
+        ) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn expired(
+            &self,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+        fn snapshot(&self) -> Result<Vec<crate::leases::Lease>, crate::leases::LeaseError> {
+            Err(crate::leases::LeaseError::Io("broken".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tasks_list_reports_unreadable_lease_store() {
+        let manager = TaskManager::with_stores(
+            0,
+            Box::new(crate::scheduler::HybridPolicy::default()),
+            Box::new(crate::scheduler::InMemoryQueueStore::default()),
+            Arc::new(BrokenLeases),
+        )
+        .unwrap();
+        let server = NannaMcpServer::new(
+            Arc::new(manager),
+            Arc::new(NoopProvider),
+            "qwen3:0.6b".to_string(),
+            100,
+        );
+        let listed = server
+            .handle_request(method_call(30, "tasks/list", serde_json::json!({})))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            listed["_meta"]["leases"]["error"],
+            "lease store I/O error: broken"
+        );
     }
 
     #[tokio::test]
@@ -864,7 +991,7 @@ mod tests {
                 23,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
