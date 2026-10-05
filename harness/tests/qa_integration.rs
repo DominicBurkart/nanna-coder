@@ -378,6 +378,14 @@ async fn tool_panics_naming_the_failing_tool() {
 }
 
 #[test]
+fn stub_tool_describes_itself_by_name() {
+    let registry = registry_with("probe", Value::Null);
+    let tool = registry.get_tool("probe").unwrap();
+    assert_eq!(tool.definition().function.name, "probe");
+    assert_eq!(tool.definition().function.description, "stub");
+}
+
+#[test]
 fn dev_containerfile_installs_the_toolchain_and_prebuilds_the_fixture() {
     let containerfile = dev_containerfile();
     assert!(containerfile.starts_with("FROM docker.io/library/rust:1-bookworm\n"));
