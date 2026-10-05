@@ -1006,7 +1006,8 @@ fn run_escalation_resolve(
         Some(explicit) => explicit,
         None => resolve_escalation_path(&resolve_queue_path(None)?),
     };
-    let hold = EscalationLog::open(&path)?.resolve(id, chrono::Utc::now())?;
+    let grant = harness::escalation::ResolveGrant::from_environment()?;
+    let hold = EscalationLog::open(&path)?.resolve(&grant, id, chrono::Utc::now())?;
     println!(
         "Resolved incident hold {} on {} (held since {}): {}",
         hold.escalation_id, hold.repo, hold.since, hold.summary

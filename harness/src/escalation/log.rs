@@ -39,6 +39,42 @@ pub fn escalation_path_from(
         .or_else(|| queue_path.map(|q| q.with_file_name("escalations.jsonl")))
 }
 
+/// Proof that the caller is a human operator at a terminal. Only
+/// [`EscalationLog::resolve`] accepts one, and no agent tool constructs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveGrant(());
+
+/// Environment variable set for processes spawned on behalf of an agent;
+/// its presence refuses [`ResolveGrant::from_environment`].
+pub const AGENT_SESSION_ENV: &str = "NANNA_AGENT_SESSION";
+
+impl ResolveGrant {
+    /// Grant resolution only to an interactive terminal session that is
+    /// not running on behalf of an agent.
+    pub fn check(interactive: bool, agent_session: Option<&str>) -> Result<Self, EscalationError> {
+        if let Some(marker) = agent_session {
+            return Err(EscalationError::Unauthorized(format!(
+                "{AGENT_SESSION_ENV}={marker} marks an agent session"
+            )));
+        }
+        if !interactive {
+            return Err(EscalationError::Unauthorized(
+                "stdin and stdout are not a terminal".to_string(),
+            ));
+        }
+        Ok(Self(()))
+    }
+
+    /// [`check`](Self::check) against this process: stdin and stdout must
+    /// be terminals and [`AGENT_SESSION_ENV`] unset.
+    pub fn from_environment() -> Result<Self, EscalationError> {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let agent = std::env::var(AGENT_SESSION_ENV).ok();
+        Self::check(interactive, agent.as_deref())
+    }
+}
+
 /// Production-class work for `repo` is parked while this hold exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncidentHold {
@@ -143,7 +179,7 @@ impl LogTable {
 ///
 /// let reopened = EscalationLog::open(&path).unwrap();
 /// assert!(reopened.production_held("example/repo"));
-/// assert_eq!(reopened.resolve("inc-1", t0 + Duration::hours(1)).unwrap().repo, "example/repo");
+/// assert_eq!(reopened.resolve(&harness::escalation::ResolveGrant::check(true, None).unwrap(), "inc-1", t0 + Duration::hours(1)).unwrap().repo, "example/repo");
 /// assert!(!EscalationLog::open(&path).unwrap().production_held("example/repo"));
 /// ```
 #[derive(Debug, Clone)]
@@ -262,6 +298,7 @@ impl EscalationLog {
     /// `nanna escalation resolve`; no agent tool reaches it.
     pub fn resolve(
         &self,
+        _grant: &ResolveGrant,
         escalation_id: &str,
         now: DateTime<Utc>,
     ) -> Result<IncidentHold, EscalationError> {
@@ -276,12 +313,20 @@ impl EscalationLog {
 
     /// Whether any incident hold parks production work for `repo`.
     pub fn production_held(&self, repo: &str) -> bool {
+        self.production_hold(Some(repo)).is_some()
+    }
+
+    /// The oldest hold parking production work for `repo`, or for any
+    /// repository when `repo` is `None`.
+    pub fn production_hold(&self, repo: Option<&str>) -> Option<IncidentHold> {
         self.table
             .lock()
             .unwrap()
             .holds
             .values()
-            .any(|h| h.repo == repo)
+            .filter(|h| repo.is_none_or(|r| h.repo == r))
+            .min_by_key(|h| h.since)
+            .cloned()
     }
 
     /// Every live hold, by escalation id.
@@ -484,6 +529,10 @@ mod tests {
         );
     }
 
+    fn grant() -> ResolveGrant {
+        ResolveGrant::check(true, None).unwrap()
+    }
+
     #[test]
     fn holds_are_per_repo_and_cleared_only_by_resolve() {
         let log = EscalationLog::in_memory();
@@ -511,11 +560,14 @@ mod tests {
         let telemetry = TelemetrySystem::new();
         snapshot.record(&telemetry);
         assert_eq!(telemetry.get_buffered_metrics_count(), 2);
-        assert_eq!(log.resolve("inc-1", t0()).unwrap().escalation_id, "inc-1");
+        assert_eq!(
+            log.resolve(&grant(), "inc-1", t0()).unwrap().escalation_id,
+            "inc-1"
+        );
         assert!(log.production_held("example/repo"));
-        let err = log.resolve("inc-1", t0()).unwrap_err();
+        let err = log.resolve(&grant(), "inc-1", t0()).unwrap_err();
         assert_eq!(err.to_string(), "no incident hold with id `inc-1`");
-        log.resolve("inc-2", t0()).unwrap();
+        log.resolve(&grant(), "inc-2", t0()).unwrap();
         assert!(!log.production_held("example/repo"));
         assert!(log.clone().holds().is_empty());
     }
@@ -553,7 +605,7 @@ mod tests {
         log.record(&a, t0() + Duration::minutes(1), false).unwrap();
         log.hold(&a, t0()).unwrap();
         log.hold(&incident("b", "example/other"), t0()).unwrap();
-        log.resolve("b", t0()).unwrap();
+        log.resolve(&grant(), "b", t0()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 5);
 
         let reopened = EscalationLog::open(&path).unwrap();
@@ -586,7 +638,7 @@ mod tests {
             Err(EscalationError::Io(_))
         ));
         assert!(matches!(
-            log.resolve("a", t0()),
+            log.resolve(&grant(), "a", t0()),
             Err(EscalationError::Io(_))
         ));
         assert!(log.production_held("example/repo"));
@@ -597,6 +649,52 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("I/O error"));
+    }
+
+    #[test]
+    fn grant_needs_an_interactive_human_and_no_agent_marker() {
+        assert!(ResolveGrant::check(true, None).is_ok());
+        let piped = ResolveGrant::check(false, None).unwrap_err();
+        assert!(matches!(piped, EscalationError::Unauthorized(_)));
+        assert!(piped.to_string().contains("terminal"));
+        let agent = ResolveGrant::check(true, Some("task-1")).unwrap_err();
+        assert!(matches!(agent, EscalationError::Unauthorized(_)));
+        assert!(agent.to_string().contains(AGENT_SESSION_ENV));
+        assert!(ResolveGrant::check(false, Some("task-1")).is_err());
+    }
+
+    #[test]
+    fn from_environment_follows_the_terminal_and_agent_marker() {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let agent = std::env::var(AGENT_SESSION_ENV).ok();
+        assert_eq!(
+            ResolveGrant::from_environment().is_ok(),
+            interactive && agent.is_none()
+        );
+    }
+
+    #[test]
+    fn production_hold_names_the_oldest_hold_per_repo_or_any() {
+        let log = EscalationLog::in_memory();
+        assert_eq!(log.production_hold(None), None);
+        assert_eq!(log.production_hold(Some("example/repo")), None);
+        log.hold(&incident("late", "example/repo"), t0() + Duration::hours(1))
+            .unwrap();
+        log.hold(&incident("early", "example/repo"), t0()).unwrap();
+        log.hold(
+            &incident("other", "example/other"),
+            t0() - Duration::hours(1),
+        )
+        .unwrap();
+        assert_eq!(
+            log.production_hold(Some("example/repo"))
+                .unwrap()
+                .escalation_id,
+            "early"
+        );
+        assert_eq!(log.production_hold(None).unwrap().escalation_id, "other");
+        assert_eq!(log.production_hold(Some("example/none")), None);
     }
 
     #[test]

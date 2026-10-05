@@ -30,7 +30,7 @@ pub use escalator::{default_window, EscalationOutcome, Escalator};
 pub use github::{GithubIssueSink, ESCALATION_LABEL};
 pub use log::{
     default_escalation_path, escalation_path_from, EscalationLog, EscalationSnapshot, IncidentHold,
-    KeyState, Occurrence, ESCALATION_PATH_ENV,
+    KeyState, Occurrence, ResolveGrant, AGENT_SESSION_ENV, ESCALATION_PATH_ENV,
 };
 pub use model::{Escalation, EscalationSource, Severity, UnknownName, HEADLINE_CHARS};
 pub use redact::{marker, redact, redact_value};

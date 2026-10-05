@@ -222,7 +222,15 @@ mod tests {
         assert!(escalator.log().production_held("example/repo"));
         assert!(!escalator.log().production_held("example/other"));
         assert_eq!(
-            escalator.log().resolve("inc-1", t0()).unwrap().summary,
+            escalator
+                .log()
+                .resolve(
+                    &crate::escalation::ResolveGrant::check(true, None).unwrap(),
+                    "inc-1",
+                    t0()
+                )
+                .unwrap()
+                .summary,
             "down"
         );
         assert!(!escalator.log().production_held("example/repo"));
