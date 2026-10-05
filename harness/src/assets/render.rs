@@ -171,4 +171,27 @@ kind = "table"
         let mermaid = graph.render_mermaid();
         assert!(mermaid.contains("n0 --> n1") && mermaid.contains("n1 --> n0"));
     }
+
+    #[test]
+    fn text_merges_declared_sites_into_owners_without_repeating_them() {
+        let mut graph = AssetGraph::parse(SRC).unwrap();
+        graph
+            .merge_declarations([
+                nanna_effects::Touch::new("db.orders", "m", "api/x.rs", 1),
+                nanna_effects::Touch::new("db.orders", "m", "api/x.rs", 2),
+            ])
+            .unwrap();
+        let text = graph.render_text();
+        assert!(text.contains("owners: api/**, api/x.rs\n"));
+        assert!(text.contains("concerns: revenue\n"));
+    }
+
+    #[test]
+    fn mermaid_skips_edges_to_unknown_assets() {
+        let mut graph = AssetGraph::new();
+        let mut asset = crate::assets::Asset::new("a", crate::assets::AssetKind::Job);
+        asset.reads = vec!["ghost".into()];
+        graph.insert_asset(asset).unwrap();
+        assert!(!graph.render_mermaid().contains("-->"));
+    }
 }
