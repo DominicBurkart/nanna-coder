@@ -1498,6 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_release_refuses_without_a_terminal_grant() {
+        let _guard = ROLLOUT_ENV.lock().await;
         let real = tempfile::tempdir().unwrap();
         std::env::set_var(
             harness::rollout::ROLLOUT_PATH_ENV,
