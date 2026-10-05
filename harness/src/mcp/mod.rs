@@ -327,9 +327,11 @@ impl NannaMcpServer {
     }
 
     /// `tasks/list` — return all tasks (v1 returns the full set, no pagination)
-    /// plus the scheduler's queue metrics under `_meta.queue` and the lease
-    /// snapshot under `_meta.leases`. A lease store that cannot be read is
-    /// reported as `_meta.leases.error` rather than hidden.
+    /// plus the scheduler's queue metrics under `_meta.queue`, the lease
+    /// snapshot under `_meta.leases` and the escalation snapshot (tracked
+    /// keys, incident holds, repositories with production held) under
+    /// `_meta.escalations`. A lease store that cannot be read is reported
+    /// as `_meta.leases.error` rather than hidden.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
         let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
@@ -341,9 +343,10 @@ impl NannaMcpServer {
                 serde_json::json!({ "error": e.to_string() })
             }
         };
+        let escalations = self.task_manager.escalation_snapshot().to_json();
         JsonRpcResponse::success(
             id,
-            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue, "leases": leases } }),
+            serde_json::json!({ "tasks": wire, "_meta": { "queue": queue, "leases": leases, "escalations": escalations } }),
         )
     }
 
@@ -867,6 +870,40 @@ mod tests {
         assert_eq!(listed["_meta"]["queue"]["running"], 0);
         assert_eq!(listed["_meta"]["leases"]["held"], 1);
         assert_eq!(listed["_meta"]["leases"]["leases"][0]["holder"], task_id);
+        assert_eq!(listed["_meta"]["escalations"]["tracked"], 0);
+        assert_eq!(
+            listed["_meta"]["escalations"]["production_held"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let incident = crate::escalation::Escalation::new(
+            crate::escalation::Severity::Incident,
+            crate::escalation::EscalationSource::Rollout,
+            "example/repo",
+            "p99 breached",
+        )
+        .with_id("inc-1");
+        server
+            .task_manager
+            .escalations()
+            .hold(&incident, chrono::Utc::now())
+            .unwrap();
+        let held = server
+            .handle_request(method_call(23, "tasks/list", serde_json::json!({})))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            held["_meta"]["escalations"]["holds"][0]["escalation_id"],
+            "inc-1"
+        );
+        assert_eq!(
+            held["_meta"]["escalations"]["production_held"][0],
+            "example/repo"
+        );
 
         // tasks/cancel transitions it to cancelled and returns the task.
         let cancelled = server
