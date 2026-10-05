@@ -47,7 +47,7 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No workspace in the agent container | the plan may mount only the broker socket; the repo is never visible to pi, so repo-borne `.pi/` config cannot influence it |
 | Capabilities are brokered | each call goes over the socket to nanna, which runs the existing Rust `Tool` under identity scope, effect ceiling and incident holds |
 | Network | only the model gateway endpoint, or none |
-| No secrets | environment names are allowlisted (`NANNA_*`, `HOME`, `LANG`, `PI_CODING_AGENT_DIR`); the model `apiKey` is a placeholder |
+| No secrets | environment names are an exact-name allowlist (`HOME`, `LANG`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`) plus a secret-marker check; the model `apiKey` is a placeholder |
 | Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
 | Fail closed | `Unsupported` for empty capability sets, empty model, or unrepresentable capability names; a plan that drops the agent's scope or limits is rejected |
 | Verified lockdown | after start the executor compares the runtime's tool set to the plan (`verify_runtime_tools`) and aborts on any difference |
@@ -91,20 +91,19 @@ is their contract and is reviewed before code.
 Until #669 lands, `ToolRegistry::scoped_for(identity)` does not exist on main.
 `ResolvedAgent::resolve` takes the capabilities of that scoped registry
 (`CapabilitySpec::from_registry`) and can only narrow them, so the grant has
-one source and cannot drift from what the broker enforces.
+one source and cannot drift from what the broker enforces. Caveat: the result is only as narrow as the set the caller passes; until #669 lands, a caller passing the unscoped registry gets unscoped capabilities and `resolve` cannot tell.
 
 ## Runtime handshake
 
 A runtime that silently ignores a lockdown flag fails open, and
 `IsolationPolicy` cannot see argv semantics. After start, the executor must
 query the runtime's registered tools (pi RPC) and abort the run unless
-`verify_runtime_tools(plan, reported)` succeeds. That function is implemented
-and tested; calling it is a requirement on the executor.
+`verify_runtime_tools(plan, reported)` succeeds. The comparison function exists and is tested; it has no caller yet. **Lockdown is not verified until the executor calls it against real pi** (`NANNA_PI_BIN` integration test, a blocker for merging the executor).
 
-## Limits and scope are carried, not dropped
+## Limits and scope are carried, not yet enforced
 
 `LaunchPlan.limits` and `LaunchPlan.scope` must equal the agent's
-(`IsolationPolicy` rejects a plan that differs). Pi has no iteration cap, so
+(`IsolationPolicy` rejects a plan that differs). This catches an adapter that forgets them; `PiAdapter` copies them, so for pi the check is a guard for future adapters. **Nothing enforces scope, turn count or deadline yet.** The executor entry point must take an enforcement value (broker handle plus deadline) as a required argument so a run cannot start without it. Pi has no iteration cap, so
 the executor counts turns against `max_iterations` and enforces
 `max_wall_clock_secs`; the broker enforces `scope`. `max_concurrent` is the
 scheduler's.
