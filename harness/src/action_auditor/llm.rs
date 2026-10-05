@@ -286,7 +286,8 @@ mod tests {
             pr: Some(1),
             ..LeaseContext::default()
         };
-        let ctx = deploy_ctx(None, lease);
+        let mut ctx = deploy_ctx(None, lease);
+        ctx.now = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 10, 0, 0).unwrap();
         let verdict = auditor.review_action(&review, &ctx).await.unwrap();
         assert!(!verdict.is_allow());
         assert_eq!(provider.calls(), 0);
@@ -308,6 +309,31 @@ mod tests {
         let sent = &provider.requests.lock().unwrap()[0];
         assert_eq!(sent.model, MODEL);
         assert_eq!(sent.temperature, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn sandbox_inside_the_resolved_window_is_allowed_and_outside_is_blocked() {
+        let lease = || LeaseContext {
+            repo: "example/repo",
+            pr: Some(1),
+            ..LeaseContext::default()
+        };
+        let (auditor, provider) = auditor(&[r#"{"verdict":"allow"}"#]);
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+
+        let open = deploy_ctx(None, lease());
+        assert!(auditor
+            .review_action(&review, &open)
+            .await
+            .unwrap()
+            .is_allow());
+        assert_eq!(provider.calls(), 1);
+
+        let mut closed = deploy_ctx(None, lease());
+        closed.now = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 10, 0, 0).unwrap();
+        let verdict = auditor.review_action(&review, &closed).await.unwrap();
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
+        assert_eq!(provider.calls(), 1);
     }
 
     #[tokio::test]

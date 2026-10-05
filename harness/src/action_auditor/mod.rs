@@ -27,6 +27,7 @@
 //! `ActionVerdict` out, every call logged), so it gets its own trait rather
 //! than being bent to fit `AuditHook`.
 
+mod commands;
 mod context;
 mod gate;
 mod llm;
