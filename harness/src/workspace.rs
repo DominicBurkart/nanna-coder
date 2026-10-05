@@ -599,6 +599,7 @@ impl TaskWorkspace {
                 self.cost_accountant.record_minutes_sync(
                     identity,
                     &self.task_id,
+                    &handle.repo,
                     BudgetClass::Sandbox,
                     minutes,
                     Utc::now(),
