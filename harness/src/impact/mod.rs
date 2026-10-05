@@ -24,7 +24,7 @@ mod model;
 pub use analyzer::{ExtractContext, Extractor, ImpactAnalyzer, DEPTH_DISCOUNT_SHIFT};
 pub use change::{Action, AddedLine, Change, ChangedFile};
 pub use extract::{
-    function_spans, route_bindings, sql_accesses, ActixRouteExtractor, OwnerPathExtractor,
-    RouteBinding, SqlAccess, SqlExtractor, TouchesExtractor,
+    function_spans, route_bindings, sql_accesses, ActionExtractor, ActixRouteExtractor,
+    OwnerPathExtractor, RouteBinding, SqlAccess, SqlExtractor, TouchesExtractor,
 };
 pub use model::{Access, AssetId, BlastRadius, Evidence, Weight};
