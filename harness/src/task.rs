@@ -242,6 +242,8 @@ struct TaskRunner {
     default_provider: Option<Arc<dyn ModelProvider>>,
     /// Coordination leases; a task's leases are released when it ends.
     leases: Arc<dyn LeaseStore>,
+    /// Incident holds the tool registries of started tasks enforce.
+    escalations: std::sync::RwLock<Arc<EscalationLog>>,
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -253,9 +255,6 @@ struct TaskRunner {
 pub struct TaskManager {
     runner: Arc<TaskRunner>,
     dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
-    /// Escalation keys and incident holds; in memory unless
-    /// [`with_escalations`](Self::with_escalations) swaps in a persisted log.
-    escalations: Arc<EscalationLog>,
 }
 
 impl TaskManager {
@@ -325,21 +324,17 @@ impl TaskManager {
             providers: RwLock::new(HashMap::new()),
             default_provider,
             leases,
+            escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
-        let escalations = Arc::new(EscalationLog::in_memory());
-        Ok(Self {
-            runner,
-            dispatcher,
-            escalations,
-        })
+        Ok(Self { runner, dispatcher })
     }
 
     /// Use `escalations` (for example the persisted log under `mcp-serve`)
     /// instead of the in-memory default.
-    pub fn with_escalations(mut self, escalations: Arc<EscalationLog>) -> Self {
-        self.escalations = escalations;
+    pub fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
+        *self.runner.escalations.write().unwrap() = escalations;
         self
     }
 
@@ -347,12 +342,12 @@ impl TaskManager {
     /// [`Escalator`](crate::escalation::Escalator) and for consumers
     /// checking [`production_held`](EscalationLog::production_held).
     pub fn escalations(&self) -> Arc<EscalationLog> {
-        Arc::clone(&self.escalations)
+        self.runner.escalation_log()
     }
 
     /// Tracked escalation keys and live incident holds as of now.
     pub fn escalation_snapshot(&self) -> EscalationSnapshot {
-        self.escalations.snapshot(Utc::now())
+        self.escalations().snapshot(Utc::now())
     }
 
     /// Backlog depth, parked count, age of the oldest queued task and
@@ -635,6 +630,10 @@ impl Launcher for Arc<TaskRunner> {
 }
 
 impl TaskRunner {
+    fn escalation_log(&self) -> Arc<EscalationLog> {
+        Arc::clone(&self.escalations.read().unwrap())
+    }
+
     /// Record a queued entry as a `Pending` task and open its status watch.
     /// The receiver is retained as a keep-alive (see `StatusSenders`).
     async fn register(&self, queued: &QueuedTask, provider: Option<Arc<dyn ModelProvider>>) {
@@ -815,7 +814,9 @@ impl TaskRunner {
             }
         };
 
-        let tool_registry = workspace.build_tool_registry();
+        let tool_registry = workspace
+            .build_tool_registry()
+            .with_production_hold(self.escalation_log(), None);
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
