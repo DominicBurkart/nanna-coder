@@ -427,14 +427,17 @@ impl RolloutExecutor {
     fn settle_lease(&self, record: &RolloutRecord) -> Result<(), RolloutError> {
         if record.state == RolloutState::Halted && record.traffic_percent > 0 {
             let now = self.clock.now();
-            acquire_all(
+            let outcome = acquire_all(
                 &*self.leases,
                 &[record.lease_name()?],
                 &record.id,
                 LIVE_SPLIT_LEASE_TTL,
                 now,
-            )?;
-            return Ok(());
+            );
+            if matches!(outcome, Err(LeaseError::Held { .. })) {
+                return Ok(());
+            }
+            return outcome.map(|_| ()).map_err(RolloutError::from);
         }
         self.leases.release_all(&record.id)?;
         Ok(())
@@ -666,6 +669,27 @@ impl RolloutExecutor {
         };
         let bake_end = since + step.bake_time;
         let hold_end = bake_end + step.min_duration;
+        let resumed_at = self.clock.now();
+        let ttl = (hold_end - resumed_at).max(Duration::zero()) + self.config.lease_grace;
+        match acquire_all(
+            &*self.leases,
+            &[record.lease_name()?],
+            &record.id,
+            ttl,
+            resumed_at,
+        ) {
+            Ok(_) => {}
+            Err(LeaseError::Held { name, by, .. }) => {
+                let summary = format!(
+                    "step {n}: deploy lease {name} is held by {by}, not by this rollout; the split is held for a human"
+                );
+                return self.halt_and_escalate(record, n, summary, None).await;
+            }
+            Err(e) => {
+                let summary = format!("step {n}: lease store failed ({e})");
+                return Err(self.stop_with(&record, n, summary, e.into()).await);
+            }
+        }
         let mut observed_pairs = 0usize;
         loop {
             let now = self.clock.now();
@@ -2443,6 +2467,7 @@ mod tests {
 
     struct LeaseProbe {
         leases: Arc<InMemoryLeaseStore>,
+        clock: Arc<SimulatedClock>,
         seen: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
@@ -2453,11 +2478,13 @@ mod tests {
             _slot: &Slot,
             _window: Duration,
         ) -> Result<HealthSample, HealthError> {
+            let now = self.clock.now();
             let holders = self
                 .leases
                 .snapshot()
                 .unwrap()
                 .into_iter()
+                .filter(|l| !l.is_expired(now))
                 .map(|l| l.holder)
                 .collect();
             self.seen.lock().unwrap().push(holders);
@@ -2470,6 +2497,7 @@ mod tests {
         let rig = rig();
         let probe = Arc::new(LeaseProbe {
             leases: rig.leases.clone(),
+            clock: rig.clock.clone(),
             seen: std::sync::Mutex::default(),
         });
         let executor = executor_with_health(&rig, probe.clone());
@@ -2590,6 +2618,133 @@ mod tests {
             "the held lease has not lapsed"
         );
         assert_eq!(held_by(&rig), std::slice::from_ref(&first.id));
+    }
+
+    async fn crashed_baking(rig: &Rig) -> RolloutRecord {
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let crashing = RolloutExecutor::new(
+            RolloutLog::open(&rig.path).unwrap(),
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            rig.adapter.clone(),
+            Arc::new(HangAfter {
+                healthy_polls: 1,
+                polls: std::sync::Mutex::new(0),
+            }),
+        )
+        .with_config(one_poll_per_step());
+        let run = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            crashing.run(&record.id),
+        )
+        .await;
+        assert!(run.is_err());
+        let crashed = rig.executor.log().load(&record.id).unwrap();
+        assert!(matches!(crashed.state, RolloutState::Baking { .. }));
+        crashed
+    }
+
+    #[tokio::test]
+    async fn a_rollout_resumed_in_baking_reacquires_an_absent_lease_before_sampling() {
+        let rig = rig();
+        let crashed = crashed_baking(&rig).await;
+        rig.leases.release_all(&crashed.id).unwrap();
+        let probe = Arc::new(LeaseProbe {
+            leases: rig.leases.clone(),
+            clock: rig.clock.clone(),
+            seen: std::sync::Mutex::default(),
+        });
+        let resumed = executor_with_health(&rig, probe.clone());
+        let done = resumed.run(&crashed.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        let seen = probe.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|holders| *holders == [crashed.id.clone()]),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rollout_resumed_in_baking_reclaims_an_expired_lease() {
+        let rig = rig();
+        let crashed = crashed_baking(&rig).await;
+        rig.leases.release_all(&crashed.id).unwrap();
+        rig.leases
+            .acquire(
+                &crashed.lease_name().unwrap(),
+                &crashed.id,
+                Duration::minutes(1),
+                rig.clock.now(),
+            )
+            .unwrap();
+        rig.clock.advance(Duration::minutes(10));
+        assert!(rig
+            .leases
+            .snapshot()
+            .unwrap()
+            .iter()
+            .all(|l| l.is_expired(rig.clock.now())));
+        let probe = Arc::new(LeaseProbe {
+            leases: rig.leases.clone(),
+            clock: rig.clock.clone(),
+            seen: std::sync::Mutex::default(),
+        });
+        let resumed = executor_with_health(&rig, probe.clone());
+        let done = resumed.run(&crashed.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        let seen = probe.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        for holders in seen {
+            assert_eq!(holders, std::slice::from_ref(&crashed.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lease_store_failure_when_resuming_a_bake_is_escalated() {
+        let rig = rig();
+        let crashed = crashed_baking(&rig).await;
+        let executor = executor_with_health(&rig, rig.health.clone()).with_config(RolloutConfig {
+            poll_interval: Duration::minutes(30),
+            lease_grace: Duration::hours(-100),
+        });
+        let err = executor.run(&crashed.id).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RolloutError::Lease(LeaseError::NonPositiveTtl(_))
+        ));
+        assert_eq!(rig.escalation.escalations().len(), 1);
+        assert!(rig.escalation.escalations()[0]
+            .summary
+            .contains("lease store failed"));
+    }
+
+    #[tokio::test]
+    async fn a_rollout_resumed_in_baking_halts_when_another_holder_owns_the_lease() {
+        let rig = rig();
+        let crashed = crashed_baking(&rig).await;
+        rig.leases.release_all(&crashed.id).unwrap();
+        rig.leases
+            .acquire(
+                &crashed.lease_name().unwrap(),
+                "usurper",
+                Duration::days(1),
+                rig.clock.now(),
+            )
+            .unwrap();
+        let probe = Arc::new(LeaseProbe {
+            leases: rig.leases.clone(),
+            clock: rig.clock.clone(),
+            seen: std::sync::Mutex::default(),
+        });
+        let resumed = executor_with_health(&rig, probe.clone());
+        let halted = resumed.run(&crashed.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert!(probe.seen.lock().unwrap().is_empty());
+        assert_eq!(held_by(&rig), ["usurper".to_string()]);
+        assert_eq!(rig.escalation.escalations().len(), 1);
+        assert!(rig.escalation.escalations()[0].summary.contains("usurper"));
     }
 
     #[tokio::test]
