@@ -2380,6 +2380,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_escalation_does_not_mask_the_original_stop_error() {
+        let rig = rig();
+        rig.escalation.set_failing(true);
+        let executor = rig.executor.with_config(RolloutConfig {
+            poll_interval: Duration::minutes(1),
+            lease_grace: Duration::hours(-9),
+        });
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
+        assert!(matches!(
+            executor.run(&record.id).await.unwrap_err(),
+            RolloutError::Lease(LeaseError::NonPositiveTtl(_))
+        ));
+        assert_eq!(rig.escalation.escalations().len(), 1);
+    }
+
+    #[tokio::test]
     async fn an_unknown_window_escalates_and_still_surfaces() {
         let rig = rig();
         let executor = RolloutExecutor::new(
