@@ -313,6 +313,7 @@ mod tests {
         assert!(!protected.is_protected(Path::new("c/nanna/agents/x.toml")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_under_a_symlinked_repo_root_is_resolved() {
         let dir = tempfile::tempdir().unwrap();
