@@ -77,9 +77,6 @@ fn read_lines(path: &Path) -> Vec<String> {
 
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        match &self.old_path {
-            Some(old) => std::env::set_var("PATH", old),
-            None => std::env::remove_var("PATH"),
-        }
+        std::env::set_var("PATH", self.old_path.clone().unwrap_or_default());
     }
 }

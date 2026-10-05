@@ -642,6 +642,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn system_runner_reports_exit_status_and_spawn_errors() {
         let Ok(true_bin) = which::which("true") else {
