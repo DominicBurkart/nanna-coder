@@ -77,6 +77,39 @@ fn read_lines(path: &Path) -> Vec<String> {
 
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        std::env::set_var("PATH", self.old_path.clone().unwrap_or_default());
+        match &self.old_path {
+            Some(old) => std::env::set_var("PATH", old),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_restores_an_originally_absent_path() {
+        let guard = PATH_LOCK.blocking_lock();
+        let original = std::env::var_os("PATH");
+        std::env::remove_var("PATH");
+        let fake = FakePodman::with_guard(guard, None);
+        assert!(std::env::var_os("PATH").is_some());
+        drop(fake);
+        let restored = std::env::var_os("PATH");
+        if let Some(original) = original {
+            std::env::set_var("PATH", original);
+        }
+        assert_eq!(restored, None);
+    }
+
+    #[test]
+    fn dropping_restores_the_original_path() {
+        let guard = PATH_LOCK.blocking_lock();
+        let original = std::env::var_os("PATH");
+        let fake = FakePodman::with_guard(guard, None);
+        assert_ne!(std::env::var_os("PATH"), original);
+        drop(fake);
+        assert_eq!(std::env::var_os("PATH"), original);
     }
 }
