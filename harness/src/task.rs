@@ -259,6 +259,9 @@ struct TaskRunner {
     /// Identities a task may be dispatched under, keyed by name. A task whose
     /// `identity_hint` names none of these fails closed.
     identities: RwLock<HashMap<String, AgentIdentity>>,
+    /// Identities bound to one task at submission; they take precedence over
+    /// the shared catalog and are consumed when the task starts.
+    bound: RwLock<HashMap<TaskId, AgentIdentity>>,
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -364,6 +367,7 @@ impl TaskManager {
             default_provider,
             leases,
             identities: RwLock::new(HashMap::new()),
+            bound: RwLock::new(HashMap::new()),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -505,8 +509,10 @@ impl TaskManager {
         }
     }
 
-    /// Submit a task that, when `identity` is present, runs under that
-    /// identity's scope: the tool registry is
+    /// Submit a task that, when `identity` is present, runs under exactly that
+    /// identity, bound to this task alone: it is neither added to nor looked
+    /// up in the shared catalog, so no other task can change what it runs as.
+    /// It runs under that identity's scope: the tool registry is
     /// [`TaskWorkspace::build_tool_registry_for`] the identity, a dev
     /// container gets [`NetworkPolicy::for_ceiling`] of its `scope.max_effect`,
     /// and the target repository must be in its `scope.repos`. Without an
@@ -523,15 +529,16 @@ impl TaskManager {
         identity: Option<AgentIdentity>,
     ) -> TaskId {
         let hint = identity.as_ref().map(|i| i.name().to_string());
+        let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
+            .with_identity_hint(hint);
         if let Some(identity) = identity {
-            self.register_identity(identity).await;
+            self.runner
+                .bound
+                .write()
+                .await
+                .insert(queued.id.clone(), identity);
         }
-        self.submit_task(
-            QueuedTask::new(description, repo_path, branch, model, max_iterations)
-                .with_identity_hint(hint),
-            provider,
-        )
-        .await
+        self.submit_task(queued, provider).await
     }
 
     /// Submit a fully described queue entry, which may be parked with
@@ -794,7 +801,14 @@ impl TaskRunner {
         .await;
     }
 
-    async fn resolve_identity(&self, hint: Option<&str>) -> Result<Option<AgentIdentity>, String> {
+    async fn resolve_identity(
+        &self,
+        task_id: &TaskId,
+        hint: Option<&str>,
+    ) -> Result<Option<AgentIdentity>, String> {
+        if let Some(identity) = self.bound.write().await.remove(task_id) {
+            return Ok(Some(identity));
+        }
         let Some(name) = hint else {
             return Ok(None);
         };
@@ -821,7 +835,10 @@ impl TaskRunner {
             .await;
             return;
         };
-        let identity = match self.resolve_identity(queued.identity_hint.as_deref()).await {
+        let identity = match self
+            .resolve_identity(&task_id, queued.identity_hint.as_deref())
+            .await
+        {
             Ok(identity) => identity,
             Err(e) => {
                 self.fail(&task_id, e, "IdentityUnavailable").await;
@@ -2727,6 +2744,63 @@ mod identity_tests {
         .unwrap();
         let task = wait_for(&with, &id, terminal).await;
         assert_eq!(failed_with(&task.status).0, "ScopeError");
+    }
+
+    #[tokio::test]
+    async fn test_a_submitted_identity_is_bound_to_its_task_and_leaves_the_catalog_alone() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let catalog_entry = scoped_identity();
+        manager.register_identity(catalog_entry.clone()).await;
+        let mut wider = scoped_identity();
+        wider.scope.max_effect = EffectClass::Repository;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(wider.clone()),
+            )
+            .await;
+        {
+            let registered = manager.runner.identities.read().await;
+            assert_eq!(registered.get("rust-implementer"), Some(&catalog_entry));
+        }
+        let bound = manager.runner.bound.read().await;
+        assert_eq!(bound.get(&id), Some(&wider));
+    }
+
+    #[tokio::test]
+    async fn test_a_bound_identity_wins_over_a_catalog_entry_of_the_same_name() {
+        let runner_manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let mut catalog_entry = scoped_identity();
+        catalog_entry.scope.max_effect = EffectClass::None;
+        runner_manager.register_identity(catalog_entry).await;
+        let bound = scoped_identity();
+        let id = TaskId::new();
+        runner_manager
+            .runner
+            .bound
+            .write()
+            .await
+            .insert(id.clone(), bound.clone());
+        let resolved = runner_manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(bound));
+        let from_catalog = runner_manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_catalog.scope.max_effect, EffectClass::None);
     }
 
     #[tokio::test]
