@@ -20,6 +20,7 @@ mod analyzer;
 mod change;
 mod extract;
 mod model;
+mod runner;
 
 pub use analyzer::{ExtractContext, Extractor, ImpactAnalyzer, DEPTH_DISCOUNT_SHIFT};
 pub use change::{Action, AddedLine, Change, ChangedFile};
@@ -28,3 +29,4 @@ pub use extract::{
     OwnerPathExtractor, RouteBinding, SqlAccess, SqlExtractor, TouchesExtractor,
 };
 pub use model::{Access, AssetId, BlastRadius, Evidence, Weight};
+pub use runner::{analyze_task, diff_against, impact_of_diff, load_repo_context, ImpactError};
