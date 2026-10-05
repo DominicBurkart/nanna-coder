@@ -86,17 +86,21 @@ impl PipeTransport {
     /// Spawn `program args...` with piped stdin and stdout; stderr is
     /// discarded because Chromium logs freely there.
     pub fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
-        let mut child = Command::new(program)
+        let child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        Self::from_child(child)
+    }
+
+    fn from_child(mut child: Child) -> std::io::Result<Self> {
         let stdin = child.stdin.take();
         let stdout = child
             .stdout
             .take()
-            .ok_or(std::io::Error::other("child has no stdout"))?;
+            .ok_or_else(|| std::io::Error::other("child has no stdout"))?;
         Ok(Self {
             child,
             stdin,
@@ -483,6 +487,7 @@ mod tests {
         out
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_transport_round_trips_nul_terminated_messages_through_cat() {
         let mut transport = PipeTransport::spawn("cat", &[]).unwrap();
@@ -497,6 +502,7 @@ mod tests {
         assert!(err.to_string().contains("already closed"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn pipe_transport_reads_a_final_unterminated_message() {
         let mut transport = PipeTransport::spawn("printf", &["tail".to_string()]).unwrap();
@@ -504,6 +510,19 @@ mod tests {
         assert!(transport.receive().is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pipe_transport_rejects_a_child_without_a_stdout_pipe() {
+        let child = Command::new("cat")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let err = PipeTransport::from_child(child).map(|_| ()).unwrap_err();
+        assert_eq!(err.to_string(), "child has no stdout");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn process_spawner_reports_missing_programs() {
         let err = ProcessSpawner

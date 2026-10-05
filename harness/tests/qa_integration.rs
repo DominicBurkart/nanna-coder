@@ -11,9 +11,11 @@
 //! needed to produce it.
 
 use harness::apprun::{Limits, APP_START_TOOL};
-use harness::container::detect_runtime;
+use harness::container::{detect_runtime, ContainerRuntime};
 use harness::qa::{QA_BROWSER_TOOL, QA_ENDPOINTS_TOOL};
-use harness::sidecar::{build_image_from_containerfile, SystemRunner};
+use harness::sidecar::{
+    build_image_from_containerfile, CommandRunner, RunOutput, SidecarError, SystemRunner,
+};
 use harness::tools::ToolRegistry;
 use harness::workspace::TaskWorkspace;
 use serde_json::{json, Value};
@@ -87,6 +89,48 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
+async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
+    registry
+        .execute(name, args)
+        .await
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+}
+
+async fn start_workspace(
+    source: &Path,
+    task_prefix: &str,
+    env: Vec<(String, String)>,
+) -> TaskWorkspace {
+    let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
+    let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
+        .await
+        .expect("dev container must start");
+    ws.set_app_limits(Some(COLD_BUILD_LIMIT));
+    if !env.is_empty() {
+        ws.set_app_env(env);
+    }
+    ws
+}
+
+fn dev_containerfile() -> String {
+    DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL)
+}
+
+fn build_dev_image(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+) -> Result<(), SidecarError> {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), &dir.path().join("fixture"));
+    build_image_from_containerfile(
+        runner,
+        runtime,
+        DEV_IMAGE_TAG,
+        dir.path(),
+        &dev_containerfile(),
+    )
+}
+
 #[tokio::test]
 #[ignore]
 async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
@@ -95,39 +139,7 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
-        registry
-            .execute(name, args)
-            .await
-            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
-    }
-
-    async fn start_workspace(
-        source: &Path,
-        task_prefix: &str,
-        env: Vec<(String, String)>,
-    ) -> TaskWorkspace {
-        let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
-        let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
-            .await
-            .expect("dev container must start");
-        ws.set_app_limits(Some(COLD_BUILD_LIMIT));
-        if !env.is_empty() {
-            ws.set_app_env(env);
-        }
-        ws
-    }
-
-    let image_context = tempfile::tempdir().unwrap();
-    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
-    build_image_from_containerfile(
-        &SystemRunner,
-        &runtime,
-        DEV_IMAGE_TAG,
-        image_context.path(),
-        &DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL),
-    )
-    .unwrap();
+    build_dev_image(&SystemRunner, &runtime).unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -207,39 +219,7 @@ async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
-        registry
-            .execute(name, args)
-            .await
-            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
-    }
-
-    async fn start_workspace(
-        source: &Path,
-        task_prefix: &str,
-        env: Vec<(String, String)>,
-    ) -> TaskWorkspace {
-        let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
-        let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
-            .await
-            .expect("dev container must start");
-        ws.set_app_limits(Some(COLD_BUILD_LIMIT));
-        if !env.is_empty() {
-            ws.set_app_env(env);
-        }
-        ws
-    }
-
-    let image_context = tempfile::tempdir().unwrap();
-    copy_dir_all(&fixture_root(), &image_context.path().join("fixture"));
-    build_image_from_containerfile(
-        &SystemRunner,
-        &runtime,
-        DEV_IMAGE_TAG,
-        image_context.path(),
-        &DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL),
-    )
-    .unwrap();
+    build_dev_image(&SystemRunner, &runtime).unwrap();
 
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
@@ -334,4 +314,165 @@ fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
     for skipped in ["target", "dist", ".git"] {
         assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
     }
+}
+
+struct StubTool {
+    name: &'static str,
+    reply: Value,
+    seen: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl harness::tools::Tool for StubTool {
+    fn definition(&self) -> model::types::ToolDefinition {
+        model::types::ToolDefinition {
+            function: model::types::FunctionDefinition {
+                name: self.name.to_string(),
+                description: "stub".to_string(),
+                parameters: model::types::JsonSchema {
+                    schema_type: model::types::SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> harness::tools::ToolResult<Value> {
+        self.seen.lock().unwrap().push(args);
+        Ok(self.reply.clone())
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn effect_class(&self) -> harness::effects::EffectClass {
+        harness::effects::EffectClass::Workspace
+    }
+}
+
+fn registry_with(name: &'static str, reply: Value) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(StubTool {
+        name,
+        reply,
+        seen: std::sync::Mutex::new(vec![]),
+    }));
+    registry
+}
+
+#[tokio::test]
+async fn tool_returns_the_tool_result() {
+    let registry = registry_with("qa_endpoints", json!({ "passed": 2 }));
+    assert_eq!(
+        tool(&registry, "qa_endpoints", json!({})).await["passed"],
+        2
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "qa_browser failed")]
+async fn tool_panics_naming_the_failing_tool() {
+    tool(&ToolRegistry::new(), "qa_browser", json!({})).await;
+}
+
+#[test]
+fn dev_containerfile_installs_the_toolchain_and_prebuilds_the_fixture() {
+    let containerfile = dev_containerfile();
+    assert!(containerfile.starts_with("FROM docker.io/library/rust:1-bookworm\n"));
+    assert!(containerfile.contains("rustup target add wasm32-unknown-unknown"));
+    assert!(containerfile.contains(TRUNK_URL));
+    assert!(containerfile.contains("COPY fixture /src"));
+    assert!(containerfile.contains("trunk build"));
+    assert!(containerfile.contains("cargo build --package api"));
+    assert!(containerfile.ends_with("CMD [\"sleep\", \"infinity\"]\n"));
+}
+
+type BuildCall = (String, Vec<String>, String, bool);
+
+struct RecordingBuildRunner {
+    success: bool,
+    seen: std::sync::Mutex<Vec<BuildCall>>,
+}
+
+impl CommandRunner for RecordingBuildRunner {
+    fn run(&self, program: &str, args: &[String]) -> std::io::Result<RunOutput> {
+        let context = Path::new(args.last().unwrap());
+        let containerfile = std::fs::read_to_string(context.join("Containerfile")).unwrap();
+        let fixture_copied = context.join("fixture/Cargo.toml").is_file();
+        self.seen.lock().unwrap().push((
+            program.to_string(),
+            args.to_vec(),
+            containerfile,
+            fixture_copied,
+        ));
+        Ok(RunOutput {
+            success: self.success,
+            stdout: String::new(),
+            stderr: "boom".to_string(),
+        })
+    }
+}
+
+#[test]
+fn build_dev_image_builds_the_tagged_image_from_the_copied_fixture() {
+    let runner = RecordingBuildRunner {
+        success: true,
+        seen: std::sync::Mutex::new(vec![]),
+    };
+    build_dev_image(&runner, &ContainerRuntime::Podman).unwrap();
+    let seen = runner.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let (program, args, containerfile, fixture_copied) = &seen[0];
+    assert_eq!(program, "podman");
+    assert_eq!(&args[..3], ["build", "-q", "-t"]);
+    assert_eq!(args[3], DEV_IMAGE_TAG);
+    assert_eq!(containerfile, &dev_containerfile());
+    assert!(fixture_copied, "fixture must be copied into the context");
+}
+
+#[test]
+fn build_dev_image_surfaces_a_failed_build() {
+    let runner = RecordingBuildRunner {
+        success: false,
+        seen: std::sync::Mutex::new(vec![]),
+    };
+    let err = build_dev_image(&runner, &ContainerRuntime::Podman).unwrap_err();
+    assert!(err.to_string().contains("boom"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn start_workspace_applies_the_cold_build_limit_and_app_env() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let podman = bin_dir.path().join("podman");
+    std::fs::write(&podman, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin_dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("a.txt"), "a").unwrap();
+    init_repo(source.path());
+    let (mut plain, mut with_env) = tokio::join!(
+        start_workspace(source.path(), "qa-plain", vec![]),
+        start_workspace(
+            source.path(),
+            "qa-env",
+            vec![("K".to_string(), "V".to_string())],
+        ),
+    );
+    std::env::set_var("PATH", old_path);
+
+    assert_eq!(plain.app_limits(), COLD_BUILD_LIMIT);
+    assert!(plain.app_env().is_empty());
+    assert_eq!(with_env.app_limits(), COLD_BUILD_LIMIT);
+    assert_eq!(with_env.app_env(), vec![("K".to_string(), "V".to_string())]);
+    plain.cleanup().unwrap();
+    with_env.cleanup().unwrap();
 }
