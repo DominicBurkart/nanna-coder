@@ -94,7 +94,7 @@ use thiserror::Error;
 /// use std::path::PathBuf;
 ///
 /// let lookup = |key: &str| (key == "NANNA_CONFIG_DIR").then(|| "/etc/nanna".into());
-/// assert_eq!(host_windows_path_from(&lookup), Some(PathBuf::from("/etc/nanna/windows.toml")));
+/// assert_eq!(host_windows_path_from(&lookup), Some(PathBuf::from("/etc/nanna").join("windows.toml")));
 /// ```
 pub fn host_windows_path_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     config_dir_from(lookup).map(|dir| dir.join(WINDOWS_FILE_NAME))

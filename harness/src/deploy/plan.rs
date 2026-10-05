@@ -1123,7 +1123,16 @@ minimum total: 1d 1h 30m
     fn plan_for_repo_checked_reads_windows_from_nanna_config_dir() {
         let repo = repo_with_fixture();
         let config = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("NANNA_CONFIG_DIR");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("NANNA_CONFIG_DIR", v),
+                    None => std::env::remove_var("NANNA_CONFIG_DIR"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var_os("NANNA_CONFIG_DIR"));
         std::env::set_var("NANNA_CONFIG_DIR", config.path());
         let window = |name: &str| {
             format!("[[window]]\nname = \"{name}\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n")
@@ -1134,10 +1143,6 @@ minimum total: 1d 1h 30m
         std::fs::write(config.path().join("windows.toml"), window("business-hours")).unwrap();
         let right = plan_for_repo_checked(repo.path(), "production", None);
         let loaded = crate::deploy::host_windows().unwrap();
-        match previous {
-            Some(v) => std::env::set_var("NANNA_CONFIG_DIR", v),
-            None => std::env::remove_var("NANNA_CONFIG_DIR"),
-        }
         assert!(matches!(
             missing,
             Err(DeployError::HostWindowsMissing { .. })

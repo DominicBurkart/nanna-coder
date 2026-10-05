@@ -434,7 +434,8 @@ impl RolloutExecutor {
                 LIVE_SPLIT_LEASE_TTL,
                 now,
             );
-            if matches!(outcome, Err(LeaseError::Held { .. })) {
+            if let Err(LeaseError::Held { name, by, .. }) = &outcome {
+                tracing::error!(rollout = %record.id, lease = %name, held_by = %by, traffic = record.traffic_percent, "Halted rollout has a live split but another holder owns its deploy lease");
                 return Ok(());
             }
             return outcome.map(|_| ()).map_err(RolloutError::from);
@@ -2717,7 +2718,7 @@ mod tests {
         assert_eq!(rig.escalation.escalations().len(), 1);
         assert!(rig.escalation.escalations()[0]
             .summary
-            .contains("lease store failed"));
+            .starts_with("step 0: lease store failed"));
     }
 
     #[tokio::test]
