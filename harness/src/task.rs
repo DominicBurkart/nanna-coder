@@ -322,16 +322,16 @@ struct TaskRunner {
 /// coordination lease it acquires.
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
-fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
-    let auditor = crate::action_auditor::RuleActionAuditor::new(
-        Arc::new(crate::windows::WindowSet::default()),
-        leases,
-        DEFAULT_ACTION_LEASE_TTL,
-    );
-    Arc::new(ActionGate::new(
-        Arc::new(auditor),
-        crate::action_auditor::ActionAuditLog::in_memory(),
-    ))
+const UNIDENTIFIED_TASK_CEILING: EffectClass = EffectClass::Workspace;
+
+fn default_action_gate(
+    leases: Arc<dyn LeaseStore>,
+    windows: Arc<crate::windows::WindowSet>,
+    log: crate::action_auditor::ActionAuditLog,
+) -> Arc<ActionGate> {
+    let auditor =
+        crate::action_auditor::RuleActionAuditor::new(windows, leases, DEFAULT_ACTION_LEASE_TTL);
+    Arc::new(ActionGate::new(Arc::new(auditor), log))
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -432,7 +432,11 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, QueueStoreError> {
-        let action_gate = default_action_gate(Arc::clone(&leases));
+        let action_gate = default_action_gate(
+            Arc::clone(&leases),
+            Arc::new(crate::windows::WindowSet::default()),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        );
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -483,6 +487,20 @@ impl TaskManager {
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
         self
+    }
+
+    /// Replace the default action gate with a [`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)
+    /// over `windows` that appends every verdict to `log`, sharing this
+    /// manager's lease store. `windows` is what `Sandbox`/`Production` calls
+    /// are checked against, and a file-backed `log` makes the audit trail
+    /// durable across restarts.
+    pub fn with_action_policy(
+        self,
+        windows: Arc<crate::windows::WindowSet>,
+        log: crate::action_auditor::ActionAuditLog,
+    ) -> Self {
+        let gate = default_action_gate(Arc::clone(&self.runner.leases), windows, log);
+        self.with_action_gate(gate)
     }
 
     /// The escalation log, for producers building an
@@ -1218,7 +1236,8 @@ fn registry_for(
 }
 
 /// The subject a dispatched task's effectful calls are reviewed against:
-/// the identity's effect ceiling (unbounded when the task carries none),
+/// the identity's effect ceiling (capped at `Workspace` when the task carries
+/// none, so an unidentified task fails closed instead of reaching `Production`),
 /// the branch this task pushes to, and no window, pull request or
 /// environment. Nothing in `Task`/`QueuedTask` names a PR or a target
 /// environment yet -- that lands with the middle/outer-loop work (#647,
@@ -1237,7 +1256,7 @@ fn action_subject_for(
 ) -> crate::tools::ActionSubject {
     let max_effect = identity
         .map(|identity| identity.scope.max_effect)
-        .unwrap_or(EffectClass::Production);
+        .unwrap_or(UNIDENTIFIED_TASK_CEILING);
     crate::tools::ActionSubject {
         task_id: task_id.clone(),
         max_effect,
@@ -2831,6 +2850,53 @@ mod scheduler_tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
         }
         panic!("task {id} did not reach the expected status within 5s; last status: {last:?}");
+    }
+
+    #[test]
+    fn a_task_with_no_identity_is_capped_below_repository_effects() {
+        let repo = tempfile::tempdir().unwrap();
+        let queued = queued(repo.path());
+        let subject = action_subject_for(&queued.id, &queued, None);
+        assert!(subject.max_effect < EffectClass::Repository);
+        assert_eq!(subject.max_effect, EffectClass::Workspace);
+    }
+
+    #[test]
+    fn a_task_identity_sets_its_own_ceiling() {
+        let repo = tempfile::tempdir().unwrap();
+        let queued = queued(repo.path());
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Ci;
+        let subject = action_subject_for(&queued.id, &queued, Some(&identity));
+        assert_eq!(subject.max_effect, EffectClass::Ci);
+    }
+
+    #[tokio::test]
+    async fn action_policy_gives_the_default_gate_real_windows_and_a_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions.jsonl");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_policy(
+            Arc::new(crate::windows::WindowSet::default()),
+            crate::action_auditor::ActionAuditLog::file(&path),
+        );
+        let gate = manager.runner.action_gate();
+        let review = crate::action_auditor::ActionReview {
+            identity: "x".to_string(),
+            task_id: TaskId("t".to_string()),
+            tool: "write_file".to_string(),
+            args: serde_json::json!({"path": "a.rs", "content": "x"}),
+            effect_class: EffectClass::Workspace,
+            prior_actions: vec![],
+        };
+        let ctx = crate::action_auditor::ActionContext {
+            max_effect: EffectClass::Workspace,
+            window: None,
+            lease: crate::leases::LeaseContext::default(),
+            now: Utc::now(),
+        };
+        assert!(gate.run_gate(&review, &ctx).await.is_allow());
+        let reopened = crate::action_auditor::ActionAuditLog::file(&path);
+        assert_eq!(reopened.entries().unwrap().len(), 1);
     }
 
     fn queued(repo: &std::path::Path) -> QueuedTask {
