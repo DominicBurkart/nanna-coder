@@ -352,6 +352,15 @@ mod tests {
         assert_eq!(ctx.apps.len(), 1, "a failed stop keeps the entry");
     }
 
+    #[test]
+    fn app_stop_definition_names_the_tool_and_documents_its_result() {
+        let (ctx, _dir) = context(true);
+        let def = AppStopTool::new(ctx).definition();
+        assert_eq!(def.function.name, "app_stop");
+        assert!(def.function.description.contains("Idempotent"));
+        assert!(def.function.description.contains("killed?"));
+    }
+
     #[tokio::test]
     async fn app_logs_returns_lines_and_validates_tail() {
         let (ctx, _dir) = context(true);

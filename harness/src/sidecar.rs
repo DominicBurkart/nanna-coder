@@ -51,6 +51,8 @@ pub enum SidecarError {
     Start { name: String, stderr: String },
     #[error("sidecar {name} not ready after {budget:?}")]
     NotReady { name: String, budget: Duration },
+    #[error("building image {tag} failed: {stderr}")]
+    ImageBuild { tag: String, stderr: String },
 }
 
 /// Result of one runtime command.
@@ -192,6 +194,20 @@ impl PostgresSidecar {
         )
     }
 
+    /// Command that prints the current database, run inside the sidecar over
+    /// TCP (the image's temporary init server only serves the unix socket).
+    pub fn current_database_probe(&self) -> Vec<String> {
+        vec![
+            "psql".to_string(),
+            format!(
+                "postgres://{}:{}@127.0.0.1:{POSTGRES_PORT}/{}",
+                self.user, self.password, self.database
+            ),
+            "-tAc".to_string(),
+            "select current_database()".to_string(),
+        ]
+    }
+
     /// The sidecar specification: the Postgres image creates `database` at
     /// first start and `pg_isready` over TCP gates readiness. The probe must
     /// use TCP because the image's entrypoint first runs a temporary,
@@ -288,6 +304,61 @@ impl Drop for TaskNetwork {
             warn!("could not remove task network {}", self.name);
         }
     }
+}
+
+/// Whether the container network `name` exists.
+pub fn network_exists(runner: &dyn CommandRunner, runtime: &ContainerRuntime, name: &str) -> bool {
+    let args = vec![
+        "network".to_string(),
+        "inspect".to_string(),
+        name.to_string(),
+    ];
+    matches!(runner.run(runtime.command(), &args), Ok(o) if o.success)
+}
+
+/// Whether the container `name` exists.
+pub fn container_exists(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    name: &str,
+) -> bool {
+    let args = vec![
+        "container".to_string(),
+        "exists".to_string(),
+        name.to_string(),
+    ];
+    matches!(runner.run(runtime.command(), &args), Ok(o) if o.success)
+}
+
+/// Write `containerfile` into `context_dir` and build it as image `tag`.
+pub fn build_image_from_containerfile(
+    runner: &dyn CommandRunner,
+    runtime: &ContainerRuntime,
+    tag: &str,
+    context_dir: &Path,
+    containerfile: &str,
+) -> Result<(), SidecarError> {
+    std::fs::write(context_dir.join("Containerfile"), containerfile).map_err(|e| {
+        SidecarError::Spawn {
+            command: format!("write Containerfile for {tag}"),
+            source: e,
+        }
+    })?;
+    let args = vec![
+        "build".to_string(),
+        "-q".to_string(),
+        "-t".to_string(),
+        tag.to_string(),
+        context_dir.display().to_string(),
+    ];
+    let output = run_or_spawn_error(runner, runtime.command(), &args)?;
+    if !output.success {
+        return Err(SidecarError::ImageBuild {
+            tag: tag.to_string(),
+            stderr: output.stderr,
+        });
+    }
+    Ok(())
 }
 
 fn run_or_spawn_error(
@@ -766,6 +837,71 @@ mod tests {
         );
     }
 
+    struct FlakyReadinessRunner {
+        probes: Mutex<usize>,
+        failures: usize,
+    }
+
+    impl CommandRunner for FlakyReadinessRunner {
+        fn run(&self, _program: &str, _args: &[String]) -> std::io::Result<RunOutput> {
+            let mut probes = self.probes.lock().unwrap();
+            *probes += 1;
+            Ok(RunOutput {
+                success: *probes > self.failures,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_ready_polls_until_the_probe_succeeds() {
+        let runner = FlakyReadinessRunner {
+            probes: Mutex::new(0),
+            failures: 2,
+        };
+        wait_ready(
+            &runner,
+            &ContainerRuntime::Podman,
+            "slow-start",
+            &["pg_isready".to_string()],
+            ReadinessConfig {
+                budget: Duration::from_secs(30),
+                interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*runner.probes.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn sidecar_set_rejects_unwritable_env_and_removes_network() {
+        let runner = FakeRunner::new(None, None);
+        let mut spec = PostgresSidecar::with_password("t6", "pw").spec();
+        spec.env.push(("BAD=KEY".to_string(), "v".to_string()));
+        let err = SidecarSet::start(
+            ContainerRuntime::Podman,
+            runner.clone(),
+            "t6",
+            &[spec],
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::Spawn { ref command, .. } if command == "write env file for nanna-task-t6-postgres"),
+            "{err}"
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![
+                "network create nanna-task-t6-net",
+                "network rm nanna-task-t6-net"
+            ]
+        );
+    }
+
     const SENTINEL: &str = "Sentinel-Pw-9f3a";
 
     struct InspectingRunner {
@@ -872,6 +1008,147 @@ mod tests {
         let seen = runner.seen_env_files.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].0.exists());
+    }
+
+    #[test]
+    fn container_exists_reports_exists_outcome() {
+        let ok = FakeRunner::new(None, None);
+        assert!(container_exists(
+            ok.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
+        assert_eq!(ok.calls(), vec!["container exists c1".to_string()]);
+        let missing = FakeRunner::new(Some("container exists"), None);
+        assert!(!container_exists(
+            missing.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
+        let broken = FakeRunner::new(None, Some("container exists"));
+        assert!(!container_exists(
+            broken.as_ref(),
+            &ContainerRuntime::Podman,
+            "c1"
+        ));
+    }
+
+    #[test]
+    fn current_database_probe_queries_over_tcp_with_credentials() {
+        let pg = PostgresSidecar::with_password("t1", "pw");
+        assert_eq!(
+            pg.current_database_probe(),
+            vec![
+                "psql".to_string(),
+                format!("postgres://{}:pw@127.0.0.1:5432/task_t1", pg.user),
+                "-tAc".to_string(),
+                "select current_database()".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn network_exists_reports_inspect_outcome() {
+        let ok = FakeRunner::new(None, None);
+        assert!(network_exists(
+            ok.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+        assert_eq!(ok.calls(), vec!["network inspect net-a".to_string()]);
+        let missing = FakeRunner::new(Some("network inspect"), None);
+        assert!(!network_exists(
+            missing.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+    }
+
+    #[test]
+    fn network_exists_is_false_when_runtime_cannot_spawn() {
+        let runner = FakeRunner::new(None, Some("network inspect"));
+        assert!(!network_exists(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "net-a"
+        ));
+    }
+
+    #[test]
+    fn build_image_writes_containerfile_and_builds_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, None);
+        build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Containerfile")).unwrap(),
+            "FROM scratch\n"
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![format!(
+                "build -q -t localhost/t:latest {}",
+                dir.path().display()
+            )]
+        );
+    }
+
+    #[test]
+    fn build_image_reports_failed_build_with_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(Some("build"), None);
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::ImageBuild { ref tag, ref stderr } if tag == "localhost/t:latest" && stderr == "boom"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_image_reports_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, Some("build"));
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            dir.path(),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, SidecarError::Spawn { .. }), "{err}");
+    }
+
+    #[test]
+    fn build_image_reports_unwritable_context_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new(None, None);
+        let err = build_image_from_containerfile(
+            runner.as_ref(),
+            &ContainerRuntime::Podman,
+            "localhost/t:latest",
+            &dir.path().join("missing"),
+            "FROM scratch\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::Spawn { ref command, .. } if command == "write Containerfile for localhost/t:latest"),
+            "{err}"
+        );
+        assert!(runner.calls().is_empty());
     }
 
     #[test]

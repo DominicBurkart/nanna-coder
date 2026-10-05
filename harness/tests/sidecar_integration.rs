@@ -5,10 +5,13 @@
 
 use harness::container::{
     detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig, ContainerRuntime,
+    ContainerConfig,
 };
 use harness::onboarding::{DeterministicOnboarder, Onboarder};
-use harness::sidecar::{PostgresSidecar, ReadinessConfig, SidecarSet, SystemRunner};
+use harness::sidecar::{
+    build_image_from_containerfile, network_exists, PostgresSidecar, ReadinessConfig, SidecarSet,
+    SystemRunner,
+};
 use harness::workspace::TaskWorkspace;
 use image_builder::build_dev_container;
 use std::path::{Path, PathBuf};
@@ -66,52 +69,6 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-/// A stand-in dev container image: the Postgres image (which ships `psql`)
-/// with an idle command, so the test does not depend on a Nix build.
-fn build_psql_dev_image(runtime: &ContainerRuntime) {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("Containerfile"),
-        "FROM docker.io/library/postgres:16\nCMD [\"sleep\", \"infinity\"]\n",
-    )
-    .unwrap();
-    let out = Command::new(runtime.command())
-        .args(["build", "-q", "-t", DEV_IMAGE_TAG])
-        .arg(dir.path())
-        .output()
-        .expect("runtime must be runnable");
-    assert!(
-        out.status.success(),
-        "image build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn network_exists(runtime: &ContainerRuntime, name: &str) -> bool {
-    Command::new(runtime.command())
-        .args(["network", "inspect", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Queries over TCP inside the sidecar, like the dev container would; the
-/// unix socket is also served by the image's temporary init server.
-fn current_database_in_sidecar(set: &SidecarSet, pg: &PostgresSidecar) -> String {
-    let url = format!(
-        "postgres://{}:{}@127.0.0.1:5432/{}",
-        pg.user, pg.password, pg.database
-    );
-    let out = exec_in_container(
-        &set.sidecars()[0].handle,
-        &["psql", &url, "-tAc", "select current_database()"],
-        None,
-    )
-    .unwrap();
-    assert!(out.success, "psql in sidecar failed: {}", out.stderr);
-    out.stdout.trim().to_string()
-}
-
 #[tokio::test]
 #[ignore]
 async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
@@ -120,7 +77,15 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
         eprintln!("No container runtime available, skipping test");
         return;
     }
-    build_psql_dev_image(&runtime);
+    let image_context = tempfile::tempdir().unwrap();
+    build_image_from_containerfile(
+        &SystemRunner,
+        &runtime,
+        DEV_IMAGE_TAG,
+        image_context.path(),
+        "FROM docker.io/library/postgres:16\nCMD [\"sleep\", \"infinity\"]\n",
+    )
+    .unwrap();
 
     let source = tempfile::tempdir().unwrap();
     std::fs::write(source.path().join("README.md"), "sidecar test").unwrap();
@@ -138,7 +103,7 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
     .await
     .expect("postgres sidecar must start");
     let network = set.network_name().to_string();
-    assert!(network_exists(&runtime, &network));
+    assert!(network_exists(&SystemRunner, &runtime, &network));
 
     let mut ws = TaskWorkspace::create_with_container_and_sidecars(
         source.path(),
@@ -173,7 +138,7 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
 
     ws.cleanup().unwrap();
     assert!(
-        !network_exists(&runtime, &network),
+        !network_exists(&SystemRunner, &runtime, &network),
         "task network must be removed with the workspace"
     );
 }
@@ -202,7 +167,11 @@ async fn two_tasks_get_distinct_databases() {
         )
         .await
         .expect("postgres sidecar must start");
-        let name = current_database_in_sidecar(&set, &pg);
+        let probe = pg.current_database_probe();
+        let probe: Vec<&str> = probe.iter().map(String::as_str).collect();
+        let out = exec_in_container(&set.sidecars()[0].handle, &probe, None).unwrap();
+        assert!(out.success, "psql in sidecar failed: {}", out.stderr);
+        let name = out.stdout.trim().to_string();
         assert_eq!(name, pg.database);
         names.push(name);
     }
@@ -265,4 +234,63 @@ async fn fixture_flake_builds_dev_container_with_profile_tools() {
         "wasm target missing from toolchain: {}",
         targets.stdout
     );
+}
+
+#[test]
+fn fixture_root_is_the_fullstack_fixture() {
+    let root = fixture_root();
+    assert!(root.join("Cargo.toml").is_file(), "{}", root.display());
+}
+
+#[test]
+fn init_repo_commits_every_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "b").unwrap();
+    init_repo(dir.path());
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let tracked: Vec<String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(tracked, vec!["a.txt", "sub/b.txt"]);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn git_helper_panics_on_a_failing_command() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["rev-parse", "HEAD"]);
+}
+
+#[test]
+fn copy_dir_all_copies_sources_and_skips_build_and_vcs_directories() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("api/src")).unwrap();
+    std::fs::write(src.path().join("api/src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(src.path().join("Cargo.toml"), "[workspace]").unwrap();
+    for skipped in ["target", "dist", ".git"] {
+        std::fs::create_dir_all(src.path().join(skipped)).unwrap();
+        std::fs::write(src.path().join(skipped).join("junk"), "x").unwrap();
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let out = dst.path().join("copy");
+    copy_dir_all(src.path(), &out);
+    assert_eq!(
+        std::fs::read_to_string(out.join("api/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert!(out.join("Cargo.toml").is_file());
+    for skipped in ["target", "dist", ".git"] {
+        assert!(!out.join(skipped).exists(), "{skipped} must not be copied");
+    }
 }

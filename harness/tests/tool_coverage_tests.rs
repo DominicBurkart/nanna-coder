@@ -932,3 +932,19 @@ async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner()
         .unwrap();
     assert_eq!(info["command"], "sqlx migrate info");
 }
+
+#[test]
+fn cargo_deny_declares_repository_effect_class() {
+    use harness::tools::CargoDenyTool;
+    use harness::EffectClass;
+    let tool = CargoDenyTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
+}
+
+#[test]
+fn cargo_audit_declares_repository_effect_class() {
+    use harness::tools::CargoAuditTool;
+    use harness::EffectClass;
+    let tool = CargoAuditTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
+}
