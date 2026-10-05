@@ -206,17 +206,15 @@ mod tests {
         );
         let mut summary = ledger.snapshot();
         summary.artifacts.push("/elsewhere/x.png".to_string());
-        let moved = summary.rebase_artifacts(
-            Path::new("/w/.nanna-artifacts/qa"),
-            Path::new("/store/t/qa"),
-        );
+        let store = Path::new("/store/t/qa");
+        let moved = summary.rebase_artifacts(Path::new("/w/.nanna-artifacts/qa"), store);
         assert_eq!(
             moved.artifacts,
             vec![
-                "/store/t/qa/endpoints-1.json",
-                "/store/t/qa/browser-1/report.json",
-                "/a/browser-1/s.png",
-                "/elsewhere/x.png"
+                store.join("endpoints-1.json").display().to_string(),
+                store.join("browser-1/report.json").display().to_string(),
+                "/a/browser-1/s.png".to_string(),
+                "/elsewhere/x.png".to_string()
             ]
         );
         assert_eq!(moved.endpoint_runs, summary.endpoint_runs);
