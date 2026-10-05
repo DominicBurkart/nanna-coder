@@ -47,9 +47,10 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No workspace in the agent container | the plan may mount only the broker socket; the repo is never visible to pi, so repo-borne `.pi/` config cannot influence it |
 | Capabilities are brokered | each call goes over the socket to nanna, which runs the existing Rust `Tool` under identity scope, effect ceiling and incident holds |
 | Network | only the model gateway endpoint, or none |
-| No secrets | env vars that look like credentials are rejected; the model `apiKey` is a placeholder |
-| Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor fixes them (non-root, read-only root, all caps dropped, no-new-privileges) |
-| Fail closed | `Unsupported` for empty capability sets, empty model, or unrepresentable capability names |
+| No secrets | environment names are allowlisted (`NANNA_*`, `HOME`, `LANG`, `PI_CODING_AGENT_DIR`); the model `apiKey` is a placeholder |
+| Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
+| Fail closed | `Unsupported` for empty capability sets, empty model, or unrepresentable capability names; a plan that drops the agent's scope or limits is rejected |
+| Verified lockdown | after start the executor compares the runtime's tool set to the plan (`verify_runtime_tools`) and aborts on any difference |
 
 `IsolationPolicy` encodes the rows that a plan can express. The property test
 `plans_always_satisfy_isolation` and `narrower_identity_never_widens_the_plan`
@@ -58,35 +59,107 @@ pin the monotonicity guarantee: a narrower identity never produces a wider plan.
 Even if the model is prompt-injected, it can only emit calls to granted
 capabilities, and the broker is authoritative for every one.
 
-## Effect boundary
+## Effect boundary and the broker contract
 
-Pi performs only `Workspace`-class work, through broker-run tools. Effects at
-`Repository` and above (push, PR, CI, deploy) stay in nanna's Rust layer and
-are never delegated into the agent container.
+Pi is only a reasoning loop. Every effect, at every class, happens in the
+broker, never in the agent container. Middle and outer loop identities
+(`pr-shepherd` at `ci`, `deployer` at `sandbox`, `incident-responder` at
+`production`) receive their effectful tools through the broker exactly as an
+inner-loop identity receives `write_file`; `ResolvedAgent` grants any class up
+to the identity's `max_effect`, and `pi_plan_carries_scope_and_limits_for_enforcement`
+and `middle_and_outer_loop_ceilings_grant_effectful_capabilities` cover this.
+
+The broker is the single door. For each capability call it must, in order:
+
+1. look the tool up in the registry scoped to the identity (the same registry
+   that produced the grant, see below); unknown or out-of-grant names are
+   refused;
+2. enforce `scope.paths` / `read_paths` and protected paths on file arguments;
+3. pass the **action gate** (the auditor's per-action review) before
+   execution; there is no unaudited path, and a refusal is returned to the
+   agent as a tool error and surfaced to the human like any other gap;
+4. for `Repository` and above: check the human-availability **window**
+   and take the coordination **lease**, holding it for the call;
+5. check the **production hold** for `Production`;
+6. execute, and record the call for the task result and audit log.
+
+Spawning goes through the existing spawn gate: a launch plan is only built
+from an identity the auditor has allowed, and the executor refuses a plan that
+was not built from one. The broker and executor are not written yet; this list
+is their contract and is reviewed before code.
+
+Until #669 lands, `ToolRegistry::scoped_for(identity)` does not exist on main.
+`ResolvedAgent::resolve` takes the capabilities of that scoped registry
+(`CapabilitySpec::from_registry`) and can only narrow them, so the grant has
+one source and cannot drift from what the broker enforces.
+
+## Runtime handshake
+
+A runtime that silently ignores a lockdown flag fails open, and
+`IsolationPolicy` cannot see argv semantics. After start, the executor must
+query the runtime's registered tools (pi RPC) and abort the run unless
+`verify_runtime_tools(plan, reported)` succeeds. That function is implemented
+and tested; calling it is a requirement on the executor.
+
+## Limits and scope are carried, not dropped
+
+`LaunchPlan.limits` and `LaunchPlan.scope` must equal the agent's
+(`IsolationPolicy` rejects a plan that differs). Pi has no iteration cap, so
+the executor counts turns against `max_iterations` and enforces
+`max_wall_clock_secs`; the broker enforces `scope`. `max_concurrent` is the
+scheduler's.
+
+## Hardening status
+
+Implemented: mount, network, capability, env-allowlist, file-path, image,
+scope and limits checks in `IsolationPolicy`; fail-closed `Unsupported`;
+handshake comparison.
+
+Not implemented yet, all executor work: non-root user, read-only root
+filesystem, dropped Linux capabilities, `no-new-privileges`, and network
+enforcement (the plan states the allowed endpoint; nothing enforces it until
+the executor runs the container on an internal network). Network policy should
+reuse `container::NetworkPolicy` from #669 once it lands; this module's type is
+`PlanNetwork` to avoid colliding with it meanwhile.
 
 ## Status of this change
 
-Landed here: `harness_adapter` (types, `IsolationPolicy`, `PiAdapter`),
-tested, doctested, clippy-clean.
+Landed here: `harness_adapter` (types, `IsolationPolicy`, `PiAdapter`,
+handshake), tested and doctested.
 
 Not yet done (in order):
 
-1. Broker: serve the capability socket from a task's `ToolRegistry`
-   (JSONL `{tool,args}` → `{ok,output}`), reusing scope filtering and the
-   production hold.
-2. Executor trait plus a container executor (hardened flags above) with a fake
-   for tests; RPC event parsing (`agent_settled`, tool events) into the
-   existing `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON
-   unchanged for the one_track bridge fixtures.
-3. Nix packaging of pi (`@earendil-works/pi-coding-agent`, pinned exactly) into
-   the agent image; the dev-container flake gains no pi dependency.
-4. `harness` key in `[identity]`, default `pi`. A repo-local override must not
-   change it: the narrowing rule treats `harness` as invariant (equality
-   required), since it changes what executes the agent. Deferred until
-   #669/#677 land, to avoid conflicts in `identity/`.
-5. Switch `TaskRunner` to the adapter path, then remove `AgentLoop` and the
-   in-house tool loop as separate commits, checking eval and rollout
-   dependents.
+1. Broker per the contract above. Depends on #669 (scoped registry), #677
+   (spawn gate) and #706 (action gate).
+2. Executor trait plus a container executor (hardening above) with a fake for
+   tests; RPC event parsing (`agent_settled`, tool events) into the existing
+   `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
+   the one_track bridge fixtures. Blocked on the real-pi integration test below.
+3. Packaging: pi as a pinned flake input (`github:earendil-works/pi`) with a
+   lock hash and `npm install --ignore-scripts`, built into the agent image
+   only. Upstream changed organisations and ships breaking renames in patch
+   releases, so upgrades are deliberate and tested. The dev-container flake
+   gains no pi dependency.
+4. `harness` key in `[identity]`, default `pi`, invariant under repo-local
+   override (equality required in `narrows`). Deferred until #669/#677 land
+   and the identity owner agrees.
+5. Switch `TaskRunner` to the adapter path.
+
+## One harness, and deleting the old one
+
+Pi is the only harness once the executor lands. The in-house `AgentLoop` path
+is not kept as a second option. Order of removal, each its own commit:
+
+1. `TaskRunner` uses the adapter (step 5 above).
+2. `eval/runner.rs` and the swebench eval, which depend on `AgentLoop`, move to
+   the executor or are rewritten against the MCP surface.
+3. `AgentLoop`, `agent/rag.rs`-style in-loop helpers and the unused in-loop
+   tool plumbing are deleted. `ToolRegistry` and the `Tool` impls stay: the
+   broker runs them.
+
+No tracking issues have been filed yet; filing them is for the repository
+owner to approve. `ARCHITECTURE.md` links here; the SDLC docs PR (#713) should
+reference it when this stack merges.
 
 ## Unverified assumptions (verify before step 2 ships)
 

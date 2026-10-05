@@ -176,3 +176,7 @@ flowchart TD
     C -- Can compile binary for --> n2(["Sandbox"])
     n2 -- Can be promoted to --> n3(["Release"])
 ```
+
+# Agent Runtime
+
+Agents run on pi inside containers, behind a harness-neutral adapter seam and a host-side capability broker. See [docs/pi-harness.md](docs/pi-harness.md).
