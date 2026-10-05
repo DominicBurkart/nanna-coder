@@ -1,14 +1,17 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
+use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
 };
+use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
 use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
@@ -95,6 +98,10 @@ pub struct TaskResult {
     pub format_patch: Option<String>,
     pub files_modified: Vec<String>,
     pub tool_calls_made: Vec<ToolCallRecord>,
+    /// Every call the identity scope refused during the run, in order.
+    /// Empty when the task ran without an identity.
+    #[serde(default)]
+    pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
     #[serde(default)]
@@ -102,6 +109,12 @@ pub struct TaskResult {
 }
 
 impl TaskResult {
+    /// Number of refused calls; repeated denials are the auditor's signal
+    /// that the identity lacks a capability the task needs.
+    pub fn denial_count(&self) -> usize {
+        self.denials.len()
+    }
+
     /// The widest blast radius any attributed tool call in this result
     /// reached, or `None` when no call carried an effect attribution.
     pub fn max_effect_class(&self) -> Option<EffectClass> {
@@ -119,6 +132,8 @@ impl TaskResult {
             "files_modified": self.files_modified,
             "tool_calls_made": self.tool_calls_made,
             "max_effect_class": self.max_effect_class(),
+            "denials": self.denials,
+            "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
             "qa_summary": self.qa_summary.to_json(),
@@ -246,6 +261,12 @@ struct TaskRunner {
     default_provider: Option<Arc<dyn ModelProvider>>,
     /// Coordination leases; a task's leases are released when it ends.
     leases: Arc<dyn LeaseStore>,
+    /// Identities a task may be dispatched under, keyed by name. A task whose
+    /// `identity_hint` names none of these fails closed.
+    identities: RwLock<HashMap<String, AgentIdentity>>,
+    /// Identities bound to one task at submission; they take precedence over
+    /// the shared catalog and are consumed when the task starts.
+    bound: RwLock<HashMap<TaskId, AgentIdentity>>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
 }
@@ -299,7 +320,31 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
     ) -> Result<Self, QueueStoreError> {
+        let identities = crate::identity::IdentityCatalog::default();
+        Self::restore_with_identities(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            &identities,
+        )
+        .await
+    }
+
+    /// [`restore`](Self::restore) with `identities` registered before the
+    /// first restored task dispatches, so restored tasks that hint an
+    /// identity are not refused for want of it.
+    pub async fn restore_with_identities(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        provider: Arc<dyn ModelProvider>,
+        identities: &crate::identity::IdentityCatalog,
+    ) -> Result<Self, QueueStoreError> {
         let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
+        manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
             manager.runner.recover_leases(&queued.id)?;
@@ -328,6 +373,8 @@ impl TaskManager {
             providers: RwLock::new(HashMap::new()),
             default_provider,
             leases,
+            identities: RwLock::new(HashMap::new()),
+            bound: RwLock::new(HashMap::new()),
             escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
         });
         let dispatcher =
@@ -469,6 +516,56 @@ impl TaskManager {
             provider,
         )
         .await
+    }
+
+    /// Register an identity so tasks hinting its name can be dispatched under
+    /// it. Registering a name again replaces the earlier identity.
+    pub async fn register_identity(&self, identity: AgentIdentity) {
+        self.runner
+            .identities
+            .write()
+            .await
+            .insert(identity.name().to_string(), identity);
+    }
+
+    /// Register every identity of `catalog`; see
+    /// [`TaskManager::register_identity`].
+    pub async fn register_catalog(&self, catalog: &crate::identity::IdentityCatalog) {
+        for identity in catalog.iter() {
+            self.register_identity(identity.clone()).await;
+        }
+    }
+
+    /// Submit a task that, when `identity` is present, runs under exactly that
+    /// identity, bound to this task alone: it is neither added to nor looked
+    /// up in the shared catalog, so no other task can change what it runs as.
+    /// It runs under that identity's scope: the tool registry is
+    /// [`TaskWorkspace::build_tool_registry_for`] the identity, a dev
+    /// container gets [`NetworkPolicy::for_ceiling`] of its `scope.max_effect`,
+    /// and the target repository must be in its `scope.repos`. Without an
+    /// identity this is exactly [`TaskManager::submit`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_with_identity(
+        &self,
+        description: String,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+        identity: Option<AgentIdentity>,
+    ) -> TaskId {
+        let hint = identity.as_ref().map(|i| i.name().to_string());
+        let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
+            .with_identity_hint(hint);
+        if let Some(identity) = identity {
+            self.runner
+                .bound
+                .write()
+                .await
+                .insert(queued.id.clone(), identity);
+        }
+        self.submit_task(queued, provider).await
     }
 
     /// Submit a fully described queue entry, which may be parked with
@@ -735,6 +832,23 @@ impl TaskRunner {
         .await;
     }
 
+    async fn resolve_identity(
+        &self,
+        task_id: &TaskId,
+        hint: Option<&str>,
+    ) -> Result<Option<AgentIdentity>, String> {
+        if let Some(identity) = self.bound.write().await.remove(task_id) {
+            return Ok(Some(identity));
+        }
+        let Some(name) = hint else {
+            return Ok(None);
+        };
+        match self.identities.read().await.get(name) {
+            Some(identity) => Ok(Some(identity.clone())),
+            None => Err(format!("identity `{name}` is not registered")),
+        }
+    }
+
     async fn run(self: Arc<Self>, queued: QueuedTask, side: Side) {
         let task_id = queued.id.clone();
         let provider = {
@@ -752,6 +866,22 @@ impl TaskRunner {
             .await;
             return;
         };
+        let identity = match self
+            .resolve_identity(&task_id, queued.identity_hint.as_deref())
+            .await
+        {
+            Ok(identity) => identity,
+            Err(e) => {
+                self.fail(&task_id, e, "IdentityUnavailable").await;
+                return;
+            }
+        };
+        if let Some(identity) = &identity {
+            if let Err(e) = crate::scope::check_repo(identity, &queued.repo_path) {
+                self.fail(&task_id, e.to_string(), "ScopeError").await;
+                return;
+            }
+        }
         tracing::info!(
             task_id = %task_id,
             side = side.label(),
@@ -818,6 +948,7 @@ impl TaskRunner {
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
+                network_policy_for(identity.as_ref()),
                 sidecars,
             )
             .await
@@ -835,9 +966,15 @@ impl TaskRunner {
             }
         };
 
-        let tool_registry = workspace
-            .build_tool_registry()
-            .with_production_hold(self.escalation_log(), None);
+        let tool_registry = match registry_for(&workspace, identity.as_ref()) {
+            Ok(registry) => registry,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e.to_string(), "ScopeError").await;
+                return;
+            }
+        };
+        let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -873,6 +1010,7 @@ impl TaskRunner {
                     format_patch,
                     files_modified,
                     tool_calls_made: result.tool_calls_made,
+                    denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
                     qa_summary,
@@ -914,6 +1052,25 @@ impl TaskRunner {
                 .await;
             }
         }
+    }
+}
+
+/// The network policy a task's dev container gets: the identity's ceiling
+/// when running under one, otherwise the runtime default.
+fn network_policy_for(identity: Option<&AgentIdentity>) -> NetworkPolicy {
+    match identity {
+        Some(identity) => NetworkPolicy::for_ceiling(identity.scope.max_effect),
+        None => NetworkPolicy::Enabled,
+    }
+}
+
+fn registry_for(
+    workspace: &TaskWorkspace,
+    identity: Option<&AgentIdentity>,
+) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
+    match identity {
+        Some(identity) => workspace.build_tool_registry_for(identity),
+        None => Ok(workspace.build_tool_registry()),
     }
 }
 
@@ -1017,7 +1174,9 @@ mod tests {
     }
 
     /// Wrap tool-loop responses with state machine responses for plan/perform/check.
-    fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+    pub(super) fn wrap_with_state_machine_responses(
+        tool_responses: Vec<ChatResponse>,
+    ) -> Vec<ChatResponse> {
         // EnrichingEntities: no LLM call
         let mut responses = vec![
             stop_response("Plan: execute the task"), // PlanningEntityModification
@@ -1043,11 +1202,27 @@ mod tests {
             format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
             files_modified: vec!["foo.rs".to_string()],
             tool_calls_made: vec![],
+            denials: vec![crate::scope::ScopeDenial {
+                identity: "rust-implementer".to_string(),
+                tool: "write_file".to_string(),
+                reason: crate::scope::DenialReason::ToolNotInScope,
+            }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
             qa_summary: QaSummary::default(),
         };
+        assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
+        assert_eq!(json["denial_count"], 1);
+        assert_eq!(json["denials"][0]["identity"], "rust-implementer");
+        assert_eq!(json["denials"][0]["tool"], "write_file");
+        assert_eq!(json["denials"][0]["reason"]["kind"], "tool_not_in_scope");
+        let legacy: TaskResult = serde_json::from_value(serde_json::json!({
+            "result_summary": "", "changes_patch": null, "format_patch": null,
+            "files_modified": [], "tool_calls_made": [], "iterations": 0, "model_used": "m"
+        }))
+        .unwrap();
+        assert_eq!(legacy.denial_count(), 0);
         assert_eq!(json["result_summary"], "Done");
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
@@ -1135,6 +1310,7 @@ mod tests {
             format_patch: None,
             files_modified: vec![],
             tool_calls_made,
+            denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
             qa_summary: QaSummary::default(),
@@ -2033,13 +2209,13 @@ mod scheduler_tests {
         }
     }
 
-    fn git_repo() -> tempfile::TempDir {
+    pub(super) fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         super::tests::init_test_git_repo(dir.path());
         dir
     }
 
-    async fn wait_for(
+    pub(super) async fn wait_for(
         manager: &TaskManager,
         id: &TaskId,
         pred: impl Fn(&TaskStatus) -> bool,
@@ -2056,7 +2232,7 @@ mod scheduler_tests {
         panic!("task {id} did not reach the expected status within 5s; last status: {last:?}");
     }
 
-    fn queued(repo: &std::path::Path) -> QueuedTask {
+    pub(super) fn queued(repo: &std::path::Path) -> QueuedTask {
         QueuedTask::new("task", repo.to_path_buf(), "HEAD", "mock", 10)
     }
 
@@ -2500,5 +2676,395 @@ mod scheduler_tests {
             .await;
         let cancelled = manager.cancel(&id).await.unwrap();
         assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::scheduler_tests::{git_repo, queued, wait_for};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use model::types::{ChatResponse, Choice, FinishReason, MessageRole};
+
+    fn scoped_identity() -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.tools = vec!["write_file".parse().unwrap(), "read_file".parse().unwrap()];
+        identity
+    }
+
+    fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        repo
+    }
+
+    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+        use model::types::{FunctionCall, ToolCall};
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function: FunctionCall {
+                            name: tool_name.to_string(),
+                            arguments: args,
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
+        }
+    }
+
+    fn terminal(status: &TaskStatus) -> bool {
+        status.is_terminal()
+    }
+
+    fn failed_with(status: &TaskStatus) -> (&str, &str) {
+        match status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (diagnostics.error_type.as_str(), error.as_str()),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_network_policy_follows_the_identity_ceiling() {
+        assert_eq!(network_policy_for(None), NetworkPolicy::Enabled);
+        let mut identity = scoped_identity();
+        assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Disabled);
+        identity.scope.max_effect = EffectClass::Repository;
+        assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Enabled);
+    }
+
+    #[tokio::test]
+    async fn test_unregistered_identity_hint_fails_closed() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let id = manager
+            .submit_task(
+                queued(repo.path()).with_identity_hint(Some("ghost".to_string())),
+                provider,
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "IdentityUnavailable");
+        assert!(error.contains("ghost"), "{error}");
+        assert!(manager.get_result(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_identity_excluding_the_target_repo_is_denied() {
+        let repo = repo_with_origin("https://github.com/example/other.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "ScopeError");
+        assert!(error.contains("github.com/example/other"), "{error}");
+        assert!(error.contains("scope.repos"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_identity_without_a_nameable_repo_is_denied() {
+        let repo = git_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert_eq!(failed_with(&task.status).0, "ScopeError");
+    }
+
+    #[tokio::test]
+    async fn test_identity_allowing_the_target_repo_runs_scoped() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": "README.md", "content": "x"}),
+                ),
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": "api/new.rs", "content": "ok"}),
+                ),
+                stop_response("done"),
+            ]));
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&id).await.unwrap();
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.denials[0].identity, "rust-implementer");
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(
+            result.to_json()["denials"][0]["reason"]["path"],
+            "README.md"
+        );
+        assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_registered_identity_is_resolved_by_hint() {
+        let repo = repo_with_origin("https://github.com/example/repo");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        manager.register_identity(scoped_identity()).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("done")]),
+        );
+        let id = manager
+            .submit_task(
+                queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string())),
+                provider,
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_registers_identities_before_dispatching_restored_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let store = || Box::new(crate::scheduler::JsonlQueueStore::open(&path).unwrap());
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            store(),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let hinted = queued(std::path::Path::new("/nonexistent"))
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let id = first.submit_task(hinted, Arc::clone(&provider)).await;
+        drop(first);
+
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+
+        let with = TaskManager::restore_with_identities(
+            1,
+            Box::new(HybridPolicy::default()),
+            store(),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let task = wait_for(&with, &id, terminal).await;
+        assert_eq!(failed_with(&task.status).0, "ScopeError");
+    }
+
+    #[tokio::test]
+    async fn test_a_submitted_identity_is_bound_to_its_task_and_leaves_the_catalog_alone() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let catalog_entry = scoped_identity();
+        manager.register_identity(catalog_entry.clone()).await;
+        let mut wider = scoped_identity();
+        wider.scope.max_effect = EffectClass::Repository;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(wider.clone()),
+            )
+            .await;
+        {
+            let registered = manager.runner.identities.read().await;
+            assert_eq!(registered.get("rust-implementer"), Some(&catalog_entry));
+        }
+        let bound = manager.runner.bound.read().await;
+        assert_eq!(bound.get(&id), Some(&wider));
+    }
+
+    #[tokio::test]
+    async fn test_a_bound_identity_wins_over_a_catalog_entry_of_the_same_name() {
+        let runner_manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let mut catalog_entry = scoped_identity();
+        catalog_entry.scope.max_effect = EffectClass::None;
+        runner_manager.register_identity(catalog_entry).await;
+        let bound = scoped_identity();
+        let id = TaskId::new();
+        runner_manager
+            .runner
+            .bound
+            .write()
+            .await
+            .insert(id.clone(), bound.clone());
+        let resolved = runner_manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(bound));
+        let from_catalog = runner_manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_catalog.scope.max_effect, EffectClass::None);
+    }
+
+    #[tokio::test]
+    async fn test_register_catalog_makes_every_identity_dispatchable() {
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        manager.register_catalog(&catalog).await;
+        let registered = manager.runner.identities.read().await;
+        assert_eq!(registered.len(), catalog.len());
+        assert!(registered.contains_key("rust-implementer"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_fails_on_an_invalid_scope_glob() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let mut identity = scoped_identity();
+        identity.scope.paths = vec!["[".to_string()];
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "ScopeError");
+        assert!(error.contains("scope.paths"), "{error}");
+        assert!(manager.runner.progress.read().await.get(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_starts_the_container_with_its_network_policy() {
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        std::fs::write(repo.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo.path().join(".devcontainer")).unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let canonical = repo.path().canonicalize().unwrap();
+        manager
+            .runner
+            .image_cache
+            .write()
+            .await
+            .insert(canonical, "nanna-missing-image-for-tests:none".to_string());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(scoped_identity()),
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert_eq!(failed_with(&task.status).0, "WorkspaceCreationFailed");
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_no_identity_runs_unscoped() {
+        let repo = git_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("done")]),
+        );
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                None,
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        assert_eq!(manager.get_result(&id).await.unwrap().denial_count(), 0);
     }
 }
