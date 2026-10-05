@@ -1010,6 +1010,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn start_container_passes_env_through_a_private_file() {
         let fake = crate::test_support::FakePodman::install(None);
@@ -1039,6 +1040,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn start_container_reports_unwritable_env_vars() {
         let _fake = crate::test_support::FakePodman::install(None);
