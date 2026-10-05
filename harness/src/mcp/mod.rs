@@ -177,9 +177,13 @@ impl NannaMcpServer {
                         "max_iterations": {
                             "type": "integer",
                             "description": "Maximum agent iterations (default: server default)"
+                        },
+                        "identity": {
+                            "type": "string",
+                            "description": "Name of a registered agent identity. The task runs under that identity's scope (tools, effect ceiling, paths, repos); an unregistered identity, or a repository outside scope.repos, fails the task."
                         }
                     },
-                    "required": ["description", "repo_path"]
+                    "required": ["description", "repo_path", "identity"]
                 },
                 "execution": { "taskSupport": "required" }
             },
@@ -440,6 +444,14 @@ mod tests {
             .find(|t| t["name"] == "assign_task")
             .expect("assign_task present");
         assert_eq!(assign["execution"]["taskSupport"], "required");
+        let required: Vec<&str> = assign["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"identity"));
+        assert!(assign["inputSchema"]["properties"]["identity"].is_object());
         // onboard_repo does not declare task support (forbidden by default).
         let onboard = arr
             .iter()
@@ -630,7 +642,7 @@ mod tests {
                 11,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": { "ttl": 5000 }
                 }),
             ))
@@ -641,6 +653,24 @@ mod tests {
         assert_eq!(task["ttl"], 5000);
         assert!(task["taskId"].is_string());
         assert_eq!(task["pollInterval"], handlers::POLL_INTERVAL_MS);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_without_identity_is_invalid_params() {
+        let server = make_server();
+        let resp = server
+            .handle_request(tools_call(
+                40,
+                serde_json::json!({
+                    "name": "assign_task",
+                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "task": {}
+                }),
+            ))
+            .await;
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("identity"), "{}", error.message);
     }
 
     #[tokio::test]
@@ -825,7 +855,7 @@ mod tests {
                 19,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
@@ -961,7 +991,7 @@ mod tests {
                 23,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" },
+                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))

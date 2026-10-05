@@ -122,6 +122,9 @@ enum Commands {
         /// Requested task lifetime in milliseconds
         #[arg(long)]
         ttl_ms: Option<u64>,
+        /// Name of the agent identity the task runs under
+        #[arg(short, long)]
+        identity: String,
     },
     /// Pull open GitHub issues into the persistent task queue
     ///
@@ -376,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
             ttl_ms,
+            identity,
         } => {
             run_delegate(
                 &description,
@@ -384,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &model,
                 max_iterations,
                 ttl_ms,
+                &identity,
             )
             .await?;
         }
@@ -1178,6 +1183,13 @@ async fn run_agent(
     Ok(())
 }
 
+fn load_identities() -> IdentityCatalog {
+    IdentityCatalog::load_default().unwrap_or_else(|e| {
+        tracing::warn!("No agent identities registered ({e}); every assign_task will fail closed");
+        IdentityCatalog::default()
+    })
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1192,13 +1204,15 @@ async fn run_mcp_server(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
+    let catalog = load_identities();
     let task_manager = Arc::new(
-        TaskManager::restore(
+        TaskManager::restore_with_identities(
             DEFAULT_MAX_CONCURRENT_TASKS,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&queue_path)?),
             Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
+            &catalog,
         )
         .await?,
     );
@@ -1235,6 +1249,7 @@ async fn run_delegate(
     model: &str,
     max_iterations: usize,
     ttl_ms: Option<u64>,
+    identity: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
@@ -1244,6 +1259,7 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
+    task_manager.register_catalog(&load_identities()).await;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
@@ -1269,6 +1285,7 @@ async fn run_delegate(
         "branch": branch,
         "model": model,
         "max_iterations": max_iterations,
+        "identity": identity,
     });
     let task_id = client.submit_task(arguments, ttl_ms).await?;
     info!("Delegated task {task_id}; awaiting completion...");

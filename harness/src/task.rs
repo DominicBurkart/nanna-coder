@@ -310,7 +310,31 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
     ) -> Result<Self, QueueStoreError> {
+        let identities = crate::identity::IdentityCatalog::default();
+        Self::restore_with_identities(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            &identities,
+        )
+        .await
+    }
+
+    /// [`restore`](Self::restore) with `identities` registered before the
+    /// first restored task dispatches, so restored tasks that hint an
+    /// identity are not refused for want of it.
+    pub async fn restore_with_identities(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        provider: Arc<dyn ModelProvider>,
+        identities: &crate::identity::IdentityCatalog,
+    ) -> Result<Self, QueueStoreError> {
         let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
+        manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
             manager.runner.recover_leases(&queued.id)?;
@@ -471,6 +495,14 @@ impl TaskManager {
             .write()
             .await
             .insert(identity.name().to_string(), identity);
+    }
+
+    /// Register every identity of `catalog`; see
+    /// [`TaskManager::register_identity`].
+    pub async fn register_catalog(&self, catalog: &crate::identity::IdentityCatalog) {
+        for identity in catalog.iter() {
+            self.register_identity(identity.clone()).await;
+        }
     }
 
     /// Submit a task that, when `identity` is present, runs under that
@@ -2655,6 +2687,60 @@ mod identity_tests {
             "{:?}",
             task.status
         );
+    }
+
+    #[tokio::test]
+    async fn test_restore_registers_identities_before_dispatching_restored_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let store = || Box::new(crate::scheduler::JsonlQueueStore::open(&path).unwrap());
+        let first = TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            store(),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+        )
+        .await
+        .unwrap();
+        let hinted = queued(std::path::Path::new("/nonexistent"))
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let id = first.submit_task(hinted, Arc::clone(&provider)).await;
+        drop(first);
+
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+
+        let with = TaskManager::restore_with_identities(
+            1,
+            Box::new(HybridPolicy::default()),
+            store(),
+            Arc::new(InMemoryLeaseStore::default()),
+            Arc::clone(&provider),
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let task = wait_for(&with, &id, terminal).await;
+        assert_eq!(failed_with(&task.status).0, "ScopeError");
+    }
+
+    #[tokio::test]
+    async fn test_register_catalog_makes_every_identity_dispatchable() {
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        manager.register_catalog(&catalog).await;
+        let registered = manager.runner.identities.read().await;
+        assert_eq!(registered.len(), catalog.len());
+        assert!(registered.contains_key("rust-implementer"));
     }
 
     #[tokio::test]
