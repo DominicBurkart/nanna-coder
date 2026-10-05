@@ -166,7 +166,7 @@ impl ProtectedPaths {
             .map(|glob| Rule::new(glob.to_string()))
             .collect();
         if let Some(relative) = config_dir.and_then(|dir| relative_config_dir(repo_root, dir)) {
-            let escaped = Pattern::escape(&relative.to_string_lossy());
+            let escaped = Pattern::escape(&crate::scope::denial_path(&relative));
             rules.push(Rule::new(format!("{escaped}{RECURSIVE_SUFFIX}")));
         }
         Self {
@@ -184,7 +184,7 @@ impl ProtectedPaths {
     pub fn check(&self, path: &Path) -> Result<(), ProtectedPathViolation> {
         match self.rules.iter().find(|rule| rule.matches(path)) {
             Some(rule) => Err(ProtectedPathViolation {
-                path: path.to_string_lossy().into_owned(),
+                path: crate::scope::denial_path(path),
                 rule: rule.glob.clone(),
             }),
             None => Ok(()),

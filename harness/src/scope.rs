@@ -414,7 +414,7 @@ pub fn relative_to<'a>(path: &'a Path, workspace_root: &Path) -> &'a Path {
     path.strip_prefix(workspace_root).unwrap_or(path)
 }
 
-fn denial_path(relative: &Path) -> String {
+pub(crate) fn denial_path(relative: &Path) -> String {
     relative
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
