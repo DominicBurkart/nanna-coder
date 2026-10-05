@@ -234,7 +234,12 @@ impl Drop for ContainerHandle {
 pub const REQUIRE_RUNTIME_ENV: &str = "NANNA_REQUIRE_RUNTIME";
 
 fn parse_require_runtime(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true"))
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Whether `NANNA_REQUIRE_RUNTIME` demands that missing prerequisites fail
@@ -778,7 +783,14 @@ mod tests {
     fn require_runtime_env_parsing() {
         assert!(parse_require_runtime(Some("1")));
         assert!(parse_require_runtime(Some("true")));
+        assert!(parse_require_runtime(Some("TRUE")));
+        assert!(parse_require_runtime(Some("Yes")));
+        assert!(parse_require_runtime(Some("ON")));
+        assert!(parse_require_runtime(Some(" on ")));
         assert!(!parse_require_runtime(Some("0")));
+        assert!(!parse_require_runtime(Some("false")));
+        assert!(!parse_require_runtime(Some("off")));
+        assert!(!parse_require_runtime(Some("no")));
         assert!(!parse_require_runtime(Some("")));
         assert!(!parse_require_runtime(None));
     }
