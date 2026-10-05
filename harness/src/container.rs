@@ -231,6 +231,40 @@ impl Drop for ContainerHandle {
     }
 }
 
+pub const REQUIRE_RUNTIME_ENV: &str = "NANNA_REQUIRE_RUNTIME";
+
+fn parse_require_runtime(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true"))
+}
+
+/// Whether `NANNA_REQUIRE_RUNTIME` demands that missing prerequisites fail
+/// runtime-dependent tests instead of skipping them.
+pub fn runtime_required() -> bool {
+    parse_require_runtime(std::env::var(REQUIRE_RUNTIME_ENV).ok().as_deref())
+}
+
+fn skip_or_panic_if(required: bool, reason: &str) {
+    if required {
+        panic!("NANNA_REQUIRE_RUNTIME is set but a prerequisite is missing: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// Skip a runtime-dependent test, or panic when `NANNA_REQUIRE_RUNTIME` is set.
+pub fn skip_or_panic(reason: &str) {
+    skip_or_panic_if(runtime_required(), reason);
+}
+
+/// Returns true when a container runtime is available. Otherwise skips the
+/// test (returns false), or panics when `NANNA_REQUIRE_RUNTIME` is set.
+pub fn ensure_runtime_or_skip(runtime: &ContainerRuntime, context: &str) -> bool {
+    if runtime.is_available() {
+        return true;
+    }
+    skip_or_panic(&format!("no container runtime available for {context}"));
+    false
+}
+
 /// Detect available container runtime in order of preference
 pub fn detect_runtime() -> ContainerRuntime {
     // Try Podman first (often better for rootless containers)
@@ -739,6 +773,32 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_runtime_env_parsing() {
+        assert!(parse_require_runtime(Some("1")));
+        assert!(parse_require_runtime(Some("true")));
+        assert!(!parse_require_runtime(Some("0")));
+        assert!(!parse_require_runtime(Some("")));
+        assert!(!parse_require_runtime(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "NANNA_REQUIRE_RUNTIME")]
+    fn skip_panics_when_runtime_required() {
+        skip_or_panic_if(true, "podman missing");
+    }
+
+    #[test]
+    fn skip_returns_when_runtime_not_required() {
+        skip_or_panic_if(false, "podman missing");
+    }
+
+    #[test]
+    fn ensure_runtime_or_skip_true_when_available() {
+        assert!(ensure_runtime_or_skip(&ContainerRuntime::Podman, "t"));
+        assert!(ensure_runtime_or_skip(&ContainerRuntime::Docker, "t"));
+    }
 
     #[test]
     fn test_container_runtime_command() {

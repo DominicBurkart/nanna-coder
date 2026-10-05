@@ -27,7 +27,9 @@ async fn test_run_eval_returns_result() {
     let result = match run_eval(&case, case_dir, &config).await {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
-            eprintln!("test_run_eval_returns_result: model provider unavailable ({msg}); skipping");
+            harness::container::skip_or_panic(&format!(
+                "test_run_eval_returns_result: model provider unavailable ({msg})"
+            ));
             return;
         }
         Err(e) => panic!("run_eval failed unexpectedly: {e:?}"),
@@ -74,10 +76,9 @@ timeout_secs = 1
             // if provider init fails (e.g. daemon gone mid-suite), surface it
             // rather than panic so the failure mode is distinct from a real
             // timeout-plumbing regression.
-            eprintln!(
-                "test_run_eval_timeout: model provider unavailable ({msg}); \
-                 skipping timeout assertion"
-            );
+            harness::container::skip_or_panic(&format!(
+                "test_run_eval_timeout: model provider unavailable ({msg})"
+            ));
         }
         other => panic!("expected Err(Timeout) (or ModelProvider unavailable), got {other:?}"),
     }
@@ -95,7 +96,9 @@ async fn test_run_eval_isolation() {
     let result1 = match run_eval(&case, case_dir, &config).await {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
-            eprintln!("test_run_eval_isolation: model provider unavailable ({msg}); skipping");
+            harness::container::skip_or_panic(&format!(
+                "test_run_eval_isolation: model provider unavailable ({msg})"
+            ));
             return;
         }
         Err(e) => panic!("run_eval failed unexpectedly: {e:?}"),
@@ -126,9 +129,9 @@ async fn test_discover_and_run_all_cases() {
         match run_eval(eval_case, case_path, &config).await {
             Ok(result) => assert_eq!(result.case_id, eval_case.case.id),
             Err(EvalRunnerError::ModelProvider(msg)) => {
-                eprintln!(
-                    "test_discover_and_run_all_cases: model provider unavailable ({msg}); skipping"
-                );
+                harness::container::skip_or_panic(&format!(
+                    "test_discover_and_run_all_cases: model provider unavailable ({msg})"
+                ));
                 return;
             }
             Err(e) => panic!(

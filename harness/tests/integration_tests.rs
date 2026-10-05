@@ -295,7 +295,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
     let runtime = detect_runtime();
     println!("🔍 Detected container runtime: {:?}", runtime);
 
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "containerized ollama test") {
         println!("⚠️  No container runtime available - demonstrating mock fallback");
         test_mock_fallback().await;
         return;
@@ -613,7 +613,7 @@ async fn test_image_operations() {
 
     let runtime = detect_runtime();
 
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "image operations test") {
         println!("⚠️  No container runtime - skipping image tests");
         return;
     }
@@ -753,7 +753,7 @@ async fn test_e2e_container_to_validated_inference() {
     println!("🚀 Starting E2E test: Container → Model → Judge validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock E2E test");
         test_mock_e2e_workflow().await;
         return;
@@ -1017,7 +1017,7 @@ async fn test_e2e_multi_model_comparison() {
     println!("🔬 Starting E2E test: Multi-model comparison with judge validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock multi-model test");
         test_mock_multi_model_comparison().await;
         return;
@@ -1157,7 +1157,7 @@ async fn test_e2e_performance_and_reliability() {
     println!("⚡ Starting E2E test: Performance and reliability validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock performance test");
         test_mock_performance_validation().await;
         return;
@@ -1751,7 +1751,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     println!("Starting E2E agent integration test with containerized Ollama...");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "E2E agent test") {
         println!("No container runtime available - skipping E2E agent test");
         return;
     }
@@ -1772,7 +1772,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     let container_handle = match start_container_with_fallback(&config).await {
         Ok(handle) => handle,
         Err(e) => {
-            println!("Container start failed: {} - skipping E2E agent test", e);
+            harness::container::skip_or_panic(&format!("container start failed: {e}"));
             return;
         }
     };
@@ -1783,7 +1783,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     {
         Ok(()) => println!("Health check passed"),
         Err(e) => {
-            println!("Health check failed: {} - skipping E2E agent test", e);
+            harness::container::skip_or_panic(&format!("container health check failed: {e}"));
             return;
         }
     }
@@ -1795,7 +1795,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     let provider = match OllamaProvider::new(ollama_config) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            println!("Failed to create provider: {} - skipping", e);
+            harness::container::skip_or_panic(&format!("failed to create provider: {e}"));
             return;
         }
     };

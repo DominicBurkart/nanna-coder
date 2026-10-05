@@ -730,7 +730,7 @@ mod tests {
         // skips when podman isn't on PATH so non-podman dev hosts don't
         // false-fail.
         if which::which("podman").is_err() {
-            eprintln!("podman not on PATH; skipping podman-fallback test");
+            crate::container::skip_or_panic("podman not on PATH; podman-fallback test");
             return;
         }
         let no_flake_dir = std::env::temp_dir().join("nanna_no_flake_for_podman_test");
@@ -763,7 +763,7 @@ mod tests {
         // ensure_running path from probe-fail through Command spawn,
         // status check, and the BringUpFailed branch.
         if which::which("podman").is_err() {
-            eprintln!("podman not on PATH; skipping bring-up failure test");
+            crate::container::skip_or_panic("podman not on PATH; bring-up failure test");
             return;
         }
         // Make sure the nix branch is NOT chosen.

@@ -192,6 +192,51 @@ jobs:
         files: lcov.info
         fail_ci_if_error: true
 
+  container-runtime-required:
+    name: Container runtime (required)
+    runs-on: ubuntu-latest
+    environment: codecov
+    env:
+      NANNA_REQUIRE_RUNTIME: "1"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+
+    - name: Optimize CI cache settings (Nix)
+      run: nix run .#ci-cache-optimize
+
+    - name: Verify container runtime and Ollama are present
+      run: |
+        if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+          echo "::error::No container runtime (podman or docker) on this runner"
+          exit 1
+        fi
+        if ! curl -sf --max-time 5 http://localhost:11434/api/tags > /dev/null; then
+          echo "::error::Ollama not reachable on port 11434"
+          exit 1
+        fi
+
+    - name: Pre-build dev container image
+      run: nix build path:tests/integration/repo#devContainerImage --no-link
+
+    - name: Run real-container suites
+      run: |
+        nix develop --command cargo nextest run --workspace --all-features \
+          --run-ignored all --test-threads=1 --no-fail-fast \
+          -E 'binary(integration_tests) | binary(scope_network_integration) | binary(dev_container_integration) | binary(nanna_self_dev_integration) | binary(eval_runner_tests)'
+
   build-matrix:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -613,6 +658,7 @@ jobs:
     if: always()
     needs:
       - test-matrix
+      - container-runtime-required
       - build-matrix
       - build-containers
       - security-scan
