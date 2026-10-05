@@ -39,7 +39,7 @@ impl fmt::Display for CodeSite {
 /// ```
 /// use harness::assets::AssetGraph;
 ///
-/// let graph = AssetGraph::parse("[asset.\"db.lonely\"]\nkind = \"table\"\n").unwrap();
+/// let graph = AssetGraph::parse("[concern.c]\nweight = 1\n[asset.\"db.lonely\"]\nkind = \"table\"\nconcerns = [\"c\"]\n").unwrap();
 /// let warnings = graph.warnings(None);
 /// assert_eq!(warnings.len(), 1);
 /// assert!(warnings[0].to_string().contains("db.lonely"));
@@ -54,6 +54,10 @@ pub enum Warning {
         file: PathBuf,
         asset: String,
         pattern: String,
+    },
+    NoConcerns {
+        file: PathBuf,
+        asset: String,
     },
 }
 
@@ -75,6 +79,9 @@ impl fmt::Display for Warning {
                 file.display(),
                 field(asset, "owners")
             ),
+            Warning::NoConcerns { file, asset } => {
+                write!(f, "{}: asset `{asset}` has no concerns", file.display())
+            }
         }
     }
 }
@@ -174,7 +181,7 @@ impl AssetGraph {
     /// Parse manifest text, reporting errors against `file`.
     pub fn parse_named(src: &str, file: &Path) -> Result<Self, AssetError> {
         let raw: RawManifest =
-            toml::from_str(src).map_err(|source| match duplicate_asset_name(source.message()) {
+            toml::from_str(src).map_err(|source| match duplicate_asset_name(src, &source) {
                 Some(asset) => AssetError::DuplicateAsset {
                     file: file.to_path_buf(),
                     asset,
@@ -304,6 +311,12 @@ impl AssetGraph {
             }
         }
         for pattern in &asset.owners {
+            if escapes_repo(pattern) {
+                return Err(self.invalid(
+                    field(&asset.name, "owners"),
+                    format!("`{pattern}` must be relative to the repository and contain no `..`"),
+                ));
+            }
             Pattern::new(pattern).map_err(|err| {
                 self.invalid(
                     field(&asset.name, "owners"),
@@ -547,6 +560,12 @@ impl AssetGraph {
             .unwrap_or_default();
         let mut warnings = Vec::new();
         for asset in self.assets.values() {
+            if asset.concerns.is_empty() {
+                warnings.push(Warning::NoConcerns {
+                    file: self.file.clone(),
+                    asset: asset.name.clone(),
+                });
+            }
             let owned = !asset.owners.is_empty() || self.sites.contains_key(&asset.name);
             if !owned && !read.contains(asset.name.as_str()) {
                 warnings.push(Warning::Orphan {
@@ -589,11 +608,20 @@ fn normalize_str(path: &str) -> String {
     replaced.trim_start_matches("./").to_string()
 }
 
-fn duplicate_asset_name(message: &str) -> Option<String> {
-    let (_, rest) = message.split_once("duplicate key `")?;
-    let (name, tail) = rest.split_once("` in table `")?;
-    tail.starts_with("asset`")
-        .then(|| name.trim_matches('"').to_string())
+fn escapes_repo(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    pattern.starts_with(['/', '\\'])
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || pattern.split(['/', '\\']).any(|part| part == "..")
+}
+
+fn duplicate_asset_name(src: &str, error: &toml::de::Error) -> Option<String> {
+    let start = error.span()?.start;
+    let line_start = src.get(..start)?.rfind('\n').map_or(0, |index| index + 1);
+    let header = src.get(line_start..)?.lines().next()?.trim();
+    let key = header.strip_prefix("[asset.")?.strip_suffix(']')?;
+    let headers = src.lines().filter(|line| line.trim() == header).count();
+    (headers >= 2).then(|| key.trim_matches('"').to_string())
 }
 
 #[cfg(test)]
@@ -758,6 +786,126 @@ concerns = ["revenue"]
     }
 
     #[test]
+    fn absolute_and_parent_owner_globs_are_rejected() {
+        for pattern in [
+            "/etc/**", "../x/**", "a/../b", "a\\..\\b", "C:\\x", "**/../y",
+        ] {
+            let mut graph = AssetGraph::new();
+            let mut asset = Asset::new("db.a", AssetKind::Table);
+            asset.owners = vec![pattern.to_string()];
+            match graph.insert_asset(asset).unwrap_err() {
+                AssetError::InvalidField { field, .. } => {
+                    assert_eq!(field, "asset.\"db.a\".owners", "{pattern}")
+                }
+                other => panic!("expected InvalidField for {pattern}, got {other}"),
+            }
+        }
+        let mut graph = AssetGraph::new();
+        let mut asset = Asset::new("db.a", AssetKind::Table);
+        asset.owners = vec!["api/**".into(), "..hidden/*.rs".into()];
+        graph.insert_asset(asset).unwrap();
+    }
+
+    #[test]
+    fn manifest_with_escaping_owner_is_rejected() {
+        assert_eq!(
+            invalid_field("[asset.a]\nkind=\"job\"\nowners=[\"/abs/**\"]\n"),
+            "asset.\"a\".owners"
+        );
+    }
+
+    #[test]
+    fn code_site_displays_file_line_and_module() {
+        let site = CodeSite {
+            module_path: "m".into(),
+            file: "f.rs".into(),
+            line: 3,
+        };
+        assert_eq!(site.to_string(), "f.rs:3 (m)");
+    }
+
+    #[test]
+    fn default_graph_is_empty_and_named_after_the_manifest() {
+        let graph = AssetGraph::default();
+        assert_eq!(graph, AssetGraph::new());
+        assert_eq!(graph.file(), Path::new(MANIFEST_FILE_NAME));
+        assert_eq!(graph.assets().count(), 0);
+    }
+
+    #[test]
+    fn blank_or_padded_concern_names_are_rejected() {
+        for name in ["", "  ", " pii"] {
+            let mut graph = AssetGraph::new();
+            let concern = Concern {
+                name: name.into(),
+                weight: 1,
+                description: None,
+            };
+            assert!(matches!(
+                graph.insert_concern(concern),
+                Err(AssetError::InvalidField { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn inserting_an_asset_twice_names_the_graph_file() {
+        let mut graph = AssetGraph::new();
+        graph
+            .insert_asset(Asset::new("db.a", AssetKind::Table))
+            .unwrap();
+        match graph
+            .insert_asset(Asset::new("db.a", AssetKind::Table))
+            .unwrap_err()
+        {
+            AssetError::DuplicateAsset { file, asset } => {
+                assert_eq!(asset, "db.a");
+                assert_eq!(file, Path::new(MANIFEST_FILE_NAME));
+            }
+            other => panic!("expected DuplicateAsset, got {other}"),
+        }
+    }
+
+    #[test]
+    fn dependents_of_an_unknown_asset_is_empty() {
+        let graph = AssetGraph::parse("[asset.a]\nkind=\"job\"\n").unwrap();
+        assert!(graph.dependents_of("ghost").is_empty());
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_message_wording_and_other_tables() {
+        let quoted = "[asset.\"a.b\"]\nkind=\"job\"\n[asset.\"a.b\"]\nkind=\"job\"\n";
+        assert!(matches!(
+            AssetGraph::parse(quoted).unwrap_err(),
+            AssetError::DuplicateAsset { ref asset, .. } if asset == "a.b"
+        ));
+        let concern = "[concern.x]\nweight=1\n[concern.x]\nweight=2\n";
+        assert!(matches!(
+            AssetGraph::parse(concern).unwrap_err(),
+            AssetError::Parse { .. }
+        ));
+    }
+
+    #[test]
+    fn assets_without_concerns_are_warned_about() {
+        let graph = AssetGraph::parse(
+            "[concern.c]\nweight=1\n[asset.a]\nkind=\"job\"\nowners=[\"x/**\"]\nconcerns=[\"c\"]\n[asset.b]\nkind=\"job\"\nowners=[\"y/**\"]\n",
+        )
+        .unwrap();
+        let warnings = graph.warnings(None);
+        assert_eq!(
+            warnings,
+            [Warning::NoConcerns {
+                file: PathBuf::from(MANIFEST_FILE_NAME),
+                asset: "b".into()
+            }]
+        );
+        assert!(warnings[0]
+            .to_string()
+            .contains("asset `b` has no concerns"));
+    }
+
+    #[test]
     fn duplicate_concern_is_rejected() {
         let mut graph = AssetGraph::new();
         let concern = Concern {
@@ -877,7 +1025,10 @@ concerns = ["revenue"]
 
     #[test]
     fn code_declaration_clears_the_orphan_warning() {
-        let mut graph = AssetGraph::parse("[asset.a]\nkind=\"table\"\n").unwrap();
+        let mut graph = AssetGraph::parse(
+            "[concern.c]\nweight=1\n[asset.a]\nkind=\"table\"\nconcerns=[\"c\"]\n",
+        )
+        .unwrap();
         assert_eq!(graph.warnings(None).len(), 1);
         graph
             .merge_declarations([Touch::new("a", "m", "f.rs", 1)])
