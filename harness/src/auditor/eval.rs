@@ -508,4 +508,31 @@ reason_codes = ["not_a_real_code"]
         let parsed: AuditorScorecardRow = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed, row);
     }
+
+    #[test]
+    fn appending_a_scorecard_row_reports_a_path_that_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let row = AuditorScorecardRow {
+            schema_version: AUDITOR_SCORECARD_SCHEMA_VERSION,
+            date: "2026-01-01T00:00:00Z".to_string(),
+            commit: "abc123".to_string(),
+            branch: None,
+            pr: None,
+            auditor: RULE_AUDITOR_NAME.to_string(),
+            summary: AuditorEvalSummary {
+                total: 0,
+                correct: 0,
+                false_allows: 0,
+                false_blocks: 0,
+                false_allow_rate: 0.0,
+                false_block_rate: 0.0,
+            },
+        };
+        let err = append_scorecard_row(&path, &row).unwrap_err();
+        assert!(
+            matches!(&err, AuditorEvalError::Io(p, _) if *p == path),
+            "{err:?}"
+        );
+    }
 }

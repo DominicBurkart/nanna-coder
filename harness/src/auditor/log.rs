@@ -226,4 +226,30 @@ mod tests {
         let log = AuditLog::file(&path);
         assert_eq!(log.entries().unwrap(), Vec::new());
     }
+
+    #[test]
+    fn a_poisoned_in_memory_log_still_appends_and_reads() {
+        let log = AuditLog::in_memory();
+        let Backing::Memory(entries) = &log.backing else {
+            unreachable!("in_memory is memory-backed");
+        };
+        let poisoner = Arc::clone(entries);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the audit log mutex");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(entries.is_poisoned());
+
+        let request = request(
+            "rust-implementer",
+            "Add a test.",
+            DevLoop::Inner,
+            EffectClass::Workspace,
+        );
+        log.append(&request, &allow_outcome()).unwrap();
+        assert_eq!(log.entries().unwrap().len(), 1);
+        assert!(format!("{log:?}").contains("1 entries"));
+    }
 }
