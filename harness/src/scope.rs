@@ -414,6 +414,14 @@ pub fn relative_to<'a>(path: &'a Path, workspace_root: &Path) -> &'a Path {
     path.strip_prefix(workspace_root).unwrap_or(path)
 }
 
+fn denial_path(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn violation(message: String) -> ToolError {
     ToolError::PathSecurityViolation { message }
 }
@@ -578,7 +586,7 @@ fn resolve(
     }
     if let Some(scope) = scope {
         if !scope.permits(access, &relative) {
-            let path = relative.to_string_lossy().into_owned();
+            let path = denial_path(&relative);
             let reason = DenialReason::PathOutsideScope { access, path };
             return Err(ToolError::ScopeDenied(scope.deny(tool, reason)));
         }
@@ -611,7 +619,7 @@ fn deny_missing_read_uniformly(
     if scope.permits(PathAccess::Read, &relative) {
         return None;
     }
-    let path = relative.to_string_lossy().into_owned();
+    let path = denial_path(&relative);
     let reason = DenialReason::PathOutsideScope {
         access: PathAccess::Read,
         path,
@@ -1027,11 +1035,14 @@ mod tests {
             matches!(traversal, Err(ToolError::PathSecurityViolation { .. })),
             "{traversal:?}"
         );
+        let outside_missing = std::env::temp_dir()
+            .join("nanna-definitely-not-here")
+            .join("here.rs");
         let absolute = resolve_path(
             Some(&scope),
             "read_file",
             PathAccess::Read,
-            Path::new("/definitely/not/here.rs"),
+            &outside_missing,
             root,
         );
         assert!(
