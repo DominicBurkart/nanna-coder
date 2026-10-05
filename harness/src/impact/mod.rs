@@ -23,5 +23,5 @@ mod model;
 
 pub use analyzer::{ExtractContext, Extractor, ImpactAnalyzer, DEPTH_DISCOUNT_SHIFT};
 pub use change::{Action, AddedLine, Change, ChangedFile};
-pub use extract::{OwnerPathExtractor, TouchesExtractor};
+pub use extract::{sql_accesses, OwnerPathExtractor, SqlAccess, SqlExtractor, TouchesExtractor};
 pub use model::{Access, AssetId, BlastRadius, Evidence, Weight};
