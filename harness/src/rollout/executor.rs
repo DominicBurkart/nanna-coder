@@ -2593,6 +2593,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_split_lease_outlives_the_ttl_that_frees_an_ordinary_lease() {
+        let rig = rig();
+        rig.audit.deny_from(1, "no");
+        let first = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let halted = rig.executor.run(&first.id).await.unwrap();
+        assert_eq!(halted.traffic_percent, 10);
+        let ordinary = LeaseName::deploy("example/ordinary", "sandbox");
+        let step = &halted.plan.steps[1];
+        let normal_ttl = step.min_duration + step.bake_time + one_poll_per_step().lease_grace;
+        let granted_at = rig.clock.now();
+        rig.leases
+            .acquire(&ordinary, "ordinary", normal_ttl, granted_at)
+            .unwrap();
+        let held = rig.leases.snapshot().unwrap();
+        let kept = held.iter().find(|l| l.holder == first.id).unwrap();
+        assert!(kept.until - rig.clock.now() > normal_ttl * 1000);
+
+        for elapsed in [
+            normal_ttl + Duration::seconds(1),
+            Duration::days(30),
+            Duration::days(36_000),
+        ] {
+            let target = granted_at + elapsed;
+            rig.clock.advance(target - rig.clock.now());
+            let lapsed: Vec<_> = rig
+                .leases
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .filter(|l| l.is_expired(rig.clock.now()))
+                .map(|l| l.holder)
+                .collect();
+            assert_eq!(lapsed, ["ordinary".to_string()], "after {elapsed}");
+            let second = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+            let parked = rig.executor.run(&second.id).await.unwrap();
+            let RolloutState::Parked { until, .. } = parked.state else {
+                panic!("second rollout was not refused after {elapsed}: {parked:?}");
+            };
+            assert!(until > rig.clock.now());
+            assert_eq!(parked.traffic_percent, 0);
+            assert!(rig
+                .leases
+                .snapshot()
+                .unwrap()
+                .iter()
+                .any(|l| l.holder == first.id));
+            rig.leases.release_all(&second.id).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn rollback_releases_the_lease_and_a_second_rollout_starts() {
         let rig = rig();
         rig.health.push_after(3, breach_sample());
