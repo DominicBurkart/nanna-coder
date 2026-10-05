@@ -445,7 +445,7 @@ mod tests {
             t0(),
         );
         record.state = RolloutState::Step(0);
-        log.append(None, &record).unwrap();
+        log.append(None, &mut record).unwrap();
         let later = t0() + Duration::minutes(5);
         record
             .transition(
@@ -456,7 +456,8 @@ mod tests {
                 later,
             )
             .unwrap();
-        log.append(Some(&RolloutState::Step(0)), &record).unwrap();
+        log.append(Some(&RolloutState::Step(0)), &mut record)
+            .unwrap();
         let history = log.history("rollout-1").unwrap();
         let postmortem = incident.postmortem(
             &ProposedAction::Rollback,
