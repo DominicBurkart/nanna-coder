@@ -30,7 +30,7 @@ pub use adapter::{
     AdapterCall, AdapterError, AdapterOp, FakeAdapter, FallbackPolicy, FallbackSupport, Slot,
     Swapped, TargetAdapter,
 };
-pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
+pub use executor::{enforcement, fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
 pub use health::{
     check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
     HealthSample, HealthSource, HealthThreshold, EVIDENCE_CAP,

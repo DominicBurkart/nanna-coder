@@ -6,7 +6,9 @@ use super::log::RolloutLog;
 use super::shadow::{FakeShadowSource, NoShadowSource, ShadowComparator, ShadowSource};
 use super::state::{RolloutRecord, RolloutState};
 use super::RolloutError;
-use crate::deploy::{DeployPlan, DeployStep, OnBreach, Precondition, StepKind};
+use crate::deploy::{
+    DeployPlan, DeployStep, Enforcement, OnBreach, Precondition, PreconditionKind, StepKind,
+};
 use crate::leases::{
     acquire_all, Clock, InMemoryLeaseStore, LeaseError, LeaseStore, SimulatedClock,
 };
@@ -163,7 +165,28 @@ pub async fn run_simulated(
     Ok(records)
 }
 
+/// The precondition kinds [`RolloutExecutor`] evaluates before every step:
+/// what plan output may claim is enforced on the run path.
+///
+/// ```
+/// assert!(harness::rollout::enforcement().is_complete());
+/// ```
+pub fn enforcement() -> Enforcement {
+    Enforcement::of(RolloutExecutor::evaluates)
+}
+
 impl RolloutExecutor {
+    /// Whether `step` evaluates preconditions of `kind`. Exhaustive, so a new
+    /// [`PreconditionKind`] forces a decision here and, through
+    /// [`enforcement`], in the plan's advisory label.
+    pub const fn evaluates(kind: PreconditionKind) -> bool {
+        match kind {
+            PreconditionKind::Window => true,
+            PreconditionKind::Health => true,
+            PreconditionKind::Lease => true,
+        }
+    }
+
     /// An executor with a no-op audit hook, a logging escalation hook and
     /// no shadow source (a `Shadow` step fails fast until
     /// [`with_shadow_source`](Self::with_shadow_source) is called).
@@ -1084,7 +1107,7 @@ mod tests {
         let other = rig
             .leases
             .acquire(
-                &LeaseName::deploy("app", "staging"),
+                &LeaseName::deploy("registry.example.invalid/ns/app", "staging"),
                 "task-other",
                 Duration::hours(2),
                 t0(),

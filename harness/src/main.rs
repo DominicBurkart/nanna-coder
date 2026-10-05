@@ -457,18 +457,10 @@ fn fake_rollout_log(
 }
 
 fn fake_rollout_executor(
-    repo: &std::path::Path,
     plan: &harness::deploy::DeployPlan,
     log: harness::rollout::RolloutLog,
 ) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
-    let windows_path = repo
-        .join(harness::deploy::DEPLOY_DIR)
-        .join(harness::windows::WINDOWS_FILE_NAME);
-    let windows = if windows_path.exists() {
-        harness::windows::WindowSet::load(&windows_path)?
-    } else {
-        harness::windows::WindowSet::default()
-    };
+    let windows = harness::deploy::host_windows()?.unwrap_or_default();
     let endpoints = plan
         .health
         .as_ref()
@@ -512,11 +504,11 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
-            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
             if !fake {
                 return Err(NO_REAL_TARGET.into());
             }
-            let (executor, clock) = fake_rollout_executor(&repo, &plan, fake_rollout_log(None)?)?;
+            let (executor, clock) = fake_rollout_executor(&plan, fake_rollout_log(None)?)?;
             let record = executor.start(plan, &image).await?;
             println!("started  {}", record.summary());
             run_fake_to_a_stop(&executor, &clock, &record.id).await?;
@@ -551,11 +543,8 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
                 return Err(NO_REAL_TARGET.into());
             }
             let real = rollout_log()?.load(&id)?;
-            let (executor, clock) = fake_rollout_executor(
-                &std::env::current_dir()?,
-                &real.plan,
-                fake_rollout_log(Some(&real))?,
-            )?;
+            let (executor, clock) =
+                fake_rollout_executor(&real.plan, fake_rollout_log(Some(&real))?)?;
             let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
             println!("forward  {}", record.summary());
             run_fake_to_a_stop(&executor, &clock, &id).await?;
