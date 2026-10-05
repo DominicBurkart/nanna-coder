@@ -262,7 +262,9 @@ impl RolloutExecutor {
     /// Kill switch: hold rollout `id` where it is; see [`RolloutLog::halt`].
     /// Human-only: no agent tool exposes this.
     pub fn halt(&self, id: &str) -> Result<RolloutRecord, RolloutError> {
-        self.log.halt(id, self.clock.now())
+        let record = self.log.halt(id, self.clock.now())?;
+        self.leases.release_all(id)?;
+        Ok(record)
     }
 
     /// Restart rollout `id` from step 0 with `image`, the fix that `pr`
@@ -324,7 +326,8 @@ impl RolloutExecutor {
                     self.persist(&mut record, *resume_state)?;
                 }
                 RolloutState::Complete | RolloutState::RolledBack | RolloutState::Halted => {
-                    return Ok(record)
+                    self.leases.release_all(&record.id)?;
+                    return Ok(record);
                 }
             }
         }
@@ -369,31 +372,45 @@ impl RolloutExecutor {
         let now = self.clock.now();
         let lease = record.lease_name()?;
         let ttl = step.min_duration + step.bake_time + self.config.lease_grace;
-        match acquire_all(&*self.leases, &[lease], &record.id, ttl, now) {
-            Ok(_) => {}
+        let held = match acquire_all(&*self.leases, &[lease], &record.id, ttl, now) {
+            Ok(leases) => leases
+                .into_iter()
+                .map(|l| l.name.to_string())
+                .collect::<Vec<_>>(),
             Err(LeaseError::Held { name, by, until }) => {
                 tracing::warn!(rollout = %record.id, lease = %name, held_by = %by, %until, "Deploy lease held; parking");
                 return self.park(record, until);
             }
             Err(e) => return Err(e.into()),
-        }
+        };
         for precondition in &step.preconditions {
-            if matches!(precondition, Precondition::HealthOk) && record.plan.health.is_none() {
-                let summary = format!(
-                    "step {n} requires {precondition} but the plan has no [health] thresholds to evaluate it against"
-                );
-                return self.halt_and_escalate(record, n, summary, None).await;
+            match precondition {
+                Precondition::HealthOk if record.plan.health.is_none() => {
+                    let summary = format!(
+                        "step {n} requires {precondition} but the plan has no [health] thresholds to evaluate it against"
+                    );
+                    return self.halt_and_escalate(record, n, summary, None).await;
+                }
+                Precondition::HealthOk => {}
+                Precondition::LeaseHeld(name) => {
+                    if !held.contains(name) {
+                        let summary = format!(
+                            "step {n} requires {precondition} but the executor holds {}",
+                            held.join(", ")
+                        );
+                        return self.halt_and_escalate(record, n, summary, None).await;
+                    }
+                }
+                Precondition::WindowOpen(name) => {
+                    if self.windows.is_open(name, now)? {
+                        continue;
+                    }
+                    let until = self.windows.next_open(name, now)?;
+                    tracing::warn!(rollout = %record.id, window = %name, %until, "Window closed; parking");
+                    self.leases.release_all(&record.id)?;
+                    return self.park(record, until);
+                }
             }
-            let Precondition::WindowOpen(name) = precondition else {
-                continue;
-            };
-            if self.windows.is_open(name, now)? {
-                continue;
-            }
-            let until = self.windows.next_open(name, now)?;
-            tracing::warn!(rollout = %record.id, window = %name, %until, "Window closed; parking");
-            self.leases.release_all(&record.id)?;
-            return self.park(record, until);
         }
         if let Err(denied) = self.audit.review_step(&record, &step).await {
             let summary = format!("audit denied step {n}: {}", denied.reason);
@@ -750,6 +767,7 @@ impl RolloutExecutor {
         breach: Option<HealthBreach>,
     ) -> Result<(), RolloutError> {
         self.persist(&mut record, RolloutState::Halted)?;
+        self.leases.release_all(&record.id)?;
         let escalation = RolloutEscalation {
             rollout_id: record.id.clone(),
             environment: record.plan.environment.clone(),
@@ -1120,10 +1138,9 @@ mod tests {
             "step 1: error_rate_max 0.01 breached by error rate 0.2"
         );
         assert_eq!(escalations[0].breach, halted.breach);
-        assert_eq!(
-            rig.leases.snapshot().unwrap().len(),
-            1,
-            "halted rollout keeps the deploy lease"
+        assert!(
+            rig.leases.snapshot().unwrap().is_empty(),
+            "a halted rollout releases the deploy lease"
         );
         assert_eq!(rig.executor.run(&record.id).await.unwrap(), halted);
     }
@@ -2246,6 +2263,145 @@ mod tests {
             executor.run(&record.id).await.unwrap_err(),
             RolloutError::Lease(LeaseError::NonPositiveTtl(_))
         ));
+    }
+
+    fn held_by(rig: &Rig) -> Vec<String> {
+        rig.leases
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.holder)
+            .collect()
+    }
+
+    struct LeaseProbe {
+        leases: Arc<InMemoryLeaseStore>,
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl HealthSource for LeaseProbe {
+        async fn sample(
+            &self,
+            _slot: &Slot,
+            _window: Duration,
+        ) -> Result<HealthSample, HealthError> {
+            let holders = self
+                .leases
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .map(|l| l.holder)
+                .collect();
+            self.seen.lock().unwrap().push(holders);
+            Ok(HealthSample::healthy(&["/health/v1".to_string()]))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_held_before_the_first_effect_and_throughout_the_rollout() {
+        let rig = rig();
+        let probe = Arc::new(LeaseProbe {
+            leases: rig.leases.clone(),
+            seen: std::sync::Mutex::default(),
+        });
+        let executor = executor_with_health(&rig, probe.clone());
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
+        let done = executor.run(&record.id).await.unwrap();
+        assert_eq!(done.state, RolloutState::Complete);
+        let seen = probe.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|holders| *holders == [record.id.clone()]),
+            "{seen:?}"
+        );
+        assert!(held_by(&rig).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lease_precondition_naming_another_lease_is_refused() {
+        let rig = rig();
+        let mut forged = plan("sandbox");
+        for step in &mut forged.steps {
+            step.preconditions[0] = Precondition::LeaseHeld("deploy:other/app:sandbox".into());
+        }
+        let record = rig.executor.start(forged, V2).await.unwrap();
+        let halted = rig.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert_eq!(halted.traffic_percent, 0);
+        assert!(!rig.adapter.calls().iter().any(|c| matches!(
+            c,
+            AdapterCall::SetTraffic(..) | AdapterCall::DeployInactive(..)
+        )));
+        assert_eq!(rig.escalation.escalations().len(), 1);
+        assert!(rig.escalation.escalations()[0]
+            .summary
+            .contains("deploy:other/app:sandbox"));
+        assert!(held_by(&rig).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_released_when_the_rollout_halts() {
+        let rig = rig();
+        rig.audit.deny_from(1, "no");
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap().state,
+            RolloutState::Halted
+        );
+        assert!(held_by(&rig).is_empty());
+
+        let rig = self::rig();
+        rig.health.set_failing(true);
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap().state,
+            RolloutState::Halted
+        );
+        assert!(held_by(&rig).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_released_when_escalation_fails_after_a_halt() {
+        let rig = rig();
+        rig.escalation.set_failing(true);
+        rig.audit.deny_from(0, "no");
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        assert!(rig.executor.run(&record.id).await.is_err());
+        assert!(held_by(&rig).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_released_after_a_rollback_and_after_an_operator_halt() {
+        let rig = rig();
+        rig.health.push_after(3, breach_sample());
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        assert_eq!(
+            rig.executor.run(&record.id).await.unwrap().state,
+            RolloutState::RolledBack
+        );
+        assert!(held_by(&rig).is_empty());
+
+        let rig = self::rig();
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        rig.executor.run(&record.id).await.unwrap();
+        let log = RolloutLog::open(&rig.path).unwrap();
+        let other = rig.executor.start(plan("sandbox"), V3).await.unwrap();
+        rig.leases
+            .acquire(
+                &LeaseName::deploy("registry.example.invalid/ns/app", "sandbox"),
+                &other.id,
+                Duration::hours(1),
+                rig.clock.now(),
+            )
+            .unwrap();
+        rig.executor.halt(&other.id).unwrap();
+        assert_eq!(log.load(&other.id).unwrap().state, RolloutState::Halted);
+        assert_eq!(
+            rig.executor.run(&other.id).await.unwrap().state,
+            RolloutState::Halted
+        );
+        assert!(held_by(&rig).is_empty());
     }
 
     #[tokio::test]
