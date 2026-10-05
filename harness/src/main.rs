@@ -159,6 +159,11 @@ enum Commands {
         #[arg(long)]
         queue_path: Option<std::path::PathBuf>,
     },
+    /// Human-only escalation controls (agents have no tool for these)
+    Escalation {
+        #[command(subcommand)]
+        action: EscalationAction,
+    },
     /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
     Deploy {
         #[command(subcommand)]
@@ -177,6 +182,21 @@ enum Commands {
         /// Optional second JSON file for comparison report
         #[arg(long)]
         compare: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscalationAction {
+    /// Clear the incident hold set by an `incident` escalation so
+    /// production-class work for its repository can resume
+    Resolve {
+        /// Escalation id printed in the issue body (`**Id:**`) and in
+        /// `nanna health`
+        id: String,
+        /// Escalation log location (defaults to NANNA_ESCALATION_PATH or
+        /// escalations.jsonl next to the queue log)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
     },
 }
 
@@ -245,6 +265,11 @@ enum DeployCommands {
     },
     /// Kill switch: hold a rollout's current traffic split (human only)
     Halt {
+        /// Rollout id
+        id: String,
+    },
+    /// Release the deploy lease a halted rollout keeps while its split is live (human only)
+    Release {
         /// Rollout id
         id: String,
     },
@@ -415,6 +440,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::Escalation {
+            action: EscalationAction::Resolve { id, path },
+        } => {
+            run_escalation_resolve(&id, path)?;
+        }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::SweBenchReport {
             input,
@@ -532,6 +562,17 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
         DeployCommands::Halt { id } => {
             let record = rollout_log()?.halt(&id, chrono::Utc::now())?;
             println!("halted   {}", record.summary());
+        }
+        DeployCommands::Release { id } => {
+            println!(
+                "{}",
+                harness::rollout::release_halted_lease_cli(
+                    &rollout_log()?,
+                    harness::escalation::ResolveGrant::from_environment(),
+                    harness::leases::default_lease_path(),
+                    &id,
+                )?
+            );
         }
         DeployCommands::RollForward {
             id,
@@ -919,7 +960,63 @@ async fn health_check(provider: &OllamaProvider) -> Result<(), Box<dyn std::erro
 
     report_queue_health()?;
     report_lease_health()?;
+    report_escalation_health()?;
 
+    Ok(())
+}
+
+/// Print the escalation counters and every live incident hold. A missing
+/// escalation log means nothing has been escalated yet.
+fn report_escalation_health() -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::{default_escalation_path, EscalationLog};
+
+    let Some(path) = default_escalation_path() else {
+        println!(
+            "- Escalations: no log location (set NANNA_ESCALATION_PATH, NANNA_QUEUE_PATH or HOME)"
+        );
+        return Ok(());
+    };
+    if !path.exists() {
+        println!("- Escalations: none (no log at {})", path.display());
+        return Ok(());
+    }
+    let snapshot = EscalationLog::open(&path)?.snapshot(chrono::Utc::now());
+    println!("- Escalations ({}): {}", path.display(), snapshot);
+    for hold in &snapshot.holds {
+        println!(
+            "  incident {} holds production for {} since {}: {} (clear with `nanna escalation resolve {}`)",
+            hold.escalation_id, hold.repo, hold.since, hold.summary, hold.escalation_id
+        );
+    }
+    Ok(())
+}
+
+/// Escalation log location: `NANNA_ESCALATION_PATH` when set, otherwise
+/// `escalations.jsonl` next to the queue log.
+fn resolve_escalation_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::escalation::escalation_path_from(
+        std::env::var_os(harness::escalation::ESCALATION_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields an escalation path")
+}
+
+fn run_escalation_resolve(
+    id: &str,
+    path: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+
+    let path = match path {
+        Some(explicit) => explicit,
+        None => resolve_escalation_path(&resolve_queue_path(None)?),
+    };
+    let grant = harness::escalation::ResolveGrant::from_environment()?;
+    let hold = EscalationLog::open(&path)?.resolve(&grant, id, chrono::Utc::now())?;
+    println!(
+        "Resolved incident hold {} on {} (held since {}): {}",
+        hold.escalation_id, hold.repo, hold.since, hold.summary
+    );
     Ok(())
 }
 
@@ -1171,6 +1268,7 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
     use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
@@ -1181,6 +1279,7 @@ async fn run_mcp_server(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
+    let escalation_path = resolve_escalation_path(&queue_path);
     let task_manager = Arc::new(
         TaskManager::restore(
             DEFAULT_MAX_CONCURRENT_TASKS,
@@ -1189,15 +1288,17 @@ async fn run_mcp_server(
             Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
         )
-        .await?,
+        .await?
+        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
     );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
         model,
         max_iterations,
         queue_path.display(),
-        lease_path.display()
+        lease_path.display(),
+        escalation_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(

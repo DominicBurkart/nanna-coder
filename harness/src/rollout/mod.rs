@@ -15,6 +15,7 @@
 //! [`FakeAdapter`], which records every call.
 
 mod adapter;
+mod escalator_hook;
 mod executor;
 mod health;
 mod hooks;
@@ -30,7 +31,11 @@ pub use adapter::{
     AdapterCall, AdapterError, AdapterOp, FakeAdapter, FallbackPolicy, FallbackSupport, Slot,
     Swapped, TargetAdapter,
 };
-pub use executor::{enforcement, fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
+pub use escalator_hook::EscalatorHook;
+pub use executor::{
+    enforcement, fake_executor, release_halted_lease, release_halted_lease_cli, run_simulated,
+    RolloutConfig, RolloutExecutor,
+};
 pub use health::{
     check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
     HealthSample, HealthSource, HealthThreshold, EVIDENCE_CAP,
@@ -114,6 +119,9 @@ pub enum RolloutError {
         /// The missing step index.
         step: usize,
     },
+    /// A lease release for a rollout that is not halted.
+    #[error("rollout {0} is not halted; only a halted rollout's lease is released by hand")]
+    NotHalted(String),
     /// A roll-forward without the pull request that justifies it.
     #[error("roll-forward requires a linked pull request reference")]
     PrRequired,
