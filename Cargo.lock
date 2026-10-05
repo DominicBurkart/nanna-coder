@@ -625,6 +625,7 @@ dependencies = [
  "glob",
  "image-builder",
  "model",
+ "nanna-effects",
  "proptest",
  "rand",
  "regex",
