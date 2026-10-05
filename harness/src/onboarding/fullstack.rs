@@ -561,6 +561,36 @@ dioxus = { version = "0.7", features = ["web"] }
         assert!(matches!(err, crate::sidecar::SidecarError::NoRuntime));
     }
 
+    #[tokio::test]
+    async fn task_sidecars_are_skipped_when_detection_fails() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "Cargo.toml", "[workspace\nmembers = 1");
+        let runner = std::sync::Arc::new(RecordingRunner(Default::default()));
+        let set = start_task_sidecars(
+            crate::container::ContainerRuntime::Podman,
+            runner.clone(),
+            dir.path(),
+            "task-9",
+            quick_readiness(),
+        )
+        .await
+        .unwrap();
+        assert!(set.is_none());
+        assert!(runner.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn member_without_package_name_or_directory_name_is_an_error() {
+        let doc: toml::Value = "[dependencies]".parse().unwrap();
+        let err = MemberManifest::from_doc(Path::new("/"), Path::new("/"), &doc, None)
+            .err()
+            .expect("a nameless member must be rejected");
+        assert!(
+            matches!(err, OnboardingError::ParseError(ref m) if m.contains("no package name")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn plain_library_crate_is_not_full_stack() {
         let dir = TempDir::new().unwrap();

@@ -805,6 +805,60 @@ mod tests {
         assert!(!ws.workspace_path.exists());
     }
 
+    #[tokio::test]
+    async fn test_create_with_container_starts_through_the_runtime_and_cleans_up() {
+        let fake = crate::test_support::FakePodman::install_async(None).await;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-create-container");
+        let mut ws = TaskWorkspace::create_with_container(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+        )
+        .await
+        .unwrap();
+        assert!(ws.sidecar_env().is_empty());
+        let mount = format!(
+            "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+            ws.workspace_path.display()
+        );
+        let calls = fake.calls();
+        let run = calls
+            .iter()
+            .find(|c| c.starts_with(&format!("run -d --name nanna-task-{task_id}")))
+            .expect("run call recorded");
+        assert!(run.contains(&mount), "{run}");
+        assert!(run.ends_with("mock-image:latest"), "{run}");
+        ws.cleanup().unwrap();
+        assert!(fake
+            .calls()
+            .contains(&format!("rm -f nanna-task-{task_id}")));
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_tolerates_failing_container_removal() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let fake = crate::test_support::FakePodman::install(Some("rm -f"));
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-rm-fails"), "HEAD")
+                .unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "nanna-rm-fails".to_string(),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(fake.calls().contains(&"rm -f nanna-rm-fails".to_string()));
+        assert!(!ws.workspace_path.exists());
+    }
+
     #[test]
     fn test_cleanup_drops_container_handle() {
         use crate::container::{ContainerHandle, ContainerRuntime};

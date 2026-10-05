@@ -322,7 +322,6 @@ impl EnvFile {
     /// assert!(!path.exists());
     /// ```
     pub fn create(vars: &[(String, String)]) -> std::io::Result<Self> {
-        use std::io::Write;
         let mut content = String::new();
         for (key, value) in vars {
             let bad_key = key.is_empty() || key.contains(['=', '\n', '\r', '\0']);
@@ -337,17 +336,29 @@ impl EnvFile {
             content.push_str(value);
             content.push('\n');
         }
+        let dir = std::env::temp_dir();
+        let mut next_suffix = || -> String {
+            rand::Rng::sample_iter(rand::rng(), rand::distr::Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect()
+        };
+        Self::write_unique(&dir, &content, &mut next_suffix)
+    }
+
+    fn write_unique(
+        dir: &Path,
+        content: &str,
+        next_suffix: &mut dyn FnMut() -> String,
+    ) -> std::io::Result<Self> {
+        use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut attempt = 0;
         loop {
-            let suffix: String = rand::Rng::sample_iter(rand::rng(), rand::distr::Alphanumeric)
-                .take(16)
-                .map(char::from)
-                .collect();
-            let path = std::env::temp_dir().join(format!("nanna-env-{suffix}"));
+            let path = dir.join(format!("nanna-env-{}", next_suffix()));
             match options.open(&path) {
                 Ok(mut file) => {
                     let guard = Self { path };
@@ -950,5 +961,105 @@ mod tests {
         };
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
+    }
+
+    #[test]
+    fn env_file_retries_on_name_collision_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nanna-env-dup"), "taken").unwrap();
+        let mut names = vec!["fresh".to_string(), "dup".to_string()];
+        let file =
+            EnvFile::write_unique(dir.path(), "A=b\n", &mut || names.pop().unwrap()).unwrap();
+        assert_eq!(file.path(), dir.path().join("nanna-env-fresh"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "A=b\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nanna-env-dup")).unwrap(),
+            "taken"
+        );
+    }
+
+    #[test]
+    fn env_file_gives_up_after_repeated_name_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nanna-env-dup"), "taken").unwrap();
+        let mut calls = 0;
+        let err = EnvFile::write_unique(dir.path(), "", &mut || {
+            calls += 1;
+            "dup".to_string()
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, 9);
+    }
+
+    #[test]
+    fn env_file_reports_unwritable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let err = EnvFile::write_unique(&missing, "", &mut || "x".to_string()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    fn quick_start_config(name: &str, env_vars: Vec<(String, String)>) -> ContainerConfig {
+        ContainerConfig {
+            container_name: name.to_string(),
+            env_vars,
+            startup_timeout: Duration::from_millis(1),
+            additional_args: vec!["--network=n".to_string()],
+            ..ContainerConfig::default()
+        }
+    }
+
+    #[test]
+    fn start_container_passes_env_through_a_private_file() {
+        let fake = crate::test_support::FakePodman::install(None);
+        let config = quick_start_config(
+            "nanna-env-start-test",
+            vec![("DATABASE_URL".to_string(), ENV_SENTINEL.to_string())],
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let handle = rt.block_on(start_container_with_fallback(&config)).unwrap();
+        assert_eq!(handle.name, "nanna-env-start-test");
+        assert_eq!(handle.runtime, ContainerRuntime::Podman);
+        assert!(handle.needs_cleanup);
+        let calls = fake.calls();
+        let run = calls
+            .iter()
+            .find(|c| c.starts_with("run -d --name nanna-env-start-test"))
+            .expect("run call recorded");
+        assert!(run.contains("--env-file"));
+        assert!(run.contains("--network=n"));
+        assert!(!run.contains(ENV_SENTINEL));
+        assert_eq!(
+            fake.env_file_contents(),
+            vec![format!("DATABASE_URL={ENV_SENTINEL}")]
+        );
+    }
+
+    #[test]
+    fn start_container_reports_unwritable_env_vars() {
+        let _fake = crate::test_support::FakePodman::install(None);
+        let config = quick_start_config(
+            "nanna-env-bad-test",
+            vec![("BAD=KEY".to_string(), "v".to_string())],
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(start_container_with_fallback(&config))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ContainerError::ContainerStartFailed { ref name, ref reason }
+                    if name == "nanna-env-bad-test" && reason.contains("could not write container env file")
+            ),
+            "{err}"
+        );
     }
 }

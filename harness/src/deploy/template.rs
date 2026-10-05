@@ -1,7 +1,7 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
 use crate::windows;
 use chrono::Duration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -61,7 +61,8 @@ impl Target {
 ///
 /// Classes are ordered from least to most consequential; a higher class
 /// demands a more cautious rollout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
     /// Nothing depends on the system yet.
     Unused,
@@ -182,7 +183,8 @@ pub enum RiskSpec {
 }
 
 /// Rollout strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Strategy {
     /// Route all traffic to the new version at once.
     Instant,
@@ -252,7 +254,7 @@ impl Rollout {
 }
 
 /// The `[health]` section.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Health {
     /// HTTP paths polled during the bake.
     pub endpoints: Vec<String>,
@@ -265,7 +267,8 @@ pub struct Health {
 }
 
 /// What to do when a health gate is breached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OnBreach {
     /// Restore the previous version at 100%.
     Rollback,
@@ -306,7 +309,7 @@ impl FromStr for OnBreach {
 
 /// The `[rollback]` section. Absent sections default to manual handling:
 /// not automatic, `halt-and-escalate`, nothing retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rollback {
     /// Whether a health breach triggers `on_breach` without a human.
     pub automatic: bool,
@@ -317,7 +320,8 @@ pub struct Rollback {
 }
 
 /// Response attribute compared between the live and shadow versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShadowCompare {
     /// HTTP status code.
     Status,
@@ -349,8 +353,11 @@ impl FromStr for ShadowCompare {
     }
 }
 
+/// Default `[shadow].max_divergence`: 5% of mirrored pairs may disagree.
+pub const DEFAULT_MAX_DIVERGENCE: f64 = 0.05;
+
 /// The `[shadow]` section.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
     /// Whether traffic is mirrored to the new version before it goes live.
     pub enabled: bool,
@@ -358,6 +365,9 @@ pub struct Shadow {
     pub mirror_percent: u8,
     /// Attributes compared between live and shadow responses.
     pub compare: Vec<ShadowCompare>,
+    /// Share of compared pairs, `0.0..=1.0`, above which an attribute's
+    /// divergence is a health breach; [`DEFAULT_MAX_DIVERGENCE`] when unset.
+    pub max_divergence: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,6 +437,7 @@ struct RawShadow {
     enabled: bool,
     mirror_percent: i64,
     compare: Vec<String>,
+    max_divergence: Option<f64>,
 }
 
 /// A loaded and validated `.nanna/deploy.toml`.
@@ -804,10 +815,19 @@ fn convert_shadow(file: &Path, raw: RawShadow) -> Result<Shadow, DeployError> {
         .iter()
         .map(|c| c.parse().map_err(|e| invalid(file, "shadow.compare", e)))
         .collect::<Result<Vec<_>, _>>()?;
+    let max_divergence = raw.max_divergence.unwrap_or(DEFAULT_MAX_DIVERGENCE);
+    if !(0.0..=1.0).contains(&max_divergence) {
+        return Err(invalid(
+            file,
+            "shadow.max_divergence",
+            format!("{max_divergence} is not a rate in 0.0..=1.0"),
+        ));
+    }
     Ok(Shadow {
         enabled: raw.enabled,
         mirror_percent,
         compare,
+        max_divergence,
     })
 }
 
@@ -882,6 +902,7 @@ compare = ["status", "latency"]
             shadow.compare,
             [ShadowCompare::Status, ShadowCompare::Latency]
         );
+        assert_eq!(shadow.max_divergence, DEFAULT_MAX_DIVERGENCE);
         assert_eq!(t.file(), Path::new(DEPLOY_FILE_NAME));
         assert_eq!(
             t.target.image_ref(),
@@ -1155,6 +1176,45 @@ compare = ["status", "latency"]
         let (field, reason) = field_error(&FIXTURE.replace("\"latency\"", "\"body\""));
         assert_eq!(field, "shadow.compare");
         assert!(reason.contains("status, latency"));
+    }
+
+    #[test]
+    fn max_divergence_is_a_rate() {
+        let with = |value: &str| {
+            FIXTURE.replace(
+                "compare = [\"status\", \"latency\"]\n",
+                &format!("compare = [\"status\", \"latency\"]\nmax_divergence = {value}\n"),
+            )
+        };
+        let t = DeployTemplate::parse(&with("0.2")).unwrap();
+        assert_eq!(t.shadow.as_ref().unwrap().max_divergence, 0.2);
+        assert_eq!(
+            DeployTemplate::parse(&with("0.0"))
+                .unwrap()
+                .shadow
+                .unwrap()
+                .max_divergence,
+            0.0
+        );
+        assert_eq!(
+            DeployTemplate::parse(&with("1.0"))
+                .unwrap()
+                .shadow
+                .unwrap()
+                .max_divergence,
+            1.0
+        );
+        for bad in ["1.5", "-0.1", "nan", "inf"] {
+            let (field, reason) = field_error(&with(bad));
+            assert_eq!(field, "shadow.max_divergence", "{bad}");
+            assert!(reason.contains("0.0..=1.0"), "{reason}");
+        }
+        let json = serde_json::to_string(t.shadow.as_ref().unwrap()).unwrap();
+        assert!(json.contains("\"status\""));
+        assert_eq!(
+            serde_json::from_str::<Shadow>(&json).unwrap(),
+            t.shadow.unwrap()
+        );
     }
 
     #[test]
