@@ -1,3 +1,4 @@
+use crate::effects::EffectClass;
 use model::provider::ModelProvider;
 use model::OllamaConfig;
 use model::OllamaProvider;
@@ -88,6 +89,52 @@ pub enum ContainerError {
     Io(#[from] std::io::Error),
 }
 
+/// Whether a dev container may open network connections.
+///
+/// Derived from an identity's effect ceiling: an agent whose effects are
+/// confined to its workspace has no reason to reach the network, so the
+/// container is started with networking disabled and `run_command` cannot
+/// exfiltrate or fetch anything.
+///
+/// ```
+/// use harness::container::NetworkPolicy;
+/// use harness::effects::EffectClass;
+///
+/// assert_eq!(NetworkPolicy::for_ceiling(EffectClass::Workspace), NetworkPolicy::Disabled);
+/// assert_eq!(NetworkPolicy::for_ceiling(EffectClass::Repository), NetworkPolicy::Enabled);
+/// assert_eq!(NetworkPolicy::Disabled.run_args(), ["--network=none"]);
+/// assert!(NetworkPolicy::Enabled.run_args().is_empty());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkPolicy {
+    /// No network namespace beyond loopback.
+    Disabled,
+    /// The runtime's default network.
+    Enabled,
+}
+
+impl NetworkPolicy {
+    /// The policy an effect ceiling implies: networking is enabled only when
+    /// the ceiling reaches [`EffectClass::Repository`] or above.
+    pub const fn for_ceiling(ceiling: EffectClass) -> Self {
+        match ceiling {
+            EffectClass::None | EffectClass::Workspace => NetworkPolicy::Disabled,
+            EffectClass::Repository
+            | EffectClass::Ci
+            | EffectClass::Sandbox
+            | EffectClass::Production => NetworkPolicy::Enabled,
+        }
+    }
+
+    /// `run` flags implementing this policy, understood by both podman and docker.
+    pub const fn run_args(self) -> &'static [&'static str] {
+        match self {
+            NetworkPolicy::Disabled => &["--network=none"],
+            NetworkPolicy::Enabled => &[],
+        }
+    }
+}
+
 /// Configuration for container operations
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -109,6 +156,39 @@ pub struct ContainerConfig {
     pub env_vars: Vec<(String, String)>,
     /// Additional container arguments
     pub additional_args: Vec<String>,
+    /// Whether the container may reach the network
+    pub network: NetworkPolicy,
+}
+
+impl ContainerConfig {
+    /// Every argument that follows `run` when starting this container:
+    /// detach and name, `--userns=keep-id` on podman (so files created inside
+    /// the container are owned by the host user rather than root), port
+    /// mapping, environment, network policy, `additional_args`, `--rm`, and
+    /// finally `image`.
+    pub fn run_args(&self, runtime: &ContainerRuntime, image: &str) -> Vec<String> {
+        let mut args = vec![
+            "-d".to_string(),
+            "--name".to_string(),
+            self.container_name.clone(),
+        ];
+        if *runtime == ContainerRuntime::Podman {
+            args.push("--userns=keep-id".to_string());
+        }
+        if let Some((host_port, container_port)) = self.port_mapping {
+            args.push("-p".to_string());
+            args.push(format!("{}:{}", host_port, container_port));
+        }
+        for (key, value) in &self.env_vars {
+            args.push("-e".to_string());
+            args.push(format!("{}={}", key, value));
+        }
+        args.extend(self.network.run_args().iter().map(ToString::to_string));
+        args.extend(self.additional_args.iter().cloned());
+        args.push("--rm".to_string());
+        args.push(image.to_string());
+        args
+    }
 }
 
 impl Default for ContainerConfig {
@@ -123,6 +203,7 @@ impl Default for ContainerConfig {
             health_check_timeout: Duration::from_secs(10),
             env_vars: Vec::new(),
             additional_args: Vec::new(),
+            network: NetworkPolicy::Enabled,
         }
     }
 }
@@ -366,36 +447,9 @@ pub async fn start_container_with_fallback(
         }
     }
 
-    // Build container run command
     let mut cmd = Command::new(runtime.command());
-    cmd.args(["run", "-d", "--name", &config.container_name]);
-
-    // Podman requires --userns=keep-id so files created inside the container
-    // are owned by the host user rather than root.
-    if runtime == ContainerRuntime::Podman {
-        cmd.arg("--userns=keep-id");
-    }
-
-    // Add port mapping if specified
-    if let Some((host_port, container_port)) = config.port_mapping {
-        cmd.args(["-p", &format!("{}:{}", host_port, container_port)]);
-    }
-
-    // Add environment variables
-    for (key, value) in &config.env_vars {
-        cmd.args(["-e", &format!("{}={}", key, value)]);
-    }
-
-    // Add additional arguments
-    for arg in &config.additional_args {
-        cmd.arg(arg);
-    }
-
-    // Add remove flag for automatic cleanup
-    cmd.arg("--rm");
-
-    // Finally add the image
-    cmd.arg(&image_to_use);
+    cmd.arg("run");
+    cmd.args(config.run_args(&runtime, &image_to_use));
 
     // Start the container
     println!("🚀 Starting container: {}", config.container_name);
@@ -747,6 +801,78 @@ mod tests {
             result,
             Err(ContainerError::ImageLoadFailed { .. })
         ));
+    }
+
+    #[test]
+    fn network_policy_maps_to_run_flags() {
+        assert_eq!(NetworkPolicy::Disabled.run_args(), ["--network=none"]);
+        assert!(NetworkPolicy::Enabled.run_args().is_empty());
+    }
+
+    #[test]
+    fn network_policy_follows_the_effect_ceiling() {
+        use crate::effects::EffectClass;
+        for class in EffectClass::ALL {
+            let expected = if class >= EffectClass::Repository {
+                NetworkPolicy::Enabled
+            } else {
+                NetworkPolicy::Disabled
+            };
+            assert_eq!(NetworkPolicy::for_ceiling(class), expected, "{class}");
+        }
+    }
+
+    #[test]
+    fn default_config_keeps_networking_enabled() {
+        assert_eq!(ContainerConfig::default().network, NetworkPolicy::Enabled);
+    }
+
+    fn run_args_config(network: NetworkPolicy) -> ContainerConfig {
+        ContainerConfig {
+            base_image: "alpine:3.19".to_string(),
+            test_image: None,
+            container_name: "svc".to_string(),
+            port_mapping: Some((8080, 80)),
+            model_to_pull: None,
+            startup_timeout: Duration::from_secs(1),
+            health_check_timeout: Duration::from_secs(1),
+            env_vars: vec![("KEY".to_string(), "value".to_string())],
+            additional_args: vec!["--memory=1g".to_string()],
+            network,
+        }
+    }
+
+    #[test]
+    fn run_args_disable_networking_before_the_image() {
+        let config = run_args_config(NetworkPolicy::Disabled);
+        let args = config.run_args(&ContainerRuntime::Podman, "alpine:3.19");
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "--name",
+                "svc",
+                "--userns=keep-id",
+                "-p",
+                "8080:80",
+                "-e",
+                "KEY=value",
+                "--network=none",
+                "--memory=1g",
+                "--rm",
+                "alpine:3.19",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_omit_network_flag_when_enabled_and_userns_on_docker() {
+        let config = run_args_config(NetworkPolicy::Enabled);
+        let args = config.run_args(&ContainerRuntime::Docker, "alpine:3.19");
+        assert!(!args.iter().any(|arg| arg.starts_with("--network")));
+        assert!(!args.iter().any(|arg| arg.starts_with("--userns")));
+        assert_eq!(args.last().map(String::as_str), Some("alpine:3.19"));
+        assert_eq!(args[..3], ["-d", "--name", "svc"]);
     }
 
     #[test]

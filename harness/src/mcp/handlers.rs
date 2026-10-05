@@ -7,6 +7,7 @@
 
 use crate::onboarding::DeterministicOnboarder;
 use crate::onboarding::Onboarder;
+use crate::scheduler::QueuedTask;
 use crate::task::{Task, TaskManager, TaskStatus};
 use model::provider::ModelProvider;
 use serde_json::Value;
@@ -23,6 +24,11 @@ pub const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Parse `assign_task` arguments, submit the task, record its TTL, and return
 /// the `CreateTaskResult` task object.
+///
+/// `identity` is required: the task is dispatched under that registered
+/// identity, and dispatch fails closed with `IdentityUnavailable` if the
+/// manager has no identity of that name. There is no unscoped MCP entry
+/// point.
 ///
 /// `ttl_ms` is the client-requested lifetime (from the request's `task`
 /// field), clamped to [`MAX_TTL_MS`] here.
@@ -64,17 +70,17 @@ pub async fn handle_assign_task(
         .map(|v| v as usize)
         .unwrap_or(default_max_iterations);
 
+    let identity = params
+        .get("identity")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "Missing required field: identity".to_string())?
+        .to_string();
+
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
-    let task_id = task_manager
-        .submit(
-            description,
-            repo_path,
-            branch,
-            model,
-            max_iterations,
-            Arc::clone(provider),
-        )
-        .await;
+    let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
+        .with_identity_hint(Some(identity));
+    let task_id = task_manager.submit_task(queued, Arc::clone(provider)).await;
 
     task_manager.set_ttl(&task_id, ttl).await;
 
@@ -310,6 +316,7 @@ mod tests {
             format_patch: None,
             files_modified: vec!["a.rs".to_string()],
             tool_calls_made: vec![],
+            denials: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
         }
@@ -331,7 +338,7 @@ mod tests {
     async fn test_handle_assign_task_missing_description() {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
-        let params = serde_json::json!({"repo_path": "/tmp"});
+        let params = serde_json::json!({"repo_path": "/tmp", "identity": "rust-implementer"});
         let result =
             handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, None).await;
         assert!(result.is_err());
@@ -342,7 +349,8 @@ mod tests {
     async fn test_handle_assign_task_missing_repo_path() {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
-        let params = serde_json::json!({"description": "Do something"});
+        let params =
+            serde_json::json!({"description": "Do something", "identity": "rust-implementer"});
         let result =
             handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, None).await;
         assert!(result.is_err());
@@ -355,7 +363,8 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
         let params = serde_json::json!({
             "description": "Test task",
-            "repo_path": "/tmp"
+            "repo_path": "/tmp",
+            "identity": "rust-implementer"
         });
         let wire = handle_assign_task(&params, &manager, &provider, "qwen3:0.6b", 100, Some(5000))
             .await
@@ -371,7 +380,9 @@ mod tests {
     async fn test_handle_assign_task_clamps_ttl() {
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("done")]);
-        let params = serde_json::json!({"description": "t", "repo_path": "/tmp"});
+        let params = serde_json::json!({
+            "description": "t", "repo_path": "/tmp", "identity": "rust-implementer"
+        });
         let wire = handle_assign_task(
             &params,
             &manager,
@@ -383,6 +394,145 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(wire["ttl"], MAX_TTL_MS);
+    }
+
+    fn plan_responses() -> Vec<ChatResponse> {
+        vec![
+            stop_response("Plan: execute the task"),
+            stop_response("performed"),
+            stop_response("COMPLETE - task done"),
+        ]
+    }
+
+    fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+            vec!["remote", "add", "origin", url],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        dir
+    }
+
+    async fn assign(
+        manager: &Arc<TaskManager>,
+        provider: &Arc<dyn ModelProvider>,
+        params: Value,
+    ) -> Result<TaskId, String> {
+        let wire = handle_assign_task(&params, manager, provider, "mock", 20, None).await?;
+        Ok(TaskId(wire["taskId"].as_str().unwrap().to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_handle_assign_task_requires_an_identity() {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let params = serde_json::json!({"description": "d", "repo_path": "/tmp"});
+        let err = handle_assign_task(&params, &manager, &provider, "m", 1, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("identity"), "{err}");
+        assert!(manager.list().await.is_empty());
+
+        for blank in [serde_json::json!(""), serde_json::json!(7)] {
+            let params = serde_json::json!({
+                "description": "d", "repo_path": "/tmp", "identity": blank
+            });
+            let err = handle_assign_task(&params, &manager, &provider, "m", 1, None)
+                .await
+                .unwrap_err();
+            assert!(err.contains("identity"), "{err}");
+        }
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_with_an_unregistered_identity_fails_closed() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let id = assign(
+            &manager,
+            &provider,
+            serde_json::json!({
+                "description": "d",
+                "repo_path": repo.path().to_str().unwrap(),
+                "identity": "ghost"
+            }),
+        )
+        .await
+        .unwrap();
+        match manager.wait_terminal(&id).await.unwrap() {
+            TaskStatus::Failed {
+                diagnostics, error, ..
+            } => {
+                assert_eq!(diagnostics.error_type, "IdentityUnavailable");
+                assert!(error.contains("ghost"), "{error}");
+            }
+            other => panic!("expected IdentityUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_denies_a_repo_outside_the_identity_scope() {
+        let repo = repo_with_origin("https://github.com/example/other.git");
+        let manager = Arc::new(TaskManager::default());
+        manager.register_identity(crate::identity::example()).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let id = assign(
+            &manager,
+            &provider,
+            serde_json::json!({
+                "description": "d",
+                "repo_path": repo.path().to_str().unwrap(),
+                "identity": "rust-implementer"
+            }),
+        )
+        .await
+        .unwrap();
+        match manager.wait_terminal(&id).await.unwrap() {
+            TaskStatus::Failed {
+                diagnostics, error, ..
+            } => {
+                assert_eq!(diagnostics.error_type, "ScopeError");
+                assert!(error.contains("github.com/example/other"), "{error}");
+            }
+            other => panic!("expected a scope denial, got {other:?}"),
+        }
+        assert!(manager.get_result(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_runs_scoped_when_the_identity_allows_the_repo() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        manager.register_identity(crate::identity::example()).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let id = assign(
+            &manager,
+            &provider,
+            serde_json::json!({
+                "description": "d",
+                "repo_path": repo.path().to_str().unwrap(),
+                "identity": "rust-implementer"
+            }),
+        )
+        .await
+        .unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let task = manager.poll(&id).await.unwrap();
+        assert_eq!(task.identity_hint.as_deref(), Some("rust-implementer"));
     }
 
     #[tokio::test]
