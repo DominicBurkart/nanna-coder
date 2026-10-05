@@ -3223,11 +3223,11 @@ mod tests {
         assert_eq!(names, vec!["sub"]);
 
         let recursive = tool.execute(json!({ "recursive": true })).await.unwrap();
-        let paths: Vec<&str> = recursive["entries"]
+        let paths: Vec<String> = recursive["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|e| e["path"].as_str().unwrap())
+            .map(|e| e["path"].as_str().unwrap().replace('\\', "/"))
             .collect();
         assert_eq!(paths, vec!["api/sub/deep.rs"]);
 
@@ -3245,7 +3245,8 @@ mod tests {
         let tool = SearchTool::scoped(ws.path().to_path_buf(), scope);
         let found = tool.execute(json!({ "pattern": "shared" })).await.unwrap();
         assert_eq!(found["count"], 1);
-        assert_eq!(found["results"][0]["file"], "docs/README.md");
+        let file = found["results"][0]["file"].as_str().unwrap();
+        assert_eq!(file.replace('\\', "/"), "docs/README.md");
         let inside_api = tool
             .execute(json!({ "pattern": "shared", "path": "api" }))
             .await
