@@ -392,6 +392,10 @@ fn cannot_resolve(path: &Path, e: std::io::Error) -> ToolError {
     violation(format!("Cannot resolve path '{}': {}", path.display(), e))
 }
 
+fn canonicalize(path: &Path, resolved: &Path) -> ToolResult<PathBuf> {
+    resolved.canonicalize().map_err(|e| cannot_resolve(path, e))
+}
+
 fn outside_root(path: &Path) -> ToolError {
     violation(format!(
         "Path '{}' is outside workspace root",
@@ -421,9 +425,7 @@ fn canonical_within_workspace(
 ) -> ToolResult<(PathBuf, PathBuf)> {
     let root = canonical_root(workspace_root)?;
     let resolved = join_root(path, workspace_root);
-    let canonical = resolved
-        .canonicalize()
-        .map_err(|e| cannot_resolve(path, e))?;
+    let canonical = canonicalize(path, &resolved)?;
     if !canonical.starts_with(&root) {
         return Err(outside_root(path));
     }
@@ -465,9 +467,7 @@ fn resolve_for_write(path: &Path, workspace_root: &Path) -> ToolResult<(PathBuf,
     }
     let resolved = join_root(path, workspace_root);
     let (ancestor, remainder) = existing_ancestor(&resolved);
-    let canonical_ancestor = ancestor
-        .canonicalize()
-        .map_err(|e| cannot_resolve(path, e))?;
+    let canonical_ancestor = canonicalize(path, &ancestor)?;
     let canonical = canonical_ancestor.join(remainder);
     let relative = canonical
         .strip_prefix(&root)
@@ -757,6 +757,16 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn validate_path_within_workspace_reports_a_missing_path() {
+        let dir = workspace();
+        let err = validate_path_within_workspace(Path::new("missing.rs"), dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::PathSecurityViolation { message } if message.contains("Cannot resolve path 'missing.rs'")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn validate_path_within_workspace_rejects_a_symlink_escape() {
         let ws = workspace();
