@@ -114,17 +114,60 @@ impl SpawnRequest {
         identity: impl Into<String>,
         subtask: impl Into<String>,
     ) -> Self {
+        Self::derive_tightened(catalog, parent_task, identity, subtask, None, None)
+    }
+
+    /// [`derive`](Self::derive), but a caller may also state an effect and a
+    /// loop of its own, which can only tighten the request.
+    ///
+    /// The effective effect is the greater of the caller's effect and the one
+    /// derived from the task text, so neither source can lower the other. The
+    /// loop is the caller's when the caller names one other than the card's
+    /// (so the loop rule blocks it), and the derived loop otherwise (so a
+    /// derived mismatch blocks even when the caller agreed with the card).
+    ///
+    /// ```
+    /// use harness::auditor::{SpawnRequest, TaskSummary};
+    /// use harness::effects::EffectClass;
+    /// use harness::identity::{DevLoop, IdentityCatalog};
+    ///
+    /// let catalog = IdentityCatalog::default();
+    /// let parent = TaskSummary::new("t", "d", "github.com/example/repo");
+    /// let request = SpawnRequest::derive_tightened(
+    ///     &catalog,
+    ///     parent,
+    ///     "ghost",
+    ///     "Deploy build 42 to production.",
+    ///     Some(EffectClass::Workspace),
+    ///     Some(DevLoop::Inner),
+    /// );
+    /// assert_eq!(request.requested_effect, EffectClass::Production);
+    /// assert_eq!(request.dev_loop, DevLoop::Outer);
+    /// ```
+    pub fn derive_tightened(
+        catalog: &IdentityCatalog,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        caller_effect: Option<EffectClass>,
+        caller_loop: Option<DevLoop>,
+    ) -> Self {
         let identity = identity.into();
         let subtask = subtask.into();
-        let requested_effect =
+        let derived_effect =
             RuleAuditor::implied_effect(&subtask).map_or(EffectClass::None, |(effect, _)| effect);
+        let requested_effect = caller_effect.map_or(derived_effect, |c| c.max(derived_effect));
         let card_loop = catalog
             .get(&identity)
             .map_or(DevLoop::Inner, |card| card.identity.dev_loop);
-        let dev_loop = match requested_effect {
+        let derived_loop = match derived_effect {
             EffectClass::Sandbox | EffectClass::Production => DevLoop::Outer,
             EffectClass::Ci => DevLoop::Middle,
             _ => card_loop,
+        };
+        let dev_loop = match caller_loop {
+            Some(declared) if declared != card_loop => declared,
+            _ => derived_loop,
         };
         Self {
             parent_task,
@@ -262,5 +305,70 @@ pub(crate) mod tests {
         let codes: Vec<_> = verdict.reasons().iter().map(|r| r.code).collect();
         assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
         assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+    }
+
+    #[test]
+    fn tightened_takes_the_stricter_effect_of_caller_and_text() {
+        let catalog = crate::auditor::rules::tests::catalog(true);
+        let up = SpawnRequest::derive_tightened(
+            &catalog,
+            parent(),
+            "rust-implementer",
+            "Add a test.",
+            Some(EffectClass::Production),
+            None,
+        );
+        assert_eq!(up.requested_effect, EffectClass::Production);
+        let text_wins = SpawnRequest::derive_tightened(
+            &catalog,
+            parent(),
+            "rust-implementer",
+            "Deploy build 42 to production.",
+            Some(EffectClass::Workspace),
+            Some(DevLoop::Inner),
+        );
+        assert_eq!(text_wins.requested_effect, EffectClass::Production);
+        assert_eq!(text_wins.dev_loop, DevLoop::Outer);
+        let none = SpawnRequest::derive_tightened(
+            &catalog,
+            parent(),
+            "rust-implementer",
+            "Add a test.",
+            None,
+            None,
+        );
+        assert_eq!(none.requested_effect, EffectClass::None);
+        assert_eq!(none.dev_loop, DevLoop::Inner);
+    }
+
+    #[test]
+    fn tightened_never_lowers_the_derived_effect_or_loop() {
+        let catalog = crate::auditor::rules::tests::catalog(true);
+        for effect in EffectClass::ALL {
+            let request = SpawnRequest::derive_tightened(
+                &catalog,
+                parent(),
+                "rust-implementer",
+                "Deploy build 42 to the sandbox environment.",
+                Some(effect),
+                Some(DevLoop::Inner),
+            );
+            assert!(request.requested_effect >= EffectClass::Sandbox);
+            assert_eq!(request.dev_loop, DevLoop::Outer);
+        }
+    }
+
+    #[test]
+    fn tightened_keeps_a_caller_loop_that_differs_from_the_card() {
+        let catalog = crate::auditor::rules::tests::catalog(true);
+        let request = SpawnRequest::derive_tightened(
+            &catalog,
+            parent(),
+            "rust-implementer",
+            "Add a test.",
+            None,
+            Some(DevLoop::Middle),
+        );
+        assert_eq!(request.dev_loop, DevLoop::Middle);
     }
 }

@@ -5,7 +5,8 @@ use super::{
     AuditContext, AuditError, AuditLog, AuditOutcome, AuditRecord, Auditor, CardSuggestion, Reason,
     ReasonCode, SpawnRequest, SpawnVerdict, TaskSummary, VerdictKind,
 };
-use crate::identity::AgentIdentity;
+use crate::effects::EffectClass;
+use crate::identity::{AgentIdentity, DevLoop};
 use async_trait::async_trait;
 use std::fmt;
 
@@ -321,6 +322,26 @@ impl SpawnGate {
         subtask: impl Into<String>,
     ) -> SpawnRequest {
         SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
+    /// [`request`](Self::request) with an effect and loop stated by the
+    /// caller, which can only tighten what the task text derives.
+    pub fn request_with_caller(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        caller_effect: Option<EffectClass>,
+        caller_loop: Option<DevLoop>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive_tightened(
+            self.context.catalog(),
+            parent_task,
+            identity,
+            subtask,
+            caller_effect,
+            caller_loop,
+        )
     }
 
     /// The context every request is reviewed against.
