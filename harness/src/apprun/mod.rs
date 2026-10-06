@@ -14,7 +14,9 @@ pub mod runner;
 pub mod tools;
 
 pub use instance::{AppInstance, Limits, RunningApps, DEFAULT_MAX_WALL_CLOCK_SECS};
-pub use ports::{PortAllocator, PortError, PortLease, DEFAULT_PORT_RANGE, LEASE_DIR_NAME};
+pub use ports::{
+    port_is_free, PortAllocator, PortError, PortLease, DEFAULT_PORT_RANGE, LEASE_DIR_NAME,
+};
 pub use runner::{
     api_build_argv, app_env, app_log_path, exec_args, exec_args_with_env_file,
     executable_from_build_output, health_probe_argv, parse_pid, shell_quote, start_script,

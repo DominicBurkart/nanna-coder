@@ -1290,10 +1290,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(result, Err(WorkspaceError::ContainerSetupFailed(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
         let default_network = TaskWorkspace::create_with_container(
             source.path(),
             &unique_id("ws-default-network"),
@@ -1301,10 +1302,14 @@ mod tests {
             "nonexistent-image-for-nanna-tests:none",
         )
         .await;
-        assert!(matches!(
-            default_network,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(
+                default_network,
+                Err(WorkspaceError::ContainerSetupFailed(_))
+            ),
+            "{:?}",
+            default_network.as_ref().err()
+        );
     }
 
     fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {
@@ -1583,7 +1588,11 @@ mod tests {
         async fn cleanup_stops_a_forgotten_app_and_releases_its_port() {
             let source = fixture_repo();
             let leases = TempDir::new().unwrap();
-            let allocator = Arc::new(PortAllocator::new(43000..=43001, leases.path()));
+            let allocator = Arc::new(PortAllocator::with_probe(
+                43000..=43001,
+                leases.path(),
+                |_| true,
+            ));
             let runner = HealthyRunner::new();
             let mut ws = fullstack_workspace(
                 source.path(),
@@ -1630,7 +1639,11 @@ mod tests {
         async fn two_workspaces_get_distinct_ports() {
             let source = fixture_repo();
             let leases = TempDir::new().unwrap();
-            let allocator = Arc::new(PortAllocator::new(44000..=44009, leases.path()));
+            let allocator = Arc::new(PortAllocator::with_probe(
+                44000..=44009,
+                leases.path(),
+                |_| true,
+            ));
             let mut a = fullstack_workspace(
                 source.path(),
                 HealthyRunner::new(),
@@ -1669,7 +1682,11 @@ mod tests {
             }
             let source = fixture_repo();
             let leases = TempDir::new().unwrap();
-            let allocator = Arc::new(PortAllocator::new(45000..=45000, leases.path()));
+            let allocator = Arc::new(PortAllocator::with_probe(
+                45000..=45000,
+                leases.path(),
+                |_| true,
+            ));
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-apps-brokenstop"), "HEAD")
                     .unwrap();

@@ -451,7 +451,7 @@ pub fn validate_path_within_workspace(path: &Path, workspace_root: &Path) -> Too
 fn existing_ancestor(path: &Path) -> (PathBuf, PathBuf) {
     let mut ancestor = path.to_path_buf();
     let mut remainder = PathBuf::new();
-    while !ancestor.exists() {
+    while ancestor.symlink_metadata().is_err() {
         let name = ancestor.file_name().map(PathBuf::from).unwrap_or_default();
         remainder = name.join(&remainder);
         if !ancestor.pop() {
@@ -1107,6 +1107,120 @@ mod tests {
         assert_eq!(remainder, Path::new(""));
         let (ancestor, _) = existing_ancestor(Path::new("definitely-missing-relative/x"));
         assert_eq!(ancestor, Path::new(""));
+    }
+
+    #[cfg(unix)]
+    fn assert_write_rejected(scope: Option<&PathScope>, path: &str, root: &Path) {
+        let result = resolve_path(
+            scope,
+            "write_file",
+            PathAccess::Write,
+            Path::new(path),
+            root,
+        );
+        assert!(
+            matches!(result, Err(ToolError::PathSecurityViolation { .. })),
+            "{path}: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_leaf_pointing_outside_the_workspace_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("planted");
+        std::os::unix::fs::symlink(&target, root.join("api/dangling")).unwrap();
+        assert_write_rejected(None, "api/dangling", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/dangling", root);
+        assert!(validate_path_for_write(Path::new("api/dangling"), root).is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_a_protected_path_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("docs/new.md"), root.join("api/sneaky")).unwrap();
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/sneaky", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_directory_component_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("nope"), root.join("api/dir")).unwrap();
+        assert_write_rejected(None, "api/dir/file.rs", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/dir/file.rs", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_an_existing_outside_file_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("existing");
+        std::fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("api/link")).unwrap();
+        assert_write_rejected(None, "api/link", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/link", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_chain_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("planted"), root.join("api/b")).unwrap();
+        std::os::unix::fs::symlink(root.join("api/b"), root.join("api/a")).unwrap();
+        assert_write_rejected(None, "api/a", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/a", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("api/y"), root.join("api/x")).unwrap();
+        std::os::unix::fs::symlink(root.join("api/x"), root.join("api/y")).unwrap();
+        assert_write_rejected(None, "api/x", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_valid_in_workspace_symlinks_and_new_paths_still_succeed() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("api/lib.rs"), root.join("api/alias")).unwrap();
+        let scope = scope(&["api/**"], None);
+        for path in ["api/alias", "api/fresh.rs", "api/new/deep/fresh.rs"] {
+            let result = resolve_path(
+                Some(&scope),
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            );
+            assert_eq!(result.unwrap(), root.join(path));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_ancestor_treats_a_dangling_symlink_as_existing() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("gone"), root.join("api/dangling")).unwrap();
+        let (ancestor, remainder) = existing_ancestor(&root.join("api/dangling"));
+        assert_eq!(ancestor, root.join("api/dangling"));
+        assert_eq!(remainder, Path::new(""));
     }
 
     fn segment() -> impl Strategy<Value = String> {

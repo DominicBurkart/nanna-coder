@@ -136,6 +136,16 @@ jobs:
           cargo nextest run --workspace --lib --all-features
         fi
 
+    - name: Run doctests
+      if: matrix.test-type == 'unit'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          nix develop --command cargo test --doc --workspace --all-features
+        else
+          cargo test --doc --workspace --all-features
+        fi
+
     - name: Run integration tests
       if: matrix.test-type == 'integration'
       shell: bash

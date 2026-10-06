@@ -38,6 +38,11 @@ impl Limits {
 
 /// A started application, as reported to the agent.
 ///
+/// The URLs are valid inside the dev container only: the dev container is
+/// created before a port is allocated, so the port cannot be published to
+/// the host, and the application is reached through `run_command` and the
+/// QA tools, which run inside the container.
+///
 /// `api_url` serves the JSON API and `frontend_url` serves the wasm bundle.
 /// For the full-stack Rust profile the API binary serves both, so the three
 /// URLs are the same origin; they stay separate fields so QA tooling can
@@ -155,7 +160,12 @@ mod tests {
 
     fn allocator() -> (Arc<PortAllocator>, TempDir) {
         let dir = TempDir::new().unwrap();
-        (Arc::new(PortAllocator::new(40000..=40009, dir.path())), dir)
+        (
+            Arc::new(PortAllocator::with_probe(40000..=40009, dir.path(), |_| {
+                true
+            })),
+            dir,
+        )
     }
 
     #[test]

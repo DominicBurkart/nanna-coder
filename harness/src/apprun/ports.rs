@@ -51,7 +51,7 @@ pub enum PortError {
 /// use std::sync::Arc;
 ///
 /// let dir = tempfile::tempdir().unwrap();
-/// let allocator = Arc::new(PortAllocator::new(20000..=20001, dir.path()));
+/// let allocator = Arc::new(PortAllocator::with_probe(20000..=20001, dir.path(), |_| true));
 /// let first = allocator.allocate("task-a").unwrap();
 /// let second = allocator.allocate("task-b").unwrap();
 /// assert_ne!(first.port(), second.port());
@@ -63,15 +63,35 @@ pub struct PortAllocator {
     range: RangeInclusive<u16>,
     lease_dir: PathBuf,
     held: Mutex<BTreeSet<u16>>,
+    probe: fn(u16) -> bool,
+}
+
+/// Whether nothing on this host is listening on `port`: a bind on every
+/// interface succeeds.
+pub fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
 impl PortAllocator {
-    /// Allocator over `range` with lease files in `lease_dir`.
+    /// Allocator over `range` with lease files in `lease_dir`. A port is
+    /// only handed out when [`port_is_free`] confirms that no other process
+    /// on the host is bound to it.
     pub fn new(range: RangeInclusive<u16>, lease_dir: impl Into<PathBuf>) -> Self {
+        Self::with_probe(range, lease_dir, port_is_free)
+    }
+
+    /// Like [`PortAllocator::new`], with `probe` deciding whether a port is
+    /// free of foreign listeners.
+    pub fn with_probe(
+        range: RangeInclusive<u16>,
+        lease_dir: impl Into<PathBuf>,
+        probe: fn(u16) -> bool,
+    ) -> Self {
         Self {
             range,
             lease_dir: lease_dir.into(),
             held: Mutex::new(BTreeSet::new()),
+            probe,
         }
     }
 
@@ -114,13 +134,14 @@ impl PortAllocator {
 
     /// Take the lowest free port for `task_id`.
     ///
-    /// A port is free when this process does not hold it and no lease file
-    /// exists for it. The lease file records the task id and this process id.
+    /// A port is free when this process does not hold it, no lease file
+    /// exists for it and no other process on the host is bound to it. The
+    /// lease file records the task id and this process id.
     pub fn allocate(self: &Arc<Self>, task_id: &str) -> Result<PortLease, PortError> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let content = format!("{task_id}\n{}\n", std::process::id());
         for port in self.range.clone() {
-            if !held.contains(&port) {
+            if !held.contains(&port) && (self.probe)(port) {
                 let path = self.lease_path(port);
                 match create_lease(&path, &content) {
                     Ok(()) => {
@@ -205,7 +226,11 @@ mod tests {
 
     fn allocator(range: RangeInclusive<u16>) -> (Arc<PortAllocator>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let allocator = Arc::new(PortAllocator::new(range, dir.path().join("leases")));
+        let allocator = Arc::new(PortAllocator::with_probe(
+            range,
+            dir.path().join("leases"),
+            |_| true,
+        ));
         (allocator, dir)
     }
 
@@ -277,7 +302,11 @@ mod tests {
         std::fs::write(allocator.lease_path(34000), "other\n1\n").unwrap();
         let lease = allocator.allocate("mine").unwrap();
         assert_eq!(lease.port(), 34001);
-        let other = Arc::new(PortAllocator::new(34000..=34001, allocator.lease_dir()));
+        let other = Arc::new(PortAllocator::with_probe(
+            34000..=34001,
+            allocator.lease_dir(),
+            |_| true,
+        ));
         assert!(matches!(
             other.allocate("x"),
             Err(PortError::Exhausted { .. })
@@ -299,7 +328,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
-        let allocator = Arc::new(PortAllocator::new(36000..=36000, file.join("leases")));
+        let allocator = Arc::new(PortAllocator::with_probe(
+            36000..=36000,
+            file.join("leases"),
+            |_| true,
+        ));
         let err = allocator.allocate("a").unwrap_err();
         assert!(matches!(err, PortError::Lease { .. }), "{err}");
     }
@@ -309,7 +342,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("leases");
         std::fs::write(&file, "x").unwrap();
-        let allocator = Arc::new(PortAllocator::new(36100..=36100, &file));
+        let allocator = Arc::new(PortAllocator::with_probe(36100..=36100, &file, |_| true));
         let err = allocator.allocate("a").unwrap_err();
         assert!(matches!(err, PortError::Lease { .. }), "{err}");
     }
@@ -322,13 +355,50 @@ mod tests {
         let leases = dir.path().join("leases");
         std::fs::create_dir_all(&leases).unwrap();
         std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let allocator = Arc::new(PortAllocator::new(37000..=37000, &leases));
+        let allocator = Arc::new(PortAllocator::with_probe(37000..=37000, &leases, |_| true));
         let result = allocator.allocate("a");
         std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o755)).unwrap();
         match result {
             Err(PortError::Lease { path, .. }) => assert_eq!(path, leases.join("37000.lease")),
             other => panic!("expected a lease error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_port_bound_by_another_process_is_skipped() {
+        fn first_port_busy(port: u16) -> bool {
+            port != 38000
+        }
+        let dir = TempDir::new().unwrap();
+        let allocator = Arc::new(PortAllocator::with_probe(
+            38000..=38001,
+            dir.path(),
+            first_port_busy,
+        ));
+        let lease = allocator.allocate("a").unwrap();
+        assert_eq!(lease.port(), 38001);
+        assert!(!allocator.lease_path(38000).exists());
+        assert!(matches!(
+            allocator.allocate("b"),
+            Err(PortError::Exhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn a_real_listener_makes_its_port_unavailable() {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(port));
+        let dir = TempDir::new().unwrap();
+        let allocator = Arc::new(PortAllocator::new(port..=port, dir.path()));
+        assert!(matches!(
+            allocator.allocate("a"),
+            Err(PortError::Exhausted { .. })
+        ));
+        assert!(!allocator.lease_path(port).exists());
+        drop(listener);
+        assert!(port_is_free(port));
+        assert_eq!(allocator.allocate("a").unwrap().port(), port);
     }
 
     #[test]
