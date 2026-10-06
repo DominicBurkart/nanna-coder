@@ -1,5 +1,5 @@
 use super::template::{DeployTemplate, Health, RiskClass, Strategy};
-use super::{is_production_env, DeployError, PRODUCTION_ENV};
+use super::{is_production_env, DeployError};
 use crate::windows::WindowSet;
 use chrono::Duration;
 use std::path::Path;
@@ -119,14 +119,14 @@ impl DeployTemplate {
                 return Err(invalid(
                     file,
                     "rollout.windows",
-                    format!("required when `{PRODUCTION_ENV}` is an environment"),
+                    "required when a production environment (any name other than sandbox, staging, dev, test, qa, preview or local) is listed".to_string(),
                 ));
             }
             if self.health.is_none() {
                 return Err(invalid(
                     file,
                     "health",
-                    format!("section required when `{PRODUCTION_ENV}` is an environment"),
+                    "section required when a production environment (any name other than sandbox, staging, dev, test, qa, preview or local) is listed".to_string(),
                 ));
             }
         }
@@ -497,5 +497,16 @@ mod tests {
         let (field, reason) = field_error(&src);
         assert_eq!(field, "rollout.windows");
         assert!(reason.contains("production"), "{reason}");
+    }
+
+    #[test]
+    fn unlisted_environment_names_are_gated_as_production() {
+        for env in ["prod", "prd", "live", "eu-west-1", "canary"] {
+            let src = template(RiskClass::Unused, Strategy::Instant, "[100]", "0m")
+                .replace("windows = \"business-hours\"\n", "")
+                .replace("\"production\"", &format!("\"{env}\""));
+            let (field, _) = field_error(&src);
+            assert_eq!(field, "rollout.windows", "{env}");
+        }
     }
 }
