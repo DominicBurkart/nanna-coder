@@ -5,6 +5,7 @@ pub mod auditor;
 pub mod backlog;
 pub mod budget;
 pub mod capabilities;
+mod ci_integrity;
 pub mod ci_policy;
 pub mod ci_tools;
 pub mod container;
