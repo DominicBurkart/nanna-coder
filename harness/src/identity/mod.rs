@@ -38,7 +38,9 @@ mod catalog;
 mod dev_loop;
 mod pattern;
 
-pub use catalog::{IdentityCatalog, AGENTS_SUBDIR, CONFIG_DIR_ENV, REPO_AGENTS_DIR};
+pub use catalog::{
+    config_dir_from, IdentityCatalog, AGENTS_SUBDIR, CONFIG_DIR_ENV, REPO_AGENTS_DIR,
+};
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
 mod narrowing;
