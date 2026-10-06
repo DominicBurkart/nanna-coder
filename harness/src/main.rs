@@ -1496,6 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_target_deploys_stay_refused_until_a_real_adapter_is_wired_after_836() {
+        let _env = ROLLOUT_ENV.lock().await;
         let repo = fake_repo();
         let run = run_deploy(DeployCommands::Run {
             repo_path: Some(repo.path().to_path_buf()),
@@ -1507,7 +1508,6 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(run.to_string(), NO_REAL_TARGET);
-        let _env = ROLLOUT_ENV.lock().await;
         let forward = run_deploy(DeployCommands::RollForward {
             id: "rollout-1".into(),
             image: "registry.example.invalid/ns/app:v3".into(),

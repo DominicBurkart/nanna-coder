@@ -2748,6 +2748,73 @@ mod tests {
         assert!(rig.escalation.escalations()[0].summary.contains("usurper"));
     }
 
+    fn unlisted_env_plan() -> DeployPlan {
+        DeployTemplate::parse(
+            &crate::rollout::state::tests::GRADUAL.replace("\"production\"", "\"prod\""),
+        )
+        .unwrap()
+        .plan("prod")
+        .unwrap()
+    }
+
+    fn set_traffic_percents(rig: &Rig) -> Vec<u8> {
+        rig.adapter
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                AdapterCall::SetTraffic(_, percent) => Some(*percent),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_environment_name_is_gated_on_the_enforced_path() {
+        let plan = unlisted_env_plan();
+        assert_eq!(
+            plan.steps[0].preconditions,
+            [
+                Precondition::LeaseHeld(plan.lease.clone()),
+                Precondition::WindowOpen("business-hours".into()),
+                Precondition::HealthOk,
+            ]
+        );
+
+        let window = rig();
+        let record = window.executor.start(plan.clone(), V2).await.unwrap();
+        let parked = window.executor.run(&record.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        assert_eq!(set_traffic_percents(&window), [10]);
+        assert!(held_by(&window).is_empty());
+
+        let health = self::rig();
+        health.health.set_failing(true);
+        let record = health.executor.start(plan.clone(), V2).await.unwrap();
+        let halted = health.executor.run(&record.id).await.unwrap();
+        assert_eq!(halted.state, RolloutState::Halted);
+        assert!(set_traffic_percents(&health).is_empty());
+
+        let lease = self::rig();
+        lease
+            .leases
+            .acquire(
+                &LeaseName::deploy_image("registry.example.invalid/ns", "app", "prod"),
+                "other",
+                Duration::hours(2),
+                t0(),
+            )
+            .unwrap();
+        let record = lease.executor.start(plan, V2).await.unwrap();
+        let parked = lease.executor.run(&record.id).await.unwrap();
+        assert!(matches!(parked.state, RolloutState::Parked { .. }));
+        assert!(set_traffic_percents(&lease).is_empty());
+        assert!(lease
+            .adapter
+            .calls()
+            .iter()
+            .all(|c| *c == AdapterCall::CurrentImage));
+    }
+
     #[tokio::test]
     async fn a_live_split_lease_outlives_the_ttl_that_frees_an_ordinary_lease() {
         let rig = rig();
