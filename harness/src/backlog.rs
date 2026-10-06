@@ -74,16 +74,33 @@ pub enum BacklogError {
         task: Option<String>,
         audited: String,
     },
+    #[error("task description does not match the audited subtask")]
+    SubtaskMismatch,
+    #[error("task repository {task:?} does not match the audited repository `{audited}`")]
+    RepoMismatch {
+        task: Option<String>,
+        audited: String,
+    },
 }
 
 fn ensure_audited(task: &QueuedTask, proof: &Allowed) -> Result<(), BacklogError> {
-    if task.identity_hint.as_deref() == Some(proof.identity().name()) {
-        return Ok(());
+    if task.identity_hint.as_deref() != Some(proof.identity().name()) {
+        return Err(BacklogError::ProofMismatch {
+            task: task.identity_hint.clone(),
+            audited: proof.identity().name().to_string(),
+        });
     }
-    Err(BacklogError::ProofMismatch {
-        task: task.identity_hint.clone(),
-        audited: proof.identity().name().to_string(),
-    })
+    if task.description != proof.request().subtask {
+        return Err(BacklogError::SubtaskMismatch);
+    }
+    let task_repo = task.origin.as_ref().map(|origin| origin.repo.as_str());
+    if task_repo != Some(proof.repo()) {
+        return Err(BacklogError::RepoMismatch {
+            task: task_repo.map(str::to_string),
+            audited: proof.repo().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Read access to the GitHub data ingestion needs.
@@ -684,19 +701,34 @@ mod tests {
         assert!(describe_issue("o/n", &bare).ends_with("\n\n"));
     }
 
-    async fn proof() -> Allowed {
+    const PROOF_REPO: &str = "github.com/example/repo";
+    const PROOF_SUBTASK: &str = "Add a test.";
+
+    async fn proof_for(repo: &str, subtask: &str) -> Allowed {
         let gate = fixture_gate();
         let request = gate.request(
-            TaskSummary::new("t", "d", "github.com/example/repo"),
+            TaskSummary::new("t", "d", repo),
             "rust-implementer",
-            "Add a test.",
+            subtask,
         );
         gate.check(request).await.unwrap()
     }
 
-    fn audited_task(description: &str, path: &str) -> QueuedTask {
+    async fn proof() -> Allowed {
+        proof_for(PROOF_REPO, PROOF_SUBTASK).await
+    }
+
+    fn task_for(description: &str, repo: &str, path: &str) -> QueuedTask {
         QueuedTask::new(description, PathBuf::from(path), "main", "m", 1)
             .with_identity_hint(Some("rust-implementer".to_string()))
+            .with_origin(Some(TaskOrigin {
+                repo: repo.to_string(),
+                issue: 0,
+            }))
+    }
+
+    fn audited_task(path: &str) -> QueuedTask {
+        task_for(PROOF_SUBTASK, PROOF_REPO, path)
     }
 
     fn issue_with(number: u64, body: &str) -> GithubIssue {
@@ -877,6 +909,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sinks_refuse_a_proof_for_a_different_task_of_the_same_identity() {
+        let store = InMemoryQueueStore::default();
+        let sink = StoreSink::open(Box::new(store)).unwrap();
+        let task_b = task_for("Delete every branch.", PROOF_REPO, "/r");
+        let err = sink.enqueue(task_b, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::SubtaskMismatch));
+        assert!(sink.known().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sinks_refuse_a_proof_for_a_different_repository() {
+        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let elsewhere = task_for(PROOF_SUBTASK, "github.com/example/other", "/r");
+        let err = sink.enqueue(elsewhere, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::RepoMismatch { .. }));
+        let unattributed = QueuedTask::new(PROOF_SUBTASK, PathBuf::from("/r"), "main", "m", 1)
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let err = sink
+            .enqueue(unattributed, &proof().await)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::RepoMismatch { .. }));
+        assert!(sink.known().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sinks_accept_a_task_matching_the_proof() {
+        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        sink.enqueue(audited_task("/r"), &proof().await)
+            .await
+            .unwrap();
+        assert_eq!(sink.known().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn sync_enqueues_and_dedupes_by_issue_number() {
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(1), issue(2)])]),
@@ -962,7 +1029,7 @@ mod tests {
             pulls: HashMap::new(),
         };
         let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
-        sink.enqueue(audited_task("manual", "/a"), &proof().await)
+        sink.enqueue(audited_task("/a"), &proof().await)
             .await
             .unwrap();
         let cfg = config(vec![source("o/a", "/a"), source("o/b", "/b")], Some(2));
@@ -1067,7 +1134,7 @@ mod tests {
             queue: Mutex::new(TaskQueue::new()),
         };
         let err = sink
-            .enqueue(audited_task("t", "/r"), &proof().await)
+            .enqueue(audited_task("/r"), &proof().await)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("queue store failed"));
