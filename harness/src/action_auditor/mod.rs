@@ -27,6 +27,7 @@
 //! `ActionVerdict` out, every call logged), so it gets its own trait rather
 //! than being bent to fit `AuditHook`.
 
+mod commands;
 mod context;
 mod gate;
 mod llm;
@@ -38,7 +39,7 @@ mod verdict;
 pub use context::ActionContext;
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
-pub use log::{ActionAuditLog, ActionAuditLogEntry};
+pub use log::{action_audit_path_from, ActionAuditLog, ActionAuditLogEntry, ACTION_AUDIT_PATH_ENV};
 pub use review::ActionReview;
 pub use rules::RuleActionAuditor;
 pub use verdict::ActionVerdict;

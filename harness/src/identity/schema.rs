@@ -429,6 +429,42 @@ impl AgentIdentity {
             .any(|pattern| pattern.matches(tool_name))
     }
 
+    /// Whether `[scope]` restricts paths: `scope.paths` does not include
+    /// `**`, or `scope.read_paths` is set at all. Tools that run arbitrary
+    /// shell commands cannot be confined to globs, so the registry refuses
+    /// them for such an identity (see [`crate::tools::PATH_UNSCOPABLE_TOOLS`]).
+    ///
+    /// ```
+    /// use harness::identity::AgentIdentity;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "narrow"
+    /// description = "Writes under src only."
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "Write." }
+    ///
+    /// [scope]
+    /// repos = ["github.com/example/repo"]
+    /// paths = ["src/**"]
+    /// max_effect = "workspace"
+    /// tools = ["run_command"]
+    ///
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let narrow = AgentIdentity::from_toml_str(toml, "narrow.toml").unwrap();
+    /// assert!(narrow.restricts_paths());
+    /// let open = AgentIdentity::from_toml_str(&toml.replace("src/**", "**"), "open.toml").unwrap();
+    /// assert!(!open.restricts_paths());
+    /// ```
+    pub fn restricts_paths(&self) -> bool {
+        self.scope.read_paths.is_some() || !self.scope.paths.iter().any(|glob| glob == "**")
+    }
+
     /// Whether `class` is at or below `scope.max_effect`.
     pub fn allows_effect(&self, class: EffectClass) -> bool {
         class <= self.scope.max_effect
