@@ -90,14 +90,20 @@ is their contract and is reviewed before code.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
 tools that cannot honour path scope (`run_command` for path-restricted
-identities). `ScopedCapabilities` can only be built from a registry that was
-scoped with it (an unscoped registry is refused), and
-`ResolvedAgent::resolve` grants exactly that set and refuses capabilities
-scoped to a different identity. There is no second filter, so the grant cannot
-drift from what the broker's registry enforces. Residual: the registry's scope
-is identified by identity name, so the production caller must build the
-registry and the `ResolvedAgent` from the same loaded identity (to be wired when
-`TaskRunner` is switched).
+identities). `ScopedCapabilities::scope(base_registry, &identity)` calls it and
+binds the result to the identity's name **and whole scope**; there is no public
+constructor from an arbitrary registry. `ResolvedAgent::resolve` grants exactly
+that set and refuses it unless name and scope both equal the identity being
+resolved.
+
+A name match alone is not sufficient: repo-local identities deliberately share
+their global identity's name while narrowing it, so a grant built from the
+global identity would otherwise pass for the narrower local one and widen it.
+As a second, fail-closed layer, `resolve` also asserts that every granted
+capability satisfies the identity's tool patterns and effect ceiling
+(`GrantWiderThanIdentity`); it is an assertion, not a second filter. Regression
+tests cover the same-name exploit, different `paths`/`read_paths`, and a
+deliberately widened grant.
 
 ## Runtime handshake
 
