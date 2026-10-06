@@ -90,9 +90,14 @@ is their contract and is reviewed before code.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
 tools that cannot honour path scope (`run_command` for path-restricted
-identities). `ResolvedAgent::resolve` takes the capabilities of that scoped registry
-(`CapabilitySpec::from_registry`) and can only narrow them, so the grant has
-one source and cannot drift from what the broker enforces. Caveat: the result is only as narrow as the set the caller passes. A caller passing an unscoped registry gets unscoped capabilities and `resolve` cannot tell, so the production caller must pass `registry.scoped_for(identity)` (to be enforced when `TaskRunner` is switched).
+identities). `ScopedCapabilities` can only be built from a registry that was
+scoped with it (an unscoped registry is refused), and
+`ResolvedAgent::resolve` grants exactly that set and refuses capabilities
+scoped to a different identity. There is no second filter, so the grant cannot
+drift from what the broker's registry enforces. Residual: the registry's scope
+is identified by identity name, so the production caller must build the
+registry and the `ResolvedAgent` from the same loaded identity (to be wired when
+`TaskRunner` is switched).
 
 ## Runtime handshake
 
@@ -118,9 +123,11 @@ handshake comparison.
 Not implemented yet, all executor work: non-root user, read-only root
 filesystem, dropped Linux capabilities, `no-new-privileges`, and network
 enforcement (the plan states the allowed endpoint; nothing enforces it until
-the executor runs the container on an internal network). Network policy should
-reuse `container::NetworkPolicy` from #669 once it lands; this module's type is
-`PlanNetwork` to avoid colliding with it meanwhile.
+the executor runs the container on an internal network). `container::NetworkPolicy::for_ceiling` (landed with #669) governs the dev
+container where broker-run tools execute and is unchanged. The agent container
+is separate: its plan is always exactly the model gateway at every ceiling
+(tested), so there is one rule per container and nothing ceiling-derived to
+drift. This module's type is `PlanNetwork` to avoid colliding with it.
 
 ## Status of this change
 
