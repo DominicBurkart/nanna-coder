@@ -39,7 +39,8 @@ mod dev_loop;
 mod pattern;
 
 pub use catalog::{
-    IdentityCatalog, AGENTS_SUBDIR, AUDITOR_IDENTITY, CONFIG_DIR_ENV, REPO_AGENTS_DIR,
+    config_dir_from, IdentityCatalog, AGENTS_SUBDIR, AUDITOR_IDENTITY, CONFIG_DIR_ENV,
+    REPO_AGENTS_DIR,
 };
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
