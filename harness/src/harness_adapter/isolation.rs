@@ -362,13 +362,9 @@ max_concurrent = 1
         ] {
             let mut plan = good_plan();
             plan.env.push((name.into(), "x".into()));
-            assert!(
-                matches!(
-                    IsolationPolicy::check(&plan, &agent()),
-                    Err(IsolationViolation::EnvNotAllowed { .. })
-                ),
-                "{name}"
-            );
+            let result = IsolationPolicy::check(&plan, &agent());
+            let hit = matches!(result, Err(IsolationViolation::EnvNotAllowed { .. }));
+            assert!(hit, "{name}");
         }
     }
 
@@ -431,13 +427,9 @@ max_concurrent = 1
         for path in ["relative/x", "/nanna/../etc/passwd"] {
             let mut plan = good_plan();
             plan.files[0].path = path.into();
-            assert!(
-                matches!(
-                    IsolationPolicy::check(&plan, &agent()),
-                    Err(IsolationViolation::FilePath { .. })
-                ),
-                "{path}"
-            );
+            let result = IsolationPolicy::check(&plan, &agent());
+            let hit = matches!(result, Err(IsolationViolation::FilePath { .. }));
+            assert!(hit, "{path}");
         }
     }
 

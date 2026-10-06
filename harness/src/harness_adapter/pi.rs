@@ -364,13 +364,9 @@ max_concurrent = 1
                 "/s".into(),
             )
             .unwrap();
-            assert!(
-                matches!(
-                    PiAdapter.plan(&agent),
-                    Err(Unsupported::CapabilityName { .. })
-                ),
-                "{name}"
-            );
+            let result = PiAdapter.plan(&agent);
+            let hit = matches!(result, Err(Unsupported::CapabilityName { .. }));
+            assert!(hit, "{name}");
         }
     }
 
