@@ -163,11 +163,27 @@ pub const DEPLOY_FILE_NAME: &str = "deploy.toml";
 /// The environment name that requires availability windows and health gates.
 pub const PRODUCTION_ENV: &str = "production";
 
-/// True when `env` names the production environment, ignoring ASCII case.
+/// Environment names that are explicitly not production. Any name outside
+/// this list is treated as production so a misspelt or aliased production
+/// environment fails closed.
+pub const NON_PRODUCTION_ENVS: &[&str] = &[
+    "sandbox",
+    "staging",
+    "stage",
+    "dev",
+    "development",
+    "test",
+    "testing",
+    "qa",
+    "preview",
+    "local",
+];
+
+/// True unless `env` is on the [`NON_PRODUCTION_ENVS`] allowlist, ignoring
+/// ASCII case.
 ///
-/// A deploy template author who writes `environments = ["Production"]` means
-/// the same thing as `"production"`; comparing case-sensitively would let a
-/// capitalisation mismatch silently skip the window and health gates that
+/// A name such as `prod` or `live` that is not on the allowlist therefore
+/// still gets the availability window and health gates that
 /// [`PRODUCTION_ENV`] exists to enforce.
 ///
 /// ```
@@ -176,11 +192,46 @@ pub const PRODUCTION_ENV: &str = "production";
 /// assert!(is_production_env("production"));
 /// assert!(is_production_env("Production"));
 /// assert!(is_production_env("PRODUCTION"));
+/// assert!(is_production_env("prod"));
+/// assert!(is_production_env("eu-west-1"));
 /// assert!(!is_production_env("staging"));
-/// assert!(!is_production_env("prod"));
+/// assert!(!is_production_env("Sandbox"));
 /// ```
 pub fn is_production_env(env: &str) -> bool {
-    env.eq_ignore_ascii_case(PRODUCTION_ENV)
+    !NON_PRODUCTION_ENVS
+        .iter()
+        .any(|known| env.eq_ignore_ascii_case(known))
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn allowlisted_names_are_not_production() {
+        for env in NON_PRODUCTION_ENVS {
+            assert!(!is_production_env(env), "{env}");
+            assert!(!is_production_env(&env.to_ascii_uppercase()), "{env}");
+        }
+    }
+
+    #[test]
+    fn production_aliases_and_blank_are_production() {
+        for env in ["production", "prod", "prd", "live", "", " staging"] {
+            assert!(is_production_env(env), "{env:?}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn only_allowlisted_names_escape_production(env in "[a-zA-Z0-9 _-]{0,12}") {
+            let listed = NON_PRODUCTION_ENVS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(&env));
+            prop_assert_eq!(is_production_env(&env), !listed);
+        }
+    }
 }
 
 /// Errors produced while loading, validating or planning a deployment template.

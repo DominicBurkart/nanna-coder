@@ -1400,4 +1400,20 @@ minimum total: 1d 1h 30m
             }
         }
     }
+
+    #[test]
+    fn unlisted_environment_names_get_production_preconditions() {
+        for env in ["prod", "live", "canary"] {
+            let src = FIXTURE.replace("\"production\"", &format!("\"{env}\""));
+            let plan = DeployTemplate::parse(&src).unwrap().plan(env).unwrap();
+            for step in &plan.steps {
+                assert!(
+                    step.preconditions
+                        .iter()
+                        .any(|p| matches!(p, Precondition::WindowOpen(_))),
+                    "{env}"
+                );
+            }
+        }
+    }
 }
