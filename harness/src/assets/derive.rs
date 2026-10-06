@@ -128,14 +128,18 @@ pub fn propose_in_repo(repo: &Path) -> Result<PathBuf, AssetError> {
     if path.exists() {
         return Err(AssetError::AlreadyExists { path });
     }
+    write_proposal(&path, &propose(repo))?;
+    Ok(path)
+}
+
+fn write_proposal(path: &Path, body: &str) -> Result<(), AssetError> {
     let io = |path: &Path, source| AssetError::Io {
         path: path.to_path_buf(),
         source,
     };
     let dir = path.parent().expect("proposal path has a parent directory");
     std::fs::create_dir_all(dir).map_err(|source| io(dir, source))?;
-    std::fs::write(&path, propose(repo)).map_err(|source| io(&path, source))?;
-    Ok(path)
+    std::fs::write(path, body).map_err(|source| io(path, source))
 }
 
 pub(super) fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -144,10 +148,8 @@ pub(super) fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
+        let kind = entry.file_type();
+        if kind.as_ref().is_ok_and(|kind| kind.is_dir()) {
             let skipped = entry
                 .file_name()
                 .to_str()
@@ -155,7 +157,7 @@ pub(super) fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             if !skipped {
                 collect_files(root, &path, out);
             }
-        } else if kind.is_file() {
+        } else if kind.is_ok_and(|kind| kind.is_file()) {
             if let Ok(rel) = path.strip_prefix(root) {
                 out.push(rel.to_path_buf());
             }
@@ -292,5 +294,60 @@ mod tests {
             std::fs::read_to_string(other.path().join(".nanna/effects.proposed.toml")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn unreadable_and_non_utf8_files_are_skipped() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("bin.rs"), [0xff, 0xfe, 0x00]).unwrap();
+        write(repo.path(), "ok.rs", "#[get(\"/ok\")]");
+        let graph = AssetGraph::parse(&propose(repo.path())).unwrap();
+        let names: Vec<_> = graph.assets().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["http.GET /ok"]);
+    }
+
+    #[test]
+    fn collecting_from_a_missing_directory_yields_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        collect_files(repo.path(), &repo.path().join("absent"), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collected_paths_are_relative_to_the_root() {
+        let repo = tempfile::tempdir().unwrap();
+        write(repo.path(), "a/b.txt", "");
+        write(repo.path(), ".git/x", "");
+        let mut out = Vec::new();
+        collect_files(repo.path(), repo.path(), &mut out);
+        assert_eq!(out, [PathBuf::from("a/b.txt")]);
+    }
+
+    #[test]
+    fn proposal_dir_creation_failure_is_an_io_error() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".nanna"), "not a dir").unwrap();
+        assert!(matches!(
+            propose_in_repo(repo.path()),
+            Err(AssetError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn proposal_write_failure_is_an_io_error() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            write_proposal(repo.path(), "body"),
+            Err(AssetError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn proposal_is_written_when_the_target_is_free() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("nested").join("p.toml");
+        write_proposal(&path, "body").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
     }
 }
