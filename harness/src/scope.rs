@@ -1401,6 +1401,32 @@ mod tests {
         assert_eq!(violation.path, ".nanna/x.toml");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_a_protected_root_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join(".nanna/agents/x.toml"), root.join("leaf")).unwrap();
+        std::os::unix::fs::symlink(root.join(".nanna/missing"), root.join("dir")).unwrap();
+        let all = scope(&["**"], None);
+        for (scope, path) in [
+            (None, "leaf"),
+            (None, "dir/x.toml"),
+            (Some(&all), "leaf"),
+            (Some(&all), "dir/x.toml"),
+        ] {
+            let result = guarded(scope, PathAccess::Write, path, root);
+            assert!(
+                matches!(
+                    result,
+                    Err(ToolError::ProtectedPath(_)) | Err(ToolError::PathSecurityViolation { .. })
+                ),
+                "{path}: {result:?}"
+            );
+        }
+        assert!(!root.join(".nanna").exists());
+    }
+
     #[test]
     fn an_escape_is_still_a_security_violation_when_guarded() {
         let ws = workspace();
