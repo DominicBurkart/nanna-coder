@@ -140,6 +140,10 @@ impl CiPolicy {
                             "environment input {input:?} allows {bad:?}, which is not one of {NON_PRODUCTION_ENVS:?}"
                         )));
                     }
+                } else if input_spec.kind == InputKind::String && input_spec.allowed.is_empty() {
+                    return Err(reach(format!(
+                        "string input {input:?} must list its allowed values"
+                    )));
                 } else if let Some(bad) = input_spec
                     .allowed
                     .iter()
@@ -429,6 +433,24 @@ type = "number"
                 "{value:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn any_free_form_string_input_is_rejected_whatever_it_is_called() {
+        for name in ["deploy_to", "region", "app_env", "cluster", "suite", "ref"] {
+            let src = format!("[workflows.\"ci.yml\".inputs.{name}]\ntype = \"string\"\n");
+            assert!(
+                matches!(
+                    parsed(&src).ensure_non_production(),
+                    Err(CiPolicyError::ProductionReachable { .. })
+                ),
+                "{name}"
+            );
+        }
+        let bounded = parsed(
+            "[workflows.\"ci.yml\".inputs.suite]\ntype = \"string\"\nallowed = [\"smoke\", \"full\"]\n\n[workflows.\"ci.yml\".inputs.verbose]\ntype = \"boolean\"\n\n[workflows.\"ci.yml\".inputs.shards]\ntype = \"number\"\n",
+        );
+        assert_eq!(bounded.ensure_non_production(), Ok(()));
     }
 
     #[test]

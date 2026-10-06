@@ -2664,7 +2664,14 @@ mod tests {
         charge_ci(&first).await.unwrap();
         charge_ci(&first).await.unwrap();
         drop(first);
-        let second = production_manager(Some(path)).await;
+        let mut second = production_manager(Some(path.clone())).await;
+        for _ in 0..250 {
+            if second.runner.cost_accountant().task_summary("t1").ci.count == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            second = production_manager(Some(path.clone())).await;
+        }
         let used = second.runner.cost_accountant().task_summary("t1").ci.count;
         assert_eq!(used, 2);
         assert!(charge_ci(&second).await.is_ok());

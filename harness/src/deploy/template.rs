@@ -1168,6 +1168,18 @@ compare = ["status", "latency"]
     }
 
     #[test]
+    fn a_free_form_string_input_is_rejected_at_load() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.deploy_to]\ntype = \"string\"\n"
+        );
+        let err = DeployTemplate::parse(&src).unwrap_err();
+        assert!(
+            matches!(err, DeployError::InvalidField { field: "ci", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_ci_section_limited_to_non_production_environments_loads() {
         let src = format!(
             "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\", \"Staging\"]\n"

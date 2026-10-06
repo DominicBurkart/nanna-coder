@@ -712,6 +712,10 @@ mod tests {
         );
         git(
             dir.path(),
+            &["update-ref", "refs/remotes/origin/feat/x", "HEAD"],
+        );
+        git(
+            dir.path(),
             &[
                 "symbolic-ref",
                 "refs/remotes/origin/HEAD",
@@ -773,6 +777,7 @@ mod tests {
         .unwrap();
         commit_all(dir, "deploy template");
         git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(dir, &["update-ref", "refs/remotes/origin/feat/x", "HEAD"]);
     }
 
     fn unlimited_accountant() -> Arc<CostAccountant> {
@@ -1346,6 +1351,27 @@ mod tests {
         );
         let err = tool.execute(json!({"workflow": "ci.yml"})).await;
         assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_branch_has_never_been_pushed() {
+        let dir = fixture();
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/feat/x"],
+        );
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let message = modified_surface_refusal(
+            tool.execute(json!({"workflow": "ci.yml"}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains("push the branch"), "{message}");
         assert!(mock.calls().is_empty(), "{:?}", mock.calls());
     }
 

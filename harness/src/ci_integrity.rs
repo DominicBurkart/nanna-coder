@@ -92,9 +92,14 @@ pub(crate) fn verify_ci_surface(
     }
     let mut revs = vec!["HEAD".to_string()];
     let pushed = format!("refs/remotes/origin/{branch}");
-    if ref_exists(repo, &pushed) {
-        revs.push(pushed);
+    if !ref_exists(repo, &pushed) {
+        return Err(IntegrityError::Unverifiable {
+            what: format!("the pushed tip of {branch}"),
+            base,
+            detail: "no remote-tracking ref; push the branch first".to_string(),
+        });
     }
+    revs.push(pushed);
     revs.extend(extra_revs.iter().cloned());
     for rev in &revs {
         if git_stdout(
