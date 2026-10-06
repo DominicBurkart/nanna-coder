@@ -28,6 +28,7 @@ impl FakePodman {
             .unwrap_or_default();
         let script = format!(
             "#!/bin/sh\n\
+             [ -n \"$NANNA_FAKE_PODMAN_PROBE\" ] && exit 0\n\
              echo \"$@\" >> '{log}'\n\
              prev=\n\
              for a in \"$@\"; do\n\
@@ -44,6 +45,7 @@ impl FakePodman {
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
+        wait_until_executable(&bin);
 
         let old_path = std::env::var_os("PATH");
         let mut paths = vec![dir.path().to_path_buf()];
@@ -65,6 +67,23 @@ impl FakePodman {
     pub(crate) fn env_file_contents(&self) -> Vec<String> {
         read_lines(&self.dir.path().join("env.log"))
     }
+}
+
+fn wait_until_executable(bin: &Path) {
+    const ETXTBSY: i32 = 26;
+    for _ in 0..2000 {
+        match std::process::Command::new(bin)
+            .env("NANNA_FAKE_PODMAN_PROBE", "1")
+            .status()
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Ok(_) => return,
+            Err(e) => panic!("fake podman is not executable: {e}"),
+        }
+    }
+    panic!("fake podman stayed busy");
 }
 
 fn read_lines(path: &Path) -> Vec<String> {
@@ -132,9 +151,10 @@ mod tests {
     fn dropping_restores_the_original_path() {
         let guard = PATH_LOCK.blocking_lock();
         let original = std::env::var_os("PATH");
-        let fake = FakePodman::with_guard(guard, None);
+        let mut fake = FakePodman::with_guard(guard, None);
         assert_ne!(std::env::var_os("PATH"), original);
-        drop(fake);
+        fake.restore_path();
         assert_eq!(std::env::var_os("PATH"), original);
+        drop(fake);
     }
 }
