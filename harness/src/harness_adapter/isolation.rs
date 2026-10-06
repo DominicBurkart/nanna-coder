@@ -222,9 +222,10 @@ max_concurrent = 1
             serde_json::json!({}),
             EffectClass::None,
         )];
+        let scoped = crate::harness_adapter::testing::scoped(&identity, &available);
         ResolvedAgent::resolve(
             &identity,
-            &available,
+            &scoped,
             "t",
             Endpoint::new("gw", 11434).unwrap(),
             "img",

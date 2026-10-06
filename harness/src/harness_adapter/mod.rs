@@ -14,10 +14,10 @@
 //! ceiling and incident holds.
 //!
 //! ```
-//! use harness::effects::EffectClass;
 //! use harness::harness_adapter::{
-//!     launch_plan, CapabilitySpec, Endpoint, HarnessKind, PiAdapter, ResolvedAgent,
+//!     launch_plan, Endpoint, HarnessKind, PiAdapter, ResolvedAgent, ScopedCapabilities,
 //! };
+//! use harness::tools::create_tool_registry;
 //! use harness::identity::AgentIdentity;
 //!
 //! let identity = AgentIdentity::from_toml_str(
@@ -44,28 +44,28 @@
 //! )
 //! .unwrap();
 //!
-//! let available = vec![
-//!     CapabilitySpec::new("read_file", "Read a file.", serde_json::json!({"type": "object"}), EffectClass::None),
-//!     CapabilitySpec::new("run_command", "Run a command.", serde_json::json!({"type": "object"}), EffectClass::Workspace),
-//! ];
+//! let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+//! let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
 //! let agent = ResolvedAgent::resolve(
 //!     &identity,
-//!     &available,
+//!     &scoped,
 //!     "Summarise src/lib.rs",
 //!     Endpoint::new("model-gateway", 11434).unwrap(),
 //!     "nanna-agent:pi",
 //!     "/run/nanna/broker.sock".into(),
 //! )
 //! .unwrap();
-//! assert_eq!(agent.capability_names(), vec!["read_file"]);
+//! assert_eq!(agent.capability_names(), vec!["read_file", "search"]);
 //!
 //! let plan = launch_plan(&PiAdapter::default(), &agent).unwrap();
-//! assert_eq!(plan.exposed_capabilities, vec!["read_file"]);
+//! assert_eq!(plan.exposed_capabilities, vec!["read_file", "search"]);
 //! assert_eq!(HarnessKind::Pi.as_str(), "pi");
 //! ```
 
 mod isolation;
 mod pi;
+#[cfg(test)]
+mod testing;
 
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
@@ -180,26 +180,40 @@ impl CapabilitySpec {
     }
 }
 
-impl CapabilitySpec {
-    /// Describe every tool in `registry`, sorted by name. Pass the registry
-    /// already scoped to the identity so the grant has a single source.
-    ///
-    /// ```
-    /// use harness::harness_adapter::CapabilitySpec;
-    /// use harness::tools::create_tool_registry;
-    ///
-    /// let registry = create_tool_registry(std::path::Path::new("."));
-    /// let specs = CapabilitySpec::from_registry(&registry);
-    /// assert!(specs.iter().any(|s| s.name == "read_file"));
-    /// assert!(specs.windows(2).all(|w| w[0].name < w[1].name));
-    /// ```
-    pub fn from_registry(registry: &ToolRegistry) -> Vec<Self> {
-        let mut specs: Vec<Self> = registry
+/// The capabilities of a registry that has been scoped to one identity with
+/// [`ToolRegistry::scoped_for`]. It can only be built from such a registry, so
+/// the grant has a single source and an unscoped registry cannot be passed.
+///
+/// ```
+/// use harness::harness_adapter::{ResolveError, ScopedCapabilities};
+/// use harness::tools::create_tool_registry;
+///
+/// let unscoped = create_tool_registry(std::path::Path::new("."));
+/// assert!(matches!(
+///     ScopedCapabilities::from_registry(&unscoped),
+///     Err(ResolveError::UnscopedRegistry)
+/// ));
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedCapabilities {
+    identity: String,
+    specs: Vec<CapabilitySpec>,
+}
+
+impl ScopedCapabilities {
+    /// Describe every tool in `registry`, sorted by name. Fails when the
+    /// registry was not scoped to an identity.
+    pub fn from_registry(registry: &ToolRegistry) -> Result<Self, ResolveError> {
+        let identity = registry
+            .identity()
+            .ok_or(ResolveError::UnscopedRegistry)?
+            .to_string();
+        let mut specs: Vec<CapabilitySpec> = registry
             .get_definitions()
             .into_iter()
             .filter_map(|def| {
                 let effect = registry.effect_class_of(&def.function.name)?;
-                Some(Self {
+                Some(CapabilitySpec {
                     parameters: serde_json::to_value(&def.function.parameters)
                         .unwrap_or(serde_json::Value::Null),
                     name: def.function.name,
@@ -209,13 +223,34 @@ impl CapabilitySpec {
             })
             .collect();
         specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
+        Ok(Self { identity, specs })
+    }
+
+    /// Name of the identity the registry was scoped to.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The scoped capabilities, sorted by name.
+    pub fn specs(&self) -> &[CapabilitySpec] {
+        &self.specs
     }
 }
 
 /// Failures resolving an identity into a [`ResolvedAgent`].
 #[derive(Debug, Error)]
 pub enum ResolveError {
+    /// The registry was not scoped to an identity with `scoped_for`.
+    #[error("registry is not scoped to an identity")]
+    UnscopedRegistry,
+    /// The registry was scoped to a different identity than the one resolved.
+    #[error("registry is scoped to `{registry}`, not `{identity}`")]
+    ScopeMismatch {
+        /// Identity the registry was scoped to.
+        registry: String,
+        /// Identity being resolved.
+        identity: String,
+    },
     /// The identity's system prompt could not be read.
     #[error("system prompt: {0}")]
     Prompt(#[from] IdentityError),
@@ -269,16 +304,16 @@ pub struct ResolvedAgent {
 }
 
 impl ResolvedAgent {
-    /// Resolve `identity` against `available`, the capabilities of the
-    /// registry scoped to the identity. Resolution can only narrow that set:
-    /// it drops any capability the identity's tool patterns or effect ceiling
-    /// do not allow, so a stale or over-broad `available` never widens a
-    /// grant. Result is sorted by name.
+    /// Resolve `identity` against the capabilities of the registry scoped to
+    /// it. The grant is exactly that set: there is no second filter, so what
+    /// the agent is shown is what the broker's registry enforces. Fails when
+    /// the capabilities were scoped to a different identity.
     ///
     /// ```
     /// use harness::effects::EffectClass;
-    /// use harness::harness_adapter::{CapabilitySpec, Endpoint, ResolvedAgent};
+    /// use harness::harness_adapter::{Endpoint, ResolvedAgent, ScopedCapabilities};
     /// use harness::identity::AgentIdentity;
+    /// use harness::tools::create_tool_registry;
     ///
     /// let toml = r#"
     /// [identity]
@@ -298,30 +333,28 @@ impl ResolvedAgent {
     /// max_concurrent = 1
     /// "#;
     /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-    /// let available = vec![
-    ///     CapabilitySpec::new("deploy", "d", serde_json::json!({}), EffectClass::Production),
-    ///     CapabilitySpec::new("read_file", "r", serde_json::json!({}), EffectClass::None),
-    /// ];
+    /// let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+    /// let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
     /// let agent = ResolvedAgent::resolve(
-    ///     &identity, &available, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
+    ///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
     /// ).unwrap();
-    /// assert_eq!(agent.capability_names(), vec!["read_file"]);
+    /// assert!(agent.capability_names().iter().all(|n| *n != "run_command"));
+    /// assert!(agent.capabilities().iter().all(|c| c.effect <= EffectClass::Workspace));
     /// ```
     pub fn resolve(
         identity: &AgentIdentity,
-        available: &[CapabilitySpec],
+        scoped: &ScopedCapabilities,
         task_prompt: impl Into<String>,
         endpoint: Endpoint,
         image: impl Into<String>,
         broker_socket: PathBuf,
     ) -> Result<Self, ResolveError> {
-        let mut capabilities: Vec<CapabilitySpec> = available
-            .iter()
-            .filter(|spec| identity.allows_tool(&spec.name) && identity.allows_effect(spec.effect))
-            .cloned()
-            .collect();
-        capabilities.sort_by(|a, b| a.name.cmp(&b.name));
-        capabilities.dedup_by(|a, b| a.name == b.name);
+        if scoped.identity() != identity.name() {
+            return Err(ResolveError::ScopeMismatch {
+                registry: scoped.identity().to_string(),
+                identity: identity.name().to_string(),
+            });
+        }
         Ok(Self {
             name: identity.name().to_string(),
             system_prompt: identity.system_prompt_text()?,
@@ -337,7 +370,7 @@ impl ResolvedAgent {
             },
             image: image.into(),
             broker_socket,
-            capabilities,
+            capabilities: scoped.specs().to_vec(),
         })
     }
 
@@ -509,9 +542,10 @@ pub trait HarnessAdapter {
 ///
 /// ```
 /// use harness::harness_adapter::{
-///     launch_plan, CapabilitySpec, Endpoint, PiAdapter, ResolvedAgent,
+///     launch_plan, Endpoint, PiAdapter, ResolvedAgent, ScopedCapabilities,
 /// };
 /// use harness::identity::AgentIdentity;
+/// use harness::tools::create_tool_registry;
 ///
 /// let toml = r#"
 /// [identity]
@@ -531,8 +565,10 @@ pub trait HarnessAdapter {
 /// max_concurrent = 1
 /// "#;
 /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+/// let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+/// let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
 /// let agent = ResolvedAgent::resolve(
-///     &identity, &[], "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
+///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
 /// ).unwrap();
 /// assert!(launch_plan(&PiAdapter::default(), &agent).is_err());
 /// ```
@@ -580,9 +616,10 @@ max_concurrent = 2
     }
 
     fn resolve(identity: &AgentIdentity, available: &[CapabilitySpec]) -> ResolvedAgent {
+        let scoped = testing::scoped(identity, available);
         ResolvedAgent::resolve(
             identity,
-            available,
+            &scoped,
             "t",
             Endpoint::new("gw", 1).unwrap(),
             "img",
@@ -612,15 +649,77 @@ max_concurrent = 2
     }
 
     #[test]
-    fn resolve_only_narrows_the_scoped_set() {
+    fn resolve_grants_exactly_the_scoped_set() {
         let available = vec![
             CapabilitySpec::new("a_tool", "d", serde_json::json!({}), EffectClass::None),
-            CapabilitySpec::new("a_tool", "dup", serde_json::json!({}), EffectClass::None),
             CapabilitySpec::new("b_tool", "d", serde_json::json!({}), EffectClass::None),
         ];
         let agent = resolve(&identity_with(inline(), "\"a_tool\"", "none"), &available);
         assert_eq!(agent.capability_names(), vec!["a_tool"]);
         assert_eq!(agent.capabilities().len(), 1);
+    }
+
+    #[test]
+    fn resolve_refuses_capabilities_scoped_to_another_identity() {
+        let identity = identity_with(inline(), "\"*\"", "none");
+        let scoped = testing::scoped(&identity, &[]);
+        let other = AgentIdentity::from_toml_str(
+            r#"
+[identity]
+name = "other"
+description = "d"
+loop = "inner"
+model = "m"
+system_prompt = { inline = "p" }
+[scope]
+repos = ["r"]
+paths = ["**"]
+max_effect = "none"
+tools = ["*"]
+[limits]
+max_iterations = 1
+max_wall_clock_secs = 1
+max_concurrent = 1
+"#,
+            "other.toml",
+        )
+        .unwrap();
+        let err = ResolvedAgent::resolve(
+            &other,
+            &scoped,
+            "t",
+            Endpoint::new("gw", 1).unwrap(),
+            "img",
+            "/s".into(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ResolveError::ScopeMismatch { .. }));
+        assert_eq!(err.to_string(), "registry is scoped to `a`, not `other`");
+    }
+
+    #[test]
+    fn unscoped_registry_is_refused() {
+        let registry = create_tool_registry(std::path::Path::new("."));
+        let err = ScopedCapabilities::from_registry(&registry).unwrap_err();
+        assert_eq!(err.to_string(), "registry is not scoped to an identity");
+    }
+
+    #[test]
+    fn real_registry_grant_matches_the_identity_scope() {
+        let identity = identity_with(
+            inline(),
+            "\"read_file\", \"cargo_*\", \"run_command\"",
+            "workspace",
+        );
+        let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+        let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+        assert_eq!(scoped.identity(), "a");
+        for spec in scoped.specs() {
+            assert!(identity.allows_tool(&spec.name), "{}", spec.name);
+            assert!(identity.allows_effect(spec.effect), "{}", spec.name);
+        }
+        assert!(scoped.specs().iter().all(|s| s.name != "run_command"));
+        assert!(scoped.specs().windows(2).all(|w| w[0].name < w[1].name));
     }
 
     #[test]
@@ -654,9 +753,10 @@ max_concurrent = 2
     #[test]
     fn missing_prompt_file_is_a_resolve_error() {
         let identity = identity_with("\"prompts/missing.md\"", "\"*\"", "none");
+        let scoped = testing::scoped(&identity, &[]);
         let err = ResolvedAgent::resolve(
             &identity,
-            &[],
+            &scoped,
             "t",
             Endpoint::new("gw", 1).unwrap(),
             "img",
@@ -667,11 +767,15 @@ max_concurrent = 2
     }
 
     #[test]
-    fn from_registry_describes_every_tool_with_its_effect() {
-        let registry = create_tool_registry(std::path::Path::new("."));
-        let specs = CapabilitySpec::from_registry(&registry);
-        assert_eq!(specs.len(), registry.list_tools().len());
-        let write = specs.iter().find(|s| s.name == "write_file").unwrap();
+    fn scoped_capabilities_describe_tools_with_their_effect() {
+        let identity = identity_with(inline(), "\"write_file\"", "workspace");
+        let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
+        let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+        let write = scoped
+            .specs()
+            .iter()
+            .find(|s| s.name == "write_file")
+            .unwrap();
         assert_eq!(write.effect, EffectClass::Workspace);
         assert_eq!(write.parameters["type"], "object");
     }

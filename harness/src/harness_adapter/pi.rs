@@ -7,6 +7,12 @@
 //! static extension that forwards each granted capability to the broker
 //! socket. The capability list is data (`capabilities.json`), never generated
 //! code.
+//!
+//! Network: `container::NetworkPolicy::for_ceiling` governs the dev container
+//! where broker-run tools execute, and still applies there. The agent
+//! container is a different container whose only legitimate need is the model
+//! gateway, so its plan is always exactly that one endpoint, whatever the
+//! effect ceiling; there is no second ceiling-derived rule to drift.
 
 use super::isolation::BROKER_SOCKET_CONTAINER_PATH;
 use super::{
@@ -212,9 +218,10 @@ max_concurrent = 1
     }
 
     fn resolve(identity: &AgentIdentity, available: &[CapabilitySpec]) -> ResolvedAgent {
+        let scoped = crate::harness_adapter::testing::scoped(identity, available);
         ResolvedAgent::resolve(
             identity,
-            available,
+            &scoped,
             "do the thing",
             Endpoint::new("model-gateway", 11434).unwrap(),
             "nanna-agent:pi",
@@ -293,6 +300,20 @@ max_concurrent = 1
     }
 
     #[test]
+    fn agent_network_is_exactly_the_gateway_at_every_ceiling() {
+        let gateway = Endpoint::new("model-gateway", 11434).unwrap();
+        for ceiling in crate::effects::EffectClass::ALL {
+            let agent = resolve(&identity("\"read_file\"", ceiling.as_str()), &catalog());
+            let plan = launch_plan(&PiAdapter, &agent).unwrap();
+            assert_eq!(
+                plan.network,
+                PlanNetwork::Only(vec![gateway.clone()]),
+                "{ceiling}"
+            );
+        }
+    }
+
+    #[test]
     fn task_prompt_travels_as_an_rpc_prompt_line() {
         let agent = resolve(&identity("\"read_file\"", "none"), &catalog());
         let plan = PiAdapter.plan(&agent).unwrap();
@@ -355,9 +376,11 @@ max_concurrent = 1
                 serde_json::json!({}),
                 EffectClass::None,
             )];
+            let identity = identity("\"*\"", "none");
+            let scoped = crate::harness_adapter::testing::scoped(&identity, &available);
             let agent = ResolvedAgent::resolve(
-                &identity("\"*\"", "none"),
-                &available,
+                &identity,
+                &scoped,
                 "t",
                 Endpoint::new("gw", 1).unwrap(),
                 "img",
