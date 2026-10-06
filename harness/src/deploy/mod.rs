@@ -66,8 +66,8 @@ mod validate;
 
 pub use init::{init, starter_template};
 pub use plan::{
-    format_duration, plan_for_repo, plan_for_repo_checked, DeployPlan, DeployStep, Precondition,
-    StepKind,
+    format_duration, plan_for_repo, plan_for_repo_checked, plan_for_repo_with_windows, DeployPlan,
+    DeployStep, Enforcement, Precondition, PreconditionKind, StepKind,
 };
 pub use template::{
     DeployTemplate, Health, OnBreach, RiskClass, RiskSpec, RiskThresholds, Rollback, Rollout,
@@ -75,8 +75,84 @@ pub use template::{
 };
 pub use validate::{min_span, min_steps, strategy_allowed};
 
-use std::path::PathBuf;
+use crate::identity::config_dir_from;
+use crate::windows::{WindowSet, WINDOWS_FILE_NAME};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Where the host keeps the availability windows deploys are gated on:
+/// `windows.toml` inside `$NANNA_CONFIG_DIR`, else `$XDG_CONFIG_HOME/nanna`,
+/// else `$HOME/.config/nanna`.
+///
+/// The file is never read from the target repository: agents can write
+/// there, so a repository-local file would let an agent loosen the window it
+/// is gated by. The repository's `deploy.toml` may only name a window.
+///
+/// ```
+/// use harness::deploy::host_windows_path_from;
+/// use std::path::PathBuf;
+///
+/// let lookup = |key: &str| (key == "NANNA_CONFIG_DIR").then(|| "/etc/nanna".into());
+/// assert_eq!(host_windows_path_from(&lookup), Some(PathBuf::from("/etc/nanna").join("windows.toml")));
+/// ```
+pub fn host_windows_path_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    config_dir_from(lookup).map(|dir| dir.join(WINDOWS_FILE_NAME))
+}
+
+/// Load the host's window set through `lookup`; `None` when the host has no
+/// configuration directory or no windows file.
+pub fn host_windows_from(
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Option<WindowSet>, DeployError> {
+    let Some(path) = host_windows_path_from(lookup).filter(|p| p.is_file()) else {
+        return Ok(None);
+    };
+    WindowSet::load(&path)
+        .map(Some)
+        .map_err(|source| DeployError::WindowSet { path, source })
+}
+
+/// [`host_windows_from`] over the process environment.
+pub fn host_windows() -> Result<Option<WindowSet>, DeployError> {
+    host_windows_from(&|key| std::env::var_os(key))
+}
+
+/// The `owner/name` of a git remote URL, or `None` when it names no
+/// repository. Handles `https://host/owner/name(.git)`, `ssh://git@host/owner/name`
+/// and scp-style `git@host:owner/name.git`.
+///
+/// ```
+/// use harness::deploy::repo_slug_from_remote;
+///
+/// assert_eq!(repo_slug_from_remote("git@github.com:Org/repo.git").as_deref(), Some("Org/repo"));
+/// assert_eq!(repo_slug_from_remote("https://github.com/Org/repo/").as_deref(), Some("Org/repo"));
+/// assert_eq!(repo_slug_from_remote("/srv/git/repo"), None);
+/// ```
+pub fn repo_slug_from_remote(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':')?.1,
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.rsplit('/');
+    let name = parts.next().filter(|p| !p.is_empty())?;
+    let owner = parts.next().filter(|p| !p.is_empty())?;
+    Some(format!("{owner}/{name}"))
+}
+
+/// The repository identity of the checkout at `repo`: the `owner/name` of
+/// its `origin` remote. `None` when it has no such remote.
+pub fn repo_identity(repo: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    repo_slug_from_remote(&String::from_utf8_lossy(&output.stdout))
+}
 
 /// Directory, relative to the repository root, holding Nanna's per-repo config.
 pub const DEPLOY_DIR: &str = ".nanna";
@@ -206,7 +282,13 @@ pub enum DeployError {
         /// The existing template.
         path: PathBuf,
     },
-    /// A co-located `windows.toml` exists but failed to load.
+    /// A production plan names a window but the host has no window set.
+    #[error("window `{window}` is required but the host has no windows.toml (set NANNA_CONFIG_DIR); refusing")]
+    HostWindowsMissing {
+        /// Window the template requests.
+        window: String,
+    },
+    /// The host's `windows.toml` exists but failed to load.
     #[error("failed to load {}: {source}", path.display())]
     WindowSet {
         /// Path of the window set that failed to load.
@@ -215,4 +297,43 @@ pub enum DeployError {
         #[source]
         source: crate::windows::WindowError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_urls_reduce_to_owner_and_name() {
+        for (url, slug) in [
+            ("https://github.com/Org/repo.git", Some("Org/repo")),
+            ("https://github.com/Org/repo", Some("Org/repo")),
+            ("https://github.com/Org/repo/\n", Some("Org/repo")),
+            ("ssh://git@host:22/Org/repo.git", Some("Org/repo")),
+            ("git@github.com:Org/repo.git", Some("Org/repo")),
+            ("https://host/group/sub/repo.git", Some("sub/repo")),
+            ("https://host", None),
+            ("https://host/repo", None),
+            ("https://host//repo", None),
+            ("/srv/git/repo", None),
+            ("", None),
+        ] {
+            assert_eq!(repo_slug_from_remote(url).as_deref(), slug, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn host_windows_are_absent_without_a_config_dir_or_file() {
+        assert!(host_windows_from(&|_| None).unwrap().is_none());
+        let empty = tempfile::tempdir().unwrap();
+        let lookup = |key: &str| (key == "NANNA_CONFIG_DIR").then(|| empty.path().into());
+        assert!(host_windows_from(&lookup).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_checkout_without_an_origin_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(repo_identity(dir.path()), None);
+        assert_eq!(repo_identity(&dir.path().join("missing")), None);
+    }
 }
