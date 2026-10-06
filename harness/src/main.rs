@@ -1288,6 +1288,10 @@ async fn run_mcp_server(
     let lease_path = resolve_lease_path(&queue_path);
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
+    let budget_path = harness::budget::budget_path_from(
+        std::env::var_os(harness::budget::BUDGET_PATH_ENV),
+        Some(queue_path.clone()),
+    );
     let task_manager = Arc::new(
         TaskManager::restore_with_identities(
             DEFAULT_MAX_CONCURRENT_TASKS,
@@ -1298,16 +1302,20 @@ async fn run_mcp_server(
             &catalog,
         )
         .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?))
+        .with_durable_budget(budget_path.clone()),
     );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {}, budget: {})",
         model,
         max_iterations,
         queue_path.display(),
         lease_path.display(),
-        escalation_path.display()
+        escalation_path.display(),
+        budget_path
+            .as_ref()
+            .map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
     );
 
     let server = Arc::new(NannaMcpServer::new(

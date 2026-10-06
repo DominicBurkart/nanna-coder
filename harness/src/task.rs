@@ -1,7 +1,9 @@
 use crate::action_auditor::{ActionAuditLogEntry, ActionGate};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::auditor::Allowed;
-use crate::budget::{BudgetConfig, BudgetReport, CostAccountant, InMemoryBudgetStore};
+use crate::budget::{
+    BudgetConfig, BudgetReport, BudgetStore, CostAccountant, FileBudgetStore, InMemoryBudgetStore,
+};
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
@@ -337,7 +339,8 @@ struct TaskRunner {
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
     /// `Ci`/`Sandbox` budget every dispatched task's workspace charges
     /// against; shared across tasks so per-day limits actually span them.
-    /// [`TaskManager::with_cost_accountant`] replaces the in-memory default.
+    /// [`TaskManager::with_durable_budget`] or [`TaskManager::with_cost_accountant`] replaces
+    /// the fail-closed default that denies every charge.
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
 }
 
@@ -357,14 +360,9 @@ fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
     ))
 }
 
-/// A [`CostAccountant`] over [`BudgetConfig::default`] and an in-process
-/// store, escalating exhaustion into `escalations` through a record-only
-/// [`FanoutSink`] (no sinks to actually deliver to) so a real exhaustion is
-/// still visible via [`TaskManager::escalation_snapshot`]/`_meta.escalations`
-/// even when nothing further has been configured. A caller that wants real
-/// delivery (a GitHub issue, a webhook) supplies its own accountant via
-/// [`TaskManager::with_cost_accountant`].
-fn default_cost_accountant_with_escalations(
+fn escalating_cost_accountant(
+    store: Arc<dyn BudgetStore>,
+    config: BudgetConfig,
     escalations: &Arc<EscalationLog>,
 ) -> Arc<CostAccountant> {
     let escalator = Arc::new(Escalator::new(
@@ -373,12 +371,14 @@ fn default_cost_accountant_with_escalations(
         Arc::new(SystemClock),
         default_window(),
     ));
-    Arc::new(
-        CostAccountant::new(
-            Arc::new(InMemoryBudgetStore::new()),
-            BudgetConfig::default(),
-        )
-        .with_escalator(escalator),
+    Arc::new(CostAccountant::new(store, config).with_escalator(escalator))
+}
+
+fn fail_closed_cost_accountant(escalations: &Arc<EscalationLog>) -> Arc<CostAccountant> {
+    escalating_cost_accountant(
+        Arc::new(InMemoryBudgetStore::new()),
+        BudgetConfig::DENY_ALL,
+        escalations,
     )
 }
 
@@ -477,7 +477,7 @@ impl TaskManager {
     ) -> Result<Self, QueueStoreError> {
         let action_gate = default_action_gate(Arc::clone(&leases));
         let escalations = Arc::new(EscalationLog::in_memory());
-        let cost_accountant = default_cost_accountant_with_escalations(&escalations);
+        let cost_accountant = fail_closed_cost_accountant(&escalations);
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -533,6 +533,27 @@ impl TaskManager {
     /// the in-memory default, so a caller that wants per-day limits to
     /// persist across restarts (or an [`crate::escalation::Escalator`]
     /// wired to a real sink) can supply one.
+    pub fn with_durable_budget(self, location: Option<PathBuf>) -> Self {
+        let escalations = self.runner.escalation_log();
+        let accountant = match location.map(FileBudgetStore::open) {
+            Some(Ok(store)) => {
+                escalating_cost_accountant(Arc::new(store), BudgetConfig::default(), &escalations)
+            }
+            Some(Err(e)) => {
+                tracing::error!("durable CI budget unavailable, denying CI triggers: {e}");
+                fail_closed_cost_accountant(&escalations)
+            }
+            None => {
+                tracing::error!(
+                    "no durable CI budget location resolved (set {} or a queue path), denying CI triggers",
+                    crate::budget::BUDGET_PATH_ENV
+                );
+                fail_closed_cost_accountant(&escalations)
+            }
+        };
+        self.with_cost_accountant(accountant)
+    }
+
     pub fn with_cost_accountant(self, accountant: Arc<CostAccountant>) -> Self {
         *self.runner.cost_accountant.write().unwrap() = accountant;
         self
@@ -2580,6 +2601,84 @@ mod tests {
             manager.escalation_snapshot().tracked >= 1,
             "the default accountant must escalate into the same log tasks/list reports"
         );
+    }
+
+    async fn charge_ci(manager: &TaskManager) -> Result<(), crate::budget::BudgetExceeded> {
+        use crate::budget::BudgetClass;
+        manager
+            .runner
+            .cost_accountant()
+            .charge_count("id", "t1", "example/repo", BudgetClass::Ci, Utc::now())
+            .await
+            .map(|_| ())
+    }
+
+    async fn production_manager(budget: Option<PathBuf>) -> TaskManager {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+        )
+        .await
+        .unwrap()
+        .with_durable_budget(budget)
+    }
+
+    #[tokio::test]
+    async fn a_manager_without_a_durable_budget_denies_every_ci_charge() {
+        let manager = TaskManager::new(0);
+        assert!(charge_ci(&manager).await.is_err());
+        assert!(manager.escalation_snapshot().tracked >= 1);
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_denies_ci_when_no_budget_location_resolves() {
+        let manager = production_manager(None).await;
+        assert!(charge_ci(&manager).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_denies_ci_when_the_budget_file_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("budget.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert!(charge_ci(&production_manager(Some(corrupt)).await)
+            .await
+            .is_err());
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, b"x").unwrap();
+        let under_a_file = blocked.join("budget.json");
+        assert!(charge_ci(&production_manager(Some(under_a_file)).await)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_keeps_ci_usage_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = production_manager(Some(path.clone())).await;
+        charge_ci(&first).await.unwrap();
+        charge_ci(&first).await.unwrap();
+        drop(first);
+        let second = production_manager(Some(path)).await;
+        let used = second.runner.cost_accountant().task_summary("t1").ci.count;
+        assert_eq!(used, 2);
+        assert!(charge_ci(&second).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_second_process_on_the_same_budget_file_is_denied_ci() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = production_manager(Some(path.clone())).await;
+        assert!(charge_ci(&first).await.is_ok());
+        let second = production_manager(Some(path)).await;
+        assert!(charge_ci(&second).await.is_err());
+        assert!(charge_ci(&first).await.is_ok());
     }
 
     #[test]

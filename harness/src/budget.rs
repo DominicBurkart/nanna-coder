@@ -123,6 +123,13 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
+    pub const DENY_ALL: Self = Self {
+        max_count_per_task: Some(0),
+        max_count_per_day: Some(0),
+        max_minutes_per_task: Some(0.0),
+        max_minutes_per_day: Some(0.0),
+    };
+
     /// No ceiling on any dimension.
     pub const UNLIMITED: Self = Self {
         max_count_per_task: None,
@@ -140,6 +147,11 @@ pub struct BudgetConfig {
 }
 
 impl BudgetConfig {
+    pub const DENY_ALL: Self = Self {
+        ci: BudgetLimits::DENY_ALL,
+        sandbox: BudgetLimits::DENY_ALL,
+    };
+
     /// No ceiling on either class: every [`CostAccountant::charge_count`]
     /// call succeeds. Useful for tests and for callers that want only the
     /// bookkeeping (usage visible in [`CostAccountant::task_summary`]) with
@@ -532,6 +544,19 @@ impl BudgetStore for InMemoryBudgetStore {
 pub struct FileBudgetStore {
     path: PathBuf,
     ledger: Mutex<Ledger>,
+    _lock: std::fs::File,
+}
+
+pub const BUDGET_PATH_ENV: &str = "NANNA_BUDGET_PATH";
+
+pub fn budget_path_from(
+    override_path: Option<std::ffi::OsString>,
+    queue_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_path
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| queue_path.map(|q| q.with_file_name("budget.json")))
 }
 
 #[derive(Debug, Error)]
@@ -541,6 +566,8 @@ pub enum BudgetStoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("budget store {path} is in use by another process")]
+    Locked { path: PathBuf },
     #[error("budget store {path} is corrupt: {source}")]
     Corrupt {
         path: PathBuf,
@@ -551,6 +578,7 @@ pub enum BudgetStoreError {
 impl FileBudgetStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BudgetStoreError> {
         let path = path.into();
+        let lock = Self::acquire_lock(&path)?;
         let ledger = match std::fs::read(&path) {
             Ok(bytes) => {
                 Ledger::from_snapshot(serde_json::from_slice(&bytes).map_err(|source| {
@@ -566,7 +594,36 @@ impl FileBudgetStore {
         Ok(Self {
             path,
             ledger: Mutex::new(ledger),
+            _lock: lock,
         })
+    }
+
+    fn acquire_lock(path: &std::path::Path) -> Result<std::fs::File, BudgetStoreError> {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let lock_path = PathBuf::from(name);
+        let io = |source| BudgetStoreError::Io {
+            path: lock_path.clone(),
+            source,
+        };
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(io)?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(io)?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(file),
+            Err(fs4::TryLockError::WouldBlock) => Err(BudgetStoreError::Locked {
+                path: path.to_path_buf(),
+            }),
+            Err(fs4::TryLockError::Error(source)) => Err(io(source)),
+        }
     }
 
     fn persist(&self, ledger: &Ledger) -> std::io::Result<()> {
@@ -657,6 +714,10 @@ pub struct CostAccountant {
 }
 
 impl CostAccountant {
+    pub fn deny_all(store: Arc<dyn BudgetStore>) -> Self {
+        Self::new(store, BudgetConfig::DENY_ALL)
+    }
+
     pub fn new(store: Arc<dyn BudgetStore>, config: BudgetConfig) -> Self {
         Self {
             store,
@@ -1408,11 +1469,66 @@ mod tests {
         let path = dir.path().join("budget.json");
         let store = FileBudgetStore::open(&path).unwrap();
         assert_eq!(store.task_usage("t", BudgetClass::Ci), Usage::default());
+        drop(store);
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(
             FileBudgetStore::open(&path),
             Err(BudgetStoreError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn a_second_open_of_the_same_store_is_refused_while_the_first_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = FileBudgetStore::open(&path).unwrap();
+        assert!(matches!(
+            FileBudgetStore::open(&path),
+            Err(BudgetStoreError::Locked { .. })
+        ));
+        drop(first);
+        assert!(FileBudgetStore::open(&path).is_ok());
+    }
+
+    #[test]
+    fn stores_at_different_paths_do_not_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = FileBudgetStore::open(dir.path().join("a.json")).unwrap();
+        let b = FileBudgetStore::open(dir.path().join("b.json")).unwrap();
+        drop((a, b));
+    }
+
+    #[test]
+    fn budget_path_prefers_the_override_then_sits_next_to_the_queue_log() {
+        use std::ffi::OsString;
+        assert_eq!(
+            budget_path_from(
+                Some(OsString::from("/srv/b.json")),
+                Some(PathBuf::from("/q/queue.jsonl"))
+            ),
+            Some(PathBuf::from("/srv/b.json"))
+        );
+        assert_eq!(
+            budget_path_from(None, Some(PathBuf::from("/q/queue.jsonl"))),
+            Some(PathBuf::from("/q/budget.json"))
+        );
+        assert_eq!(
+            budget_path_from(Some(OsString::new()), Some(PathBuf::from("/q/queue.jsonl"))),
+            Some(PathBuf::from("/q/budget.json"))
+        );
+        assert_eq!(budget_path_from(None, None), None);
+        assert_eq!(budget_path_from(Some(OsString::new()), None), None);
+    }
+
+    #[tokio::test]
+    async fn deny_all_refuses_every_charge_for_both_classes() {
+        let accountant = CostAccountant::deny_all(Arc::new(InMemoryBudgetStore::new()));
+        for class in [BudgetClass::Ci, BudgetClass::Sandbox] {
+            assert!(accountant
+                .charge_count("id", "t", "o/n", class, now())
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]
