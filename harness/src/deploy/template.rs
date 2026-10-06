@@ -48,6 +48,8 @@ pub struct Target {
     /// Image name inside the registry.
     pub image: String,
     /// Environments the deployable can be rolled out to, in declaration order.
+    /// Names outside [`NON_PRODUCTION_ENVS`](super::NON_PRODUCTION_ENVS) are
+    /// treated as production.
     pub environments: Vec<String>,
 }
 

@@ -122,6 +122,9 @@ enum Commands {
         /// Requested task lifetime in milliseconds
         #[arg(long)]
         ttl_ms: Option<u64>,
+        /// Name of the agent identity the task runs under
+        #[arg(short, long)]
+        identity: String,
     },
     /// Pull open GitHub issues into the persistent task queue
     ///
@@ -396,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
             ttl_ms,
+            identity,
         } => {
             run_delegate(
                 &description,
@@ -404,6 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &model,
                 max_iterations,
                 ttl_ms,
+                &identity,
             )
             .await?;
         }
@@ -469,9 +474,22 @@ type FakeExecutor = (
     std::sync::Arc<harness::leases::SimulatedClock>,
 );
 
+fn fake_rollout_log(
+    seed: Option<&harness::rollout::RolloutRecord>,
+) -> Result<harness::rollout::RolloutLog, Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("nanna-fake-rollout-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
+    if let Some(record) = seed {
+        log.append(None, record)?;
+    }
+    Ok(log)
+}
+
 fn fake_rollout_executor(
     repo: &std::path::Path,
     plan: &harness::deploy::DeployPlan,
+    log: harness::rollout::RolloutLog,
 ) -> Result<FakeExecutor, Box<dyn std::error::Error>> {
     let windows_path = repo
         .join(harness::deploy::DEPLOY_DIR)
@@ -488,7 +506,7 @@ fn fake_rollout_executor(
         .unwrap_or_default();
     let previous = format!("{}:previous", plan.image);
     let (executor, _adapter, _health, _shadow, clock) =
-        harness::rollout::fake_executor(rollout_log()?, windows, &previous, &endpoints);
+        harness::rollout::fake_executor(log, windows, &previous, &endpoints);
     Ok((executor, clock))
 }
 
@@ -528,7 +546,7 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
             if !fake {
                 return Err(NO_REAL_TARGET.into());
             }
-            let (executor, clock) = fake_rollout_executor(&repo, &plan)?;
+            let (executor, clock) = fake_rollout_executor(&repo, &plan, fake_rollout_log(None)?)?;
             let record = executor.start(plan, &image).await?;
             println!("started  {}", record.summary());
             run_fake_to_a_stop(&executor, &clock, &record.id).await?;
@@ -562,9 +580,12 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
             if !fake {
                 return Err(NO_REAL_TARGET.into());
             }
-            let log = rollout_log()?;
-            let plan = log.load(&id)?.plan;
-            let (executor, clock) = fake_rollout_executor(&std::env::current_dir()?, &plan)?;
+            let real = rollout_log()?.load(&id)?;
+            let (executor, clock) = fake_rollout_executor(
+                &std::env::current_dir()?,
+                &real.plan,
+                fake_rollout_log(Some(&real))?,
+            )?;
             let record = executor.roll_forward(&id, &image, Some(&pr)).await?;
             println!("forward  {}", record.summary());
             run_fake_to_a_stop(&executor, &clock, &id).await?;
@@ -579,7 +600,7 @@ async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::E
                 Some(p) => p,
                 None => std::env::current_dir()?,
             };
-            let plan = harness::deploy::plan_for_repo(&repo, &env, score)?;
+            let plan = harness::deploy::plan_for_repo_checked(&repo, &env, score)?;
             if json {
                 println!("{}", plan.to_json_pretty());
             } else {
@@ -990,7 +1011,8 @@ fn run_escalation_resolve(
         Some(explicit) => explicit,
         None => resolve_escalation_path(&resolve_queue_path(None)?),
     };
-    let hold = EscalationLog::open(&path)?.resolve(id, chrono::Utc::now())?;
+    let grant = harness::escalation::ResolveGrant::from_environment()?;
+    let hold = EscalationLog::open(&path)?.resolve(&grant, id, chrono::Utc::now())?;
     println!(
         "Resolved incident hold {} on {} (held since {}): {}",
         hold.escalation_id, hold.repo, hold.since, hold.summary
@@ -1242,6 +1264,13 @@ async fn run_agent(
     Ok(())
 }
 
+fn load_identities() -> IdentityCatalog {
+    IdentityCatalog::load_default().unwrap_or_else(|e| {
+        tracing::warn!("No agent identities registered ({e}); every assign_task will fail closed");
+        IdentityCatalog::default()
+    })
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1257,14 +1286,16 @@ async fn run_mcp_server(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
+    let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
     let task_manager = Arc::new(
-        TaskManager::restore(
+        TaskManager::restore_with_identities(
             DEFAULT_MAX_CONCURRENT_TASKS,
             Box::new(HybridPolicy::default()),
             Box::new(JsonlQueueStore::open(&queue_path)?),
             Arc::new(JsonlLeaseStore::open(&lease_path)?),
             provider.clone(),
+            &catalog,
         )
         .await?
         .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
@@ -1303,6 +1334,7 @@ async fn run_delegate(
     model: &str,
     max_iterations: usize,
     ttl_ms: Option<u64>,
+    identity: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
@@ -1312,6 +1344,7 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
+    task_manager.register_catalog(&load_identities()).await;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
@@ -1337,6 +1370,7 @@ async fn run_delegate(
         "branch": branch,
         "model": model,
         "max_iterations": max_iterations,
+        "identity": identity,
     });
     let task_id = client.submit_task(arguments, ttl_ms).await?;
     info!("Delegated task {task_id}; awaiting completion...");
@@ -1442,5 +1476,77 @@ mod tests {
             Some(missing_compare.as_path()),
         );
         assert!(result.is_err(), "expected error on missing compare file");
+    }
+
+    const FAKE_TEMPLATE: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"edge\"\n[rollout]\nstrategy = \"gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n";
+
+    static ROLLOUT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn fake_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".nanna")).unwrap();
+        std::fs::write(repo.path().join(".nanna/deploy.toml"), FAKE_TEMPLATE).unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn fake_deploy_run_never_writes_the_real_rollout_log() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        run_deploy(DeployCommands::Run {
+            repo_path: Some(repo.path().to_path_buf()),
+            env: "sandbox".into(),
+            image: "registry.example.invalid/ns/app:v2".into(),
+            score: None,
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(!real_path.exists(), "fake run touched the real log");
+    }
+
+    #[tokio::test]
+    async fn fake_roll_forward_leaves_the_real_record_untouched() {
+        let _env = ROLLOUT_ENV.lock().await;
+        let repo = fake_repo();
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().join("rollouts.jsonl");
+        std::env::set_var(harness::rollout::ROLLOUT_PATH_ENV, &real_path);
+        let plan = harness::deploy::plan_for_repo(repo.path(), "sandbox", None).unwrap();
+        let mut record = harness::rollout::RolloutRecord::new(
+            "rollout-real",
+            plan,
+            "registry.example.invalid/ns/app:v2",
+            "registry.example.invalid/ns/app:v1",
+            chrono::Utc::now(),
+        );
+        let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
+        log.append(None, &record).unwrap();
+        let pending = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&pending), &record).unwrap();
+        let stepping = record.state.clone();
+        record
+            .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
+            .unwrap();
+        log.append(Some(&stepping), &record).unwrap();
+        let before = std::fs::read_to_string(&real_path).unwrap();
+        run_deploy(DeployCommands::RollForward {
+            id: "rollout-real".into(),
+            image: "registry.example.invalid/ns/app:v3".into(),
+            pr: "https://example.invalid/pr/1".into(),
+            fake: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&real_path).unwrap() == before,
+            "fake roll-forward rewrote the real log"
+        );
     }
 }

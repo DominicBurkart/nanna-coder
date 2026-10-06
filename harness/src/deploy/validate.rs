@@ -1,5 +1,5 @@
 use super::template::{DeployTemplate, Health, RiskClass, Strategy};
-use super::{DeployError, PRODUCTION_ENV};
+use super::{is_production_env, DeployError};
 use crate::windows::WindowSet;
 use chrono::Duration;
 use std::path::Path;
@@ -109,19 +109,24 @@ impl DeployTemplate {
         if span < min_span(class) {
             return Err(invalid(file, "rollout.min_step_duration", format!("risk class `{class}` requires a rollout span of at least {}, got {} ({steps} steps x {})", describe(min_span(class)), describe(span), describe(self.rollout.min_step_duration))));
         }
-        if self.target.environments.iter().any(|e| e == PRODUCTION_ENV) {
+        if self
+            .target
+            .environments
+            .iter()
+            .any(|e| is_production_env(e))
+        {
             if self.rollout.windows.is_none() {
                 return Err(invalid(
                     file,
                     "rollout.windows",
-                    format!("required when `{PRODUCTION_ENV}` is an environment"),
+                    "required when a production environment (any name other than sandbox, staging, dev, test, qa, preview or local) is listed".to_string(),
                 ));
             }
             if self.health.is_none() {
                 return Err(invalid(
                     file,
                     "health",
-                    format!("section required when `{PRODUCTION_ENV}` is an environment"),
+                    "section required when a production environment (any name other than sandbox, staging, dev, test, qa, preview or local) is listed".to_string(),
                 ));
             }
         }
@@ -482,5 +487,26 @@ mod tests {
             );
         let template = DeployTemplate::parse(&src).unwrap();
         template.validate_against(&WindowSet::default()).unwrap();
+    }
+
+    #[test]
+    fn production_gate_matches_environment_case_insensitively() {
+        let src = template(RiskClass::Unused, Strategy::Instant, "[100]", "0m")
+            .replace("windows = \"business-hours\"\n", "")
+            .replace("\"production\"", "\"Production\"");
+        let (field, reason) = field_error(&src);
+        assert_eq!(field, "rollout.windows");
+        assert!(reason.contains("production"), "{reason}");
+    }
+
+    #[test]
+    fn unlisted_environment_names_are_gated_as_production() {
+        for env in ["prod", "prd", "live", "eu-west-1", "canary"] {
+            let src = template(RiskClass::Unused, Strategy::Instant, "[100]", "0m")
+                .replace("windows = \"business-hours\"\n", "")
+                .replace("\"production\"", &format!("\"{env}\""));
+            let (field, _) = field_error(&src);
+            assert_eq!(field, "rollout.windows", "{env}");
+        }
     }
 }

@@ -141,18 +141,16 @@ mod tests {
     use proptest::prelude::*;
 
     fn widened_field(result: Result<(), IdentityError>) -> String {
-        match result {
-            Err(IdentityError::WidensScope {
-                name,
-                field,
-                reason,
-            }) => {
-                assert_eq!(name, "rust-implementer");
-                assert!(!reason.is_empty());
-                field
-            }
-            other => panic!("expected WidensScope, got {other:?}"),
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::WidensScope { name, reason, .. } if name == "rust-implementer" && !reason.is_empty()),
+            "expected WidensScope, got {err:?}"
+        );
+        let mut field = String::new();
+        if let IdentityError::WidensScope { field: widened, .. } = err {
+            field = widened;
         }
+        field
     }
 
     #[test]

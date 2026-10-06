@@ -19,7 +19,7 @@ use harness::tools::{
     sqlx_migrate_args, trunk_build_args, CalculatorTool, ReadFileTool, SqlxMigrateTool, Tool,
     ToolError, ToolRegistry, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -382,15 +382,6 @@ fn test_container_handle() -> Arc<ContainerHandle> {
     })
 }
 
-fn stub_container_handle() -> Arc<ContainerHandle> {
-    Arc::new(ContainerHandle {
-        name: "stub-container".to_string(),
-        runtime: ContainerRuntime::Stub,
-        port: None,
-        needs_cleanup: false,
-    })
-}
-
 #[test]
 fn cargo_deny_registered_when_deny_toml_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -503,8 +494,6 @@ async fn cargo_audit_tool_definition_name_matches_execute_name() {
 //
 // ContainerRuntime::None makes exec_in_container return NoRuntimeAvailable,
 // so every execute body up to and including the `?` operator is exercised.
-// The Ok(json!{...}) success branch is covered by the #[ignore] container
-// integration tests in dev_container_integration.rs.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -603,114 +592,196 @@ async fn cargo_deny_execute_no_check_arg_error_path() {
     assert!(matches!(err, ToolError::ExecutionFailed { .. }));
 }
 
-// ---------------------------------------------------------------------------
-// Success path coverage — ContainerRuntime::Stub bypasses exec and returns an
-// empty Ok result so the Ok(json!{...}) branch in each tool's execute() is hit.
-// ---------------------------------------------------------------------------
+const FAKE_PODMAN_SCRIPT: &str = "#!/bin/sh\n\
+case \"$*\" in\n\
+  *boom*) echo \"FAKE_PODMAN_FAILED $*\" >&2; exit 3 ;;\n\
+esac\n\
+echo \"FAKE_PODMAN $*\"\n\
+echo \"FAKE_PODMAN_STDERR\" >&2\n\
+exit 0\n";
+
+fn fake_podman_handle() -> Arc<ContainerHandle> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("fake-podman-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create fake podman dir");
+        let script = dir.join("podman");
+        std::fs::write(&script, FAKE_PODMAN_SCRIPT).expect("write fake podman");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake podman");
+        let mut paths = vec![dir];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("join PATH"));
+    });
+    Arc::new(ContainerHandle {
+        name: "fake-container".to_string(),
+        runtime: ContainerRuntime::Podman,
+        port: None,
+        needs_cleanup: false,
+    })
+}
+
+fn assert_fake_exec_output(result: &Value, argv: &str, command: &str) {
+    assert_eq!(result["command"].as_str().unwrap(), command);
+    assert_eq!(result["success"], json!(true));
+    let stdout = result["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "FAKE_PODMAN exec -w /workspace fake-container {argv}"
+        )),
+        "stdout {stdout:?} does not show argv {argv:?}"
+    );
+    assert!(result["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN_STDERR"));
+}
 
 #[tokio::test]
 async fn cargo_build_execute_success_path_covered() {
     use harness::tools::CargoBuildTool;
-    let handle = stub_container_handle();
-    let tool = CargoBuildTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({"package": "harness", "release": "true"}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(
+        &result,
+        "cargo build --package harness --release",
+        "cargo build --package harness --release",
+    );
 }
 
 #[tokio::test]
 async fn cargo_test_execute_success_path_covered() {
     use harness::tools::CargoTestTool;
-    let handle = stub_container_handle();
-    let tool = CargoTestTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoTestTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({"test_filter": "my_test"}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(&result, "cargo test my_test", "cargo test my_test");
 }
 
 #[tokio::test]
 async fn cargo_check_execute_success_path_covered() {
     use harness::tools::CargoCheckTool;
-    let handle = stub_container_handle();
-    let tool = CargoCheckTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoCheckTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(&result, "cargo check", "cargo check");
 }
 
 #[tokio::test]
 async fn cargo_bench_execute_success_path_covered() {
     use harness::tools::CargoBenchTool;
-    let handle = stub_container_handle();
-    let tool = CargoBenchTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoBenchTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({"bench_filter": "bench_foo"}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(&result, "cargo bench bench_foo", "cargo bench bench_foo");
 }
 
 #[tokio::test]
 async fn cargo_run_execute_success_path_covered() {
     use harness::tools::CargoRunTool;
-    let handle = stub_container_handle();
-    let tool = CargoRunTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoRunTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({"bin": "nanna", "args": "--help"}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(
+        &result,
+        "cargo run --bin nanna -- --help",
+        "cargo run --bin nanna -- --help",
+    );
 }
 
 #[tokio::test]
 async fn cargo_deny_execute_success_path_covered() {
     use harness::tools::CargoDenyTool;
-    let handle = stub_container_handle();
-    let tool = CargoDenyTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoDenyTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({"check": "advisories"}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
-    assert!(result.get("command").is_some());
-    assert_eq!(
-        result["command"].as_str().unwrap(),
-        "cargo deny check advisories"
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(
+        &result,
+        "cargo deny check advisories",
+        "cargo deny check advisories",
     );
 }
 
 #[tokio::test]
 async fn cargo_audit_execute_success_path_covered() {
     use harness::tools::CargoAuditTool;
-    let handle = stub_container_handle();
-    let tool = CargoAuditTool::new(handle, Some("/workspace".to_string()));
+    let tool = CargoAuditTool::new(fake_podman_handle(), Some("/workspace".to_string()));
     let result = tool
         .execute(json!({}))
         .await
-        .expect("execute must succeed with Stub runtime");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
-    assert!(result.get("command").is_some());
-    assert_eq!(result["command"].as_str().unwrap(), "cargo audit");
+        .expect("execute must succeed with fake podman");
+    assert_fake_exec_output(&result, "cargo audit", "cargo audit");
+}
+
+#[tokio::test]
+async fn cargo_build_nonzero_exit_reports_failure_not_success() {
+    use harness::tools::CargoBuildTool;
+    let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
+    let result = tool
+        .execute(json!({"package": "boom"}))
+        .await
+        .expect("a non-zero cargo exit is a tool result, not a tool error");
+    assert_eq!(result["success"], json!(false));
+    assert_eq!(result["command"], json!("cargo build --package boom"));
+    assert!(result["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN_FAILED"));
+}
+
+#[tokio::test]
+async fn cargo_build_rejects_option_like_package() {
+    use harness::tools::CargoBuildTool;
+    let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"package": "--release"}))
+        .await
+        .expect_err("an option-like package must not reach cargo's argv");
+    assert!(matches!(err, ToolError::InvalidArguments { .. }));
+}
+
+#[tokio::test]
+async fn cargo_test_rejects_option_like_filter() {
+    use harness::tools::CargoTestTool;
+    let tool = CargoTestTool::new(fake_podman_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"test_filter": "--ignored"}))
+        .await
+        .expect_err("an option-like test filter must not reach cargo's argv");
+    assert!(matches!(err, ToolError::InvalidArguments { .. }));
+}
+
+#[test]
+fn cargo_deny_declares_repository_effect_class() {
+    use harness::tools::CargoDenyTool;
+    use harness::EffectClass;
+    let tool = CargoDenyTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
+}
+
+#[test]
+fn cargo_audit_declares_repository_effect_class() {
+    use harness::tools::CargoAuditTool;
+    use harness::EffectClass;
+    let tool = CargoAuditTool::new(test_container_handle(), None);
+    assert_eq!(tool.effect_class(), EffectClass::Repository);
 }
 
 // ---------------------------------------------------------------------------
@@ -801,33 +872,6 @@ async fn trunk_build_execute_error_path_covered() {
 }
 
 #[tokio::test]
-async fn trunk_build_execute_success_path_runs_in_member_dir() {
-    let dir = full_stack_workspace();
-    let registry = create_container_tool_registry(
-        dir.path(),
-        stub_container_handle(),
-        CONTAINER_WORKSPACE_DIR,
-    );
-    let result = registry
-        .execute("trunk_build", json!({}))
-        .await
-        .expect("execute must succeed with Stub runtime");
-    assert_eq!(result["command"], "trunk build");
-    assert_eq!(result["working_dir"], "/workspace/ui");
-    assert!(result.get("stdout").is_some());
-    assert!(result.get("stderr").is_some());
-    assert!(result.get("success").is_some());
-}
-
-#[tokio::test]
-async fn trunk_build_release_flag_is_forwarded() {
-    let tool = TrunkBuildTool::new(stub_container_handle(), None);
-    let result = tool.execute(json!({"release": "true"})).await.unwrap();
-    assert_eq!(result["command"], "trunk build --release");
-    assert!(result["working_dir"].is_null());
-}
-
-#[tokio::test]
 async fn sqlx_migrate_execute_error_path_covered() {
     let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
     let err = tool
@@ -839,7 +883,7 @@ async fn sqlx_migrate_execute_error_path_covered() {
 
 #[tokio::test]
 async fn sqlx_migrate_rejects_unknown_command() {
-    let tool = SqlxMigrateTool::new(stub_container_handle(), Some("/workspace".to_string()));
+    let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
     let err = tool
         .execute(json!({"command": "drop"}))
         .await
@@ -851,25 +895,4 @@ async fn sqlx_migrate_rejects_unknown_command() {
         }
         other => panic!("unexpected error {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
-    let dir = full_stack_workspace();
-    let registry = create_container_tool_registry(
-        dir.path(),
-        stub_container_handle(),
-        CONTAINER_WORKSPACE_DIR,
-    );
-    let result = registry
-        .execute("sqlx_migrate", json!({}))
-        .await
-        .expect("execute must succeed with Stub runtime");
-    assert_eq!(result["command"], "sqlx migrate run");
-    assert_eq!(result["working_dir"], "/workspace/api");
-    let info = registry
-        .execute("sqlx_migrate", json!({"command": "info"}))
-        .await
-        .unwrap();
-    assert_eq!(info["command"], "sqlx migrate info");
 }

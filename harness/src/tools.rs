@@ -4,6 +4,7 @@ use crate::action_auditor::{
 use crate::auditor::{Reason, ReasonCode};
 use crate::budget::BudgetExceeded;
 use crate::effects::EffectClass;
+use crate::escalation::EscalationLog;
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
 use crate::protected::{ProtectedPathViolation, ProtectedPaths};
@@ -57,6 +58,12 @@ pub enum ToolError {
     /// [`crate::budget::CostAccountant`].
     #[error("{0}")]
     BudgetExceeded(BudgetExceeded),
+    #[error("Production effects are held for {repo} by incident {escalation_id}: {summary}")]
+    ProductionHeld {
+        repo: String,
+        escalation_id: String,
+        summary: String,
+    },
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -109,7 +116,19 @@ pub struct ToolRegistry {
     action_prior: Mutex<Vec<EffectClass>>,
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
+    production_hold: Option<ProductionHold>,
 }
+
+struct ProductionHold {
+    log: Arc<EscalationLog>,
+    repo: Option<String>,
+}
+
+/// Tools whose reach cannot be confined to path globs. `run_command` hands
+/// the model `sh -c` inside the container, so `scope.paths` and
+/// `scope.read_paths` cannot apply to it; [`ToolRegistry::scoped_for`] removes
+/// these tools for any identity where [`AgentIdentity::restricts_paths`] holds.
+pub const PATH_UNSCOPABLE_TOOLS: &[&str] = &["run_command"];
 
 impl ToolRegistry {
     pub fn new() -> Self {
@@ -122,6 +141,7 @@ impl ToolRegistry {
             action_prior: Mutex::new(Vec::new()),
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
+            production_hold: None,
         }
     }
 
@@ -148,6 +168,9 @@ impl ToolRegistry {
     /// `scope.max_effect`. Everything else is dropped, so it never appears in
     /// the definitions sent to the model. Calls to dropped or unknown tools
     /// are refused with [`ToolError::ScopeDenied`] and recorded.
+    ///
+    /// A tool in [`PATH_UNSCOPABLE_TOOLS`] is also dropped when the identity
+    /// restricts paths, because path globs cannot be applied to a shell.
     ///
     /// ```
     /// use harness::effects::EffectClass;
@@ -185,8 +208,11 @@ impl ToolRegistry {
     /// assert_eq!(scoped.denial_count(), 0);
     /// ```
     pub fn scoped_for(mut self, identity: &AgentIdentity) -> Self {
+        let restricted = identity.restricts_paths();
         let keep = |name: &String, tool: &mut Box<dyn Tool>| {
-            identity.allows_tool(name) && identity.allows_effect(tool.effect_class())
+            identity.allows_tool(name)
+                && identity.allows_effect(tool.effect_class())
+                && !(restricted && PATH_UNSCOPABLE_TOOLS.contains(&name.as_str()))
         };
         self.tools.retain(keep);
         self.identity = Some(identity.name().to_string());
@@ -211,6 +237,13 @@ impl ToolRegistry {
     fn record(&self, denial: ScopeDenial) {
         let mut log = self.denials.lock().expect("denial log poisoned");
         log.push(denial);
+    }
+
+    /// Refuse every `Production`-class call while `log` holds an incident
+    /// for `repo`, or for any repository when `repo` is `None`.
+    pub fn with_production_hold(mut self, log: Arc<EscalationLog>, repo: Option<String>) -> Self {
+        self.production_hold = Some(ProductionHold { log, repo });
+        self
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -247,7 +280,10 @@ impl ToolRegistry {
             }
         }
         let outcome = match (self.tools.get(name), &self.identity) {
-            (Some(tool), _) => tool.execute(args).await,
+            (Some(tool), _) => {
+                self.check_production_hold(tool.effect_class())?;
+                tool.execute(args).await
+            }
             (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
                 identity: identity.clone(),
                 tool: name.to_string(),
@@ -380,6 +416,23 @@ impl ToolRegistry {
                     .expect("action denial count poisoned") += 1;
                 ActionVerdict::Escalate { reasons }
             }
+        }
+    }
+
+    fn check_production_hold(&self, class: EffectClass) -> ToolResult<()> {
+        if class != EffectClass::Production {
+            return Ok(());
+        }
+        let Some(gate) = &self.production_hold else {
+            return Ok(());
+        };
+        match gate.log.production_hold(gate.repo.as_deref()) {
+            Some(hold) => Err(ToolError::ProductionHeld {
+                repo: hold.repo,
+                escalation_id: hold.escalation_id,
+                summary: hold.summary,
+            }),
+            None => Ok(()),
         }
     }
 
@@ -1662,6 +1715,36 @@ pub fn cargo_run_args(
     args
 }
 
+fn reject_option_like(field: &str, value: Option<&str>) -> ToolResult<()> {
+    match value {
+        Some(v) if v.starts_with('-') => Err(ToolError::InvalidArguments {
+            message: format!("'{field}' must not start with '-': {v}"),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn run_cargo_argv(
+    handle: &crate::container::ContainerHandle,
+    working_dir: Option<&str>,
+    argv: &[String],
+) -> ToolResult<Value> {
+    let command = argv.join(" ");
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let result =
+        crate::container::exec_in_container(handle, &argv_refs, working_dir).map_err(|e| {
+            ToolError::ExecutionFailed {
+                message: e.to_string(),
+            }
+        })?;
+    Ok(json!({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.success,
+        "command": command,
+    }))
+}
+
 pub struct CargoBuildTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
     working_dir: Option<String>,
@@ -1681,6 +1764,10 @@ impl CargoBuildTool {
 
 #[async_trait]
 impl Tool for CargoBuildTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -1721,29 +1808,13 @@ impl Tool for CargoBuildTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+        reject_option_like("package", package)?;
         let argv = cargo_build_args(package, release);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_build"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -1766,6 +1837,10 @@ impl CargoTestTool {
 
 #[async_trait]
 impl Tool for CargoTestTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -1804,29 +1879,14 @@ impl Tool for CargoTestTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let test_filter = args.get("test_filter").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
+        reject_option_like("test_filter", test_filter)?;
         let argv = cargo_test_args(package, test_filter);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_test"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -1849,6 +1909,10 @@ impl CargoCheckTool {
 
 #[async_trait]
 impl Tool for CargoCheckTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -1876,29 +1940,13 @@ impl Tool for CargoCheckTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
         let argv = cargo_check_args(package);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_check"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -1921,6 +1969,10 @@ impl CargoBenchTool {
 
 #[async_trait]
 impl Tool for CargoBenchTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -1961,29 +2013,14 @@ impl Tool for CargoBenchTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let package = args.get("package").and_then(|v| v.as_str());
         let bench_filter = args.get("bench_filter").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
+        reject_option_like("bench_filter", bench_filter)?;
         let argv = cargo_bench_args(package, bench_filter);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_bench"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -2006,6 +2043,10 @@ impl CargoRunTool {
 
 #[async_trait]
 impl Tool for CargoRunTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -2060,29 +2101,14 @@ impl Tool for CargoRunTool {
             .and_then(|v| v.as_str())
             .map(|s| s.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
+        reject_option_like("package", package)?;
+        reject_option_like("bin", bin)?;
         let argv = cargo_run_args(package, bin, &extra_args);
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_run"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -2105,6 +2131,10 @@ impl CargoDenyTool {
 
 #[async_trait]
 impl Tool for CargoDenyTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -2141,31 +2171,13 @@ impl Tool for CargoDenyTool {
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         let check = args.get("check").and_then(|v| v.as_str());
+        reject_option_like("check", check)?;
         let argv = cargo_deny_args(check);
-        let command = argv.join(" ");
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-            "command": command,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_deny"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -2188,6 +2200,10 @@ impl CargoAuditTool {
 
 #[async_trait]
 impl Tool for CargoAuditTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Repository
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             function: FunctionDefinition {
@@ -2207,30 +2223,11 @@ impl Tool for CargoAuditTool {
 
     async fn execute(&self, _args: Value) -> ToolResult<Value> {
         let argv = cargo_audit_args();
-        let command = argv.join(" ");
-        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let result = crate::container::exec_in_container(
-            &self.container_handle,
-            &argv_refs,
-            self.working_dir.as_deref(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed {
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "success": result.success,
-            "command": command,
-        }))
+        run_cargo_argv(&self.container_handle, self.working_dir.as_deref(), &argv)
     }
 
     fn name(&self) -> &str {
         "cargo_audit"
-    }
-
-    fn effect_class(&self) -> EffectClass {
-        EffectClass::Workspace
     }
 }
 
@@ -3354,6 +3351,163 @@ mod tests {
         }
     }
 
+    fn held_log(repo: &str) -> Arc<EscalationLog> {
+        use crate::escalation::{Escalation, EscalationSource, Severity};
+        let log = Arc::new(EscalationLog::in_memory());
+        let incident = Escalation::new(
+            Severity::Incident,
+            EscalationSource::Rollout,
+            repo,
+            "p99 breached",
+        )
+        .with_id("inc-1");
+        log.hold(&incident, chrono::Utc::now()).unwrap();
+        log
+    }
+
+    fn stub_container_handle() -> Arc<crate::container::ContainerHandle> {
+        Arc::new(crate::container::ContainerHandle {
+            name: "stub-container".to_string(),
+            runtime: crate::container::ContainerRuntime::Stub,
+            port: None,
+            needs_cleanup: false,
+        })
+    }
+
+    fn full_stack_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"api\", \"ui\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ui")).unwrap();
+        std::fs::write(dir.path().join("ui/Trunk.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("api/migrations")).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn trunk_build_execute_success_path_runs_in_member_dir() {
+        let dir = full_stack_workspace();
+        let registry = create_container_tool_registry(
+            dir.path(),
+            stub_container_handle(),
+            CONTAINER_WORKSPACE_DIR,
+        );
+        let result = registry
+            .execute("trunk_build", json!({}))
+            .await
+            .expect("execute must succeed with Stub runtime");
+        assert_eq!(result["command"], "trunk build");
+        assert_eq!(result["working_dir"], "/workspace/ui");
+        assert!(result.get("stdout").is_some());
+        assert!(result.get("stderr").is_some());
+        assert!(result.get("success").is_some());
+    }
+
+    #[tokio::test]
+    async fn trunk_build_release_flag_is_forwarded() {
+        let tool = TrunkBuildTool::new(stub_container_handle(), None);
+        let result = tool.execute(json!({"release": "true"})).await.unwrap();
+        assert_eq!(result["command"], "trunk build --release");
+        assert!(result["working_dir"].is_null());
+    }
+
+    #[tokio::test]
+    async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
+        let dir = full_stack_workspace();
+        let registry = create_container_tool_registry(
+            dir.path(),
+            stub_container_handle(),
+            CONTAINER_WORKSPACE_DIR,
+        );
+        let result = registry
+            .execute("sqlx_migrate", json!({}))
+            .await
+            .expect("execute must succeed with Stub runtime");
+        assert_eq!(result["command"], "sqlx migrate run");
+        assert_eq!(result["working_dir"], "/workspace/api");
+        let info = registry
+            .execute("sqlx_migrate", json!({"command": "info"}))
+            .await
+            .unwrap();
+        assert_eq!(info["command"], "sqlx migrate info");
+    }
+
+    struct AllowAuditor;
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for AllowAuditor {
+        fn name(&self) -> &str {
+            "allow-everything"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &ActionReview,
+            _context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            Ok(ActionVerdict::Allow)
+        }
+    }
+
+    fn gated(log: Arc<EscalationLog>, repo: Option<&str>) -> ToolRegistry {
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(AllowAuditor),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let subject = ActionSubject {
+            task_id: TaskId("t1".to_string()),
+            max_effect: EffectClass::Production,
+            window: None,
+            repo: "example/repo".to_string(),
+            branch: None,
+            pr: None,
+            environment: None,
+            paths: vec![],
+        };
+        let mut registry = ToolRegistry::new()
+            .with_production_hold(log, repo.map(str::to_string))
+            .with_action_gate(gate, subject);
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry
+    }
+
+    #[tokio::test]
+    async fn production_hold_refuses_production_tools_and_names_the_incident() {
+        let registry = gated(held_log("example/repo"), Some("example/repo"));
+        let err = registry.execute("deploy", json!({})).await.unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ProductionHeld { repo, escalation_id, .. } if repo == "example/repo" && escalation_id == "inc-1")
+        );
+        assert!(err.to_string().contains("inc-1"));
+        assert!(err.to_string().contains("p99 breached"));
+        assert!(registry.execute("push", json!({})).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_hold_scopes_to_the_repo_unless_unscoped() {
+        let other = gated(held_log("example/repo"), Some("example/other"));
+        assert!(other.execute("deploy", json!({})).await.is_ok());
+        let any = gated(held_log("example/repo"), None);
+        assert!(any.execute("deploy", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn production_tools_run_once_the_hold_is_resolved_or_absent() {
+        let log = held_log("example/repo");
+        let registry = gated(log.clone(), Some("example/repo"));
+        assert!(registry.execute("deploy", json!({})).await.is_err());
+        let grant = crate::escalation::ResolveGrant::check(true, None).unwrap();
+        log.resolve(&grant, "inc-1", chrono::Utc::now()).unwrap();
+        assert!(registry.execute("deploy", json!({})).await.is_ok());
+        let mut ungated = gated(Arc::new(EscalationLog::in_memory()), None);
+        ungated.register(StubTool::boxed("deploy", EffectClass::Production));
+        assert!(ungated.execute("deploy", json!({})).await.is_ok());
+    }
+
     fn names(tools: &[&dyn Tool]) -> Vec<String> {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
@@ -3639,11 +3793,11 @@ mod tests {
         assert_eq!(names, vec!["sub"]);
 
         let recursive = tool.execute(json!({ "recursive": true })).await.unwrap();
-        let paths: Vec<&str> = recursive["entries"]
+        let paths: Vec<String> = recursive["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|e| e["path"].as_str().unwrap())
+            .map(|e| e["path"].as_str().unwrap().replace('\\', "/"))
             .collect();
         assert_eq!(paths, vec!["api/sub/deep.rs"]);
 
@@ -3661,7 +3815,8 @@ mod tests {
         let tool = SearchTool::scoped(ws.path().to_path_buf(), scope);
         let found = tool.execute(json!({ "pattern": "shared" })).await.unwrap();
         assert_eq!(found["count"], 1);
-        assert_eq!(found["results"][0]["file"], "docs/README.md");
+        let file = found["results"][0]["file"].as_str().unwrap();
+        assert_eq!(file.replace('\\', "/"), "docs/README.md");
         let inside_api = tool
             .execute(json!({ "pattern": "shared", "path": "api" }))
             .await
@@ -3858,7 +4013,8 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        let mut identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        identity.scope.paths = vec!["**".to_string()];
         let registry = create_container_tool_registry_for(
             Path::new("."),
             std::sync::Arc::clone(&handle),
@@ -3867,6 +4023,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sorted_names(&registry), vec!["read_file", "run_command"]);
+
+        let path_scoped = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        assert!(path_scoped.restricts_paths());
+        let registry = create_container_tool_registry_for(
+            Path::new("."),
+            std::sync::Arc::clone(&handle),
+            CONTAINER_WORKSPACE_DIR,
+            &path_scoped,
+        )
+        .unwrap();
+        assert_eq!(sorted_names(&registry), vec!["read_file"]);
 
         let read_only = identity_with(EffectClass::None, &["run_command", "read_file"]);
         let registry = create_container_tool_registry_for(
@@ -5147,6 +5314,52 @@ mod tests {
         assert!(registry.get_tool("cargo_check").is_none());
         assert!(registry.get_tool("cargo_bench").is_none());
         assert!(registry.get_tool("cargo_run").is_none());
+    }
+
+    fn shell_identity(paths: &[&str], read_paths: Option<&[&str]>) -> AgentIdentity {
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.tools = vec!["run_command".parse().unwrap(), "echo".parse().unwrap()];
+        identity.scope.paths = strings(paths);
+        identity.scope.read_paths = read_paths.map(strings);
+        identity
+    }
+
+    fn shell_registry(identity: &AgentIdentity) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
+        registry.register(StubTool::boxed("echo", EffectClass::None));
+        registry.scoped_for(identity)
+    }
+
+    #[tokio::test]
+    async fn run_command_is_refused_for_an_identity_with_a_path_restriction() {
+        let restricted = [
+            shell_identity(&["src/**"], None),
+            shell_identity(&[], None),
+            shell_identity(&["**"], Some(&["src/**"])),
+            shell_identity(&["**"], Some(&["**"])),
+        ];
+        for identity in restricted {
+            let registry = shell_registry(&identity);
+            assert!(registry.get_tool("run_command").is_none(), "{identity:?}");
+            assert!(registry.get_tool("echo").is_some());
+            let err = registry
+                .execute("run_command", serde_json::json!({"command": "cat secrets"}))
+                .await
+                .unwrap_err();
+            assert_eq!(denial(err).reason, DenialReason::ToolNotInScope);
+            assert_eq!(registry.denial_count(), 1);
+        }
+    }
+
+    #[test]
+    fn run_command_is_kept_for_an_identity_without_a_path_restriction() {
+        for paths in [&["**"][..], &["api/**", "**"][..]] {
+            let registry = shell_registry(&shell_identity(paths, None));
+            assert!(registry.get_tool("run_command").is_some(), "{paths:?}");
+        }
     }
 }
 
