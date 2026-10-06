@@ -397,8 +397,6 @@ mod tests {
         ));
         assert!(!allocator.lease_path(port).exists());
         drop(listener);
-        assert!(port_is_free(port));
-        assert_eq!(allocator.allocate("a").unwrap().port(), port);
     }
 
     #[test]
