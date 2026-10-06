@@ -1099,15 +1099,50 @@ async fn run_agent(
     Ok(())
 }
 
+async fn build_mcp_task_manager(
+    provider: std::sync::Arc<OllamaProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+    lease_path: &std::path::Path,
+    escalation_path: &std::path::Path,
+    action_audit_path: &std::path::Path,
+) -> Result<std::sync::Arc<harness::task::TaskManager>, Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+    use harness::leases::JsonlLeaseStore;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
+    use std::sync::Arc;
+
+    let identities = match harness::identity::IdentityCatalog::load_default() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            tracing::warn!(%error, "identity catalog unavailable; restored tasks with an identity will fail closed");
+            harness::identity::IdentityCatalog::default()
+        }
+    };
+    Ok(Arc::new(
+        TaskManager::restore(
+            DEFAULT_MAX_CONCURRENT_TASKS,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(queue_path)?),
+            Arc::new(JsonlLeaseStore::open(lease_path)?),
+            provider.clone(),
+            &identities,
+        )
+        .await?
+        .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
+        .with_action_log(harness::action_auditor::ActionAuditLog::file(
+            action_audit_path,
+        ))
+        .with_action_model(provider, model),
+    ))
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::escalation::EscalationLog;
-    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
-    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
-    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
@@ -1116,29 +1151,15 @@ async fn run_mcp_server(
     let lease_path = resolve_lease_path(&queue_path);
     let escalation_path = resolve_escalation_path(&queue_path);
     let action_audit_path = resolve_action_audit_path(&queue_path);
-    let identities = match harness::identity::IdentityCatalog::load_default() {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            tracing::warn!(%error, "identity catalog unavailable; restored tasks with an identity will fail closed");
-            harness::identity::IdentityCatalog::default()
-        }
-    };
-    let task_manager = Arc::new(
-        TaskManager::restore(
-            DEFAULT_MAX_CONCURRENT_TASKS,
-            Box::new(HybridPolicy::default()),
-            Box::new(JsonlQueueStore::open(&queue_path)?),
-            Arc::new(JsonlLeaseStore::open(&lease_path)?),
-            provider.clone(),
-            &identities,
-        )
-        .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?))
-        .with_action_log(harness::action_auditor::ActionAuditLog::file(
-            &action_audit_path,
-        ))
-        .with_action_model(provider.clone(), model),
-    );
+    let task_manager = build_mcp_task_manager(
+        provider.clone(),
+        model,
+        &queue_path,
+        &lease_path,
+        &escalation_path,
+        &action_audit_path,
+    )
+    .await?;
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {}, action audit: {})",
@@ -1226,6 +1247,25 @@ mod tests {
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
     };
+
+    #[tokio::test]
+    async fn the_production_mcp_task_manager_has_a_file_backed_audit_log_and_a_model_auditor() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("action_audit.jsonl");
+        let provider = std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+        let manager = build_mcp_task_manager(
+            provider,
+            "strong-model",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            &dir.path().join("escalations.jsonl"),
+            &audit_path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.action_log_path(), Some(audit_path));
+        assert!(manager.has_action_model());
+    }
 
     fn fixture_run(scenario: &str) -> SweBenchRunResult {
         SweBenchRunResult {

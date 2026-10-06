@@ -536,6 +536,20 @@ impl TaskManager {
         self
     }
 
+    pub fn action_log_path(&self) -> Option<std::path::PathBuf> {
+        self.runner
+            .action_policy
+            .read()
+            .unwrap()
+            .log
+            .file_path()
+            .map(std::path::Path::to_path_buf)
+    }
+
+    pub fn has_action_model(&self) -> bool {
+        self.runner.action_policy.read().unwrap().model.is_some()
+    }
+
     /// The escalation log, for producers building an
     /// [`Escalator`](crate::escalation::Escalator) and for consumers
     /// checking [`production_held`](EscalationLog::production_held).

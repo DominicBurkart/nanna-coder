@@ -117,6 +117,13 @@ impl ActionAuditLog {
         }
     }
 
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        match &self.backing {
+            Backing::File(path) => Some(path),
+            Backing::Memory(_) => None,
+        }
+    }
+
     /// Append `verdict` for `review`.
     pub fn append(
         &self,
