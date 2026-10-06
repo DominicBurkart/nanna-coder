@@ -80,6 +80,14 @@ pub async fn handle_assign_task(
 
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
     let card = spawn_gate.context().catalog().get(&identity);
+    let dev_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
+        Some(value) => value.parse::<DevLoop>().map_err(|e| e.to_string())?,
+        None => card.map_or(DevLoop::Inner, |card| card.identity.dev_loop),
+    };
+    let requested_effect = match params.get("requested_effect").and_then(|v| v.as_str()) {
+        Some(value) => value.parse::<EffectClass>().map_err(|e| e.to_string())?,
+        None => card.map_or(EffectClass::None, |card| card.scope.max_effect),
+    };
     let repo =
         crate::scope::origin_slug(&repo_path).unwrap_or_else(|| repo_path.display().to_string());
     let request = SpawnRequest {
@@ -90,8 +98,8 @@ pub async fn handle_assign_task(
         ),
         identity,
         subtask: description,
-        dev_loop: card.map_or(DevLoop::Inner, |card| card.identity.dev_loop),
-        requested_effect: card.map_or(EffectClass::None, |card| card.scope.max_effect),
+        dev_loop,
+        requested_effect,
     };
     let allowed = spawn_gate
         .check(request)
@@ -569,6 +577,62 @@ mod tests {
         assert!(err.contains("scope.repos"), "{err}");
         assert!(err.contains("github.com/example/other"), "{err}");
         assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_carries_the_callers_effect_and_loop_to_the_gate() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        for (field, value, code) in [
+            ("requested_effect", "production", "effect_above_ceiling"),
+            ("dev_loop", "outer", "loop_mismatch"),
+        ] {
+            let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+            request[field] = serde_json::json!(value);
+            let err = assign(&manager, &provider, &gate, request)
+                .await
+                .unwrap_err();
+            assert!(err.contains("spawn refused"), "{err}");
+            let log = gate.log().entries().unwrap();
+            let last = log.last().unwrap();
+            assert!(!last.verdict.is_allow());
+            assert!(
+                serde_json::to_string(&last.verdict).unwrap().contains(code),
+                "{field}: {:?}",
+                last.verdict
+            );
+        }
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_an_unknown_effect_or_loop() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        for (field, value) in [("requested_effect", "galaxy"), ("dev_loop", "sideways")] {
+            let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+            request[field] = serde_json::json!(value);
+            assert!(assign(&manager, &provider, &gate, request).await.is_err());
+        }
+        assert!(gate.log().entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_accepts_the_cards_own_effect_and_loop() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        request["dev_loop"] = serde_json::json!("inner");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
     }
 
     #[tokio::test]
