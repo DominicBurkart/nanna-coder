@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod assets;
 pub mod backlog;
 pub mod capabilities;
 pub mod container;

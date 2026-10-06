@@ -172,6 +172,11 @@ enum Commands {
         #[command(subcommand)]
         command: DeployCommands,
     },
+    /// Inspect the state-asset manifest (.nanna/effects.toml)
+    Effects {
+        #[command(subcommand)]
+        command: EffectsCommands,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -214,6 +219,31 @@ enum AgentsAction {
         /// Repository whose .nanna/agents/ overrides are layered on top.
         #[arg(long)]
         repo: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GraphFormat {
+    Text,
+    Mermaid,
+}
+
+#[derive(Subcommand)]
+enum EffectsCommands {
+    /// Print the asset graph declared in .nanna/effects.toml
+    Graph {
+        /// Repository root containing .nanna/effects.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Output format
+        #[arg(long, value_enum, default_value = "text")]
+        format: GraphFormat,
+    },
+    /// Write a proposed manifest derived from sqlx migrations and actix routes
+    Propose {
+        /// Repository root to write .nanna/effects.proposed.toml into (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -451,6 +481,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_escalation_resolve(&id, path)?;
         }
         Commands::Deploy { command } => run_deploy(command).await?,
+        Commands::Effects { command } => {
+            if let Err(err) = run_effects(command) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
         Commands::SweBenchReport {
             input,
             output_dir,
@@ -525,6 +561,35 @@ async fn run_fake_to_a_stop(
 
 const NO_REAL_TARGET: &str =
     "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+fn run_effects(command: EffectsCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        EffectsCommands::Graph { repo_path, format } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let graph = harness::assets::AssetGraph::load_from_repo(&repo)?;
+            for warning in graph.warnings(Some(&repo)) {
+                eprintln!("warning: {warning}");
+            }
+            match format {
+                GraphFormat::Text => print!("{}", graph.render_text()),
+                GraphFormat::Mermaid => print!("{}", graph.render_mermaid()),
+            }
+        }
+        EffectsCommands::Propose { repo_path } => {
+            let repo = match repo_path {
+                Some(p) => p,
+                None => std::env::current_dir()?,
+            };
+            let path = harness::assets::propose_in_repo(&repo)?;
+            println!("Wrote {}", path.display());
+            println!("Review it and move it to .nanna/effects.toml to adopt it; it is never loaded automatically.");
+        }
+    }
+    Ok(())
+}
 
 async fn run_deploy(command: DeployCommands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
