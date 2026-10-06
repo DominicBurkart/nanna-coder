@@ -87,6 +87,27 @@ impl LeaseName {
         Self::new(LeaseKind::Deploy, repo, env)
     }
 
+    /// `deploy:<repo>/<image>:<env>`: a rollout of `image` from `repo` to
+    /// `env`. Two repositories publishing the same image name hold different
+    /// leases; the same repository and image contend per repository, as
+    /// [`LeaseName::deploy`] does.
+    ///
+    /// ```
+    /// use harness::leases::LeaseName;
+    ///
+    /// let a = LeaseName::deploy_image("example/one", "app", "prod");
+    /// assert_eq!(a.to_string(), "deploy:example/one/app:prod");
+    /// assert_ne!(a, LeaseName::deploy_image("example/two", "app", "prod"));
+    /// assert_ne!(a, LeaseName::deploy_image("example/one", "api", "prod"));
+    /// ```
+    pub fn deploy_image(
+        repo: impl AsRef<str>,
+        image: impl AsRef<str>,
+        env: impl Into<String>,
+    ) -> Self {
+        Self::deploy(format!("{}/{}", repo.as_ref(), image.as_ref()), env)
+    }
+
     /// `branch:<repo>:<branch>`: pushes to `branch`.
     pub fn branch(repo: impl Into<String>, branch: impl Into<String>) -> Self {
         Self::new(LeaseKind::Branch, repo, branch)
