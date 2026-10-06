@@ -45,7 +45,12 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "AGENTS.md",
     "evals/cases/**",
     "harness/src/protected.rs",
-    "auditor/**",
+    ".gitattributes",
+    ".gitmodules",
+    "harness/src/scope.rs",
+    "CODEOWNERS",
+    "docs/CODEOWNERS",
+    "harness/src/auditor/**",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -286,7 +291,12 @@ mod tests {
             ("AGENTS.md", "AGENTS.md"),
             ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
             ("harness/src/protected.rs", "harness/src/protected.rs"),
-            ("auditor/**", "auditor/src/lib.rs"),
+            (".gitattributes", ".gitattributes"),
+            (".gitmodules", ".gitmodules"),
+            ("harness/src/scope.rs", "harness/src/scope.rs"),
+            ("CODEOWNERS", "CODEOWNERS"),
+            ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+            ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
         ];
         let protected = protected();
         for (rule, path) in table {
@@ -329,6 +339,43 @@ mod tests {
     }
 
     #[test]
+    fn every_previously_unprotected_path_is_now_protected() {
+        let protected = protected();
+        for path in [
+            ".gitattributes",
+            ".gitmodules",
+            "harness/src/scope.rs",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            ".github/CODEOWNERS",
+            "harness/src/auditor/mod.rs",
+            "harness/src/auditor/review/rules.rs",
+            "harness/src/auditor",
+        ] {
+            assert!(protected.is_protected(Path::new(path)), "{path}");
+        }
+    }
+
+    fn agents_md_protected_paths_line() -> String {
+        include_str!("../../AGENTS.md")
+            .lines()
+            .find(|line| line.contains("PROTECTED_PATTERNS"))
+            .expect("AGENTS.md documents the protected paths")
+            .to_string()
+    }
+
+    #[test]
+    fn agents_md_documents_every_protected_pattern() {
+        let line = agents_md_protected_paths_line();
+        for pattern in PROTECTED_PATTERNS {
+            assert!(
+                line.contains(&format!("`{pattern}`")),
+                "{pattern} missing from AGENTS.md"
+            );
+        }
+    }
+
+    #[test]
     fn matching_ignores_case() {
         let protected = protected();
         for path in [
@@ -349,7 +396,12 @@ mod tests {
             ".DevContainer/devcontainer.json",
             "Evals/Cases/happy-path-001/case.toml",
             "Harness/Src/Protected.rs",
-            "AUDITOR/src/lib.rs",
+            "Harness/SRC/Auditor/mod.rs",
+            ".GitAttributes",
+            ".GITMODULES",
+            "harness/src/SCOPE.rs",
+            "codeowners",
+            "Docs/CodeOwners",
             "Windows.TOML",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
@@ -373,6 +425,12 @@ mod tests {
             "docs/AGENTS.md",
             "harness/src/protected_extra.rs",
             "auditors/x.rs",
+            "auditor/src/lib.rs",
+            "harness/src/auditors/x.rs",
+            "harness/src/scope_extra.rs",
+            "src/CODEOWNERS",
+            "docs/ci/CODEOWNERS",
+            ".gitattributes.bak",
         ] {
             assert!(!protected.is_protected(Path::new(path)), "{path}");
             assert_eq!(protected.check(Path::new(path)), Ok(()));
@@ -461,7 +519,12 @@ mod tests {
                 PathBuf::from("AGENTS.md"),
                 PathBuf::from("evals/cases"),
                 PathBuf::from("harness/src/protected.rs"),
-                PathBuf::from("auditor"),
+                PathBuf::from(".gitattributes"),
+                PathBuf::from(".gitmodules"),
+                PathBuf::from("harness/src/scope.rs"),
+                PathBuf::from("CODEOWNERS"),
+                PathBuf::from("docs/CODEOWNERS"),
+                PathBuf::from("harness/src/auditor"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -494,7 +557,12 @@ mod tests {
                 ("AGENTS.md".to_string(), false),
                 ("evals/cases".to_string(), true),
                 ("harness/src/protected.rs".to_string(), false),
-                ("auditor".to_string(), true),
+                (".gitattributes".to_string(), false),
+                (".gitmodules".to_string(), false),
+                ("harness/src/scope.rs".to_string(), false),
+                ("CODEOWNERS".to_string(), false),
+                ("docs/CODEOWNERS".to_string(), false),
+                ("harness/src/auditor".to_string(), true),
             ]
         );
     }

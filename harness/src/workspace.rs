@@ -1029,7 +1029,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 9] = [
+    const PLACEHOLDER_FILES: [&str; 14] = [
         ".github/CODEOWNERS",
         "codecov.yml",
         "windows.toml",
@@ -1039,6 +1039,11 @@ mod tests {
         "flake.lock",
         "AGENTS.md",
         "harness/src/protected.rs",
+        ".gitattributes",
+        ".gitmodules",
+        "harness/src/scope.rs",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1066,7 +1071,12 @@ mod tests {
             "AGENTS.md",
             "evals/cases",
             "harness/src/protected.rs",
-            "auditor",
+            ".gitattributes",
+            ".gitmodules",
+            "harness/src/scope.rs",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            "harness/src/auditor",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -1120,7 +1130,7 @@ mod tests {
             ".cargo",
             ".devcontainer",
             "evals/cases",
-            "auditor",
+            "harness/src/auditor",
         ] {
             assert!(root.join(dir).is_dir(), "{dir}");
         }

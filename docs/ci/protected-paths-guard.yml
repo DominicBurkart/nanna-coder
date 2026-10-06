@@ -78,7 +78,12 @@ jobs:
             "AGENTS.md"
             "evals/cases/**"
             "harness/src/protected.rs"
-            "auditor/**"
+            ".gitattributes"
+            ".gitmodules"
+            "harness/src/scope.rs"
+            "CODEOWNERS"
+            "docs/CODEOWNERS"
+            "harness/src/auditor/**"
           )
           shopt -s nocasematch
           VIOLATIONS=()

@@ -4142,7 +4142,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 21] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 26] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4163,7 +4163,12 @@ mod tests {
         ("AGENTS.md", "AGENTS.md"),
         ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
         ("harness/src/protected.rs", "harness/src/protected.rs"),
-        ("auditor/**", "auditor/src/lib.rs"),
+        (".gitattributes", ".gitattributes"),
+        (".gitmodules", ".gitmodules"),
+        ("harness/src/scope.rs", "harness/src/scope.rs"),
+        ("CODEOWNERS", "CODEOWNERS"),
+        ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
