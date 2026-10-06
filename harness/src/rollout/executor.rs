@@ -335,14 +335,13 @@ impl RolloutExecutor {
                 RolloutState::RollingBack => {
                     let stalled = record.clone();
                     match self.roll_back(record).await {
-                        Err(error @ RolloutError::Conflict { .. }) => Err(error),
-                        Err(error) => {
+                        Err(error) if !matches!(error, RolloutError::Conflict { .. }) => {
                             let step = stalled.breach.as_ref().map_or(0, |b| b.step);
                             let summary =
                                 format!("rollback failed ({error}): a human must finish it");
                             return Err(self.stop_with(&stalled, step, summary, error).await);
                         }
-                        Ok(()) => Ok(()),
+                        other => other,
                     }
                 }
                 RolloutState::Parked {
@@ -3052,6 +3051,26 @@ mod tests {
         let executor = executor_halting_after(&rig, trigger);
         assert_conflict(executor.roll_back(record).await);
         effects(&rig)[2..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_halt_during_a_resumed_rollback_ends_the_run_halted_without_a_human_stop() {
+        let rig = rig();
+        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let slot = rig.adapter.deploy_inactive(V2).await.unwrap();
+        let mut crafted = record.clone();
+        crafted.state = RolloutState::RollingBack;
+        crafted.slot = Some(slot.clone());
+        rig.executor
+            .log()
+            .append(Some(&record.state), &mut crafted)
+            .unwrap();
+        let executor = executor_halting_after(&rig, AdapterCall::SetTraffic(slot, 0));
+        let finished = executor.run(&record.id).await.unwrap();
+        assert_eq!(finished.state, RolloutState::Halted);
+        assert!(!effects(&rig)
+            .iter()
+            .any(|c| matches!(c, AdapterCall::RollbackTo(_))));
     }
 
     #[tokio::test]
