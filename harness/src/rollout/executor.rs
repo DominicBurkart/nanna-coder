@@ -1,4 +1,3 @@
-use super::adapter::{FakeAdapter, FallbackPolicy, Slot, TargetAdapter};
 use super::health::{check_health, FakeHealthSource, HealthBreach, HealthError, HealthSource};
 use super::hooks::{AuditHook, EscalationHook, LogEscalation, NoAudit, RolloutEscalation};
 use super::incident::{Incident, IncidentResponder, ProposedAction};
@@ -11,6 +10,7 @@ use crate::escalation::EscalationLog;
 use crate::leases::{
     acquire_all, Clock, InMemoryLeaseStore, LeaseError, LeaseStore, SimulatedClock,
 };
+use crate::rollout::adapter::{FakeAdapter, FallbackPolicy, Slot, TargetAdapter};
 use crate::windows::WindowSet;
 use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
@@ -2751,5 +2751,354 @@ mod tests {
         );
         assert_eq!(adapter.current(), V2);
         assert_eq!(health.calls().len(), 3 * 31);
+    }
+
+    const BLUE_GREEN_HEALTH: &str = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"internal\"\n[rollout]\nstrategy = \"blue-green\"\nmin_step_duration = \"1h\"\n[health]\nendpoints = [\"/health/v1\"]\nerror_rate_max = 0.01\nlatency_p99_max_ms = 800\nbake_time = \"10m\"\n[rollback]\nautomatic = true\non_breach = \"rollback\"\nretain_for = \"2d\"\n";
+
+    fn blue_green_plan() -> DeployPlan {
+        DeployTemplate::parse(BLUE_GREEN_HEALTH)
+            .unwrap()
+            .plan("sandbox")
+            .unwrap()
+    }
+
+    fn halt_now(log: &RolloutLog) {
+        let id = log.latest().unwrap().into_keys().next().unwrap();
+        log.halt(&id, t0()).unwrap();
+    }
+
+    struct HaltAfterCall {
+        inner: Arc<FakeAdapter>,
+        log: RolloutLog,
+        trigger: AdapterCall,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl HaltAfterCall {
+        fn after(&self) {
+            let last = self.inner.calls().last().cloned();
+            if last.as_ref() == Some(&self.trigger)
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                halt_now(&self.log);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TargetAdapter for HaltAfterCall {
+        async fn deploy_inactive(
+            &self,
+            image: &str,
+        ) -> Result<Slot, crate::rollout::adapter::AdapterError> {
+            let out = self.inner.deploy_inactive(image).await;
+            self.after();
+            out
+        }
+        async fn set_traffic(
+            &self,
+            slot: &Slot,
+            percent: u8,
+        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+            let out = self.inner.set_traffic(slot, percent).await;
+            self.after();
+            out
+        }
+        async fn current_image(&self) -> Result<String, crate::rollout::adapter::AdapterError> {
+            let out = self.inner.current_image().await;
+            self.after();
+            out
+        }
+        async fn rollback_to(
+            &self,
+            image: &str,
+        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+            let out = self.inner.rollback_to(image).await;
+            self.after();
+            out
+        }
+        async fn retire(&self, slot: &Slot) -> Result<(), crate::rollout::adapter::AdapterError> {
+            let out = self.inner.retire(slot).await;
+            self.after();
+            out
+        }
+        async fn mirror(
+            &self,
+            slot: &Slot,
+            percent: u8,
+        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+            let out = self.inner.mirror(slot, percent).await;
+            self.after();
+            out
+        }
+        async fn swap(
+            &self,
+        ) -> Result<crate::rollout::adapter::Swapped, crate::rollout::adapter::AdapterError>
+        {
+            let out = self.inner.swap().await;
+            self.after();
+            out
+        }
+        async fn set_fallback(
+            &self,
+            slot: &Slot,
+            policy: &FallbackPolicy,
+        ) -> Result<FallbackSupport, crate::rollout::adapter::AdapterError> {
+            let out = self.inner.set_fallback(slot, policy).await;
+            self.after();
+            out
+        }
+        async fn clear_fallback(
+            &self,
+            slot: &Slot,
+        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+            let out = self.inner.clear_fallback(slot).await;
+            self.after();
+            out
+        }
+    }
+
+    fn executor_halting_after(rig: &Rig, trigger: AdapterCall) -> RolloutExecutor {
+        let log = RolloutLog::open(&rig.path).unwrap();
+        let adapter = Arc::new(HaltAfterCall {
+            inner: rig.adapter.clone(),
+            log: log.clone(),
+            trigger,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        RolloutExecutor::new(
+            log,
+            rig.leases.clone(),
+            WindowSet::default(),
+            rig.clock.clone(),
+            adapter,
+            rig.health.clone(),
+        )
+        .with_shadow_source(rig.shadow.clone())
+        .with_config(one_poll_per_step())
+    }
+
+    async fn stale_record(rig: &Rig, plan: DeployPlan) -> RolloutRecord {
+        let record = rig.executor.start(plan, V2).await.unwrap();
+        rig.executor.halt(&record.id).unwrap();
+        record
+    }
+
+    fn assert_conflict<T: std::fmt::Debug>(outcome: Result<T, RolloutError>) {
+        assert!(
+            matches!(outcome, Err(RolloutError::Conflict { .. })),
+            "{outcome:?}"
+        );
+    }
+
+    fn effects(rig: &Rig) -> Vec<AdapterCall> {
+        rig.adapter
+            .calls()
+            .into_iter()
+            .filter(|c| *c != AdapterCall::CurrentImage)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_deploy_stops_deploy_inactive() {
+        let rig = rig();
+        let record = stale_record(&rig, plan("sandbox")).await;
+        assert_conflict(rig.executor.step(record, 0).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_fallback_stops_set_fallback() {
+        let rig = rig();
+        let mut record = stale_record(&rig, plan("sandbox")).await;
+        record.slot = Some(Slot::new("slot-1"));
+        assert_conflict(rig.executor.step(record, 0).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_mirror_stops_the_shadow_step() {
+        let rig = rig();
+        let mut record = stale_record(&rig, shadow_plan()).await;
+        record.slot = Some(Slot::new("slot-1"));
+        record.fallback = Some(FallbackSupport::Native);
+        assert_conflict(rig.executor.step(record, 0).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_swap_stops_the_swap() {
+        let rig = rig();
+        let mut record = stale_record(&rig, blue_green_plan()).await;
+        record.state = RolloutState::Step(0);
+        record.slot = Some(Slot::new("slot-1"));
+        record.fallback = Some(FallbackSupport::Native);
+        assert_conflict(rig.executor.step(record, 0).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    fn retire_ready(mut record: RolloutRecord) -> RolloutRecord {
+        record.slot = Some(Slot::new("slot-1"));
+        record.fallback = Some(FallbackSupport::Native);
+        record.retained_slot = Some(Slot::new("slot-0"));
+        record.retained_since = Some(t0() - Duration::days(3));
+        record
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_retired_slots_fallback_is_cleared_stops_clear_fallback() {
+        let rig = rig();
+        let record = retire_ready(stale_record(&rig, blue_green_plan()).await);
+        assert_conflict(rig.executor.step(record, 1).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_the_retired_slots_fallback_is_cleared_stops_retire() {
+        let rig = rig();
+        let record = rig.executor.start(blue_green_plan(), V2).await.unwrap();
+        let record = retire_ready(record);
+        let executor = executor_halting_after(
+            &rig,
+            AdapterCall::ClearFallback(record.retained_slot.clone().unwrap()),
+        );
+        assert_conflict(executor.step(record, 1).await);
+        let calls = effects(&rig);
+        assert_eq!(calls, vec![AdapterCall::ClearFallback(Slot::new("slot-0"))]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_the_final_clear_fallback_stops_completion() {
+        let rig = rig();
+        let mut record = stale_record(&rig, plan("sandbox")).await;
+        record.slot = Some(Slot::new("slot-1"));
+        let last = record.plan.steps.len() - 1;
+        assert_conflict(rig.executor.advance_or_complete(record, last).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    struct HaltOnNthNow {
+        inner: Arc<SimulatedClock>,
+        log: RolloutLog,
+        nth: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Clock for HaltOnNthNow {
+        fn now(&self) -> DateTime<Utc> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.nth {
+                halt_now(&self.log);
+            }
+            self.inner.now()
+        }
+
+        fn sleep(&self, duration: Duration) -> crate::leases::SleepFuture<'_> {
+            self.inner.sleep(duration)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_halt_at_the_end_of_a_shadow_bake_stops_the_mirror_reset() {
+        let rig = rig();
+        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
+        let log = RolloutLog::open(&rig.path).unwrap();
+        let clock = Arc::new(HaltOnNthNow {
+            inner: rig.clock.clone(),
+            log: log.clone(),
+            nth: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executor = RolloutExecutor::new(
+            log,
+            rig.leases.clone(),
+            WindowSet::default(),
+            clock,
+            rig.adapter.clone(),
+            rig.health.clone(),
+        )
+        .with_shadow_source(rig.shadow.clone())
+        .with_config(one_poll_per_step());
+        let mut record = record;
+        record.slot = Some(Slot::new("slot-1"));
+        record.plan.steps[0].min_duration = Duration::zero();
+        assert_conflict(executor.bake(record, 0, t0()).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    fn rolling_back(record: RolloutRecord) -> RolloutRecord {
+        let mut record = retire_ready(record);
+        record.state = RolloutState::RollingBack;
+        record
+    }
+
+    #[tokio::test]
+    async fn a_halt_before_a_rollback_stops_restoring_the_retained_slot() {
+        let rig = rig();
+        let record = rolling_back(stale_record(&rig, blue_green_plan()).await);
+        assert_conflict(rig.executor.roll_back(record).await);
+        assert_eq!(effects(&rig), vec![]);
+    }
+
+    async fn rollback_halted_after(trigger: AdapterCall) -> Vec<AdapterCall> {
+        let rig = rig();
+        let slot = rig.adapter.deploy_inactive(V2).await.unwrap();
+        rig.adapter
+            .set_fallback(&slot, &FallbackPolicy::default())
+            .await
+            .unwrap();
+        let record = rig.executor.start(blue_green_plan(), V2).await.unwrap();
+        let record = rolling_back(record);
+        let executor = executor_halting_after(&rig, trigger);
+        assert_conflict(executor.roll_back(record).await);
+        effects(&rig)[2..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_restoring_the_retained_slot_stops_draining_the_candidate() {
+        let old = Slot::new("slot-0");
+        assert_eq!(
+            rollback_halted_after(AdapterCall::SetTraffic(old.clone(), 100)).await,
+            vec![AdapterCall::SetTraffic(old, 100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_draining_the_candidate_stops_the_mirror_reset() {
+        let slot = Slot::new("slot-1");
+        assert_eq!(
+            rollback_halted_after(AdapterCall::SetTraffic(slot.clone(), 0)).await,
+            vec![
+                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
+                AdapterCall::SetTraffic(slot, 0)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_the_mirror_reset_stops_clear_fallback_in_a_rollback() {
+        let slot = Slot::new("slot-1");
+        assert_eq!(
+            rollback_halted_after(AdapterCall::Mirror(slot.clone(), 0)).await,
+            vec![
+                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
+                AdapterCall::SetTraffic(slot.clone(), 0),
+                AdapterCall::Mirror(slot, 0)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_clearing_the_candidates_fallback_stops_rollback_to() {
+        let slot = Slot::new("slot-1");
+        assert_eq!(
+            rollback_halted_after(AdapterCall::ClearFallback(slot.clone())).await,
+            vec![
+                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
+                AdapterCall::SetTraffic(slot.clone(), 0),
+                AdapterCall::Mirror(slot.clone(), 0),
+                AdapterCall::ClearFallback(slot)
+            ]
+        );
     }
 }
