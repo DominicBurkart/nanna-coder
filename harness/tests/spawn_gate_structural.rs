@@ -106,3 +106,14 @@ fn raw_task_manager_submission_is_only_reachable_with_an_allowed_proof_in_produc
     let handlers = code_of(&all, "mcp/handlers.rs");
     assert!(handlers.contains("allowed,"));
 }
+
+#[test]
+fn raw_task_manager_submission_methods_are_not_public() {
+    let code = code_of(&sources(), "task.rs");
+    for name in ["submit", "submit_with_identity", "submit_task"] {
+        let public = format!("pub async fn {name}(");
+        assert!(!code.contains(&public), "`{name}` must not be public");
+        let crate_only = format!("pub(crate) async fn {name}(");
+        assert!(code.contains(&crate_only), "`{name}` must be pub(crate)");
+    }
+}
