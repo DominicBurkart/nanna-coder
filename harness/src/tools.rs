@@ -94,6 +94,12 @@ pub struct ActionSubject {
     pub paths: Vec<String>,
 }
 
+/// Tools whose reach cannot be confined to path globs. `run_command` hands
+/// the model `sh -c` inside the container, so `scope.paths` and
+/// `scope.read_paths` cannot apply to it; [`ToolRegistry::scoped_for`] removes
+/// these tools for any identity where [`AgentIdentity::restricts_paths`] holds.
+pub const PATH_UNSCOPABLE_TOOLS: &[&str] = &["run_command"];
+
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     identity: Option<String>,
@@ -104,6 +110,20 @@ pub struct ToolRegistry {
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_clock: Option<ActionClock>,
+    workspace_root: Option<PathBuf>,
+}
+
+fn relative_to_root(root: &Path, path: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let canonical = root.canonicalize().ok();
+    let relative = [Some(root), canonical.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|root| candidate.strip_prefix(root).ok());
+    relative.map(|relative| relative.to_string_lossy().into_owned())
 }
 
 pub type ActionClock = Arc<dyn Fn() -> chrono::DateTime<Utc> + Send + Sync>;
@@ -120,6 +140,7 @@ impl ToolRegistry {
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
             action_clock: None,
+            workspace_root: None,
         }
     }
 
@@ -153,6 +174,9 @@ impl ToolRegistry {
     /// `scope.max_effect`. Everything else is dropped, so it never appears in
     /// the definitions sent to the model. Calls to dropped or unknown tools
     /// are refused with [`ToolError::ScopeDenied`] and recorded.
+    ///
+    /// A tool in [`PATH_UNSCOPABLE_TOOLS`] is also dropped when the identity
+    /// restricts paths, because path globs cannot be applied to a shell.
     ///
     /// ```
     /// use harness::effects::EffectClass;
@@ -190,8 +214,11 @@ impl ToolRegistry {
     /// assert_eq!(scoped.denial_count(), 0);
     /// ```
     pub fn scoped_for(mut self, identity: &AgentIdentity) -> Self {
+        let restricted = identity.restricts_paths();
         let keep = |name: &String, tool: &mut Box<dyn Tool>| {
-            identity.allows_tool(name) && identity.allows_effect(tool.effect_class())
+            identity.allows_tool(name)
+                && identity.allows_effect(tool.effect_class())
+                && !(restricted && PATH_UNSCOPABLE_TOOLS.contains(&name.as_str()))
         };
         self.tools.retain(keep);
         self.identity = Some(identity.name().to_string());
@@ -300,11 +327,12 @@ impl ToolRegistry {
             .as_ref()
             .map(|subject| subject.task_id.clone())
             .unwrap_or_else(|| TaskId(UNSCOPED_IDENTITY.to_string()));
+        let (review_args, call_path) = self.reviewable_args(name, args);
         let review = ActionReview {
             identity,
             task_id,
             tool: name.to_string(),
-            args: args.clone(),
+            args: review_args,
             effect_class: class,
             prior_actions: self
                 .action_prior
@@ -314,6 +342,8 @@ impl ToolRegistry {
         };
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
+                let mut paths = subject.paths.clone();
+                paths.extend(call_path);
                 let ctx = ActionContext {
                     max_effect: subject.max_effect,
                     window: subject.window.as_deref(),
@@ -322,7 +352,7 @@ impl ToolRegistry {
                         branch: subject.branch.as_deref(),
                         pr: subject.pr,
                         environment: subject.environment.as_deref(),
-                        paths: &subject.paths,
+                        paths: &paths,
                     },
                     now: self
                         .action_clock
@@ -357,6 +387,27 @@ impl ToolRegistry {
             }
             ActionVerdict::Block { reasons } => Err(ActionDenied::Block { reasons }),
             ActionVerdict::Escalate { reasons } => Err(ActionDenied::Escalate { reasons }),
+        }
+    }
+
+    fn reviewable_args(&self, name: &str, args: &Value) -> (Value, Option<String>) {
+        if name != "write_file" {
+            return (args.clone(), None);
+        }
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return (args.clone(), None);
+        };
+        let relative = self
+            .workspace_root
+            .as_deref()
+            .and_then(|root| relative_to_root(root, path));
+        match relative {
+            Some(relative) => {
+                let mut rewritten = args.clone();
+                rewritten["path"] = Value::String(relative.clone());
+                (rewritten, Some(relative))
+            }
+            None => (args.clone(), Some(path.to_string())),
         }
     }
 
@@ -2346,6 +2397,7 @@ fn create_tool_registry_with_scope(
 ) -> ToolRegistry {
     let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
+    registry.workspace_root = Some(workspace_root.to_path_buf());
     registry.register(Box::new(EchoTool::new()));
     registry.register(Box::new(CalculatorTool::new()));
     registry.register(Box::new(ReadFileTool::scoped(root.clone(), scope.clone())));
@@ -2938,7 +2990,8 @@ mod tests {
             port: None,
             needs_cleanup: false,
         });
-        let identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        let mut identity = identity_with(EffectClass::Workspace, &["run_command", "read_file"]);
+        identity.scope.paths = vec!["**".to_string()];
         let registry = create_container_tool_registry_for(
             Path::new("."),
             std::sync::Arc::clone(&handle),
@@ -3729,6 +3782,110 @@ mod tests {
                 "blocked for the test",
             )]))
         }
+    }
+
+    struct PathCapturingAuditor {
+        seen: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for PathCapturingAuditor {
+        fn name(&self) -> &str {
+            "path-capturing"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &ActionReview,
+            context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            self.seen.lock().unwrap().push(context.lease.paths.to_vec());
+            Ok(ActionVerdict::Allow)
+        }
+    }
+
+    fn rule_gated_registry(root: &std::path::Path) -> ToolRegistry {
+        let auditor = crate::action_auditor::RuleActionAuditor::new(
+            Arc::new(crate::windows::WindowSet::default()),
+            Arc::new(crate::leases::InMemoryLeaseStore::default()),
+            chrono::Duration::minutes(10),
+        );
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(auditor),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        create_tool_registry(root).with_action_gate(gate, subject(EffectClass::Workspace))
+    }
+
+    #[tokio::test]
+    async fn write_file_to_an_absolute_path_outside_the_workspace_is_denied_by_the_auditor() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = rule_gated_registry(dir.path());
+        for path in ["/etc/cron.d/x", "/tmp/nanna-outside.txt"] {
+            let result = registry
+                .execute("write_file", json!({ "path": path, "content": "x" }))
+                .await;
+            assert!(matches!(result, Err(ToolError::ActionDenied(_))), "{path}");
+        }
+        let escaped = format!("{}/../outside.txt", dir.path().display());
+        let result = registry
+            .execute("write_file", json!({ "path": escaped, "content": "x" }))
+            .await;
+        assert!(matches!(result, Err(ToolError::ActionDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn write_file_to_an_absolute_path_inside_the_workspace_is_reviewed_as_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = rule_gated_registry(dir.path());
+        let absolute = dir.path().join("src/lib.rs");
+        let outcome = registry
+            .execute(
+                "write_file",
+                json!({ "path": absolute.display().to_string(), "content": "x" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome["success"], true);
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews[0].review.args["path"], "src/lib.rs");
+        assert!(reviews[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn write_file_reviews_carry_the_call_path_and_the_task_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = Arc::new(PathCapturingAuditor {
+            seen: Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(ActionGate::new(
+            auditor.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut task_subject = subject(EffectClass::Workspace);
+        task_subject.paths = vec!["src/**".to_string()];
+        let registry = create_tool_registry(dir.path()).with_action_gate(gate, task_subject);
+        registry
+            .execute("write_file", json!({ "path": "src/a.rs", "content": "x" }))
+            .await
+            .unwrap();
+        let seen = auditor.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![vec!["src/**".to_string(), "src/a.rs".to_string()]]
+        );
+    }
+
+    #[test]
+    fn a_path_restricted_identity_loses_run_command() {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
+        registry.register(StubTool::boxed("write_file", EffectClass::Workspace));
+        let mut narrow = identity_with(EffectClass::Workspace, &["run_command", "write_file"]);
+        narrow.scope.paths = vec!["src/**".to_string()];
+        let scoped = registry.scoped_for(&narrow);
+        assert!(scoped.get_tool("run_command").is_none());
+        assert!(scoped.get_tool("write_file").is_some());
     }
 
     fn subject(max_effect: EffectClass) -> ActionSubject {
