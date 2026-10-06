@@ -309,13 +309,43 @@ struct TaskRunner {
     leases: Arc<dyn LeaseStore>,
     identities: RwLock<HashMap<TaskId, AgentIdentity>>,
     audit: std::sync::RwLock<Arc<dyn AuditHook>>,
-    /// Reviews every effectful action a dispatched task's agent attempts.
-    /// Defaults to a [`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)
-    /// sharing this runner's own `leases`, so a lease it acquires is
-    /// released with the rest of the task's leases; [`TaskManager::with_action_gate`]
-    /// replaces it with a stronger one (typically a
-    /// [`ModelActionAuditor`](crate::action_auditor::ModelActionAuditor)).
-    action_gate: std::sync::RwLock<Arc<ActionGate>>,
+    /// How each dispatched task's gate is built: per repository, from the
+    /// repo's own `.nanna/windows.toml`, over this runner's `leases`.
+    action_policy: std::sync::RwLock<ActionPolicy>,
+}
+
+struct ActionPolicy {
+    gate: Option<Arc<ActionGate>>,
+    windows: Option<Arc<crate::windows::WindowSet>>,
+    log: crate::action_auditor::ActionAuditLog,
+    model: Option<(Arc<dyn ModelProvider>, String)>,
+}
+
+impl ActionPolicy {
+    fn in_memory() -> Self {
+        Self {
+            gate: None,
+            windows: None,
+            log: crate::action_auditor::ActionAuditLog::in_memory(),
+            model: None,
+        }
+    }
+}
+
+fn load_repo_windows(repo: &std::path::Path) -> Arc<crate::windows::WindowSet> {
+    let path = repo
+        .join(crate::deploy::DEPLOY_DIR)
+        .join(crate::windows::WINDOWS_FILE_NAME);
+    if !path.exists() {
+        return Arc::new(crate::windows::WindowSet::default());
+    }
+    match crate::windows::WindowSet::load(&path) {
+        Ok(windows) => Arc::new(windows),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "unreadable availability windows; Sandbox and Production actions stay blocked");
+            Arc::new(crate::windows::WindowSet::default())
+        }
+    }
 }
 
 /// How long the default action gate's [`RuleActionAuditor`] holds a
@@ -323,16 +353,6 @@ struct TaskRunner {
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
 const UNIDENTIFIED_TASK_CEILING: EffectClass = EffectClass::Workspace;
-
-fn default_action_gate(
-    leases: Arc<dyn LeaseStore>,
-    windows: Arc<crate::windows::WindowSet>,
-    log: crate::action_auditor::ActionAuditLog,
-) -> Arc<ActionGate> {
-    let auditor =
-        crate::action_auditor::RuleActionAuditor::new(windows, leases, DEFAULT_ACTION_LEASE_TTL);
-    Arc::new(ActionGate::new(Arc::new(auditor), log))
-}
 
 /// Manages task submission, scheduling and lifecycle.
 ///
@@ -432,11 +452,6 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, QueueStoreError> {
-        let action_gate = default_action_gate(
-            Arc::clone(&leases),
-            Arc::new(crate::windows::WindowSet::default()),
-            crate::action_auditor::ActionAuditLog::in_memory(),
-        );
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -448,7 +463,7 @@ impl TaskManager {
             leases,
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::RwLock::new(Arc::new(NoopAuditHook)),
-            action_gate: std::sync::RwLock::new(action_gate),
+            action_policy: std::sync::RwLock::new(ActionPolicy::in_memory()),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -473,34 +488,52 @@ impl TaskManager {
         self
     }
 
-    /// Review every effectful action (`effect_class() >= Repository`) a
-    /// dispatched task's agent attempts through `gate` instead of the
-    /// default [`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)
-    /// (issue #642). A `Sandbox`/`Production` action always needs the
-    /// strongest configured model per the epic, so most callers will pass a
-    /// [`ModelActionAuditor`](crate::action_auditor::ModelActionAuditor) here.
+    /// Review every effectful action through `gate` instead of the per-repo
+    /// default gate (see [`TaskManager::with_action_log`]).
     ///
     /// Build it over [`TaskManager::leases`], not a fresh store: a lease it
     /// acquires is released with the rest of a task's leases only when it
     /// shares the same store this manager's [`TaskManager::cancel`] and
     /// terminal-transition handling release from.
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
-        *self.runner.action_gate.write().unwrap() = gate;
+        self.runner.action_policy.write().unwrap().gate = Some(gate);
         self
     }
 
-    /// Replace the default action gate with a [`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)
-    /// over `windows` that appends every verdict to `log`, sharing this
-    /// manager's lease store. `windows` is what `Sandbox`/`Production` calls
-    /// are checked against, and a file-backed `log` makes the audit trail
-    /// durable across restarts.
+    /// Check `Sandbox`/`Production` actions of every task against `windows`
+    /// instead of each repository's own `.nanna/windows.toml`, appending
+    /// verdicts to `log`.
     pub fn with_action_policy(
         self,
         windows: Arc<crate::windows::WindowSet>,
         log: crate::action_auditor::ActionAuditLog,
     ) -> Self {
-        let gate = default_action_gate(Arc::clone(&self.runner.leases), windows, log);
-        self.with_action_gate(gate)
+        {
+            let mut policy = self.runner.action_policy.write().unwrap();
+            policy.windows = Some(windows);
+            policy.log = log;
+        }
+        self
+    }
+
+    /// Append every action verdict to `log`, for example a file-backed one so
+    /// the trail survives a restart. Windows still come from each
+    /// repository's `.nanna/windows.toml`.
+    pub fn with_action_log(self, log: crate::action_auditor::ActionAuditLog) -> Self {
+        self.runner.action_policy.write().unwrap().log = log;
+        self
+    }
+
+    /// Have `model`, reached through `provider`, review the `Sandbox` and
+    /// `Production` actions that pass the rule checks. Without it those
+    /// actions are escalated by the rules alone and never allowed.
+    pub fn with_action_model(
+        self,
+        provider: Arc<dyn ModelProvider>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.runner.action_policy.write().unwrap().model = Some((provider, model.into()));
+        self
     }
 
     /// The escalation log, for producers building an
@@ -909,8 +942,31 @@ impl TaskRunner {
         Arc::clone(&self.audit.read().unwrap())
     }
 
-    fn action_gate(&self) -> Arc<ActionGate> {
-        Arc::clone(&self.action_gate.read().unwrap())
+    fn action_gate_for(&self, repo: &std::path::Path) -> Arc<ActionGate> {
+        let policy = self.action_policy.read().unwrap();
+        if let Some(gate) = &policy.gate {
+            return Arc::clone(gate);
+        }
+        let windows = policy
+            .windows
+            .clone()
+            .unwrap_or_else(|| load_repo_windows(repo));
+        let leases = Arc::clone(&self.leases);
+        let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match &policy.model {
+            Some((provider, model)) => Arc::new(crate::action_auditor::ModelActionAuditor::new(
+                Arc::clone(provider),
+                model.clone(),
+                windows,
+                leases,
+                DEFAULT_ACTION_LEASE_TTL,
+            )),
+            None => Arc::new(crate::action_auditor::RuleActionAuditor::new(
+                windows,
+                leases,
+                DEFAULT_ACTION_LEASE_TTL,
+            )),
+        };
+        Arc::new(ActionGate::new(auditor, policy.log.clone()))
     }
 
     /// Transition a task to a new status: update the stored `Task` (status +
@@ -1086,7 +1142,8 @@ impl TaskRunner {
             }
         };
         let subject = action_subject_for(&task_id, &queued, identity.as_ref());
-        let tool_registry = tool_registry.with_action_gate(self.action_gate(), subject);
+        let tool_registry =
+            tool_registry.with_action_gate(self.action_gate_for(&queued.repo_path), subject);
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -1235,20 +1292,6 @@ fn registry_for(
     }
 }
 
-/// The subject a dispatched task's effectful calls are reviewed against:
-/// the identity's effect ceiling (capped at `Workspace` when the task carries
-/// none, so an unidentified task fails closed instead of reaching `Production`),
-/// the branch this task pushes to, and no window, pull request or
-/// environment. Nothing in `Task`/`QueuedTask` names a PR or a target
-/// environment yet -- that lands with the middle/outer-loop work (#647,
-/// #649) -- so `Sandbox`/`Production` calls dispatched through
-/// `TaskRunner` correctly `Block` on a missing lease context
-/// ([`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)) until
-/// then, rather than silently skipping the check. `repo` is
-/// `queued.repo_path`'s filesystem path, not the `owner/name` form
-/// [`ActionSubject::repo`](crate::tools::ActionSubject::repo) is documented
-/// against; harmless today since no lease is ever acquired while `window`
-/// is `None`, but worth fixing alongside the PR/environment metadata.
 fn action_subject_for(
     task_id: &TaskId,
     queued: &QueuedTask,
@@ -1265,7 +1308,9 @@ fn action_subject_for(
         branch: Some(queued.branch.clone()),
         pr: None,
         environment: None,
-        paths: Vec::new(),
+        paths: identity
+            .map(|identity| identity.scope.paths.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1343,7 +1388,7 @@ mod tests {
         }
     }
 
-    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+    pub(super) fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
         use model::types::{FunctionCall, ToolCall};
         ChatResponse {
             choices: vec![Choice {
@@ -1381,7 +1426,9 @@ mod tests {
     }
 
     /// Wrap tool-loop responses with state machine responses for plan/perform/check.
-    fn wrap_with_state_machine_responses(tool_responses: Vec<ChatResponse>) -> Vec<ChatResponse> {
+    pub(super) fn wrap_with_state_machine_responses(
+        tool_responses: Vec<ChatResponse>,
+    ) -> Vec<ChatResponse> {
         // EnrichingEntities: no LLM call
         let mut responses = vec![
             stop_response("Plan: execute the task"), // PlanningEntityModification
@@ -2254,7 +2301,7 @@ mod tests {
         identity
     }
 
-    async fn wait_for_terminal(manager: &TaskManager, task_id: &TaskId) -> TaskStatus {
+    pub(super) async fn wait_for_terminal(manager: &TaskManager, task_id: &TaskId) -> TaskStatus {
         let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
         loop {
             let task = manager.poll(task_id).await.unwrap();
@@ -2318,7 +2365,7 @@ mod tests {
         assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
     }
 
-    fn repository_scoped_identity() -> AgentIdentity {
+    pub(super) fn repository_scoped_identity() -> AgentIdentity {
         let mut identity = crate::identity::example();
         identity.scope.max_effect = EffectClass::Repository;
         identity.scope.tools = vec!["github_pr_status".parse().unwrap()];
@@ -2749,7 +2796,10 @@ mod tests {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::tests::{stop_response, MockProvider};
+    use super::tests::{
+        init_test_git_repo, repository_scoped_identity, stop_response, tool_call_response,
+        wait_for_terminal, wrap_with_state_machine_responses, MockProvider,
+    };
     use super::*;
     use crate::leases::{JsonlLeaseStore, Lease, LeaseError, LeaseName};
     use crate::scheduler::{InMemoryQueueStore, JsonlQueueStore, QueueStore, QueueStoreError};
@@ -2879,7 +2929,7 @@ mod scheduler_tests {
             Arc::new(crate::windows::WindowSet::default()),
             crate::action_auditor::ActionAuditLog::file(&path),
         );
-        let gate = manager.runner.action_gate();
+        let gate = manager.runner.action_gate_for(dir.path());
         let review = crate::action_auditor::ActionReview {
             identity: "x".to_string(),
             task_id: TaskId("t".to_string()),
@@ -2897,6 +2947,154 @@ mod scheduler_tests {
         assert!(gate.run_gate(&review, &ctx).await.is_allow());
         let reopened = crate::action_auditor::ActionAuditLog::file(&path);
         assert_eq!(reopened.entries().unwrap().len(), 1);
+    }
+
+    const BUSINESS_HOURS: &str = "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\", \"sandbox\"]\n";
+
+    fn repo_with_windows(contents: Option<&str>) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        if let Some(contents) = contents {
+            std::fs::create_dir_all(repo.path().join(".nanna")).unwrap();
+            std::fs::write(repo.path().join(".nanna/windows.toml"), contents).unwrap();
+        }
+        repo
+    }
+
+    fn at(day: u32, hour: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, day, hour, 0, 0).unwrap()
+    }
+
+    async fn sandbox_verdict(
+        manager: &TaskManager,
+        repo: &std::path::Path,
+        now: DateTime<Utc>,
+    ) -> crate::action_auditor::ActionVerdict {
+        let review = crate::action_auditor::ActionReview {
+            identity: "x".to_string(),
+            task_id: TaskId("t".to_string()),
+            tool: "sandbox_deploy".to_string(),
+            args: serde_json::json!({}),
+            effect_class: EffectClass::Sandbox,
+            prior_actions: vec![],
+        };
+        let ctx = crate::action_auditor::ActionContext {
+            max_effect: EffectClass::Production,
+            window: None,
+            lease: crate::leases::LeaseContext {
+                repo: "example/repo",
+                pr: Some(7),
+                environment: Some("staging"),
+                ..crate::leases::LeaseContext::default()
+            },
+            now,
+        };
+        manager
+            .runner
+            .action_gate_for(repo)
+            .run_gate(&review, &ctx)
+            .await
+    }
+
+    #[tokio::test]
+    async fn new_manager_reads_each_repos_windows_so_sandbox_is_not_blindly_blocked() {
+        use crate::auditor::VerdictKind;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let configured = repo_with_windows(Some(BUSINESS_HOURS));
+        let unconfigured = repo_with_windows(None);
+
+        let open = sandbox_verdict(&manager, configured.path(), at(5, 12)).await;
+        assert_eq!(open.kind(), VerdictKind::Escalate, "{open:?}");
+
+        let closed = sandbox_verdict(&manager, configured.path(), at(3, 12)).await;
+        assert_eq!(closed.kind(), VerdictKind::Block);
+        assert_eq!(
+            closed.reasons()[0].code,
+            crate::auditor::ReasonCode::WindowClosed
+        );
+        assert!(closed.reasons()[0].detail.contains("is open"));
+
+        let none = sandbox_verdict(&manager, unconfigured.path(), at(5, 12)).await;
+        assert_eq!(none.kind(), VerdictKind::Block);
+        assert!(none.reasons()[0].detail.contains("no availability window"));
+    }
+
+    #[tokio::test]
+    async fn malformed_repo_windows_fail_closed() {
+        use crate::auditor::VerdictKind;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let broken = repo_with_windows(Some("[[window]]\nname = 7\n"));
+        let verdict = sandbox_verdict(&manager, broken.path(), at(5, 12)).await;
+        assert_eq!(verdict.kind(), VerdictKind::Block);
+    }
+
+    #[tokio::test]
+    async fn without_a_model_a_sandbox_action_is_never_allowed_and_with_one_it_is_reviewed() {
+        use crate::auditor::VerdictKind;
+        let repo = repo_with_windows(Some(BUSINESS_HOURS));
+        let rule_only = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        assert_ne!(
+            sandbox_verdict(&rule_only, repo.path(), at(5, 12))
+                .await
+                .kind(),
+            VerdictKind::Allow
+        );
+
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("{\"verdict\":\"allow\"}")]);
+        let modelled = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_action_model(provider, "strong-model");
+        assert!(sandbox_verdict(&modelled, repo.path(), at(5, 12))
+            .await
+            .is_allow());
+        let closed = sandbox_verdict(&modelled, repo.path(), at(3, 12)).await;
+        assert_eq!(closed.kind(), VerdictKind::Block);
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_task_appends_its_verdicts_to_the_durable_action_log() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_test_git_repo(repo_dir.path());
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("action_audit.jsonl");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_action_log(crate::action_auditor::ActionAuditLog::file(&log_path));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+        let status = wait_for_terminal(&manager, &task_id).await;
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+
+        let reopened = crate::action_auditor::ActionAuditLog::file(&log_path);
+        let entries = reopened.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].review.tool, "github_pr_status");
+    }
+
+    #[test]
+    fn a_task_subject_carries_the_identitys_path_globs() {
+        let repo = tempfile::tempdir().unwrap();
+        let queued = queued(repo.path());
+        let mut identity = crate::identity::example();
+        identity.scope.paths = vec!["src/**".to_string()];
+        let subject = action_subject_for(&queued.id, &queued, Some(&identity));
+        assert_eq!(subject.paths, vec!["src/**".to_string()]);
+        assert!(action_subject_for(&queued.id, &queued, None)
+            .paths
+            .is_empty());
     }
 
     fn queued(repo: &std::path::Path) -> QueuedTask {

@@ -829,6 +829,14 @@ fn resolve_escalation_path(queue_path: &std::path::Path) -> std::path::PathBuf {
     .expect("a queue path always yields an escalation path")
 }
 
+fn resolve_action_audit_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::action_auditor::action_audit_path_from(
+        std::env::var_os(harness::action_auditor::ACTION_AUDIT_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields an action audit path")
+}
+
 fn run_escalation_resolve(
     id: &str,
     path: Option<std::path::PathBuf>,
@@ -1107,6 +1115,7 @@ async fn run_mcp_server(
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
     let escalation_path = resolve_escalation_path(&queue_path);
+    let action_audit_path = resolve_action_audit_path(&queue_path);
     let identities = match harness::identity::IdentityCatalog::load_default() {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1124,16 +1133,21 @@ async fn run_mcp_server(
             &identities,
         )
         .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?))
+        .with_action_log(harness::action_auditor::ActionAuditLog::file(
+            &action_audit_path,
+        ))
+        .with_action_model(provider.clone(), model),
     );
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {}, action audit: {})",
         model,
         max_iterations,
         queue_path.display(),
         lease_path.display(),
-        escalation_path.display()
+        escalation_path.display(),
+        action_audit_path.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
