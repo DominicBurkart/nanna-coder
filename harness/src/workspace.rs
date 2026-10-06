@@ -1724,7 +1724,11 @@ mod tests {
         async fn qa_tools_run_against_the_started_app_using_the_repository_manifest() {
             let source = fixture_repo();
             let leases = TempDir::new().unwrap();
-            let allocator = Arc::new(PortAllocator::new(46000..=46000, leases.path()));
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46000..=46000,
+                leases.path(),
+                |_| true,
+            ));
             let mut ws = fullstack_workspace(
                 source.path(),
                 HealthyRunner::new(),
@@ -1789,7 +1793,11 @@ mod tests {
                 .output()
                 .unwrap();
             let leases = TempDir::new().unwrap();
-            let allocator = Arc::new(PortAllocator::new(46100..=46100, leases.path()));
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46100..=46100,
+                leases.path(),
+                |_| true,
+            ));
             let mut ws = fullstack_workspace(
                 source.path(),
                 HealthyRunner::new(),
