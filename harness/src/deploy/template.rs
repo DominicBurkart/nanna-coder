@@ -552,6 +552,9 @@ impl DeployTemplate {
             file: file.to_path_buf(),
             source,
         })?;
+        let ci = raw.ci.unwrap_or_default();
+        ci.ensure_non_production()
+            .map_err(|e| invalid(file, "ci", e.to_string()))?;
         let template = Self {
             file: file.to_path_buf(),
             target: convert_target(file, raw.target)?,
@@ -568,7 +571,7 @@ impl DeployTemplate {
                     retain_for: Duration::zero(),
                 }),
             shadow: raw.shadow.map(|s| convert_shadow(file, s)).transpose()?,
-            ci: raw.ci.unwrap_or_default(),
+            ci,
         };
         template.validate()?;
         Ok(template)
@@ -1144,6 +1147,32 @@ compare = ["status", "latency"]
             assert_eq!(t.rollback.on_breach, expected);
             assert_eq!(expected.name(), name);
         }
+    }
+
+    #[test]
+    fn a_ci_section_that_can_reach_production_is_rejected_at_load() {
+        for section in [
+            "[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"sandbox\", \"production\"]\n",
+            "[ci.workflows.\"deploy.yml\".inputs.environment]\ntype = \"string\"\n",
+            "[ci.workflows.\"deploy.yml\".inputs.ENV]\ntype = \"string\"\nallowed = [\"Prod\"]\n",
+            "[ci.workflows.\"release-production.yml\"]\n",
+            "[ci.workflows.\"ci.yml \"]\n",
+        ] {
+            let src = format!("{FIXTURE}\n{section}");
+            let err = DeployTemplate::parse(&src).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidField { field: "ci", .. }),
+                "{section}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ci_section_limited_to_non_production_environments_loads() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\", \"Staging\"]\n"
+        );
+        assert!(DeployTemplate::parse(&src).is_ok());
     }
 
     #[test]

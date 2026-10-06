@@ -862,6 +862,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_template_whose_allowlist_can_reach_production_denies_every_workflow() {
+        let dir = fixture();
+        write_template(
+            dir.path(),
+            "[ci.workflows.\"ci.yml\"]\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"production\"]\n",
+        );
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::from_repo_template(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
     async fn a_missing_or_broken_deploy_template_denies_every_workflow() {
         let dir = fixture();
         let mock: Arc<dyn GithubActionsClient> = Arc::new(MockGithubActions::default());
