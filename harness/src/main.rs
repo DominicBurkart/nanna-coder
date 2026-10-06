@@ -1395,10 +1395,13 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
-    let escalation_log = Arc::new(harness::escalation::EscalationLog::in_memory());
+    let queue_path = resolve_queue_path(None)?;
+    let escalation_log = Arc::new(harness::escalation::EscalationLog::open(
+        &resolve_escalation_path(&queue_path),
+    )?);
     let gate = build_spawn_gate(
         &load_identities(),
-        harness::auditor::AuditLog::in_memory(),
+        harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
         spawn_escalation_hook(escalation_log),
     )?;
     let server = Arc::new(NannaMcpServer::new(
