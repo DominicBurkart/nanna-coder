@@ -186,7 +186,9 @@ impl RolloutLog {
     pub fn transitions(&self) -> Result<Vec<RolloutTransition>, RolloutError> {
         let mut out = Vec::new();
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-        for line in BufReader::new(File::open(&self.path)?).lines() {
+        let file = File::open(&self.path)?;
+        fs4::FileExt::lock_shared(&file)?;
+        for line in BufReader::new(&file).lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
@@ -413,6 +415,41 @@ mod tests {
             .collect();
         assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
         assert_eq!(log.history("rollout-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn readers_interleaved_with_appends_always_see_whole_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        log.append(None, &mut record("sandbox")).unwrap();
+        let writer = {
+            let log = RolloutLog::open(log.path()).unwrap();
+            std::thread::spawn(move || {
+                for i in 0..20u8 {
+                    let mut next = log.load("rollout-1").unwrap();
+                    let from = next.state.clone();
+                    next.traffic_percent = i;
+                    next.updated_at = t0();
+                    log.append(Some(&from), &mut next).unwrap();
+                }
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let log = RolloutLog::open(log.path()).unwrap();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        log.transitions().unwrap();
+                        log.history("rollout-1").unwrap();
+                    }
+                })
+            })
+            .collect();
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(log.history("rollout-1").unwrap().len(), 21);
     }
 
     proptest::proptest! {
