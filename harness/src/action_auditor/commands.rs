@@ -10,6 +10,39 @@ const DISK_BINARIES: &[&str] = &["dd", "shred", "fdisk", "parted", "wipefs"];
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
 
+const WRAPPERS: &[&str] = &[
+    "env", "command", "exec", "nohup", "time", "timeout", "nice", "ionice", "stdbuf", "setsid",
+    "xargs", "builtin",
+];
+
+const INTERPRETER_EVAL_FLAGS: &[(&str, &[&str])] = &[
+    ("python", &["-c"]),
+    ("perl", &["-e", "-E"]),
+    ("ruby", &["-e"]),
+    ("node", &["-e", "--eval", "-p"]),
+    ("php", &["-r"]),
+];
+
+const INTERPRETER_DANGER_MARKERS: &[&str] = &[
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
+    "subprocess",
+    "pty.spawn",
+    "child_process",
+    "system(",
+    "exec(",
+    "popen",
+    "socket",
+    "urllib",
+    "http.client",
+    "requests.",
+    "shutil.rmtree",
+];
+
+const MAX_NESTING: usize = 4;
+
 const SECRET_MARKERS: &[&str] = &[
     ".ssh",
     ".aws",
@@ -42,6 +75,9 @@ fn inspect_write_path(args: &Value) -> Result<(), String> {
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing or non-string `path`".to_string())?;
+    if path.starts_with(['/', '\\']) || path.as_bytes().get(1) == Some(&b':') {
+        return Err(format!("`{path}` is outside the workspace"));
+    }
     for component in path.split(['/', '\\']) {
         if component == ".." {
             return Err(format!("`{path}` escapes the workspace"));
@@ -58,21 +94,123 @@ fn inspect_command(args: &Value) -> Result<(), String> {
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing or non-string `command`".to_string())?;
-    let lowered = command.to_lowercase();
-    if let Some(marker) = SECRET_MARKERS.iter().find(|m| lowered.contains(**m)) {
+    inspect_script(&command.to_lowercase(), 0)
+}
+
+fn inspect_script(script: &str, depth: usize) -> Result<(), String> {
+    if depth > MAX_NESTING {
+        return Err("nests shells too deeply to review".to_string());
+    }
+    if let Some(marker) = SECRET_MARKERS.iter().find(|m| script.contains(**m)) {
         return Err(format!("touches credential material (`{marker}`)"));
     }
-    for (segment, piped) in split_pipeline(&lowered) {
+    for (segment, piped) in split_pipeline(script) {
         let words = tokenize(segment);
+        let words = strip_prefixes(&words);
         let Some(first) = words.first() else {
             continue;
         };
         if piped && SHELLS.contains(&basename(first)) {
             return Err("pipes data into a shell".to_string());
         }
-        inspect_words(&words)?;
+        inspect_words(words)?;
+    }
+    inspect_nested(script, depth)
+}
+
+fn inspect_nested(script: &str, depth: usize) -> Result<(), String> {
+    let mut offset = 0;
+    let mut tokens = Vec::new();
+    for word in script.split_whitespace() {
+        let start = script[offset..].find(word).map_or(offset, |i| offset + i);
+        offset = start + word.len();
+        tokens.push((word.trim_matches(['"', '\'']), offset));
+    }
+    for (i, (token, _)) in tokens.iter().enumerate() {
+        let program = basename(token);
+        if program == "eval" {
+            if let Some((_, end)) = tokens.get(i) {
+                inspect_script(unquote(&script[*end..]), depth + 1)?;
+            }
+            continue;
+        }
+        let is_shell = SHELLS.contains(&program);
+        let eval_flags = INTERPRETER_EVAL_FLAGS
+            .iter()
+            .find(|(name, _)| program.starts_with(name))
+            .map(|(_, flags)| *flags);
+        if !is_shell && eval_flags.is_none() {
+            continue;
+        }
+        let flag = tokens[i + 1..]
+            .iter()
+            .take_while(|(word, _)| word.starts_with('-'))
+            .find(|(word, _)| match eval_flags {
+                Some(flags) => flags.contains(word),
+                None => !word.starts_with("--") && word.contains('c'),
+            });
+        let Some((_, end)) = flag else {
+            continue;
+        };
+        let code = unquote(&script[*end..]);
+        if eval_flags.is_some() {
+            if let Some(marker) = INTERPRETER_DANGER_MARKERS
+                .iter()
+                .find(|m| code.contains(**m))
+            {
+                return Err(format!(
+                    "`{program}` evaluates code that can spawn processes or open sockets (`{marker}`)"
+                ));
+            }
+        }
+        inspect_script(code, depth + 1)?;
     }
     Ok(())
+}
+
+fn unquote(rest: &str) -> &str {
+    let rest = rest.trim();
+    match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let inner = &rest[1..];
+            inner.strip_suffix(quote).unwrap_or(inner)
+        }
+        _ => rest,
+    }
+}
+
+fn strip_prefixes(words: &[String]) -> &[String] {
+    let mut rest = words;
+    loop {
+        let Some(first) = rest.first() else {
+            return rest;
+        };
+        if is_assignment(first) {
+            rest = &rest[1..];
+            continue;
+        }
+        if WRAPPERS.contains(&basename(first)) {
+            rest = &rest[1..];
+            while let Some(next) = rest.first() {
+                let numeric = next.chars().all(|c| c.is_ascii_digit() || c == '.');
+                if next.starts_with('-') || is_assignment(next) || numeric {
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 fn split_pipeline(command: &str) -> Vec<(&str, bool)> {
@@ -98,7 +236,10 @@ fn tokenize(segment: &str) -> Vec<String> {
 }
 
 fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
+    word.rsplit('/')
+        .next()
+        .unwrap_or(word)
+        .trim_start_matches('\\')
 }
 
 fn inspect_words(words: &[String]) -> Result<(), String> {
