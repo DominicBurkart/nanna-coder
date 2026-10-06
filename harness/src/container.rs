@@ -263,10 +263,17 @@ pub fn skip_or_panic(reason: &str) {
 /// Returns true when a container runtime is available. Otherwise skips the
 /// test (returns false), or panics when `NANNA_REQUIRE_RUNTIME` is set.
 pub fn ensure_runtime_or_skip(runtime: &ContainerRuntime, context: &str) -> bool {
-    if runtime.is_available() {
+    gate_runtime(runtime.is_available(), runtime_required(), context)
+}
+
+fn gate_runtime(available: bool, required: bool, context: &str) -> bool {
+    if available {
         return true;
     }
-    skip_or_panic(&format!("no container runtime available for {context}"));
+    skip_or_panic_if(
+        required,
+        &format!("no container runtime available for {context}"),
+    );
     false
 }
 
@@ -804,6 +811,18 @@ mod tests {
     #[test]
     fn skip_returns_when_runtime_not_required() {
         skip_or_panic_if(false, "podman missing");
+    }
+
+    #[test]
+    fn gate_runtime_skips_when_unavailable_and_not_required() {
+        assert!(!gate_runtime(false, false, "ctx"));
+        assert!(gate_runtime(true, true, "ctx"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no container runtime available for ctx")]
+    fn gate_runtime_panics_when_unavailable_and_required() {
+        gate_runtime(false, true, "ctx");
     }
 
     #[test]
