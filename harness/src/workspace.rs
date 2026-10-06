@@ -857,10 +857,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(result, Err(WorkspaceError::ContainerSetupFailed(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
         let default_network = TaskWorkspace::create_with_container(
             source.path(),
             &unique_id("ws-default-network"),
@@ -868,10 +869,14 @@ mod tests {
             "nonexistent-image-for-nanna-tests:none",
         )
         .await;
-        assert!(matches!(
-            default_network,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(
+                default_network,
+                Err(WorkspaceError::ContainerSetupFailed(_))
+            ),
+            "{:?}",
+            default_network.as_ref().err()
+        );
     }
 
     fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {
