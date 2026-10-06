@@ -153,6 +153,10 @@ jobs:
           echo "Ollama not reachable on port 11434, skipping model integration tests"
         fi
 
+    - name: Lint runtime job structure
+      if: matrix.test-type == 'lint' && runner.os == 'Linux'
+      run: scripts/lint-ci-runtime-jobs.sh
+
     - name: Run lint checks
       if: matrix.test-type == 'lint'
       shell: bash
@@ -227,6 +231,9 @@ jobs:
 
     - name: Pre-build dev container image
       run: nix build path:tests/integration/repo#devContainerImage --no-link
+
+    - name: Pre-build nanna dev container image
+      run: nix build path:.#devContainerImage --no-link --print-build-logs
 
     - name: Run container-only suites
       run: |

@@ -47,9 +47,10 @@ const GUARD_WORDS: &[&str] = &["runtime", "podman", "docker", "ollama", "11434",
 const GUARD_SHAPES: &[&str] = &["if ", "else", "match ", "err(", "none"];
 
 fn has_helper(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .any(|l| !is_comment(l) && HELPERS.iter().any(|h| l.contains(h)))
+    lines.iter().any(|l| {
+        let code = code_only(l);
+        !is_comment(l) && HELPERS.iter().any(|h| code.contains(h))
+    })
 }
 
 fn has_early_return(lines: &[&str]) -> bool {
@@ -59,7 +60,8 @@ fn has_early_return(lines: &[&str]) -> bool {
                 || l.contains("return Ok(")
                 || l.contains("return ()")
                 || l.contains("return }")
-                || l.contains("return,"))
+                || l.contains("return,")
+                || l.contains("exit(0)"))
     })
 }
 
@@ -83,21 +85,17 @@ fn skip_wording_near_runtime(lines: &[&str], idx: usize) -> bool {
 
 fn guard_window<'a>(lines: &'a [&'a str], idx: usize) -> &'a [&'a str] {
     let cap = (idx + 6).min(lines.len());
-    let mut end = idx + 1;
-    while end < cap {
-        let closes = lines[end].trim_start().starts_with('}');
-        end += 1;
-        if closes {
-            break;
-        }
-    }
+    let end = lines[idx + 1..cap]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map_or(cap, |p| idx + 2 + p);
     &lines[idx..end]
 }
 
 fn silent_runtime_exit(lines: &[&str], idx: usize) -> bool {
     let lower = lines[idx].to_lowercase();
     let runtime_related = if lower.contains("is_available") {
-        lower.contains('!')
+        lower.contains('!') || lower.contains("== false")
     } else {
         GUARD_WORDS.iter().any(|w| lower.contains(w))
     };
@@ -146,7 +144,10 @@ fn ignored_tests_outside_convention(source: &str) -> Vec<String> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        if is_comment(line) || !line.trim_start().starts_with("#[ignore") {
+        let attr = line.trim_start();
+        let is_ignore = attr.starts_with("#[ignore")
+            || (attr.starts_with("#[cfg_attr") && attr.contains("ignore"));
+        if is_comment(line) || !is_ignore {
             continue;
         }
         let name = lines[idx + 1..].iter().find_map(|l| {
@@ -168,23 +169,22 @@ fn ignored_tests_outside_convention(source: &str) -> Vec<String> {
     out
 }
 
-fn job_section<'a>(workflow: &'a str, job: &str) -> Option<&'a str> {
-    let header = format!("  {job}:");
-    let mut offset = 0;
-    let mut start = None;
-    for line in workflow.split_inclusive('\n') {
-        let top_level_key =
-            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
-        if let Some(s) = start {
-            if top_level_key {
-                return Some(&workflow[s..offset]);
-            }
-        } else if line.trim_end() == header {
-            start = Some(offset);
+fn normalise_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn relative_path(root: &Path, file: &Path) -> String {
+    normalise_separators(&file.strip_prefix(root).unwrap().to_string_lossy())
+}
+
+fn code_only(line: &str) -> String {
+    let mut out = String::new();
+    for (i, part) in line.split('"').enumerate() {
+        if i % 2 == 0 {
+            out.push_str(part);
         }
-        offset += line.len();
     }
-    start.map(|s| &workflow[s..])
+    out
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -318,15 +318,6 @@ fn ignore_inside_comments_is_not_counted() {
 }
 
 #[test]
-fn job_section_isolates_one_job() {
-    let wf = "jobs:\n  a:\n    name: A\n    steps: []\n  b:\n    name: B\n";
-    let a = job_section(wf, "a").unwrap();
-    assert!(a.contains("name: A") && !a.contains("name: B"));
-    assert!(job_section(wf, "b").unwrap().contains("name: B"));
-    assert!(job_section(wf, "c").is_none());
-}
-
-#[test]
 fn every_ignored_test_follows_a_prefix_convention() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut files = Vec::new();
@@ -335,11 +326,7 @@ fn every_ignored_test_follows_a_prefix_convention() {
     }
     let mut report = Vec::new();
     for file in files {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let rel = relative_path(root, &file);
         if rel == "harness/tests/runtime_skip_lint.rs" {
             continue;
         }
@@ -353,26 +340,6 @@ fn every_ignored_test_follows_a_prefix_convention() {
         "#[ignore]d tests must be named with one of {IGNORE_PREFIXES:?} so a CI job selects them:\n{}",
         report.join("\n")
     );
-}
-
-#[test]
-fn ci_selects_ignored_tests_by_prefix_convention() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let wf = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-    let required = job_section(&wf, "container-runtime-required").expect("required job");
-    let ollama = job_section(&wf, "container-ollama").expect("ollama job");
-    assert!(required.contains("NANNA_REQUIRE_RUNTIME: \"1\""));
-    assert!(required.contains("container_"));
-    assert!(!required.contains("11434") && !required.to_lowercase().contains("ollama"));
-    assert!(!required.contains("continue-on-error"));
-    assert!(ollama.contains("ollama_") && ollama.contains("11434"));
-    assert!(ollama.contains("continue-on-error: true"));
-    assert!(required.contains("if: always()") && ollama.contains("if: always()"));
-    for job in [required, ollama] {
-        assert!(job.contains("permissions:") && !job.contains("environment:"));
-    }
-    let gate = job_section(&wf, "all-checks").expect("gate job");
-    assert!(gate.contains("- container-runtime-required") && gate.contains("- container-ollama"));
 }
 
 #[test]
@@ -390,11 +357,7 @@ fn workspace_runtime_dependent_tests_honour_require_runtime() {
     );
     let mut report = Vec::new();
     for file in files {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let rel = relative_path(root, &file);
         if rel == "harness/tests/runtime_skip_lint.rs" {
             continue;
         }
@@ -409,4 +372,61 @@ fn workspace_runtime_dependent_tests_honour_require_runtime() {
         "runtime-dependent tests must call harness::container::ensure_runtime_or_skip or skip_or_panic (honouring NANNA_REQUIRE_RUNTIME) instead of skipping silently:\n{}",
         report.join("\n")
     );
+}
+
+#[test]
+fn normalises_windows_separators() {
+    assert_eq!(
+        normalise_separators("harness\\tests\\x.rs"),
+        "harness/tests/x.rs"
+    );
+    assert_eq!(normalise_separators("a/b.rs"), "a/b.rs");
+}
+
+#[test]
+fn relative_path_is_slash_separated() {
+    let root = Path::new("root");
+    assert_eq!(
+        relative_path(root, &root.join("harness").join("tests").join("x.rs")),
+        "harness/tests/x.rs"
+    );
+}
+
+#[test]
+fn rust_files_ignores_missing_directory() {
+    let mut out = Vec::new();
+    rust_files(Path::new("/nonexistent/nanna-lint-dir"), &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn flags_process_exit_zero_on_unavailable_runtime() {
+    let src = "fn t() {\n    if !rt.is_available() {\n        std::process::exit(0);\n    }\n}\n";
+    assert_eq!(violations("x.rs", src, true).len(), 1);
+}
+
+#[test]
+fn flags_is_available_compared_to_false() {
+    let src = "fn t() {\n    if rt.is_available() == false {\n        return;\n    }\n}\n";
+    assert_eq!(violations("x.rs", src, true).len(), 1);
+}
+
+#[test]
+fn helper_name_inside_a_string_literal_does_not_exempt() {
+    let src = "fn t() {\n    if !rt.is_available() {\n        let _ = \"skip_or_panic\";\n        return;\n    }\n}\n";
+    assert_eq!(violations("x.rs", src, true).len(), 1);
+}
+
+#[test]
+fn guard_window_stops_at_closing_brace() {
+    let lines = ["if x {", "a", "}", "b", "c"];
+    assert_eq!(guard_window(&lines, 0), &lines[0..3]);
+    let long = ["if x {", "a", "b", "c", "d", "e", "f", "g"];
+    assert_eq!(guard_window(&long, 0).len(), 6);
+}
+
+#[test]
+fn cfg_attr_ignore_needs_a_convention_prefix() {
+    let src = "#[cfg_attr(not(feature = \"x\"), ignore)]\nfn test_thing() {}\n#[cfg_attr(unix, allow(dead_code))]\nfn fine() {}\n";
+    assert_eq!(ignored_tests_outside_convention(src), vec!["test_thing"]);
 }
