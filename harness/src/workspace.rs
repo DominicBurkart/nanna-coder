@@ -472,11 +472,8 @@ impl TaskWorkspace {
         let accountant = Arc::clone(&self.cost_accountant);
         let client = github_actions_client();
         registry.register(Box::new(
-            CiTriggerTool::new(self.workspace_path.clone(), Arc::clone(&client)).with_budget(
-                Arc::clone(&accountant),
-                identity_name,
-                self.task_id.clone(),
-            ),
+            CiTriggerTool::from_repo_template(self.workspace_path.clone(), Arc::clone(&client))
+                .with_budget(Arc::clone(&accountant), identity_name, self.task_id.clone()),
         ));
         registry.register(Box::new(
             CiStatusTool::new(self.workspace_path.clone(), client).with_budget(
@@ -599,6 +596,7 @@ impl TaskWorkspace {
                 self.cost_accountant.record_minutes_sync(
                     identity,
                     &self.task_id,
+                    &handle.repo,
                     BudgetClass::Sandbox,
                     minutes,
                     Utc::now(),
@@ -907,6 +905,48 @@ mod tests {
             registry.get_tool("ci_logs").unwrap().effect_class(),
             crate::effects::EffectClass::Repository
         );
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_budgeted_ci_trigger_enforces_the_repository_allowlist() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(source.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        git(&["remote", "add", "origin", "git@github.com:o/n.git"]);
+        std::fs::create_dir_all(source.path().join(".nanna")).unwrap();
+        std::fs::write(
+            source.path().join(".nanna/deploy.toml"),
+            "[target]\nkind = \"container-registry+serverless\"\nregistry = \"r.invalid\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"instant\"\n[ci.workflows.\"ci.yml\"]\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "policy"]);
+        git(&["branch", "task/ci-policy"]);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-ci-policy"), "task/ci-policy")
+                .unwrap();
+        let registry = ws.build_tool_registry();
+        let tool = registry.get_tool("ci_trigger").unwrap();
+        let refused = tool
+            .execute(serde_json::json!({"workflow": "release.yml"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("not allowlisted"), "{refused}");
+        let allowed = tool
+            .execute(serde_json::json!({"workflow": "ci.yml"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!allowed.contains("not allowlisted"), "{allowed}");
         ws.cleanup().unwrap();
     }
 
@@ -1490,6 +1530,7 @@ mod tests {
         let mut identity = crate::identity::example();
         identity.scope.max_effect = ceiling;
         identity.scope.tools = vec!["*".parse().unwrap()];
+        identity.scope.paths = vec!["**".to_string()];
         identity
     }
 

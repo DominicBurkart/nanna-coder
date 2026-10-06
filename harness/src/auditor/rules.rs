@@ -336,6 +336,7 @@ pub(crate) mod tests {
                 &format!("max_effect = \"{max_effect}\""),
             )
             .replace("tools = []", &format!("tools = [{tools}]"))
+            .replace("repos = []", "repos = [\"github.com/example/repo\"]")
     }
 
     fn write(dir: &Path, file: &str, toml: &str) {

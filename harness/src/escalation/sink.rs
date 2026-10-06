@@ -58,6 +58,8 @@ pub enum EscalationError {
     Serde(#[from] serde_json::Error),
     #[error("no incident hold with id `{0}`")]
     UnknownHold(String),
+    #[error("resolving an incident hold needs a human operator at a terminal: {0}")]
+    Unauthorized(String),
     /// Some sinks of a [`FanoutSink`] failed; every sink was still attempted
     /// and `delivered` lists the ones that succeeded.
     #[error("{} of {} sinks failed: {}", failed.len(), failed.len() + delivered.len(), describe(failed))]

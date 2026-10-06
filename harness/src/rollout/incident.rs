@@ -9,13 +9,11 @@
 //! before acting. With no responder configured, the executor's behaviour
 //! is unchanged: it halts and escalates directly.
 //!
-//! The identity this loop runs under is authored as a TOML fixture at
-//! `harness/tests/fixtures/identities/global/incident-responder.toml`,
-//! loaded here by [`IncidentIdentity::from_fixture`] via `include_str!`.
-//! Now that the identity/RBAC lane shares this tree, the same fixture is
-//! also picked up by `harness::identity::IdentityCatalog::load` as an
-//! ordinary global identity (see `identity_catalog_tests.rs`); the two
-//! loaders are independent and both parse the file unchanged.
+//! The identity this loop runs under is [`IncidentIdentity::incident_responder`],
+//! defined in code. It is not yet built from an identity catalog (#786); a
+//! test pins it to the human-authored TOML under
+//! `harness/tests/fixtures/identities/global/incident-responder.toml` so
+//! the two cannot drift apart.
 
 use super::adapter::Slot;
 use super::health::{
@@ -97,10 +95,6 @@ pub struct IncidentIdentity {
     tools: Vec<String>,
 }
 
-/// The identity fixture's TOML source, embedded at compile time.
-pub const INCIDENT_RESPONDER_FIXTURE_TOML: &str =
-    include_str!("../../tests/fixtures/identities/global/incident-responder.toml");
-
 /// Tool name the identity must carry to propose [`ProposedAction::Rollback`].
 pub const ROLLBACK_TOOL: &str = "rollout_rollback";
 /// Tool name the identity must carry to propose
@@ -128,10 +122,16 @@ impl IncidentIdentity {
         })
     }
 
-    /// The bundled `incident-responder.toml` fixture.
-    pub fn from_fixture() -> Self {
-        Self::from_toml_str(INCIDENT_RESPONDER_FIXTURE_TOML)
-            .expect("bundled incident-responder.toml is valid")
+    /// The incident responder's identity: it may roll a halted rollout
+    /// back, propose a roll-forward to an existing fix pull request, and
+    /// read logs for evidence, and nothing else.
+    pub fn incident_responder() -> Self {
+        Self {
+            tools: [ROLLBACK_TOOL, ROLL_FORWARD_PR_TOOL, READ_LOGS_TOOL]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        }
     }
 
     /// The identity's allowed tool names, in file order.
@@ -186,7 +186,7 @@ impl IncidentResponder {
     ///     ProposedAction,
     /// };
     ///
-    /// let responder = IncidentResponder::new(IncidentIdentity::from_fixture());
+    /// let responder = IncidentResponder::new(IncidentIdentity::incident_responder());
     /// let breach = HealthBreach {
     ///     threshold: HealthThreshold::ErrorRateMax(0.01),
     ///     observed: HealthObservation::ErrorRate(0.5),
@@ -307,6 +307,22 @@ mod tests {
     use crate::rollout::state::tests::{plan, t0};
     use crate::rollout::state::{RolloutRecord, RolloutState};
 
+    #[test]
+    fn production_code_does_not_embed_test_fixtures() {
+        let source = include_str!("incident.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("include_str!"));
+    }
+
+    const FIXTURE_TOML: &str =
+        include_str!("../../tests/fixtures/identities/global/incident-responder.toml");
+
+    #[test]
+    fn the_production_identity_matches_the_authored_fixture() {
+        let fixture = IncidentIdentity::from_toml_str(FIXTURE_TOML).unwrap();
+        assert_eq!(IncidentIdentity::incident_responder(), fixture);
+    }
+
     fn breach() -> HealthBreach {
         HealthBreach {
             threshold: HealthThreshold::ErrorRateMax(0.01),
@@ -321,14 +337,14 @@ mod tests {
 
     #[test]
     fn responder_exposes_its_identity() {
-        let identity = IncidentIdentity::from_fixture();
+        let identity = IncidentIdentity::incident_responder();
         let responder = IncidentResponder::new(identity.clone());
         assert_eq!(responder.identity(), &identity);
     }
 
     #[test]
     fn propose_prefers_a_known_fix_pr_and_always_escalates_shadow_divergence() {
-        let responder = IncidentResponder::new(IncidentIdentity::from_fixture());
+        let responder = IncidentResponder::new(IncidentIdentity::incident_responder());
         assert_eq!(responder.propose(&breach(), None), ProposedAction::Rollback);
         assert_eq!(
             responder.propose(&breach(), Some("https://example.invalid/pr/9")),
@@ -362,7 +378,7 @@ mod tests {
 
     #[test]
     fn identity_permits_exactly_its_declared_tools() {
-        let identity = IncidentIdentity::from_fixture();
+        let identity = IncidentIdentity::incident_responder();
         assert!(identity.permits(&ProposedAction::Rollback));
         assert!(identity.permits(&ProposedAction::RollForwardPr("pr".into())));
         assert!(identity.permits(&ProposedAction::Escalate));
@@ -378,7 +394,7 @@ mod tests {
 
     #[test]
     fn fixture_identity_registry_contains_exactly_the_allowed_tools() {
-        let identity = IncidentIdentity::from_fixture();
+        let identity = IncidentIdentity::incident_responder();
         let mut tools = identity.tools().to_vec();
         tools.sort();
         let mut expected = vec![

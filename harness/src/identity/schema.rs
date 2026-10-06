@@ -93,9 +93,13 @@ pub enum SystemPrompt {
 pub struct ScopeSection {
     /// Repositories the identity may be spawned against.
     pub repos: Vec<String>,
-    /// Writable globs relative to the worktree root.
+    /// Writable globs relative to the worktree root. Enforced by the file
+    /// tools only: `run_command` cannot be confined to globs, so it is
+    /// withheld from any identity whose paths do not include `**`.
     pub paths: Vec<String>,
     /// Readable globs; `None` leaves reads unrestricted inside the worktree.
+    /// Enforced by the file tools only; setting it at all withholds
+    /// `run_command` from the identity.
     pub read_paths: Option<Vec<String>>,
     /// Highest [`EffectClass`] any tool call may reach.
     pub max_effect: EffectClass,
@@ -429,6 +433,42 @@ impl AgentIdentity {
             .any(|pattern| pattern.matches(tool_name))
     }
 
+    /// Whether `[scope]` restricts paths: `scope.paths` does not include
+    /// `**`, or `scope.read_paths` is set at all. Tools that run arbitrary
+    /// shell commands cannot be confined to globs, so the registry refuses
+    /// them for such an identity (see [`crate::tools::PATH_UNSCOPABLE_TOOLS`]).
+    ///
+    /// ```
+    /// use harness::identity::AgentIdentity;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "narrow"
+    /// description = "Writes under src only."
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "Write." }
+    ///
+    /// [scope]
+    /// repos = ["github.com/example/repo"]
+    /// paths = ["src/**"]
+    /// max_effect = "workspace"
+    /// tools = ["run_command"]
+    ///
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let narrow = AgentIdentity::from_toml_str(toml, "narrow.toml").unwrap();
+    /// assert!(narrow.restricts_paths());
+    /// let open = AgentIdentity::from_toml_str(&toml.replace("src/**", "**"), "open.toml").unwrap();
+    /// assert!(!open.restricts_paths());
+    /// ```
+    pub fn restricts_paths(&self) -> bool {
+        self.scope.read_paths.is_some() || !self.scope.paths.iter().any(|glob| glob == "**")
+    }
+
     /// Whether `class` is at or below `scope.max_effect`.
     pub fn allows_effect(&self, class: EffectClass) -> bool {
         class <= self.scope.max_effect
@@ -503,17 +543,16 @@ max_concurrent = 4
     }
 
     fn invalid_field(result: Result<AgentIdentity, IdentityError>) -> (String, String) {
-        match result {
-            Err(IdentityError::InvalidField {
-                file,
-                field,
-                reason,
-            }) => {
-                assert_eq!(file, PathBuf::from("agents/rust-implementer.toml"));
-                (field, reason)
-            }
-            other => panic!("expected InvalidField, got {other:?}"),
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::InvalidField { file, .. } if *file == Path::new("agents/rust-implementer.toml")),
+            "expected InvalidField, got {err:?}"
+        );
+        let mut parts = (String::new(), String::new());
+        if let IdentityError::InvalidField { field, reason, .. } = err {
+            parts = (field, reason);
         }
+        parts
     }
 
     #[test]
@@ -646,13 +685,11 @@ max_concurrent = 4
             &EXAMPLE.replace("max_concurrent", "max_concurrency"),
             &EXAMPLE.replace("[limits]", "[limitz]"),
         ] {
-            match AgentIdentity::from_toml_str(src, "agents/x.toml") {
-                Err(IdentityError::Parse { file, message }) => {
-                    assert_eq!(file, PathBuf::from("agents/x.toml"));
-                    assert!(!message.is_empty());
-                }
-                other => panic!("expected Parse error, got {other:?}"),
-            }
+            let err = AgentIdentity::from_toml_str(src, "agents/x.toml").unwrap_err();
+            assert!(
+                matches!(&err, IdentityError::Parse { file, message } if *file == Path::new("agents/x.toml") && !message.is_empty()),
+                "expected Parse error, got {err:?}"
+            );
         }
         let err = AgentIdentity::from_toml_str("", "agents/x.toml").unwrap_err();
         assert!(err.to_string().starts_with("agents/x.toml: "), "{err}");
@@ -878,21 +915,18 @@ max_concurrent = 4
     fn load_reports_missing_identity_file_and_missing_prompt_file() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.toml");
-        match AgentIdentity::load(&missing) {
-            Err(IdentityError::Io { file, source }) => {
-                assert_eq!(file, missing);
-                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            }
-            other => panic!("expected Io error, got {other:?}"),
-        }
-        let file = dir.path().join("rust-implementer.toml");
-        fs::write(&file, EXAMPLE).unwrap();
-        match AgentIdentity::load(&file) {
-            Err(IdentityError::Io { file, .. }) => {
-                assert_eq!(file, dir.path().join("prompts/rust-implementer.md"))
-            }
-            other => panic!("expected Io error, got {other:?}"),
-        }
+        let err = AgentIdentity::load(&missing).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::Io { file, source } if *file == missing && source.kind() == std::io::ErrorKind::NotFound),
+            "expected Io error, got {err:?}"
+        );
+        let identity_file = dir.path().join("rust-implementer.toml");
+        fs::write(&identity_file, EXAMPLE).unwrap();
+        let err = AgentIdentity::load(&identity_file).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::Io { file, .. } if *file == dir.path().join("prompts/rust-implementer.md")),
+            "expected Io error, got {err:?}"
+        );
     }
 
     #[test]
@@ -912,12 +946,11 @@ max_concurrent = 4
         let identity =
             AgentIdentity::from_toml_str(EXAMPLE, "/nonexistent-dir-for-identity-test/x.toml")
                 .unwrap();
-        match identity.system_prompt_text() {
-            Err(IdentityError::Io { file, .. }) => {
-                assert_eq!(file, PathBuf::from("/nonexistent-dir-for-identity-test"))
-            }
-            other => panic!("expected Io error, got {other:?}"),
-        }
+        let err = identity.system_prompt_text().unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::Io { file, .. } if *file == Path::new("/nonexistent-dir-for-identity-test")),
+            "expected Io error, got {err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -934,18 +967,11 @@ max_concurrent = 4
         .unwrap();
         let file = dir.path().join("rust-implementer.toml");
         fs::write(&file, EXAMPLE).unwrap();
-        match AgentIdentity::load(&file) {
-            Err(IdentityError::PromptOutsideDirectory {
-                file: reported,
-                path,
-                dir: reported_dir,
-            }) => {
-                assert_eq!(reported, file);
-                assert_eq!(path, PathBuf::from("prompts/rust-implementer.md"));
-                assert_eq!(reported_dir, dir.path().canonicalize().unwrap());
-            }
-            other => panic!("expected PromptOutsideDirectory, got {other:?}"),
-        }
+        let err = AgentIdentity::load(&file).unwrap_err();
+        assert!(
+            matches!(&err, IdentityError::PromptOutsideDirectory { file: reported, path, dir: reported_dir } if *reported == file && *path == Path::new("prompts/rust-implementer.md") && *reported_dir == dir.path().canonicalize().unwrap()),
+            "expected PromptOutsideDirectory, got {err:?}"
+        );
     }
 
     pub(crate) fn name_strategy() -> impl Strategy<Value = String> {

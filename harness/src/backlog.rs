@@ -210,6 +210,10 @@ pub struct WorkflowRun {
     #[serde(default)]
     pub head_branch: Option<String>,
     #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
     pub run_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -2406,6 +2410,8 @@ mod tests {
             conclusion: conclusion.map(str::to_string),
             html_url: format!("https://example.invalid/runs/{id}"),
             head_branch: None,
+            path: None,
+            head_sha: None,
             run_started_at: None,
             updated_at: None,
         }

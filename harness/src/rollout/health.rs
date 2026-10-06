@@ -380,6 +380,30 @@ mod tests {
     }
 
     #[test]
+    fn worst_endpoints_break_status_ties_by_endpoint_name() {
+        let sample = HealthSample {
+            error_rate: 0.0,
+            p99_latency_ms: 1,
+            endpoint_statuses: [("/zeta", 503), ("/alpha", 503), ("/mid", 500)]
+                .into_iter()
+                .map(|(endpoint, status)| (endpoint.to_string(), status))
+                .collect(),
+        };
+        let order: Vec<(String, u16)> = worst_endpoints(&sample, EVIDENCE_CAP)
+            .into_iter()
+            .map(|e| (e.endpoint, e.status))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("/alpha".to_string(), 503),
+                ("/zeta".to_string(), 503),
+                ("/mid".to_string(), 500),
+            ]
+        );
+    }
+
+    #[test]
     fn breach_evidence_defaults_when_missing_from_an_older_log_line() {
         let json =
             r#"{"threshold":{"error_rate_max":0.01},"observed":{"error_rate":0.5},"step":0}"#;

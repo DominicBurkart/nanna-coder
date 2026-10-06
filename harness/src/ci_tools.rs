@@ -27,6 +27,9 @@
 
 use crate::backlog::{BacklogError, GithubActionsClient, WorkflowRun};
 use crate::budget::{BudgetClass, CostAccountant};
+use crate::ci_integrity::{is_workflow_file_name, verify_ci_surface, workflow_file_of_run_path};
+use crate::ci_policy::CiPolicy;
+use crate::deploy::DeployTemplate;
 use crate::effects::EffectClass;
 use crate::pr_tools::{
     current_branch, map_backlog_error, required_str, required_u64, resolve_repo,
@@ -36,9 +39,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Identity/task context a tool charges its budget against, shared by
@@ -189,6 +192,7 @@ pub struct CiTriggerTool {
     correlation_budget: Duration,
     correlation_poll: Duration,
     budget: Option<BudgetContext>,
+    policy: CiPolicy,
 }
 
 impl CiTriggerTool {
@@ -199,7 +203,29 @@ impl CiTriggerTool {
             correlation_budget: DEFAULT_CORRELATION_BUDGET,
             correlation_poll: DEFAULT_CORRELATION_POLL,
             budget: None,
+            policy: CiPolicy::deny_all(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: CiPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn from_repo_template(
+        workspace_root: PathBuf,
+        client: Arc<dyn GithubActionsClient>,
+    ) -> Self {
+        let policy = match DeployTemplate::load_from_repo(&workspace_root) {
+            Ok(template) => template.ci,
+            Err(e) => {
+                tracing::warn!(
+                    "ci_trigger has no usable deploy template, denying all workflows: {e}"
+                );
+                CiPolicy::deny_all()
+            }
+        };
+        Self::new(workspace_root, client).with_policy(policy)
     }
 
     /// Override how long and how often the dispatch-correlation retry loop
@@ -235,6 +261,7 @@ impl CiTriggerTool {
         let Some(ctx) = &self.budget else {
             return Ok(());
         };
+        self.settle_pending_runs(ctx, repo).await;
         ctx.accountant
             .charge_count(
                 &ctx.identity,
@@ -246,6 +273,14 @@ impl CiTriggerTool {
             .await
             .map_err(ToolError::BudgetExceeded)?;
         Ok(())
+    }
+
+    async fn settle_pending_runs(&self, ctx: &BudgetContext, repo: &str) {
+        for run_id in ctx.accountant.pending_runs(repo) {
+            if let Ok(run) = self.client.get_workflow_run(repo, run_id).await {
+                record_run_minutes(ctx, repo, &run).await;
+            }
+        }
     }
 
     /// The highest run id already listed for `branch`/[`DISPATCH_EVENT`]
@@ -308,7 +343,7 @@ impl Tool for CiTriggerTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "ci_trigger",
-            "Dispatch a GitHub Actions workflow (workflow_dispatch) against the task's own branch, or re-run a failed run's failed jobs when 'run_id' is given. Returns the run id either way. Result: { mode: \"dispatch\"|\"rerun\", run_id, html_url, status }.",
+            "Dispatch a GitHub Actions workflow (workflow_dispatch) against the task's own branch, or re-run a failed run's failed jobs when 'run_id' is given. Only allowlisted workflows run, and a call is refused when the branch changes anything under .github/ or the deploy template relative to the base branch. Returns the run id either way. Result: { mode: \"dispatch\"|\"rerun\", run_id, html_url, status }.",
             vec![
                 ("workflow", property(SchemaType::String, "Workflow file name (e.g. \"ci.yml\") or numeric workflow id. Required to dispatch; ignored for a rerun.")),
                 ("run_id", property(SchemaType::Integer, "Run to re-run instead of dispatching a new one.")),
@@ -334,6 +369,35 @@ impl Tool for CiTriggerTool {
                     ),
                 });
             }
+            let workflow = run
+                .path
+                .as_deref()
+                .and_then(workflow_file_of_run_path)
+                .ok_or_else(|| ToolError::InvalidArguments {
+                    message: format!(
+                        "run {run_id} does not name a workflow file under .github/workflows/; refusing to rerun it"
+                    ),
+                })?;
+            if !self.policy.permits(workflow) {
+                return Err(ToolError::InvalidArguments {
+                    message: format!(
+                        "run {run_id} belongs to workflow {workflow:?}, which is not allowlisted in the repository's .nanna/deploy.toml"
+                    ),
+                });
+            }
+            let head_sha = run
+                .head_sha
+                .clone()
+                .ok_or_else(|| ToolError::InvalidArguments {
+                    message: format!(
+                        "run {run_id} does not report the commit it ran; refusing to rerun it"
+                    ),
+                })?;
+            verify_ci_surface(&self.workspace_root, &branch, &[head_sha], Some(workflow)).map_err(
+                |e| ToolError::InvalidArguments {
+                    message: e.to_string(),
+                },
+            )?;
             self.charge(&repo).await?;
             self.client
                 .rerun_workflow(&repo, run_id)
@@ -360,6 +424,20 @@ impl Tool for CiTriggerTool {
             });
         }
         let inputs = optional_object(&args, "inputs")?;
+        self.policy
+            .validate_dispatch(workflow, &inputs)
+            .map_err(|e| ToolError::InvalidArguments {
+                message: e.to_string(),
+            })?;
+        verify_ci_surface(
+            &self.workspace_root,
+            &branch,
+            &[],
+            is_workflow_file_name(workflow).then_some(workflow),
+        )
+        .map_err(|e| ToolError::InvalidArguments {
+            message: e.to_string(),
+        })?;
         let baseline = self
             .max_known_run_id(&repo, workflow, &branch)
             .await
@@ -373,6 +451,9 @@ impl Tool for CiTriggerTool {
             .correlate_run(&repo, workflow, &branch, baseline)
             .await
             .map_err(map_backlog_error)?;
+        if let Some(ctx) = &self.budget {
+            ctx.accountant.note_run(&repo, run.id);
+        }
         Ok(json!({
             "mode": "dispatch",
             "run_id": run.id,
@@ -395,9 +476,6 @@ pub struct CiStatusTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubActionsClient>,
     budget: Option<BudgetContext>,
-    /// Run ids whose minutes have already been charged, so repeated polling
-    /// of the same completed run never double-counts.
-    minutes_charged: Mutex<HashSet<u64>>,
 }
 
 impl CiStatusTool {
@@ -406,7 +484,6 @@ impl CiStatusTool {
             workspace_root,
             client,
             budget: None,
-            minutes_charged: Mutex::new(HashSet::new()),
         }
     }
 
@@ -425,29 +502,29 @@ impl CiStatusTool {
     }
 
     async fn charge_minutes_once(&self, repo: &str, run: &WorkflowRun) {
-        let Some(ctx) = &self.budget else {
-            return;
-        };
-        let Some(minutes) = run.duration_minutes() else {
-            return;
-        };
-        {
-            let mut charged = self.minutes_charged.lock().expect("charged set poisoned");
-            if !charged.insert(run.id) {
-                return;
-            }
+        if let Some(ctx) = &self.budget {
+            record_run_minutes(ctx, repo, run).await;
         }
-        ctx.accountant
-            .record_minutes(
-                &ctx.identity,
-                &ctx.task_id,
-                repo,
-                BudgetClass::Ci,
-                minutes,
-                Utc::now(),
-            )
-            .await;
     }
+}
+
+async fn record_run_minutes(ctx: &BudgetContext, repo: &str, run: &WorkflowRun) {
+    let Some(minutes) = run.duration_minutes() else {
+        return;
+    };
+    if !ctx.accountant.claim_run(repo, run.id) {
+        return;
+    }
+    ctx.accountant
+        .record_minutes(
+            &ctx.identity,
+            &ctx.task_id,
+            repo,
+            BudgetClass::Ci,
+            minutes,
+            Utc::now(),
+        )
+        .await;
 }
 
 #[async_trait]
@@ -569,7 +646,7 @@ pub(crate) fn github_actions_client() -> Arc<dyn GithubActionsClient> {
 /// mirroring [`crate::pr_tools::register`].
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path) {
     let client = github_actions_client();
-    registry.register(Box::new(CiTriggerTool::new(
+    registry.register(Box::new(CiTriggerTool::from_repo_template(
         workspace_root.to_path_buf(),
         Arc::clone(&client),
     )));
@@ -614,13 +691,58 @@ mod tests {
         git(dir.path(), &["config", "user.name", "test"]);
         git(dir.path(), &["config", "commit.gpgsign", "false"]);
         std::fs::write(dir.path().join("f"), "1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
         git(dir.path(), &["add", "."]);
-        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        let committed = StdCommand::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(committed.status.success());
         git(
             dir.path(),
             &["remote", "add", "origin", "git@github.com:o/n.git"],
         );
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/feat/x", "HEAD"],
+        );
+        git(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
         dir
+    }
+
+    fn commit_all(dir: &Path, message: &str) {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    fn rev_parse(dir: &Path, rev: &str) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn fixture_head_sha() -> String {
+        static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SHA.get_or_init(|| rev_parse(fixture().path(), "HEAD"))
+            .clone()
     }
 
     fn run(id: u64, status: &str, conclusion: Option<&str>) -> WorkflowRun {
@@ -631,13 +753,260 @@ mod tests {
             conclusion: conclusion.map(str::to_string),
             html_url: format!("https://example.invalid/runs/{id}"),
             head_branch: Some("feat/x".to_string()),
+            path: Some(".github/workflows/ci.yml".to_string()),
+            head_sha: Some(fixture_head_sha()),
             run_started_at: None,
             updated_at: None,
         }
     }
 
+    fn allow_ci_yml() -> CiPolicy {
+        toml::from_str(
+            "[workflows.\"ci.yml\"]\n\n[workflows.\"ci.yml\".inputs.k]\ntype = \"string\"\n",
+        )
+        .unwrap()
+    }
+
+    fn write_template(dir: &Path, ci_section: &str) {
+        std::fs::create_dir_all(dir.join(".nanna")).unwrap();
+        let base = "[target]\nkind = \"container-registry+serverless\"\nregistry = \"r.invalid\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"instant\"\n";
+        std::fs::write(
+            dir.join(".nanna/deploy.toml"),
+            format!("{base}{ci_section}"),
+        )
+        .unwrap();
+        commit_all(dir, "deploy template");
+        git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(dir, &["update-ref", "refs/remotes/origin/feat/x", "HEAD"]);
+    }
+
+    fn unlimited_accountant() -> Arc<CostAccountant> {
+        Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ))
+    }
+
+    #[tokio::test]
+    async fn dispatch_of_a_non_allowlisted_workflow_is_rejected_before_any_effect_or_charge() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let accountant = unlimited_accountant();
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(Arc::clone(&accountant), "id", "t1");
+        let err = tool
+            .execute(json!({"workflow": "release.yml"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|c| c.contains("dispatch_workflow") || c.contains("list_workflow_runs")));
+        assert_eq!(accountant.task_summary("t1").ci.count, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_inputs_are_validated_against_the_workflow_schema() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        for inputs in [json!({"unknown": "x"}), json!({"k": 5})] {
+            let err = tool
+                .execute(json!({"workflow": "ci.yml", "inputs": inputs}))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments { .. }));
+        }
+        assert!(!mock.calls().iter().any(|c| c.contains("dispatch_workflow")));
+    }
+
+    #[tokio::test]
+    async fn a_tool_with_no_policy_denies_every_dispatch() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::new(dir.path().to_path_buf(), mock);
+        let err = tool
+            .execute(json!({"workflow": "ci.yml"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_comes_from_the_deploy_template_and_not_from_agent_arguments() {
+        let dir = fixture();
+        write_template(dir.path(), "[ci.workflows.\"ci.yml\"]\n");
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        let tool = CiTriggerTool::from_repo_template(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_correlation_policy(Duration::from_millis(50), Duration::from_millis(5));
+        tool.execute(json!({"workflow": "ci.yml"})).await.unwrap();
+        let err = tool
+            .execute(json!({
+                "workflow": "evil.yml",
+                "allow": ["evil.yml"],
+                "allowlist": {"evil.yml": {}},
+                "policy": {"workflows": {"evil.yml": {}}}
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_template_whose_allowlist_can_reach_production_denies_every_workflow() {
+        let dir = fixture();
+        write_template(
+            dir.path(),
+            "[ci.workflows.\"ci.yml\"]\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"production\"]\n",
+        );
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::from_repo_template(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_broken_deploy_template_denies_every_workflow() {
+        let dir = fixture();
+        let mock: Arc<dyn GithubActionsClient> = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::from_repo_template(dir.path().to_path_buf(), Arc::clone(&mock));
+        assert!(tool.execute(json!({"workflow": "ci.yml"})).await.is_err());
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(dir.path().join(".nanna/deploy.toml"), "not toml [").unwrap();
+        let tool = CiTriggerTool::from_repo_template(dir.path().to_path_buf(), mock);
+        assert!(tool.execute(json!({"workflow": "ci.yml"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_run_is_remembered_as_pending_for_later_settlement() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        let accountant = unlimited_accountant();
+        let tool = trigger_tool(dir.path(), mock).with_budget(Arc::clone(&accountant), "id", "t1");
+        tool.execute(json!({"workflow": "ci.yml"})).await.unwrap();
+        assert_eq!(accountant.pending_runs("o/n"), vec![1]);
+    }
+
+    fn finished_run(id: u64, minutes: i64) -> WorkflowRun {
+        let mut finished = run(id, "completed", Some("success"));
+        finished.run_started_at = Some(chrono::Utc::now());
+        finished.updated_at = Some(chrono::Utc::now() + chrono::Duration::minutes(minutes));
+        finished
+    }
+
+    #[tokio::test]
+    async fn minutes_of_a_finished_dispatch_are_charged_on_the_next_trigger_without_any_status_poll(
+    ) {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(finished_run(1, 9));
+        mock.set_run(run(2, "completed", Some("failure")));
+        let accountant = unlimited_accountant();
+        accountant.note_run("o/n", 1);
+        let tool = trigger_tool(dir.path(), mock).with_budget(Arc::clone(&accountant), "id", "t1");
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 0.0);
+        tool.execute(json!({"run_id": 2})).await.unwrap();
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 9.0);
+        tool.execute(json!({"run_id": 2})).await.unwrap();
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 9.0);
+        assert!(accountant.pending_runs("o/n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_pending_run_stays_pending_across_triggers() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(1, "in_progress", None));
+        mock.set_run(run(2, "completed", Some("failure")));
+        let accountant = unlimited_accountant();
+        accountant.note_run("o/n", 1);
+        let tool = trigger_tool(dir.path(), mock).with_budget(Arc::clone(&accountant), "id", "t1");
+        tool.execute(json!({"run_id": 2})).await.unwrap();
+        assert_eq!(accountant.pending_runs("o/n"), vec![1]);
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_status_poll_and_trigger_settlement_never_double_charge_a_run() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(finished_run(1, 5));
+        mock.set_run(run(2, "completed", Some("failure")));
+        let accountant = unlimited_accountant();
+        accountant.note_run("o/n", 1);
+        let client = Arc::clone(&mock) as Arc<dyn GithubActionsClient>;
+        let trigger = trigger_tool(dir.path(), Arc::clone(&client)).with_budget(
+            Arc::clone(&accountant),
+            "id",
+            "t1",
+        );
+        let status = CiStatusTool::new(dir.path().to_path_buf(), client).with_budget(
+            Arc::clone(&accountant),
+            "id",
+            "t1",
+        );
+        status.execute(json!({"run_id": 1})).await.unwrap();
+        trigger.execute(json!({"run_id": 2})).await.unwrap();
+        assert_eq!(accountant.task_summary("t1").ci.minutes, 5.0);
+    }
+
+    #[tokio::test]
+    async fn a_new_task_on_the_same_repo_cannot_bypass_the_day_ceiling() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(run(1, "completed", Some("failure")));
+        let config = BudgetConfig {
+            ci: BudgetLimits {
+                max_count_per_day: Some(2),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        };
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            config,
+        ));
+        let client = Arc::clone(&mock) as Arc<dyn GithubActionsClient>;
+        for (identity, task) in [("a", "t1"), ("b", "t2")] {
+            trigger_tool(dir.path(), Arc::clone(&client))
+                .with_budget(Arc::clone(&accountant), identity, task)
+                .execute(json!({"run_id": 1}))
+                .await
+                .unwrap();
+        }
+        let err = trigger_tool(dir.path(), client)
+            .with_budget(Arc::clone(&accountant), "c", "t3")
+            .execute(json!({"run_id": 1}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::BudgetExceeded(_)));
+    }
+
     fn trigger_tool(dir: &Path, client: Arc<dyn GithubActionsClient>) -> CiTriggerTool {
         CiTriggerTool::new(dir.to_path_buf(), client)
+            .with_policy(allow_ci_yml())
             .with_correlation_policy(Duration::from_millis(50), Duration::from_millis(5))
     }
 
@@ -874,6 +1243,301 @@ mod tests {
             .iter()
             .any(|c| c.contains("rerun_workflow o/n#9")));
         assert!(!mock.calls().iter().any(|c| c.contains("dispatch_workflow")));
+    }
+
+    fn dispatch_calls(mock: &MockGithubActions) -> Vec<String> {
+        mock.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("dispatch_workflow"))
+            .collect()
+    }
+
+    fn modified_surface_refusal(err: ToolError) -> String {
+        match err {
+            ToolError::InvalidArguments { message } => message,
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_runs_the_allowlisted_workflow_on_the_task_branch_when_ci_files_match_base() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
+        commit_all(dir.path(), "feature work");
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        tool.execute(json!({"workflow": "ci.yml"})).await.unwrap();
+        assert_eq!(
+            dispatch_calls(&mock),
+            vec!["dispatch_workflow o/n ci.yml@feat/x {}".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_task_branch_edits_the_allowlisted_workflow() {
+        let dir = fixture();
+        std::fs::write(
+            dir.path().join(".github/workflows/ci.yml"),
+            "name: ci\non: workflow_dispatch\njobs: {}\n",
+        )
+        .unwrap();
+        commit_all(dir.path(), "edit ci");
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let message = modified_surface_refusal(
+            tool.execute(json!({"workflow": "ci.yml"}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains(".github"), "{message}");
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_task_branch_adds_or_edits_any_other_ci_file() {
+        for (path, body) in [
+            (".github/workflows/extra.yml", "name: extra\n"),
+            (".github/actions/setup/action.yml", "name: setup\n"),
+        ] {
+            let dir = fixture();
+            let target = dir.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, body).unwrap();
+            commit_all(dir.path(), "touch ci surface");
+            let mock = Arc::new(MockGithubActions::default());
+            let tool = trigger_tool(
+                dir.path(),
+                Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+            );
+            let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+            assert!(
+                matches!(err, Err(ToolError::InvalidArguments { .. })),
+                "{path}"
+            );
+            assert!(mock.calls().is_empty(), "{path}: {:?}", mock.calls());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_pushed_branch_tip_differs_from_a_clean_local_head() {
+        let dir = fixture();
+        let clean = rev_parse(dir.path(), "HEAD");
+        std::fs::write(
+            dir.path().join(".github/workflows/ci.yml"),
+            "name: pushed-evil\n",
+        )
+        .unwrap();
+        commit_all(dir.path(), "evil");
+        let evil = rev_parse(dir.path(), "HEAD");
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/feat/x", &evil],
+        );
+        git(dir.path(), &["reset", "-q", "--hard", &clean]);
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_branch_has_never_been_pushed() {
+        let dir = fixture();
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/feat/x"],
+        );
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let message = modified_surface_refusal(
+            tool.execute(json!({"workflow": "ci.yml"}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains("push the branch"), "{message}");
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_no_base_branch_can_be_resolved() {
+        let dir = fixture();
+        git(
+            dir.path(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_allowlisted_workflow_is_absent_from_base() {
+        let dir = fixture();
+        let policy: CiPolicy = toml::from_str("[workflows.\"ghost.yml\"]\n").unwrap();
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::new(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_policy(policy);
+        let err = tool.execute(json!({"workflow": "ghost.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_the_policy_file_in_the_worktree_differs_from_base() {
+        let dir = fixture();
+        write_template(dir.path(), "[ci.workflows.\"ci.yml\"]\n");
+        let widened = format!(
+            "{}[ci.workflows.\"evil.yml\"]\n",
+            std::fs::read_to_string(dir.path().join(".nanna/deploy.toml")).unwrap()
+        );
+        std::fs::write(dir.path().join(".nanna/deploy.toml"), widened).unwrap();
+        let mock = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::from_repo_template(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"workflow": "ci.yml"})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    fn rerun_fixture(
+        path: Option<&str>,
+        head_sha: Option<String>,
+    ) -> (TempDir, Arc<MockGithubActions>) {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let mut failed = run(9, "completed", Some("failure"));
+        failed.path = path.map(str::to_string);
+        if head_sha.is_some() {
+            failed.head_sha = head_sha;
+        }
+        mock.set_run(failed);
+        (dir, mock)
+    }
+
+    fn reruns(mock: &MockGithubActions) -> usize {
+        mock.calls()
+            .iter()
+            .filter(|c| c.starts_with("rerun_workflow"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn rerun_of_a_workflow_outside_the_allowlist_is_refused() {
+        let (dir, mock) = rerun_fixture(Some(".github/workflows/release.yml"), None);
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"run_id": 9})).await.unwrap_err();
+        assert!(modified_surface_refusal(err).contains("release.yml"));
+        assert_eq!(reruns(&mock), 0);
+    }
+
+    #[tokio::test]
+    async fn rerun_matches_the_workflow_file_name_exactly() {
+        for path in [
+            None,
+            Some(""),
+            Some(".github/workflows/CI.yml"),
+            Some(".github/workflows/ci.yml "),
+            Some(".github/workflows/ci.yml."),
+            Some(".github/workflows/../ci.yml"),
+            Some(".github/workflows/sub/ci.yml"),
+            Some("ci.yml"),
+            Some("x/.github/workflows/ci.yml"),
+            Some(".github/workflows/ci%2Eyml"),
+            Some(".github/workflows/\u{441}i.yml"),
+        ] {
+            let (dir, mock) = rerun_fixture(path, None);
+            let tool = trigger_tool(
+                dir.path(),
+                Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+            );
+            let err = tool.execute(json!({"run_id": 9})).await;
+            assert!(
+                matches!(err, Err(ToolError::InvalidArguments { .. })),
+                "{path:?}"
+            );
+            assert_eq!(reruns(&mock), 0, "{path:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rerun_of_an_allowlisted_workflow_with_a_ref_suffix_is_accepted() {
+        let (dir, mock) = rerun_fixture(Some(".github/workflows/ci.yml@refs/heads/feat/x"), None);
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        tool.execute(json!({"run_id": 9})).await.unwrap();
+        assert_eq!(reruns(&mock), 1);
+    }
+
+    #[tokio::test]
+    async fn rerun_is_refused_when_the_run_executed_a_modified_workflow() {
+        let dir = fixture();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: evil\n").unwrap();
+        commit_all(dir.path(), "evil");
+        let evil = rev_parse(dir.path(), "HEAD");
+        git(dir.path(), &["reset", "-q", "--hard", "HEAD~1"]);
+        let mock = Arc::new(MockGithubActions::default());
+        let mut failed = run(9, "completed", Some("failure"));
+        failed.head_sha = Some(evil);
+        mock.set_run(failed);
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"run_id": 9})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert_eq!(reruns(&mock), 0);
+    }
+
+    #[tokio::test]
+    async fn rerun_is_refused_when_the_run_does_not_report_its_commit() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions::default());
+        let mut failed = run(9, "completed", Some("failure"));
+        failed.head_sha = None;
+        mock.set_run(failed);
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        );
+        let err = tool.execute(json!({"run_id": 9})).await;
+        assert!(matches!(err, Err(ToolError::InvalidArguments { .. })));
+        assert_eq!(reruns(&mock), 0);
     }
 
     #[tokio::test]

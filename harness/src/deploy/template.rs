@@ -1,4 +1,5 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
+use crate::ci_policy::CiPolicy;
 use crate::windows;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ pub struct Target {
     /// Image name inside the registry.
     pub image: String,
     /// Environments the deployable can be rolled out to, in declaration order.
+    /// Names outside [`NON_PRODUCTION_ENVS`](super::NON_PRODUCTION_ENVS) are
+    /// treated as production.
     pub environments: Vec<String>,
 }
 
@@ -379,6 +382,7 @@ struct RawTemplate {
     health: Option<RawHealth>,
     rollback: Option<RawRollback>,
     shadow: Option<RawShadow>,
+    ci: Option<CiPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +460,7 @@ pub struct DeployTemplate {
     pub rollback: Rollback,
     /// The `[shadow]` section, if present.
     pub shadow: Option<Shadow>,
+    pub ci: CiPolicy,
 }
 
 impl DeployTemplate {
@@ -547,6 +552,9 @@ impl DeployTemplate {
             file: file.to_path_buf(),
             source,
         })?;
+        let ci = raw.ci.unwrap_or_default();
+        ci.ensure_non_production()
+            .map_err(|e| invalid(file, "ci", e.to_string()))?;
         let template = Self {
             file: file.to_path_buf(),
             target: convert_target(file, raw.target)?,
@@ -563,6 +571,7 @@ impl DeployTemplate {
                     retain_for: Duration::zero(),
                 }),
             shadow: raw.shadow.map(|s| convert_shadow(file, s)).transpose()?,
+            ci,
         };
         template.validate()?;
         Ok(template)
@@ -1138,6 +1147,65 @@ compare = ["status", "latency"]
             assert_eq!(t.rollback.on_breach, expected);
             assert_eq!(expected.name(), name);
         }
+    }
+
+    #[test]
+    fn a_ci_section_that_can_reach_production_is_rejected_at_load() {
+        for section in [
+            "[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"sandbox\", \"production\"]\n",
+            "[ci.workflows.\"deploy.yml\".inputs.environment]\ntype = \"string\"\n",
+            "[ci.workflows.\"deploy.yml\".inputs.ENV]\ntype = \"string\"\nallowed = [\"Prod\"]\n",
+            "[ci.workflows.\"release-production.yml\"]\n",
+            "[ci.workflows.\"ci.yml \"]\n",
+        ] {
+            let src = format!("{FIXTURE}\n{section}");
+            let err = DeployTemplate::parse(&src).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidField { field: "ci", .. }),
+                "{section}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_free_form_string_input_is_rejected_at_load() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.deploy_to]\ntype = \"string\"\n"
+        );
+        let err = DeployTemplate::parse(&src).unwrap_err();
+        assert!(
+            matches!(err, DeployError::InvalidField { field: "ci", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_ci_section_limited_to_non_production_environments_loads() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\", \"Staging\"]\n"
+        );
+        assert!(DeployTemplate::parse(&src).is_ok());
+    }
+
+    #[test]
+    fn ci_section_defaults_to_denying_every_workflow() {
+        let t = DeployTemplate::parse(FIXTURE).unwrap();
+        assert_eq!(t.ci, CiPolicy::deny_all());
+    }
+
+    #[test]
+    fn ci_section_declares_allowlisted_workflows_and_input_schemas() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"ci.yml\"]\n\n[ci.workflows.\"sandbox.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\"]\n"
+        );
+        let t = DeployTemplate::parse(&src).unwrap();
+        assert!(t.ci.permits("ci.yml"));
+        assert!(t.ci.permits("sandbox.yml"));
+        assert!(!t.ci.permits("release.yml"));
+        assert!(t
+            .ci
+            .validate_dispatch("sandbox.yml", &serde_json::json!({"env": "production"}))
+            .is_err());
     }
 
     #[test]

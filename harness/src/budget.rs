@@ -20,8 +20,9 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationSource, Escalator, Severity};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -72,6 +73,7 @@ pub enum BudgetScope {
     Task,
     /// Scoped to one identity's calendar day (UTC).
     Day,
+    Repo,
 }
 
 impl fmt::Display for BudgetScope {
@@ -79,6 +81,7 @@ impl fmt::Display for BudgetScope {
         f.write_str(match self {
             BudgetScope::Task => "per-task",
             BudgetScope::Day => "per-day",
+            BudgetScope::Repo => "per-repo",
         })
     }
 }
@@ -120,6 +123,13 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
+    pub const DENY_ALL: Self = Self {
+        max_count_per_task: Some(0),
+        max_count_per_day: Some(0),
+        max_minutes_per_task: Some(0.0),
+        max_minutes_per_day: Some(0.0),
+    };
+
     /// No ceiling on any dimension.
     pub const UNLIMITED: Self = Self {
         max_count_per_task: None,
@@ -137,6 +147,11 @@ pub struct BudgetConfig {
 }
 
 impl BudgetConfig {
+    pub const DENY_ALL: Self = Self {
+        ci: BudgetLimits::DENY_ALL,
+        sandbox: BudgetLimits::DENY_ALL,
+    };
+
     /// No ceiling on either class: every [`CostAccountant::charge_count`]
     /// call succeeds. Useful for tests and for callers that want only the
     /// bookkeeping (usage visible in [`CostAccountant::task_summary`]) with
@@ -262,37 +277,42 @@ impl BudgetReport {
     }
 }
 
-/// Where [`CostAccountant`] persists usage. In-memory only: cross-task
-/// per-day limits therefore span the tasks one process handles, matching
-/// [`crate::leases::InMemoryLeaseStore`] and [`crate::escalation::EscalationLog::in_memory`]'s
-/// defaults; a durable store is not required by this issue's acceptance
-/// criteria and can implement this same trait later.
+#[derive(Debug, Clone, Copy)]
+pub struct ChargeKey<'a> {
+    pub identity: &'a str,
+    pub task_id: &'a str,
+    pub repo: &'a str,
+    pub class: BudgetClass,
+    pub day: NaiveDate,
+}
+
 pub trait BudgetStore: Send + Sync {
-    /// Usage recorded for `task_id`'s `class` budget so far.
     fn task_usage(&self, task_id: &str, class: BudgetClass) -> Usage;
-    /// Usage recorded for `identity`'s `class` budget on `day` so far.
     fn day_usage(&self, identity: &str, class: BudgetClass, day: NaiveDate) -> Usage;
-    /// Add `delta` to both the task's and the identity's day counters.
-    fn record(
-        &self,
-        identity: &str,
-        task_id: &str,
-        class: BudgetClass,
-        day: NaiveDate,
-        delta: Usage,
-    );
+    fn repo_day_usage(&self, repo: &str, class: BudgetClass, day: NaiveDate) -> Usage;
+    fn record(&self, key: &ChargeKey<'_>, delta: Usage);
+    fn try_charge(&self, key: &ChargeKey<'_>, limits: &BudgetLimits) -> Result<(), BudgetExceeded>;
+    fn note_run(&self, repo: &str, run_id: u64);
+    fn pending_runs(&self, repo: &str) -> Vec<u64>;
+    fn claim_run(&self, repo: &str, run_id: u64) -> bool;
 }
 
 #[derive(Debug, Default)]
-pub struct InMemoryBudgetStore {
-    by_task: Mutex<HashMap<(String, BudgetClass), Usage>>,
-    by_day: Mutex<HashMap<(String, BudgetClass, NaiveDate), Usage>>,
+struct Ledger {
+    tasks: HashMap<(String, BudgetClass), Usage>,
+    days: HashMap<(String, BudgetClass, NaiveDate), Usage>,
+    repos: HashMap<(String, BudgetClass, NaiveDate), Usage>,
+    charged_runs: HashSet<(String, u64)>,
+    pending_runs: BTreeSet<(String, u64)>,
 }
 
-impl InMemoryBudgetStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LedgerSnapshot {
+    tasks: Vec<(String, BudgetClass, Usage)>,
+    days: Vec<(String, BudgetClass, NaiveDate, Usage)>,
+    repos: Vec<(String, BudgetClass, NaiveDate, Usage)>,
+    charged_runs: Vec<(String, u64)>,
+    pending_runs: Vec<(String, u64)>,
 }
 
 fn add(usage: &mut Usage, delta: Usage) {
@@ -300,49 +320,387 @@ fn add(usage: &mut Usage, delta: Usage) {
     usage.minutes += delta.minutes;
 }
 
-impl BudgetStore for InMemoryBudgetStore {
-    fn task_usage(&self, task_id: &str, class: BudgetClass) -> Usage {
-        self.by_task
-            .lock()
-            .expect("budget task table poisoned")
+impl Ledger {
+    fn task(&self, task_id: &str, class: BudgetClass) -> Usage {
+        self.tasks
             .get(&(task_id.to_string(), class))
             .copied()
             .unwrap_or_default()
     }
 
-    fn day_usage(&self, identity: &str, class: BudgetClass, day: NaiveDate) -> Usage {
-        self.by_day
-            .lock()
-            .expect("budget day table poisoned")
+    fn day(&self, identity: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.days
             .get(&(identity.to_string(), class, day))
             .copied()
             .unwrap_or_default()
     }
 
-    fn record(
-        &self,
-        identity: &str,
-        task_id: &str,
-        class: BudgetClass,
-        day: NaiveDate,
-        delta: Usage,
-    ) {
+    fn repo_day(&self, repo: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.repos
+            .get(&(repo.to_string(), class, day))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn record(&mut self, key: &ChargeKey<'_>, delta: Usage) {
         add(
-            self.by_task
-                .lock()
-                .expect("budget task table poisoned")
-                .entry((task_id.to_string(), class))
+            self.tasks
+                .entry((key.task_id.to_string(), key.class))
                 .or_default(),
             delta,
         );
         add(
-            self.by_day
-                .lock()
-                .expect("budget day table poisoned")
-                .entry((identity.to_string(), class, day))
+            self.days
+                .entry((key.identity.to_string(), key.class, key.day))
                 .or_default(),
             delta,
         );
+        add(
+            self.repos
+                .entry((key.repo.to_string(), key.class, key.day))
+                .or_default(),
+            delta,
+        );
+    }
+
+    fn try_charge(
+        &mut self,
+        key: &ChargeKey<'_>,
+        limits: &BudgetLimits,
+    ) -> Result<(), BudgetExceeded> {
+        let scopes = [
+            (
+                BudgetScope::Task,
+                self.task(key.task_id, key.class),
+                limits.max_count_per_task,
+                limits.max_minutes_per_task,
+            ),
+            (
+                BudgetScope::Day,
+                self.day(key.identity, key.class, key.day),
+                limits.max_count_per_day,
+                limits.max_minutes_per_day,
+            ),
+            (
+                BudgetScope::Repo,
+                self.repo_day(key.repo, key.class, key.day),
+                limits.max_count_per_day,
+                limits.max_minutes_per_day,
+            ),
+        ];
+        for (scope, usage, max_count, max_minutes) in scopes {
+            if let Some(max) = max_count {
+                if usage.count >= max {
+                    return Err(BudgetExceeded::new(
+                        key.identity,
+                        key.class,
+                        scope,
+                        BudgetDimension::Count,
+                        f64::from(usage.count),
+                        f64::from(max),
+                    ));
+                }
+            }
+            if let Some(max) = max_minutes {
+                if usage.minutes >= max {
+                    return Err(BudgetExceeded::new(
+                        key.identity,
+                        key.class,
+                        scope,
+                        BudgetDimension::Minutes,
+                        usage.minutes,
+                        max,
+                    ));
+                }
+            }
+        }
+        self.record(
+            key,
+            Usage {
+                count: 1,
+                minutes: 0.0,
+            },
+        );
+        Ok(())
+    }
+
+    fn note_run(&mut self, repo: &str, run_id: u64) -> bool {
+        let id = (repo.to_string(), run_id);
+        if self.charged_runs.contains(&id) {
+            return false;
+        }
+        self.pending_runs.insert(id)
+    }
+
+    fn pending(&self, repo: &str) -> Vec<u64> {
+        self.pending_runs
+            .iter()
+            .filter(|(r, _)| r == repo)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    fn claim_run(&mut self, repo: &str, run_id: u64) -> bool {
+        let id = (repo.to_string(), run_id);
+        self.pending_runs.remove(&id);
+        self.charged_runs.insert(id)
+    }
+
+    fn snapshot(&self) -> LedgerSnapshot {
+        LedgerSnapshot {
+            tasks: self
+                .tasks
+                .iter()
+                .map(|((t, c), u)| (t.clone(), *c, *u))
+                .collect(),
+            days: self
+                .days
+                .iter()
+                .map(|((i, c, d), u)| (i.clone(), *c, *d, *u))
+                .collect(),
+            repos: self
+                .repos
+                .iter()
+                .map(|((r, c, d), u)| (r.clone(), *c, *d, *u))
+                .collect(),
+            charged_runs: self.charged_runs.iter().cloned().collect(),
+            pending_runs: self.pending_runs.iter().cloned().collect(),
+        }
+    }
+
+    fn from_snapshot(snapshot: LedgerSnapshot) -> Self {
+        Self {
+            tasks: snapshot
+                .tasks
+                .into_iter()
+                .map(|(t, c, u)| ((t, c), u))
+                .collect(),
+            days: snapshot
+                .days
+                .into_iter()
+                .map(|(i, c, d, u)| ((i, c, d), u))
+                .collect(),
+            repos: snapshot
+                .repos
+                .into_iter()
+                .map(|(r, c, d, u)| ((r, c, d), u))
+                .collect(),
+            charged_runs: snapshot.charged_runs.into_iter().collect(),
+            pending_runs: snapshot.pending_runs.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryBudgetStore {
+    ledger: Mutex<Ledger>,
+}
+
+impl InMemoryBudgetStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger.lock().expect("budget ledger poisoned")
+    }
+}
+
+impl BudgetStore for InMemoryBudgetStore {
+    fn task_usage(&self, task_id: &str, class: BudgetClass) -> Usage {
+        self.ledger().task(task_id, class)
+    }
+
+    fn day_usage(&self, identity: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.ledger().day(identity, class, day)
+    }
+
+    fn repo_day_usage(&self, repo: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.ledger().repo_day(repo, class, day)
+    }
+
+    fn record(&self, key: &ChargeKey<'_>, delta: Usage) {
+        self.ledger().record(key, delta);
+    }
+
+    fn try_charge(&self, key: &ChargeKey<'_>, limits: &BudgetLimits) -> Result<(), BudgetExceeded> {
+        self.ledger().try_charge(key, limits)
+    }
+
+    fn note_run(&self, repo: &str, run_id: u64) {
+        self.ledger().note_run(repo, run_id);
+    }
+
+    fn pending_runs(&self, repo: &str) -> Vec<u64> {
+        self.ledger().pending(repo)
+    }
+
+    fn claim_run(&self, repo: &str, run_id: u64) -> bool {
+        self.ledger().claim_run(repo, run_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct FileBudgetStore {
+    path: PathBuf,
+    ledger: Mutex<Ledger>,
+    _lock: std::fs::File,
+}
+
+pub const BUDGET_PATH_ENV: &str = "NANNA_BUDGET_PATH";
+
+pub fn budget_path_from(
+    override_path: Option<std::ffi::OsString>,
+    queue_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_path
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| queue_path.map(|q| q.with_file_name("budget.json")))
+}
+
+#[derive(Debug, Error)]
+pub enum BudgetStoreError {
+    #[error("budget store {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("budget store {path} is in use by another process")]
+    Locked { path: PathBuf },
+    #[error("budget store {path} is corrupt: {source}")]
+    Corrupt {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+impl FileBudgetStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, BudgetStoreError> {
+        let path = path.into();
+        let lock = Self::acquire_lock(&path)?;
+        let ledger = match std::fs::read(&path) {
+            Ok(bytes) => {
+                Ledger::from_snapshot(serde_json::from_slice(&bytes).map_err(|source| {
+                    BudgetStoreError::Corrupt {
+                        path: path.clone(),
+                        source,
+                    }
+                })?)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
+            Err(source) => return Err(BudgetStoreError::Io { path, source }),
+        };
+        Ok(Self {
+            path,
+            ledger: Mutex::new(ledger),
+            _lock: lock,
+        })
+    }
+
+    fn acquire_lock(path: &std::path::Path) -> Result<std::fs::File, BudgetStoreError> {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let lock_path = PathBuf::from(name);
+        let io = |source| BudgetStoreError::Io {
+            path: lock_path.clone(),
+            source,
+        };
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(io)?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(io)?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(file),
+            Err(fs4::TryLockError::WouldBlock) => Err(BudgetStoreError::Locked {
+                path: path.to_path_buf(),
+            }),
+            Err(fs4::TryLockError::Error(source)) => Err(io(source)),
+        }
+    }
+
+    fn persist(&self, ledger: &Ledger) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(&ledger.snapshot())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &self.path)
+    }
+
+    fn mutate<R>(&self, f: impl FnOnce(&mut Ledger) -> (R, bool)) -> R {
+        let mut ledger = self.ledger.lock().expect("budget ledger poisoned");
+        let (result, changed) = f(&mut ledger);
+        if changed {
+            if let Err(e) = self.persist(&ledger) {
+                tracing::error!("budget store {} not persisted: {e}", self.path.display());
+            }
+        }
+        result
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&Ledger) -> R) -> R {
+        f(&self.ledger.lock().expect("budget ledger poisoned"))
+    }
+}
+
+impl BudgetStore for FileBudgetStore {
+    fn task_usage(&self, task_id: &str, class: BudgetClass) -> Usage {
+        self.read(|l| l.task(task_id, class))
+    }
+
+    fn day_usage(&self, identity: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.read(|l| l.day(identity, class, day))
+    }
+
+    fn repo_day_usage(&self, repo: &str, class: BudgetClass, day: NaiveDate) -> Usage {
+        self.read(|l| l.repo_day(repo, class, day))
+    }
+
+    fn record(&self, key: &ChargeKey<'_>, delta: Usage) {
+        self.mutate(|l| {
+            l.record(key, delta);
+            ((), true)
+        });
+    }
+
+    fn try_charge(&self, key: &ChargeKey<'_>, limits: &BudgetLimits) -> Result<(), BudgetExceeded> {
+        self.mutate(|l| {
+            let result = l.try_charge(key, limits);
+            let changed = result.is_ok();
+            (result, changed)
+        })
+    }
+
+    fn note_run(&self, repo: &str, run_id: u64) {
+        self.mutate(|l| {
+            let changed = l.note_run(repo, run_id);
+            ((), changed)
+        });
+    }
+
+    fn pending_runs(&self, repo: &str) -> Vec<u64> {
+        self.read(|l| l.pending(repo))
+    }
+
+    fn claim_run(&self, repo: &str, run_id: u64) -> bool {
+        self.mutate(|l| {
+            let first = l.claim_run(repo, run_id);
+            (first, true)
+        })
     }
 }
 
@@ -356,6 +714,10 @@ pub struct CostAccountant {
 }
 
 impl CostAccountant {
+    pub fn deny_all(store: Arc<dyn BudgetStore>) -> Self {
+        Self::new(store, BudgetConfig::DENY_ALL)
+    }
+
     pub fn new(store: Arc<dyn BudgetStore>, config: BudgetConfig) -> Self {
         Self {
             store,
@@ -416,73 +778,17 @@ impl CostAccountant {
         class: BudgetClass,
         now: DateTime<Utc>,
     ) -> Result<BudgetReport, BudgetExceeded> {
-        let limits = self.config.limits(class);
-        let day = now.date_naive();
-        let task = self.store.task_usage(task_id, class);
-        if let Some(max) = limits.max_count_per_task {
-            if task.count >= max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Task,
-                    BudgetDimension::Count,
-                    f64::from(task.count),
-                    f64::from(max),
-                );
-                return Err(self.deny(repo, exceeded).await);
-            }
-        }
-        if let Some(max) = limits.max_minutes_per_task {
-            if task.minutes >= max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Task,
-                    BudgetDimension::Minutes,
-                    task.minutes,
-                    max,
-                );
-                return Err(self.deny(repo, exceeded).await);
-            }
-        }
-        let day_usage = self.store.day_usage(identity, class, day);
-        if let Some(max) = limits.max_count_per_day {
-            if day_usage.count >= max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Day,
-                    BudgetDimension::Count,
-                    f64::from(day_usage.count),
-                    f64::from(max),
-                );
-                return Err(self.deny(repo, exceeded).await);
-            }
-        }
-        if let Some(max) = limits.max_minutes_per_day {
-            if day_usage.minutes >= max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Day,
-                    BudgetDimension::Minutes,
-                    day_usage.minutes,
-                    max,
-                );
-                return Err(self.deny(repo, exceeded).await);
-            }
-        }
-        self.store.record(
+        let key = ChargeKey {
             identity,
             task_id,
+            repo,
             class,
-            day,
-            Usage {
-                count: 1,
-                minutes: 0.0,
-            },
-        );
-        Ok(self.task_summary(task_id))
+            day: now.date_naive(),
+        };
+        match self.store.try_charge(&key, &self.config.limits(class)) {
+            Ok(()) => Ok(self.task_summary(task_id)),
+            Err(exceeded) => Err(self.deny(repo, exceeded).await),
+        }
     }
 
     /// Like [`Self::record_minutes`], but synchronous and without an
@@ -495,17 +801,19 @@ impl CostAccountant {
         &self,
         identity: &str,
         task_id: &str,
+        repo: &str,
         class: BudgetClass,
         minutes: f64,
         now: DateTime<Utc>,
     ) -> BudgetReport {
-        self.store.record(
+        let key = ChargeKey {
             identity,
             task_id,
+            repo,
             class,
-            now.date_naive(),
-            Usage { count: 0, minutes },
-        );
+            day: now.date_naive(),
+        };
+        self.store.record(&key, Usage { count: 0, minutes });
         self.task_summary(task_id)
     }
 
@@ -525,38 +833,55 @@ impl CostAccountant {
         now: DateTime<Utc>,
     ) -> BudgetReport {
         let day = now.date_naive();
-        self.store
-            .record(identity, task_id, class, day, Usage { count: 0, minutes });
+        let key = ChargeKey {
+            identity,
+            task_id,
+            repo,
+            class,
+            day,
+        };
+        self.store.record(&key, Usage { count: 0, minutes });
         let limits = self.config.limits(class);
-        let task = self.store.task_usage(task_id, class);
-        if let Some(max) = limits.max_minutes_per_task {
-            if task.minutes > max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Task,
-                    BudgetDimension::Minutes,
-                    task.minutes,
-                    max,
-                );
-                self.deny(repo, exceeded).await;
-            }
-        }
-        let day_usage = self.store.day_usage(identity, class, day);
-        if let Some(max) = limits.max_minutes_per_day {
-            if day_usage.minutes > max {
-                let exceeded = BudgetExceeded::new(
-                    identity,
-                    class,
-                    BudgetScope::Day,
-                    BudgetDimension::Minutes,
-                    day_usage.minutes,
-                    max,
-                );
-                self.deny(repo, exceeded).await;
+        let observed = [
+            (BudgetScope::Task, self.store.task_usage(task_id, class)),
+            (BudgetScope::Day, self.store.day_usage(identity, class, day)),
+            (
+                BudgetScope::Repo,
+                self.store.repo_day_usage(repo, class, day),
+            ),
+        ];
+        for (scope, usage) in observed {
+            let max = match scope {
+                BudgetScope::Task => limits.max_minutes_per_task,
+                BudgetScope::Day | BudgetScope::Repo => limits.max_minutes_per_day,
+            };
+            if let Some(max) = max {
+                if usage.minutes > max {
+                    let exceeded = BudgetExceeded::new(
+                        identity,
+                        class,
+                        scope,
+                        BudgetDimension::Minutes,
+                        usage.minutes,
+                        max,
+                    );
+                    self.deny(repo, exceeded).await;
+                }
             }
         }
         self.task_summary(task_id)
+    }
+
+    pub fn note_run(&self, repo: &str, run_id: u64) {
+        self.store.note_run(repo, run_id);
+    }
+
+    pub fn pending_runs(&self, repo: &str) -> Vec<u64> {
+        self.store.pending_runs(repo)
+    }
+
+    pub fn claim_run(&self, repo: &str, run_id: u64) -> bool {
+        self.store.claim_run(repo, run_id)
     }
 }
 
@@ -689,7 +1014,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_day_count_ceiling_spans_tasks_for_the_same_identity_but_not_others() {
+    async fn per_day_count_ceiling_spans_tasks_for_the_same_identity_but_not_others_on_another_repo(
+    ) {
         let config = BudgetConfig {
             ci: BudgetLimits {
                 max_count_per_day: Some(1),
@@ -709,7 +1035,7 @@ mod tests {
         assert_eq!(err.scope, BudgetScope::Day);
         assert_eq!(err.dimension, BudgetDimension::Count);
         accountant
-            .charge_count("other", "t3", "o/n", BudgetClass::Ci, now())
+            .charge_count("other", "t3", "other/repo", BudgetClass::Ci, now())
             .await
             .unwrap();
     }
@@ -790,7 +1116,8 @@ mod tests {
             },
         };
         let accountant = accountant(config);
-        let summary = accountant.record_minutes_sync("id", "t1", BudgetClass::Sandbox, 50.0, now());
+        let summary =
+            accountant.record_minutes_sync("id", "t1", "o/n", BudgetClass::Sandbox, 50.0, now());
         assert_eq!(summary.sandbox.minutes, 50.0);
         assert_eq!(accountant.task_summary("t1").sandbox.minutes, 50.0);
     }
@@ -975,10 +1302,13 @@ mod tests {
             .unwrap()
             .date_naive();
         store.record(
-            "id",
-            "t1",
-            BudgetClass::Ci,
-            day,
+            &ChargeKey {
+                identity: "id",
+                task_id: "t1",
+                repo: "o/n",
+                class: BudgetClass::Ci,
+                day,
+            },
             Usage {
                 count: 1,
                 minutes: 2.0,
@@ -1026,5 +1356,247 @@ mod tests {
         let config = BudgetConfig::default();
         assert!(config.sandbox.max_count_per_task < config.ci.max_count_per_task);
         assert!(config.sandbox.max_count_per_day < config.ci.max_count_per_day);
+    }
+
+    fn limited_count(per_task: u32, per_day: u32) -> BudgetConfig {
+        BudgetConfig {
+            ci: BudgetLimits {
+                max_count_per_task: Some(per_task),
+                max_count_per_day: Some(per_day),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        }
+    }
+
+    #[test]
+    fn concurrent_charges_on_the_store_cannot_overshoot_the_ceiling() {
+        let store = Arc::new(InMemoryBudgetStore::new());
+        let limits = limited_count(5, 1000).ci;
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let day = now().date_naive();
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .try_charge(
+                            &ChargeKey {
+                                identity: "id",
+                                task_id: "t1",
+                                repo: "o/n",
+                                class: BudgetClass::Ci,
+                                day,
+                            },
+                            &limits,
+                        )
+                        .is_ok()
+                })
+            })
+            .collect();
+        let granted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(granted, 5);
+        assert_eq!(store.task_usage("t1", BudgetClass::Ci).count, 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_accountant_charges_cannot_overshoot_the_ceiling() {
+        let accountant = Arc::new(accountant(limited_count(3, 1000)));
+        let handles: Vec<_> = (0..24)
+            .map(|_| {
+                let accountant = Arc::clone(&accountant);
+                tokio::spawn(async move {
+                    accountant
+                        .charge_count("id", "t1", "o/n", BudgetClass::Ci, now())
+                        .await
+                        .is_ok()
+                })
+            })
+            .collect();
+        let mut granted = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 3);
+        assert_eq!(accountant.task_summary("t1").ci.count, 3);
+    }
+
+    #[tokio::test]
+    async fn file_store_budget_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("budget.json");
+        {
+            let accountant = CostAccountant::new(
+                Arc::new(FileBudgetStore::open(&path).unwrap()),
+                limited_count(2, 1000),
+            );
+            accountant
+                .charge_count("id", "t1", "o/n", BudgetClass::Ci, now())
+                .await
+                .unwrap();
+            accountant
+                .charge_count("id", "t1", "o/n", BudgetClass::Ci, now())
+                .await
+                .unwrap();
+            accountant.note_run("o/n", 7);
+        }
+        let reopened = CostAccountant::new(
+            Arc::new(FileBudgetStore::open(&path).unwrap()),
+            limited_count(2, 1000),
+        );
+        assert_eq!(reopened.task_summary("t1").ci.count, 2);
+        let err = reopened
+            .charge_count("id", "t1", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap_err();
+        assert_eq!(err.scope, BudgetScope::Task);
+        assert_eq!(reopened.pending_runs("o/n"), vec![7]);
+        assert!(reopened.claim_run("o/n", 7));
+        assert!(reopened.pending_runs("o/n").is_empty());
+    }
+
+    #[test]
+    fn file_store_opens_empty_when_missing_and_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let store = FileBudgetStore::open(&path).unwrap();
+        assert_eq!(store.task_usage("t", BudgetClass::Ci), Usage::default());
+        drop(store);
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(matches!(
+            FileBudgetStore::open(&path),
+            Err(BudgetStoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_second_open_of_the_same_store_is_refused_while_the_first_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = FileBudgetStore::open(&path).unwrap();
+        assert!(matches!(
+            FileBudgetStore::open(&path),
+            Err(BudgetStoreError::Locked { .. })
+        ));
+        drop(first);
+        assert!(FileBudgetStore::open(&path).is_ok());
+    }
+
+    #[test]
+    fn stores_at_different_paths_do_not_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = FileBudgetStore::open(dir.path().join("a.json")).unwrap();
+        let b = FileBudgetStore::open(dir.path().join("b.json")).unwrap();
+        drop((a, b));
+    }
+
+    #[test]
+    fn budget_path_prefers_the_override_then_sits_next_to_the_queue_log() {
+        use std::ffi::OsString;
+        assert_eq!(
+            budget_path_from(
+                Some(OsString::from("/srv/b.json")),
+                Some(PathBuf::from("/q/queue.jsonl"))
+            ),
+            Some(PathBuf::from("/srv/b.json"))
+        );
+        assert_eq!(
+            budget_path_from(None, Some(PathBuf::from("/q/queue.jsonl"))),
+            Some(PathBuf::from("/q/budget.json"))
+        );
+        assert_eq!(
+            budget_path_from(Some(OsString::new()), Some(PathBuf::from("/q/queue.jsonl"))),
+            Some(PathBuf::from("/q/budget.json"))
+        );
+        assert_eq!(budget_path_from(None, None), None);
+        assert_eq!(budget_path_from(Some(OsString::new()), None), None);
+    }
+
+    #[tokio::test]
+    async fn deny_all_refuses_every_charge_for_both_classes() {
+        let accountant = CostAccountant::deny_all(Arc::new(InMemoryBudgetStore::new()));
+        for class in [BudgetClass::Ci, BudgetClass::Sandbox] {
+            assert!(accountant
+                .charge_count("id", "t", "o/n", class, now())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn day_ceiling_is_keyed_per_repo_so_new_identities_and_tasks_cannot_bypass_it() {
+        let accountant = accountant(limited_count(1000, 3));
+        for n in 0..3 {
+            accountant
+                .charge_count(
+                    &format!("id{n}"),
+                    &format!("t{n}"),
+                    "o/n",
+                    BudgetClass::Ci,
+                    now(),
+                )
+                .await
+                .unwrap();
+        }
+        let err = accountant
+            .charge_count("id9", "t9", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap_err();
+        assert_eq!(err.scope, BudgetScope::Repo);
+        accountant
+            .charge_count("id9", "t9", "other/repo", BudgetClass::Ci, now())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repo_minutes_accumulated_across_identities_block_further_triggers() {
+        let config = BudgetConfig {
+            ci: BudgetLimits {
+                max_minutes_per_day: Some(10.0),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        };
+        let accountant = accountant(config);
+        accountant
+            .record_minutes("a", "t1", "o/n", BudgetClass::Ci, 6.0, now())
+            .await;
+        accountant
+            .record_minutes("b", "t2", "o/n", BudgetClass::Ci, 6.0, now())
+            .await;
+        let err = accountant
+            .charge_count("c", "t3", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap_err();
+        assert_eq!(err.scope, BudgetScope::Repo);
+        assert_eq!(err.dimension, BudgetDimension::Minutes);
+    }
+
+    #[test]
+    fn a_run_is_claimed_once_and_only_pending_until_then() {
+        let accountant = accountant(BudgetConfig::UNLIMITED);
+        accountant.note_run("o/n", 1);
+        accountant.note_run("o/n", 1);
+        accountant.note_run("x/y", 2);
+        assert_eq!(accountant.pending_runs("o/n"), vec![1]);
+        assert!(accountant.claim_run("o/n", 1));
+        assert!(!accountant.claim_run("o/n", 1));
+        accountant.note_run("o/n", 1);
+        assert!(accountant.pending_runs("o/n").is_empty());
+        assert_eq!(accountant.pending_runs("x/y"), vec![2]);
+    }
+
+    #[test]
+    fn budget_scope_repo_displays_as_per_repo() {
+        assert_eq!(BudgetScope::Repo.to_string(), "per-repo");
     }
 }

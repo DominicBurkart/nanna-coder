@@ -38,6 +38,8 @@
 //! [`crate::sidecar::CommandRunner`] so it stays testable without shelling
 //! out for real.
 
+#![allow(clippy::result_large_err)]
+
 use crate::budget::{BudgetClass, CostAccountant};
 use crate::deploy::{DeployError, DeployTemplate};
 use crate::effects::EffectClass;
