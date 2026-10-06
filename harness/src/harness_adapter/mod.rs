@@ -44,8 +44,7 @@
 //! )
 //! .unwrap();
 //!
-//! let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
-//! let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+//! let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
 //! let agent = ResolvedAgent::resolve(
 //!     &identity,
 //!     &scoped,
@@ -71,7 +70,7 @@ pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER
 pub use pi::PiAdapter;
 
 use crate::effects::EffectClass;
-use crate::identity::{AgentIdentity, IdentityError, LimitsSection};
+use crate::identity::{AgentIdentity, IdentityError, LimitsSection, ScopeSection};
 use crate::tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -180,34 +179,51 @@ impl CapabilitySpec {
     }
 }
 
-/// The capabilities of a registry that has been scoped to one identity with
-/// [`ToolRegistry::scoped_for`]. It can only be built from such a registry, so
-/// the grant has a single source and an unscoped registry cannot be passed.
+/// The capabilities of a registry scoped to one identity, bound to that
+/// identity's whole scope. It is built in one step from a base registry and the
+/// identity, so a registry scoped by one identity cannot be paired with
+/// another. Repo-local identities share their global identity's name while
+/// narrowing it, so a name alone cannot tell them apart; the bound scope can.
 ///
 /// ```
-/// use harness::harness_adapter::{ResolveError, ScopedCapabilities};
+/// use harness::harness_adapter::ScopedCapabilities;
+/// use harness::identity::AgentIdentity;
 /// use harness::tools::create_tool_registry;
 ///
-/// let unscoped = create_tool_registry(std::path::Path::new("."));
-/// assert!(matches!(
-///     ScopedCapabilities::from_registry(&unscoped),
-///     Err(ResolveError::UnscopedRegistry)
-/// ));
+/// let toml = r#"
+/// [identity]
+/// name = "a"
+/// description = "d"
+/// loop = "inner"
+/// model = "m"
+/// system_prompt = { inline = "p" }
+/// [scope]
+/// repos = ["r"]
+/// paths = ["**"]
+/// max_effect = "none"
+/// tools = ["read_file"]
+/// [limits]
+/// max_iterations = 1
+/// max_wall_clock_secs = 1
+/// max_concurrent = 1
+/// "#;
+/// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+/// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+/// assert_eq!(scoped.identity(), "a");
+/// assert_eq!(scoped.specs().len(), 1);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedCapabilities {
     identity: String,
+    scope: ScopeSection,
     specs: Vec<CapabilitySpec>,
 }
 
 impl ScopedCapabilities {
-    /// Describe every tool in `registry`, sorted by name. Fails when the
-    /// registry was not scoped to an identity.
-    pub fn from_registry(registry: &ToolRegistry) -> Result<Self, ResolveError> {
-        let identity = registry
-            .identity()
-            .ok_or(ResolveError::UnscopedRegistry)?
-            .to_string();
+    /// Scope `base` to `identity` with [`ToolRegistry::scoped_for`] and
+    /// describe what remains, sorted by name.
+    pub fn scope(base: ToolRegistry, identity: &AgentIdentity) -> Self {
+        let registry = base.scoped_for(identity);
         let mut specs: Vec<CapabilitySpec> = registry
             .get_definitions()
             .into_iter()
@@ -223,10 +239,14 @@ impl ScopedCapabilities {
             })
             .collect();
         specs.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Self { identity, specs })
+        Self {
+            identity: identity.name().to_string(),
+            scope: identity.scope.clone(),
+            specs,
+        }
     }
 
-    /// Name of the identity the registry was scoped to.
+    /// Name of the identity the capabilities were scoped by.
     pub fn identity(&self) -> &str {
         &self.identity
     }
@@ -240,16 +260,22 @@ impl ScopedCapabilities {
 /// Failures resolving an identity into a [`ResolvedAgent`].
 #[derive(Debug, Error)]
 pub enum ResolveError {
-    /// The registry was not scoped to an identity with `scoped_for`.
-    #[error("registry is not scoped to an identity")]
-    UnscopedRegistry,
-    /// The registry was scoped to a different identity than the one resolved.
-    #[error("registry is scoped to `{registry}`, not `{identity}`")]
+    /// The capabilities were scoped by an identity whose name or scope differs
+    /// from the one being resolved.
+    #[error("capabilities were scoped by a different identity than `{identity}`")]
     ScopeMismatch {
-        /// Identity the registry was scoped to.
-        registry: String,
         /// Identity being resolved.
         identity: String,
+    },
+    /// A granted capability exceeds what the identity allows. Never expected
+    /// when the grant is built with [`ScopedCapabilities::scope`]; it exists
+    /// so a widened grant fails closed.
+    #[error("capability `{tool}` is wider than identity `{identity}` allows")]
+    GrantWiderThanIdentity {
+        /// Identity being resolved.
+        identity: String,
+        /// Offending capability.
+        tool: String,
     },
     /// The identity's system prompt could not be read.
     #[error("system prompt: {0}")]
@@ -307,7 +333,8 @@ impl ResolvedAgent {
     /// Resolve `identity` against the capabilities of the registry scoped to
     /// it. The grant is exactly that set: there is no second filter, so what
     /// the agent is shown is what the broker's registry enforces. Fails when
-    /// the capabilities were scoped to a different identity.
+    /// the capabilities were scoped by an identity with a different name or
+    /// scope, and refuses any capability the identity does not allow.
     ///
     /// ```
     /// use harness::effects::EffectClass;
@@ -333,8 +360,7 @@ impl ResolvedAgent {
     /// max_concurrent = 1
     /// "#;
     /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-    /// let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
-    /// let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+    /// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
     /// let agent = ResolvedAgent::resolve(
     ///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
     /// ).unwrap();
@@ -349,10 +375,19 @@ impl ResolvedAgent {
         image: impl Into<String>,
         broker_socket: PathBuf,
     ) -> Result<Self, ResolveError> {
-        if scoped.identity() != identity.name() {
+        if scoped.identity != identity.name() || scoped.scope != identity.scope {
             return Err(ResolveError::ScopeMismatch {
-                registry: scoped.identity().to_string(),
                 identity: identity.name().to_string(),
+            });
+        }
+        if let Some(spec) = scoped
+            .specs
+            .iter()
+            .find(|s| !identity.allows_tool(&s.name) || !identity.allows_effect(s.effect))
+        {
+            return Err(ResolveError::GrantWiderThanIdentity {
+                identity: identity.name().to_string(),
+                tool: spec.name.clone(),
             });
         }
         Ok(Self {
@@ -565,8 +600,7 @@ pub trait HarnessAdapter {
 /// max_concurrent = 1
 /// "#;
 /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-/// let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
-/// let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+/// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
 /// let agent = ResolvedAgent::resolve(
 ///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
 /// ).unwrap();
@@ -694,14 +728,126 @@ max_concurrent = 1
         )
         .unwrap_err();
         assert!(matches!(err, ResolveError::ScopeMismatch { .. }));
-        assert_eq!(err.to_string(), "registry is scoped to `a`, not `other`");
+        assert_eq!(
+            err.to_string(),
+            "capabilities were scoped by a different identity than `other`"
+        );
+    }
+
+    fn named(name: &str, tools: &str, effect: &str, paths: &str, read: &str) -> AgentIdentity {
+        let toml = format!(
+            r#"
+[identity]
+name = "{name}"
+description = "d"
+loop = "inner"
+model = "m"
+system_prompt = {{ inline = "p" }}
+[scope]
+repos = ["r"]
+paths = {paths}
+{read}
+max_effect = "{effect}"
+tools = [{tools}]
+[limits]
+max_iterations = 1
+max_wall_clock_secs = 1
+max_concurrent = 1
+"#
+        );
+        AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
+    }
+
+    fn resolve_pair(
+        scoped_by: &AgentIdentity,
+        resolved: &AgentIdentity,
+    ) -> Result<ResolvedAgent, ResolveError> {
+        let scoped =
+            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), scoped_by);
+        ResolvedAgent::resolve(
+            resolved,
+            &scoped,
+            "t",
+            Endpoint::new("gw", 1).unwrap(),
+            "img",
+            "/s".into(),
+        )
     }
 
     #[test]
-    fn unscoped_registry_is_refused() {
-        let registry = create_tool_registry(std::path::Path::new("."));
-        let err = ScopedCapabilities::from_registry(&registry).unwrap_err();
-        assert_eq!(err.to_string(), "registry is not scoped to an identity");
+    fn same_name_narrower_local_identity_cannot_use_the_global_grant() {
+        let global = named("implementer", "\"*\"", "workspace", "[\"**\"]", "");
+        let local = named("implementer", "\"read_file\"", "none", "[\"**\"]", "");
+        let err = resolve_pair(&global, &local).unwrap_err();
+        assert!(matches!(err, ResolveError::ScopeMismatch { .. }));
+        assert_eq!(
+            err.to_string(),
+            "capabilities were scoped by a different identity than `implementer`"
+        );
+        assert!(resolve_pair(&local, &local).is_ok());
+    }
+
+    #[test]
+    fn same_name_identity_with_different_paths_or_read_paths_is_refused() {
+        let base = named("implementer", "\"*\"", "workspace", "[\"**\"]", "");
+        let narrower_paths = named("implementer", "\"*\"", "workspace", "[\"api/**\"]", "");
+        let with_reads = named(
+            "implementer",
+            "\"*\"",
+            "workspace",
+            "[\"**\"]",
+            "read_paths = [\"**\"]",
+        );
+        for other in [&narrower_paths, &with_reads] {
+            assert!(matches!(
+                resolve_pair(&base, other),
+                Err(ResolveError::ScopeMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn widened_grant_fails_closed() {
+        let identity = named("a", "\"read_file\"", "none", "[\"**\"]", "");
+        let mut scoped = testing::scoped(&identity, &[]);
+        scoped.specs.push(CapabilitySpec::new(
+            "write_file",
+            "d",
+            serde_json::json!({}),
+            EffectClass::Workspace,
+        ));
+        let err = ResolvedAgent::resolve(
+            &identity,
+            &scoped,
+            "t",
+            Endpoint::new("gw", 1).unwrap(),
+            "img",
+            "/s".into(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ResolveError::GrantWiderThanIdentity { .. }));
+        assert_eq!(
+            err.to_string(),
+            "capability `write_file` is wider than identity `a` allows"
+        );
+        scoped.specs[0] = CapabilitySpec::new(
+            "read_file",
+            "d",
+            serde_json::json!({}),
+            EffectClass::Workspace,
+        );
+        scoped.specs.truncate(1);
+        assert!(matches!(
+            ResolvedAgent::resolve(
+                &identity,
+                &scoped,
+                "t",
+                Endpoint::new("gw", 1).unwrap(),
+                "img",
+                "/s".into(),
+            ),
+            Err(ResolveError::GrantWiderThanIdentity { .. })
+        ));
     }
 
     #[test]
@@ -711,8 +857,8 @@ max_concurrent = 1
             "\"read_file\", \"cargo_*\", \"run_command\"",
             "workspace",
         );
-        let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
-        let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+        let scoped =
+            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
         assert_eq!(scoped.identity(), "a");
         for spec in scoped.specs() {
             assert!(identity.allows_tool(&spec.name), "{}", spec.name);
@@ -769,8 +915,8 @@ max_concurrent = 1
     #[test]
     fn scoped_capabilities_describe_tools_with_their_effect() {
         let identity = identity_with(inline(), "\"write_file\"", "workspace");
-        let registry = create_tool_registry(std::path::Path::new(".")).scoped_for(&identity);
-        let scoped = ScopedCapabilities::from_registry(&registry).unwrap();
+        let scoped =
+            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
         let write = scoped
             .specs()
             .iter()

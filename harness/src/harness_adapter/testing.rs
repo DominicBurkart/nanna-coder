@@ -50,7 +50,7 @@ pub(crate) fn scoped(identity: &AgentIdentity, specs: &[CapabilitySpec]) -> Scop
             effect: spec.effect,
         }));
     }
-    ScopedCapabilities::from_registry(&registry.scoped_for(identity)).unwrap()
+    ScopedCapabilities::scope(registry, identity)
 }
 
 #[cfg(test)]
