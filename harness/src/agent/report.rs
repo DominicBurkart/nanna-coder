@@ -120,6 +120,7 @@ mod tests {
                 effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
             }],
             conversation_snapshot: vec![ChatMessage::user("hi")],
+            denials: vec![],
             token_usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,

@@ -88,10 +88,11 @@ from an identity the auditor has allowed, and the executor refuses a plan that
 was not built from one. The broker and executor are not written yet; this list
 is their contract and is reviewed before code.
 
-Until #669 lands, `ToolRegistry::scoped_for(identity)` does not exist on main.
-`ResolvedAgent::resolve` takes the capabilities of that scoped registry
+`ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
+tools that cannot honour path scope (`run_command` for path-restricted
+identities). `ResolvedAgent::resolve` takes the capabilities of that scoped registry
 (`CapabilitySpec::from_registry`) and can only narrow them, so the grant has
-one source and cannot drift from what the broker enforces. Caveat: the result is only as narrow as the set the caller passes; until #669 lands, a caller passing the unscoped registry gets unscoped capabilities and `resolve` cannot tell.
+one source and cannot drift from what the broker enforces. Caveat: the result is only as narrow as the set the caller passes. A caller passing an unscoped registry gets unscoped capabilities and `resolve` cannot tell, so the production caller must pass `registry.scoped_for(identity)` (to be enforced when `TaskRunner` is switched).
 
 ## Runtime handshake
 
