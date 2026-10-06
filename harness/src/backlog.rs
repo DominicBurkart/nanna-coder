@@ -832,6 +832,22 @@ mod tests {
         assert_eq!(log[0].request.dev_loop, crate::identity::DevLoop::Outer);
     }
 
+    #[tokio::test]
+    async fn a_ci_issue_is_blocked_on_the_derived_loop_through_the_real_path() {
+        let github = github_with(vec![issue_with(1, "Re-run CI on the PR.")]);
+        let store = InMemoryQueueStore::default();
+        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let gate = fixture_gate();
+        let cfg = config(vec![source("o/n", "/repo")], None);
+        let report = backlog_sync(&github, &sink, &cfg, &gate).await.unwrap();
+        assert!(report.enqueued.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(store.load().unwrap().is_empty());
+        let log = gate.log().entries().unwrap();
+        assert_eq!(log[0].verdict.kind(), VerdictKind::Block);
+        assert_eq!(log[0].request.dev_loop, crate::identity::DevLoop::Middle);
+    }
+
     #[derive(Default)]
     struct SeenHook(std::sync::Arc<StdMutex<Vec<SpawnEscalation>>>);
 

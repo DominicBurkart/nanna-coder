@@ -610,6 +610,129 @@ mod tests {
         assert!(manager.list().await.is_empty());
     }
 
+    async fn refused_request(
+        gate: &SpawnGate,
+        description: &str,
+        effect: Option<&str>,
+        dev_loop: Option<&str>,
+    ) -> crate::auditor::SpawnRequest {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let mut request = params(repo.path(), "rust-implementer", description);
+        if let Some(effect) = effect {
+            request["requested_effect"] = serde_json::json!(effect);
+        }
+        if let Some(dev_loop) = dev_loop {
+            request["dev_loop"] = serde_json::json!(dev_loop);
+        }
+        let err = assign(&manager, &provider, gate, request)
+            .await
+            .unwrap_err();
+        assert!(err.contains("spawn refused"), "{err}");
+        assert!(manager.list().await.is_empty());
+        let log = gate.log().entries().unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.verdict.kind(), crate::auditor::VerdictKind::Block);
+        last.request.clone()
+    }
+
+    fn last_codes(gate: &SpawnGate) -> Vec<crate::auditor::ReasonCode> {
+        let log = gate.log().entries().unwrap();
+        log.last()
+            .unwrap()
+            .verdict
+            .reasons()
+            .iter()
+            .map(|r| r.code)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_workspace_but_the_text_implies_production(
+    ) {
+        let gate = implementer_only_gate();
+        let request = refused_request(
+            &gate,
+            "Deploy build 42 to production for all users.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert_eq!(request.dev_loop, DevLoop::Outer);
+        let codes = last_codes(&gate);
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_production_but_the_text_implies_workspace(
+    ) {
+        let gate = fixture_gate();
+        let request =
+            refused_request(&gate, "Add a test.", Some("production"), Some("inner")).await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_never_lets_a_lower_caller_effect_loosen_the_derived_one() {
+        for lower in ["none", "workspace", "repository", "ci"] {
+            let gate = implementer_only_gate();
+            let request = refused_request(
+                &gate,
+                "Deploy build 42 to production for all users.",
+                Some(lower),
+                None,
+            )
+            .await;
+            assert_eq!(request.requested_effect, EffectClass::Production, "{lower}");
+            assert_eq!(request.dev_loop, DevLoop::Outer, "{lower}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_caller_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(&gate, "Add a test.", None, Some("middle")).await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert_eq!(request.requested_effect, EffectClass::None);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_derived_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(
+            &gate,
+            "Re-run CI on the PR.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_allows_agreeing_caller_and_text_within_the_ceiling() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        request["dev_loop"] = serde_json::json!("inner");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let log = gate.log().entries().unwrap();
+        assert!(log[0].verdict.is_allow());
+        assert_eq!(log[0].request.requested_effect, EffectClass::Workspace);
+        assert_eq!(log[0].request.dev_loop, DevLoop::Inner);
+    }
+
     #[tokio::test]
     async fn test_assign_task_rejects_an_unknown_effect_or_loop() {
         let repo = repo_with_origin("https://github.com/example/repo.git");
