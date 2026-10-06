@@ -483,17 +483,23 @@ impl AssetGraph {
         let path = normalize(path.as_ref());
         self.assets
             .values()
-            .filter(|asset| {
-                asset.owners.iter().any(|owner| {
-                    Pattern::new(owner)
-                        .map(|pattern| pattern.matches_with(&path, MATCH_OPTIONS))
-                        .unwrap_or(false)
-                }) || self
-                    .sites
-                    .get(&asset.name)
-                    .is_some_and(|sites| sites.iter().any(|site| normalize_str(&site.file) == path))
-            })
+            .filter(|asset| self.owns(asset, &path))
             .collect()
+    }
+
+    fn owns(&self, asset: &Asset, path: &str) -> bool {
+        let by_glob = asset
+            .owners
+            .iter()
+            .filter_map(|owner| Pattern::new(owner).ok())
+            .any(|pattern| pattern.matches_with(path, MATCH_OPTIONS));
+        let by_site = self
+            .sites
+            .get(&asset.name)
+            .into_iter()
+            .flatten()
+            .any(|site| normalize_str(&site.file) == path);
+        by_glob || by_site
     }
 
     /// Merge in-code `touches!` declarations; an undeclared asset is an error.
@@ -520,12 +526,7 @@ impl AssetGraph {
         for touch in &touches {
             if !self.assets.contains_key(touch.asset) {
                 return Err(AssetError::UndeclaredAsset {
-                    site: touch
-                        .to_string()
-                        .split(" touches ")
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
+                    site: format!("{}:{}", touch.file, touch.line),
                     asset: touch.asset.to_string(),
                 });
             }

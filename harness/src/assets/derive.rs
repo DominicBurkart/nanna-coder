@@ -128,14 +128,18 @@ pub fn propose_in_repo(repo: &Path) -> Result<PathBuf, AssetError> {
     if path.exists() {
         return Err(AssetError::AlreadyExists { path });
     }
+    write_proposal(&path, &propose(repo))?;
+    Ok(path)
+}
+
+fn write_proposal(path: &Path, body: &str) -> Result<(), AssetError> {
     let io = |path: &Path, source| AssetError::Io {
         path: path.to_path_buf(),
         source,
     };
     let dir = path.parent().expect("proposal path has a parent directory");
     std::fs::create_dir_all(dir).map_err(|source| io(dir, source))?;
-    std::fs::write(&path, propose(repo)).map_err(|source| io(&path, source))?;
-    Ok(path)
+    std::fs::write(path, body).map_err(|source| io(path, source))
 }
 
 pub(super) fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -333,17 +337,17 @@ mod tests {
     #[test]
     fn proposal_write_failure_is_an_io_error() {
         let repo = tempfile::tempdir().unwrap();
-        let dir = repo.path().join(".nanna");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500);
-        std::fs::set_permissions(&dir, permissions).unwrap();
-        let result = propose_in_repo(repo.path());
-        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-        std::fs::set_permissions(&dir, permissions).unwrap();
-        if let Err(error) = result {
-            assert!(matches!(error, AssetError::Io { .. }));
-        }
+        assert!(matches!(
+            write_proposal(repo.path(), "body"),
+            Err(AssetError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn proposal_is_written_when_the_target_is_free() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("nested").join("p.toml");
+        write_proposal(&path, "body").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "body");
     }
 }
