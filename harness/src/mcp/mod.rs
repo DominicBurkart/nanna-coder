@@ -182,6 +182,14 @@ impl NannaMcpServer {
                             "type": "integer",
                             "description": "Maximum agent iterations (default: server default)"
                         },
+                        "requested_effect": {
+                            "type": "string",
+                            "description": "Effect class the task is expected to reach (none, workspace, repository, ci, sandbox, production). The auditor refuses it when it exceeds the identity's ceiling. Defaults to the identity's ceiling."
+                        },
+                        "dev_loop": {
+                            "type": "string",
+                            "description": "Development loop the task belongs to (inner, middle, outer). The auditor refuses a loop other than the identity's. Defaults to the identity's loop."
+                        },
                         "identity": {
                             "type": "string",
                             "description": "Name of a registered agent identity. The task runs under that identity's scope (tools, effect ceiling, paths, repos); an unregistered identity, or a repository outside scope.repos, fails the task."
