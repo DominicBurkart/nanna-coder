@@ -11,6 +11,23 @@ mod fake {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    fn settle_executable(bin: &Path) {
+        for _ in 0..200 {
+            match std::process::Command::new(bin)
+                .arg("--settle")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
+    }
+
     pub(crate) struct FakePodman {
         dir: TempDir,
         old_path: Option<OsString>,
@@ -53,6 +70,9 @@ mod fake {
             let mut perms = std::fs::metadata(&bin).unwrap().permissions();
             std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
             std::fs::set_permissions(&bin, perms).unwrap();
+            settle_executable(&bin);
+            let _ = std::fs::remove_file(&log);
+            let _ = std::fs::remove_file(&env_log);
 
             let old_path = std::env::var_os("PATH");
             let mut paths = vec![dir.path().to_path_buf()];
