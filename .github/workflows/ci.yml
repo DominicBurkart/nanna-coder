@@ -245,10 +245,16 @@ jobs:
     - name: Pre-build nanna dev container image
       run: nix build path:.#devContainerImage --no-link --print-build-logs
 
+    - name: Report container tooling
+      run: |
+        command -v podman skopeo docker || true
+        podman --version || true
+        nix develop --command bash -c 'command -v podman skopeo docker || true; podman --version || true; skopeo --version || true'
+
     - name: Run container-only suites
       run: |
         nix develop --command cargo nextest run --workspace --all-features \
-          --run-ignored all --test-threads=1 --no-fail-fast \
+          --run-ignored all --test-threads=1 --no-fail-fast --no-capture \
           -E 'test(/(^|::)container_/)'
 
     - name: Remove leftover task containers
