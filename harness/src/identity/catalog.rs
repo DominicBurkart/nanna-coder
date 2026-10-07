@@ -17,6 +17,30 @@ pub const AGENTS_SUBDIR: &str = "agents";
 /// Repo-relative directory whose identities override the global catalog.
 pub const REPO_AGENTS_DIR: &str = ".nanna/agents";
 
+/// The host-controlled Nanna configuration directory: `$NANNA_CONFIG_DIR`,
+/// else `$XDG_CONFIG_HOME/nanna`, else `$HOME/.config/nanna`. `None` when
+/// none of those is set. Nothing under a target repository is consulted.
+///
+/// ```
+/// use harness::identity::config_dir_from;
+/// use std::path::PathBuf;
+///
+/// let lookup = |key: &str| (key == "NANNA_CONFIG_DIR").then(|| "/etc/nanna".into());
+/// assert_eq!(config_dir_from(&lookup), Some(PathBuf::from("/etc/nanna")));
+/// assert_eq!(config_dir_from(&|_: &str| None), None);
+/// ```
+pub fn config_dir_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let non_empty = |key: &str| lookup(key).filter(|value| !value.is_empty());
+    if let Some(config) = non_empty(CONFIG_DIR_ENV) {
+        return Some(PathBuf::from(config));
+    }
+    if let Some(xdg) = non_empty("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("nanna"));
+    }
+    let home = non_empty("HOME")?;
+    Some(PathBuf::from(home).join(".config").join("nanna"))
+}
+
 /// Every identity found in a catalog directory, keyed by name.
 ///
 /// [`IdentityCatalog::load`] reads each `*.toml` file directly under the
@@ -75,20 +99,7 @@ impl IdentityCatalog {
 
     /// [`IdentityCatalog::default_global_dir`] over an arbitrary environment lookup.
     pub fn global_dir_from(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-        let non_empty = |key: &str| lookup(key).filter(|value| !value.is_empty());
-        if let Some(config) = non_empty(CONFIG_DIR_ENV) {
-            return Some(PathBuf::from(config).join(AGENTS_SUBDIR));
-        }
-        if let Some(xdg) = non_empty("XDG_CONFIG_HOME") {
-            return Some(PathBuf::from(xdg).join("nanna").join(AGENTS_SUBDIR));
-        }
-        let home = non_empty("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("nanna")
-                .join(AGENTS_SUBDIR),
-        )
+        config_dir_from(lookup).map(|dir| dir.join(AGENTS_SUBDIR))
     }
 
     /// Load the global catalog from [`IdentityCatalog::default_global_dir`].

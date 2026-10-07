@@ -487,7 +487,7 @@ pub(crate) mod tests {
         let r = record("production");
         assert_eq!(
             r.lease_name().unwrap(),
-            LeaseName::deploy("app", "production")
+            LeaseName::deploy("registry.example.invalid/ns/app", "production")
         );
         let mut odd = record("sandbox");
         odd.plan.lease = "branch:app:main".into();
