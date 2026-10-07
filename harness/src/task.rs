@@ -923,12 +923,29 @@ impl TaskRunner {
                     return;
                 }
             };
-            TaskWorkspace::create_with_container_networked(
+            let sidecars = match crate::onboarding::fullstack::start_task_sidecars(
+                crate::container::detect_runtime(),
+                Arc::new(crate::sidecar::SystemRunner),
+                &queued.repo_path,
+                &task_id.0,
+                crate::sidecar::ReadinessConfig::default(),
+            )
+            .await
+            {
+                Ok(sidecars) => sidecars,
+                Err(e) => {
+                    self.fail(&task_id, e.to_string(), "SidecarSetupFailed")
+                        .await;
+                    return;
+                }
+            };
+            TaskWorkspace::create_with_container_and_sidecars(
                 &queued.repo_path,
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
                 network_policy_for(identity.as_ref()),
+                sidecars,
             )
             .await
             .map_err(|e| e.to_string())
@@ -1931,6 +1948,76 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_submit_records_sidecar_setup_failure() {
+        let fake = crate::test_support::FakePodman::install_async(Some("network create")).await;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+        copy_tree(&fixture, repo_dir.path());
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir_all(repo_dir.path().join(".devcontainer")).unwrap();
+
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.runner.image_cache.write().await;
+            cache.insert(canonical, "pre-built:latest".to_string());
+        }
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+                    panic!("expected Failed, got {:?}", task.status);
+                };
+                assert_eq!(diagnostics.error_type, "SidecarSetupFailed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete within 10 s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("network create nanna-task-")));
+    }
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_wait_terminal_unknown_id_returns_none() {
         let manager = TaskManager::default();
@@ -2900,6 +2987,7 @@ mod identity_tests {
 
     #[tokio::test]
     async fn test_submit_with_identity_starts_the_container_with_its_network_policy() {
+        let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("https://github.com/example/repo.git");
         std::fs::write(repo.path().join("flake.nix"), "{}").unwrap();
         std::fs::create_dir(repo.path().join(".devcontainer")).unwrap();
