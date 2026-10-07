@@ -140,3 +140,52 @@ impl BlastRadius {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_displays_lowercase() {
+        assert_eq!(Access::Read.to_string(), "read");
+        assert_eq!(Access::Write.to_string(), "write");
+    }
+
+    #[test]
+    fn evidence_displays_all_fields() {
+        let e = Evidence::new("sql", "m.sql", "db.a", Access::Read, "SELECT a");
+        assert_eq!(e.to_string(), "[sql] m.sql read db.a: SELECT a");
+    }
+
+    #[test]
+    fn render_text_of_empty_radius() {
+        assert_eq!(
+            BlastRadius::default().render_text(),
+            "score: 0\ntouched: (none)\ndownstream: (none)\nconcerns: (none)\n"
+        );
+    }
+
+    #[test]
+    fn render_text_lists_everything() {
+        let radius = BlastRadius {
+            touched: vec!["db.a".into(), "db.b".into()],
+            downstream: vec!["http.GET /x".into()],
+            concerns: BTreeMap::from([
+                ("availability".to_string(), 6),
+                ("revenue".to_string(), 10),
+            ]),
+            score: 42,
+            evidence: vec![Evidence::new(
+                "sql",
+                "m.sql",
+                "db.a",
+                Access::Write,
+                "INSERT a",
+            )],
+        };
+        assert_eq!(
+            radius.render_text(),
+            "score: 42\ntouched: db.a, db.b\ndownstream: http.GET /x\nconcerns: availability (6), revenue (10)\nevidence:\n  [sql] m.sql write db.a: INSERT a\n"
+        );
+    }
+}

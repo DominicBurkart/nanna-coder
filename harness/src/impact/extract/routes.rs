@@ -496,4 +496,23 @@ mod tests {
             [("m".to_string(), 2, 2)]
         );
     }
+
+    #[test]
+    fn resource_tail_cut_inside_a_multibyte_char_still_finds_routes() {
+        let padding = "é".repeat(400);
+        let source = format!("web::resource(\"/p\").route(web::get().to(h))a{padding}");
+        let found: Vec<_> = route_bindings(&source)
+            .into_iter()
+            .map(|b| format!("{} {} {}", b.method, b.path, b.handler))
+            .collect();
+        assert_eq!(found, ["GET /p h"]);
+    }
+
+    #[test]
+    fn char_literal_brace_does_not_end_a_function_early() {
+        assert_eq!(
+            function_spans("fn a() {\n    let c = '}';\n    let d = '{';\n}\nfn b() {}\n"),
+            [("a".to_string(), 1, 4), ("b".to_string(), 5, 5)]
+        );
+    }
 }

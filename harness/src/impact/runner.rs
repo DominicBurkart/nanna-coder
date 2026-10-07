@@ -323,4 +323,24 @@ mod tests {
         assert!(analyze_task(&root, None, &mut calls).unwrap().is_empty());
         assert!(calls[0].effect.is_none());
     }
+
+    #[test]
+    fn bare_repository_has_no_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(dir.path()).unwrap();
+        let error = workdir_root(dir.path()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to read diff: bare repository has no working tree"
+        );
+    }
+
+    #[test]
+    fn build_without_environments_keeps_the_graph() {
+        let graph = AssetGraph::parse("[asset.\"db.a\"]\nkind = \"table\"\n").unwrap();
+        let analyzer = build(&graph, None);
+        assert_eq!(analyzer.graph().assets().count(), 1);
+        let scoped = build(&graph, Some(vec!["prod".to_string()]));
+        assert_eq!(scoped.graph().assets().count(), 1);
+    }
 }

@@ -66,11 +66,8 @@ fn impact_prints_the_blast_radius_of_a_diff() {
         "--repo-path",
         dir.path().to_str().unwrap(),
     ]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("score: "));
     assert!(text.contains("touched: "));

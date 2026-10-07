@@ -113,12 +113,11 @@ impl<'g> ImpactAnalyzer<'g> {
         };
         let mut evidence: BTreeSet<Evidence> = BTreeSet::new();
         for extractor in &self.extractors {
-            evidence.extend(
-                extractor
-                    .extract(&ctx, change)
-                    .into_iter()
-                    .filter(|item| self.graph.asset(&item.asset).is_some()),
-            );
+            for item in extractor.extract(&ctx, change) {
+                if self.graph.asset(&item.asset).is_some() {
+                    evidence.insert(item);
+                }
+            }
         }
         let touched: BTreeSet<AssetId> = evidence
             .iter()
@@ -143,11 +142,13 @@ impl<'g> ImpactAnalyzer<'g> {
         I: IntoIterator<Item = S>,
         S: Into<AssetId>,
     {
-        let touched = assets
-            .into_iter()
-            .map(Into::into)
-            .filter(|name| self.graph.asset(name).is_some())
-            .collect();
+        let mut touched = BTreeSet::new();
+        for asset in assets {
+            let name: AssetId = asset.into();
+            if self.graph.asset(&name).is_some() {
+                touched.insert(name);
+            }
+        }
         BlastRadius::compute(self.graph, touched, Vec::new())
     }
 }
@@ -478,5 +479,57 @@ concerns = ["revenue"]
                 .collect();
             prop_assert_eq!(radius.downstream.iter().cloned().collect::<BTreeSet<_>>(), closure);
         }
+    }
+
+    #[test]
+    fn graph_accessor_returns_the_analysed_graph() {
+        let g = graph();
+        let analyzer = ImpactAnalyzer::new(&g);
+        assert!(std::ptr::eq(analyzer.graph(), &g));
+    }
+
+    #[test]
+    fn radius_of_assets_accepts_str_and_string_and_drops_unknown() {
+        let g = graph();
+        let analyzer = ImpactAnalyzer::new(&g);
+        let from_str = analyzer.radius_of_assets(["db.orders", "db.nope"]);
+        let from_string = analyzer.radius_of_assets(vec!["db.orders".to_string()]);
+        assert_eq!(from_str.touched, ["db.orders"]);
+        assert_eq!(from_str, from_string);
+        assert!(from_str.evidence.is_empty());
+        assert!(analyzer.radius_of_assets(["db.nope"]).is_empty());
+    }
+
+    struct Fixed(Vec<Evidence>);
+
+    impl Extractor for Fixed {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+
+        fn extract(&self, _ctx: &ExtractContext<'_>, _change: &Change) -> Vec<Evidence> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn analyze_discards_evidence_for_unknown_assets_and_dedups() {
+        let g = graph();
+        let known = Evidence::new("fixed", "s", "db.orders", Access::Write, "d");
+        let unknown = Evidence::new("fixed", "s", "db.ghost", Access::Write, "d");
+        let read = Evidence::new("fixed", "s", "db.orders", Access::Read, "r");
+        let analyzer = ImpactAnalyzer::without_extractors(&g)
+            .with_extractor(Box::new(Fixed(vec![
+                known.clone(),
+                unknown,
+                known.clone(),
+                read.clone(),
+            ])))
+            .with_extractor(Box::new(Fixed(vec![known.clone()])));
+        let radius = analyzer.analyze(&Change::default());
+        assert_eq!(radius.touched, ["db.orders"]);
+        let mut expected = vec![known, read];
+        expected.sort();
+        assert_eq!(radius.evidence, expected);
     }
 }

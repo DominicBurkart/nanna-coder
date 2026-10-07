@@ -49,14 +49,11 @@ impl ChangedFile {
     pub fn whole(path: impl Into<String>, content: impl Into<String>) -> Self {
         let content = content.into();
         let mut file = Self::new(path);
-        file.added = content
-            .lines()
-            .enumerate()
-            .map(|(i, text)| AddedLine {
-                number: i as u32 + 1,
-                text: text.to_string(),
-            })
-            .collect();
+        for (i, text) in content.lines().enumerate() {
+            let number = i as u32 + 1;
+            let text = text.to_string();
+            file.added.push(AddedLine { number, text });
+        }
         file.content = Some(content);
         file
     }
@@ -349,5 +346,43 @@ mod tests {
             })
         );
         assert_eq!(Action::CiTrigger.label(), "ci_trigger");
+    }
+
+    #[test]
+    fn whole_numbers_every_line_and_keeps_content() {
+        let file = ChangedFile::whole("a.sql", "one\ntwo\n");
+        assert_eq!(file.path, "a.sql");
+        assert_eq!(
+            file.added
+                .iter()
+                .map(|l| (l.number, l.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "one"), (2, "two")]
+        );
+        assert_eq!(file.content.as_deref(), Some("one\ntwo\n"));
+        assert!(ChangedFile::whole("e", "").added.is_empty());
+    }
+
+    #[test]
+    fn diff_header_without_b_prefix_uses_the_whole_remainder() {
+        let change = Change::from_unified_diff("diff --git weird\n");
+        assert_eq!(change.files.len(), 1);
+        assert_eq!(change.files[0].path, "weird");
+    }
+
+    #[test]
+    fn deleted_file_takes_its_path_from_the_old_side() {
+        let diff = "diff --git a/gone.rs b/gone.rs\ndeleted file mode 100644\n--- a/gone.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-bye\n";
+        let change = Change::from_unified_diff(diff);
+        assert_eq!(change.files[0].path, "gone.rs");
+        assert_eq!(change.files[0].removed, ["bye"]);
+        assert!(change.files[0].added.is_empty());
+    }
+
+    #[test]
+    fn unrecognised_new_side_keeps_the_header_path() {
+        let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ elsewhere\n";
+        let change = Change::from_unified_diff(diff);
+        assert_eq!(change.files[0].path, "x.rs");
     }
 }

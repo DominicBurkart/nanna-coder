@@ -21,7 +21,7 @@ fn line_containing(source: &str, needle: &str) -> u32 {
     source
         .lines()
         .position(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("{needle} not in source")) as u32
+        .expect("needle present in source") as u32
         + 1
 }
 

@@ -509,4 +509,72 @@ fn a() {
             prop_assert_eq!(pairs(&sql), [w(&table)]);
         }
     }
+
+    fn literal_texts(source: &str) -> Vec<String> {
+        macro_literals(source).into_iter().map(|l| l.text).collect()
+    }
+
+    #[test]
+    fn raw_prefix_without_a_quote_is_not_a_literal() {
+        assert!(literal_texts("sqlx::query!(r#x, \"DELETE FROM a\")").is_empty());
+    }
+
+    #[test]
+    fn skips_a_non_literal_argument_with_nested_brackets() {
+        assert_eq!(
+            literal_texts("sqlx::query_as!(Foo<A, B>, \"DELETE FROM a\")"),
+            ["DELETE FROM a"]
+        );
+        assert_eq!(
+            literal_texts("sqlx::query_as!(Foo{x: [1, 2]}, \"DELETE FROM b\")"),
+            ["DELETE FROM b"]
+        );
+    }
+
+    #[test]
+    fn unbalanced_closer_before_any_literal_yields_nothing() {
+        assert!(literal_texts("sqlx::query_as!(Foo)").is_empty());
+        assert!(literal_texts("sqlx::query_as!(Foo>, \"DELETE FROM a\")").is_empty());
+    }
+
+    #[test]
+    fn two_non_literal_arguments_yield_nothing() {
+        assert!(literal_texts("sqlx::query_as!(A, B, \"DELETE FROM a\")").is_empty());
+        assert!(literal_texts("sqlx::query_as!(A, B").is_empty());
+    }
+
+    #[test]
+    fn rust_file_without_content_scans_added_and_removed_lines() {
+        let graph = AssetGraph::parse("[asset.\"db.orders\"]\nkind = \"table\"\n").unwrap();
+        let mut file = ChangedFile::new("src/q.rs");
+        file.added.push(crate::impact::AddedLine {
+            number: 3,
+            text: "sqlx::query!(\"DELETE FROM orders\")".to_string(),
+        });
+        let radius = ImpactAnalyzer::without_extractors(&graph)
+            .with_extractor(Box::new(SqlExtractor))
+            .analyze(&Change {
+                files: vec![file],
+                actions: vec![],
+            });
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.evidence[0].detail, "DELETE orders");
+    }
+
+    #[test]
+    fn removed_query_in_a_file_with_content_touches_the_table() {
+        let graph = AssetGraph::parse("[asset.\"db.orders\"]\nkind = \"table\"\n").unwrap();
+        let mut file = ChangedFile::new("src/q.rs");
+        file.content = Some("fn nothing() {}\n".to_string());
+        file.removed
+            .push("sqlx::query!(\"DROP TABLE orders\");".to_string());
+        let radius = ImpactAnalyzer::without_extractors(&graph)
+            .with_extractor(Box::new(SqlExtractor))
+            .analyze(&Change {
+                files: vec![file],
+                actions: vec![],
+            });
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.evidence[0].detail, "DROP orders");
+    }
 }
