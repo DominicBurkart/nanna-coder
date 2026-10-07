@@ -5,6 +5,7 @@ use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
+use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
@@ -103,6 +104,10 @@ pub struct TaskResult {
     pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
+    /// What the task's patch and actions reach in the repository's
+    /// state-asset graph; `None` when the repository declares no manifest.
+    #[serde(default)]
+    pub blast_radius: Option<BlastRadius>,
 }
 
 impl TaskResult {
@@ -133,6 +138,7 @@ impl TaskResult {
             "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "blast_radius": self.blast_radius,
         })
     }
 }
@@ -969,9 +975,18 @@ impl TaskRunner {
 
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
-        let run_result = agent.run(context).await;
+        let mut run_result = agent.run(context).await;
 
         let changes_patch = workspace.extract_changes().ok().and_then(bound_patch);
+
+        let blast_radius = match run_result.as_mut() {
+            Ok(result) => crate::impact::analyze_task(
+                &workspace.workspace_path,
+                changes_patch.as_deref(),
+                &mut result.tool_calls_made,
+            ),
+            Err(_) => None,
+        };
 
         let format_patch = workspace.format_patch().ok().flatten();
 
@@ -991,6 +1006,7 @@ impl TaskRunner {
                     denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    blast_radius,
                 };
                 self.set_status(
                     &task_id,
@@ -1186,6 +1202,7 @@ mod tests {
             }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            blast_radius: None,
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1271,7 +1288,40 @@ mod tests {
             denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            blast_radius: None,
         }
+    }
+
+    #[test]
+    fn test_task_result_json_shows_blast_radius() {
+        let mut result = result_with_calls(vec![]);
+        assert!(result.to_json()["blast_radius"].is_null());
+        result.blast_radius = Some(BlastRadius {
+            touched: vec!["db.orders".to_string()],
+            score: 10,
+            ..BlastRadius::default()
+        });
+        let json = result.to_json();
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(json["blast_radius"]["score"], 10);
+        let back: TaskResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.blast_radius, result.blast_radius);
+    }
+
+    #[test]
+    fn test_tool_call_json_carries_blast_radius_next_to_effect_class() {
+        let mut call = record("write_file", Some(EffectClass::Workspace));
+        let effect = call.effect.take().unwrap();
+        call.effect = Some(effect.with_blast_radius(BlastRadius {
+            score: 4,
+            ..BlastRadius::default()
+        }));
+        let json = result_with_calls(vec![call]).to_json();
+        assert_eq!(json["tool_calls_made"][0]["effect"]["class"], "workspace");
+        assert_eq!(
+            json["tool_calls_made"][0]["effect"]["blast_radius"]["score"],
+            4
+        );
     }
 
     #[test]

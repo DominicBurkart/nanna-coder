@@ -1,5 +1,6 @@
 use super::card::CardRequest;
 use super::redact::{redact, redact_value};
+use crate::impact::BlastRadius;
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,9 @@ pub struct Escalation {
     /// 1 for the first occurrence of this key, 2 for the next, and so on.
     pub occurrence: u64,
     pub created_at: DateTime<Utc>,
+    /// Assets and business concerns the escalated change or action reaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius: Option<BlastRadius>,
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -194,6 +198,7 @@ impl Escalation {
             proposed_identity_toml: None,
             occurrence: 1,
             created_at: Utc::now(),
+            blast_radius: None,
         }
     }
 
@@ -238,6 +243,31 @@ impl Escalation {
 
     pub fn with_proposed_identity(mut self, toml: impl Into<String>) -> Self {
         self.proposed_identity_toml = Some(toml.into());
+        self
+    }
+
+    /// Attach the blast radius; the body then lists the touched assets,
+    /// downstream assets and concerns.
+    ///
+    /// ```
+    /// use harness::escalation::{Escalation, EscalationSource, Severity};
+    /// use harness::impact::BlastRadius;
+    ///
+    /// let radius = BlastRadius {
+    ///     touched: vec!["db.orders".into()],
+    ///     concerns: [("revenue".to_string(), 10)].into(),
+    ///     score: 10,
+    ///     ..BlastRadius::default()
+    /// };
+    /// let escalation = Escalation::new(Severity::Blocked, EscalationSource::Auditor, "example/repo", "needs a human")
+    ///     .with_blast_radius(radius);
+    /// let body = escalation.body();
+    /// assert!(body.contains("## Blast radius"));
+    /// assert!(body.contains("db.orders"));
+    /// assert!(body.contains("revenue (10)"));
+    /// ```
+    pub fn with_blast_radius(mut self, blast_radius: BlastRadius) -> Self {
+        self.blast_radius = Some(blast_radius);
         self
     }
 
@@ -335,6 +365,27 @@ impl Escalation {
         }
         for line in &self.evidence {
             out.push_str(&format!("- {}\n", line.trim()));
+        }
+        if let Some(radius) = &self.blast_radius {
+            let list = |items: &[String]| {
+                if items.is_empty() {
+                    "_none_".to_string()
+                } else {
+                    items.join(", ")
+                }
+            };
+            let concerns: Vec<String> = radius
+                .concerns
+                .iter()
+                .map(|(name, weight)| format!("{name} ({weight})"))
+                .collect();
+            out.push_str(&format!(
+                "\n## Blast radius\n\n**Score:** {}\n**Touched assets:** {}\n**Downstream assets:** {}\n**Concerns:** {}\n",
+                radius.score,
+                list(&radius.touched),
+                list(&radius.downstream),
+                list(&concerns),
+            ));
         }
         out.push_str(&format!(
             "\n## Suggested action\n\n{}\n",
@@ -514,6 +565,62 @@ mod tests {
             "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 leaked",
         );
         assert!(leaky.title().contains("token=<redacted:credential> leaked"));
+    }
+
+    fn radius() -> BlastRadius {
+        BlastRadius {
+            touched: vec!["db.orders".to_string()],
+            downstream: vec!["http.POST /checkout".to_string()],
+            concerns: [("revenue".to_string(), 10), ("availability".to_string(), 6)].into(),
+            score: 15,
+            evidence: vec![],
+        }
+    }
+
+    #[test]
+    fn body_lists_touched_assets_and_concerns_when_a_radius_is_attached() {
+        let body = sample().with_blast_radius(radius()).body();
+        assert!(body.contains("## Blast radius"));
+        assert!(body.contains("**Score:** 15"));
+        assert!(body.contains("**Touched assets:** db.orders"));
+        assert!(body.contains("**Downstream assets:** http.POST /checkout"));
+        assert!(body.contains("availability (6), revenue (10)"));
+    }
+
+    #[test]
+    fn body_marks_empty_radius_lists_and_omits_section_without_radius() {
+        assert!(!sample().body().contains("Blast radius"));
+        let body = sample().with_blast_radius(BlastRadius::default()).body();
+        assert!(body.contains("**Touched assets:** _none_"));
+        assert!(body.contains("**Concerns:** _none_"));
+    }
+
+    #[test]
+    fn blast_radius_round_trips_and_is_absent_from_legacy_json() {
+        let with = sample().with_blast_radius(radius());
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(serde_json::from_value::<Escalation>(json).unwrap(), with);
+        let legacy = serde_json::to_value(sample()).unwrap();
+        assert!(legacy.get("blast_radius").is_none());
+        assert_eq!(
+            serde_json::from_value::<Escalation>(legacy)
+                .unwrap()
+                .blast_radius,
+            None
+        );
+        assert!(with.to_json()["body"]
+            .as_str()
+            .unwrap()
+            .contains("db.orders"));
+    }
+
+    #[test]
+    fn dedupe_key_ignores_the_blast_radius() {
+        assert_eq!(
+            sample().dedupe_key(),
+            sample().with_blast_radius(radius()).dedupe_key()
+        );
     }
 
     #[test]
