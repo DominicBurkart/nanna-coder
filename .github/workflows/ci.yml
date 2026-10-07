@@ -253,7 +253,9 @@ jobs:
 
     - name: Run container-only suites
       run: |
-        nix develop --command cargo nextest run --workspace --all-features \
+        shim="$(mktemp -d)"
+        ln -s /usr/bin/podman "$shim/podman"
+        nix develop --command env PATH="$shim:$PATH" cargo nextest run --workspace --all-features \
           --run-ignored all --test-threads=1 --no-fail-fast --no-capture \
           -E 'test(/(^|::)container_/)'
 
