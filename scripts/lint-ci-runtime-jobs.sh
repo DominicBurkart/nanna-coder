@@ -39,6 +39,9 @@ forbid() {
 
 expect required "$required" 'NANNA_REQUIRE_RUNTIME: "1"'
 expect required "$required" 'container_'
+expect required "$required" "bash -c 'PATH=\"\$1:\$PATH\""
+forbid required "$required" 'env PATH='
+expect required "$required" 'command -v podman skopeo'
 forbid required "$required" '11434'
 if printf '%s\n' "$required" | grep -qi 'ollama'; then
   fail "required must not mention ollama"

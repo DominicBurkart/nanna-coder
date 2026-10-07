@@ -965,14 +965,17 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     static FAKE_PATH_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(unix)]
     struct FakeBin {
         dir: std::path::PathBuf,
         old_path: Option<std::ffi::OsString>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
+    #[cfg(unix)]
     impl FakeBin {
         fn new(tag: &str) -> Self {
             let guard = FAKE_PATH_LOCK
@@ -1039,6 +1042,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for FakeBin {
         fn drop(&mut self) {
             match &self.old_path {
@@ -1052,6 +1056,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn podman_nix2container_goes_through_docker_archive_then_load() {
         let fake = FakeBin::new("podman-ok");
@@ -1075,6 +1080,7 @@ mod tests {
         assert!(!Path::new(tar).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn podman_skopeo_failure_cleans_up_and_skips_load() {
         let fake = FakeBin::new("podman-skopeo-fail");
@@ -1090,6 +1096,7 @@ mod tests {
         assert!(fake.archives().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn podman_load_failure_cleans_up_archive() {
         let fake = FakeBin::new("podman-load-fail");
@@ -1116,6 +1123,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn docker_nix2container_still_uses_docker_daemon() {
         let fake = FakeBin::new("docker-ok");
@@ -1132,6 +1140,7 @@ mod tests {
         assert!(fake.archives().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn plain_archive_is_loaded_directly_and_parsed() {
         let fake = FakeBin::new("plain-archive");
@@ -1146,6 +1155,7 @@ mod tests {
         assert!(tar.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn plain_archive_load_failure_is_reported() {
         let fake = FakeBin::new("plain-fail");

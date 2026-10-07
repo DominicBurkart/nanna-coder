@@ -255,9 +255,9 @@ jobs:
       run: |
         shim="$(mktemp -d)"
         ln -s /usr/bin/podman "$shim/podman"
-        nix develop --command env PATH="$shim:$PATH" cargo nextest run --workspace --all-features \
+        nix develop --command bash -c 'PATH="$1:$PATH"; command -v podman skopeo; exec cargo nextest run --workspace --all-features \
           --run-ignored all --test-threads=1 --no-fail-fast --no-capture \
-          -E 'test(/(^|::)container_/)'
+          -E "test(/(^|::)container_/)"' _ "$shim"
 
     - name: Remove leftover task containers
       if: always()
