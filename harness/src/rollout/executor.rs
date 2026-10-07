@@ -3173,7 +3173,7 @@ mod tests {
         let mut live = RolloutRecord::new("rollout-live", plan("sandbox"), V2, V1, t0());
         live.state = RolloutState::Step(1);
         live.traffic_percent = 10;
-        rig.executor.log().append(None, &live).unwrap();
+        rig.executor.log().append(None, &mut live).unwrap();
         rig.leases
             .acquire(
                 &live.lease_name().unwrap(),
@@ -3679,7 +3679,7 @@ mod tests {
         let clock = Arc::new(HaltOnNthNow {
             inner: rig.clock.clone(),
             log: log.clone(),
-            nth: 2,
+            nth: 3,
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let executor = RolloutExecutor::new(
