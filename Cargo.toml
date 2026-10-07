@@ -4,6 +4,7 @@ members = [
     "image-builder",
     "model",
     "harness",
+    "nanna-effects",
 ]
 exclude = [
     "tests/fixtures/fullstack",
