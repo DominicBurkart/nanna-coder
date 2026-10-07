@@ -155,7 +155,7 @@
         };
 
         devShell = import ./nix/dev-shell.nix {
-          inherit pkgs rustToolchain self nixpkgs;
+          inherit pkgs rustToolchain self nixpkgs nix2containerPkgs;
           lib = pkgs.lib;
         };
 

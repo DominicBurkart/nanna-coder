@@ -10,6 +10,7 @@
 , rustToolchain
 , self
 , nixpkgs
+, nix2containerPkgs
 }:
 
 pkgs.mkShell {
@@ -32,7 +33,7 @@ pkgs.mkShell {
     # Container tools
     podman
     buildah
-    skopeo
+    nix2containerPkgs.skopeo-nix2container
 
     # System dependencies
     pkg-config

@@ -42,6 +42,7 @@ expect required "$required" 'container_'
 expect required "$required" "bash -c 'PATH=\"\$1:\$PATH\""
 forbid required "$required" 'env PATH='
 expect required "$required" 'command -v podman skopeo'
+expect required "$required" 'unknown transport'
 forbid required "$required" '11434'
 if printf '%s\n' "$required" | grep -qi 'ollama'; then
   fail "required must not mention ollama"

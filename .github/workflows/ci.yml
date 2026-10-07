@@ -251,6 +251,10 @@ jobs:
         podman --version || true
         nix develop --command bash -c 'command -v podman skopeo docker || true; podman --version || true; skopeo --version || true'
 
+    - name: Verify skopeo supports the nix transport
+      run: |
+        nix develop --command bash -c 'out="$(skopeo copy nix:/nonexistent "dir:$(mktemp -d)/x" 2>&1 || true)"; printf "%s\n" "$out"; if printf "%s" "$out" | grep -qi "unknown transport"; then echo "::error::skopeo on PATH lacks the nix: transport"; exit 1; fi'
+
     - name: Run container-only suites
       run: |
         shim="$(mktemp -d)"
