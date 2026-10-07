@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod apprun;
 pub mod assets;
 pub mod backlog;
 pub mod capabilities;
@@ -50,10 +51,10 @@ pub use observability::{
 };
 pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
 pub use sidecar::{
-    build_image_from_containerfile, network_exists, task_leftovers, task_network_name,
-    CommandRunner, PostgresSidecar, ReadinessConfig, RunOutput, RunningSidecar, SidecarError,
-    SidecarSet, SidecarSpec, SystemRunner, TaskNetwork, DATABASE_URL_VAR, POSTGRES_ALIAS,
-    POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_USER,
+    build_image_from_containerfile, container_exists, network_exists, task_leftovers,
+    task_network_name, CommandRunner, PostgresSidecar, ReadinessConfig, RunOutput, RunningSidecar,
+    SidecarError, SidecarSet, SidecarSpec, SystemRunner, TaskNetwork, DATABASE_URL_VAR,
+    POSTGRES_ALIAS, POSTGRES_IMAGE, POSTGRES_PORT, POSTGRES_USER,
 };
 pub use telemetry::{
     CustomEvent, MetricPoint, MetricType, PrometheusExporter, SpanStatus, TelemetryConfig,
