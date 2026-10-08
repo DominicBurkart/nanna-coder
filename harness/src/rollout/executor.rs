@@ -901,6 +901,9 @@ impl RolloutExecutor {
         let previous_image = record.previous_image.clone();
         self.persist(&mut record, RolloutState::RollingBack)?;
         let outcome = self.roll_back(record).await;
+        if matches!(outcome, Err(RolloutError::Conflict { .. })) {
+            return outcome;
+        }
         let (verdict, summary) = match &outcome {
             Ok(()) => (
                 "rolled back automatically".to_string(),
@@ -3558,6 +3561,7 @@ mod tests {
         .with_audit(Arc::new(InjectedAudit {
             injection: injection.clone(),
         }))
+        .with_escalation(rig.escalation.clone())
         .with_incident_responder(Arc::new(IncidentResponder::new(
             IncidentIdentity::incident_responder(),
         )))
@@ -3893,12 +3897,34 @@ mod tests {
             .run()
             .await;
         assert_eq!(rolled_back.finished.state, RolloutState::RolledBack);
+        let escalations = rolled_back.rig.escalation.escalations();
+        assert_eq!(escalations.len(), 1);
+        assert!(escalations[0].summary.contains("rolled back automatically"));
         let halted = Play::of(plan)
             .breaching_in_the_bake_of(0)
             .halted_at(HaltPoint::DuringIncidentActionReview)
             .run()
             .await;
         halted.assert_it_withheld(&rolled_back, AdapterCall::SetTraffic(candidate(), 0));
+        assert_eq!(halted.rig.escalation.escalations(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_during_an_incident_rollback_is_not_reported_as_a_failed_rollback() {
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let rolled_back = Play::of(plan.clone())
+            .breaching_in_the_bake_of(0)
+            .run()
+            .await;
+        let halted = Play::of(plan)
+            .breaching_in_the_bake_of(0)
+            .halted_at(HaltPoint::AfterEffectWhileRollingBack(
+                AdapterCall::SetTraffic(candidate(), 0),
+            ))
+            .run()
+            .await;
+        halted.assert_it_withheld(&rolled_back, AdapterCall::Mirror(candidate(), 0));
+        assert_eq!(halted.rig.escalation.escalations(), vec![]);
     }
 
     #[tokio::test]
@@ -3924,7 +3950,7 @@ mod tests {
         assert!(!effects(&rig)
             .iter()
             .any(|c| matches!(c, AdapterCall::RollbackTo(_))));
-        assert!(rig.escalation.escalations().is_empty());
+        assert_eq!(rig.escalation.escalations(), vec![]);
     }
 
     #[tokio::test]
