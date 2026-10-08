@@ -6,6 +6,7 @@ use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -103,6 +104,8 @@ pub struct TaskResult {
     pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
+    #[serde(default)]
+    pub qa_summary: QaSummary,
 }
 
 impl TaskResult {
@@ -133,6 +136,7 @@ impl TaskResult {
             "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "qa_summary": self.qa_summary.to_json(),
         })
     }
 }
@@ -991,6 +995,7 @@ impl TaskRunner {
         let changes_patch = workspace.extract_changes().ok().and_then(bound_patch);
 
         let format_patch = workspace.format_patch().ok().flatten();
+        let qa_summary = workspace.persist_qa_summary();
 
         let _ = workspace.cleanup();
 
@@ -1008,6 +1013,7 @@ impl TaskRunner {
                     denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    qa_summary,
                 };
                 self.set_status(
                     &task_id,
@@ -1203,6 +1209,7 @@ mod tests {
             }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1220,6 +1227,24 @@ mod tests {
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
+        assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_task_result_qa_summary_defaults_when_absent_from_stored_json() {
+        let stored = serde_json::json!({
+            "result_summary": "Done",
+            "changes_patch": null,
+            "format_patch": null,
+            "files_modified": [],
+            "tool_calls_made": [],
+            "iterations": 1,
+            "model_used": "qwen3:0.6b",
+        });
+        let result: TaskResult = serde_json::from_value(stored).unwrap();
+        assert!(result.qa_summary.is_empty());
+        assert_eq!(result.qa_summary, QaSummary::default());
     }
 
     #[test]
@@ -1288,6 +1313,7 @@ mod tests {
             denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            qa_summary: QaSummary::default(),
         }
     }
 

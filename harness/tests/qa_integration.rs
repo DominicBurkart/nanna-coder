@@ -1,19 +1,20 @@
-//! Container integration tests for `app_start`, `app_logs` and `app_stop`
-//! on the full-stack fixture. All tests are `#[ignore]` and skip when no
-//! runtime is available; run them with
-//! `cargo test -p harness --test apprun_integration -- --ignored --test-threads=1`.
+//! Container integration tests for `qa_endpoints` and `qa_browser` on the
+//! full-stack fixture. All tests are `#[ignore]` and skip when no runtime is
+//! available; run them with
+//! `cargo test -p harness --test qa_integration -- --ignored --test-threads=1`.
 //!
-//! The dev image is a stand-in for the generated flake image: the official
-//! Rust image plus the wasm target, a trunk release binary and the fixture's
-//! dependencies pre-built into a fixed `CARGO_TARGET_DIR`, so the test only
-//! pays for compiling the fixture crates themselves.
+//! The dev image is the [`apprun_integration`] stand-in plus headless
+//! Chromium (the package the generated flake adds for this profile).
+//! `qa_browser`'s console-error evidence comes from Chromium's own
+//! automatic `GET /favicon.ico` request, which the fixture's static file
+//! service 404s (no file exists under `ui/dist`); no fixture change was
+//! needed to produce it.
 
-use harness::apprun::{Limits, DEFAULT_PORT_RANGE};
-use harness::apprun::{PortAllocator, APP_LOGS_TOOL, APP_START_TOOL, APP_STOP_TOOL};
+use harness::apprun::{Limits, APP_START_TOOL};
 use harness::container::{detect_runtime, ContainerRuntime};
+use harness::qa::{QA_BROWSER_TOOL, QA_ENDPOINTS_TOOL};
 use harness::sidecar::{
-    build_image_from_containerfile, container_exists, CommandRunner, RunOutput, SidecarError,
-    SystemRunner,
+    build_image_from_containerfile, CommandRunner, RunOutput, SidecarError, SystemRunner,
 };
 use harness::tools::ToolRegistry;
 use harness::workspace::TaskWorkspace;
@@ -21,9 +22,21 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEV_IMAGE_TAG: &str = "localhost/nanna-apprun-test-dev:latest";
+const DEV_IMAGE_TAG: &str = "localhost/nanna-qa-test-dev:latest";
 const TRUNK_URL: &str =
     "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz";
+const DEV_CONTAINERFILE: &str = "FROM docker.io/library/rust:1-bookworm\n\
+         RUN rustup target add wasm32-unknown-unknown \\\n\
+         \x20&& curl -fsSL @TRUNK_URL@ | tar -xz -C /usr/local/bin trunk \\\n\
+         \x20&& mkdir -p /home/dev /cache \\\n\
+         \x20&& apt-get update \\\n\
+         \x20&& apt-get install -y --no-install-recommends chromium \\\n\
+         \x20&& rm -rf /var/lib/apt/lists/*\n\
+         ENV HOME=/home/dev CARGO_TARGET_DIR=/cache/target\n\
+         COPY fixture /src\n\
+         RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
+         \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
+         CMD [\"sleep\", \"infinity\"]\n";
 const COLD_BUILD_LIMIT: Limits = Limits {
     max_wall_clock_secs: 1800,
 };
@@ -76,38 +89,31 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-async fn curl(registry: &ToolRegistry, url: &str) -> Value {
+async fn tool(registry: &ToolRegistry, name: &str, args: Value) -> Value {
     registry
-        .execute(
-            "run_command",
-            json!({ "command": format!("curl -sf {url}") }),
-        )
+        .execute(name, args)
         .await
-        .expect("run_command must execute")
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"))
 }
 
-async fn app(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
-    registry
-        .execute(tool, args)
+async fn start_workspace(
+    source: &Path,
+    task_prefix: &str,
+    env: Vec<(String, String)>,
+) -> TaskWorkspace {
+    let task_id = format!("{task_prefix}-{}", uuid::Uuid::new_v4());
+    let mut ws = TaskWorkspace::create_with_container(source, &task_id, "HEAD", DEV_IMAGE_TAG)
         .await
-        .unwrap_or_else(|e| panic!("{tool} failed: {e}"))
+        .expect("dev container must start");
+    ws.set_app_limits(Some(COLD_BUILD_LIMIT));
+    if !env.is_empty() {
+        ws.set_app_env(env);
+    }
+    ws
 }
 
 fn dev_containerfile() -> String {
-    format!(
-        "FROM docker.io/library/rust:1-bookworm\n\
-         RUN rustup target add wasm32-unknown-unknown \\\n\
-         \x20&& curl -fsSL {TRUNK_URL} | tar -xz -C /usr/local/bin trunk \\\n\
-         \x20&& mkdir -p /home/dev /cache \\\n\
-         \x20&& apt-get update \\\n\
-         \x20&& apt-get install -y --no-install-recommends chromium \\\n\
-         \x20&& rm -rf /var/lib/apt/lists/*\n\
-         ENV HOME=/home/dev CARGO_TARGET_DIR=/cache/target\n\
-         COPY fixture /src\n\
-         RUN cd /src/ui && trunk build && cd /src && cargo build --package api \\\n\
-         \x20&& rm -rf /src && chmod -R a+w /cache /home/dev /usr/local/cargo\n\
-         CMD [\"sleep\", \"infinity\"]\n"
-    )
+    DEV_CONTAINERFILE.replace("@TRUNK_URL@", TRUNK_URL)
 }
 
 fn build_dev_image(
@@ -127,7 +133,7 @@ fn build_dev_image(
 
 #[tokio::test]
 #[ignore]
-async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
+async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
     let runtime = detect_runtime();
     if !runtime.is_available() {
         eprintln!("No container runtime available, skipping test");
@@ -138,121 +144,117 @@ async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
     let source = tempfile::tempdir().unwrap();
     copy_dir_all(&fixture_root(), source.path());
     init_repo(source.path());
-    let task_id = format!("apprun-{}", uuid::Uuid::new_v4());
-    let container_name = format!("nanna-task-{task_id}");
-
-    let mut ws =
-        TaskWorkspace::create_with_container(source.path(), &task_id, "HEAD", DEV_IMAGE_TAG)
-            .await
-            .expect("dev container must start");
-    ws.set_app_limits(Some(COLD_BUILD_LIMIT));
+    let mut ws = start_workspace(source.path(), "qa-precheck", vec![]).await;
     let registry = ws.build_tool_registry();
-    for name in [APP_START_TOOL, APP_STOP_TOOL, APP_LOGS_TOOL] {
+
+    for (name, args) in [
+        (QA_ENDPOINTS_TOOL, json!({})),
+        (
+            QA_BROWSER_TOOL,
+            json!({ "scenario": { "steps": [{ "step": "goto", "path": "/" }] } }),
+        ),
+    ] {
+        let err = registry.execute(name, args).await.unwrap_err();
         assert!(
-            registry.get_tool(name).is_some(),
-            "{name} must be registered"
+            err.to_string().contains("no application is running"),
+            "{name}: {err}"
         );
     }
 
-    let started = app(&registry, APP_START_TOOL, Value::Null).await;
-    let base_url = started["base_url"].as_str().unwrap().to_string();
-    let port = u16::try_from(started["port"].as_u64().unwrap()).unwrap();
-    assert_eq!(base_url, format!("http://127.0.0.1:{port}"));
-    assert!(
-        DEFAULT_PORT_RANGE.contains(&port),
-        "port {port} outside the default range"
-    );
-    assert_eq!(started["api_url"], base_url);
-    assert_eq!(started["frontend_url"], base_url);
-    assert_eq!(started["task_id"], task_id);
-    assert_eq!(started["log_path"], format!("/tmp/nanna-app-{task_id}.log"));
-    assert_eq!(PortAllocator::shared().held(), vec![port]);
+    tool(&registry, APP_START_TOOL, Value::Null).await;
 
-    let health = curl(&registry, &format!("{base_url}/health/v1")).await;
-    assert_eq!(health["success"], true, "{health}");
-    assert!(health["stdout"].as_str().unwrap().contains("\"ok\""));
-    let index = curl(
-        &registry,
-        &format!("{}/", started["frontend_url"].as_str().unwrap()),
-    )
-    .await;
-    assert_eq!(index["success"], true, "{index}");
-    let html = index["stdout"].as_str().unwrap();
-    assert!(html.contains("<html"), "index page: {html}");
-    assert!(html.contains("Full-stack fixture"), "index page: {html}");
-    assert!(
-        html.contains(".wasm"),
-        "index page must load the wasm bundle: {html}"
-    );
-    let greeting = curl(
-        &registry,
-        &format!("{}/api/v1/greeting", started["api_url"].as_str().unwrap()),
-    )
-    .await;
-    assert_eq!(greeting["success"], true, "{greeting}");
-    assert!(greeting["stdout"]
-        .as_str()
+    let endpoints = tool(&registry, QA_ENDPOINTS_TOOL, json!({})).await;
+    assert_eq!(endpoints["manifest"], "CHECKS", "{endpoints}");
+    assert_eq!(endpoints["all_passed"], true, "{endpoints}");
+    assert_eq!(endpoints["passed"], 3, "{endpoints}");
+    let paths: Vec<&str> = endpoints["checks"]
+        .as_array()
         .unwrap()
-        .contains("Hello from the full-stack fixture"));
-
-    let logs = app(&registry, APP_LOGS_TOOL, json!({ "tail": 50 })).await;
-    assert_eq!(logs["log_path"], started["log_path"]);
-    let lines = logs["lines"].as_array().unwrap();
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["/", "/health/v1", "/api/v1/greeting"]);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.as_str().unwrap().contains("starting fixture api")),
-        "log lines: {lines:?}"
+        Path::new(endpoints["artifact"].as_str().unwrap()).is_file(),
+        "{endpoints}"
     );
 
-    let again = app(&registry, APP_START_TOOL, Value::Null).await;
-    assert_eq!(
-        again, started,
-        "second app_start returns the running instance"
+    let scenario = json!({ "steps": [
+        { "step": "goto", "path": "/" },
+        { "step": "expect_text", "selector": "#greeting", "text": "Hello from the full-stack fixture" },
+        { "step": "screenshot", "name": "home" }
+    ] });
+    let browser = tool(&registry, QA_BROWSER_TOOL, json!({ "scenario": scenario })).await;
+    assert_eq!(browser["passed"], true, "{browser}");
+    let screenshots = browser["screenshots"].as_array().unwrap();
+    assert_eq!(screenshots.len(), 1, "{browser}");
+    let screenshot = PathBuf::from(screenshots[0].as_str().unwrap());
+    assert!(screenshot.is_file(), "{screenshot:?}");
+    assert!(
+        std::fs::metadata(&screenshot).unwrap().len() > 0,
+        "screenshot must not be empty"
+    );
+    let console_errors = browser["console_errors"].as_array().unwrap();
+    assert!(
+        console_errors.iter().any(|e| e["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/favicon.ico"))
+            && e["text"].as_str().is_some_and(|t| t.contains("404"))),
+        "the browser's automatic favicon.ico request must 404 and be reported: {browser}"
     );
 
-    let stopped = app(&registry, APP_STOP_TOOL, Value::Null).await;
-    assert_eq!(stopped["stopped"], true, "{stopped}");
-    assert_eq!(stopped["killed"], true, "{stopped}");
-    assert_eq!(stopped["pid"], started["pid"]);
-    assert_eq!(stopped["port"], started["port"]);
-    assert!(PortAllocator::shared().held().is_empty());
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let after_stop = curl(&registry, &format!("{base_url}/health/v1")).await;
-    assert_eq!(
-        after_stop["success"], false,
-        "the app must be gone: {after_stop}"
-    );
-    let stopped_again = app(&registry, APP_STOP_TOOL, Value::Null).await;
-    assert_eq!(
-        stopped_again,
-        json!({ "task_id": task_id, "stopped": false })
-    );
+    let summary = ws.qa_summary();
+    assert_eq!(summary.endpoint_runs, 1);
+    assert_eq!(summary.browser_runs, 1);
+    assert!(!summary.artifacts.is_empty());
 
-    let restarted = app(&registry, APP_START_TOOL, Value::Null).await;
-    assert_ne!(
-        restarted["pid"], started["pid"],
-        "restart starts a new process"
-    );
-    let health = curl(
-        &registry,
-        &format!("{}/health/v1", restarted["base_url"].as_str().unwrap()),
+    ws.cleanup().expect("cleanup must succeed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
+    let runtime = detect_runtime();
+    if !runtime.is_available() {
+        eprintln!("No container runtime available, skipping test");
+        return;
+    }
+    build_dev_image(&SystemRunner, &runtime).unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), source.path());
+    init_repo(source.path());
+    let mut ws = start_workspace(
+        source.path(),
+        "qa-break",
+        vec![("FIXTURE_BREAK_ROUTE".to_string(), "1".to_string())],
     )
     .await;
-    assert_eq!(health["success"], true, "{health}");
-    let restarted_port = u16::try_from(restarted["port"].as_u64().unwrap()).unwrap();
+    let registry = ws.build_tool_registry();
 
-    ws.cleanup()
-        .expect("cleanup must succeed with a running app");
+    tool(&registry, APP_START_TOOL, Value::Null).await;
+    let endpoints = tool(&registry, QA_ENDPOINTS_TOOL, json!({})).await;
+    assert_eq!(endpoints["all_passed"], false, "{endpoints}");
+    assert_eq!(endpoints["passed"], 2, "{endpoints}");
+    assert_eq!(endpoints["failed"], 1, "{endpoints}");
+    let checks = endpoints["checks"].as_array().unwrap();
+    let health = checks.iter().find(|c| c["path"] == "/health/v1").unwrap();
+    assert_eq!(health["passed"], true, "{health}");
+    let greeting = checks
+        .iter()
+        .find(|c| c["path"] == "/api/v1/greeting")
+        .unwrap();
+    assert_eq!(greeting["passed"], false, "{greeting}");
+    assert_eq!(greeting["status"], 500, "{greeting}");
     assert!(
-        PortAllocator::shared().held().is_empty(),
-        "cleanup releases the port"
+        greeting["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("route broken by FIXTURE_BREAK_ROUTE=1"),
+        "{greeting}"
     );
-    assert!(!PortAllocator::shared().lease_path(restarted_port).exists());
-    assert!(
-        !container_exists(&SystemRunner, &runtime, &container_name),
-        "dev container must be removed"
-    );
+
+    ws.cleanup().expect("cleanup must succeed");
 }
 
 #[test]
@@ -361,28 +363,18 @@ fn registry_with(name: &'static str, reply: Value) -> ToolRegistry {
 }
 
 #[tokio::test]
-async fn curl_runs_a_silent_failing_curl_through_run_command() {
-    let registry = registry_with("run_command", json!({ "success": true, "stdout": "ok" }));
-    let out = curl(&registry, "http://127.0.0.1:1/x").await;
-    assert_eq!(out["stdout"], "ok");
+async fn tool_returns_the_tool_result() {
+    let registry = registry_with("qa_endpoints", json!({ "passed": 2 }));
+    assert_eq!(
+        tool(&registry, "qa_endpoints", json!({})).await["passed"],
+        2
+    );
 }
 
 #[tokio::test]
-#[should_panic(expected = "run_command must execute")]
-async fn curl_panics_when_run_command_is_missing() {
-    curl(&ToolRegistry::new(), "http://127.0.0.1:1/x").await;
-}
-
-#[tokio::test]
-async fn app_returns_the_tool_result() {
-    let registry = registry_with("app_start", json!({ "port": 1 }));
-    assert_eq!(app(&registry, "app_start", Value::Null).await["port"], 1);
-}
-
-#[tokio::test]
-#[should_panic(expected = "app_stop failed")]
-async fn app_panics_naming_the_failing_tool() {
-    app(&ToolRegistry::new(), "app_stop", Value::Null).await;
+#[should_panic(expected = "qa_browser failed")]
+async fn tool_panics_naming_the_failing_tool() {
+    tool(&ToolRegistry::new(), "qa_browser", json!({})).await;
 }
 
 #[test]
@@ -456,4 +448,39 @@ fn build_dev_image_surfaces_a_failed_build() {
     };
     let err = build_dev_image(&runner, &ContainerRuntime::Podman).unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn start_workspace_applies_the_cold_build_limit_and_app_env() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let podman = bin_dir.path().join("podman");
+    std::fs::write(&podman, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin_dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("a.txt"), "a").unwrap();
+    init_repo(source.path());
+    let (mut plain, mut with_env) = tokio::join!(
+        start_workspace(source.path(), "qa-plain", vec![]),
+        start_workspace(
+            source.path(),
+            "qa-env",
+            vec![("K".to_string(), "V".to_string())],
+        ),
+    );
+    std::env::set_var("PATH", old_path);
+
+    assert_eq!(plain.app_limits(), COLD_BUILD_LIMIT);
+    assert!(plain.app_env().is_empty());
+    assert_eq!(with_env.app_limits(), COLD_BUILD_LIMIT);
+    assert_eq!(with_env.app_env(), vec![("K".to_string(), "V".to_string())]);
+    plain.cleanup().unwrap();
+    with_env.cleanup().unwrap();
 }
