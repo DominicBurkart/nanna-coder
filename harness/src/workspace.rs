@@ -27,6 +27,30 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
+const DEV_CONTAINER_CONFIG: &str = include_str!("../dev-container.toml");
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevContainerConfig {
+    cargo_home: String,
+}
+
+fn parse_cargo_home(src: &str) -> Result<String, WorkspaceError> {
+    let config: DevContainerConfig = toml::from_str(src)
+        .map_err(|e| WorkspaceError::InvalidDevContainerConfig(e.to_string()))?;
+    if !Path::new(&config.cargo_home).is_absolute() {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "cargo_home must be an absolute path, got {:?}",
+            config.cargo_home
+        )));
+    }
+    Ok(config.cargo_home)
+}
+
+fn container_cargo_home() -> Result<String, WorkspaceError> {
+    parse_cargo_home(DEV_CONTAINER_CONFIG)
+}
+
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
     #[error("Git worktree creation failed: {0}")]
@@ -41,6 +65,8 @@ pub enum WorkspaceError {
     FormatPatchFailed(String),
     #[error("Container setup failed: {0}")]
     ContainerSetupFailed(String),
+    #[error("Invalid harness/dev-container.toml: {0}")]
+    InvalidDevContainerConfig(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -248,6 +274,7 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
+        let cargo_home = container_cargo_home()?;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -274,7 +301,10 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![worktree_mount_arg(&workspace_path)];
+        let mut additional_args = vec![
+            worktree_mount_arg(&workspace_path),
+            format!("--tmpfs={cargo_home}:rw,mode=1777"),
+        ];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
             additional_args.extend(set.container_args());
@@ -1272,6 +1302,83 @@ mod tests {
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
         assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_parse_cargo_home_accepts_an_absolute_path() {
+        assert_eq!(
+            parse_cargo_home("cargo_home = \"/opt/cargo\"\n").unwrap(),
+            "/opt/cargo"
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_home_rejects_invalid_config() {
+        for src in [
+            "",
+            "cargo_home = \"relative/cargo\"",
+            "cargo_home = \"\"",
+            "cargo_home = 3",
+            "cargo_home = \"/tmp/cargo\"\nextra = 1",
+            "not toml at all =",
+        ] {
+            let err = parse_cargo_home(src).unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::InvalidDevContainerConfig(_)),
+                "{src:?} -> {err:?}"
+            );
+            assert!(err.to_string().contains("dev-container.toml"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_shipped_dev_container_config_parses_to_the_tmp_cargo_home() {
+        let home = container_cargo_home().unwrap();
+        assert_eq!(home, "/tmp/cargo");
+        assert!(Path::new(&home).is_absolute());
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_gives_cargo_home_a_world_writable_tmpfs() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-cargohome"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = config.run_args(&runtime, "mock-image:latest");
+            assert!(
+                args.iter()
+                    .any(|a| *a
+                        == format!("--tmpfs={}:rw,mode=1777", container_cargo_home().unwrap())),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "--privileged"));
+        }
         ws.cleanup().unwrap();
     }
 
