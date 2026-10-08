@@ -18,6 +18,7 @@ pub mod observability;
 pub mod onboarding;
 pub mod pod;
 pub mod protected;
+pub mod qa;
 pub mod rollout;
 pub mod scheduler;
 pub mod scope;
