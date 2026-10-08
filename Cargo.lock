@@ -455,6 +455,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix 1.1.2",
+ "windows-sys 0.61.0",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,6 +630,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "criterion",
+ "fs4",
  "futures",
  "git2",
  "glob",

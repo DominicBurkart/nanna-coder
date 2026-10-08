@@ -33,6 +33,7 @@ serverless-adapter = []
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.0", features = ["derive"] }
+fs4 = "1.1"
 image-builder = { path = "../image-builder" }
 model = { path = "../model" }
 nanna-effects = { path = "../nanna-effects" }
