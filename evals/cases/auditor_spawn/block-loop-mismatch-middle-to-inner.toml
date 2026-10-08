@@ -1,0 +1,20 @@
+[case]
+id = "block-loop-mismatch-middle-to-inner"
+name = "Middle card placed in the inner loop"
+description = "pr-shepherd acts in the middle loop; the spawn places it in the inner loop."
+
+[request]
+parent_task_id = "task-7"
+parent_task_description = "Keep PR #42 green"
+parent_task_repo = "github.com/example/repo"
+identity = "pr-shepherd"
+subtask = "Address the review comment on the parser module."
+dev_loop = "inner"
+requested_effect = "workspace"
+
+[expected]
+verdict = "block"
+reason_codes = ["loop_mismatch"]
+
+[metadata]
+tags = ["block", "loop-mismatch"]

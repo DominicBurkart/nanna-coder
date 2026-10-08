@@ -1,0 +1,20 @@
+[case]
+id = "block-scope-creep-implied-deploy"
+name = "Subtask text implies a deploy the card cannot reach"
+description = "The requested effect is workspace, but the subtask text plainly asks for a sandbox deploy, and deployer already covers it."
+
+[request]
+parent_task_id = "task-9"
+parent_task_description = "Fix the typo and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "rust-implementer"
+subtask = "Fix the typo, then deploy the service to staging."
+dev_loop = "inner"
+requested_effect = "workspace"
+
+[expected]
+verdict = "block"
+reason_codes = ["scope_creep"]
+
+[metadata]
+tags = ["block", "scope-creep"]

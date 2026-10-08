@@ -1,4 +1,5 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop};
+use crate::auditor::Allowed;
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
@@ -271,6 +272,30 @@ struct TaskRunner {
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
 }
 
+/// Why [`TaskManager::submit_spawn`] refused to dispatch an audited spawn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpawnRefused {
+    /// The target repository is not the one the spawn was audited against.
+    #[error("spawn audited for repository `{audited}` cannot run against `{target}`")]
+    RepoMismatch {
+        /// The repository the auditor reviewed.
+        audited: String,
+        /// The path the caller asked to run against.
+        target: String,
+    },
+    /// The model is not the one the spawn was audited against.
+    #[error("spawn audited for model `{audited}` cannot run with model `{requested}`")]
+    ModelMismatch {
+        /// The model on the audited identity's card.
+        audited: String,
+        /// The model the caller asked for.
+        requested: String,
+    },
+    /// The audited identity's `scope.repos` does not list the target.
+    #[error(transparent)]
+    OutsideScope(#[from] crate::scope::ScopeError),
+}
+
 /// Manages task submission, scheduling and lifecycle.
 ///
 /// Submissions beyond `max_concurrent_tasks` are queued, not rejected, and
@@ -534,6 +559,53 @@ impl TaskManager {
         for identity in catalog.iter() {
             self.register_identity(identity.clone()).await;
         }
+    }
+
+    /// Submit a spawn the planner obtained an [`Allowed`] proof for.
+    ///
+    /// The proof binds the identity, the repository and the model the
+    /// auditor reviewed, and this function refuses to dispatch against
+    /// anything else: the target must be the audited repository
+    /// ([`SpawnRefused::RepoMismatch`]) and be listed in the identity's
+    /// `scope.repos` ([`SpawnRefused::OutsideScope`]), and `model` must be
+    /// the identity's model ([`SpawnRefused::ModelMismatch`]). The subtask
+    /// text becomes the task description and the task runs under the audited
+    /// identity exactly as [`TaskManager::submit_with_identity`] would run it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_spawn(
+        &self,
+        allowed: Allowed,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<TaskId, SpawnRefused> {
+        if !crate::scope::names_repo(allowed.repo(), &repo_path) {
+            return Err(SpawnRefused::RepoMismatch {
+                audited: allowed.repo().to_string(),
+                target: repo_path.display().to_string(),
+            });
+        }
+        if model != allowed.model() {
+            return Err(SpawnRefused::ModelMismatch {
+                audited: allowed.model().to_string(),
+                requested: model,
+            });
+        }
+        crate::scope::check_repo(allowed.identity(), &repo_path)?;
+        let (request, identity) = allowed.into_parts();
+        Ok(self
+            .submit_with_identity(
+                request.subtask,
+                repo_path,
+                branch,
+                model,
+                max_iterations,
+                provider,
+                Some(identity),
+            )
+            .await)
     }
 
     /// Submit a task that, when `identity` is present, runs under exactly that
@@ -3066,5 +3138,168 @@ mod identity_tests {
             task.status
         );
         assert_eq!(manager.get_result(&id).await.unwrap().denial_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::scheduler_tests::git_repo;
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    use crate::identity::{DevLoop, IdentityCatalog};
+
+    fn context() -> AuditContext {
+        let catalog = IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        AuditContext::new(catalog, auditor).unwrap()
+    }
+
+    fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        repo
+    }
+
+    async fn allowed_for(repo_label: &str) -> Allowed {
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", repo_label),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        gate.check(request, &context()).await.unwrap()
+    }
+
+    fn provider() -> Arc<dyn ModelProvider> {
+        MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+            "done",
+        )]))
+    }
+
+    #[tokio::test]
+    async fn test_allowed_binds_the_audited_repo_and_model() {
+        let allowed = allowed_for("github.com/example/repo").await;
+        assert_eq!(allowed.repo(), "github.com/example/repo");
+        assert_eq!(allowed.model(), "gemma4:e4b");
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_repo_other_than_the_audited_one() {
+        let repo_a = repo_with_origin("https://github.com/example/repo.git");
+        let repo_b = repo_with_origin("https://github.com/example/other.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+        assert!(crate::scope::names_repo(allowed.repo(), repo_a.path()));
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                repo_b.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            SpawnRefused::RepoMismatch {
+                audited: "github.com/example/repo".to_string(),
+                target: repo_b.path().display().to_string(),
+            }
+        );
+        assert!(refused.to_string().contains("github.com/example/repo"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_model_other_than_the_audited_one() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "some-other-model".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            SpawnRefused::ModelMismatch {
+                audited: "gemma4:e4b".to_string(),
+                requested: "some-other-model".to_string(),
+            }
+        );
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_repo_outside_the_identity_scope() {
+        let other = repo_with_origin("https://github.com/example/other.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/other").await;
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                other.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, SpawnRefused::OutsideScope(_)),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("scope.repos"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_runs_the_audited_identity_against_the_audited_repo() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let by_path = repo.path().display().to_string();
+        for label in ["github.com/example/repo".to_string(), by_path] {
+            let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+            let allowed = allowed_for(&label).await;
+            let id = manager
+                .submit_spawn(
+                    allowed,
+                    repo.path().to_path_buf(),
+                    "HEAD".to_string(),
+                    "gemma4:e4b".to_string(),
+                    20,
+                    provider(),
+                )
+                .await
+                .unwrap();
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            let task = manager.poll(&id).await.unwrap();
+            assert_eq!(task.description, "Add a regression test.");
+            assert_eq!(task.identity_hint.as_deref(), Some("rust-implementer"));
+        }
     }
 }

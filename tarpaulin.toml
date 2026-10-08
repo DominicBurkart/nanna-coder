@@ -1,4 +1,5 @@
 [config]
 exclude-files = [
-    "model/tests/*_integration.rs"
+    "model/tests/*_integration.rs",
+    "harness/tests/auditor_eval_integration.rs"
 ]

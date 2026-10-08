@@ -1,0 +1,17 @@
+[identity]
+name = "rust-implementer"
+description = "Implements a scoped issue in a Rust workspace and opens a draft PR."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You implement one issue at a time inside the writable paths only." }
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = ["api/**", "shared/**"]
+max_effect = "repository"
+tools = ["read_file", "write_file", "search", "cargo_*", "git_*"]
+
+[limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4

@@ -316,7 +316,7 @@ pub fn repo_slug(url: &str) -> Option<String> {
     Some(format!("{}/{owner}/{name}", host.to_ascii_lowercase()))
 }
 
-fn origin_slug(repo_path: &Path) -> Option<String> {
+pub fn origin_slug(repo_path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -327,6 +327,28 @@ fn origin_slug(repo_path: &Path) -> Option<String> {
         return None;
     }
     repo_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether `label` (a path, a remote URL or `host/owner/name`) names the
+/// repository checked out at `repo_path`: either the same path, or the same
+/// `origin` slug.
+///
+/// ```
+/// use harness::scope::names_repo;
+/// use std::path::Path;
+///
+/// assert!(names_repo("/work/repo", Path::new("/work/repo")));
+/// assert!(!names_repo("github.com/example/repo", Path::new("/no/such/checkout")));
+/// ```
+pub fn names_repo(label: &str, repo_path: &Path) -> bool {
+    if Path::new(label) == repo_path {
+        return true;
+    }
+    let Some(origin) = origin_slug(repo_path) else {
+        return false;
+    };
+    let wanted = repo_slug(label).unwrap_or_else(|| label.to_string());
+    wanted.eq_ignore_ascii_case(&origin)
 }
 
 /// Refuse a task whose target repository is not in the identity's
@@ -1322,5 +1344,22 @@ mod tests {
         open_identity.scope.repos.clear();
         let listed = repo_with_origin(Some("https://github.com/example/repo"));
         assert!(check_repo(&open_identity, listed.path()).is_err());
+    }
+
+    #[test]
+    fn names_repo_matches_a_path_or_the_origin_slug() {
+        let repo = repo_with_origin(Some("git@github.com:Example/Repo.git"));
+        let path = repo.path();
+        assert!(names_repo(&path.display().to_string(), path));
+        assert!(names_repo("github.com/example/repo", path));
+        assert!(names_repo("https://github.com/example/repo.git", path));
+        assert!(!names_repo("github.com/example/other", path));
+        assert!(!names_repo("/some/other/path", path));
+        let no_remote = repo_with_origin(None);
+        assert!(!names_repo("github.com/example/repo", no_remote.path()));
+        assert!(names_repo(
+            &no_remote.path().display().to_string(),
+            no_remote.path()
+        ));
     }
 }

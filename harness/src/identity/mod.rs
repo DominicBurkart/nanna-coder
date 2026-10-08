@@ -39,7 +39,8 @@ mod dev_loop;
 mod pattern;
 
 pub use catalog::{
-    config_dir_from, IdentityCatalog, AGENTS_SUBDIR, CONFIG_DIR_ENV, REPO_AGENTS_DIR,
+    config_dir_from, IdentityCatalog, AGENTS_SUBDIR, AUDITOR_IDENTITY, CONFIG_DIR_ENV,
+    REPO_AGENTS_DIR,
 };
 pub use dev_loop::{DevLoop, UnknownDevLoop};
 pub use pattern::{ToolPattern, ToolPatternError};
@@ -108,6 +109,15 @@ pub enum IdentityError {
     #[error("{file}: repo-local identity `{name}` has no global identity to narrow")]
     NoBaseIdentity {
         /// The unmatched name.
+        name: String,
+        /// Repo-local file that declared it.
+        file: PathBuf,
+    },
+    /// A repo-local file tries to override an identity a repository may not
+    /// reshape, such as the auditor.
+    #[error("{file}: repo-local identity `{name}` may not override a protected identity")]
+    ProtectedIdentity {
+        /// The protected name.
         name: String,
         /// Repo-local file that declared it.
         file: PathBuf,
