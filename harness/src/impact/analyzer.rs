@@ -127,49 +127,12 @@ impl<'g> ImpactAnalyzer<'g> {
         BlastRadius::compute(self.graph, touched, evidence.into_iter().collect())
     }
 
-    /// Score a set of already-known touched assets, without evidence.
+    /// Score a set of already-known touched assets, without evidence. Names
+    /// that are not assets of the graph are dropped (tracked in #847).
     ///
     /// ```
     /// use harness::assets::AssetGraph;
     /// use harness::impact::ImpactAnalyzer;
-    ///
-    /// let graph = AssetGraph::parse("[asset.\"db.a\"]\nkind = \"table\"\n").unwrap();
-    /// let radius = ImpactAnalyzer::new(&graph).radius_of_assets(["db.a", "db.unknown"]);
-    /// assert_eq!(radius.touched, ["db.a"]);
-    /// ```
-    pub fn radius_of_assets<I, S>(&self, assets: I) -> BlastRadius
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<AssetId>,
-    {
-        let mut touched = BTreeSet::new();
-        for asset in assets {
-            let name: AssetId = asset.into();
-            if self.graph.asset(&name).is_some() {
-                touched.insert(name);
-            }
-        }
-        BlastRadius::compute(self.graph, touched, Vec::new())
-    }
-}
-
-/// Divisor exponent applied per level of depth; see [`BlastRadius::compute`].
-pub const DEPTH_DISCOUNT_SHIFT: u32 = 1;
-
-impl BlastRadius {
-    /// Score `touched` assets and everything that transitively reads them.
-    ///
-    /// The score is the sum, over every touched and downstream asset, of the
-    /// weights of that asset's distinct concerns, where an asset at distance
-    /// `d` from the nearest touched asset along `reads` edges contributes its
-    /// weight shifted right by `d * DEPTH_DISCOUNT_SHIFT` bits (halved per
-    /// level, rounding down, so zero from depth 4 for weights below 16).
-    /// Touched assets have depth 0. Additions saturate at `u32::MAX`.
-    ///
-    /// ```
-    /// use harness::assets::AssetGraph;
-    /// use harness::impact::BlastRadius;
-    /// use std::collections::BTreeSet;
     ///
     /// let graph = AssetGraph::parse(r#"
     /// [concern.content]
@@ -188,11 +151,48 @@ impl BlastRadius {
     /// concerns = ["auth"]
     /// reads = ["http.b"]
     /// "#).unwrap();
-    /// let radius = BlastRadius::compute(&graph, BTreeSet::from(["db.a".to_string()]), Vec::new());
+    /// let radius = ImpactAnalyzer::new(&graph).radius_of_assets(["db.a", "db.unknown"]);
+    /// assert_eq!(radius.touched, ["db.a"]);
     /// assert_eq!(radius.downstream, ["http.b", "job.c"]);
     /// assert_eq!(radius.score, 3 + (9 >> 1) + (9 >> 2));
     /// ```
-    pub fn compute(
+    pub fn radius_of_assets<I, S>(&self, assets: I) -> BlastRadius
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<AssetId>,
+    {
+        let mut touched = BTreeSet::new();
+        for asset in assets {
+            let name: AssetId = asset.into();
+            if self.graph.asset(&name).is_some() {
+                touched.insert(name);
+            }
+        }
+        BlastRadius::compute(self.graph, touched, Vec::new())
+    }
+}
+
+/// Bits an asset's weight is shifted right per `reads` hop from a touched
+/// asset; see the [scoring rules](crate::impact#scoring).
+pub const DEPTH_DISCOUNT_SHIFT: u32 = 1;
+
+impl BlastRadius {
+    /// Score `touched` assets and everything that transitively reads them.
+    ///
+    /// The score is the sum, over every touched and downstream asset, of the
+    /// weights of that asset's concerns, where an asset at distance `d` from
+    /// the nearest touched asset along `reads` edges contributes its weight
+    /// shifted right by `d * DEPTH_DISCOUNT_SHIFT` bits (halved per level,
+    /// rounding down, so zero from depth 4 for weights below 16). Touched
+    /// assets have depth 0. Additions saturate at `u32::MAX`.
+    ///
+    /// Every name in `touched` must be an asset of `graph`, and `graph` must
+    /// have passed [`AssetGraph::check_references`] (loading a manifest does).
+    ///
+    /// # Panics
+    ///
+    /// When an asset names a concern the graph does not declare.
+    pub(crate) fn compute(
         graph: &AssetGraph,
         touched: BTreeSet<AssetId>,
         evidence: Vec<Evidence>,
@@ -200,21 +200,21 @@ impl BlastRadius {
         let depths = downstream_depths(graph, &touched);
         let mut score: u32 = 0;
         let mut concerns: BTreeMap<String, Weight> = BTreeMap::new();
-        let reached = touched
-            .iter()
-            .map(|name| (name, 0u32))
-            .chain(depths.iter().map(|(name, depth)| (name, *depth)));
-        for (name, depth) in reached {
-            let Some(asset) = graph.asset(name) else {
+        for asset in graph.assets() {
+            let depth = if touched.contains(&asset.name) {
+                0
+            } else if let Some(depth) = depths.get(&asset.name) {
+                *depth
+            } else {
                 continue;
             };
-            let names: BTreeSet<&String> = asset.concerns.iter().collect();
             let mut weight: u32 = 0;
-            for concern_name in names {
-                if let Some(concern) = graph.concern(concern_name) {
-                    weight = weight.saturating_add(concern.weight);
-                    concerns.insert(concern.name.clone(), concern.weight);
-                }
+            for concern_name in &asset.concerns {
+                let concern = graph
+                    .concern(concern_name)
+                    .expect("concern references are checked when a graph is loaded");
+                weight = weight.saturating_add(concern.weight);
+                concerns.insert(concern.name.clone(), concern.weight);
             }
             let shift = depth.saturating_mul(DEPTH_DISCOUNT_SHIFT);
             score = score.saturating_add(weight.checked_shr(shift).unwrap_or(0));
@@ -334,26 +334,118 @@ concerns = ["revenue"]
         assert_eq!(radius.downstream, ["b", "c"]);
     }
 
-    #[test]
-    fn depth_beyond_word_width_contributes_zero_without_panicking() {
+    fn chain(length: usize, weight: u32) -> AssetGraph {
         let mut g = AssetGraph::new();
         g.insert_concern(Concern {
             name: "c".into(),
-            weight: u32::MAX,
+            weight,
             description: None,
         })
         .unwrap();
-        for i in 0..40 {
-            let mut asset = Asset::new(format!("n{i}"), AssetKind::Job);
+        for i in 0..length {
+            let mut asset = Asset::new(format!("n{i:02}"), AssetKind::Job);
             asset.concerns = vec!["c".into()];
             if i > 0 {
-                asset.reads = vec![format!("n{}", i - 1)];
+                asset.reads = vec![format!("n{:02}", i - 1)];
             }
             g.insert_asset(asset).unwrap();
         }
-        let radius = BlastRadius::compute(&g, touched(&["n0"]), Vec::new());
+        g
+    }
+
+    #[test]
+    fn each_hop_halves_the_contribution_and_depth_past_the_word_width_contributes_zero() {
+        let radius = BlastRadius::compute(&chain(40, 1 << 20), touched(&["n00"]), Vec::new());
         assert_eq!(radius.downstream.len(), 39);
-        assert!(radius.score >= u32::MAX >> 1);
+        assert_eq!(radius.score, (1 << 21) - 1);
+    }
+
+    #[test]
+    fn depth_two_contributes_a_quarter_rounding_down() {
+        let radius = BlastRadius::compute(&chain(3, 10), touched(&["n00"]), Vec::new());
+        assert_eq!(radius.score, 10 + 5 + 2);
+        let radius = BlastRadius::compute(&chain(4, 10), touched(&["n01"]), Vec::new());
+        assert_eq!(radius.touched, ["n01"]);
+        assert_eq!(radius.downstream, ["n02", "n03"]);
+        assert_eq!(radius.score, 10 + 5 + 2);
+    }
+
+    #[test]
+    fn depth_is_the_shortest_path_from_any_touched_asset() {
+        let mut g = AssetGraph::new();
+        g.insert_concern(Concern {
+            name: "c".into(),
+            weight: 16,
+            description: None,
+        })
+        .unwrap();
+        for (name, reads) in [
+            ("t", vec![]),
+            ("b", vec!["t"]),
+            ("e", vec!["t"]),
+            ("f", vec!["e"]),
+            ("z", vec!["f", "b"]),
+        ] {
+            let mut asset = Asset::new(name, AssetKind::Job);
+            if name == "z" {
+                asset.concerns = vec!["c".into()];
+            }
+            asset.reads = reads.into_iter().map(String::from).collect();
+            g.insert_asset(asset).unwrap();
+        }
+        let radius = BlastRadius::compute(&g, touched(&["t"]), Vec::new());
+        assert_eq!(radius.downstream, ["b", "e", "f", "z"]);
+        assert_eq!(radius.score, 16 >> 2);
+    }
+
+    #[test]
+    fn concerns_on_one_asset_add_and_saturate_before_the_discount() {
+        let mut g = AssetGraph::new();
+        for (name, weight) in [("big", u32::MAX), ("small", 5)] {
+            g.insert_concern(Concern {
+                name: name.into(),
+                weight,
+                description: None,
+            })
+            .unwrap();
+        }
+        let mut asset = Asset::new("a", AssetKind::Table);
+        asset.concerns = vec!["big".into(), "small".into()];
+        g.insert_asset(asset).unwrap();
+        let radius = BlastRadius::compute(&g, touched(&["a"]), Vec::new());
+        assert_eq!(radius.score, u32::MAX);
+        assert_eq!(radius.concerns["big"], u32::MAX);
+        assert_eq!(radius.concerns["small"], 5);
+    }
+
+    #[test]
+    fn two_concerns_on_one_asset_sum() {
+        let mut g = AssetGraph::new();
+        for (name, weight) in [("x", 3), ("y", 4)] {
+            g.insert_concern(Concern {
+                name: name.into(),
+                weight,
+                description: None,
+            })
+            .unwrap();
+        }
+        let mut asset = Asset::new("a", AssetKind::Table);
+        asset.concerns = vec!["x".into(), "y".into()];
+        g.insert_asset(asset).unwrap();
+        assert_eq!(
+            BlastRadius::compute(&g, touched(&["a"]), Vec::new()).score,
+            7
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "concern references are checked when a graph is loaded")]
+    fn a_hand_built_graph_with_an_undeclared_concern_is_rejected_loudly() {
+        let mut g = AssetGraph::new();
+        let mut asset = Asset::new("a", AssetKind::Table);
+        asset.concerns = vec!["ghost".into()];
+        g.insert_asset(asset).unwrap();
+        let _ = BlastRadius::compute(&g, touched(&["a"]), Vec::new());
     }
 
     #[test]
@@ -395,6 +487,31 @@ concerns = ["revenue"]
         prop::collection::btree_set((0..NODES, 0..NODES), 0..24)
     }
 
+    fn ring_and(edges: BTreeSet<(usize, usize)>) -> BTreeSet<(usize, usize)> {
+        let mut all = edges;
+        all.extend((0..NODES).map(|i| (i, (i + 1) % NODES)));
+        all
+    }
+
+    fn naive_distances(
+        edges: &BTreeSet<(usize, usize)>,
+        seeds: &BTreeSet<usize>,
+    ) -> Vec<Option<u32>> {
+        let mut dist: Vec<Option<u32>> = (0..NODES)
+            .map(|i| seeds.contains(&i).then_some(0))
+            .collect();
+        for _ in 0..NODES {
+            for &(reader, read) in edges {
+                if let Some(d) = dist[read] {
+                    if dist[reader].is_none_or(|current| d + 1 < current) {
+                        dist[reader] = Some(d + 1);
+                    }
+                }
+            }
+        }
+        dist
+    }
+
     fn build(weights: &[Vec<usize>], edges: &BTreeSet<(usize, usize)>) -> AssetGraph {
         let mut g = AssetGraph::new();
         for (i, weight) in [1u32, 2, 4, 8, 16, 32].into_iter().enumerate() {
@@ -425,12 +542,49 @@ concerns = ["revenue"]
 
     proptest! {
         #[test]
+        fn score_downstream_and_concerns_match_a_naive_shortest_path_oracle(
+            concerns in concerns_strategy(),
+            edges in edge_set(),
+            ring in any::<bool>(),
+            seeds in prop::collection::btree_set(0..NODES, 0..NODES),
+        ) {
+            let edges = if ring { ring_and(edges) } else { edges };
+            let g = build(&concerns, &edges);
+            let touched: BTreeSet<AssetId> = seeds.iter().map(|i| format!("n{i}")).collect();
+            let radius = BlastRadius::compute(&g, touched, Vec::new());
+            let dist = naive_distances(&edges, &seeds);
+            let weights = [1u32, 2, 4, 8, 16, 32];
+            let mut score = 0u32;
+            let mut expected_concerns = BTreeMap::new();
+            let mut expected_downstream = Vec::new();
+            for (i, d) in dist.iter().enumerate() {
+                let Some(d) = d else { continue };
+                if !seeds.contains(&i) {
+                    expected_downstream.push(format!("n{i}"));
+                }
+                let distinct: BTreeSet<usize> = concerns[i].iter().copied().collect();
+                let weight: u32 = distinct.iter().map(|c| weights[*c]).sum();
+                score += weight >> d;
+                for c in distinct {
+                    expected_concerns.insert(format!("c{c}"), weights[c]);
+                }
+            }
+            prop_assert_eq!(radius.score, score);
+            prop_assert_eq!(&radius.downstream, &expected_downstream);
+            prop_assert_eq!(&radius.concerns, &expected_concerns);
+            let expected_touched: Vec<String> = seeds.iter().map(|i| format!("n{i}")).collect();
+            prop_assert_eq!(&radius.touched, &expected_touched);
+        }
+
+        #[test]
         fn adding_an_edge_never_lowers_the_score(
             concerns in concerns_strategy(),
             edges in edge_set(),
+            ring in any::<bool>(),
             extra in (0..NODES, 0..NODES),
             seeds in prop::collection::btree_set(0..NODES, 0..4),
         ) {
+            let edges = if ring { ring_and(edges) } else { edges };
             let touched: BTreeSet<AssetId> = seeds.iter().map(|i| format!("n{i}")).collect();
             let before = BlastRadius::compute(&build(&concerns, &edges), touched.clone(), Vec::new());
             let mut more = edges.clone();
@@ -463,8 +617,10 @@ concerns = ["revenue"]
         fn computation_terminates_and_partitions_assets(
             concerns in concerns_strategy(),
             edges in edge_set(),
+            ring in any::<bool>(),
             seeds in prop::collection::btree_set(0..NODES, 0..NODES),
         ) {
+            let edges = if ring { ring_and(edges) } else { edges };
             let g = build(&concerns, &edges);
             let touched: BTreeSet<AssetId> = seeds.iter().map(|i| format!("n{i}")).collect();
             let radius = BlastRadius::compute(&g, touched.clone(), Vec::new());

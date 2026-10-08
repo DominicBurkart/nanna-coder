@@ -141,3 +141,88 @@ fn impact_reports_unknown_revisions_and_missing_manifests() {
     assert!(!no_manifest.status.success());
     assert!(String::from_utf8_lossy(&no_manifest.stderr).contains("effects.toml"));
 }
+
+#[test]
+fn impact_scores_a_new_migration_that_was_never_staged() {
+    let dir = committed_fixture();
+    std::fs::write(
+        dir.path().join("migrations/20260925000000_note.sql"),
+        "ALTER TABLE greetings ADD COLUMN note TEXT;\n",
+    )
+    .unwrap();
+    let out = nanna(&[
+        "impact",
+        "--diff",
+        "HEAD",
+        "--repo-path",
+        dir.path().to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["touched"], serde_json::json!(["db.greetings"]));
+    assert!(json["downstream"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "http.GET /api/v1/greeting"));
+    assert!(json["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["extractor"] == "sql" && e["detail"] == "ALTER greetings"));
+}
+
+#[test]
+fn impact_defaults_to_the_repository_containing_the_current_directory() {
+    let dir = committed_fixture();
+    touch_greeting_handler(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_nanna"))
+        .args(["impact", "--diff", "HEAD", "--json"])
+        .current_dir(dir.path().join("api/src"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["touched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "http.GET /api/v1/greeting"));
+}
+
+#[test]
+fn impact_rejects_a_malformed_deploy_template_instead_of_ignoring_it() {
+    let dir = committed_fixture();
+    std::fs::write(dir.path().join(".nanna/deploy.toml"), "[target\n").unwrap();
+    let out = nanna(&[
+        "impact",
+        "--diff",
+        "HEAD",
+        "--repo-path",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(stderr.contains("deploy.toml"), "{stderr}");
+}
+
+#[test]
+fn impact_rejects_a_malformed_manifest() {
+    let dir = committed_fixture();
+    std::fs::write(dir.path().join(".nanna/effects.toml"), "[asset\n").unwrap();
+    let out = nanna(&[
+        "impact",
+        "--diff",
+        "HEAD",
+        "--repo-path",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("effects.toml"));
+}

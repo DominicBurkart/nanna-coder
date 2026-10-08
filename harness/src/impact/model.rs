@@ -82,7 +82,7 @@ impl fmt::Display for Evidence {
 ///
 /// `touched` and `downstream` are sorted and disjoint; `concerns` maps each
 /// concern on either set to its weight; `score` is computed as documented on
-/// [`BlastRadius::compute`].
+/// the [scoring rules](crate::impact#scoring).
 ///
 /// ```
 /// use harness::impact::BlastRadius;

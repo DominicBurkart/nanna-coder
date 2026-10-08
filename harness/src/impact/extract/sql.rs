@@ -64,13 +64,13 @@ pub fn sql_accesses(sql: &str) -> Vec<SqlAccess> {
         let verb = caps[1]
             .split_whitespace()
             .next()
-            .unwrap_or("")
+            .expect("the statement pattern captures a keyword")
             .to_uppercase();
         let before = cleaned[..whole.start()].trim_end().to_lowercase();
         let preceding_word = before
             .rsplit(|c: char| !c.is_alphanumeric())
             .next()
-            .unwrap_or("");
+            .expect("rsplit yields at least one item");
         let skip = match verb.as_str() {
             "UPDATE" => matches!(preceding_word, "for" | "do"),
             "FROM" => preceding_word == "distinct",
@@ -108,7 +108,10 @@ pub fn sql_accesses(sql: &str) -> Vec<SqlAccess> {
 }
 
 fn table_asset(graph: &AssetGraph, table: &str) -> Option<String> {
-    let bare = table.rsplit('.').next().unwrap_or(table);
+    let bare = table
+        .rsplit('.')
+        .next()
+        .expect("rsplit yields at least one item");
     [
         table.to_string(),
         table.to_lowercase(),
@@ -291,10 +294,12 @@ mod tests {
     use proptest::prelude::*;
 
     fn pairs(sql: &str) -> Vec<(String, Access)> {
-        sql_accesses(sql)
+        let mut found: Vec<_> = sql_accesses(sql)
             .into_iter()
             .map(|a| (a.table, a.access))
-            .collect()
+            .collect();
+        found.sort();
+        found
     }
 
     fn w(name: &str) -> (String, Access) {
@@ -334,11 +339,11 @@ mod tests {
     fn subselects_are_found_at_any_depth() {
         assert_eq!(
             pairs("SELECT * FROM (SELECT id FROM inner_t WHERE id IN (SELECT id FROM deepest)) s"),
-            [r("inner_t"), r("deepest")]
+            [r("deepest"), r("inner_t")]
         );
         assert_eq!(
             pairs("UPDATE orders SET total = (SELECT sum(x) FROM lines WHERE lines.o = orders.id)"),
-            [w("orders"), r("lines")]
+            [r("lines"), w("orders")]
         );
         assert_eq!(
             pairs("INSERT INTO audit SELECT * FROM orders"),
@@ -483,14 +488,17 @@ fn a() {
     }
 
     #[test]
-    fn unterminated_literals_do_not_panic() {
+    fn unterminated_literals_yield_no_evidence() {
         for source in [
             "sqlx::query!(\"DELETE FROM orders",
             "sqlx::query!(r#\"DELETE",
             "sqlx::query!(",
             "sqlx::query_as!(Row",
         ] {
-            let _ = analyze(ChangedFile::whole("q.rs", source));
+            assert!(
+                analyze(ChangedFile::whole("q.rs", source)).is_empty(),
+                "{source}"
+            );
         }
     }
 

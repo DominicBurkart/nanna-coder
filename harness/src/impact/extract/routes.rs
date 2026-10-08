@@ -69,7 +69,10 @@ fn line_of(source: &str, offset: usize) -> u32 {
 }
 
 fn last_segment(path: &str) -> String {
-    path.rsplit("::").next().unwrap_or(path).to_string()
+    path.rsplit("::")
+        .next()
+        .expect("rsplit yields at least one item")
+        .to_string()
 }
 
 /// Route registrations in actix source (a `#[get]` attribute with no function
@@ -427,6 +430,21 @@ mod tests {
             ["http.GET /health"]
         );
         assert_eq!(touched(change_at(&[line("web::put()")])), ["http.PUT /res"]);
+    }
+
+    #[test]
+    fn changing_only_the_closing_brace_of_a_handler_touches_its_endpoint() {
+        let closing = SOURCE
+            .lines()
+            .enumerate()
+            .skip(line("async fn list") as usize - 1)
+            .find(|(_, l)| *l == "}")
+            .map(|(i, _)| i as u32 + 1)
+            .unwrap();
+        assert_eq!(
+            touched(change_at(&[closing])),
+            ["http.GET /items", "http.PUT /res"]
+        );
     }
 
     #[test]

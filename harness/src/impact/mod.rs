@@ -18,15 +18,17 @@
 
 mod analyzer;
 mod change;
+mod error;
 mod extract;
 mod model;
 mod runner;
 
 pub use analyzer::{ExtractContext, Extractor, ImpactAnalyzer, DEPTH_DISCOUNT_SHIFT};
-pub use change::{Action, AddedLine, Change, ChangedFile};
+pub use change::{Action, ActionError, AddedLine, Change, ChangedFile, DiffError};
+pub use error::ImpactError;
 pub use extract::{
     function_spans, route_bindings, sql_accesses, ActionExtractor, ActixRouteExtractor,
     OwnerPathExtractor, RouteBinding, SqlAccess, SqlExtractor, TouchesExtractor,
 };
 pub use model::{Access, AssetId, BlastRadius, Evidence, Weight};
-pub use runner::{analyze_task, diff_against, impact_of_diff, load_repo_context, ImpactError};
+pub use runner::{diff_against, impact_of_diff, load_repo_context, TaskImpact};
