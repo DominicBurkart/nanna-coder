@@ -6,6 +6,7 @@ use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -103,6 +104,8 @@ pub struct TaskResult {
     pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
+    #[serde(default)]
+    pub qa_summary: QaSummary,
 }
 
 impl TaskResult {
@@ -133,6 +136,7 @@ impl TaskResult {
             "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "qa_summary": self.qa_summary.to_json(),
         })
     }
 }
@@ -923,12 +927,29 @@ impl TaskRunner {
                     return;
                 }
             };
-            TaskWorkspace::create_with_container_networked(
+            let sidecars = match crate::onboarding::fullstack::start_task_sidecars(
+                crate::container::detect_runtime(),
+                Arc::new(crate::sidecar::SystemRunner),
+                &queued.repo_path,
+                &task_id.0,
+                crate::sidecar::ReadinessConfig::default(),
+            )
+            .await
+            {
+                Ok(sidecars) => sidecars,
+                Err(e) => {
+                    self.fail(&task_id, e.to_string(), "SidecarSetupFailed")
+                        .await;
+                    return;
+                }
+            };
+            TaskWorkspace::create_with_container_and_sidecars(
                 &queued.repo_path,
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
                 network_policy_for(identity.as_ref()),
+                sidecars,
             )
             .await
             .map_err(|e| e.to_string())
@@ -974,6 +995,7 @@ impl TaskRunner {
         let changes_patch = workspace.extract_changes().ok().and_then(bound_patch);
 
         let format_patch = workspace.format_patch().ok().flatten();
+        let qa_summary = workspace.persist_qa_summary();
 
         let _ = workspace.cleanup();
 
@@ -991,6 +1013,7 @@ impl TaskRunner {
                     denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    qa_summary,
                 };
                 self.set_status(
                     &task_id,
@@ -1186,6 +1209,7 @@ mod tests {
             }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1203,6 +1227,24 @@ mod tests {
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
+        assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_task_result_qa_summary_defaults_when_absent_from_stored_json() {
+        let stored = serde_json::json!({
+            "result_summary": "Done",
+            "changes_patch": null,
+            "format_patch": null,
+            "files_modified": [],
+            "tool_calls_made": [],
+            "iterations": 1,
+            "model_used": "qwen3:0.6b",
+        });
+        let result: TaskResult = serde_json::from_value(stored).unwrap();
+        assert!(result.qa_summary.is_empty());
+        assert_eq!(result.qa_summary, QaSummary::default());
     }
 
     #[test]
@@ -1271,6 +1313,7 @@ mod tests {
             denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            qa_summary: QaSummary::default(),
         }
     }
 
@@ -1928,6 +1971,76 @@ mod tests {
                 "task did not complete within 5 s"
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_submit_records_sidecar_setup_failure() {
+        let fake = crate::test_support::FakePodman::install_async(Some("network create")).await;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+        copy_tree(&fixture, repo_dir.path());
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir_all(repo_dir.path().join(".devcontainer")).unwrap();
+
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.runner.image_cache.write().await;
+            cache.insert(canonical, "pre-built:latest".to_string());
+        }
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+                    panic!("expected Failed, got {:?}", task.status);
+                };
+                assert_eq!(diagnostics.error_type, "SidecarSetupFailed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete within 10 s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("network create nanna-task-")));
+    }
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
         }
     }
 
@@ -2900,6 +3013,7 @@ mod identity_tests {
 
     #[tokio::test]
     async fn test_submit_with_identity_starts_the_container_with_its_network_policy() {
+        let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("https://github.com/example/repo.git");
         std::fs::write(repo.path().join("flake.nix"), "{}").unwrap();
         std::fs::create_dir(repo.path().join(".devcontainer")).unwrap();
