@@ -3,9 +3,10 @@
 
 use super::{
     AuditContext, AuditError, AuditLog, AuditOutcome, AuditRecord, Auditor, CardSuggestion, Reason,
-    ReasonCode, SpawnRequest, SpawnVerdict, VerdictKind,
+    ReasonCode, SpawnRequest, SpawnVerdict, TaskSummary, VerdictKind,
 };
-use crate::identity::AgentIdentity;
+use crate::effects::EffectClass;
+use crate::identity::{AgentIdentity, DevLoop};
 use async_trait::async_trait;
 use std::fmt;
 
@@ -134,6 +135,13 @@ pub struct SpawnEscalation {
 pub trait SpawnEscalationHook: Send + Sync {
     /// Called once per escalation, after it has been logged.
     async fn on_escalate(&self, escalation: &SpawnEscalation);
+}
+
+#[async_trait]
+impl SpawnEscalationHook for Box<dyn SpawnEscalationHook> {
+    async fn on_escalate(&self, escalation: &SpawnEscalation) {
+        (**self).on_escalate(escalation).await
+    }
 }
 
 /// [`SpawnEscalationHook`] that does nothing; the default for [`Gate::new`].
@@ -281,17 +289,59 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
 /// neither reach the task manager without an [`Allowed`] proof nor audit
 /// against a catalog of its own choosing.
 pub struct SpawnGate {
-    gate: Gate<Box<dyn Auditor>>,
+    gate: Gate<Box<dyn Auditor>, Box<dyn SpawnEscalationHook>>,
     context: AuditContext,
 }
 
 impl SpawnGate {
     /// A gate over `auditor`, appending to `log`, reviewing against `context`.
     pub fn new(auditor: Box<dyn Auditor>, log: AuditLog, context: AuditContext) -> Self {
+        Self::with_hook(auditor, log, context, Box::new(NoopEscalationHook))
+    }
+
+    /// A gate that also hands every escalated spawn to `hook`.
+    pub fn with_hook(
+        auditor: Box<dyn Auditor>,
+        log: AuditLog,
+        context: AuditContext,
+        hook: Box<dyn SpawnEscalationHook>,
+    ) -> Self {
         Self {
-            gate: Gate::new(auditor, log),
+            gate: Gate::with_hook(auditor, log, hook),
             context,
         }
+    }
+
+    /// A request for `identity` to run `subtask` under `parent_task`, with
+    /// its effect and loop derived by [`SpawnRequest::derive`] against this
+    /// gate's own catalog.
+    pub fn request(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
+    /// [`request`](Self::request) with an effect and loop stated by the
+    /// caller, which can only tighten what the task text derives.
+    pub fn request_with_caller(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        caller_effect: Option<EffectClass>,
+        caller_loop: Option<DevLoop>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive_tightened(
+            self.context.catalog(),
+            parent_task,
+            identity,
+            subtask,
+            caller_effect,
+            caller_loop,
+        )
     }
 
     /// The context every request is reviewed against.
@@ -547,6 +597,38 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, Refused::Verdict { .. }));
         assert_eq!(spawn_gate.log().entries().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_gate_with_hook_notifies_on_escalation_only() {
+        use std::sync::Arc;
+        struct Shared(Arc<RecordingHook>);
+        #[async_trait]
+        impl SpawnEscalationHook for Shared {
+            async fn on_escalate(&self, escalation: &SpawnEscalation) {
+                self.0.on_escalate(escalation).await
+            }
+        }
+        let hook = Arc::new(RecordingHook::default());
+        let spawn_gate = SpawnGate::with_hook(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context(true),
+            Box::new(Shared(Arc::clone(&hook))),
+        );
+        spawn_gate.check(fitting()).await.unwrap();
+        assert!(hook.seen.lock().unwrap().is_empty());
+        let escalated = spawn_gate.request(
+            TaskSummary::new("t", "d", "github.com/example/repo"),
+            "deployer",
+            "Deploy build 42 to the production environment.",
+        );
+        let refused = spawn_gate.check(escalated).await.unwrap_err();
+        match refused {
+            Refused::Verdict { verdict, .. } => assert_eq!(verdict.kind(), VerdictKind::Escalate),
+            other => panic!("expected Verdict, got {other:?}"),
+        }
+        assert_eq!(hook.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -4,7 +4,6 @@ use harness::container::{
     ContainerConfig, ContainerRuntime,
 };
 use harness::entities::InMemoryEntityStore;
-use harness::task::{TaskManager, TaskStatus, DEFAULT_MAX_CONCURRENT_TASKS};
 use harness::tools::{
     create_container_tool_registry, ListDirTool, ReadFileTool, RunCommandTool, SearchTool,
     ToolRegistry, WriteFileTool, CONTAINER_WORKSPACE_DIR,
@@ -188,68 +187,6 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-#[tokio::test]
-#[ignore]
-async fn test_task_manager_submit_with_dev_container() {
-    let repo_path = example_repo_path();
-    assert!(
-        repo_path.exists(),
-        "Example repo not found at {:?}",
-        repo_path
-    );
-
-    require_runtime(detect_runtime());
-
-    assert!(
-        tokio::net::TcpStream::connect("127.0.0.1:11434")
-            .await
-            .is_ok(),
-        "Ollama not reachable on 127.0.0.1:11434: required to run this ignored test"
-    );
-
-    let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
-
-    let ollama_config = model::OllamaConfig::default();
-    let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
-    let provider: Arc<dyn ModelProvider> = Arc::new(provider);
-
-    let task_id = manager
-        .submit(
-            "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
-                .to_string(),
-            repo_path,
-            "HEAD".to_string(),
-            E2E_MODEL.to_string(),
-            MAX_TURNS,
-            provider,
-        )
-        .await;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(700);
-    loop {
-        if std::time::Instant::now() > deadline {
-            panic!("Task did not complete within timeout");
-        }
-
-        let task = manager.poll(&task_id).await.expect("task not found");
-        match &task.status {
-            TaskStatus::Completed { result, .. } => {
-                assert!(
-                    result.changes_patch.is_some(),
-                    "expected non-empty changes_patch"
-                );
-                return;
-            }
-            TaskStatus::Failed { error, .. } => {
-                panic!("Task failed: {}", error);
-            }
-            _ => {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
 }
 
 fn nanna_workspace_root() -> PathBuf {

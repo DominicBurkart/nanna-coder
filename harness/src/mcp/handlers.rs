@@ -5,7 +5,7 @@
 //! work (`assign_task`, `onboard_repo`), and the mappers that turn an internal
 //! [`Task`] into its MCP Tasks wire representation.
 
-use crate::auditor::{SpawnGate, SpawnRequest, TaskSummary};
+use crate::auditor::{SpawnGate, TaskSummary};
 use crate::effects::EffectClass;
 use crate::identity::DevLoop;
 use crate::onboarding::DeterministicOnboarder;
@@ -79,28 +79,27 @@ pub async fn handle_assign_task(
         .to_string();
 
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
-    let card = spawn_gate.context().catalog().get(&identity);
-    let dev_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
-        Some(value) => value.parse::<DevLoop>().map_err(|e| e.to_string())?,
-        None => card.map_or(DevLoop::Inner, |card| card.identity.dev_loop),
+    let caller_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
+        Some(value) => Some(value.parse::<DevLoop>().map_err(|e| e.to_string())?),
+        None => None,
     };
-    let requested_effect = match params.get("requested_effect").and_then(|v| v.as_str()) {
-        Some(value) => value.parse::<EffectClass>().map_err(|e| e.to_string())?,
-        None => card.map_or(EffectClass::None, |card| card.scope.max_effect),
+    let caller_effect = match params.get("requested_effect").and_then(|v| v.as_str()) {
+        Some(value) => Some(value.parse::<EffectClass>().map_err(|e| e.to_string())?),
+        None => None,
     };
     let repo =
         crate::scope::origin_slug(&repo_path).unwrap_or_else(|| repo_path.display().to_string());
-    let request = SpawnRequest {
-        parent_task: TaskSummary::new(
+    let request = spawn_gate.request_with_caller(
+        TaskSummary::new(
             format!("mcp-{}", uuid::Uuid::new_v4()),
             description.clone(),
             repo,
         ),
         identity,
-        subtask: description,
-        dev_loop,
-        requested_effect,
-    };
+        description,
+        caller_effect,
+        caller_loop,
+    );
     let allowed = spawn_gate
         .check(request)
         .await
@@ -536,7 +535,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assign_task_escalates_a_production_request_and_queues_nothing() {
+    async fn test_assign_task_blocks_a_production_request_from_an_inner_loop_card_and_queues_nothing(
+    ) {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
@@ -557,7 +557,10 @@ mod tests {
         assert!(manager.list().await.is_empty());
         let log = gate.log().entries().unwrap();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Escalate);
+        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Block);
+        let codes: Vec<_> = log[0].verdict.reasons().iter().map(|r| r.code).collect();
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
     }
 
     #[tokio::test]
@@ -605,6 +608,129 @@ mod tests {
             );
         }
         assert!(manager.list().await.is_empty());
+    }
+
+    async fn refused_request(
+        gate: &SpawnGate,
+        description: &str,
+        effect: Option<&str>,
+        dev_loop: Option<&str>,
+    ) -> crate::auditor::SpawnRequest {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let mut request = params(repo.path(), "rust-implementer", description);
+        if let Some(effect) = effect {
+            request["requested_effect"] = serde_json::json!(effect);
+        }
+        if let Some(dev_loop) = dev_loop {
+            request["dev_loop"] = serde_json::json!(dev_loop);
+        }
+        let err = assign(&manager, &provider, gate, request)
+            .await
+            .unwrap_err();
+        assert!(err.contains("spawn refused"), "{err}");
+        assert!(manager.list().await.is_empty());
+        let log = gate.log().entries().unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.verdict.kind(), crate::auditor::VerdictKind::Block);
+        last.request.clone()
+    }
+
+    fn last_codes(gate: &SpawnGate) -> Vec<crate::auditor::ReasonCode> {
+        let log = gate.log().entries().unwrap();
+        log.last()
+            .unwrap()
+            .verdict
+            .reasons()
+            .iter()
+            .map(|r| r.code)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_workspace_but_the_text_implies_production(
+    ) {
+        let gate = implementer_only_gate();
+        let request = refused_request(
+            &gate,
+            "Deploy build 42 to production for all users.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert_eq!(request.dev_loop, DevLoop::Outer);
+        let codes = last_codes(&gate);
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_production_but_the_text_implies_workspace(
+    ) {
+        let gate = fixture_gate();
+        let request =
+            refused_request(&gate, "Add a test.", Some("production"), Some("inner")).await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_never_lets_a_lower_caller_effect_loosen_the_derived_one() {
+        for lower in ["none", "workspace", "repository", "ci"] {
+            let gate = implementer_only_gate();
+            let request = refused_request(
+                &gate,
+                "Deploy build 42 to production for all users.",
+                Some(lower),
+                None,
+            )
+            .await;
+            assert_eq!(request.requested_effect, EffectClass::Production, "{lower}");
+            assert_eq!(request.dev_loop, DevLoop::Outer, "{lower}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_caller_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(&gate, "Add a test.", None, Some("middle")).await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert_eq!(request.requested_effect, EffectClass::None);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_derived_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(
+            &gate,
+            "Re-run CI on the PR.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_allows_agreeing_caller_and_text_within_the_ceiling() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        request["dev_loop"] = serde_json::json!("inner");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let log = gate.log().entries().unwrap();
+        assert!(log[0].verdict.is_allow());
+        assert_eq!(log[0].request.requested_effect, EffectClass::Workspace);
+        assert_eq!(log[0].request.dev_loop, DevLoop::Inner);
     }
 
     #[tokio::test]
