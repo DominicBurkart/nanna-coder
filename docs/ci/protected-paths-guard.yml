@@ -1,0 +1,102 @@
+# Ready-to-apply workflow for issue #639. Agents may not write under
+# .github/workflows/**, so a maintainer must copy this file to
+# .github/workflows/protected-paths-guard.yml (and add that path to the
+# repository ruleset's path restriction) for it to run.
+#
+# A pull request authored by a Nanna identity carries the marker from
+# harness::marker (a `Nanna-Identity: <name>` commit trailer or a
+# `<!-- Nanna-Identity: <name> -->` comment in the PR body). When the marker
+# is present and the PR touches a protected path, the check fails. Human PRs
+# (no marker) are not affected. The pattern list mirrors
+# harness::protected::PROTECTED_PATTERNS; a unit test keeps them in sync.
+
+name: protected-paths-guard
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect the Nanna-Identity marker
+        id: identity
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1 || ! git rev-parse --verify "$HEAD_SHA" >/dev/null 2>&1; then
+            echo "::error::base or head commit not resolvable; fail-closed per policy"
+            exit 1
+          fi
+          NAME_RE='[A-Za-z0-9][A-Za-z0-9._-]*'
+          COMMITS="$(git log --format=%B "$BASE_SHA..$HEAD_SHA")"
+          MARKER="$(printf '%s\n%s\n' "$PR_BODY" "$COMMITS" | tr -d '\r' \
+            | grep -oE "(^Nanna-Identity:[[:blank:]]*${NAME_RE}[[:blank:]]*$)|(<!--[[:space:]]*Nanna-Identity:[[:space:]]*${NAME_RE}[[:space:]]*-->)" \
+            | head -n 1 || true)"
+          IDENTITY="$(printf '%s' "$MARKER" | sed -E "s/.*Nanna-Identity:[[:space:]]*(${NAME_RE}).*/\1/")"
+          if [ -z "$IDENTITY" ]; then
+            echo "no Nanna-Identity marker: not an agent PR, protected paths are not enforced here"
+          else
+            echo "agent PR authored by identity '$IDENTITY'"
+          fi
+          echo "name=$IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse protected paths in an agent PR
+        if: steps.identity.outputs.name != ''
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IDENTITY: ${{ steps.identity.outputs.name }}
+        run: |
+          set -euo pipefail
+          PROTECTED_PATTERNS=(
+            ".nanna/**"
+            "**/.nanna/**"
+            ".git/**"
+            ".github/workflows/**"
+            ".github/CODEOWNERS"
+            "codecov.yml"
+            "windows.toml"
+          )
+          VIOLATIONS=()
+          while IFS= read -r -d '' path; do
+            [ -z "$path" ] && continue
+            for pattern in "${PROTECTED_PATTERNS[@]}"; do
+              shell_glob="${pattern//\*\*/*}"
+              directory="${shell_glob%/\*}"
+              # shellcheck disable=SC2254
+              case "$path" in
+                $shell_glob|$directory)
+                  VIOLATIONS+=("$path (rule: $pattern)")
+                  break
+                  ;;
+              esac
+            done
+          done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
+
+          if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
+            echo "identity '$IDENTITY' touched no protected path"
+            exit 0
+          fi
+
+          {
+            echo "::error::PR authored by Nanna identity '$IDENTITY' touches protected paths:"
+            for v in "${VIOLATIONS[@]}"; do echo "  - $v"; done
+            echo ""
+            echo "Nanna may not modify its own configuration (identities, RBAC policy,"
+            echo "deployment templates, availability windows, the CI that guards them)."
+            echo "A maintainer must make this change in a human-authored PR."
+          } >&2
+          exit 1

@@ -58,6 +58,7 @@ async fn start(network: NetworkPolicy) -> Arc<ContainerHandle> {
         env_vars: vec![],
         additional_args: vec!["-i".to_string(), "-t".to_string()],
         network,
+        read_only_mounts: vec![],
     };
     let handle = start_container_with_fallback(&config)
         .await

@@ -2,7 +2,7 @@ use crate::effects::EffectClass;
 use model::provider::ModelProvider;
 use model::OllamaConfig;
 use model::OllamaProvider;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -135,6 +135,40 @@ impl NetworkPolicy {
     }
 }
 
+/// A [`ContainerConfig::read_only_mounts`] value that mounts nothing.
+pub const NO_READ_ONLY_MOUNTS: Vec<ReadOnlyMount> = Vec::new();
+
+/// A host path bind-mounted read-only at a path inside the container.
+///
+/// ```
+/// use harness::container::ReadOnlyMount;
+///
+/// let mount = ReadOnlyMount::new("/repo/.nanna", "/workspace/.nanna");
+/// assert_eq!(mount.run_arg(), "-v=/repo/.nanna:/workspace/.nanna:ro");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyMount {
+    /// The path on the host.
+    pub host: PathBuf,
+    /// Where it appears inside the container.
+    pub container: PathBuf,
+}
+
+impl ReadOnlyMount {
+    /// Mount `host` read-only at `container`.
+    pub fn new(host: impl AsRef<Path>, container: impl AsRef<Path>) -> Self {
+        Self {
+            host: host.as_ref().to_path_buf(),
+            container: container.as_ref().to_path_buf(),
+        }
+    }
+
+    /// The `run` flag implementing this mount, understood by podman and docker.
+    pub fn run_arg(&self) -> String {
+        format!("-v={}:{}:ro", self.host.display(), self.container.display())
+    }
+}
+
 /// Configuration for container operations
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -158,14 +192,17 @@ pub struct ContainerConfig {
     pub additional_args: Vec<String>,
     /// Whether the container may reach the network
     pub network: NetworkPolicy,
+    /// Paths bind-mounted read-only, after `additional_args` so they shadow
+    /// any writable mount of an ancestor
+    pub read_only_mounts: Vec<ReadOnlyMount>,
 }
 
 impl ContainerConfig {
     /// Every argument that follows `run` when starting this container:
     /// detach and name, `--userns=keep-id` on podman (so files created inside
     /// the container are owned by the host user rather than root), port
-    /// mapping, environment, network policy, `additional_args`, `--rm`, and
-    /// finally `image`.
+    /// mapping, environment, network policy, `additional_args`,
+    /// `read_only_mounts`, `--rm`, and finally `image`.
     pub fn run_args(&self, runtime: &ContainerRuntime, image: &str) -> Vec<String> {
         let mut args = vec![
             "-d".to_string(),
@@ -185,6 +222,7 @@ impl ContainerConfig {
         }
         args.extend(self.network.run_args().iter().map(ToString::to_string));
         args.extend(self.additional_args.iter().cloned());
+        args.extend(self.read_only_mounts.iter().map(ReadOnlyMount::run_arg));
         args.push("--rm".to_string());
         args.push(image.to_string());
         args
@@ -204,6 +242,7 @@ impl Default for ContainerConfig {
             env_vars: Vec::new(),
             additional_args: Vec::new(),
             network: NetworkPolicy::Enabled,
+            read_only_mounts: Vec::new(),
         }
     }
 }
@@ -492,6 +531,7 @@ pub fn run_args(
     }
     args.extend(config.network.run_args().iter().map(ToString::to_string));
     args.extend(config.additional_args.iter().cloned());
+    args.extend(config.read_only_mounts.iter().map(ReadOnlyMount::run_arg));
     args.push("--rm".to_string());
     args.push(image.to_string());
     args
@@ -918,6 +958,23 @@ mod tests {
     }
 
     #[test]
+    fn env_file_run_args_place_read_only_mounts_after_additional_args() {
+        let mut config = env_config();
+        config.additional_args = vec!["-v=/h/ws:/workspace:z".to_string()];
+        config.read_only_mounts = vec![ReadOnlyMount::new("/h/ws/.nanna", "/workspace/.nanna")];
+        let args = run_args(&ContainerRuntime::Docker, &config, "img:1", None);
+        assert_eq!(
+            args[args.len() - 4..],
+            [
+                "-v=/h/ws:/workspace:z",
+                "-v=/h/ws/.nanna:/workspace/.nanna:ro",
+                "--rm",
+                "img:1"
+            ]
+        );
+    }
+
+    #[test]
     fn run_args_never_carry_env_values() {
         let config = env_config();
         let args = run_args(
@@ -1089,6 +1146,7 @@ mod tests {
             env_vars: vec![("KEY".to_string(), "value".to_string())],
             additional_args: vec!["--memory=1g".to_string()],
             network,
+            read_only_mounts: vec![],
         }
     }
 
@@ -1135,6 +1193,39 @@ mod tests {
         };
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
+    }
+
+    #[test]
+    fn read_only_mount_renders_a_volume_flag() {
+        let mount = ReadOnlyMount::new("/host/repo/.nanna", "/workspace/.nanna");
+        assert_eq!(mount.run_arg(), "-v=/host/repo/.nanna:/workspace/.nanna:ro");
+        assert_eq!(mount.host, PathBuf::from("/host/repo/.nanna"));
+        assert_eq!(mount.container, PathBuf::from("/workspace/.nanna"));
+    }
+
+    #[test]
+    fn run_args_emit_read_only_mounts_after_additional_args_and_before_rm() {
+        let mut config = run_args_config(NetworkPolicy::Enabled);
+        config.read_only_mounts = vec![
+            ReadOnlyMount::new("/h/.nanna", "/workspace/.nanna"),
+            ReadOnlyMount::new("/h/codecov.yml", "/workspace/codecov.yml"),
+        ];
+        let args = config.run_args(&ContainerRuntime::Docker, "alpine:3.19");
+        assert_eq!(
+            args[args.len() - 5..],
+            [
+                "--memory=1g",
+                "-v=/h/.nanna:/workspace/.nanna:ro",
+                "-v=/h/codecov.yml:/workspace/codecov.yml:ro",
+                "--rm",
+                "alpine:3.19",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_config_has_no_read_only_mounts() {
+        assert!(ContainerConfig::default().read_only_mounts.is_empty());
     }
 
     #[test]
