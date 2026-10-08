@@ -1032,6 +1032,29 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    const PLACEHOLDER_FILES: [&str; 14] = [
+        ".github/CODEOWNERS",
+        "codecov.yml",
+        "windows.toml",
+        "tarpaulin.toml",
+        "deny.toml",
+        "flake.nix",
+        "flake.lock",
+        "AGENTS.md",
+        "harness/src/protected.rs",
+        ".gitattributes",
+        ".gitmodules",
+        "harness/src/scope.rs",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+    ];
+
+    fn sorted_placeholder_files() -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = PLACEHOLDER_FILES.iter().map(PathBuf::from).collect();
+        files.sort();
+        files
+    }
+
     fn every_protected_root_mount(root: &Path) -> Vec<ReadOnlyMount> {
         [
             ".nanna",
@@ -1040,6 +1063,23 @@ mod tests {
             ".github/CODEOWNERS",
             "codecov.yml",
             "windows.toml",
+            "tarpaulin.toml",
+            "deny.toml",
+            "flake.nix",
+            "flake.lock",
+            ".github/rulesets",
+            ".githooks",
+            ".cargo",
+            ".devcontainer",
+            "AGENTS.md",
+            "evals/cases",
+            "harness/src/protected.rs",
+            ".gitattributes",
+            ".gitmodules",
+            "harness/src/scope.rs",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            "harness/src/auditor",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -1087,20 +1127,23 @@ mod tests {
         assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
         assert!(root.join(".nanna").is_dir());
         assert!(root.join(".github/workflows").is_dir());
-        for file in ["codecov.yml", "windows.toml", ".github/CODEOWNERS"] {
+        for dir in [
+            ".github/rulesets",
+            ".githooks",
+            ".cargo",
+            ".devcontainer",
+            "evals/cases",
+            "harness/src/auditor",
+        ] {
+            assert!(root.join(dir).is_dir(), "{dir}");
+        }
+        for file in PLACEHOLDER_FILES {
             let meta = std::fs::metadata(root.join(file)).unwrap();
             assert!(meta.is_file() && meta.len() == 0, "{file}");
         }
         let mut placeholders = ws.placeholders.clone();
         placeholders.sort();
-        assert_eq!(
-            placeholders,
-            vec![
-                PathBuf::from(".github/CODEOWNERS"),
-                PathBuf::from("codecov.yml"),
-                PathBuf::from("windows.toml"),
-            ]
-        );
+        assert_eq!(placeholders, sorted_placeholder_files());
         ws.cleanup().unwrap();
     }
 
@@ -1184,10 +1227,10 @@ mod tests {
         placeholders.sort();
         assert_eq!(
             placeholders,
-            vec![
-                PathBuf::from(".github/CODEOWNERS"),
-                PathBuf::from("windows.toml"),
-            ]
+            sorted_placeholder_files()
+                .into_iter()
+                .filter(|path| path != Path::new("codecov.yml"))
+                .collect::<Vec<_>>()
         );
         assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
     }
