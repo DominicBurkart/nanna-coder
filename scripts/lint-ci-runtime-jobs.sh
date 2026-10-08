@@ -18,11 +18,9 @@ section() {
 }
 
 required="$(section container-runtime-required)"
-ollama="$(section container-ollama)"
 gate="$(section all-checks)"
 
 [ -n "$required" ] || fail "job container-runtime-required is missing"
-[ -n "$ollama" ] || fail "job container-ollama is missing"
 [ -n "$gate" ] || fail "job all-checks is missing"
 
 has() {
@@ -47,22 +45,16 @@ forbid required "$required" '11434'
 if printf '%s\n' "$required" | grep -qi 'ollama'; then
   fail "required must not mention ollama"
 fi
-forbid required "$required" 'continue-on-error'
 
-expect ollama "$ollama" 'ollama_'
-expect ollama "$ollama" '11434'
-expect ollama "$ollama" 'continue-on-error: true'
-
-for pair in "required:$required" "ollama:$ollama"; do
-  name="${pair%%:*}"
-  body="${pair#*:}"
-  expect "$name" "$body" 'if: always()'
-  expect "$name" "$body" 'permissions:'
-  forbid "$name" "$body" 'environment:'
+for pattern in '|| true' 'continue-on-error' 'no-capture' '2>/dev/null' ; do
+  forbid required "$required" "$pattern"
 done
+expect required "$required" 'if: always()'
+expect required "$required" 'permissions:'
+forbid required "$required" 'environment:'
+forbid gate "$gate" '- container-ollama'
 
 expect gate "$gate" '- container-runtime-required'
-expect gate "$gate" '- container-ollama'
 
 if [ "$failures" -ne 0 ]; then
   exit 1
