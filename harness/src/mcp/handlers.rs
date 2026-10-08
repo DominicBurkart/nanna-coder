@@ -358,6 +358,7 @@ mod tests {
             denials: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
+            qa_summary: crate::qa::QaSummary::default(),
         }
     }
 

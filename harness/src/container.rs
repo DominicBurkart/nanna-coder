@@ -383,6 +383,120 @@ pub fn load_image_from_path(
     }
 }
 
+/// A private file of `KEY=value` lines handed to `<runtime> run --env-file`,
+/// so secrets stay out of the process argument list. The file is created with
+/// mode 0600 and removed when the value is dropped.
+#[derive(Debug)]
+pub struct EnvFile {
+    path: std::path::PathBuf,
+}
+
+impl EnvFile {
+    /// Write `vars` to a fresh, owner-only file in the temp directory.
+    ///
+    /// ```
+    /// use harness::container::EnvFile;
+    /// let file = EnvFile::create(&[("A".to_string(), "b".to_string())]).unwrap();
+    /// assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "A=b\n");
+    /// let path = file.path().to_path_buf();
+    /// drop(file);
+    /// assert!(!path.exists());
+    /// ```
+    pub fn create(vars: &[(String, String)]) -> std::io::Result<Self> {
+        let mut content = String::new();
+        for (key, value) in vars {
+            let bad_key = key.is_empty() || key.contains(['=', '\n', '\r', '\0']);
+            if bad_key || value.contains(['\n', '\r', '\0']) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("environment variable {key:?} cannot be written to an env file"),
+                ));
+            }
+            content.push_str(key);
+            content.push('=');
+            content.push_str(value);
+            content.push('\n');
+        }
+        let dir = std::env::temp_dir();
+        let mut next_suffix = || -> String {
+            rand::Rng::sample_iter(rand::rng(), rand::distr::Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect()
+        };
+        Self::write_unique(&dir, &content, &mut next_suffix)
+    }
+
+    fn write_unique(
+        dir: &Path,
+        content: &str,
+        next_suffix: &mut dyn FnMut() -> String,
+    ) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut attempt = 0;
+        loop {
+            let path = dir.join(format!("nanna-env-{}", next_suffix()));
+            match options.open(&path) {
+                Ok(mut file) => {
+                    let guard = Self { path };
+                    file.write_all(content.as_bytes())?;
+                    return Ok(guard);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Arguments for `<runtime> run` that start the dev container. Environment
+/// variables are passed through `env_file`, never as `-e KEY=value`.
+pub fn run_args(
+    runtime: &ContainerRuntime,
+    config: &ContainerConfig,
+    image: &str,
+    env_file: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        config.container_name.clone(),
+    ];
+    if *runtime == ContainerRuntime::Podman {
+        args.push("--userns=keep-id".to_string());
+    }
+    if let Some((host_port, container_port)) = config.port_mapping {
+        args.push("-p".to_string());
+        args.push(format!("{host_port}:{container_port}"));
+    }
+    if let Some(path) = env_file {
+        args.push("--env-file".to_string());
+        args.push(path.display().to_string());
+    }
+    args.extend(config.network.run_args().iter().map(ToString::to_string));
+    args.extend(config.additional_args.iter().cloned());
+    args.push("--rm".to_string());
+    args.push(image.to_string());
+    args
+}
+
 /// Start container with intelligent fallback logic
 pub async fn start_container_with_fallback(
     config: &ContainerConfig,
@@ -447,9 +561,23 @@ pub async fn start_container_with_fallback(
         }
     }
 
+    let env_file = if config.env_vars.is_empty() {
+        None
+    } else {
+        Some(EnvFile::create(&config.env_vars).map_err(|e| {
+            ContainerError::ContainerStartFailed {
+                name: config.container_name.clone(),
+                reason: format!("could not write container env file: {e}"),
+            }
+        })?)
+    };
     let mut cmd = Command::new(runtime.command());
-    cmd.arg("run");
-    cmd.args(config.run_args(&runtime, &image_to_use));
+    cmd.args(run_args(
+        &runtime,
+        config,
+        &image_to_use,
+        env_file.as_ref().map(EnvFile::path),
+    ));
 
     // Start the container
     println!("🚀 Starting container: {}", config.container_name);
@@ -754,6 +882,128 @@ mod tests {
         assert!(!ContainerRuntime::None.is_available());
     }
 
+    const ENV_SENTINEL: &str = "Sentinel-Pw-1c7d";
+
+    fn env_config() -> ContainerConfig {
+        ContainerConfig {
+            container_name: "c".to_string(),
+            env_vars: vec![(
+                "DATABASE_URL".to_string(),
+                format!("postgres://postgres:{ENV_SENTINEL}@postgres:5432/db"),
+            )],
+            port_mapping: None,
+            additional_args: vec!["--network=n".to_string()],
+            ..ContainerConfig::default()
+        }
+    }
+
+    #[test]
+    fn env_file_run_args_apply_the_network_policy_before_additional_args() {
+        let mut config = env_config();
+        config.network = NetworkPolicy::Disabled;
+        let args = run_args(&ContainerRuntime::Docker, &config, "img:1", None);
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-d",
+                "--name",
+                "c",
+                "--network=none",
+                "--network=n",
+                "--rm",
+                "img:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_never_carry_env_values() {
+        let config = env_config();
+        let args = run_args(
+            &ContainerRuntime::Podman,
+            &config,
+            "img:1",
+            Some(Path::new("/tmp/envfile")),
+        );
+        assert!(!args.join(" ").contains(ENV_SENTINEL));
+        assert!(!args.iter().any(|a| a == "-e"));
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-d",
+                "--name",
+                "c",
+                "--userns=keep-id",
+                "--env-file",
+                "/tmp/envfile",
+                "--network=n",
+                "--rm",
+                "img:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_without_env_file_or_podman() {
+        let mut config = env_config();
+        config.port_mapping = Some((1, 2));
+        let args = run_args(&ContainerRuntime::Docker, &config, "img:1", None);
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-d",
+                "--name",
+                "c",
+                "-p",
+                "1:2",
+                "--network=n",
+                "--rm",
+                "img:1"
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_is_private_complete_and_removed_on_drop() {
+        let file = EnvFile::create(&env_config().env_vars).unwrap();
+        let path = file.path().to_path_buf();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(ENV_SENTINEL));
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn env_file_rejects_unrepresentable_variables() {
+        for (key, value) in [
+            ("", "v"),
+            ("A=B", "v"),
+            ("A\nB", "v"),
+            ("A", "line1\nline2"),
+            ("A", "nul\0"),
+        ] {
+            let err = EnvFile::create(&[(key.to_string(), value.to_string())]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn env_file_names_are_unique() {
+        let a = EnvFile::create(&[]).unwrap();
+        let b = EnvFile::create(&[]).unwrap();
+        assert_ne!(a.path(), b.path());
+    }
+
     #[test]
     fn test_detect_runtime() {
         let runtime = detect_runtime();
@@ -885,5 +1135,107 @@ mod tests {
         };
         let result = exec_in_container(&handle, &["echo", "hello"], None);
         assert!(matches!(result, Err(ContainerError::NoRuntimeAvailable)));
+    }
+
+    #[test]
+    fn env_file_retries_on_name_collision_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nanna-env-dup"), "taken").unwrap();
+        let mut names = vec!["fresh".to_string(), "dup".to_string()];
+        let file =
+            EnvFile::write_unique(dir.path(), "A=b\n", &mut || names.pop().unwrap()).unwrap();
+        assert_eq!(file.path(), dir.path().join("nanna-env-fresh"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "A=b\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nanna-env-dup")).unwrap(),
+            "taken"
+        );
+    }
+
+    #[test]
+    fn env_file_gives_up_after_repeated_name_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nanna-env-dup"), "taken").unwrap();
+        let mut calls = 0;
+        let err = EnvFile::write_unique(dir.path(), "", &mut || {
+            calls += 1;
+            "dup".to_string()
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, 9);
+    }
+
+    #[test]
+    fn env_file_reports_unwritable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let err = EnvFile::write_unique(&missing, "", &mut || "x".to_string()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    fn quick_start_config(name: &str, env_vars: Vec<(String, String)>) -> ContainerConfig {
+        ContainerConfig {
+            container_name: name.to_string(),
+            env_vars,
+            startup_timeout: Duration::from_millis(1),
+            additional_args: vec!["--network=n".to_string()],
+            ..ContainerConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_container_passes_env_through_a_private_file() {
+        let fake = crate::test_support::FakePodman::install(None);
+        let config = quick_start_config(
+            "nanna-env-start-test",
+            vec![("DATABASE_URL".to_string(), ENV_SENTINEL.to_string())],
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let handle = rt.block_on(start_container_with_fallback(&config)).unwrap();
+        assert_eq!(handle.name, "nanna-env-start-test");
+        assert_eq!(handle.runtime, ContainerRuntime::Podman);
+        assert!(handle.needs_cleanup);
+        let calls = fake.calls();
+        let run = calls
+            .iter()
+            .find(|c| c.starts_with("run -d --name nanna-env-start-test"))
+            .expect("run call recorded");
+        assert!(run.contains("--env-file"));
+        assert!(run.contains("--network=n"));
+        assert!(!run.contains(ENV_SENTINEL));
+        assert_eq!(
+            fake.env_file_contents(),
+            vec![format!("DATABASE_URL={ENV_SENTINEL}")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_container_reports_unwritable_env_vars() {
+        let _fake = crate::test_support::FakePodman::install(None);
+        let config = quick_start_config(
+            "nanna-env-bad-test",
+            vec![("BAD=KEY".to_string(), "v".to_string())],
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(start_container_with_fallback(&config))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ContainerError::ContainerStartFailed { ref name, ref reason }
+                    if name == "nanna-env-bad-test" && reason.contains("could not write container env file")
+            ),
+            "{err}"
+        );
     }
 }

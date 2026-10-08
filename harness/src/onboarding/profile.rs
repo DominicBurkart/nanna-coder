@@ -64,6 +64,9 @@ pub struct ProjectProfile {
     pub tools: Vec<ToolSpec>,
     pub nix_packages: Vec<String>,
     pub rust_version: Option<String>,
+    /// Extra rustup targets compiled into the toolchain, e.g.
+    /// `wasm32-unknown-unknown` for a trunk-built frontend.
+    pub rust_targets: Vec<String>,
     pub extra_env_vars: Vec<(String, String)>,
 }
 
