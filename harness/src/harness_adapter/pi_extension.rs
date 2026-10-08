@@ -1,4 +1,4 @@
-import { connect } from "node:net";
+pub(super) const SOURCE: &str = r##"import { connect } from "node:net";
 import { readFileSync } from "node:fs";
 
 const SOCKET = process.env.NANNA_BROKER_SOCKET ?? "/nanna/broker.sock";
@@ -42,3 +42,4 @@ export default function (pi: any) {
     });
   }
 }
+"##;

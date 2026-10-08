@@ -63,6 +63,7 @@
 
 mod isolation;
 mod pi;
+mod pi_extension;
 #[cfg(test)]
 mod testing;
 
@@ -380,15 +381,13 @@ impl ResolvedAgent {
                 identity: identity.name().to_string(),
             });
         }
-        if let Some(spec) = scoped
-            .specs
-            .iter()
-            .find(|s| !identity.allows_tool(&s.name) || !identity.allows_effect(s.effect))
-        {
-            return Err(ResolveError::GrantWiderThanIdentity {
-                identity: identity.name().to_string(),
-                tool: spec.name.clone(),
-            });
+        for spec in &scoped.specs {
+            if !identity.allows_tool(&spec.name) || !identity.allows_effect(spec.effect) {
+                return Err(ResolveError::GrantWiderThanIdentity {
+                    identity: identity.name().to_string(),
+                    tool: spec.name.clone(),
+                });
+            }
         }
         Ok(Self {
             name: identity.name().to_string(),

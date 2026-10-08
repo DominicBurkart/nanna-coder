@@ -3,7 +3,7 @@
 
 use super::{LaunchPlan, PlanNetwork, ResolvedAgent};
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Where the broker socket appears inside the container. Fixed so that no
@@ -136,7 +136,7 @@ impl IsolationPolicy {
         }
         for mount in &plan.mounts {
             let is_broker = mount.host == agent.broker_socket
-                && mount.container == Path::new(BROKER_SOCKET_CONTAINER_PATH);
+                && mount.container.to_str() == Some(BROKER_SOCKET_CONTAINER_PATH);
             if !is_broker {
                 found.push(IsolationViolation::Mount {
                     host: mount.host.clone(),
@@ -179,10 +179,8 @@ impl IsolationPolicy {
 }
 
 fn path_is_contained(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|c| !matches!(c, Component::ParentDir))
+    let text = path.to_string_lossy();
+    text.starts_with('/') && !text.contains('\\') && text.split('/').all(|part| part != "..")
 }
 
 fn env_allowed(name: &str) -> bool {
@@ -425,7 +423,13 @@ max_concurrent = 1
 
     #[test]
     fn rejects_escaping_or_relative_file_paths() {
-        for path in ["relative/x", "/nanna/../etc/passwd"] {
+        for path in [
+            "relative/x",
+            "/nanna/../etc/passwd",
+            "C:\\nanna\\x",
+            "/nanna\\..\\x",
+            "\\\\host\\share",
+        ] {
             let mut plan = good_plan();
             plan.files[0].path = path.into();
             let result = IsolationPolicy::check(&plan, &agent());

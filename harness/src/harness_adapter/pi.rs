@@ -23,7 +23,6 @@ use std::path::PathBuf;
 
 const AGENT_DIR: &str = "/nanna/pi";
 const WORK_DIR: &str = "/nanna/work";
-const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
 const PROVIDER: &str = "nanna";
 const MAX_CAPABILITY_NAME: usize = 64;
 
@@ -111,7 +110,7 @@ impl HarnessAdapter for PiAdapter {
                 file("capabilities.json", capabilities),
                 PlanFile {
                     path: PathBuf::from(&extension_path),
-                    contents: EXTENSION_SOURCE.to_string(),
+                    contents: super::pi_extension::SOURCE.to_string(),
                 },
             ],
             argv: [
