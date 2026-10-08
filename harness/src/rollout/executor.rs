@@ -1756,149 +1756,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn operator_halt_during_a_step_is_not_overwritten_by_the_step_result() {
-        let rig = rig();
-        let log = RolloutLog::open(&rig.path).unwrap();
-        let health = Arc::new(HaltOnPoll {
-            log: log.clone(),
-            after: 1,
-            polls: std::sync::Mutex::new(0),
-        });
-        let executor = RolloutExecutor::new(
-            log.clone(),
-            rig.leases.clone(),
-            WindowSet::default(),
-            rig.clock.clone(),
-            rig.adapter.clone(),
-            health,
-        )
-        .with_config(RolloutConfig {
-            poll_interval: Duration::minutes(10),
-            lease_grace: Duration::hours(1),
-        });
-        let record = executor.start(plan("sandbox"), V2).await.unwrap();
-        let outcome = executor.run(&record.id).await.unwrap();
-        assert_eq!(outcome.state, RolloutState::Halted);
-        let history = log.history(&record.id).unwrap();
-        let last = history.last().unwrap();
-        assert_eq!(last.record.state, RolloutState::Halted);
-        assert!(
-            history
-                .iter()
-                .skip_while(|t| t.record.state != RolloutState::Halted)
-                .all(|t| t.record.state == RolloutState::Halted),
-            "nothing may follow the halt: {history:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_halt_at_the_health_poll_stops_the_adapter_from_receiving_set_traffic() {
-        let rig = rig();
-        let log = RolloutLog::open(&rig.path).unwrap();
-        let health = Arc::new(HaltOnPoll {
-            log: log.clone(),
-            after: 1,
-            polls: std::sync::Mutex::new(0),
-        });
-        let executor = RolloutExecutor::new(
-            log.clone(),
-            rig.leases.clone(),
-            WindowSet::default(),
-            rig.clock.clone(),
-            rig.adapter.clone(),
-            health,
-        )
-        .with_config(RolloutConfig {
-            poll_interval: Duration::minutes(10),
-            lease_grace: Duration::hours(1),
-        });
-        let record = executor.start(plan("sandbox"), V2).await.unwrap();
-        let outcome = executor.run(&record.id).await.unwrap();
-        assert_eq!(outcome.state, RolloutState::Halted);
-        let calls = rig.adapter.calls();
-        assert!(
-            !calls
-                .iter()
-                .any(|c| matches!(c, AdapterCall::SetTraffic(..))),
-            "no traffic may move after a halt: {calls:?}"
-        );
-        assert_eq!(rig.adapter.traffic(&Slot::new("slot-1")), Some(0));
-    }
-
-    struct HaltAndRollForwardOnPoll {
-        log: RolloutLog,
-        polls: std::sync::Mutex<usize>,
-    }
-
-    #[async_trait]
-    impl HealthSource for HaltAndRollForwardOnPoll {
-        async fn sample(
-            &self,
-            _slot: &Slot,
-            _window: Duration,
-        ) -> Result<HealthSample, HealthError> {
-            let mut polls = self.polls.lock().unwrap();
-            *polls += 1;
-            if *polls == 1 {
-                let record = self.log.latest().unwrap().into_values().next().unwrap();
-                let mut halted = record.clone();
-                halted
-                    .transition(RolloutState::Halted, record.updated_at)
-                    .unwrap();
-                self.log.append(Some(&record.state), &mut halted).unwrap();
-                let mut forward = halted.clone();
-                forward
-                    .transition(RolloutState::Step(0), record.updated_at)
-                    .unwrap();
-                forward.image = V3.to_string();
-                forward.slot = None;
-                forward.traffic_percent = 0;
-                self.log.append(Some(&halted.state), &mut forward).unwrap();
-            }
-            Ok(HealthSample::healthy(&["/health/v1".to_string()]))
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stale_executor_cannot_drive_the_old_image_after_halt_and_roll_forward() {
-        let rig = rig();
-        let log = RolloutLog::open(&rig.path).unwrap();
-        let health = Arc::new(HaltAndRollForwardOnPoll {
-            log: log.clone(),
-            polls: std::sync::Mutex::new(0),
-        });
-        let executor = RolloutExecutor::new(
-            log.clone(),
-            rig.leases.clone(),
-            WindowSet::default(),
-            rig.clock.clone(),
-            rig.adapter.clone(),
-            health,
-        )
-        .with_config(RolloutConfig {
-            poll_interval: Duration::minutes(10),
-            lease_grace: Duration::hours(1),
-        });
-        let record = executor.start(plan("sandbox"), V2).await.unwrap();
-        let _ = executor.run(&record.id).await;
-        let history = log.history(&record.id).unwrap();
-        assert!(
-            history
-                .iter()
-                .skip_while(|t| t.record.image != V3)
-                .all(|t| t.record.image == V3),
-            "the stale executor wrote the old image after the roll-forward: {history:?}"
-        );
-        assert!(
-            !rig.adapter.calls().iter().any(
-                |c| matches!(c, AdapterCall::SetTraffic(slot, _) if *slot == Slot::new("slot-1"))
-            ),
-            "{:?}",
-            rig.adapter.calls()
-        );
-    }
-
     struct HaltOnSleep {
         inner: Arc<SimulatedClock>,
         log: RolloutLog,
@@ -3435,133 +3292,372 @@ mod tests {
             .unwrap()
     }
 
-    fn halt_now(log: &RolloutLog) {
-        let id = log.latest().unwrap().into_keys().next().unwrap();
-        log.halt(&id, t0()).unwrap();
+    fn without_holds(mut plan: DeployPlan) -> DeployPlan {
+        for step in &mut plan.steps {
+            step.min_duration = Duration::zero();
+        }
+        plan
     }
 
-    struct HaltAfterCall {
-        inner: Arc<FakeAdapter>,
-        log: RolloutLog,
-        trigger: AdapterCall,
-        fired: std::sync::atomic::AtomicBool,
+    #[derive(Debug, Clone)]
+    enum Observed {
+        Audit,
+        ActionReview,
+        Effect(AdapterCall),
+        HealthPoll,
+        Clock(DateTime<Utc>),
     }
 
-    impl HaltAfterCall {
-        fn after(&self) {
-            let last = self.inner.calls().last().cloned();
-            if last.as_ref() == Some(&self.trigger)
-                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                halt_now(&self.log);
+    #[derive(Debug, Clone)]
+    enum HaltPoint {
+        DuringAudit(usize),
+        DuringIncidentActionReview,
+        AfterEffect(AdapterCall),
+        AfterEffectWhileRollingBack(AdapterCall),
+        DuringStepHealthCheck(usize),
+        DuringBakePoll(usize),
+        WhenBakeCompletes(usize),
+    }
+
+    impl HaltPoint {
+        fn reached(&self, observed: &Observed, record: &RolloutRecord) -> bool {
+            match (self, observed) {
+                (Self::DuringAudit(n), Observed::Audit)
+                | (Self::DuringStepHealthCheck(n), Observed::HealthPoll) => {
+                    record.state == RolloutState::Step(*n)
+                }
+                (Self::DuringIncidentActionReview, Observed::ActionReview) => {
+                    matches!(record.state, RolloutState::Baking { .. })
+                }
+                (Self::AfterEffect(call), Observed::Effect(seen)) => call == seen,
+                (Self::AfterEffectWhileRollingBack(call), Observed::Effect(seen)) => {
+                    call == seen && record.state == RolloutState::RollingBack
+                }
+                (Self::DuringBakePoll(n), Observed::HealthPoll) => {
+                    matches!(record.state, RolloutState::Baking { step, .. } if step == *n)
+                }
+                (Self::WhenBakeCompletes(n), Observed::Clock(now)) => {
+                    matches!(
+                        record.state,
+                        RolloutState::Baking { step, since }
+                            if step == *n && *now >= since + record.plan.steps[*n].bake_time
+                    )
+                }
+                _ => false,
             }
         }
     }
 
+    struct Injection {
+        log: RolloutLog,
+        point: Option<HaltPoint>,
+        roll_forward: bool,
+        fired: std::sync::atomic::AtomicBool,
+        after_halt: std::sync::Mutex<Vec<AdapterCall>>,
+    }
+
+    impl Injection {
+        fn current(&self) -> Option<RolloutRecord> {
+            self.log.latest().unwrap().into_values().next()
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn observe(&self, observed: Observed) {
+            let Some(point) = &self.point else { return };
+            let Some(record) = self.current() else { return };
+            if self.fired() || !point.reached(&observed, &record) {
+                return;
+            }
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            let halted = self.log.halt(&record.id, t0()).unwrap();
+            if self.roll_forward {
+                let mut forward = halted.clone();
+                forward.transition(RolloutState::Step(0), t0()).unwrap();
+                forward.image = V3.to_string();
+                forward.slot = None;
+                forward.traffic_percent = 0;
+                self.log
+                    .append(Some(&RolloutState::Halted), &mut forward)
+                    .unwrap();
+            }
+        }
+
+        fn effect(&self, call: AdapterCall) {
+            if self.fired() {
+                self.after_halt.lock().unwrap().push(call.clone());
+            }
+            self.observe(Observed::Effect(call));
+        }
+    }
+
+    struct InjectedClock {
+        inner: Arc<SimulatedClock>,
+        injection: Arc<Injection>,
+    }
+
+    impl Clock for InjectedClock {
+        fn now(&self) -> DateTime<Utc> {
+            let now = self.inner.now();
+            self.injection.observe(Observed::Clock(now));
+            now
+        }
+
+        fn sleep(&self, duration: Duration) -> crate::leases::SleepFuture<'_> {
+            self.inner.sleep(duration)
+        }
+    }
+
+    struct InjectedAudit {
+        injection: Arc<Injection>,
+    }
+
     #[async_trait]
-    impl TargetAdapter for HaltAfterCall {
-        async fn deploy_inactive(
+    impl AuditHook for InjectedAudit {
+        async fn review_step(
             &self,
-            image: &str,
-        ) -> Result<Slot, crate::rollout::adapter::AdapterError> {
+            _record: &RolloutRecord,
+            _step: &DeployStep,
+        ) -> Result<(), crate::rollout::hooks::AuditDenied> {
+            self.injection.observe(Observed::Audit);
+            Ok(())
+        }
+
+        async fn review_action(
+            &self,
+            _incident: &Incident,
+            _action: &ProposedAction,
+        ) -> Result<(), crate::rollout::hooks::AuditDenied> {
+            self.injection.observe(Observed::ActionReview);
+            Ok(())
+        }
+    }
+
+    struct InjectedHealth {
+        inner: Arc<FakeHealthSource>,
+        injection: Arc<Injection>,
+        breach_in_bake_of: Option<usize>,
+    }
+
+    #[async_trait]
+    impl HealthSource for InjectedHealth {
+        async fn sample(&self, slot: &Slot, window: Duration) -> Result<HealthSample, HealthError> {
+            self.injection.observe(Observed::HealthPoll);
+            let breaching = match (self.breach_in_bake_of, self.injection.current()) {
+                (Some(n), Some(record)) => {
+                    matches!(record.state, RolloutState::Baking { step, .. } if step == n)
+                }
+                _ => false,
+            };
+            if breaching {
+                return Ok(breach_sample());
+            }
+            self.inner.sample(slot, window).await
+        }
+    }
+
+    struct InjectedAdapter {
+        inner: Arc<FakeAdapter>,
+        injection: Arc<Injection>,
+    }
+
+    type AdapterResult<T> = Result<T, crate::rollout::adapter::AdapterError>;
+
+    #[async_trait]
+    impl TargetAdapter for InjectedAdapter {
+        async fn deploy_inactive(&self, image: &str) -> AdapterResult<Slot> {
             let out = self.inner.deploy_inactive(image).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::DeployInactive(image.to_string()));
             out
         }
-        async fn set_traffic(
-            &self,
-            slot: &Slot,
-            percent: u8,
-        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+        async fn set_traffic(&self, slot: &Slot, percent: u8) -> AdapterResult<()> {
             let out = self.inner.set_traffic(slot, percent).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::SetTraffic(slot.clone(), percent));
             out
         }
-        async fn current_image(&self) -> Result<String, crate::rollout::adapter::AdapterError> {
-            let out = self.inner.current_image().await;
-            self.after();
-            out
+        async fn current_image(&self) -> AdapterResult<String> {
+            self.inner.current_image().await
         }
-        async fn rollback_to(
-            &self,
-            image: &str,
-        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+        async fn rollback_to(&self, image: &str) -> AdapterResult<()> {
             let out = self.inner.rollback_to(image).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::RollbackTo(image.to_string()));
             out
         }
-        async fn retire(&self, slot: &Slot) -> Result<(), crate::rollout::adapter::AdapterError> {
+        async fn retire(&self, slot: &Slot) -> AdapterResult<()> {
             let out = self.inner.retire(slot).await;
-            self.after();
+            self.injection.effect(AdapterCall::Retire(slot.clone()));
             out
         }
-        async fn mirror(
-            &self,
-            slot: &Slot,
-            percent: u8,
-        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+        async fn mirror(&self, slot: &Slot, percent: u8) -> AdapterResult<()> {
             let out = self.inner.mirror(slot, percent).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::Mirror(slot.clone(), percent));
             out
         }
-        async fn swap(
-            &self,
-        ) -> Result<crate::rollout::adapter::Swapped, crate::rollout::adapter::AdapterError>
-        {
+        async fn swap(&self) -> AdapterResult<crate::rollout::adapter::Swapped> {
             let out = self.inner.swap().await;
-            self.after();
+            self.injection.effect(AdapterCall::Swap);
             out
         }
         async fn set_fallback(
             &self,
             slot: &Slot,
             policy: &FallbackPolicy,
-        ) -> Result<FallbackSupport, crate::rollout::adapter::AdapterError> {
+        ) -> AdapterResult<FallbackSupport> {
             let out = self.inner.set_fallback(slot, policy).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::SetFallback(slot.clone(), policy.clone()));
             out
         }
-        async fn clear_fallback(
-            &self,
-            slot: &Slot,
-        ) -> Result<(), crate::rollout::adapter::AdapterError> {
+        async fn clear_fallback(&self, slot: &Slot) -> AdapterResult<()> {
             let out = self.inner.clear_fallback(slot).await;
-            self.after();
+            self.injection
+                .effect(AdapterCall::ClearFallback(slot.clone()));
             out
         }
     }
 
-    fn executor_halting_after(rig: &Rig, trigger: AdapterCall) -> RolloutExecutor {
+    fn injected_executor(
+        rig: &Rig,
+        point: Option<HaltPoint>,
+        roll_forward: bool,
+        breach_in_bake_of: Option<usize>,
+    ) -> (RolloutExecutor, Arc<Injection>) {
         let log = RolloutLog::open(&rig.path).unwrap();
-        let adapter = Arc::new(HaltAfterCall {
-            inner: rig.adapter.clone(),
+        let injection = Arc::new(Injection {
             log: log.clone(),
-            trigger,
+            point,
+            roll_forward,
             fired: std::sync::atomic::AtomicBool::new(false),
+            after_halt: std::sync::Mutex::new(Vec::new()),
         });
-        RolloutExecutor::new(
+        let executor = RolloutExecutor::new(
             log,
             rig.leases.clone(),
             WindowSet::default(),
-            rig.clock.clone(),
-            adapter,
-            rig.health.clone(),
+            Arc::new(InjectedClock {
+                inner: rig.clock.clone(),
+                injection: injection.clone(),
+            }),
+            Arc::new(InjectedAdapter {
+                inner: rig.adapter.clone(),
+                injection: injection.clone(),
+            }),
+            Arc::new(InjectedHealth {
+                inner: rig.health.clone(),
+                injection: injection.clone(),
+                breach_in_bake_of,
+            }),
         )
         .with_shadow_source(rig.shadow.clone())
-        .with_config(one_poll_per_step())
+        .with_audit(Arc::new(InjectedAudit {
+            injection: injection.clone(),
+        }))
+        .with_incident_responder(Arc::new(IncidentResponder::new(
+            IncidentIdentity::incident_responder(),
+        )))
+        .with_config(one_poll_per_step());
+        (executor, injection)
     }
 
-    async fn stale_record(rig: &Rig, plan: DeployPlan) -> RolloutRecord {
-        let record = rig.executor.start(plan, V2).await.unwrap();
-        rig.executor.halt(&record.id).unwrap();
-        record
+    struct Play {
+        plan: DeployPlan,
+        breach_in_bake_of: Option<usize>,
+        point: Option<HaltPoint>,
+        roll_forward: bool,
     }
 
-    fn assert_conflict<T: std::fmt::Debug>(outcome: Result<T, RolloutError>) {
-        assert!(
-            matches!(outcome, Err(RolloutError::Conflict { .. })),
-            "{outcome:?}"
-        );
+    struct Played {
+        rig: Rig,
+        finished: RolloutRecord,
+        history: Vec<super::super::log::RolloutTransition>,
+        injection: Arc<Injection>,
+    }
+
+    impl Play {
+        fn of(plan: DeployPlan) -> Self {
+            Self {
+                plan,
+                breach_in_bake_of: None,
+                point: None,
+                roll_forward: false,
+            }
+        }
+
+        fn breaching_in_the_bake_of(mut self, step: usize) -> Self {
+            self.breach_in_bake_of = Some(step);
+            self
+        }
+
+        fn halted_at(mut self, point: HaltPoint) -> Self {
+            self.point = Some(point);
+            self
+        }
+
+        fn then_rolled_forward(mut self) -> Self {
+            self.roll_forward = true;
+            self
+        }
+
+        async fn run(self) -> Played {
+            let rig = rig();
+            let (executor, injection) =
+                injected_executor(&rig, self.point, self.roll_forward, self.breach_in_bake_of);
+            let record = executor.start(self.plan, V2).await.unwrap();
+            let finished = run_simulated(&executor, &rig.clock, &record.id)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let history = executor.log().history(&record.id).unwrap();
+            Played {
+                rig,
+                finished,
+                history,
+                injection,
+            }
+        }
+    }
+
+    impl Played {
+        fn effects(&self) -> Vec<AdapterCall> {
+            effects(&self.rig)
+        }
+
+        fn assert_the_halt_landed(&self) {
+            assert!(
+                self.injection.fired(),
+                "the halt was never injected: its point was not reached, so this run proves nothing; effects: {:?}",
+                self.effects()
+            );
+        }
+
+        fn assert_nothing_followed_the_halt(&self) {
+            self.assert_the_halt_landed();
+            assert_eq!(self.finished.state, RolloutState::Halted);
+            assert_eq!(
+                *self.injection.after_halt.lock().unwrap(),
+                vec![],
+                "adapter effects reached the target after the halt"
+            );
+        }
+
+        fn assert_it_withheld(&self, undisturbed: &Played, withheld: AdapterCall) {
+            self.assert_nothing_followed_the_halt();
+            assert_ne!(undisturbed.finished.state, RolloutState::Halted);
+            let performed = self.effects();
+            assert_eq!(
+                undisturbed.effects().get(performed.len()),
+                Some(&withheld),
+                "the undisturbed run does not perform {withheld:?} right after {performed:?}"
+            );
+            assert!(undisturbed.effects().starts_with(&performed));
+        }
     }
 
     fn effects(rig: &Rig) -> Vec<AdapterCall> {
@@ -3572,131 +3668,155 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn a_halt_before_the_deploy_stops_deploy_inactive() {
-        let rig = rig();
-        let record = stale_record(&rig, plan("sandbox")).await;
-        assert_conflict(rig.executor.step(record, 0).await);
-        assert_eq!(effects(&rig), vec![]);
+    fn candidate() -> Slot {
+        Slot::new("slot-1")
+    }
+
+    fn previous() -> Slot {
+        Slot::new("slot-0")
+    }
+
+    async fn withheld_by_a_halt(
+        plan: DeployPlan,
+        point: HaltPoint,
+        withheld: AdapterCall,
+    ) -> Played {
+        let undisturbed = Play::of(plan.clone()).run().await;
+        let halted = Play::of(plan).halted_at(point).run().await;
+        halted.assert_it_withheld(&undisturbed, withheld);
+        halted
+    }
+
+    async fn rollback_withheld_by_a_halt(point: HaltPoint, withheld: AdapterCall) -> Played {
+        let rolled_back = Play::of(blue_green_plan())
+            .breaching_in_the_bake_of(0)
+            .run()
+            .await;
+        assert_eq!(rolled_back.finished.state, RolloutState::RolledBack);
+        let halted = Play::of(blue_green_plan())
+            .breaching_in_the_bake_of(0)
+            .halted_at(point)
+            .run()
+            .await;
+        halted.assert_it_withheld(&rolled_back, withheld);
+        halted
     }
 
     #[tokio::test]
-    async fn a_halt_before_the_fallback_stops_set_fallback() {
-        let rig = rig();
-        let mut record = stale_record(&rig, plan("sandbox")).await;
-        record.slot = Some(Slot::new("slot-1"));
-        assert_conflict(rig.executor.step(record, 0).await);
-        assert_eq!(effects(&rig), vec![]);
+    async fn a_halt_while_the_auditor_reviews_the_first_step_stops_deploy_inactive() {
+        withheld_by_a_halt(
+            plan("sandbox"),
+            HaltPoint::DuringAudit(0),
+            AdapterCall::DeployInactive(V2.into()),
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn a_halt_before_the_mirror_stops_the_shadow_step() {
-        let rig = rig();
-        let mut record = stale_record(&rig, shadow_plan()).await;
-        record.slot = Some(Slot::new("slot-1"));
-        record.fallback = Some(FallbackSupport::Native);
-        assert_conflict(rig.executor.step(record, 0).await);
-        assert_eq!(effects(&rig), vec![]);
+    async fn a_halt_after_the_deploy_stops_set_fallback() {
+        withheld_by_a_halt(
+            plan("sandbox"),
+            HaltPoint::AfterEffect(AdapterCall::DeployInactive(V2.into())),
+            AdapterCall::SetFallback(candidate(), FallbackPolicy::default()),
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn a_halt_before_the_swap_stops_the_swap() {
-        let rig = rig();
-        let mut record = stale_record(&rig, blue_green_plan()).await;
-        record.state = RolloutState::Step(0);
-        record.slot = Some(Slot::new("slot-1"));
-        record.fallback = Some(FallbackSupport::Native);
-        assert_conflict(rig.executor.step(record, 0).await);
-        assert_eq!(effects(&rig), vec![]);
-    }
-
-    fn retire_ready(mut record: RolloutRecord) -> RolloutRecord {
-        record.slot = Some(Slot::new("slot-1"));
-        record.fallback = Some(FallbackSupport::Native);
-        record.retained_slot = Some(Slot::new("slot-0"));
-        record.retained_since = Some(t0() - Duration::days(3));
-        record
+    async fn a_halt_during_the_health_check_before_a_traffic_step_stops_set_traffic() {
+        let halted = withheld_by_a_halt(
+            plan("sandbox"),
+            HaltPoint::DuringStepHealthCheck(0),
+            AdapterCall::SetTraffic(candidate(), 10),
+        )
+        .await;
+        assert_eq!(halted.rig.adapter.traffic(&candidate()), Some(0));
     }
 
     #[tokio::test]
-    async fn a_halt_before_the_retired_slots_fallback_is_cleared_stops_clear_fallback() {
-        let rig = rig();
-        let record = retire_ready(stale_record(&rig, blue_green_plan()).await);
-        assert_conflict(rig.executor.step(record, 1).await);
-        assert_eq!(effects(&rig), vec![]);
+    async fn a_halt_during_the_health_check_before_a_shadow_step_stops_the_mirror() {
+        withheld_by_a_halt(
+            shadow_plan(),
+            HaltPoint::DuringStepHealthCheck(0),
+            AdapterCall::Mirror(candidate(), 15),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_during_the_health_check_before_a_swap_stops_the_swap() {
+        withheld_by_a_halt(
+            blue_green_plan(),
+            HaltPoint::DuringStepHealthCheck(0),
+            AdapterCall::Swap,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_during_the_health_check_before_a_retire_stops_clearing_the_retired_fallback() {
+        withheld_by_a_halt(
+            blue_green_plan(),
+            HaltPoint::DuringStepHealthCheck(1),
+            AdapterCall::ClearFallback(previous()),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn a_halt_after_the_retired_slots_fallback_is_cleared_stops_retire() {
+        withheld_by_a_halt(
+            blue_green_plan(),
+            HaltPoint::AfterEffect(AdapterCall::ClearFallback(previous())),
+            AdapterCall::Retire(previous()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_when_the_final_bake_completes_stops_the_final_clear_fallback() {
+        let plan = without_holds(plan("sandbox"));
+        let last = plan.steps.len() - 1;
+        withheld_by_a_halt(
+            plan,
+            HaltPoint::WhenBakeCompletes(last),
+            AdapterCall::ClearFallback(candidate()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_when_a_shadow_bake_completes_stops_the_mirror_reset() {
+        withheld_by_a_halt(
+            without_holds(shadow_plan()),
+            HaltPoint::WhenBakeCompletes(0),
+            AdapterCall::Mirror(candidate(), 0),
+        )
+        .await;
+    }
+
+    async fn stale_rollback(halt_first: bool) -> (Result<(), RolloutError>, Vec<AdapterCall>) {
         let rig = rig();
         let record = rig.executor.start(blue_green_plan(), V2).await.unwrap();
-        let record = retire_ready(record);
-        let executor = executor_halting_after(
-            &rig,
-            AdapterCall::ClearFallback(record.retained_slot.clone().unwrap()),
-        );
-        assert_conflict(executor.step(record, 1).await);
-        let calls = effects(&rig);
-        assert_eq!(calls, vec![AdapterCall::ClearFallback(Slot::new("slot-0"))]);
-    }
-
-    #[tokio::test]
-    async fn a_halt_before_the_final_clear_fallback_stops_completion() {
-        let rig = rig();
-        let mut record = stale_record(&rig, plan("sandbox")).await;
-        record.slot = Some(Slot::new("slot-1"));
-        let last = record.plan.steps.len() - 1;
-        assert_conflict(rig.executor.advance_or_complete(record, last).await);
-        assert_eq!(effects(&rig), vec![]);
-    }
-
-    struct HaltOnNthNow {
-        inner: Arc<SimulatedClock>,
-        log: RolloutLog,
-        nth: usize,
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl Clock for HaltOnNthNow {
-        fn now(&self) -> DateTime<Utc> {
-            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if n == self.nth {
-                halt_now(&self.log);
-            }
-            self.inner.now()
+        let slot = rig.adapter.deploy_inactive(V2).await.unwrap();
+        rig.adapter
+            .set_fallback(&slot, &FallbackPolicy::default())
+            .await
+            .unwrap();
+        let setup = effects(&rig).len();
+        overwrite(&rig, &rolling_back(retire_ready(record.clone())));
+        let read_by_the_executor = rig.executor.log().load(&record.id).unwrap();
+        if halt_first {
+            rig.executor.halt(&record.id).unwrap();
         }
-
-        fn sleep(&self, duration: Duration) -> crate::leases::SleepFuture<'_> {
-            self.inner.sleep(duration)
+        let outcome = rig.executor.roll_back(read_by_the_executor).await;
+        if halt_first {
+            assert_eq!(
+                rig.executor.log().load(&record.id).unwrap().state,
+                RolloutState::Halted
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn a_halt_at_the_end_of_a_shadow_bake_stops_the_mirror_reset() {
-        let rig = rig();
-        let record = rig.executor.start(shadow_plan(), V2).await.unwrap();
-        let log = RolloutLog::open(&rig.path).unwrap();
-        let clock = Arc::new(HaltOnNthNow {
-            inner: rig.clock.clone(),
-            log: log.clone(),
-            nth: 3,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let executor = RolloutExecutor::new(
-            log,
-            rig.leases.clone(),
-            WindowSet::default(),
-            clock,
-            rig.adapter.clone(),
-            rig.health.clone(),
-        )
-        .with_shadow_source(rig.shadow.clone())
-        .with_config(one_poll_per_step());
-        let mut record = record;
-        record.slot = Some(Slot::new("slot-1"));
-        record.plan.steps[0].min_duration = Duration::zero();
-        assert_conflict(executor.bake(record, 0, t0()).await);
-        assert_eq!(effects(&rig), vec![]);
+        (outcome, effects(&rig).split_off(setup))
     }
 
     fn rolling_back(record: RolloutRecord) -> RolloutRecord {
@@ -3705,93 +3825,176 @@ mod tests {
         record
     }
 
-    #[tokio::test]
-    async fn a_halt_before_a_rollback_stops_restoring_the_retained_slot() {
-        let rig = rig();
-        let record = rolling_back(stale_record(&rig, blue_green_plan()).await);
-        assert_conflict(rig.executor.roll_back(record).await);
-        assert_eq!(effects(&rig), vec![]);
+    fn retire_ready(mut record: RolloutRecord) -> RolloutRecord {
+        record.slot = Some(candidate());
+        record.fallback = Some(FallbackSupport::Native);
+        record.retained_slot = Some(previous());
+        record.retained_since = Some(t0() - Duration::days(3));
+        record
     }
 
-    async fn rollback_halted_after(trigger: AdapterCall) -> Vec<AdapterCall> {
-        let rig = rig();
-        let slot = rig.adapter.deploy_inactive(V2).await.unwrap();
-        rig.adapter
-            .set_fallback(&slot, &FallbackPolicy::default())
-            .await
-            .unwrap();
-        let record = rig.executor.start(blue_green_plan(), V2).await.unwrap();
-        let record = rolling_back(record);
-        let executor = executor_halting_after(&rig, trigger);
-        assert_conflict(executor.roll_back(record).await);
-        effects(&rig)[2..].to_vec()
+    #[tokio::test]
+    async fn a_halt_after_a_rollback_was_read_stops_restoring_the_retained_slot() {
+        let (undisturbed, performed) = stale_rollback(false).await;
+        undisturbed.unwrap();
+        assert_eq!(
+            performed.first(),
+            Some(&AdapterCall::SetTraffic(previous(), 100))
+        );
+        let (outcome, withheld) = stale_rollback(true).await;
+        assert!(
+            matches!(outcome, Err(RolloutError::Conflict { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(withheld, vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_restoring_the_retained_slot_stops_draining_the_candidate() {
+        rollback_withheld_by_a_halt(
+            HaltPoint::AfterEffectWhileRollingBack(AdapterCall::SetTraffic(previous(), 100)),
+            AdapterCall::SetTraffic(candidate(), 0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_draining_the_candidate_stops_the_mirror_reset_in_a_rollback() {
+        rollback_withheld_by_a_halt(
+            HaltPoint::AfterEffectWhileRollingBack(AdapterCall::SetTraffic(candidate(), 0)),
+            AdapterCall::Mirror(candidate(), 0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_the_mirror_reset_stops_clear_fallback_in_a_rollback() {
+        rollback_withheld_by_a_halt(
+            HaltPoint::AfterEffectWhileRollingBack(AdapterCall::Mirror(candidate(), 0)),
+            AdapterCall::ClearFallback(candidate()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_after_clearing_the_candidates_fallback_stops_rollback_to() {
+        rollback_withheld_by_a_halt(
+            HaltPoint::AfterEffectWhileRollingBack(AdapterCall::ClearFallback(candidate())),
+            AdapterCall::RollbackTo(V1.into()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_halt_while_the_auditor_reviews_an_incident_rollback_stops_the_rollback() {
+        let plan = plan_with("[rollback]\nautomatic = true\non_breach = \"halt-and-escalate\"\n");
+        let rolled_back = Play::of(plan.clone())
+            .breaching_in_the_bake_of(0)
+            .run()
+            .await;
+        assert_eq!(rolled_back.finished.state, RolloutState::RolledBack);
+        let halted = Play::of(plan)
+            .breaching_in_the_bake_of(0)
+            .halted_at(HaltPoint::DuringIncidentActionReview)
+            .run()
+            .await;
+        halted.assert_it_withheld(&rolled_back, AdapterCall::SetTraffic(candidate(), 0));
     }
 
     #[tokio::test]
     async fn a_halt_during_a_resumed_rollback_ends_the_run_halted_without_a_human_stop() {
         let rig = rig();
-        let record = rig.executor.start(plan("sandbox"), V2).await.unwrap();
+        let (executor, injection) = injected_executor(
+            &rig,
+            Some(HaltPoint::AfterEffectWhileRollingBack(
+                AdapterCall::SetTraffic(candidate(), 0),
+            )),
+            false,
+            None,
+        );
+        let record = executor.start(plan("sandbox"), V2).await.unwrap();
         let slot = rig.adapter.deploy_inactive(V2).await.unwrap();
         let mut crafted = record.clone();
         crafted.state = RolloutState::RollingBack;
-        crafted.slot = Some(slot.clone());
-        rig.executor
-            .log()
-            .append(Some(&record.state), &mut crafted)
-            .unwrap();
-        let executor = executor_halting_after(&rig, AdapterCall::SetTraffic(slot, 0));
+        crafted.slot = Some(slot);
+        overwrite(&rig, &crafted);
         let finished = executor.run(&record.id).await.unwrap();
+        assert!(injection.fired());
         assert_eq!(finished.state, RolloutState::Halted);
         assert!(!effects(&rig)
             .iter()
             .any(|c| matches!(c, AdapterCall::RollbackTo(_))));
+        assert!(rig.escalation.escalations().is_empty());
     }
 
     #[tokio::test]
-    async fn a_halt_after_restoring_the_retained_slot_stops_draining_the_candidate() {
-        let old = Slot::new("slot-0");
-        assert_eq!(
-            rollback_halted_after(AdapterCall::SetTraffic(old.clone(), 100)).await,
-            vec![AdapterCall::SetTraffic(old, 100)]
+    async fn a_halt_during_a_bake_poll_is_never_overwritten_by_the_step_result() {
+        let played = Play::of(plan("sandbox"))
+            .halted_at(HaltPoint::DuringBakePoll(0))
+            .run()
+            .await;
+        played.assert_nothing_followed_the_halt();
+        assert!(
+            played
+                .history
+                .iter()
+                .skip_while(|t| t.record.state != RolloutState::Halted)
+                .all(|t| t.record.state == RolloutState::Halted),
+            "nothing may follow the halt: {:?}",
+            played.history
         );
     }
 
     #[tokio::test]
-    async fn a_halt_after_draining_the_candidate_stops_the_mirror_reset() {
-        let slot = Slot::new("slot-1");
-        assert_eq!(
-            rollback_halted_after(AdapterCall::SetTraffic(slot.clone(), 0)).await,
-            vec![
-                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
-                AdapterCall::SetTraffic(slot, 0)
-            ]
+    async fn a_stale_executor_cannot_drive_the_old_image_after_halt_and_roll_forward() {
+        let played = Play::of(plan("sandbox"))
+            .halted_at(HaltPoint::DuringStepHealthCheck(0))
+            .then_rolled_forward()
+            .run()
+            .await;
+        played.assert_the_halt_landed();
+        assert!(
+            played
+                .history
+                .iter()
+                .skip_while(|t| t.record.image != V3)
+                .all(|t| t.record.image == V3),
+            "the stale executor wrote the old image after the roll-forward: {:?}",
+            played.history
         );
+        let old_slot_touched = |c: &AdapterCall| match c {
+            AdapterCall::SetTraffic(slot, _)
+            | AdapterCall::Mirror(slot, _)
+            | AdapterCall::ClearFallback(slot)
+            | AdapterCall::SetFallback(slot, _)
+            | AdapterCall::Retire(slot) => *slot == candidate(),
+            AdapterCall::DeployInactive(image) => image == V2,
+            _ => false,
+        };
+        assert!(
+            !played
+                .injection
+                .after_halt
+                .lock()
+                .unwrap()
+                .iter()
+                .any(old_slot_touched),
+            "{:?}",
+            played.injection.after_halt.lock().unwrap()
+        );
+        assert_eq!(played.finished.state, RolloutState::Complete);
+        assert_eq!(played.finished.image, V3);
     }
 
     #[tokio::test]
-    async fn a_halt_after_the_mirror_reset_stops_clear_fallback_in_a_rollback() {
-        let slot = Slot::new("slot-1");
-        assert_eq!(
-            rollback_halted_after(AdapterCall::Mirror(slot.clone(), 0)).await,
-            vec![
-                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
-                AdapterCall::SetTraffic(slot.clone(), 0),
-                AdapterCall::Mirror(slot, 0)
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_halt_after_clearing_the_candidates_fallback_stops_rollback_to() {
-        let slot = Slot::new("slot-1");
-        assert_eq!(
-            rollback_halted_after(AdapterCall::ClearFallback(slot.clone())).await,
-            vec![
-                AdapterCall::SetTraffic(Slot::new("slot-0"), 100),
-                AdapterCall::SetTraffic(slot.clone(), 0),
-                AdapterCall::Mirror(slot.clone(), 0),
-                AdapterCall::ClearFallback(slot)
-            ]
-        );
+    #[should_panic(expected = "the halt was never injected")]
+    async fn a_halt_point_that_is_never_reached_fails_the_test_instead_of_passing_vacuously() {
+        let played = Play::of(plan("sandbox"))
+            .halted_at(HaltPoint::AfterEffect(AdapterCall::Retire(Slot::new(
+                "slot-9",
+            ))))
+            .run()
+            .await;
+        played.assert_nothing_followed_the_halt();
     }
 }
