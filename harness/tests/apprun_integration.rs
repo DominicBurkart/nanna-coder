@@ -10,7 +10,7 @@
 
 use harness::apprun::{Limits, DEFAULT_PORT_RANGE};
 use harness::apprun::{PortAllocator, APP_LOGS_TOOL, APP_START_TOOL, APP_STOP_TOOL};
-use harness::container::{detect_runtime, ContainerRuntime};
+use harness::container::{detect_runtime, ensure_runtime_or_skip, ContainerRuntime};
 use harness::sidecar::{
     build_image_from_containerfile, container_exists, CommandRunner, RunOutput, SidecarError,
     SystemRunner,
@@ -127,10 +127,9 @@ fn build_dev_image(
 
 #[tokio::test]
 #[ignore]
-async fn app_start_serves_index_and_api_until_app_stop_and_cleanup() {
+async fn manual_app_start_serves_index_and_api_until_app_stop_and_cleanup() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "apprun") {
         return;
     }
     build_dev_image(&SystemRunner, &runtime).unwrap();

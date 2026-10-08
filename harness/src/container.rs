@@ -231,6 +231,52 @@ impl Drop for ContainerHandle {
     }
 }
 
+pub const REQUIRE_RUNTIME_ENV: &str = "NANNA_REQUIRE_RUNTIME";
+
+fn parse_require_runtime(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Whether `NANNA_REQUIRE_RUNTIME` demands that missing prerequisites fail
+/// runtime-dependent tests instead of skipping them.
+pub fn runtime_required() -> bool {
+    parse_require_runtime(std::env::var(REQUIRE_RUNTIME_ENV).ok().as_deref())
+}
+
+fn skip_or_panic_if(required: bool, reason: &str) {
+    if required {
+        panic!("NANNA_REQUIRE_RUNTIME is set but a prerequisite is missing: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// Skip a runtime-dependent test, or panic when `NANNA_REQUIRE_RUNTIME` is set.
+pub fn skip_or_panic(reason: &str) {
+    skip_or_panic_if(runtime_required(), reason);
+}
+
+/// Returns true when a container runtime is available. Otherwise skips the
+/// test (returns false), or panics when `NANNA_REQUIRE_RUNTIME` is set.
+pub fn ensure_runtime_or_skip(runtime: &ContainerRuntime, context: &str) -> bool {
+    gate_runtime(runtime.is_available(), runtime_required(), context)
+}
+
+fn gate_runtime(available: bool, required: bool, context: &str) -> bool {
+    if available {
+        return true;
+    }
+    skip_or_panic_if(
+        required,
+        &format!("no container runtime available for {context}"),
+    );
+    false
+}
+
 /// Detect available container runtime in order of preference
 pub fn detect_runtime() -> ContainerRuntime {
     // Try Podman first (often better for rootless containers)
@@ -331,56 +377,127 @@ pub fn load_image_from_path(
         let tag = json.get("tag").and_then(|v| v.as_str()).unwrap_or("latest");
         let image_ref = format!("{}:{}", name, tag);
 
-        let dest = match runtime {
-            ContainerRuntime::Podman => format!("containers-storage:{}", image_ref),
-            ContainerRuntime::Docker => format!("docker-daemon:{}", image_ref),
-            ContainerRuntime::None => return Err(ContainerError::NoRuntimeAvailable),
-        };
-
-        let output = Command::new("skopeo")
-            .args(["copy", &format!("nix:{}", real_path.display()), &dest])
-            .output()
-            .map_err(|e| ContainerError::ImageLoadFailed {
-                path: image_path.display().to_string(),
-                reason: format!("skopeo not available: {}", e),
-            })?;
-
-        if !output.status.success() {
-            return Err(ContainerError::ImageLoadFailed {
-                path: image_path.display().to_string(),
-                reason: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
+        if matches!(runtime, ContainerRuntime::Podman) {
+            let archive = TempArchive::new();
+            skopeo_copy(
+                image_path,
+                &real_path,
+                &format!("docker-archive:{}:{}", archive.path().display(), image_ref),
+            )?;
+            load_archive(runtime, archive.path(), image_path)?;
+        } else {
+            skopeo_copy(
+                image_path,
+                &real_path,
+                &format!("docker-daemon:{}", image_ref),
+            )?;
         }
-
         Ok(image_ref)
     } else {
-        let output = Command::new(runtime.command())
-            .args(["load", "-i"])
-            .arg(image_path)
-            .output()
-            .map_err(|e| ContainerError::ImageLoadFailed {
-                path: image_path.display().to_string(),
-                reason: e.to_string(),
-            })?;
-
-        if !output.status.success() {
-            return Err(ContainerError::ImageLoadFailed {
-                path: image_path.display().to_string(),
-                reason: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let image_ref = stdout
-            .lines()
-            .find(|l| l.contains("Loaded image"))
-            .and_then(|l| l.split(": ").last())
-            .unwrap_or("unknown:latest")
-            .trim()
-            .to_string();
-
-        Ok(image_ref)
+        load_archive(runtime, image_path, image_path)
     }
+}
+
+static TEMP_ARCHIVE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct TempArchive {
+    path: std::path::PathBuf,
+}
+
+impl TempArchive {
+    fn new() -> Self {
+        let id = TEMP_ARCHIVE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "nanna-image-{}-{}.tar",
+                std::process::id(),
+                id
+            )),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn skopeo_copy(
+    image_path: &Path,
+    nix_json: &Path,
+    destination: &str,
+) -> Result<(), ContainerError> {
+    skopeo_copy_with("skopeo", image_path, nix_json, destination)
+}
+
+fn skopeo_copy_with(
+    program: &str,
+    image_path: &Path,
+    nix_json: &Path,
+    destination: &str,
+) -> Result<(), ContainerError> {
+    let output = Command::new(program)
+        .args(["copy", &format!("nix:{}", nix_json.display()), destination])
+        .output()
+        .map_err(|e| ContainerError::ImageLoadFailed {
+            path: image_path.display().to_string(),
+            reason: format!("skopeo not available: {}", e),
+        })?;
+
+    if !output.status.success() {
+        return Err(ContainerError::ImageLoadFailed {
+            path: image_path.display().to_string(),
+            reason: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn load_archive(
+    runtime: &ContainerRuntime,
+    archive: &Path,
+    reported_path: &Path,
+) -> Result<String, ContainerError> {
+    load_archive_with(runtime.command(), archive, reported_path)
+}
+
+fn load_archive_with(
+    program: &str,
+    archive: &Path,
+    reported_path: &Path,
+) -> Result<String, ContainerError> {
+    let output = Command::new(program)
+        .args(["load", "-i"])
+        .arg(archive)
+        .output()
+        .map_err(|e| ContainerError::ImageLoadFailed {
+            path: reported_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        return Err(ContainerError::ImageLoadFailed {
+            path: reported_path.display().to_string(),
+            reason: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let image_ref = stdout
+        .lines()
+        .find(|l| l.contains("Loaded image"))
+        .and_then(|l| l.split(": ").last())
+        .unwrap_or("unknown:latest")
+        .trim()
+        .to_string();
+
+    Ok(image_ref)
 }
 
 /// A private file of `KEY=value` lines handed to `<runtime> run --env-file`,
@@ -869,6 +986,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn require_runtime_env_parsing() {
+        assert!(parse_require_runtime(Some("1")));
+        assert!(parse_require_runtime(Some("true")));
+        assert!(parse_require_runtime(Some("TRUE")));
+        assert!(parse_require_runtime(Some("Yes")));
+        assert!(parse_require_runtime(Some("ON")));
+        assert!(parse_require_runtime(Some(" on ")));
+        assert!(!parse_require_runtime(Some("0")));
+        assert!(!parse_require_runtime(Some("false")));
+        assert!(!parse_require_runtime(Some("off")));
+        assert!(!parse_require_runtime(Some("no")));
+        assert!(!parse_require_runtime(Some("")));
+        assert!(!parse_require_runtime(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "NANNA_REQUIRE_RUNTIME")]
+    fn skip_panics_when_runtime_required() {
+        skip_or_panic_if(true, "podman missing");
+    }
+
+    #[test]
+    fn skip_returns_when_runtime_not_required() {
+        skip_or_panic_if(false, "podman missing");
+    }
+
+    #[test]
+    fn gate_runtime_skips_when_unavailable_and_not_required() {
+        assert!(!gate_runtime(false, false, "ctx"));
+        assert!(gate_runtime(true, true, "ctx"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no container runtime available for ctx")]
+    fn gate_runtime_panics_when_unavailable_and_required() {
+        gate_runtime(false, true, "ctx");
+    }
+
+    #[test]
+    fn ensure_runtime_or_skip_true_when_available() {
+        assert!(ensure_runtime_or_skip(&ContainerRuntime::Podman, "t"));
+        assert!(ensure_runtime_or_skip(&ContainerRuntime::Docker, "t"));
+    }
+
+    #[test]
     fn test_container_runtime_command() {
         assert_eq!(ContainerRuntime::Podman.command(), "podman");
         assert_eq!(ContainerRuntime::Docker.command(), "docker");
@@ -1051,6 +1213,212 @@ mod tests {
             result,
             Err(ContainerError::ImageLoadFailed { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    struct FakeBin {
+        dir: std::path::PathBuf,
+        old_path: Option<std::ffi::OsString>,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl FakeBin {
+        fn new(tag: &str) -> Self {
+            let guard = crate::test_support::hold_path_blocking();
+            let dir =
+                std::env::temp_dir().join(format!("nanna-fakebin-{}-{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let skopeo = "#!/bin/sh\n\
+                echo \"skopeo $*\" >> \"$FAKE_LOG\"\n\
+                if [ -n \"$FAKE_SKOPEO_FAIL\" ]; then echo skopeo-boom >&2; exit 1; fi\n\
+                case \"$3\" in docker-archive:*) d=\"${3#docker-archive:}\"; d=\"${d%%:*}\"; : > \"$d\"; echo \"$d\" >> \"$FAKE_LOG.tar\";; esac\n";
+            let runtime = "#!/bin/sh\n\
+                echo \"${0##*/} $*\" >> \"$FAKE_LOG\"\n\
+                if [ -n \"$FAKE_LOAD_FAIL\" ]; then echo load-boom >&2; exit 1; fi\n\
+                echo 'Loaded image: localhost/loaded:v1'\n";
+            let mut scripts = vec![("podman", runtime), ("docker", runtime)];
+            scripts.push(("skopeo", skopeo));
+            for (name, body) in scripts {
+                let file = dir.join(name);
+                std::fs::write(&file, body).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let log = dir.join("log");
+            std::fs::write(&log, "").unwrap();
+            std::fs::write(dir.join("log.tar"), "").unwrap();
+            let old_path = std::env::var_os("PATH");
+            let mut search = vec![dir.clone()];
+            search.extend(std::env::split_paths(&old_path.clone().unwrap_or_default()));
+            std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+            std::env::set_var("FAKE_LOG", &log);
+            std::env::remove_var("FAKE_SKOPEO_FAIL");
+            std::env::remove_var("FAKE_LOAD_FAIL");
+            Self {
+                dir,
+                old_path,
+                _guard: guard,
+            }
+        }
+
+        fn log(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("log"))
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("skopeo ") || l.contains(" load -i "))
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn archives(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("log.tar"))
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn image_json(&self) -> std::path::PathBuf {
+            let json = self.dir.join("image.json");
+            std::fs::write(&json, r#"{"name":"img","tag":"t1"}"#).unwrap();
+            json
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeBin {
+        fn drop(&mut self) {
+            match &self.old_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            std::env::remove_var("FAKE_LOG");
+            std::env::remove_var("FAKE_SKOPEO_FAIL");
+            std::env::remove_var("FAKE_LOAD_FAIL");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_nix2container_goes_through_docker_archive_then_load() {
+        let fake = FakeBin::new("podman-ok");
+        let json = fake.image_json();
+        let image = load_image_from_path(&ContainerRuntime::Podman, &json).unwrap();
+        assert_eq!(image, "img:t1");
+        let archives = fake.archives();
+        assert_eq!(archives.len(), 1);
+        let tar = &archives[0];
+        assert_eq!(
+            fake.log(),
+            vec![
+                format!(
+                    "skopeo copy nix:{} docker-archive:{}:img:t1",
+                    json.display(),
+                    tar
+                ),
+                format!("podman load -i {}", tar),
+            ]
+        );
+        assert!(!Path::new(tar).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_skopeo_failure_cleans_up_and_skips_load() {
+        let fake = FakeBin::new("podman-skopeo-fail");
+        std::env::set_var("FAKE_SKOPEO_FAIL", "1");
+        let json = fake.image_json();
+        let err = load_image_from_path(&ContainerRuntime::Podman, &json).unwrap_err();
+        assert!(
+            matches!(&err, ContainerError::ImageLoadFailed { reason, .. } if reason.contains("skopeo-boom")),
+            "{err:?}"
+        );
+        assert_eq!(fake.log().len(), 1);
+        assert!(fake.log()[0].starts_with("skopeo copy nix:"));
+        assert!(fake.archives().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_load_failure_cleans_up_archive() {
+        let fake = FakeBin::new("podman-load-fail");
+        std::env::set_var("FAKE_LOAD_FAIL", "1");
+        let json = fake.image_json();
+        let err = load_image_from_path(&ContainerRuntime::Podman, &json).unwrap_err();
+        assert!(
+            matches!(&err, ContainerError::ImageLoadFailed { path, reason } if reason.contains("load-boom") && path == &json.display().to_string()),
+            "{err:?}"
+        );
+        let archives = fake.archives();
+        assert_eq!(archives.len(), 1);
+        assert!(!Path::new(&archives[0]).exists());
+        assert_eq!(fake.log().len(), 2);
+    }
+
+    #[test]
+    fn podman_missing_skopeo_is_reported() {
+        let json = Path::new("/nonexistent/image.json");
+        let err = skopeo_copy_with("nanna-no-such-skopeo", json, json, "dest").unwrap_err();
+        assert!(
+            matches!(&err, ContainerError::ImageLoadFailed { reason, .. } if reason.contains("skopeo not available")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_nix2container_still_uses_docker_daemon() {
+        let fake = FakeBin::new("docker-ok");
+        let json = fake.image_json();
+        let image = load_image_from_path(&ContainerRuntime::Docker, &json).unwrap();
+        assert_eq!(image, "img:t1");
+        assert_eq!(
+            fake.log(),
+            vec![format!(
+                "skopeo copy nix:{} docker-daemon:img:t1",
+                json.display()
+            )]
+        );
+        assert!(fake.archives().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_archive_is_loaded_directly_and_parsed() {
+        let fake = FakeBin::new("plain-archive");
+        let tar = fake.dir.join("plain.tar");
+        std::fs::write(&tar, "not json").unwrap();
+        let image = load_image_from_path(&ContainerRuntime::Docker, &tar).unwrap();
+        assert_eq!(image, "localhost/loaded:v1");
+        assert_eq!(
+            fake.log(),
+            vec![format!("docker load -i {}", tar.display())]
+        );
+        assert!(tar.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_archive_load_failure_is_reported() {
+        let fake = FakeBin::new("plain-fail");
+        std::env::set_var("FAKE_LOAD_FAIL", "1");
+        let tar = fake.dir.join("plain.tar");
+        std::fs::write(&tar, "not json").unwrap();
+        let err = load_image_from_path(&ContainerRuntime::Podman, &tar).unwrap_err();
+        assert!(
+            matches!(&err, ContainerError::ImageLoadFailed { reason, .. } if reason.contains("load-boom")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_runtime_binary_is_reported_on_load() {
+        let tar = Path::new("/nonexistent/plain.tar");
+        let err = load_archive_with("nanna-no-such-runtime", tar, tar).unwrap_err();
+        assert!(matches!(err, ContainerError::ImageLoadFailed { .. }));
     }
 
     #[test]

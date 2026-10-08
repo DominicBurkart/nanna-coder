@@ -39,7 +39,7 @@ fn example_repo_path() -> PathBuf {
 
 #[tokio::test]
 #[ignore]
-async fn test_dev_container_fibonacci_to_primes() {
+async fn ollama_dev_container_fibonacci_to_primes() {
     let repo_path = example_repo_path();
     assert!(
         repo_path.exists(),
@@ -192,7 +192,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
 
 #[tokio::test]
 #[ignore]
-async fn test_task_manager_submit_with_dev_container() {
+async fn ollama_task_manager_submit_with_dev_container() {
     let repo_path = example_repo_path();
     assert!(
         repo_path.exists(),
@@ -276,7 +276,7 @@ fn nanna_workspace_root_resolves_to_repo_root() {
 /// it, so it requires a container runtime and the Nix build toolchain.
 #[tokio::test]
 #[ignore]
-async fn cargo_deny_tool_registered_for_nanna_workspace() {
+async fn container_cargo_deny_tool_registered_for_nanna_workspace() {
     let root = nanna_workspace_root();
     assert!(
         root.join("deny.toml").exists(),
@@ -328,7 +328,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
 /// and `command` == `"cargo deny check"`.
 #[tokio::test]
 #[ignore]
-async fn cargo_deny_tool_output_has_command_field() {
+async fn container_cargo_deny_tool_output_has_command_field() {
     let root = nanna_workspace_root();
     let runtime = require_runtime(detect_runtime());
 
@@ -390,7 +390,7 @@ async fn cargo_deny_tool_output_has_command_field() {
 /// Execute `CargoCheckTool` inside a real nanna dev container.
 #[tokio::test]
 #[ignore]
-async fn cargo_check_tool_succeeds_in_nanna_container() {
+async fn container_cargo_check_tool_succeeds_in_nanna_container() {
     let root = nanna_workspace_root();
     let runtime = require_runtime(detect_runtime());
 

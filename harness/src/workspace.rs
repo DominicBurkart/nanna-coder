@@ -27,6 +27,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
+const CONTAINER_CARGO_HOME: &str = "/tmp/cargo";
+
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
     #[error("Git worktree creation failed: {0}")]
@@ -274,7 +276,10 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![worktree_mount_arg(&workspace_path)];
+        let mut additional_args = vec![
+            worktree_mount_arg(&workspace_path),
+            format!("--tmpfs={CONTAINER_CARGO_HOME}:rw,mode=1777"),
+        ];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
             additional_args.extend(set.container_args());
@@ -1272,6 +1277,54 @@ mod tests {
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
         assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_container_cargo_home_matches_the_dev_image_env() {
+        let nix = include_str!("../../nix/containers.nix");
+        assert!(nix.contains(&format!("\"CARGO_HOME={CONTAINER_CARGO_HOME}\"")));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_gives_cargo_home_a_world_writable_tmpfs() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-cargohome"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = config.run_args(&runtime, "mock-image:latest");
+            assert!(
+                args.iter()
+                    .any(|a| *a == format!("--tmpfs={CONTAINER_CARGO_HOME}:rw,mode=1777")),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "--privileged"));
+        }
         ws.cleanup().unwrap();
     }
 

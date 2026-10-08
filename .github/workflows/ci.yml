@@ -163,6 +163,10 @@ jobs:
           echo "Ollama not reachable on port 11434, skipping model integration tests"
         fi
 
+    - name: Lint runtime job structure
+      if: matrix.test-type == 'lint' && runner.os == 'Linux'
+      run: scripts/lint-ci-runtime-jobs.sh
+
     - name: Run lint checks
       if: matrix.test-type == 'lint'
       shell: bash
@@ -201,6 +205,66 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: lcov.info
         fail_ci_if_error: true
+
+  container-runtime-required:
+    name: Container runtime (required)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      NANNA_REQUIRE_RUNTIME: "1"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Configure Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: nanna-coder
+        authToken: ${{ secrets.CACHIX_AUTH }}
+        pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+        skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+
+    - name: Optimize CI cache settings (Nix)
+      run: nix run .#ci-cache-optimize
+
+    - name: Verify container runtime is present
+      run: |
+        if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+          echo "::error::No container runtime (podman or docker) on this runner"
+          exit 1
+        fi
+
+    - name: Pre-build dev container image
+      run: nix build path:tests/integration/repo#devContainerImage --no-link
+
+    - name: Pre-build nanna dev container image
+      run: nix build path:.#devContainerImage --no-link --print-build-logs
+
+    - name: Verify skopeo supports the nix transport
+      run: |
+        nix develop --command bash -c 'dest="$(mktemp -d)"; status=0; out="$(skopeo copy nix:/nonexistent "dir:$dest/x" 2>&1)" || status=$?; printf "%s\n" "$out"; if [ "$status" -eq 0 ]; then echo "::error::skopeo copy from a nonexistent nix: path unexpectedly succeeded"; exit 1; fi; if printf "%s" "$out" | grep -qi "unknown transport"; then echo "::error::skopeo on PATH lacks the nix: transport"; exit 1; fi'
+
+    - name: Run container-only suites
+      run: |
+        shim="$(mktemp -d)"
+        ln -s /usr/bin/podman "$shim/podman"
+        nix develop --command bash -c 'PATH="$1:$PATH"; command -v podman skopeo; exec cargo nextest run --workspace --all-features \
+          --run-ignored all --test-threads=1 --no-fail-fast \
+          -E "test(/(^|::)container_/)"' _ "$shim"
+
+    - name: Remove leftover task containers
+      if: always()
+      run: |
+        for rt in podman docker; do
+          if command -v "$rt" >/dev/null 2>&1; then
+            "$rt" ps -aq --filter name=nanna-task- | xargs -r "$rt" rm -f
+          fi
+        done
 
   build-matrix:
     name: Build ${{ matrix.target }}
@@ -623,6 +687,7 @@ jobs:
     if: always()
     needs:
       - test-matrix
+      - container-runtime-required
       - build-matrix
       - build-containers
       - security-scan

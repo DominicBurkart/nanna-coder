@@ -29,7 +29,7 @@ fn workspace_root() -> PathBuf {
 
 #[tokio::test]
 #[ignore]
-async fn test_nanna_self_dev_translate_help_to_french() {
+async fn ollama_nanna_self_dev_translate_help_to_french() {
     let root = workspace_root();
     assert!(
         root.join("flake.nix").exists(),
@@ -40,8 +40,7 @@ async fn test_nanna_self_dev_translate_help_to_french() {
     let image_path = build_dev_container(&root).expect("failed to build nanna dev container image");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !harness::container::ensure_runtime_or_skip(&runtime, "nanna self-dev test") {
         return;
     }
 

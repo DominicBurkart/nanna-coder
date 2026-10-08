@@ -231,7 +231,7 @@ async fn test_model_info_serialization() {
 
 // This test requires Ollama to be running
 #[tokio::test]
-async fn test_ollama_health_check() {
+async fn ollama_health_check() {
     let config = OllamaConfig::default();
     let provider = OllamaProvider::new(config).unwrap();
 
@@ -243,22 +243,19 @@ async fn test_ollama_health_check() {
         }
         Ok(Err(e)) => {
             // In development, Ollama might not be running - that's okay
-            println!("⚠️  Ollama health check failed: {}", e);
-            println!("   This is expected if Ollama is not running locally");
-            println!("   In CI, containers are pre-built and this test will pass");
-            return; // Skip test gracefully
+            harness::container::skip_or_panic(&format!("Ollama health check failed: {e}"));
+            return;
         }
         Err(_) => {
-            println!("⚠️  Ollama health check timed out");
-            println!("   This is expected if Ollama is not running locally");
-            return; // Skip test gracefully
+            harness::container::skip_or_panic("Ollama health check timed out");
+            return;
         }
     }
 }
 
 // This test requires Ollama to be running with models
 #[tokio::test]
-async fn test_ollama_list_models() {
+async fn ollama_list_models() {
     let config = OllamaConfig::default();
     let provider = OllamaProvider::new(config).unwrap();
 
@@ -272,15 +269,12 @@ async fn test_ollama_list_models() {
             }
         }
         Ok(Err(e)) => {
-            println!("⚠️  Failed to list models: {}", e);
-            println!("   This is expected if Ollama is not running locally");
-            println!("   In CI, containers are pre-built and this test will pass");
-            return; // Skip test gracefully
+            harness::container::skip_or_panic(&format!("Ollama list models failed: {e}"));
+            return;
         }
         Err(_) => {
-            println!("⚠️  List models request timed out");
-            println!("   This is expected if Ollama is not running locally");
-            return; // Skip test gracefully
+            harness::container::skip_or_panic("Ollama list models request timed out");
+            return;
         }
     }
 }
@@ -288,14 +282,14 @@ async fn test_ollama_list_models() {
 // This test demonstrates the enhanced container runtime detection and fallback system
 // Uses the new ContainerRuntime utility for robust container management
 #[tokio::test]
-async fn test_enhanced_containerized_ollama_qwen3() {
+async fn ollama_enhanced_containerized_qwen3() {
     println!("🚀 Starting enhanced containerized Ollama integration test...");
 
     // Detect available runtime
     let runtime = detect_runtime();
     println!("🔍 Detected container runtime: {:?}", runtime);
 
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "containerized ollama test") {
         println!("⚠️  No container runtime available - demonstrating mock fallback");
         test_mock_fallback().await;
         return;
@@ -319,6 +313,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
     let container_handle = match start_container_with_fallback(&config).await {
         Ok(handle) => handle,
         Err(ContainerError::NoRuntimeAvailable) => {
+            harness::container::skip_or_panic("no container runtime for containerized ollama test");
             println!("⚠️  No container runtime - using mock implementation");
             test_mock_fallback().await;
             return;
@@ -367,7 +362,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
     let provider = match OllamaProvider::new(ollama_config) {
         Ok(p) => p,
         Err(e) => {
-            println!("⚠️  Failed to create provider: {}", e);
+            harness::container::skip_or_panic(&format!("failed to create provider: {e}"));
             return;
         }
     };
@@ -608,12 +603,12 @@ async fn test_no_runtime_fallback() {
 
 // Test image verification and loading
 #[tokio::test]
-async fn test_image_operations() {
+async fn container_image_operations() {
     println!("🖼️  Testing image operations...");
 
     let runtime = detect_runtime();
 
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "image operations test") {
         println!("⚠️  No container runtime - skipping image tests");
         return;
     }
@@ -749,11 +744,11 @@ async fn test_container_configuration() {
 
 /// E2E Test: Complete workflow from container startup to validated model inference
 #[tokio::test]
-async fn test_e2e_container_to_validated_inference() {
+async fn ollama_e2e_container_to_validated_inference() {
     println!("🚀 Starting E2E test: Container → Model → Judge validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock E2E test");
         test_mock_e2e_workflow().await;
         return;
@@ -1013,11 +1008,11 @@ async fn test_e2e_container_to_validated_inference() {
 
 /// E2E Test: Multi-model comparison using ModelJudge
 #[tokio::test]
-async fn test_e2e_multi_model_comparison() {
+async fn ollama_e2e_multi_model_comparison() {
     println!("🔬 Starting E2E test: Multi-model comparison with judge validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock multi-model test");
         test_mock_multi_model_comparison().await;
         return;
@@ -1153,11 +1148,11 @@ async fn test_e2e_multi_model_comparison() {
 
 /// E2E Test: Performance and reliability validation
 #[tokio::test]
-async fn test_e2e_performance_and_reliability() {
+async fn ollama_e2e_performance_and_reliability() {
     println!("⚡ Starting E2E test: Performance and reliability validation");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "e2e container test") {
         println!("⚠️  No container runtime - running mock performance test");
         test_mock_performance_validation().await;
         return;
@@ -1199,7 +1194,7 @@ async fn test_e2e_performance_and_reliability() {
     let provider = match OllamaProvider::new(ollama_config) {
         Ok(p) => p,
         Err(e) => {
-            println!("⚠️  Performance test provider failed: {}", e);
+            harness::container::skip_or_panic(&format!("performance test provider failed: {e}"));
             return;
         }
     };
@@ -1747,11 +1742,11 @@ async fn test_context_entity_stored_after_agent_run() {
 }
 
 #[tokio::test]
-async fn test_e2e_agent_with_containerized_ollama() {
+async fn ollama_e2e_agent_with_containerized_ollama() {
     println!("Starting E2E agent integration test with containerized Ollama...");
 
     let runtime = detect_runtime();
-    if !runtime.is_available() {
+    if !harness::container::ensure_runtime_or_skip(&runtime, "E2E agent test") {
         println!("No container runtime available - skipping E2E agent test");
         return;
     }
@@ -1772,7 +1767,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     let container_handle = match start_container_with_fallback(&config).await {
         Ok(handle) => handle,
         Err(e) => {
-            println!("Container start failed: {} - skipping E2E agent test", e);
+            harness::container::skip_or_panic(&format!("container start failed: {e}"));
             return;
         }
     };
@@ -1783,7 +1778,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     {
         Ok(()) => println!("Health check passed"),
         Err(e) => {
-            println!("Health check failed: {} - skipping E2E agent test", e);
+            harness::container::skip_or_panic(&format!("container health check failed: {e}"));
             return;
         }
     }
@@ -1795,7 +1790,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
     let provider = match OllamaProvider::new(ollama_config) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            println!("Failed to create provider: {} - skipping", e);
+            harness::container::skip_or_panic(&format!("failed to create provider: {e}"));
             return;
         }
     };

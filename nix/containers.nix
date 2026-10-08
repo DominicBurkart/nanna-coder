@@ -75,7 +75,7 @@ let
     };
 
     config = {
-      Cmd = [ "${pkgs.bash}/bin/sleep" "infinity" ];
+      Cmd = [ "${pkgs.coreutils}/bin/sleep" "infinity" ];
       Env = [
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "PATH=/bin"

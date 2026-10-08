@@ -1768,13 +1768,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_planning() {
+    async fn ollama_llm_planning() {
         use model::OllamaProvider;
 
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
-                eprintln!("Skipping LLM planning test: Ollama not available");
+                crate::container::skip_or_panic("LLM planning test: Ollama not available");
                 return;
             }
         };
@@ -1796,7 +1796,10 @@ mod tests {
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             if err_msg.contains("Ollama") || err_msg.contains("model") || err_msg.contains("LLM") {
-                eprintln!("Skipping LLM planning test: Model not available - {}", e);
+                crate::container::skip_or_panic(&format!(
+                    "LLM planning test: Model not available - {}",
+                    e
+                ));
                 return;
             }
         }
@@ -1832,7 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_completion_check() {
+    async fn ollama_llm_completion_check() {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
         use model::OllamaProvider;
@@ -1840,7 +1843,7 @@ mod tests {
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
-                eprintln!("Skipping LLM completion test: Ollama not available");
+                crate::container::skip_or_panic("LLM completion test: Ollama not available");
                 return;
             }
         };
@@ -1863,7 +1866,10 @@ mod tests {
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             if err_msg.contains("Ollama") || err_msg.contains("model") || err_msg.contains("LLM") {
-                eprintln!("Skipping LLM completion test: Model not available - {}", e);
+                crate::container::skip_or_panic(&format!(
+                    "LLM completion test: Model not available - {}",
+                    e
+                ));
                 return;
             }
         }
@@ -1872,13 +1878,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_decision_making() {
+    async fn ollama_llm_decision_making() {
         use model::OllamaProvider;
 
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
-                eprintln!("Skipping LLM decision test: Ollama not available");
+                crate::container::skip_or_panic("LLM decision test: Ollama not available");
                 return;
             }
         };
@@ -1897,7 +1903,7 @@ mod tests {
         let result = agent.entity_modification_decision(&context).await;
 
         if result.is_err() {
-            eprintln!("Skipping LLM decision test: LLM call failed");
+            crate::container::skip_or_panic("LLM decision test: LLM call failed");
             return;
         }
 
@@ -1906,7 +1912,7 @@ mod tests {
 
     /// Task 8: Full LLM Agent Control Loop Integration Test
     #[tokio::test]
-    async fn test_full_llm_agent_control_loop() {
+    async fn ollama_full_llm_agent_control_loop() {
         use crate::entities::git::types::GitRepository;
         use crate::entities::EntityStore;
         use model::OllamaProvider;
@@ -1914,7 +1920,7 @@ mod tests {
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(_) => {
-                eprintln!("Skipping full LLM test: Ollama not available");
+                crate::container::skip_or_panic("full LLM test: Ollama not available");
                 return;
             }
         };
@@ -1940,7 +1946,9 @@ mod tests {
         let result = agent.run(context).await;
 
         if result.is_err() {
-            eprintln!("Skipping full LLM test: Agent run failed (likely LLM unavailable)");
+            crate::container::skip_or_panic(
+                "full LLM test: Agent run failed (likely LLM unavailable)",
+            );
             return;
         }
 
@@ -2003,14 +2011,14 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn test_agent_loop_with_ollama_and_tools() {
+    async fn ollama_agent_loop_with_ollama_and_tools() {
         use crate::tools::{CalculatorTool, EchoTool};
         use model::OllamaProvider;
 
         let provider = match OllamaProvider::with_default_config() {
             Ok(p) => Arc::new(p),
             Err(e) => {
-                eprintln!("Skipping: Ollama not available: {}", e);
+                crate::container::skip_or_panic(&format!("Ollama not available: {}", e));
                 return;
             }
         };
