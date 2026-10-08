@@ -219,6 +219,7 @@ max_concurrent = 4
             nix_packages: vec!["pkg-config".to_string()],
             rust_version: Some("1.84.0".to_string()),
             extra_env_vars: vec![],
+            rust_targets: vec![],
         };
         let summary = AuditContext::summarize_profile(&profile);
         assert_eq!(summary, "project `shop` built with Cargo (rust 1.84.0); tools: build = `cargo build`, test = `cargo test`; nix packages: pkg-config");
@@ -235,6 +236,7 @@ max_concurrent = 4
             nix_packages: vec![],
             rust_version: None,
             extra_env_vars: vec![],
+            rust_targets: vec![],
         };
         assert_eq!(
             AuditContext::summarize_profile(&profile),
