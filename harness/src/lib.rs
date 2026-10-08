@@ -9,6 +9,7 @@ pub mod effects;
 pub mod entities;
 pub mod escalation;
 pub mod eval;
+pub mod harness_adapter;
 pub mod identity;
 pub mod leases;
 pub mod mcp;

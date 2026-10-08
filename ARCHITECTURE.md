@@ -177,6 +177,11 @@ flowchart TD
     n2 -- Can be promoted to --> n3(["Release"])
 ```
 
+# Agent Runtime
+
+Agents run on pi inside containers, behind a harness-neutral adapter seam and a host-side capability broker. See [docs/pi-harness.md](docs/pi-harness.md).
+
+
 ### Identity scope limits
 
 `run_command` executes `sh -c` in the dev container, so `scope.paths` and `scope.read_paths` cannot be applied to it. An identity whose `scope.paths` does not include `**`, or that sets `scope.read_paths` at all, never receives `run_command`, even when `scope.tools` names it. Only an identity with `paths = ["**"]` and no `read_paths` can run shell commands, and it is bounded by its effect ceiling and network policy alone. The network reach of a `repository`-ceiling identity holding `run_command` is tracked in #714.
