@@ -478,6 +478,97 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        #[test]
+        fn appends_follow_the_revision_cas_model(
+            ops in proptest::collection::vec((0usize..16, 0usize..4, 0usize..4), 1..14),
+        ) {
+            let states = [
+                RolloutState::Pending,
+                RolloutState::Step(0),
+                RolloutState::Step(1),
+                RolloutState::Halted,
+            ];
+            let dir = tempfile::tempdir().unwrap();
+            let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+            let mut created = record("sandbox");
+            log.append(None, &mut created).unwrap();
+            let mut snapshots = vec![log.load("rollout-1").unwrap()];
+            let mut last_appended_revision = created.revision;
+            for (pick, claimed, next) in ops {
+                let logged = log.load("rollout-1").unwrap();
+                let count = log.history("rollout-1").unwrap().len() as u64;
+                proptest::prop_assert_eq!(logged.revision, count);
+                let mut stale = snapshots[pick % snapshots.len()].clone();
+                let read_at = stale.revision;
+                stale.state = states[next].clone();
+                stale.traffic_percent = u8::try_from(count).unwrap();
+                let outcome = log.append(Some(&states[claimed]), &mut stale);
+                let fresh = read_at == count && logged.state == states[claimed];
+                if read_at < count {
+                    proptest::prop_assert!(
+                        matches!(outcome, Err(RolloutError::Conflict { .. })),
+                        "a record read at revision {} appended over revision {}",
+                        read_at,
+                        count
+                    );
+                }
+                proptest::prop_assert_eq!(outcome.is_ok(), fresh);
+                if fresh {
+                    proptest::prop_assert_eq!(stale.revision, count + 1);
+                    proptest::prop_assert!(stale.revision > last_appended_revision);
+                    last_appended_revision = stale.revision;
+                    proptest::prop_assert_eq!(log.load("rollout-1").unwrap().state, states[next].clone());
+                } else {
+                    proptest::prop_assert_eq!(stale.revision, read_at);
+                    proptest::prop_assert_eq!(log.load("rollout-1").unwrap(), logged);
+                }
+                let revisions: Vec<u64> = log
+                    .history("rollout-1")
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.record.revision)
+                    .collect();
+                let expected: Vec<u64> = (1..=revisions.len() as u64).collect();
+                proptest::prop_assert_eq!(revisions, expected);
+                snapshots.push(log.load("rollout-1").unwrap());
+            }
+        }
+
+        #[test]
+        fn a_halt_is_never_lost_to_a_writer_that_read_before_it(
+            progress in 0usize..4,
+            reentered in 0usize..3,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+            let mut r = record("sandbox");
+            log.append(None, &mut r).unwrap();
+            for n in 0..progress {
+                let from = r.state.clone();
+                r.state = RolloutState::Step(n);
+                log.append(Some(&from), &mut r).unwrap();
+            }
+            let mut stale = log.load("rollout-1").unwrap();
+            let halted = log.halt("rollout-1", t0()).unwrap();
+            let mut at = halted;
+            for n in 0..reentered {
+                let from = at.state.clone();
+                at.state = if n % 2 == 0 { stale.state.clone() } else { RolloutState::Halted };
+                log.append(Some(&from), &mut at).unwrap();
+            }
+            let from = stale.state.clone();
+            stale.traffic_percent = 99;
+            let before = log.history("rollout-1").unwrap().len();
+            let outcome = log.append(Some(&from), &mut stale);
+            let conflicted = matches!(outcome, Err(RolloutError::Conflict { .. }));
+            proptest::prop_assert!(conflicted);
+            proptest::prop_assert_eq!(log.history("rollout-1").unwrap().len(), before);
+            proptest::prop_assert_ne!(log.load("rollout-1").unwrap().traffic_percent, 99);
+        }
+    }
+
     #[test]
     fn blank_lines_are_skipped_and_garbage_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
