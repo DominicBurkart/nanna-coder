@@ -15,8 +15,9 @@ use harness::capabilities::{detect_capabilities, find_capability, CARGO_CAPABILI
 use harness::container::{ContainerHandle, ContainerRuntime};
 use harness::task::TaskId;
 use harness::tools::{
-    cargo_audit_args, cargo_deny_args, create_container_tool_registry, CalculatorTool,
-    ReadFileTool, Tool, ToolError, ToolRegistry, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    cargo_audit_args, cargo_deny_args, create_container_tool_registry, member_working_dir,
+    sqlx_migrate_args, trunk_build_args, CalculatorTool, ReadFileTool, SqlxMigrateTool, Tool,
+    ToolError, ToolRegistry, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -765,6 +766,171 @@ async fn cargo_test_rejects_option_like_filter() {
         .await
         .expect_err("an option-like test filter must not reach cargo's argv");
     assert!(matches!(err, ToolError::InvalidArguments { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// trunk_build and sqlx_migrate – arg builders, gating, error and success paths
+// ---------------------------------------------------------------------------
+
+fn full_stack_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"api\", \"ui\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ui")).unwrap();
+    std::fs::write(dir.path().join("ui/Trunk.toml"), "").unwrap();
+    std::fs::create_dir_all(dir.path().join("api/migrations")).unwrap();
+    dir
+}
+
+#[test]
+fn trunk_build_args_toggle_release() {
+    assert_eq!(trunk_build_args(false), vec!["trunk", "build"]);
+    assert_eq!(trunk_build_args(true), vec!["trunk", "build", "--release"]);
+}
+
+#[test]
+fn sqlx_migrate_args_use_given_command() {
+    assert_eq!(sqlx_migrate_args("info"), vec!["sqlx", "migrate", "info"]);
+}
+
+#[test]
+fn member_working_dir_joins_relative_member_paths() {
+    assert_eq!(
+        member_working_dir("/workspace", std::path::Path::new("")),
+        "/workspace"
+    );
+    assert_eq!(
+        member_working_dir("/workspace", std::path::Path::new("ui")),
+        "/workspace/ui"
+    );
+}
+
+#[test]
+fn trunk_build_and_sqlx_migrate_registered_for_full_stack_workspace() {
+    let dir = full_stack_workspace();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(registry.get_tool("trunk_build").is_some());
+    assert!(registry.get_tool("sqlx_migrate").is_some());
+}
+
+#[test]
+fn trunk_build_and_sqlx_migrate_absent_without_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+    let handle = test_container_handle();
+    let registry = create_container_tool_registry(dir.path(), handle, CONTAINER_WORKSPACE_DIR);
+    assert!(registry.get_tool("trunk_build").is_none());
+    assert!(registry.get_tool("sqlx_migrate").is_none());
+}
+
+#[tokio::test]
+async fn trunk_build_definition_matches_name_and_catalog() {
+    let tool = TrunkBuildTool::new(test_container_handle(), None);
+    let def = tool.definition();
+    assert_eq!(tool.name(), def.function.name);
+    assert!(def.function.description.contains("frontend"));
+    assert!(def.function.description.contains("Returns"));
+}
+
+#[tokio::test]
+async fn sqlx_migrate_definition_matches_name_and_catalog() {
+    let tool = SqlxMigrateTool::new(test_container_handle(), None);
+    let def = tool.definition();
+    assert_eq!(tool.name(), def.function.name);
+    assert!(def.function.description.contains("DATABASE_URL"));
+    assert!(def.function.description.contains("Returns"));
+}
+
+#[tokio::test]
+async fn trunk_build_execute_error_path_covered() {
+    let tool = TrunkBuildTool::new(test_container_handle(), Some("/workspace/ui".to_string()));
+    let err = tool
+        .execute(json!({"release": "true"}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn trunk_build_execute_success_path_runs_in_member_dir() {
+    let dir = full_stack_workspace();
+    let registry =
+        create_container_tool_registry(dir.path(), fake_podman_handle(), CONTAINER_WORKSPACE_DIR);
+    let result = registry
+        .execute("trunk_build", json!({}))
+        .await
+        .expect("execute must succeed with fake podman");
+    assert_eq!(result["command"], "trunk build");
+    assert_eq!(result["working_dir"], "/workspace/ui");
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec -w /workspace/ui fake-container trunk build"));
+    assert_eq!(result["success"], json!(true));
+}
+
+#[tokio::test]
+async fn trunk_build_release_flag_is_forwarded() {
+    let tool = TrunkBuildTool::new(fake_podman_handle(), None);
+    let result = tool.execute(json!({"release": "true"})).await.unwrap();
+    assert_eq!(result["command"], "trunk build --release");
+    assert!(result["working_dir"].is_null());
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec fake-container trunk build --release"));
+}
+
+#[tokio::test]
+async fn sqlx_migrate_execute_error_path_covered() {
+    let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({}))
+        .await
+        .expect_err("execute must fail with None runtime");
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+}
+
+#[tokio::test]
+async fn sqlx_migrate_rejects_unknown_command() {
+    let tool = SqlxMigrateTool::new(test_container_handle(), Some("/workspace".to_string()));
+    let err = tool
+        .execute(json!({"command": "drop"}))
+        .await
+        .expect_err("unknown command must be rejected before execution");
+    match err {
+        ToolError::InvalidArguments { message } => {
+            assert!(message.contains("drop"), "{message}");
+            assert!(message.contains("run, info, revert"), "{message}");
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
+    let dir = full_stack_workspace();
+    let registry =
+        create_container_tool_registry(dir.path(), fake_podman_handle(), CONTAINER_WORKSPACE_DIR);
+    let result = registry
+        .execute("sqlx_migrate", json!({}))
+        .await
+        .expect("execute must succeed with fake podman");
+    assert_eq!(result["command"], "sqlx migrate run");
+    assert_eq!(result["working_dir"], "/workspace/api");
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("FAKE_PODMAN exec -w /workspace/api fake-container sqlx migrate run"));
+    let info = registry
+        .execute("sqlx_migrate", json!({"command": "info"}))
+        .await
+        .unwrap();
+    assert_eq!(info["command"], "sqlx migrate info");
 }
 
 #[test]

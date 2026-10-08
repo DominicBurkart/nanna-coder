@@ -1,10 +1,17 @@
+use crate::apprun::{
+    register_app_tools, stop_app, AppContext, AppSpec, Limits, PortAllocator, RunningApps,
+    DEFAULT_POLL_INTERVAL,
+};
 use crate::container::{
-    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle, NetworkPolicy,
-    ReadOnlyMount,
+    cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
+    ContainerHandle, NetworkPolicy, ReadOnlyMount,
 };
 use crate::identity::AgentIdentity;
+use crate::onboarding::fullstack::FullStackRust;
+use crate::onboarding::OnboardingError;
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths};
 use crate::scope::ScopeError;
+use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
     create_container_tool_registry, create_container_tool_registry_for, create_tool_registry,
     create_tool_registry_for, ToolRegistry, CONTAINER_WORKSPACE_DIR,
@@ -14,6 +21,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -53,11 +61,36 @@ fn git_cmd(cwd: &Path) -> Command {
     cmd
 }
 
+/// The `-v` argument that mounts the worktree at [`CONTAINER_WORKSPACE_DIR`].
+/// The `:z` option relabels the directory for SELinux hosts (where the
+/// container could otherwise only read it) and is ignored elsewhere.
+pub fn worktree_mount_arg(workspace_path: &Path) -> String {
+    format!(
+        "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+        workspace_path.display()
+    )
+}
+
+/// The app spec of the full-stack workspace at `workspace_path`, `None`
+/// when the workspace does not match the profile.
+fn detect_app_spec(workspace_path: &Path) -> Result<Option<AppSpec>, OnboardingError> {
+    let Some(profile) = FullStackRust::detect(workspace_path)? else {
+        return Ok(None);
+    };
+    let spec = AppSpec::from_profile(&profile, workspace_path, CONTAINER_WORKSPACE_DIR)?;
+    Ok(Some(spec))
+}
+
 pub struct TaskWorkspace {
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
     pub task_id: String,
     container_handle: Option<Arc<crate::container::ContainerHandle>>,
+    sidecars: Option<SidecarSet>,
+    apps: Arc<RunningApps>,
+    port_allocator: Arc<PortAllocator>,
+    app_runner: Arc<dyn CommandRunner>,
+    app_limits: Limits,
     cleaned_up: bool,
     protected: ProtectedPaths,
     audit: Arc<dyn AuditHook>,
@@ -85,6 +118,11 @@ impl TaskWorkspace {
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: None,
+            sidecars: None,
+            apps: Arc::new(RunningApps::new()),
+            port_allocator: PortAllocator::shared(),
+            app_runner: Arc::new(SystemRunner),
+            app_limits: Limits::default(),
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
@@ -109,9 +147,14 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
     ) -> Result<Self, WorkspaceError> {
-        let network = NetworkPolicy::Enabled;
-        Self::create_with_container_networked(source_repo, task_id, branch, image_ref, network)
-            .await
+        Self::create_with_container_networked(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            NetworkPolicy::Enabled,
+        )
+        .await
     }
 
     /// Like [`TaskWorkspace::create_with_container`], with the dev
@@ -124,12 +167,36 @@ impl TaskWorkspace {
         image_ref: &str,
         network: NetworkPolicy,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_container_and_sidecars(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            network,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_with_container_networked`], but the dev container
+    /// joins the network of an already started [`SidecarSet`] and receives
+    /// the environment the sidecars export (for example `DATABASE_URL`). The
+    /// workspace owns the set and tears it down in [`Self::cleanup`].
+    pub async fn create_with_container_and_sidecars(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        network: NetworkPolicy,
+        sidecars: Option<SidecarSet>,
+    ) -> Result<Self, WorkspaceError> {
         Self::create_with_container_using(
             source_repo,
             task_id,
             branch,
             image_ref,
             network,
+            sidecars,
             |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
         )
         .await
@@ -147,6 +214,7 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
         network: NetworkPolicy,
+        sidecars: Option<SidecarSet>,
         start_fn: F,
     ) -> Result<Self, WorkspaceError>
     where
@@ -185,10 +253,12 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let additional_args = vec![format!(
-            "-v={}:{CONTAINER_WORKSPACE_DIR}",
-            workspace_path.display()
-        )];
+        let mut additional_args = vec![worktree_mount_arg(&workspace_path)];
+        let mut env_vars = vec![];
+        if let Some(set) = &sidecars {
+            additional_args.extend(set.container_args());
+            env_vars.extend(set.exports().iter().cloned());
+        }
         let protected = ProtectedPaths::for_repo(&workspace_path);
         let shielded = match protected_mounts(&protected, &workspace_path) {
             Ok(shielded) => shielded,
@@ -208,7 +278,7 @@ impl TaskWorkspace {
             model_to_pull: None,
             startup_timeout: Duration::from_secs(30),
             health_check_timeout: Duration::from_secs(10),
-            env_vars: vec![],
+            env_vars,
             additional_args,
             network,
             read_only_mounts,
@@ -227,6 +297,11 @@ impl TaskWorkspace {
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: Some(Arc::new(handle)),
+            sidecars,
+            apps: Arc::new(RunningApps::new()),
+            port_allocator: PortAllocator::shared(),
+            app_runner: Arc::new(SystemRunner),
+            app_limits: Limits::default(),
             cleaned_up: false,
             protected,
             audit: Arc::new(NoopAuditHook),
@@ -234,18 +309,104 @@ impl TaskWorkspace {
         })
     }
 
+    /// Environment the sidecars export into the dev container, empty when
+    /// the workspace has no sidecars.
+    pub fn sidecar_env(&self) -> &[(String, String)] {
+        self.sidecars.as_ref().map_or(&[], |s| s.exports())
+    }
+
+    /// Limits for the app tools; `None` restores the defaults.
+    pub fn set_app_limits(&mut self, limits: Option<Limits>) {
+        self.app_limits = limits.unwrap_or_default();
+    }
+
+    pub fn app_limits(&self) -> Limits {
+        self.app_limits
+    }
+
+    /// Runner the app tools use for container commands (a stub in tests).
+    pub fn set_app_runner(&mut self, runner: Arc<dyn CommandRunner>) {
+        self.app_runner = runner;
+    }
+
+    /// Allocator the app tools take the backend port from.
+    pub fn set_port_allocator(&mut self, allocator: Arc<PortAllocator>) {
+        self.port_allocator = allocator;
+    }
+
+    /// Applications started for this task, shared with its tool registries.
+    pub fn running_apps(&self) -> Arc<RunningApps> {
+        Arc::clone(&self.apps)
+    }
+
+    /// App tool context when the workspace runs in a container and holds a
+    /// full-stack Rust workspace; `None` otherwise. A profile that cannot be
+    /// read is logged and treated as absent so the remaining tools still
+    /// register.
+    fn app_context(&self) -> Option<AppContext> {
+        let handle = self.container_handle.as_ref()?;
+        let spec = match detect_app_spec(&self.workspace_path) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(
+                    "task {}: full-stack profile unreadable, app tools skipped: {e}",
+                    self.task_id
+                );
+                return None;
+            }
+        };
+        Some(AppContext {
+            task_id: self.task_id.clone(),
+            handle: Arc::clone(handle),
+            runner: Arc::clone(&self.app_runner),
+            apps: Arc::clone(&self.apps),
+            ports: Arc::clone(&self.port_allocator),
+            spec,
+            env: self.sidecar_env().to_vec(),
+            limits: self.app_limits,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+        })
+    }
+
+    fn stop_forgotten_app(&self, handle: &ContainerHandle) {
+        let stopped = stop_app(self.app_runner.as_ref(), handle, &self.apps, &self.task_id);
+        match stopped {
+            Ok(Some(app)) => warn!(
+                "task {}: app pid {} was still running at cleanup",
+                self.task_id, app.instance.pid
+            ),
+            Ok(None) => {}
+            Err(e) => warn!("task {}: could not stop app at cleanup: {e}", self.task_id),
+        }
+    }
+
+    /// Remove the worktree, the dev container and any sidecars, stopping
+    /// the application first if the agent left it running.
+    ///
+    /// The dev container is removed explicitly rather than through the last
+    /// `Arc<ContainerHandle>` drop, because tool registries built from this
+    /// workspace keep their own reference to the handle and may outlive it;
+    /// the sidecar network can only be removed once the container has left it.
     pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
         if self.cleaned_up {
             return Ok(());
         }
-        drop(self.container_handle.take());
+        if let Some(handle) = self.container_handle.take() {
+            self.stop_forgotten_app(&handle);
+            if handle.needs_cleanup {
+                if let Err(e) = cleanup_container(&handle) {
+                    warn!(
+                        "dev container cleanup for task {} failed: {e}",
+                        self.task_id
+                    );
+                }
+            }
+        }
+        drop(self.sidecars.take());
         let output = git_cmd(&self.source_repo)
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                self.workspace_path.to_str().expect("non-UTF8 path"),
-            ])
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.workspace_path)
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -259,11 +420,15 @@ impl TaskWorkspace {
     /// when a container handle is present, plain otherwise.
     pub fn build_tool_registry(&self) -> ToolRegistry {
         if let Some(handle) = &self.container_handle {
-            create_container_tool_registry(
+            let mut registry = create_container_tool_registry(
                 &self.workspace_path,
                 Arc::clone(handle),
                 CONTAINER_WORKSPACE_DIR,
-            )
+            );
+            if let Some(ctx) = self.app_context() {
+                register_app_tools(&mut registry, ctx);
+            }
+            registry
         } else {
             create_tool_registry(&self.workspace_path)
         }
@@ -657,6 +822,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Ok(ContainerHandle {
                     name: "mock-container".to_string(),
@@ -689,6 +855,7 @@ mod tests {
             "HEAD",
             "bad-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
             },
@@ -716,6 +883,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 use crate::container::{ContainerHandle, ContainerRuntime};
                 Ok(ContainerHandle {
@@ -735,6 +903,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_with_container_using_sidecars_injects_env_and_network() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::sidecar::{PostgresSidecar, ReadinessConfig, SidecarSet};
+        use std::sync::Mutex;
+
+        struct RecordingRunner;
+        impl crate::sidecar::CommandRunner for RecordingRunner {
+            fn run(&self, _: &str, _: &[String]) -> std::io::Result<crate::sidecar::RunOutput> {
+                Ok(crate::sidecar::RunOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-sidecars");
+        let specs = vec![PostgresSidecar::with_password(&task_id, "pw").spec()];
+        let set = SidecarSet::start(
+            ContainerRuntime::Podman,
+            Arc::new(RecordingRunner),
+            &task_id,
+            &specs,
+            ReadinessConfig::default(),
+        )
+        .await
+        .unwrap();
+        let expected_network = format!("--network={}", set.network_name());
+        let seen = Arc::new(Mutex::new(None));
+        let seen_in_start = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            Some(set),
+            |config: ContainerConfig| async move {
+                *seen_in_start.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().take().unwrap();
+        assert!(config.additional_args.contains(&expected_network));
+        let mount = format!("-v={}:/workspace:z", ws.workspace_path.display());
+        assert_eq!(
+            config.additional_args[0], mount,
+            "worktree mount is relabelled"
+        );
+        assert_eq!(worktree_mount_arg(Path::new("/w")), "-v=/w:/workspace:z");
+        assert_eq!(config.env_vars, specs[0].exports);
+        assert_eq!(ws.sidecar_env(), specs[0].exports.as_slice());
+        ws.cleanup().unwrap();
+        assert!(ws.sidecars.is_none());
+        assert!(ws.sidecar_env().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_removes_container_even_when_registry_holds_a_reference() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-stub"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: true,
+        }));
+        let registry = ws.build_tool_registry();
+        ws.cleanup().unwrap();
+        assert!(ws.container_handle.is_none());
+        assert!(registry.get_tool("run_command").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_tolerates_container_removal_failure() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-fail"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Docker,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_create_with_container_starts_through_the_runtime_and_cleans_up() {
+        let fake = crate::test_support::FakePodman::install_async(None).await;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-create-container");
+        let mut ws = TaskWorkspace::create_with_container(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+        )
+        .await
+        .unwrap();
+        assert!(ws.sidecar_env().is_empty());
+        let mount = format!(
+            "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+            ws.workspace_path.display()
+        );
+        let calls = fake.calls();
+        let run = calls
+            .iter()
+            .find(|c| c.starts_with(&format!("run -d --name nanna-task-{task_id}")))
+            .expect("run call recorded");
+        assert!(run.contains(&mount), "{run}");
+        assert!(run.ends_with("mock-image:latest"), "{run}");
+        ws.cleanup().unwrap();
+        assert!(fake
+            .calls()
+            .contains(&format!("rm -f nanna-task-{task_id}")));
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_tolerates_failing_container_removal() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let fake = crate::test_support::FakePodman::install(Some("rm -f"));
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-rm-fails"), "HEAD")
+                .unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "nanna-rm-fails".to_string(),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(fake.calls().contains(&"rm -f nanna-rm-fails".to_string()));
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[tokio::test]
     async fn test_create_with_container_using_passes_the_network_policy() {
         use crate::container::{ContainerHandle, ContainerRuntime};
 
@@ -749,6 +1080,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Disabled,
+            None,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -766,12 +1098,13 @@ mod tests {
         assert_eq!(config.network, NetworkPolicy::Disabled);
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
-        assert!(args.iter().any(|a| a.ends_with(CONTAINER_WORKSPACE_DIR)));
+        assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
         ws.cleanup().unwrap();
     }
 
     #[tokio::test]
     async fn test_create_with_container_fails_without_an_image() {
+        let _path = crate::test_support::hold_path_async().await;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
@@ -784,10 +1117,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(result, Err(WorkspaceError::ContainerSetupFailed(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
         let default_network = TaskWorkspace::create_with_container(
             source.path(),
             &unique_id("ws-default-network"),
@@ -795,10 +1129,14 @@ mod tests {
             "nonexistent-image-for-nanna-tests:none",
         )
         .await;
-        assert!(matches!(
-            default_network,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(
+                default_network,
+                Err(WorkspaceError::ContainerSetupFailed(_))
+            ),
+            "{:?}",
+            default_network.as_ref().err()
+        );
     }
 
     fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {
@@ -1060,6 +1398,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -1224,6 +1563,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -1243,7 +1583,7 @@ mod tests {
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         let workspace_mount = args
             .iter()
-            .position(|a| a.ends_with(":/workspace"))
+            .position(|a| a.ends_with(":/workspace:z"))
             .unwrap();
         let ro_mount = args
             .iter()
@@ -1302,5 +1642,283 @@ mod tests {
         let violation = protected_violation(ws.extract_changes().unwrap_err());
         assert_eq!(violation.rule, ".nanna/**");
         ws.cleanup().unwrap();
+    }
+
+    mod apps {
+        use super::*;
+        use crate::apprun::{
+            AppInstance, Limits, PortAllocator, RunningApps, APP_LOGS_TOOL, APP_START_TOOL,
+            APP_STOP_TOOL,
+        };
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::sidecar::{CommandRunner, RunOutput};
+        use std::sync::Mutex;
+
+        const BUILD_JSON: &str = r#"{"reason":"compiler-artifact","executable":"/t/debug/api"}"#;
+
+        struct HealthyRunner {
+            scripts: Mutex<Vec<String>>,
+        }
+
+        impl HealthyRunner {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    scripts: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn scripts(&self) -> Vec<String> {
+                self.scripts.lock().unwrap().clone()
+            }
+        }
+
+        impl CommandRunner for HealthyRunner {
+            fn run(&self, _: &str, args: &[String]) -> std::io::Result<RunOutput> {
+                let last = args.last().cloned().unwrap_or_default();
+                self.scripts.lock().unwrap().push(args.join(" "));
+                let stdout = if args.iter().any(|a| a == "cargo") {
+                    BUILD_JSON
+                } else if last.contains("nohup") {
+                    "99\n"
+                } else {
+                    ""
+                };
+                Ok(RunOutput {
+                    success: true,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn copy_dir_all(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if name == "target" || name == "dist" || name == ".git" {
+                    continue;
+                }
+                let target = dst.join(&name);
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir_all(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        fn fixture_repo() -> TempDir {
+            let source = TempDir::new().unwrap();
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+            copy_dir_all(&fixture, source.path());
+            init_git_repo(source.path());
+            source
+        }
+
+        fn stub_handle() -> Arc<ContainerHandle> {
+            Arc::new(ContainerHandle {
+                name: "app-test-container".to_string(),
+                runtime: ContainerRuntime::Podman,
+                port: None,
+                needs_cleanup: false,
+            })
+        }
+
+        fn fullstack_workspace(
+            source: &Path,
+            runner: Arc<HealthyRunner>,
+            allocator: Arc<PortAllocator>,
+            prefix: &str,
+        ) -> TaskWorkspace {
+            let mut ws = TaskWorkspace::create(source, &unique_id(prefix), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            ws.set_app_runner(runner);
+            ws.set_port_allocator(allocator);
+            ws
+        }
+
+        #[test]
+        fn app_tools_registered_only_for_full_stack_profile_in_a_container() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-host"), "HEAD").unwrap();
+            let registry = ws.build_tool_registry();
+            assert!(
+                registry.get_tool(APP_START_TOOL).is_none(),
+                "no container, no app tools"
+            );
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            for name in [APP_START_TOOL, APP_STOP_TOOL, APP_LOGS_TOOL] {
+                assert!(registry.get_tool(name).is_some(), "{name} missing");
+            }
+            assert!(registry.get_tool("trunk_build").is_some());
+            ws.cleanup().unwrap();
+
+            let plain = TempDir::new().unwrap();
+            init_git_repo(plain.path());
+            let mut ws =
+                TaskWorkspace::create(plain.path(), &unique_id("ws-apps-plain"), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            assert!(
+                registry.get_tool(APP_START_TOOL).is_none(),
+                "plain repo has no app tools"
+            );
+            assert!(registry.get_tool("run_command").is_some());
+            ws.cleanup().unwrap();
+        }
+
+        #[test]
+        fn malformed_manifest_skips_app_tools_but_keeps_the_registry() {
+            let source = fixture_repo();
+            std::fs::write(source.path().join("Cargo.toml"), "[workspace\n").unwrap();
+            git_cmd(source.path())
+                .args(["commit", "-qam", "break"])
+                .output()
+                .unwrap();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-broken"), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            assert!(registry.get_tool(APP_START_TOOL).is_none());
+            assert!(registry.get_tool("run_command").is_some());
+            ws.cleanup().unwrap();
+        }
+
+        #[tokio::test]
+        async fn cleanup_stops_a_forgotten_app_and_releases_its_port() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                43000..=43001,
+                leases.path(),
+                |_| true,
+            ));
+            let runner = HealthyRunner::new();
+            let mut ws = fullstack_workspace(
+                source.path(),
+                Arc::clone(&runner),
+                Arc::clone(&allocator),
+                "ws-apps-forgot",
+            );
+            ws.set_app_limits(Some(Limits {
+                max_wall_clock_secs: 30,
+            }));
+            let registry = ws.build_tool_registry();
+            let started = registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(started["port"], 43000);
+            assert_eq!(started["pid"], 99);
+            assert!(
+                runner
+                    .scripts()
+                    .iter()
+                    .any(|s| s.ends_with("timeout 30 trunk build")),
+                "limits reach the tools: {:?}",
+                runner.scripts()
+            );
+            let apps = ws.running_apps();
+            assert_eq!(apps.len(), 1);
+            assert_eq!(apps.get(&ws.task_id).map(|a| a.pid), Some(99));
+            ws.cleanup().unwrap();
+            assert!(
+                runner
+                    .scripts()
+                    .iter()
+                    .any(|s| s.ends_with("sh -c kill 99")),
+                "cleanup kills the app: {:?}",
+                runner.scripts()
+            );
+            assert!(apps.is_empty());
+            assert!(allocator.held().is_empty());
+            assert!(!ws.workspace_path.exists());
+        }
+
+        #[tokio::test]
+        async fn two_workspaces_get_distinct_ports() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                44000..=44009,
+                leases.path(),
+                |_| true,
+            ));
+            let mut a = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-apps-a",
+            );
+            let mut b = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-apps-b",
+            );
+            let ra = a.build_tool_registry();
+            let rb = b.build_tool_registry();
+            let (sa, sb) = tokio::join!(
+                ra.execute(APP_START_TOOL, serde_json::Value::Null),
+                rb.execute(APP_START_TOOL, serde_json::Value::Null)
+            );
+            let (sa, sb) = (sa.unwrap(), sb.unwrap());
+            assert_ne!(sa["port"], sb["port"]);
+            assert_ne!(sa["base_url"], sb["base_url"]);
+            assert_eq!(allocator.held().len(), 2);
+            a.cleanup().unwrap();
+            assert_eq!(allocator.held().len(), 1);
+            b.cleanup().unwrap();
+            assert!(allocator.held().is_empty());
+        }
+
+        #[test]
+        fn cleanup_tolerates_a_failing_stop() {
+            struct Broken;
+            impl CommandRunner for Broken {
+                fn run(&self, _: &str, _: &[String]) -> std::io::Result<RunOutput> {
+                    Err(std::io::Error::other("no runtime"))
+                }
+            }
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                45000..=45000,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-brokenstop"), "HEAD")
+                    .unwrap();
+            ws.container_handle = Some(stub_handle());
+            ws.set_app_runner(Arc::new(Broken));
+            let lease = allocator.allocate(&ws.task_id).unwrap();
+            ws.running_apps().insert(
+                AppInstance::local(&ws.task_id, lease.port(), 7, "/l"),
+                lease,
+            );
+            ws.cleanup().unwrap();
+            assert!(!ws.workspace_path.exists());
+        }
+
+        #[test]
+        fn app_limits_default_when_unset() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-limits"), "HEAD").unwrap();
+            assert_eq!(ws.app_limits(), Limits::default());
+            ws.set_app_limits(Some(Limits {
+                max_wall_clock_secs: 5,
+            }));
+            assert_eq!(ws.app_limits().max_wall_clock_secs, 5);
+            ws.set_app_limits(None);
+            assert_eq!(ws.app_limits(), Limits::default());
+            assert!(Arc::ptr_eq(&ws.running_apps(), &ws.running_apps()));
+            let _: &RunningApps = &ws.running_apps();
+            ws.cleanup().unwrap();
+        }
     }
 }
