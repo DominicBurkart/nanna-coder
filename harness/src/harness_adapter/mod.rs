@@ -121,11 +121,7 @@ impl Endpoint {
     /// ```
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ResolveError> {
         let host = host.into();
-        let valid = !host.is_empty()
-            && host
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
-        if !valid || port == 0 {
+        if !host_is_valid(&host) || port == 0 {
             return Err(ResolveError::InvalidEndpoint { host, port });
         }
         Ok(Self { host, port })
@@ -140,6 +136,18 @@ impl Endpoint {
     pub fn port(&self) -> u16 {
         self.port
     }
+}
+
+fn host_is_valid(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    for c in host.chars() {
+        if !c.is_ascii_alphanumeric() && c != '.' && c != '-' {
+            return false;
+        }
+    }
+    true
 }
 
 /// One capability an agent may call: a tool nanna runs on its behalf.
@@ -664,6 +672,9 @@ max_concurrent = 2
     #[test]
     fn endpoint_rejects_port_zero_and_exposes_parts() {
         assert!(Endpoint::new("gw", 0).is_err());
+        assert!(Endpoint::new("", 80).is_err());
+        assert!(Endpoint::new("evil/../host", 80).is_err());
+        assert!(Endpoint::new("a-b.c-1", 80).is_ok());
         let endpoint = Endpoint::new("gw.local", 8080).unwrap();
         assert_eq!((endpoint.host(), endpoint.port()), ("gw.local", 8080));
         let err = Endpoint::new("a b", 1).unwrap_err();
