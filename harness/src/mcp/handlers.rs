@@ -371,6 +371,7 @@ mod tests {
             tool_call_history: vec![],
             last_agent_state: None,
             conversation_snapshot: None,
+            denials: vec![],
         }
     }
 

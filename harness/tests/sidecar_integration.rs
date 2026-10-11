@@ -223,6 +223,7 @@ async fn fixture_flake_builds_dev_container_with_profile_tools() {
         env_vars: vec![],
         additional_args: vec![],
         network: NetworkPolicy::Enabled,
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
     let handle = start_container_with_fallback(&config)
         .await
