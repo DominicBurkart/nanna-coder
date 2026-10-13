@@ -1,5 +1,7 @@
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 const NETWORK_BINARIES: &[&str] = &[
     "curl", "wget", "nc", "ncat", "netcat", "socat", "scp", "sftp", "ssh", "ftp", "telnet",
@@ -141,8 +143,26 @@ const WRAPPER_VALUE_FLAGS: &[(&str, &[&str])] = &[
 ];
 
 const KEYWORDS: &[&str] = &[
-    "{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "time",
-    "function", "select",
+    "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "function", "select",
+    "for", "case", "esac", "coproc",
+];
+
+const BLOCK_OPENERS: &[&str] = &["if", "while", "until", "case", "select", "for"];
+
+const BLOCK_CLOSERS: &[&str] = &["fi", "done", "esac"];
+
+const VARIABLE_WRITERS: &[&str] = &[
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "unset",
+    "let",
+    "printf",
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
 ];
 
 const ASSIGNMENT_BUILTINS: &[&str] = &["export", "declare", "readonly", "local", "typeset"];
@@ -191,6 +211,14 @@ const INTERPRETER_DANGER_MARKERS: &[&str] = &[
 ];
 
 const MAX_NESTING: usize = 4;
+
+const MAX_WORK: usize = 262_144;
+
+const MAX_VARIABLE_BYTES: usize = 4096;
+
+const MAX_TABLE_BYTES: usize = 8192;
+
+const MAX_SIMPLES: usize = 1024;
 
 const SECRET_MARKERS: &[&str] = &[
     ".ssh",
@@ -265,13 +293,106 @@ const DOCKER_SYSTEM_MOUNTS: &[&str] = &[
     "/run",
 ];
 
-type Vars = HashMap<String, Option<String>>;
+struct Budget {
+    work: Cell<usize>,
+    simples: Cell<usize>,
+}
+
+impl Budget {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            work: Cell::new(0),
+            simples: Cell::new(0),
+        })
+    }
+
+    fn charge(&self, amount: usize) -> Result<(), String> {
+        let total = self.work.get().saturating_add(amount);
+        if total > MAX_WORK {
+            return Err("command is too large to review".to_string());
+        }
+        self.work.set(total);
+        Ok(())
+    }
+
+    fn count_simple(&self) -> Result<(), String> {
+        let total = self.simples.get() + 1;
+        if total > MAX_SIMPLES {
+            return Err("command has too many parts to review".to_string());
+        }
+        self.simples.set(total);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct Scope {
+    known: HashMap<String, String>,
+    tainted: HashSet<String>,
+    poisoned: bool,
+    bytes: usize,
+}
+
+impl Scope {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        if self.poisoned || self.tainted.contains(name) {
+            return None;
+        }
+        self.known.get(name).map(String::as_str)
+    }
+
+    fn forget(&mut self, name: &str) {
+        if let Some(old) = self.known.remove(name) {
+            self.bytes -= old.len() + name.len();
+        }
+    }
+
+    fn assign(&mut self, name: &str, value: Option<String>) -> Result<(), String> {
+        self.forget(name);
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if self.tainted.contains(name) {
+            return Ok(());
+        }
+        if value.len() > MAX_VARIABLE_BYTES {
+            return Err("variable value is too large to review".to_string());
+        }
+        let bytes = self.bytes + name.len() + value.len();
+        if bytes > MAX_TABLE_BYTES {
+            return Err("variable table is too large to review".to_string());
+        }
+        self.bytes = bytes;
+        self.known.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    fn taint(&mut self, name: &str) {
+        self.forget(name);
+        self.tainted.insert(name.to_string());
+    }
+}
+
+#[derive(Clone)]
+struct Env {
+    scope: Rc<Scope>,
+    budget: Rc<Budget>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sep {
+    Plain,
+    Cond,
+    Pipe,
+    Amp,
+}
 
 #[derive(Clone, Debug)]
 struct Word {
     text: String,
     dynamic: bool,
     glob: bool,
+    quoted: bool,
 }
 
 struct Redirect {
@@ -282,7 +403,7 @@ struct Redirect {
 struct Simple {
     words: Vec<Word>,
     redirects: Vec<Redirect>,
-    vars: Vars,
+    scope: Rc<Scope>,
 }
 
 pub(super) fn inspect(tool: &str, args: &Value) -> Result<(), String> {
@@ -317,15 +438,19 @@ fn inspect_command(args: &Value) -> Result<(), String> {
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing or non-string `command`".to_string())?;
-    inspect_script(command, 0, Vars::new())
+    let env = Env {
+        scope: Rc::new(Scope::default()),
+        budget: Budget::new(),
+    };
+    inspect_script(command, 0, &env)
 }
 
-fn inspect_script(script: &str, depth: usize, vars: Vars) -> Result<(), String> {
+fn inspect_script(script: &str, depth: usize, env: &Env) -> Result<(), String> {
     check_secret(&script.to_lowercase())?;
-    let simples = parse_script(script, depth, vars)?;
+    let simples = parse_script(script, depth, env)?;
     let mut written = HashSet::new();
     for simple in &simples {
-        inspect_simple(simple, depth, &mut written)?;
+        inspect_simple(simple, depth, &env.budget, &mut written)?;
     }
     Ok(())
 }
@@ -337,15 +462,17 @@ fn check_secret(lowered: &str) -> Result<(), String> {
     }
 }
 
-fn parse_script(src: &str, depth: usize, vars: Vars) -> Result<Vec<Simple>, String> {
+fn parse_script(src: &str, depth: usize, env: &Env) -> Result<Vec<Simple>, String> {
     if depth > MAX_NESTING {
         return Err("nests shells too deeply to review".to_string());
     }
+    env.budget.charge(src.len())?;
     let mut parser = Parser {
         chars: src.chars().collect(),
         pos: 0,
         depth,
-        vars,
+        scope: Rc::clone(&env.scope),
+        budget: Rc::clone(&env.budget),
         out: Vec::new(),
         words: Vec::new(),
         redirects: Vec::new(),
@@ -353,8 +480,12 @@ fn parse_script(src: &str, depth: usize, vars: Vars) -> Result<Vec<Simple>, Stri
         started: false,
         dynamic: false,
         glob: false,
+        quoted: false,
         pending: None,
         heredocs: Vec::new(),
+        paren: 0,
+        block: 0,
+        prev_sep: Sep::Plain,
     };
     parser.run()?;
     Ok(parser.out)
@@ -364,7 +495,8 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     depth: usize,
-    vars: Vars,
+    scope: Rc<Scope>,
+    budget: Rc<Budget>,
     out: Vec<Simple>,
     words: Vec<Word>,
     redirects: Vec<Redirect>,
@@ -372,8 +504,12 @@ struct Parser {
     started: bool,
     dynamic: bool,
     glob: bool,
+    quoted: bool,
     pending: Option<String>,
-    heredocs: Vec<String>,
+    heredocs: Vec<(String, bool, bool)>,
+    paren: usize,
+    block: usize,
+    prev_sep: Sep,
 }
 
 impl Parser {
@@ -389,11 +525,11 @@ impl Parser {
         while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' | '\r' => {
-                    self.finish_word();
+                    self.finish_word()?;
                     self.pos += 1;
                 }
                 '\n' => {
-                    self.end_command();
+                    self.end_command(Sep::Plain)?;
                     self.pos += 1;
                     self.skip_heredocs()?;
                 }
@@ -403,90 +539,178 @@ impl Parser {
                     }
                 }
                 ';' => {
-                    self.end_command();
+                    self.end_command(Sep::Plain)?;
                     self.pos += 1;
                 }
                 '&' if self.peek_at(1) == Some('>') => self.redirect()?,
+                '&' if self.peek_at(1) == Some('&') => {
+                    self.end_command(Sep::Cond)?;
+                    self.pos += 2;
+                }
                 '&' => {
-                    self.end_command();
+                    self.end_command(Sep::Amp)?;
                     self.pos += 1;
+                }
+                '|' if self.peek_at(1) == Some('|') => {
+                    self.end_command(Sep::Cond)?;
+                    self.pos += 2;
                 }
                 '|' => {
-                    self.end_command();
+                    self.end_command(Sep::Pipe)?;
+                    self.pos += if self.peek_at(1) == Some('&') { 2 } else { 1 };
+                }
+                '(' => {
+                    self.end_command(Sep::Plain)?;
+                    self.paren += 1;
                     self.pos += 1;
                 }
-                '(' | ')' => {
-                    self.end_command();
+                ')' => {
+                    self.end_command(Sep::Plain)?;
+                    self.paren = self.paren.saturating_sub(1);
                     self.pos += 1;
                 }
                 '<' | '>' => self.redirect()?,
                 _ => self.word_char(c)?,
             }
         }
-        self.end_command();
-        Ok(())
+        self.end_command(Sep::Plain)
     }
 
-    fn finish_word(&mut self) {
+    fn finish_word(&mut self) -> Result<(), String> {
         if !self.started {
-            return;
+            return Ok(());
         }
         let word = Word {
             text: std::mem::take(&mut self.cur),
             dynamic: self.dynamic,
             glob: self.glob,
+            quoted: self.quoted,
         };
         self.started = false;
         self.dynamic = false;
         self.glob = false;
+        self.quoted = false;
         match self.pending.take() {
-            Some(op) if op.starts_with("<<") && op != "<<<" => self.heredocs.push(word.text),
+            Some(op) if op.starts_with("<<") && op != "<<<" => {
+                self.heredocs.push((word.text, word.quoted, op == "<<-"));
+            }
             Some(op) => self.redirects.push(Redirect { op, target: word }),
+            None if !word.quoted && !word.dynamic && word.text == "{" => {
+                self.end_command(Sep::Plain)?;
+                self.block += 1;
+            }
+            None if !word.quoted && !word.dynamic && word.text == "}" => {
+                self.end_command(Sep::Plain)?;
+                self.block = self.block.saturating_sub(1);
+            }
             None => self.words.push(word),
         }
+        Ok(())
     }
 
-    fn end_command(&mut self) {
-        self.finish_word();
+    fn end_command(&mut self, sep: Sep) -> Result<(), String> {
+        self.finish_word()?;
         self.pending = None;
         let words = std::mem::take(&mut self.words);
         let redirects = std::mem::take(&mut self.redirects);
         if words.is_empty() && redirects.is_empty() {
-            return;
+            if sep != Sep::Plain {
+                self.prev_sep = sep;
+            }
+            return Ok(());
         }
+        let previous = std::mem::replace(&mut self.prev_sep, sep);
+        let scoped = self.paren > 0
+            || self.block > 0
+            || matches!(previous, Sep::Cond | Sep::Pipe)
+            || matches!(sep, Sep::Pipe | Sep::Amp);
+        let mut lead = 0;
+        while let Some(word) = words.get(lead) {
+            if word.dynamic || word.quoted || !KEYWORDS.contains(&word.text.as_str()) {
+                break;
+            }
+            if BLOCK_OPENERS.contains(&word.text.as_str()) {
+                self.block += 1;
+                if word.text == "for" || word.text == "select" {
+                    if let Some(var) = words.get(lead + 1) {
+                        Rc::make_mut(&mut self.scope).taint(&var.text);
+                    }
+                }
+            }
+            if BLOCK_CLOSERS.contains(&word.text.as_str()) {
+                self.block = self.block.saturating_sub(1);
+            }
+            lead += 1;
+        }
+        let rest = &words[lead..];
+        self.taint_written_variables(rest);
         let start = usize::from(
-            words
-                .first()
+            rest.first()
                 .is_some_and(|w| ASSIGNMENT_BUILTINS.contains(&w.text.as_str())),
         );
         let assignments_only =
-            words.len() > start && words[start..].iter().all(|w| is_assignment(&w.text));
+            rest.len() > start && rest[start..].iter().all(|w| is_assignment(&w.text));
         if assignments_only {
-            for word in &words[start..] {
-                if let Some((name, value)) = word.text.split_once('=') {
-                    let value = (!word.dynamic).then(|| value.to_string());
-                    self.vars.insert(name.to_string(), value);
-                }
+            for word in &rest[start..] {
+                self.record_assignment(word, scoped)?;
             }
             if redirects.is_empty() {
-                return;
+                return Ok(());
             }
-            self.out.push(Simple {
-                words: Vec::new(),
-                redirects,
-                vars: self.vars.clone(),
-            });
-            return;
+            return self.push_simple(Vec::new(), redirects);
         }
+        self.push_simple(words, redirects)
+    }
+
+    fn push_simple(&mut self, words: Vec<Word>, redirects: Vec<Redirect>) -> Result<(), String> {
+        self.budget.count_simple()?;
         self.out.push(Simple {
             words,
             redirects,
-            vars: self.vars.clone(),
+            scope: Rc::clone(&self.scope),
         });
+        Ok(())
+    }
+
+    fn record_assignment(&mut self, word: &Word, scoped: bool) -> Result<(), String> {
+        let (name, value) = word
+            .text
+            .split_once('=')
+            .expect("is_assignment guarantees an equals sign");
+        let base = name.split('[').next().unwrap_or(name).trim_end_matches('+');
+        let compound = name.ends_with('+') || name.contains('[');
+        let scope = Rc::make_mut(&mut self.scope);
+        if scoped || compound {
+            scope.taint(base);
+            return Ok(());
+        }
+        scope.assign(base, (!word.dynamic).then(|| value.to_string()))
+    }
+
+    fn taint_written_variables(&mut self, words: &[Word]) {
+        let scope = Rc::make_mut(&mut self.scope);
+        if words.iter().any(|w| w.text == "eval") {
+            scope.poisoned = true;
+        }
+        let Some(position) = words
+            .iter()
+            .position(|w| VARIABLE_WRITERS.contains(&w.text.as_str()))
+        else {
+            return;
+        };
+        for word in &words[position..] {
+            if word.text.starts_with('-') && word.text.contains('n') {
+                scope.poisoned = true;
+            }
+            let name = word.text.split('=').next().unwrap_or("");
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                scope.taint(name);
+            }
+        }
     }
 
     fn skip_heredocs(&mut self) -> Result<(), String> {
-        for delimiter in std::mem::take(&mut self.heredocs) {
+        for (delimiter, literal, strip) in std::mem::take(&mut self.heredocs) {
             while self.pos < self.chars.len() {
                 let start = self.pos;
                 while self.peek().is_some_and(|c| c != '\n') {
@@ -496,10 +720,15 @@ impl Parser {
                 if self.pos < self.chars.len() {
                     self.pos += 1;
                 }
-                if line.trim_start_matches('\t') == delimiter {
+                let candidate = if strip {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if candidate == delimiter {
                     break;
                 }
-                if line.contains("$(") || line.contains('`') {
+                if !literal && (line.contains("$(") || line.contains('`')) {
                     return Err("heredoc body contains a command substitution".to_string());
                 }
             }
@@ -525,7 +754,7 @@ impl Parser {
             self.cur.clear();
             self.started = false;
         } else {
-            self.finish_word();
+            self.finish_word()?;
         }
         let mut op = String::new();
         if first == '&' {
@@ -564,6 +793,7 @@ impl Parser {
                     Some(next) => {
                         self.cur.push(next);
                         self.started = true;
+                        self.quoted = true;
                         self.pos += 1;
                     }
                     None => {
@@ -575,6 +805,7 @@ impl Parser {
             '\'' => {
                 self.pos += 1;
                 self.started = true;
+                self.quoted = true;
                 loop {
                     match self.peek() {
                         None => return Err("unterminated quote".to_string()),
@@ -592,7 +823,7 @@ impl Parser {
             '"' => self.double_quote()?,
             '$' => self.dollar(false)?,
             '`' => self.backtick()?,
-            '*' | '?' | '{' => {
+            '*' | '?' | '{' | '[' => {
                 self.cur.push(c);
                 self.started = true;
                 self.glob = true;
@@ -610,6 +841,7 @@ impl Parser {
     fn double_quote(&mut self) -> Result<(), String> {
         self.pos += 1;
         self.started = true;
+        self.quoted = true;
         loop {
             match self.peek() {
                 None => return Err("unterminated quote".to_string()),
@@ -641,6 +873,8 @@ impl Parser {
     fn dollar(&mut self, quoted: bool) -> Result<(), String> {
         self.pos += 1;
         match self.peek() {
+            Some('\'') if !quoted => self.ansi_c()?,
+            Some('"') if !quoted => self.double_quote()?,
             Some('(') => {
                 let body = self.read_balanced('(', ')')?;
                 self.substitute(&body)?;
@@ -654,7 +888,7 @@ impl Parser {
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();
                 if !name.is_empty() && name == body {
-                    self.expand(&name, quoted);
+                    self.expand(&name, quoted)?;
                 } else {
                     if body.contains("$(") || body.contains('`') {
                         self.substitute(&body)?;
@@ -676,7 +910,7 @@ impl Parser {
                         break;
                     }
                 }
-                self.expand(&name, quoted);
+                self.expand(&name, quoted)?;
             }
             Some(c) if c.is_ascii_digit() || "@*#?$!-".contains(c) => {
                 self.cur.push('$');
@@ -693,30 +927,103 @@ impl Parser {
         Ok(())
     }
 
-    fn expand(&mut self, name: &str, quoted: bool) {
-        match self.vars.get(name).cloned() {
-            Some(Some(value)) => {
-                if quoted {
-                    self.cur.push_str(&value);
-                    self.started = true;
-                } else {
-                    for ch in value.chars() {
-                        if ch.is_whitespace() {
-                            self.finish_word();
-                        } else {
-                            self.cur.push(ch);
-                            self.started = true;
-                        }
-                    }
+    fn ansi_c(&mut self) -> Result<(), String> {
+        self.pos += 1;
+        self.started = true;
+        self.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated quote".to_string()),
+                Some('\'') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    let decoded = self.ansi_escape()?;
+                    self.cur.push(decoded);
+                }
+                Some(ch) => {
+                    self.cur.push(ch);
+                    self.pos += 1;
                 }
             }
-            _ => {
-                self.cur.push('$');
-                self.cur.push_str(name);
+        }
+    }
+
+    fn ansi_escape(&mut self) -> Result<char, String> {
+        let unsupported = || "unsupported escape in ANSI-C quoting".to_string();
+        let escape = self.peek().ok_or_else(unsupported)?;
+        self.pos += 1;
+        let simple = match escape {
+            'a' => Some('\u{7}'),
+            'b' => Some('\u{8}'),
+            'e' | 'E' => Some('\u{1b}'),
+            'f' => Some('\u{c}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            'v' => Some('\u{b}'),
+            '\\' | '\'' | '"' | '?' => Some(escape),
+            _ => None,
+        };
+        if let Some(decoded) = simple {
+            return Ok(decoded);
+        }
+        let (radix, max, first) = match escape {
+            'x' => (16, 2, None),
+            'u' => (16, 4, None),
+            'U' => (16, 8, None),
+            '0'..='7' => (8, 3, escape.to_digit(8)),
+            _ => return Err(unsupported()),
+        };
+        let mut value = first.unwrap_or(0);
+        let mut digits = usize::from(first.is_some());
+        while digits < max {
+            let Some(digit) = self.peek().and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            value = value * radix + digit;
+            digits += 1;
+            self.pos += 1;
+        }
+        if digits == 0 || value == 0 {
+            return Err(unsupported());
+        }
+        let value = if escape == 'x' || radix == 8 {
+            value & 0xff
+        } else {
+            value
+        };
+        char::from_u32(value).ok_or_else(unsupported)
+    }
+
+    fn expand(&mut self, name: &str, quoted: bool) -> Result<(), String> {
+        let Some(value) = self.scope.lookup(name).map(str::to_string) else {
+            self.cur.push('$');
+            self.cur.push_str(name);
+            self.started = true;
+            self.dynamic = true;
+            return Ok(());
+        };
+        self.budget.charge(value.len())?;
+        if quoted {
+            self.cur.push_str(&value);
+            self.started = true;
+            return Ok(());
+        }
+        for ch in value.chars() {
+            if ch.is_whitespace() {
+                self.finish_word()?;
+            } else {
+                if matches!(ch, '*' | '?' | '[') {
+                    self.glob = true;
+                }
+                self.cur.push(ch);
                 self.started = true;
-                self.dynamic = true;
             }
         }
+        Ok(())
     }
 
     fn backtick(&mut self) -> Result<(), String> {
@@ -786,7 +1093,11 @@ impl Parser {
     }
 
     fn substitute(&mut self, body: &str) -> Result<(), String> {
-        let nested = parse_script(body, self.depth + 1, self.vars.clone())?;
+        let env = Env {
+            scope: Rc::clone(&self.scope),
+            budget: Rc::clone(&self.budget),
+        };
+        let nested = parse_script(body, self.depth + 1, &env)?;
         self.out.extend(nested);
         Ok(())
     }
@@ -794,9 +1105,19 @@ impl Parser {
 
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        let name = name.trim_end_matches('+');
+        let base = match name.split_once('[') {
+            Some((base, subscript)) => {
+                if !subscript.ends_with(']') {
+                    return false;
+                }
+                base
+            }
+            None => name,
+        };
+        !base.is_empty()
+            && !base.starts_with(|c: char| c.is_ascii_digit())
+            && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 
@@ -922,12 +1243,17 @@ fn strip_prefixes(words: &[Word]) -> Result<(&[Word], bool), String> {
 fn inspect_simple(
     simple: &Simple,
     depth: usize,
+    budget: &Rc<Budget>,
     written: &mut HashSet<String>,
 ) -> Result<(), String> {
     for redirect in &simple.redirects {
         inspect_redirect(redirect, written)?;
     }
-    inspect_words(&simple.words, &simple.vars, depth, written)
+    let env = Env {
+        scope: Rc::clone(&simple.scope),
+        budget: Rc::clone(budget),
+    };
+    inspect_words(&simple.words, &env, depth, written)
 }
 
 fn inspect_redirect(redirect: &Redirect, written: &mut HashSet<String>) -> Result<(), String> {
@@ -959,10 +1285,13 @@ fn inspect_redirect(redirect: &Redirect, written: &mut HashSet<String>) -> Resul
 
 fn inspect_words(
     words: &[Word],
-    vars: &Vars,
+    env: &Env,
     depth: usize,
     written: &mut HashSet<String>,
 ) -> Result<(), String> {
+    if depth > MAX_NESTING {
+        return Err("nests shells too deeply to review".to_string());
+    }
     let (words, xargs) = strip_prefixes(words)?;
     let Some(first) = words.first() else {
         return Ok(());
@@ -1005,17 +1334,18 @@ fn inspect_words(
         ));
     }
     if SHELLS.contains(&program) {
-        return inspect_shell(args, vars, depth);
+        return inspect_shell(args, env, depth);
     }
     match program {
-        "eval" => return inspect_eval(args, vars, depth),
+        "eval" => return inspect_eval(args, env, depth),
         "source" | "." => return Err("sources a script that cannot be reviewed".to_string()),
-        "trap" => return inspect_trap(args, vars, depth),
+        "trap" => return inspect_trap(args, env, depth),
         "rm" => return inspect_rm(args),
         "git" => return inspect_git(args),
         "gh" => return inspect_gh(args),
-        "find" => return inspect_find(args, vars, depth, written),
+        "find" => return inspect_find(args, env, depth, written),
         "kill" => return inspect_kill(args),
+        "alias" => return Err("defines an alias that cannot be reviewed".to_string()),
         _ => {}
     }
     if DOCKER_BINARIES.contains(&program) {
@@ -1028,7 +1358,7 @@ fn inspect_words(
     inspect_interpreter(program, args, written)
 }
 
-fn inspect_shell(args: &[Word], vars: &Vars, depth: usize) -> Result<(), String> {
+fn inspect_shell(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
     let mut i = 0;
     let mut code = None;
     while let Some(arg) = args.get(i) {
@@ -1060,25 +1390,25 @@ fn inspect_shell(args: &[Word], vars: &Vars, depth: usize) -> Result<(), String>
     if code.dynamic {
         return Err("runs a shell command string that cannot be resolved".to_string());
     }
-    inspect_script(&code.text, depth + 1, vars.clone())
+    inspect_script(&code.text, depth + 1, env)
 }
 
-fn inspect_eval(args: &[Word], vars: &Vars, depth: usize) -> Result<(), String> {
+fn inspect_eval(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
     if args.iter().any(|a| a.dynamic) {
         return Err("`eval` of a value that cannot be resolved".to_string());
     }
     let joined: Vec<&str> = args.iter().map(|a| a.text.as_str()).collect();
-    inspect_script(&joined.join(" "), depth + 1, vars.clone())
+    inspect_script(&joined.join(" "), depth + 1, env)
 }
 
-fn inspect_trap(args: &[Word], vars: &Vars, depth: usize) -> Result<(), String> {
+fn inspect_trap(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
     let Some(handler) = positionals(args).into_iter().next() else {
         return Ok(());
     };
     if handler.dynamic {
         return Err("`trap` handler cannot be resolved".to_string());
     }
-    inspect_script(&handler.text, depth + 1, vars.clone())
+    inspect_script(&handler.text, depth + 1, env)
 }
 
 fn inspect_rm(args: &[Word]) -> Result<(), String> {
@@ -1120,7 +1450,7 @@ fn inspect_kill(args: &[Word]) -> Result<(), String> {
 
 fn inspect_find(
     args: &[Word],
-    vars: &Vars,
+    env: &Env,
     depth: usize,
     written: &mut HashSet<String>,
 ) -> Result<(), String> {
@@ -1143,7 +1473,7 @@ fn inspect_find(
                 .cloned()
                 .collect();
             i += inner.len() + 1;
-            inspect_words(&inner, vars, depth, written)?;
+            inspect_words(&inner, env, depth + 1, written)?;
         }
         i += 1;
     }
@@ -1561,5 +1891,177 @@ fn inspect_gh_api(args: &[Word]) -> Result<(), String> {
         Some(other) => Err(format!("`gh api -X {other}` mutates remote state")),
         None if has_fields => Err("`gh api` with fields is an implicit POST".to_string()),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    fn run(command: &str) -> Result<(), String> {
+        inspect("run_command", &json!({ "command": command }))
+    }
+
+    fn blocked(command: &str, needle: &str) {
+        match run(command) {
+            Ok(()) => panic!("expected `{command}` to be refused ({needle})"),
+            Err(message) => assert!(
+                message.contains(needle),
+                "`{command}` refused with `{message}`, wanted `{needle}`"
+            ),
+        }
+    }
+
+    fn allowed(command: &str) {
+        if let Err(message) = run(command) {
+            panic!("expected `{command}` to be allowed, refused with `{message}`");
+        }
+    }
+
+    fn blocked_quickly(command: String, needle: &str) {
+        let started = Instant::now();
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || run(&command))
+            .unwrap()
+            .join()
+            .expect("inspection must not overflow the stack");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        let message = outcome.expect_err("must fail closed");
+        assert!(message.contains(needle), "{message}");
+    }
+
+    #[test]
+    fn deeply_nested_find_exec_fails_closed_without_overflowing_the_stack() {
+        blocked_quickly("find . -exec ".repeat(1100), "nests");
+    }
+
+    #[test]
+    fn exponential_variable_doubling_fails_closed_quickly() {
+        let mut script = String::from("a=xxxxxxxx;");
+        script.push_str(&"a=$a$a;".repeat(30));
+        script.push_str("echo $a");
+        blocked_quickly(script, "too large");
+    }
+
+    #[test]
+    fn many_alternating_assignments_and_commands_fail_closed_quickly() {
+        let mut script = String::new();
+        for i in 0..4000 {
+            script.push_str(&format!("a{i}=xxxxxxxxxxxxxxxx; echo $a{i};"));
+        }
+        blocked_quickly(script, "too");
+    }
+
+    #[test]
+    fn oversized_scripts_are_refused() {
+        blocked_quickly("echo x;".repeat(100_000), "too large");
+    }
+
+    #[test]
+    fn a_large_but_bounded_variable_table_is_refused() {
+        let mut script = String::new();
+        for i in 0..200 {
+            script.push_str(&format!("v{i}={};", "y".repeat(100)));
+        }
+        blocked_quickly(script, "variable table");
+    }
+
+    #[test]
+    fn subshell_assignments_do_not_leak() {
+        blocked("X=curl; (X=ls); $X x", "cannot be resolved");
+    }
+
+    #[test]
+    fn conditional_assignments_do_not_leak() {
+        blocked("X=curl; false && X=ls; $X x", "cannot be resolved");
+        blocked("X=curl; true || X=ls; $X x", "cannot be resolved");
+    }
+
+    #[test]
+    fn pipeline_assignments_do_not_leak() {
+        blocked("X=curl; echo | X=ls; $X x", "cannot be resolved");
+        blocked("X=curl; X=ls | cat; $X x", "cannot be resolved");
+        blocked("X=curl; X=ls & $X x", "cannot be resolved");
+    }
+
+    #[test]
+    fn block_and_function_assignments_taint_the_name_permanently() {
+        blocked("X=ls; if true; then X=curl; fi; $X x", "cannot be resolved");
+        blocked("f() { X=curl; }; X=ls; f; $X x", "cannot be resolved");
+        blocked(
+            "X=ls; for i in 1; do X=curl; done; X=ls; $X x",
+            "cannot be resolved",
+        );
+        blocked(
+            "X=ls; while true; do X=curl; done; $X x",
+            "cannot be resolved",
+        );
+    }
+
+    #[test]
+    fn loop_variables_and_reads_are_unknown() {
+        blocked("for m in curl; do $m x; done", "cannot be resolved");
+        blocked("X=ls; read X <<< curl; $X x", "cannot be resolved");
+        blocked("X=ls; mapfile X < f; $X x", "cannot be resolved");
+        blocked("X=ls; unset X; $X x", "cannot be resolved");
+        blocked("X=ls; printf -v X curl; $X x", "cannot be resolved");
+        blocked("X=ls; let X=1; $X x", "cannot be resolved");
+        blocked("X=ls; eval 'X=curl'; $X x", "cannot be resolved");
+        blocked("X=ls; declare -n X=Y; $X x", "cannot be resolved");
+    }
+
+    #[test]
+    fn straight_line_assignments_are_still_resolved() {
+        blocked("X=curl; $X x", "can send data");
+        blocked("export X=curl; $X x", "can send data");
+        allowed("X=ls; $X -la");
+        allowed("if true; then echo hi; fi");
+        allowed("for i in 1 2; do echo $i; done");
+    }
+
+    #[test]
+    fn ansi_c_and_locale_quoting_are_decoded() {
+        blocked("$'curl' x", "can send data");
+        blocked("$'\\x63url' x", "can send data");
+        blocked("$'\\143url' x", "can send data");
+        blocked("$'\\u0063url' x", "can send data");
+        blocked("$\"curl\" x", "can send data");
+        blocked("cu$''rl x", "can send data");
+        blocked("c$'u'rl x", "can send data");
+        allowed("echo $'a\\tb\\n'");
+        allowed("echo \"cost: $5\"");
+    }
+
+    #[test]
+    fn undecodable_ansi_c_escapes_fail_closed() {
+        blocked("echo $'\\cA'", "ANSI-C");
+        blocked("echo $'\\x'", "ANSI-C");
+        blocked("echo $'\\x00'", "ANSI-C");
+        blocked("echo $'abc", "unterminated");
+        blocked("echo $'\\", "ANSI-C");
+    }
+
+    #[test]
+    fn function_bodies_are_reviewed() {
+        blocked("function f { curl x; }; f", "can send data");
+        blocked("function f { rm -rf /; }; f", "outside");
+        blocked("f() { curl x; }; f", "can send data");
+        blocked("{ curl x; }", "can send data");
+        allowed("f() { echo hi; }; f");
+        allowed("echo '{' '}'");
+    }
+
+    #[test]
+    fn alias_and_coproc() {
+        blocked("alias c=curl; c x", "alias");
+        blocked("coproc curl x", "can send data");
+        blocked("time -p curl x", "can send data");
     }
 }
