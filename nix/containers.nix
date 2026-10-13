@@ -25,20 +25,45 @@ let
     WorkingDir = "/workspace";
   };
 
+  devToolPaths = [
+    pkgs.bash
+    pkgs.coreutils
+    pkgs.git
+    pkgs.cacert
+    pkgs.pkg-config
+    pkgs.openssl
+    pkgs.stdenv.cc
+    pkgs.libssh2
+    pkgs.zlib
+  ];
+
+  devEnvPathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
+
+  devToolEnv = pkgs.buildEnv {
+    name = "dev-tool-env";
+    paths = devToolPaths;
+    pathsToLink = devEnvPathsToLink;
+  };
+
   devContainerConfigFile = pkgs.writeText "dev-container-config.json" (builtins.toJSON devContainerConfig);
 
   devContainerCmdCheck = pkgs.runCommand "dev-container-cmd-check" {
     nativeBuildInputs = [ pkgs.jq ];
-    closure = pkgs.closureInfo { rootPaths = [ devContainerConfigFile ]; };
+    closure = pkgs.closureInfo { rootPaths = [ devToolEnv ]; };
     config = devContainerConfigFile;
+    toolEnv = devToolEnv;
   } ''
     cmd=$(jq -r '.Cmd[0]' "$config")
     if [ ! -x "$cmd" ]; then
       echo "dev container Cmd[0] is not an executable file: $cmd" >&2
       exit 1
     fi
+    if [ ! -x "$toolEnv/bin/sleep" ]; then
+      echo "sleep is not executable at /bin/sleep in the dev image root: $toolEnv/bin/sleep" >&2
+      exit 1
+    fi
     if ! grep -qxF "$(echo "$cmd" | cut -d/ -f1-4)" "$closure/store-paths"; then
-      echo "dev container Cmd[0] store path is not in the image closure: $cmd" >&2
+      echo "dev container Cmd[0] store path is not in the dev image closure: $cmd" >&2
       exit 1
     fi
     touch "$out"
@@ -92,17 +117,8 @@ let
         pkgs.cargo-audit
         pkgs.cargo-deny
         pkgs.cargo-tarpaulin
-        pkgs.bash
-        pkgs.coreutils
-        pkgs.git
-        pkgs.cacert
-        pkgs.pkg-config
-        pkgs.openssl
-        pkgs.stdenv.cc
-        pkgs.libssh2
-        pkgs.zlib
-      ];
-      pathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
+      ] ++ devToolPaths;
+      pathsToLink = devEnvPathsToLink;
     };
 
     config = devContainerConfig;
