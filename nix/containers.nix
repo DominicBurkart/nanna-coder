@@ -13,6 +13,37 @@
 }:
 
 let
+  devContainerConfig = {
+    Cmd = [ "${pkgs.coreutils}/bin/sleep" "infinity" ];
+    Env = [
+      "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      "PATH=/bin"
+      "CARGO_HOME=/tmp/cargo"
+      "PKG_CONFIG_PATH=/lib/pkgconfig"
+      "RUST_LOG=info"
+    ];
+    WorkingDir = "/workspace";
+  };
+
+  devContainerConfigFile = pkgs.writeText "dev-container-config.json" (builtins.toJSON devContainerConfig);
+
+  devContainerCmdCheck = pkgs.runCommand "dev-container-cmd-check" {
+    nativeBuildInputs = [ pkgs.jq ];
+    closure = pkgs.closureInfo { rootPaths = [ devContainerConfigFile ]; };
+    config = devContainerConfigFile;
+  } ''
+    cmd=$(jq -r '.Cmd[0]' "$config")
+    if [ ! -x "$cmd" ]; then
+      echo "dev container Cmd[0] is not an executable file: $cmd" >&2
+      exit 1
+    fi
+    if ! grep -qxF "$(echo "$cmd" | cut -d/ -f1-4)" "$closure/store-paths"; then
+      echo "dev container Cmd[0] store path is not in the image closure: $cmd" >&2
+      exit 1
+    fi
+    touch "$out"
+  '';
+
   # Container image for the harness CLI
   harnessImage = nix2containerPkgs.nix2container.buildImage {
     name = "nanna-coder-harness";
@@ -74,17 +105,7 @@ let
       pathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
     };
 
-    config = {
-      Cmd = [ "${pkgs.coreutils}/bin/sleep" "infinity" ];
-      Env = [
-        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        "PATH=/bin"
-        "CARGO_HOME=/tmp/cargo"
-        "PKG_CONFIG_PATH=/lib/pkgconfig"
-        "RUST_LOG=info"
-      ];
-      WorkingDir = "/workspace";
-    };
+    config = devContainerConfig;
 
     maxLayers = 100;
   };
@@ -377,6 +398,6 @@ let
 
 in
 {
-  inherit harnessImage ollamaImage vllmImage devContainerImage;
+  inherit harnessImage ollamaImage vllmImage devContainerImage devContainerCmdCheck;
   inherit modelRegistry models strictModels containers;
 }
