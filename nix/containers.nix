@@ -79,7 +79,7 @@ let
       Env = [
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "PATH=/bin"
-        "CARGO_HOME=/tmp/cargo"
+        "CARGO_HOME=${(builtins.fromTOML (builtins.readFile ../harness/dev-container.toml)).cargo_home}"
         "PKG_CONFIG_PATH=/lib/pkgconfig"
         "RUST_LOG=info"
       ];

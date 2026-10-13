@@ -27,7 +27,29 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
-const CONTAINER_CARGO_HOME: &str = "/tmp/cargo";
+const DEV_CONTAINER_CONFIG: &str = include_str!("../dev-container.toml");
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevContainerConfig {
+    cargo_home: String,
+}
+
+fn parse_cargo_home(src: &str) -> Result<String, WorkspaceError> {
+    let config: DevContainerConfig = toml::from_str(src)
+        .map_err(|e| WorkspaceError::InvalidDevContainerConfig(e.to_string()))?;
+    if !Path::new(&config.cargo_home).is_absolute() {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "cargo_home must be an absolute path, got {:?}",
+            config.cargo_home
+        )));
+    }
+    Ok(config.cargo_home)
+}
+
+fn container_cargo_home() -> Result<String, WorkspaceError> {
+    parse_cargo_home(DEV_CONTAINER_CONFIG)
+}
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -43,6 +65,8 @@ pub enum WorkspaceError {
     FormatPatchFailed(String),
     #[error("Container setup failed: {0}")]
     ContainerSetupFailed(String),
+    #[error("Invalid harness/dev-container.toml: {0}")]
+    InvalidDevContainerConfig(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -250,6 +274,7 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
+        let cargo_home = container_cargo_home()?;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -278,7 +303,7 @@ impl TaskWorkspace {
         let container_name = format!("nanna-task-{}", task_id);
         let mut additional_args = vec![
             worktree_mount_arg(&workspace_path),
-            format!("--tmpfs={CONTAINER_CARGO_HOME}:rw,mode=1777"),
+            format!("--tmpfs={cargo_home}:rw,mode=1777"),
         ];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
@@ -1281,9 +1306,37 @@ mod tests {
     }
 
     #[test]
-    fn test_container_cargo_home_matches_the_dev_image_env() {
-        let nix = include_str!("../../nix/containers.nix");
-        assert!(nix.contains(&format!("\"CARGO_HOME={CONTAINER_CARGO_HOME}\"")));
+    fn test_parse_cargo_home_accepts_an_absolute_path() {
+        assert_eq!(
+            parse_cargo_home("cargo_home = \"/opt/cargo\"\n").unwrap(),
+            "/opt/cargo"
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_home_rejects_invalid_config() {
+        for src in [
+            "",
+            "cargo_home = \"relative/cargo\"",
+            "cargo_home = \"\"",
+            "cargo_home = 3",
+            "cargo_home = \"/tmp/cargo\"\nextra = 1",
+            "not toml at all =",
+        ] {
+            let err = parse_cargo_home(src).unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::InvalidDevContainerConfig(_)),
+                "{src:?} -> {err:?}"
+            );
+            assert!(err.to_string().contains("dev-container.toml"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_shipped_dev_container_config_parses_to_the_tmp_cargo_home() {
+        let home = container_cargo_home().unwrap();
+        assert_eq!(home, "/tmp/cargo");
+        assert!(Path::new(&home).is_absolute());
     }
 
     #[tokio::test]
@@ -1320,7 +1373,8 @@ mod tests {
             let args = config.run_args(&runtime, "mock-image:latest");
             assert!(
                 args.iter()
-                    .any(|a| *a == format!("--tmpfs={CONTAINER_CARGO_HOME}:rw,mode=1777")),
+                    .any(|a| *a
+                        == format!("--tmpfs={}:rw,mode=1777", container_cargo_home().unwrap())),
                 "{args:?}"
             );
             assert!(!args.iter().any(|a| a == "--privileged"));
