@@ -507,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     fn bring_up_command_requires_flake_for_nix_path() {
         // Non-existent dir → no flake.nix → nix path NOT chosen even when
         // `nix` is on PATH. (The fallback may still kick in via
@@ -527,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     fn bring_up_command_picks_nix_when_flake_present() {
         // Skip if `nix` is not on PATH (CI without nix shouldn't false-fail).
         if which::which("nix").is_err() {

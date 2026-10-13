@@ -346,7 +346,7 @@ pub fn repo_slug(url: &str) -> Option<String> {
     Some(format!("{}/{owner}/{name}", host.to_ascii_lowercase()))
 }
 
-fn origin_slug(repo_path: &Path) -> Option<String> {
+pub fn origin_slug(repo_path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -357,6 +357,28 @@ fn origin_slug(repo_path: &Path) -> Option<String> {
         return None;
     }
     repo_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether `label` (a path, a remote URL or `host/owner/name`) names the
+/// repository checked out at `repo_path`: either the same path, or the same
+/// `origin` slug.
+///
+/// ```
+/// use harness::scope::names_repo;
+/// use std::path::Path;
+///
+/// assert!(names_repo("/work/repo", Path::new("/work/repo")));
+/// assert!(!names_repo("github.com/example/repo", Path::new("/no/such/checkout")));
+/// ```
+pub fn names_repo(label: &str, repo_path: &Path) -> bool {
+    if Path::new(label) == repo_path {
+        return true;
+    }
+    let Some(origin) = origin_slug(repo_path) else {
+        return false;
+    };
+    let wanted = repo_slug(label).unwrap_or_else(|| label.to_string());
+    wanted.eq_ignore_ascii_case(&origin)
 }
 
 /// Refuse a task whose target repository is not in the identity's
@@ -414,7 +436,7 @@ pub fn relative_to<'a>(path: &'a Path, workspace_root: &Path) -> &'a Path {
     path.strip_prefix(workspace_root).unwrap_or(path)
 }
 
-fn denial_path(relative: &Path) -> String {
+pub(crate) fn denial_path(relative: &Path) -> String {
     relative
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
@@ -481,7 +503,7 @@ pub fn validate_path_within_workspace(path: &Path, workspace_root: &Path) -> Too
 fn existing_ancestor(path: &Path) -> (PathBuf, PathBuf) {
     let mut ancestor = path.to_path_buf();
     let mut remainder = PathBuf::new();
-    while !ancestor.exists() {
+    while ancestor.symlink_metadata().is_err() {
         let name = ancestor.file_name().map(PathBuf::from).unwrap_or_default();
         remainder = name.join(&remainder);
         if !ancestor.pop() {
@@ -1172,6 +1194,120 @@ mod tests {
         assert_eq!(ancestor, Path::new(""));
     }
 
+    #[cfg(unix)]
+    fn assert_write_rejected(scope: Option<&PathScope>, path: &str, root: &Path) {
+        let result = resolve_path(
+            scope,
+            "write_file",
+            PathAccess::Write,
+            Path::new(path),
+            root,
+        );
+        assert!(
+            matches!(result, Err(ToolError::PathSecurityViolation { .. })),
+            "{path}: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_leaf_pointing_outside_the_workspace_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("planted");
+        std::os::unix::fs::symlink(&target, root.join("api/dangling")).unwrap();
+        assert_write_rejected(None, "api/dangling", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/dangling", root);
+        assert!(validate_path_for_write(Path::new("api/dangling"), root).is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_a_protected_path_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("docs/new.md"), root.join("api/sneaky")).unwrap();
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/sneaky", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_directory_component_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("nope"), root.join("api/dir")).unwrap();
+        assert_write_rejected(None, "api/dir/file.rs", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/dir/file.rs", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_an_existing_outside_file_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("existing");
+        std::fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("api/link")).unwrap();
+        assert_write_rejected(None, "api/link", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/link", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_chain_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("planted"), root.join("api/b")).unwrap();
+        std::os::unix::fs::symlink(root.join("api/b"), root.join("api/a")).unwrap();
+        assert_write_rejected(None, "api/a", root);
+        assert_write_rejected(Some(&scope(&["api/**"], None)), "api/a", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_is_rejected_for_writes() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("api/y"), root.join("api/x")).unwrap();
+        std::os::unix::fs::symlink(root.join("api/x"), root.join("api/y")).unwrap();
+        assert_write_rejected(None, "api/x", root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_valid_in_workspace_symlinks_and_new_paths_still_succeed() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("api/lib.rs"), root.join("api/alias")).unwrap();
+        let scope = scope(&["api/**"], None);
+        for path in ["api/alias", "api/fresh.rs", "api/new/deep/fresh.rs"] {
+            let result = resolve_path(
+                Some(&scope),
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            );
+            assert_eq!(result.unwrap(), root.join(path));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_ancestor_treats_a_dangling_symlink_as_existing() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join("gone"), root.join("api/dangling")).unwrap();
+        let (ancestor, remainder) = existing_ancestor(&root.join("api/dangling"));
+        assert_eq!(ancestor, root.join("api/dangling"));
+        assert_eq!(remainder, Path::new(""));
+    }
+
     fn segment() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_]{0,6}(\\.[a-z]{1,3})?"
     }
@@ -1285,6 +1421,32 @@ mod tests {
         std::os::unix::fs::symlink(root.join(".nanna"), root.join("cfg")).unwrap();
         let violation = protected_error(guarded(None, PathAccess::Write, "cfg/x.toml", root));
         assert_eq!(violation.path, ".nanna/x.toml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_a_protected_root_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join(".nanna/agents/x.toml"), root.join("leaf")).unwrap();
+        std::os::unix::fs::symlink(root.join(".nanna/missing"), root.join("dir")).unwrap();
+        let all = scope(&["**"], None);
+        for (scope, path) in [
+            (None, "leaf"),
+            (None, "dir/x.toml"),
+            (Some(&all), "leaf"),
+            (Some(&all), "dir/x.toml"),
+        ] {
+            let result = guarded(scope, PathAccess::Write, path, root);
+            assert!(
+                matches!(
+                    result,
+                    Err(ToolError::ProtectedPath(_)) | Err(ToolError::PathSecurityViolation { .. })
+                ),
+                "{path}: {result:?}"
+            );
+        }
+        assert!(!root.join(".nanna").exists());
     }
 
     #[test]
@@ -1432,5 +1594,22 @@ mod tests {
         open_identity.scope.repos.clear();
         let listed = repo_with_origin(Some("https://github.com/example/repo"));
         assert!(check_repo(&open_identity, listed.path()).is_err());
+    }
+
+    #[test]
+    fn names_repo_matches_a_path_or_the_origin_slug() {
+        let repo = repo_with_origin(Some("git@github.com:Example/Repo.git"));
+        let path = repo.path();
+        assert!(names_repo(&path.display().to_string(), path));
+        assert!(names_repo("github.com/example/repo", path));
+        assert!(names_repo("https://github.com/example/repo.git", path));
+        assert!(!names_repo("github.com/example/other", path));
+        assert!(!names_repo("/some/other/path", path));
+        let no_remote = repo_with_origin(None);
+        assert!(!names_repo("github.com/example/repo", no_remote.path()));
+        assert!(names_repo(
+            &no_remote.path().display().to_string(),
+            no_remote.path()
+        ));
     }
 }

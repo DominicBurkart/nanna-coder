@@ -528,7 +528,17 @@ async fn run_agent_subprocess(
 }
 
 fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
-    if let Ok(p) = std::env::var("NANNA_HARNESS_BIN") {
+    locate_nanna_binary_in(
+        std::env::var("NANNA_HARNESS_BIN").ok(),
+        std::env::var_os("PATH"),
+    )
+}
+
+fn locate_nanna_binary_in(
+    env_bin: Option<String>,
+    search_path: Option<std::ffi::OsString>,
+) -> Result<PathBuf, EvalRunnerError> {
+    if let Some(p) = env_bin {
         let path = PathBuf::from(p);
         // Reject directories: `path.exists()` alone matches a bare dir,
         // and the subsequent `cmd.output()` would then fail with a cryptic
@@ -540,7 +550,8 @@ fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
         }
         return Ok(path);
     }
-    which::which("nanna").map_err(|_| EvalRunnerError::BinaryNotFound)
+    let cwd = std::env::current_dir().map_err(|_| EvalRunnerError::BinaryNotFound)?;
+    which::which_in("nanna", search_path, cwd).map_err(|_| EvalRunnerError::BinaryNotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,25 +1708,37 @@ tags = ["{tag}"]
         assert_eq!(result.token_usage.total_tokens, 12);
     }
 
-    #[tokio::test]
-    #[serial_test::serial(nanna_harness_bin_env)]
-    async fn locate_nanna_binary_falls_back_to_which_when_env_unset() {
-        let key = "NANNA_HARNESS_BIN";
-        let saved_bin = std::env::var(key).ok();
-        std::env::remove_var(key);
-        let saved_path = std::env::var("PATH").ok();
+    #[test]
+    fn locate_nanna_binary_falls_back_to_which_when_env_unset() {
         let empty_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PATH", empty_dir.path());
-        let result = locate_nanna_binary();
-        match saved_bin {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        match saved_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        let result = locate_nanna_binary_in(None, Some(empty_dir.path().into()));
         assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_nanna_binary_finds_nanna_on_the_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nanna");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let found = locate_nanna_binary_in(None, Some(dir.path().into())).unwrap();
+        assert_eq!(found.file_name().unwrap(), "nanna");
+    }
+
+    #[test]
+    fn locate_nanna_binary_prefers_the_env_override_over_the_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fake-nanna");
+        std::fs::write(&bin, "x").unwrap();
+        let found = locate_nanna_binary_in(
+            Some(bin.to_str().unwrap().to_string()),
+            Some(std::ffi::OsString::new()),
+        )
+        .unwrap();
+        assert_eq!(found, bin);
     }
 
     #[test]

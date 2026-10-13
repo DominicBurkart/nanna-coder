@@ -1,4 +1,5 @@
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
+use crate::auditor::Allowed;
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
@@ -7,6 +8,7 @@ use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
+use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
     QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
@@ -105,6 +107,8 @@ pub struct TaskResult {
     pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
+    #[serde(default)]
+    pub qa_summary: QaSummary,
 }
 
 impl TaskResult {
@@ -135,6 +139,7 @@ impl TaskResult {
             "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "qa_summary": self.qa_summary.to_json(),
         })
     }
 }
@@ -302,6 +307,30 @@ struct TaskRunner {
     bound: RwLock<HashMap<TaskId, AgentIdentity>>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
+}
+
+/// Why [`TaskManager::submit_spawn`] refused to dispatch an audited spawn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpawnRefused {
+    /// The target repository is not the one the spawn was audited against.
+    #[error("spawn audited for repository `{audited}` cannot run against `{target}`")]
+    RepoMismatch {
+        /// The repository the auditor reviewed.
+        audited: String,
+        /// The path the caller asked to run against.
+        target: String,
+    },
+    /// The model is not the one the spawn was audited against.
+    #[error("spawn audited for model `{audited}` cannot run with model `{requested}`")]
+    ModelMismatch {
+        /// The model on the audited identity's card.
+        audited: String,
+        /// The model the caller asked for.
+        requested: String,
+    },
+    /// The audited identity's `scope.repos` does not list the target.
+    #[error(transparent)]
+    OutsideScope(#[from] crate::scope::ScopeError),
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -574,6 +603,53 @@ impl TaskManager {
         for identity in catalog.iter() {
             self.register_identity(identity.clone()).await;
         }
+    }
+
+    /// Submit a spawn the planner obtained an [`Allowed`] proof for.
+    ///
+    /// The proof binds the identity, the repository and the model the
+    /// auditor reviewed, and this function refuses to dispatch against
+    /// anything else: the target must be the audited repository
+    /// ([`SpawnRefused::RepoMismatch`]) and be listed in the identity's
+    /// `scope.repos` ([`SpawnRefused::OutsideScope`]), and `model` must be
+    /// the identity's model ([`SpawnRefused::ModelMismatch`]). The subtask
+    /// text becomes the task description and the task runs under the audited
+    /// identity exactly as [`TaskManager::submit_with_identity`] would run it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_spawn(
+        &self,
+        allowed: Allowed,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<TaskId, SpawnRefused> {
+        if !crate::scope::names_repo(allowed.repo(), &repo_path) {
+            return Err(SpawnRefused::RepoMismatch {
+                audited: allowed.repo().to_string(),
+                target: repo_path.display().to_string(),
+            });
+        }
+        if model != allowed.model() {
+            return Err(SpawnRefused::ModelMismatch {
+                audited: allowed.model().to_string(),
+                requested: model,
+            });
+        }
+        crate::scope::check_repo(allowed.identity(), &repo_path)?;
+        let (request, identity) = allowed.into_parts();
+        Ok(self
+            .submit_with_identity(
+                request.subtask,
+                repo_path,
+                branch,
+                model,
+                max_iterations,
+                provider,
+                Some(identity),
+            )
+            .await)
     }
 
     /// Submit a task that, when `identity` is present, runs under exactly that
@@ -968,12 +1044,29 @@ impl TaskRunner {
                     return;
                 }
             };
-            TaskWorkspace::create_with_container_networked(
+            let sidecars = match crate::onboarding::fullstack::start_task_sidecars(
+                crate::container::detect_runtime(),
+                Arc::new(crate::sidecar::SystemRunner),
+                &queued.repo_path,
+                &task_id.0,
+                crate::sidecar::ReadinessConfig::default(),
+            )
+            .await
+            {
+                Ok(sidecars) => sidecars,
+                Err(e) => {
+                    self.fail(&task_id, e.to_string(), "SidecarSetupFailed")
+                        .await;
+                    return;
+                }
+            };
+            TaskWorkspace::create_with_container_and_sidecars(
                 &queued.repo_path,
                 &task_id.0,
                 &queued.branch,
                 &image_ref,
                 network_policy_for(identity.as_ref()),
+                sidecars,
             )
             .await
             .map_err(|e| e.to_string())
@@ -1024,6 +1117,7 @@ impl TaskRunner {
             Err(WorkspaceError::ProtectedPath(_)) => None,
             _ => workspace.format_patch().ok().flatten(),
         };
+        let qa_summary = workspace.persist_qa_summary();
 
         let _ = workspace.cleanup();
 
@@ -1054,6 +1148,7 @@ impl TaskRunner {
                     denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    qa_summary,
                 };
                 self.set_status(
                     &task_id,
@@ -1264,6 +1359,7 @@ mod tests {
             }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1281,6 +1377,24 @@ mod tests {
         assert_eq!(json["iterations"], 3);
         assert!(json["changes_patch"].is_string());
         assert!(json["format_patch"].is_string());
+        assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
+        assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_task_result_qa_summary_defaults_when_absent_from_stored_json() {
+        let stored = serde_json::json!({
+            "result_summary": "Done",
+            "changes_patch": null,
+            "format_patch": null,
+            "files_modified": [],
+            "tool_calls_made": [],
+            "iterations": 1,
+            "model_used": "qwen3:0.6b",
+        });
+        let result: TaskResult = serde_json::from_value(stored).unwrap();
+        assert!(result.qa_summary.is_empty());
+        assert_eq!(result.qa_summary, QaSummary::default());
     }
 
     #[test]
@@ -1351,6 +1465,7 @@ mod tests {
             denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            qa_summary: QaSummary::default(),
         }
     }
 
@@ -2008,6 +2123,76 @@ mod tests {
                 "task did not complete within 5 s"
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_submit_records_sidecar_setup_failure() {
+        let fake = crate::test_support::FakePodman::install_async(Some("network create")).await;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response("Task complete!")]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+        copy_tree(&fixture, repo_dir.path());
+        std::fs::write(repo_dir.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir_all(repo_dir.path().join(".devcontainer")).unwrap();
+
+        let canonical = repo_dir.path().canonicalize().unwrap();
+        {
+            let mut cache = manager.runner.image_cache.write().await;
+            cache.insert(canonical, "pre-built:latest".to_string());
+        }
+
+        let task_id = manager
+            .submit(
+                "Test task".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "test-model".to_string(),
+                10,
+                provider,
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running { .. }
+            ) {
+                let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+                    panic!("expected Failed, got {:?}", task.status);
+                };
+                assert_eq!(diagnostics.error_type, "SidecarSetupFailed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not complete within 10 s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("network create nanna-task-")));
+    }
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
         }
     }
 
@@ -2980,6 +3165,7 @@ mod identity_tests {
 
     #[tokio::test]
     async fn test_submit_with_identity_starts_the_container_with_its_network_policy() {
+        let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("https://github.com/example/repo.git");
         std::fs::write(repo.path().join("flake.nix"), "{}").unwrap();
         std::fs::create_dir(repo.path().join(".devcontainer")).unwrap();
@@ -3237,6 +3423,169 @@ mod identity_tests {
                 assert_eq!(diagnostics.to_json()["denials"], serde_json::json!([]));
             }
             other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::scheduler_tests::git_repo;
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    use crate::identity::{DevLoop, IdentityCatalog};
+
+    fn context() -> AuditContext {
+        let catalog = IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        AuditContext::new(catalog, auditor).unwrap()
+    }
+
+    fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        repo
+    }
+
+    async fn allowed_for(repo_label: &str) -> Allowed {
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", repo_label),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        gate.check(request, &context()).await.unwrap()
+    }
+
+    fn provider() -> Arc<dyn ModelProvider> {
+        MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+            "done",
+        )]))
+    }
+
+    #[tokio::test]
+    async fn test_allowed_binds_the_audited_repo_and_model() {
+        let allowed = allowed_for("github.com/example/repo").await;
+        assert_eq!(allowed.repo(), "github.com/example/repo");
+        assert_eq!(allowed.model(), "gemma4:e4b");
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_repo_other_than_the_audited_one() {
+        let repo_a = repo_with_origin("https://github.com/example/repo.git");
+        let repo_b = repo_with_origin("https://github.com/example/other.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+        assert!(crate::scope::names_repo(allowed.repo(), repo_a.path()));
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                repo_b.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            SpawnRefused::RepoMismatch {
+                audited: "github.com/example/repo".to_string(),
+                target: repo_b.path().display().to_string(),
+            }
+        );
+        assert!(refused.to_string().contains("github.com/example/repo"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_model_other_than_the_audited_one() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "some-other-model".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            SpawnRefused::ModelMismatch {
+                audited: "gemma4:e4b".to_string(),
+                requested: "some-other-model".to_string(),
+            }
+        );
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_refuses_a_repo_outside_the_identity_scope() {
+        let other = repo_with_origin("https://github.com/example/other.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/other").await;
+
+        let refused = manager
+            .submit_spawn(
+                allowed,
+                other.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, SpawnRefused::OutsideScope(_)),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("scope.repos"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_runs_the_audited_identity_against_the_audited_repo() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let by_path = repo.path().display().to_string();
+        for label in ["github.com/example/repo".to_string(), by_path] {
+            let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+            let allowed = allowed_for(&label).await;
+            let id = manager
+                .submit_spawn(
+                    allowed,
+                    repo.path().to_path_buf(),
+                    "HEAD".to_string(),
+                    "gemma4:e4b".to_string(),
+                    20,
+                    provider(),
+                )
+                .await
+                .unwrap();
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            let task = manager.poll(&id).await.unwrap();
+            assert_eq!(task.description, "Add a regression test.");
+            assert_eq!(task.identity_hint.as_deref(), Some("rust-implementer"));
         }
     }
 }
