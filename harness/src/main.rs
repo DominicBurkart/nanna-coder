@@ -113,9 +113,9 @@ enum Commands {
         /// Branch or ref to base the worktree on
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
-        /// The model to use
-        #[arg(short, long, default_value = "qwen3:0.6b")]
-        model: String,
+        /// The model to use; must be the identity's model (default: the identity's model)
+        #[arg(short, long)]
+        model: Option<String>,
         /// Maximum agent iterations
         #[arg(long, default_value = "100")]
         max_iterations: usize,
@@ -440,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &description,
                 &repo_path,
                 &branch,
-                &model,
+                model.as_deref(),
                 max_iterations,
                 ttl_ms,
                 &identity,
@@ -1341,6 +1341,20 @@ fn load_identities() -> IdentityCatalog {
     })
 }
 
+fn build_spawn_gate(
+    catalog: &IdentityCatalog,
+    log: harness::auditor::AuditLog,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    use harness::auditor::{AuditContext, RuleAuditor, SpawnGate};
+    use harness::identity::AUDITOR_IDENTITY;
+
+    let auditor = catalog.get(AUDITOR_IDENTITY).ok_or_else(|| {
+        format!("the identity catalog has no `{AUDITOR_IDENTITY}` identity, so assign_task cannot be gated")
+    })?;
+    let context = AuditContext::new(catalog.clone(), auditor.clone())?;
+    Ok(SpawnGate::new(Box::new(RuleAuditor::new()), log, context))
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1380,10 +1394,12 @@ async fn run_mcp_server(
         escalation_path.display()
     );
 
+    let audit_log = harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl"));
+    let gate = build_spawn_gate(&catalog, audit_log)?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
-        model.to_string(),
+        gate,
         max_iterations,
     ));
 
@@ -1401,7 +1417,7 @@ async fn run_delegate(
     description: &str,
     repo_path: &std::path::Path,
     branch: &str,
-    model: &str,
+    model: Option<&str>,
     max_iterations: usize,
     ttl_ms: Option<u64>,
     identity: &str,
@@ -1414,11 +1430,11 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(TaskManager::default());
-    task_manager.register_catalog(&load_identities()).await;
+    let gate = build_spawn_gate(&load_identities(), harness::auditor::AuditLog::in_memory())?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
-        model.to_string(),
+        gate,
         max_iterations,
     ));
 
@@ -1434,14 +1450,16 @@ async fn run_delegate(
     let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
 
     client.initialize().await?;
-    let arguments = serde_json::json!({
+    let mut arguments = serde_json::json!({
         "description": description,
         "repo_path": repo_path.to_string_lossy(),
         "branch": branch,
-        "model": model,
         "max_iterations": max_iterations,
         "identity": identity,
     });
+    if let Some(model) = model {
+        arguments["model"] = serde_json::json!(model);
+    }
     let task_id = client.submit_task(arguments, ttl_ms).await?;
     info!("Delegated task {task_id}; awaiting completion...");
 
