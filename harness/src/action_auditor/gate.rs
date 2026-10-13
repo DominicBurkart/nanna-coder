@@ -25,7 +25,8 @@ pub enum ActionDenied {
         reasons: Vec<Reason>,
     },
     /// The action must not run and the task should halt for human review,
-    /// because this is the third denial the task has accumulated.
+    /// because the auditor escalated it or it is the third denial the task has
+    /// accumulated.
     Escalate {
         /// Why.
         reasons: Vec<Reason>,
@@ -54,7 +55,7 @@ impl fmt::Display for ActionDenied {
             }
             ActionDenied::Escalate { reasons } => write!(
                 f,
-                "action escalated after repeated denials: {}",
+                "action escalated for human review: {}",
                 join_reasons(reasons)
             ),
         }
@@ -91,13 +92,13 @@ impl fmt::Display for ActionDenied {
 /// let review = ActionReview {
 ///     identity: "rust-implementer".to_string(),
 ///     task_id: TaskId("t1".to_string()),
-///     tool: "github_pr_status".to_string(),
+///     tool: "write_file".to_string(),
 ///     args: serde_json::json!({}),
-///     effect_class: EffectClass::Repository,
+///     effect_class: EffectClass::Workspace,
 ///     prior_actions: vec![],
 /// };
 /// let ctx = ActionContext {
-///     max_effect: EffectClass::Repository,
+///     max_effect: EffectClass::Workspace,
 ///     window: None,
 ///     lease: LeaseContext::default(),
 ///     now: chrono::Utc::now(),
@@ -256,6 +257,6 @@ mod tests {
         assert!(escalate.is_escalation());
         assert!(escalate
             .to_string()
-            .starts_with("action escalated after repeated denials:"));
+            .starts_with("action escalated for human review:"));
     }
 }

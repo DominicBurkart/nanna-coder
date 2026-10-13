@@ -14,10 +14,10 @@
 //! is deterministic: it always allows `None`/`Workspace` calls (the inner
 //! loop is container-isolated and needs no gate), checks the identity's
 //! effect ceiling for `Repository`/`Ci` calls, and for `Sandbox`/`Production`
-//! calls checks the action's availability window and coordination lease
-//! before ever considering an allow. [`ModelActionAuditor`] wraps it,
-//! consulting the strongest configured model for `Sandbox`/`Production`
-//! calls whose window and lease checks already passed; a rule `Block` always
+//! calls checks the action's availability window and coordination lease. It
+//! never allows a `Repository`/`Ci`/`Sandbox`/`Production` call by itself.
+//! [`ModelActionAuditor`] wraps it, consulting the configured model for
+//! those four classes once the rule checks passed; a rule `Block` always
 //! short-circuits the model.
 //!
 //! This module reuses [`crate::protected::AuditHook`] nowhere: that trait

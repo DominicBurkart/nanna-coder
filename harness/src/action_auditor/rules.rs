@@ -19,12 +19,14 @@ pub const RULE_ACTION_AUDITOR_NAME: &str = "rule-action-auditor";
 /// Crate-private: [`ModelActionAuditor`](super::ModelActionAuditor) matches
 /// on it directly so a rule `Block` can short-circuit the model call, while
 /// [`RuleActionAuditor`]'s own [`ActionAuditor`] impl turns a deferral into
-/// an `Escalate`, since a bare rule auditor has no model to ask.
+/// a `Block` (`Repository`/`Ci`) or an `Escalate` (`Sandbox`/`Production`),
+/// since a bare rule auditor has no model to ask.
 pub(crate) enum RuleOutcome {
     /// The rules alone decide the outcome.
     Decided(ActionVerdict),
-    /// The window and lease checks passed for a `Sandbox`/`Production`
-    /// action; only the strongest configured model may allow it.
+    /// The ceiling (`Repository`/`Ci`) or the window and lease checks
+    /// (`Sandbox`/`Production`) passed; only a configured model may allow
+    /// the action.
     NeedsModel,
 }
 
@@ -32,15 +34,16 @@ pub(crate) enum RuleOutcome {
 /// [`ModelActionAuditor`](super::ModelActionAuditor).
 ///
 /// `None`/`Workspace` calls are always allowed: the inner loop is isolated
-/// by container design and needs no gate. `Repository`/`Ci` calls are
-/// decided by comparing the requested class against the identity's effect
-/// ceiling (defense in depth: RBAC should already keep an over-ceiling call
-/// out of the tool registry, but the gate checks again). `Sandbox`/`Production`
-/// calls first require the action's target availability window to be open
-/// and the coordination lease it needs to be held; a rule auditor used
-/// alone can never allow one of these, because the epic requires the
-/// strongest configured model to also sign off, so a bare
-/// [`RuleActionAuditor`] escalates once window and lease checks pass.
+/// by container design and needs no gate. `Repository`/`Ci` calls are first
+/// compared against the identity's effect ceiling (defense in depth: RBAC
+/// should already keep an over-ceiling call out of the tool registry, but
+/// the gate checks again); one within the ceiling still needs a model to
+/// sign off, so a bare [`RuleActionAuditor`] blocks it with a reason naming
+/// the missing model. `Sandbox`/`Production` calls first require the
+/// action's target availability window to be open and the coordination
+/// lease it needs to be held; a rule auditor used alone can never allow one
+/// of these either, so a bare [`RuleActionAuditor`] escalates once window
+/// and lease checks pass.
 ///
 /// ```
 /// use harness::action_auditor::{ActionAuditor, ActionContext, ActionReview, RuleActionAuditor};
@@ -74,7 +77,7 @@ pub(crate) enum RuleOutcome {
 ///     now: chrono::Utc::now(),
 /// };
 /// let verdict = rules.review_action(&review, &ctx).await.unwrap();
-/// assert!(verdict.is_allow());
+/// assert_eq!(verdict.kind(), VerdictKind::Block);
 ///
 /// let over_ceiling = ActionContext { max_effect: EffectClass::Workspace, ..ctx };
 /// let verdict = rules.review_action(&review, &over_ceiling).await.unwrap();
@@ -113,9 +116,10 @@ impl RuleActionAuditor {
             EffectClass::None | EffectClass::Workspace => {
                 RuleOutcome::Decided(ActionVerdict::Allow)
             }
-            EffectClass::Repository | EffectClass::Ci => {
-                RuleOutcome::Decided(self.ceiling_check(review, ctx))
-            }
+            EffectClass::Repository | EffectClass::Ci => match self.ceiling_check(review, ctx) {
+                ActionVerdict::Allow => RuleOutcome::NeedsModel,
+                verdict => RuleOutcome::Decided(verdict),
+            },
             EffectClass::Sandbox => {
                 self.window_and_lease_check(review, ctx, leases::Effect::Sandbox)
             }
@@ -207,11 +211,14 @@ impl ActionAuditor for RuleActionAuditor {
                 let reason = Reason::new(
                     ReasonCode::Other,
                     format!(
-                        "`{}` is `{}`; the strongest configured model must also review it, and this auditor has no model attached",
+                        "`{}` is `{}`; a configured model must also review it, and this auditor has no model attached",
                         review.tool, review.effect_class
                     ),
                 );
-                ActionVerdict::escalate(vec![reason])
+                match review.effect_class {
+                    EffectClass::Repository | EffectClass::Ci => ActionVerdict::block(vec![reason]),
+                    _ => ActionVerdict::escalate(vec![reason]),
+                }
             }
         })
     }
@@ -289,14 +296,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repository_within_ceiling_is_allowed() {
+    async fn repository_and_ci_within_ceiling_are_blocked_without_a_model() {
         let rules = auditor();
-        let review = review("github_pr_status", EffectClass::Repository);
-        let context = ctx(EffectClass::Repository, None, LeaseContext::default());
-        assert_eq!(
-            rules.review_action(&review, &context).await.unwrap(),
-            ActionVerdict::Allow
-        );
+        for class in [EffectClass::Repository, EffectClass::Ci] {
+            let review = review("github_pr_status", class);
+            let context = ctx(class, None, LeaseContext::default());
+            let verdict = rules.review_action(&review, &context).await.unwrap();
+            assert_eq!(verdict.kind(), VerdictKind::Block, "{class}");
+            assert!(
+                verdict.reasons()[0].detail.contains("model"),
+                "{class}: {:?}",
+                verdict.reasons()
+            );
+        }
     }
 
     #[tokio::test]

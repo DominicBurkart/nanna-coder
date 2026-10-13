@@ -4,9 +4,12 @@
 //! execution at both L0 and L1 levels, and error handling.
 //! Tests gracefully handle environments where git or GITHUB_TOKEN may be unavailable.
 
-use harness::action_auditor::{ActionAuditLog, ActionGate, RuleActionAuditor};
+use async_trait::async_trait;
+use harness::action_auditor::{
+    ActionAuditError, ActionAuditLog, ActionAuditor, ActionContext, ActionGate, ActionReview,
+    ActionVerdict,
+};
 use harness::effects::EffectClass;
-use harness::leases::InMemoryLeaseStore;
 use harness::task::TaskId;
 use harness::tools::{
     create_tool_registry, ActionSubject, GitHubPrStatusTool, GitHubStatus, PrStatusData, Tool,
@@ -19,18 +22,26 @@ use tempfile::TempDir;
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
-/// A registry with an action gate that allows any `Repository`-class call:
-/// [`ToolRegistry::execute`] now reviews every effectful call (issue #642),
-/// so an ungated registry would refuse `github_pr_status` before it ever
-/// reached the tool.
+struct AllowRepository;
+
+#[async_trait]
+impl ActionAuditor for AllowRepository {
+    fn name(&self) -> &str {
+        "allow-repository"
+    }
+
+    async fn review_action(
+        &self,
+        _review: &ActionReview,
+        _context: &ActionContext<'_>,
+    ) -> Result<ActionVerdict, ActionAuditError> {
+        Ok(ActionVerdict::Allow)
+    }
+}
+
 fn gated_registry(repo: &Path) -> ToolRegistry {
-    let auditor = RuleActionAuditor::new(
-        Arc::new(harness::windows::WindowSet::default()),
-        Arc::new(InMemoryLeaseStore::default()),
-        chrono::Duration::minutes(10),
-    );
     let gate = Arc::new(ActionGate::new(
-        Arc::new(auditor),
+        Arc::new(AllowRepository),
         ActionAuditLog::in_memory(),
     ));
     let subject = ActionSubject {

@@ -1365,6 +1365,10 @@ mod tests {
             })
         }
 
+        pub(super) fn remaining(&self) -> usize {
+            self.responses.lock().unwrap().len()
+        }
+
         pub(super) fn with_hook(responses: Vec<ChatResponse>, on_chat: ChatHook) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(responses),
@@ -3180,7 +3184,7 @@ mod identity_tests {
     }
 
     #[tokio::test]
-    async fn test_default_action_gate_allows_a_call_within_the_identity_ceiling() {
+    async fn test_default_rule_only_gate_blocks_a_repository_call_pending_a_model() {
         let repo_dir = repo_with_origin("git@github.com:example/repo.git");
 
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
@@ -3210,7 +3214,60 @@ mod identity_tests {
         let result = manager.get_result(&task_id).await.unwrap();
         assert_eq!(result.action_audit.len(), 1);
         assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
+        assert_eq!(
+            result.action_audit[0].verdict.kind(),
+            crate::auditor::VerdictKind::Block
+        );
+        assert!(result.action_audit[0].verdict.reasons()[0]
+            .detail
+            .contains("model"));
+    }
+
+    #[tokio::test]
+    async fn test_a_model_auditor_reviews_and_allows_a_repository_call_within_the_ceiling() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let auditor_provider = MockProvider::new(vec![stop_response(r#"{"verdict":"allow"}"#)]);
+        let auditor = crate::action_auditor::ModelActionAuditor::new(
+            auditor_provider.clone(),
+            "auditor-model",
+            Arc::new(crate::windows::WindowSet::default()),
+            manager.leases(),
+            chrono::Duration::minutes(10),
+        );
+        let manager = manager.with_action_gate(Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(auditor),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        )));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 1);
+        assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
         assert!(result.action_audit[0].verdict.is_allow());
+        assert_eq!(auditor_provider.remaining(), 0);
     }
 
     #[tokio::test]

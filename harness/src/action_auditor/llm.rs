@@ -1,5 +1,6 @@
 //! Model-backed action review, used only once the rule pre-pass has cleared
-//! window and lease checks for a `Sandbox`/`Production` call.
+//! the ceiling (`Repository`/`Ci`) or the window and lease checks
+//! (`Sandbox`/`Production`) for a call.
 
 use super::rules::RuleOutcome;
 use super::{ActionAuditError, ActionAuditor, ActionContext, ActionReview, ActionVerdict};
@@ -34,12 +35,14 @@ pub const ACTION_ARGS_OPEN: &str = "<<<ACTION_ARGS";
 /// Marker that closes the tool-argument data block in the prompt.
 pub const ACTION_ARGS_CLOSE: &str = "ACTION_ARGS>>>";
 
-/// An [`ActionAuditor`] that asks a model, but only for `Sandbox`/`Production`
-/// calls whose [`RuleActionAuditor`] window and lease checks already passed.
+/// An [`ActionAuditor`] that asks a model for every `Repository`, `Ci`,
+/// `Sandbox` and `Production` call whose [`RuleActionAuditor`] pre-checks
+/// (effect ceiling, then availability window and lease) already passed.
 ///
-/// `None`/`Workspace`/`Repository`/`Ci` calls are decided by the rule pass
-/// alone (the epic only mandates a model for `Sandbox`/`Production`). A rule
-/// `Block` — an over-ceiling call, a closed window, an unavailable lease —
+/// `None`/`Workspace` calls are decided by the rule pass alone. The same
+/// configured model reviews every class; there is no separate smaller model
+/// for `Repository`/`Ci`. A rule `Block` — an over-ceiling call, a closed
+/// window, an unavailable lease —
 /// is returned without ever consulting the model, so the model can never
 /// talk its way past a hard rule failure. Output the model produces that is
 /// not a valid verdict becomes `Escalate` with [`ReasonCode::Other`], so a
@@ -262,17 +265,77 @@ mod tests {
         (auditor, provider)
     }
 
-    #[tokio::test]
-    async fn repository_calls_never_reach_the_model() {
-        let (auditor, provider) = auditor(&[r#"{"verdict":"allow"}"#]);
-        let review = review("github_pr_status", EffectClass::Repository);
-        let ctx = ActionContext {
-            max_effect: EffectClass::Repository,
+    fn repository_ctx(max_effect: EffectClass) -> ActionContext<'static> {
+        ActionContext {
+            max_effect,
             window: None,
             lease: LeaseContext::default(),
             now: open_monday(),
-        };
-        let verdict = auditor.review_action(&review, &ctx).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_and_ci_calls_within_the_ceiling_are_reviewed_by_the_model() {
+        for class in [EffectClass::Repository, EffectClass::Ci] {
+            let (auditor, provider) = auditor(&[r#"{"verdict":"allow"}"#]);
+            let review = review("github_pr_status", class);
+            let verdict = auditor
+                .review_action(&review, &repository_ctx(class))
+                .await
+                .unwrap();
+            assert!(verdict.is_allow(), "{class}");
+            assert_eq!(provider.calls(), 1, "{class}");
+            let sent = &provider.requests.lock().unwrap()[0];
+            assert_eq!(sent.model, MODEL);
+            assert_eq!(sent.temperature, Some(0.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_block_stops_a_repository_call() {
+        let reply =
+            r#"{"verdict":"block","reasons":[{"code":"scope_creep","detail":"pushes elsewhere"}]}"#;
+        let (auditor, provider) = auditor(&[reply]);
+        let review = review("github_pr_status", EffectClass::Repository);
+        let verdict = auditor
+            .review_action(&review, &repository_ctx(EffectClass::Repository))
+            .await
+            .unwrap();
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
+        assert_eq!(provider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn unparsable_model_output_escalates_a_repository_call() {
+        let (auditor, _provider) = auditor(&["not json"]);
+        let review = review("github_pr_status", EffectClass::Repository);
+        let verdict = auditor
+            .review_action(&review, &repository_ctx(EffectClass::Repository))
+            .await
+            .unwrap();
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Escalate);
+    }
+
+    #[tokio::test]
+    async fn a_repository_call_above_the_ceiling_never_reaches_the_model() {
+        let (auditor, provider) = auditor(&[r#"{"verdict":"allow"}"#]);
+        let review = review("github_pr_status", EffectClass::Repository);
+        let verdict = auditor
+            .review_action(&review, &repository_ctx(EffectClass::Workspace))
+            .await
+            .unwrap();
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_calls_never_reach_the_model() {
+        let (auditor, provider) = auditor(&[r#"{"verdict":"block"}"#]);
+        let review = review("write_file", EffectClass::Workspace);
+        let verdict = auditor
+            .review_action(&review, &repository_ctx(EffectClass::Workspace))
+            .await
+            .unwrap();
         assert!(verdict.is_allow());
         assert_eq!(provider.calls(), 0);
     }
