@@ -7,15 +7,20 @@
 //! Escape protection (`..`, absolute paths elsewhere, symlinks resolving
 //! outside the worktree) is shared with the unscoped tools through
 //! [`resolve_path`]: a scope only ever narrows what an unscoped tool would
-//! already allow.
+//! already allow. [`resolve_path_guarded`] additionally refuses writes to
+//! [`ProtectedPaths`], which no scope can widen.
 
 use crate::identity::AgentIdentity;
+use crate::protected::{ProtectedPathViolation, ProtectedPaths};
 use crate::tools::{ToolError, ToolResult};
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+
+/// The identity recorded on a denial raised outside any identity scope.
+pub const UNSCOPED_IDENTITY: &str = "unscoped";
 
 /// Which kind of file access a path-scoped tool is attempting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,6 +46,13 @@ pub enum DenialReason {
         /// The worktree-relative path that was refused.
         path: String,
     },
+    /// The path is Nanna's own configuration, which no identity may write.
+    ProtectedPath {
+        /// The worktree-relative path that was refused.
+        path: String,
+        /// The protected glob that matched.
+        rule: String,
+    },
 }
 
 impl fmt::Display for DenialReason {
@@ -51,6 +63,9 @@ impl fmt::Display for DenialReason {
                 PathAccess::Read => write!(f, "read of `{path}` is outside scope.read_paths"),
                 PathAccess::Write => write!(f, "write to `{path}` is outside scope.paths"),
             },
+            DenialReason::ProtectedPath { path, rule } => {
+                write!(f, "write to `{path}` is refused by protected rule `{rule}`")
+            }
         }
     }
 }
@@ -84,6 +99,21 @@ pub struct ScopeDenial {
     pub tool: String,
     /// Why the call was refused.
     pub reason: DenialReason,
+}
+
+impl ScopeDenial {
+    /// The denial recorded when `tool` reached a protected path, attributed
+    /// to [`UNSCOPED_IDENTITY`] until a scoped registry names its identity.
+    pub fn protected(tool: &str, violation: &ProtectedPathViolation) -> Self {
+        ScopeDenial {
+            identity: UNSCOPED_IDENTITY.to_string(),
+            tool: tool.to_string(),
+            reason: DenialReason::ProtectedPath {
+                path: violation.path.clone(),
+                rule: violation.rule.clone(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for ScopeDenial {
@@ -316,7 +346,7 @@ pub fn repo_slug(url: &str) -> Option<String> {
     Some(format!("{}/{owner}/{name}", host.to_ascii_lowercase()))
 }
 
-fn origin_slug(repo_path: &Path) -> Option<String> {
+pub fn origin_slug(repo_path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -327,6 +357,28 @@ fn origin_slug(repo_path: &Path) -> Option<String> {
         return None;
     }
     repo_slug(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether `label` (a path, a remote URL or `host/owner/name`) names the
+/// repository checked out at `repo_path`: either the same path, or the same
+/// `origin` slug.
+///
+/// ```
+/// use harness::scope::names_repo;
+/// use std::path::Path;
+///
+/// assert!(names_repo("/work/repo", Path::new("/work/repo")));
+/// assert!(!names_repo("github.com/example/repo", Path::new("/no/such/checkout")));
+/// ```
+pub fn names_repo(label: &str, repo_path: &Path) -> bool {
+    if Path::new(label) == repo_path {
+        return true;
+    }
+    let Some(origin) = origin_slug(repo_path) else {
+        return false;
+    };
+    let wanted = repo_slug(label).unwrap_or_else(|| label.to_string());
+    wanted.eq_ignore_ascii_case(&origin)
 }
 
 /// Refuse a task whose target repository is not in the identity's
@@ -384,7 +436,7 @@ pub fn relative_to<'a>(path: &'a Path, workspace_root: &Path) -> &'a Path {
     path.strip_prefix(workspace_root).unwrap_or(path)
 }
 
-fn denial_path(relative: &Path) -> String {
+pub(crate) fn denial_path(relative: &Path) -> String {
     relative
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
@@ -497,6 +549,33 @@ pub fn resolve_path(
     path: &Path,
     workspace_root: &Path,
 ) -> ToolResult<PathBuf> {
+    resolve(scope, None, tool, access, path, workspace_root)
+}
+
+/// [`resolve_path`] that also refuses writes to `protected` paths.
+///
+/// Protection is judged before the scope, so a protected path is
+/// [`ToolError::ProtectedPath`] whether or not the identity's globs would
+/// have permitted it; reads are never protected.
+pub fn resolve_path_guarded(
+    scope: Option<&PathScope>,
+    protected: &ProtectedPaths,
+    tool: &str,
+    access: PathAccess,
+    path: &Path,
+    workspace_root: &Path,
+) -> ToolResult<PathBuf> {
+    resolve(scope, Some(protected), tool, access, path, workspace_root)
+}
+
+fn resolve(
+    scope: Option<&PathScope>,
+    protected: Option<&ProtectedPaths>,
+    tool: &str,
+    access: PathAccess,
+    path: &Path,
+    workspace_root: &Path,
+) -> ToolResult<PathBuf> {
     let (resolved, relative) = match access {
         PathAccess::Read => {
             let root = canonical_root(workspace_root)?;
@@ -522,6 +601,11 @@ pub fn resolve_path(
         }
         PathAccess::Write => resolve_for_write(path, workspace_root)?,
     };
+    if let (PathAccess::Write, Some(protected)) = (access, protected) {
+        protected
+            .check(&relative)
+            .map_err(ToolError::ProtectedPath)?;
+    }
     if let Some(scope) = scope {
         if !scope.permits(access, &relative) {
             let path = denial_path(&relative);
@@ -569,6 +653,7 @@ fn deny_missing_read_uniformly(
 mod tests {
     use super::*;
     use crate::identity::example;
+    use crate::protected::{ProtectedPathViolation, ProtectedPaths};
     use proptest::prelude::*;
     use tempfile::TempDir;
 
@@ -1255,6 +1340,193 @@ mod tests {
         }
     }
 
+    fn guarded(
+        scope: Option<&PathScope>,
+        access: PathAccess,
+        path: &str,
+        root: &Path,
+    ) -> ToolResult<PathBuf> {
+        let protected = ProtectedPaths::with_config_dir(root, None);
+        resolve_path_guarded(
+            scope,
+            &protected,
+            "write_file",
+            access,
+            Path::new(path),
+            root,
+        )
+    }
+
+    fn protected_error(result: ToolResult<PathBuf>) -> ProtectedPathViolation {
+        match result {
+            Err(ToolError::ProtectedPath(violation)) => violation,
+            other => panic!("expected ProtectedPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
+        let ws = workspace();
+        let root = ws.path();
+        let all = scope(&["**"], None);
+        let violation = protected_error(guarded(
+            Some(&all),
+            PathAccess::Write,
+            ".nanna/agents/x.toml",
+            root,
+        ));
+        assert_eq!(violation.path, ".nanna/agents/x.toml");
+        assert_eq!(violation.rule, ".nanna/**");
+        let unscoped = protected_error(guarded(None, PathAccess::Write, "codecov.yml", root));
+        assert_eq!(unscoped.rule, "codecov.yml");
+    }
+
+    #[test]
+    fn protection_wins_over_a_scope_denial() {
+        let ws = workspace();
+        let root = ws.path();
+        let narrow = scope(&["api/**"], None);
+        let violation = protected_error(guarded(
+            Some(&narrow),
+            PathAccess::Write,
+            ".github/workflows/ci.yml",
+            root,
+        ));
+        assert_eq!(violation.rule, ".github/workflows/**");
+        let denied = guarded(Some(&narrow), PathAccess::Write, "docs/new.md", root);
+        assert!(matches!(denied, Err(ToolError::ScopeDenied(_))));
+        let allowed = guarded(Some(&narrow), PathAccess::Write, "api/new.rs", root).unwrap();
+        assert_eq!(allowed, root.join("api/new.rs"));
+    }
+
+    #[test]
+    fn protected_paths_may_still_be_read() {
+        let ws = workspace();
+        let root = ws.path();
+        std::fs::create_dir_all(root.join(".nanna/agents")).unwrap();
+        std::fs::write(root.join(".nanna/agents/x.toml"), "").unwrap();
+        let read = guarded(None, PathAccess::Read, ".nanna/agents/x.toml", root).unwrap();
+        assert_eq!(
+            read,
+            root.canonicalize().unwrap().join(".nanna/agents/x.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_a_protected_directory_is_judged_by_its_target() {
+        let ws = workspace();
+        let root = ws.path();
+        std::fs::create_dir_all(root.join(".nanna")).unwrap();
+        std::os::unix::fs::symlink(root.join(".nanna"), root.join("cfg")).unwrap();
+        let violation = protected_error(guarded(None, PathAccess::Write, "cfg/x.toml", root));
+        assert_eq!(violation.path, ".nanna/x.toml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_into_a_protected_root_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        std::os::unix::fs::symlink(root.join(".nanna/agents/x.toml"), root.join("leaf")).unwrap();
+        std::os::unix::fs::symlink(root.join(".nanna/missing"), root.join("dir")).unwrap();
+        let all = scope(&["**"], None);
+        for (scope, path) in [
+            (None, "leaf"),
+            (None, "dir/x.toml"),
+            (Some(&all), "leaf"),
+            (Some(&all), "dir/x.toml"),
+        ] {
+            let result = guarded(scope, PathAccess::Write, path, root);
+            assert!(
+                matches!(
+                    result,
+                    Err(ToolError::ProtectedPath(_)) | Err(ToolError::PathSecurityViolation { .. })
+                ),
+                "{path}: {result:?}"
+            );
+        }
+        assert!(!root.join(".nanna").exists());
+    }
+
+    #[test]
+    fn an_escape_is_still_a_security_violation_when_guarded() {
+        let ws = workspace();
+        let root = ws.path();
+        let escape = guarded(None, PathAccess::Write, "../.nanna/x", root);
+        assert!(matches!(
+            escape,
+            Err(ToolError::PathSecurityViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn protected_path_denial_reason_displays_and_serialises() {
+        let reason = DenialReason::ProtectedPath {
+            path: "codecov.yml".to_string(),
+            rule: "codecov.yml".to_string(),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "write to `codecov.yml` is refused by protected rule `codecov.yml`"
+        );
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(json["kind"], "protected_path");
+        assert_eq!(json["rule"], "codecov.yml");
+        let denial = ScopeDenial::protected(
+            "write_file",
+            &ProtectedPathViolation {
+                path: "codecov.yml".to_string(),
+                rule: "codecov.yml".to_string(),
+            },
+        );
+        assert_eq!(denial.identity, UNSCOPED_IDENTITY);
+        assert_eq!(denial.tool, "write_file");
+        assert_eq!(denial.reason, reason);
+    }
+
+    fn writable_glob() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("**".to_string()),
+            Just("*".to_string()),
+            Just("**/*".to_string()),
+            Just("**/*.toml".to_string()),
+            Just("**/*.yml".to_string()),
+            Just(".nanna/**".to_string()),
+            Just(".github/**".to_string()),
+            Just(".*".to_string()),
+            Just(".*/**".to_string()),
+            segment().prop_map(|s| format!("{s}/**")),
+        ]
+    }
+
+    fn protected_path() -> impl Strategy<Value = String> {
+        let prefix = prop_oneof![
+            Just(".nanna".to_string()),
+            Just(".github/workflows".to_string()),
+            segment().prop_map(|s| format!("{s}/.nanna")),
+            relative_path().prop_map(|p| format!("{p}/.nanna")),
+        ];
+        prop_oneof![
+            (prefix, relative_path()).prop_map(|(p, rest)| format!("{p}/{rest}")),
+            Just(".nanna".to_string()),
+            Just(".github/CODEOWNERS".to_string()),
+            Just("codecov.yml".to_string()),
+            Just("windows.toml".to_string()),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn no_scope_glob_lets_a_write_reach_a_protected_path(globs in prop::collection::vec(writable_glob(), 1..4), path in protected_path()) {
+            let ws = workspace();
+            let root = ws.path();
+            let scoped = scope(&globs.iter().map(String::as_str).collect::<Vec<_>>(), None);
+            let violation = protected_error(guarded(Some(&scoped), PathAccess::Write, &path, root));
+            prop_assert_eq!(violation.path, path);
+        }
+    }
+
     #[test]
     fn repo_slug_normalises_every_remote_shape() {
         let slug = |url: &str| repo_slug(url);
@@ -1322,5 +1594,22 @@ mod tests {
         open_identity.scope.repos.clear();
         let listed = repo_with_origin(Some("https://github.com/example/repo"));
         assert!(check_repo(&open_identity, listed.path()).is_err());
+    }
+
+    #[test]
+    fn names_repo_matches_a_path_or_the_origin_slug() {
+        let repo = repo_with_origin(Some("git@github.com:Example/Repo.git"));
+        let path = repo.path();
+        assert!(names_repo(&path.display().to_string(), path));
+        assert!(names_repo("github.com/example/repo", path));
+        assert!(names_repo("https://github.com/example/repo.git", path));
+        assert!(!names_repo("github.com/example/other", path));
+        assert!(!names_repo("/some/other/path", path));
+        let no_remote = repo_with_origin(None);
+        assert!(!names_repo("github.com/example/repo", no_remote.path()));
+        assert!(names_repo(
+            &no_remote.path().display().to_string(),
+            no_remote.path()
+        ));
     }
 }

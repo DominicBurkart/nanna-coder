@@ -2,6 +2,7 @@ pub mod client;
 pub mod handlers;
 pub mod jsonrpc;
 
+use crate::auditor::SpawnGate;
 use crate::task::{TaskId, TaskManager};
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use model::provider::ModelProvider;
@@ -12,21 +13,24 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 pub struct NannaMcpServer {
     task_manager: Arc<TaskManager>,
     provider: Arc<dyn ModelProvider>,
-    default_model: String,
+    spawn_gate: SpawnGate,
     default_max_iterations: usize,
 }
 
 impl NannaMcpServer {
+    /// A server whose `assign_task` dispatches only spawns that
+    /// `spawn_gate` allowed. The identity card chooses the model, so there
+    /// is no server-wide default model.
     pub fn new(
         task_manager: Arc<TaskManager>,
         provider: Arc<dyn ModelProvider>,
-        default_model: String,
+        spawn_gate: SpawnGate,
         default_max_iterations: usize,
     ) -> Self {
         Self {
             task_manager,
             provider,
-            default_model,
+            spawn_gate,
             default_max_iterations,
         }
     }
@@ -178,6 +182,14 @@ impl NannaMcpServer {
                             "type": "integer",
                             "description": "Maximum agent iterations (default: server default)"
                         },
+                        "requested_effect": {
+                            "type": "string",
+                            "description": "Effect class the task is expected to reach (none, workspace, repository, ci, sandbox, production). The auditor refuses it when it exceeds the identity's ceiling. Defaults to the identity's ceiling."
+                        },
+                        "dev_loop": {
+                            "type": "string",
+                            "description": "Development loop the task belongs to (inner, middle, outer). The auditor refuses a loop other than the identity's. Defaults to the identity's loop."
+                        },
                         "identity": {
                             "type": "string",
                             "description": "Name of a registered agent identity. The task runs under that identity's scope (tools, effect ceiling, paths, repos); an unregistered identity, or a repository outside scope.repos, fails the task."
@@ -240,7 +252,7 @@ impl NannaMcpServer {
                     &tool_params,
                     &self.task_manager,
                     &self.provider,
-                    &self.default_model,
+                    &self.spawn_gate,
                     self.default_max_iterations,
                     requested_ttl,
                 )
@@ -399,7 +411,7 @@ mod tests {
         NannaMcpServer::new(
             Arc::new(TaskManager::default()),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         )
     }
@@ -636,16 +648,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_assign_task_with_task_returns_create_task_result() {
-        let server = make_server();
-        // repo_path "/tmp" is not a git repo, so the worker fails at workspace
-        // creation (no model call), but the immediate CreateTaskResult is
+        let server = NannaMcpServer::new(
+            Arc::new(TaskManager::new(0)),
+            Arc::new(NoopProvider),
+            crate::auditor::test_support::fixture_gate(),
+            100,
+        );
+        // The audited spawn is queued and the immediate CreateTaskResult is
         // returned synchronously with status "working".
         let resp = server
             .handle_request(tools_call(
                 11,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": { "ttl": 5000 }
                 }),
             ))
@@ -845,7 +861,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(TaskManager::new(0)),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let empty = server
@@ -858,7 +874,7 @@ mod tests {
                 19,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
@@ -999,7 +1015,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(manager),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let listed = server
@@ -1020,7 +1036,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(TaskManager::new(0)),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let created = server
@@ -1028,7 +1044,7 @@ mod tests {
                 23,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
