@@ -38,7 +38,7 @@ struct DevContainerConfig {
 fn parse_cargo_home(src: &str) -> Result<String, WorkspaceError> {
     let config: DevContainerConfig = toml::from_str(src)
         .map_err(|e| WorkspaceError::InvalidDevContainerConfig(e.to_string()))?;
-    if !Path::new(&config.cargo_home).is_absolute() {
+    if !config.cargo_home.starts_with('/') {
         return Err(WorkspaceError::InvalidDevContainerConfig(format!(
             "cargo_home must be an absolute path, got {:?}",
             config.cargo_home
@@ -1319,6 +1319,9 @@ mod tests {
             "",
             "cargo_home = \"relative/cargo\"",
             "cargo_home = \"\"",
+            "cargo_home = \"C:\\\\cargo\"",
+            "cargo_home = \"C:/cargo\"",
+            "cargo_home = \"\\\\cargo\"",
             "cargo_home = 3",
             "cargo_home = \"/tmp/cargo\"\nextra = 1",
             "not toml at all =",
@@ -1336,7 +1339,7 @@ mod tests {
     fn test_shipped_dev_container_config_parses_to_the_tmp_cargo_home() {
         let home = container_cargo_home().unwrap();
         assert_eq!(home, "/tmp/cargo");
-        assert!(Path::new(&home).is_absolute());
+        assert!(home.starts_with('/'));
     }
 
     #[tokio::test]
