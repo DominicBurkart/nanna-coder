@@ -307,6 +307,7 @@ async fn ollama_enhanced_containerized_qwen3() {
         env_vars: vec![],
         additional_args: vec![],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     // Start container with smart fallback
@@ -724,6 +725,7 @@ async fn test_container_configuration() {
         ],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     assert_eq!(custom_config.base_image, "custom/image:latest");
@@ -767,6 +769,7 @@ async fn ollama_e2e_container_to_validated_inference() {
         env_vars: vec![("OLLAMA_MODELS".to_string(), "/models".to_string())],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1056,6 +1059,7 @@ async fn ollama_e2e_multi_model_comparison() {
             env_vars: vec![],
             additional_args: vec![],
             network: harness::container::NetworkPolicy::Enabled,
+            read_only_mounts: vec![],
         };
 
         let _container_handle = match start_container_with_fallback(&config).await {
@@ -1173,6 +1177,7 @@ async fn ollama_e2e_performance_and_reliability() {
         ],
         additional_args: vec!["--memory".to_string(), "4g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1762,6 +1767,7 @@ async fn ollama_e2e_agent_with_containerized_ollama() {
         env_vars: vec![],
         additional_args: vec![],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
