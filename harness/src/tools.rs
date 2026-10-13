@@ -1,9 +1,10 @@
 use crate::effects::EffectClass;
 use crate::escalation::EscalationLog;
 use crate::identity::AgentIdentity;
+use crate::protected::{ProtectedPathViolation, ProtectedPaths};
 use crate::scope::{
-    canonical_root, relative_to, resolve_path, validate_path_within_workspace, DenialReason,
-    PathAccess, PathScope, ScopeDenial, ScopeError,
+    canonical_root, relative_to, resolve_path, resolve_path_guarded,
+    validate_path_within_workspace, DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError,
 };
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -33,6 +34,9 @@ pub enum ToolError {
 
     #[error("Scope denial: {0}")]
     ScopeDenied(ScopeDenial),
+
+    #[error("Protected path: {0}")]
+    ProtectedPath(ProtectedPathViolation),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -204,8 +208,16 @@ impl ToolRegistry {
                 name: name.to_string(),
             }),
         };
-        if let Err(ToolError::ScopeDenied(denial)) = &outcome {
-            self.record(denial.clone());
+        match &outcome {
+            Err(ToolError::ScopeDenied(denial)) => self.record(denial.clone()),
+            Err(ToolError::ProtectedPath(violation)) => {
+                let mut denial = ScopeDenial::protected(name, violation);
+                if let Some(identity) = &self.identity {
+                    denial.identity = identity.clone();
+                }
+                self.record(denial);
+            }
+            _ => {}
         }
         outcome
     }
@@ -653,6 +665,7 @@ impl Tool for ReadFileTool {
 pub struct WriteFileTool {
     workspace_root: PathBuf,
     scope: Option<PathScope>,
+    protected: ProtectedPaths,
 }
 
 impl WriteFileTool {
@@ -661,11 +674,23 @@ impl WriteFileTool {
     }
 
     /// A writer that, when `scope` is present, refuses paths outside the
-    /// identity's `scope.paths`.
+    /// identity's `scope.paths`, and always refuses
+    /// [`ProtectedPaths::for_repo`] of the workspace.
     pub fn scoped(workspace_root: PathBuf, scope: Option<PathScope>) -> Self {
+        let protected = ProtectedPaths::for_repo(&workspace_root);
+        Self::guarded(workspace_root, scope, protected)
+    }
+
+    /// [`WriteFileTool::scoped`] with an explicit protected set.
+    pub fn guarded(
+        workspace_root: PathBuf,
+        scope: Option<PathScope>,
+        protected: ProtectedPaths,
+    ) -> Self {
         Self {
             workspace_root,
             scope,
+            protected,
         }
     }
 }
@@ -722,7 +747,9 @@ impl Tool for WriteFileTool {
         let path = Path::new(path_str);
         let scope = self.scope.as_ref();
         let root = &self.workspace_root;
-        let safe_path = resolve_path(scope, "write_file", PathAccess::Write, path, root)?;
+        let access = PathAccess::Write;
+        let protected = &self.protected;
+        let safe_path = resolve_path_guarded(scope, protected, "write_file", access, path, root)?;
 
         if let Some(parent) = safe_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1379,6 +1406,37 @@ pub fn cargo_audit_args() -> Vec<String> {
     vec!["cargo".to_string(), "audit".to_string()]
 }
 
+/// Argument vector for `trunk build`, optionally in release mode.
+pub fn trunk_build_args(release: bool) -> Vec<String> {
+    let mut args = vec!["trunk".to_string(), "build".to_string()];
+    if release {
+        args.push("--release".to_string());
+    }
+    args
+}
+
+/// `sqlx migrate` subcommands the agent may run.
+pub const SQLX_MIGRATE_COMMANDS: [&str; 3] = ["run", "info", "revert"];
+
+/// Argument vector for `sqlx migrate <command>`.
+pub fn sqlx_migrate_args(command: &str) -> Vec<String> {
+    vec![
+        "sqlx".to_string(),
+        "migrate".to_string(),
+        command.to_string(),
+    ]
+}
+
+/// Working directory inside the container for a workspace-relative
+/// directory: `base` itself for the workspace root, `base/<rel>` otherwise.
+pub fn member_working_dir(base: &str, rel: &std::path::Path) -> String {
+    if rel.as_os_str().is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{}", rel.display())
+    }
+}
+
 pub fn cargo_build_args(package: Option<&str>, release: bool) -> Vec<String> {
     let mut args = vec!["cargo".to_string(), "build".to_string()];
     if let Some(pkg) = package {
@@ -1958,6 +2016,177 @@ impl Tool for CargoAuditTool {
 
     fn name(&self) -> &str {
         "cargo_audit"
+    }
+}
+
+pub struct TrunkBuildTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl TrunkBuildTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TrunkBuildTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "trunk_build".to_string(),
+                description: crate::capabilities::find_capability("trunk_build")
+                    .map(|c| c.description)
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "release".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Set to 'true' to build in release mode".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+        let argv = trunk_build_args(release);
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+            "working_dir": self.working_dir,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "trunk_build"
+    }
+}
+
+pub struct SqlxMigrateTool {
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    working_dir: Option<String>,
+}
+
+impl SqlxMigrateTool {
+    pub fn new(
+        container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+        working_dir: Option<String>,
+    ) -> Self {
+        Self {
+            container_handle,
+            working_dir,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SqlxMigrateTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "sqlx_migrate".to_string(),
+                description: crate::capabilities::find_capability("sqlx_migrate")
+                    .map(|c| c.description)
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some({
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "command".to_string(),
+                            PropertySchema {
+                                schema_type: SchemaType::String,
+                                description: Some(
+                                    "Migration command: run (default), info, or revert".to_string(),
+                                ),
+                                items: None,
+                            },
+                        );
+                        props
+                    }),
+                    required: None,
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let command_name = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("run");
+        if !SQLX_MIGRATE_COMMANDS.contains(&command_name) {
+            return Err(ToolError::InvalidArguments {
+                message: format!(
+                    "unknown sqlx migrate command '{command_name}'; expected one of {}",
+                    SQLX_MIGRATE_COMMANDS.join(", ")
+                ),
+            });
+        }
+        let argv = sqlx_migrate_args(command_name);
+        let command = argv.join(" ");
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = crate::container::exec_in_container(
+            &self.container_handle,
+            &argv_refs,
+            self.working_dir.as_deref(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed {
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+            "command": command,
+            "working_dir": self.working_dir,
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "sqlx_migrate"
     }
 }
 
@@ -2811,8 +3040,9 @@ pub fn create_container_tool_registry(
             container_handle.clone(),
             wd.clone(),
         )));
-        let detected = crate::capabilities::detect_capabilities(workspace_root);
-        for cap in detected {
+        let detected = crate::capabilities::detect_capability_locations(workspace_root);
+        for (cap, rel) in detected {
+            let member_wd = Some(member_working_dir(container_working_dir, &rel));
             match cap.id {
                 "cargo_deny" => registry.register(Box::new(CargoDenyTool::new(
                     container_handle.clone(),
@@ -2821,6 +3051,14 @@ pub fn create_container_tool_registry(
                 "cargo_audit" => registry.register(Box::new(CargoAuditTool::new(
                     container_handle.clone(),
                     wd.clone(),
+                ))),
+                "trunk_build" => registry.register(Box::new(TrunkBuildTool::new(
+                    container_handle.clone(),
+                    member_wd,
+                ))),
+                "sqlx_migrate" => registry.register(Box::new(SqlxMigrateTool::new(
+                    container_handle.clone(),
+                    member_wd,
                 ))),
                 _ => {}
             }
@@ -2977,6 +3215,24 @@ mod tests {
         for (name, class) in EXPECTED_CLASSES {
             assert_eq!(registry.effect_class_of(name), Some(class), "{name}");
         }
+    }
+
+    #[test]
+    fn trunk_and_sqlx_tools_declare_workspace_effects() {
+        let handle = std::sync::Arc::new(crate::container::ContainerHandle {
+            name: "effects-test-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        assert_eq!(
+            TrunkBuildTool::new(handle.clone(), None).effect_class(),
+            EffectClass::Workspace
+        );
+        assert_eq!(
+            SqlxMigrateTool::new(handle, None).effect_class(),
+            EffectClass::Workspace
+        );
     }
 
     #[test]
@@ -4113,6 +4369,108 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
+    }
+
+    const PROTECTED_EXAMPLES: [(&str, &str); 9] = [
+        (".nanna/**", ".nanna/agents/x.toml"),
+        ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
+        (".git/**", ".git/config"),
+        (".git/**", ".git/hooks/pre-commit"),
+        (".git/**", ".git"),
+        (".github/workflows/**", ".github/workflows/ci.yml"),
+        (".github/CODEOWNERS", ".github/CODEOWNERS"),
+        ("codecov.yml", "codecov.yml"),
+        ("windows.toml", "windows.toml"),
+    ];
+
+    fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry
+            .at_most(EffectClass::Production)
+            .into_iter()
+            .filter(|tool| tool.effect_class() >= EffectClass::Workspace)
+            .filter(|tool| {
+                let definition = tool.definition();
+                let properties = definition.function.parameters.properties;
+                properties.is_some_and(|props| props.contains_key("path"))
+            })
+            .map(|tool| tool.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn assert_all_protected_writes_refused(registry: &ToolRegistry, root: &Path) {
+        let tools = write_capable_tools(registry);
+        assert_eq!(tools, vec!["write_file".to_string()]);
+        for pattern in crate::protected::PROTECTED_PATTERNS {
+            assert!(
+                PROTECTED_EXAMPLES.iter().any(|(rule, _)| rule == pattern),
+                "{pattern} has no example"
+            );
+        }
+        for tool in &tools {
+            for (rule, path) in PROTECTED_EXAMPLES {
+                let args = json!({ "path": path, "content": "tampered" });
+                let err = registry.execute(tool, args).await.unwrap_err();
+                match err {
+                    ToolError::ProtectedPath(violation) => {
+                        assert_eq!(violation.path, path);
+                        assert_eq!(violation.rule, rule);
+                    }
+                    other => panic!("{tool} on {path}: expected ProtectedPath, got {other:?}"),
+                }
+                assert!(!root.join(path).exists(), "{tool} wrote {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_write_capable_tool_refuses_every_protected_pattern_unscoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = create_tool_registry(dir.path());
+        assert_all_protected_writes_refused(&registry, dir.path()).await;
+        let denials = registry.denials();
+        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert_eq!(denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert_eq!(denials[0].tool, "write_file");
+        assert!(matches!(
+            denials[0].reason,
+            DenialReason::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_write_capable_tool_refuses_every_protected_pattern_under_a_catch_all_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registry = create_tool_registry_for(dir.path(), &identity).unwrap();
+        assert_all_protected_writes_refused(&registry, dir.path()).await;
+        let denials = registry.denials();
+        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert!(denials.iter().all(|d| d.identity == identity.name()));
+        let ok = registry
+            .execute(
+                "write_file",
+                json!({ "path": "src/lib.rs", "content": "fine" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok["success"], true);
+    }
+
+    #[tokio::test]
+    async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("cfg/nanna");
+        let protected =
+            crate::protected::ProtectedPaths::with_config_dir(dir.path(), Some(&config));
+        let tool = WriteFileTool::guarded(dir.path().to_path_buf(), None, protected);
+        let err = tool
+            .execute(json!({ "path": "cfg/nanna/agents/x.toml", "content": "x" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
     }
 
     #[test]

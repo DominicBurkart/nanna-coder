@@ -4,8 +4,9 @@ A tiny, deterministic full-stack Rust monorepo used by harness tests and evals:
 an actix-web backend (`api/`), a dioxus web frontend built with trunk (`ui/`),
 a `shared/` crate holding the wire types, one sqlx/Postgres migration under
 `migrations/`, a `Containerfile` that packages api + ui into one image, a
-`CHECKS` endpoint manifest and a `.nanna/deploy.toml` describing a fake deploy
-target. It is its own cargo workspace and is excluded from the repository's
+`CHECKS` endpoint manifest, a `.nanna/deploy.toml` describing a fake deploy
+target and a `.nanna/effects.toml` declaring its state assets (`nanna effects
+graph --repo-path tests/fixtures/fullstack` renders them). It is its own cargo workspace and is excluded from the repository's
 root workspace.
 
 ## Endpoints
@@ -18,11 +19,13 @@ root workspace.
 
 `CHECKS` lists these paths one per line for smoke tests.
 
-`ui/index.html`'s `<body>` must keep its `<div id="main">`: dioxus-web's
-default config mounts the app there, and its silent fallback on a missing
-mount point (a detached DOM node, not `document.body`) means the page loads
-and returns `200` with no visible sign anything is wrong — only a real
-browser session shows `#greeting` as permanently absent.
+`index.html` mounts the app into `<div id="main">`, dioxus 0.7's default
+root: without it, `dioxus::launch` logs a fallback ("mounting to the body")
+but never actually attaches the tree, so a real browser sees an empty
+`<body>` (found running the `qa_browser` container test in a headless
+Chromium; a plain `.wasm` substring check on `index.html`, as
+`apprun_integration` does, does not catch this).
+
 
 ## Environment hooks
 
