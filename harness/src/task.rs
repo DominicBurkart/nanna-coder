@@ -320,7 +320,21 @@ struct TaskRunner {
     bound: RwLock<HashMap<TaskId, AgentIdentity>>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
-    action_gate: std::sync::RwLock<Option<Arc<ActionGate>>>,
+    action_gate: std::sync::RwLock<Arc<ActionGate>>,
+}
+
+const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
+fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
+    let auditor = crate::action_auditor::RuleActionAuditor::new(
+        Arc::new(crate::windows::WindowSet::default()),
+        leases,
+        DEFAULT_ACTION_LEASE_TTL,
+    );
+    Arc::new(ActionGate::new(
+        Arc::new(auditor),
+        crate::action_auditor::ActionAuditLog::in_memory(),
+    ))
 }
 
 /// Why [`TaskManager::submit_spawn`] refused to dispatch an audited spawn.
@@ -440,6 +454,7 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, QueueStoreError> {
+        let action_gate = default_action_gate(Arc::clone(&leases));
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -453,7 +468,7 @@ impl TaskManager {
             audit: std::sync::Mutex::new(Arc::new(NoopAuditHook)),
             bound: RwLock::new(HashMap::new()),
             escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
-            action_gate: std::sync::RwLock::new(None),
+            action_gate: std::sync::RwLock::new(action_gate),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -474,11 +489,13 @@ impl TaskManager {
     }
 
     /// Review every effectful action (`effect_class() >= Repository`) a
-    /// dispatched task's agent attempts through `gate` (issue #642). Without
-    /// one, every such call is refused: this attaches the auditor, it does
-    /// not merely configure it.
+    /// dispatched task's agent attempts through `gate` instead of the
+    /// default [`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)
+    /// (issue #642). A `Sandbox`/`Production` action always needs the
+    /// strongest configured model per the epic, so most callers will pass a
+    /// [`ModelActionAuditor`](crate::action_auditor::ModelActionAuditor) here.
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
-        *self.runner.action_gate.write().unwrap() = Some(gate);
+        *self.runner.action_gate.write().unwrap() = gate;
         self
     }
 
@@ -871,8 +888,8 @@ impl Launcher for Arc<TaskRunner> {
 }
 
 impl TaskRunner {
-    fn action_gate(&self) -> Option<Arc<ActionGate>> {
-        self.action_gate.read().unwrap().clone()
+    fn action_gate(&self) -> Arc<ActionGate> {
+        Arc::clone(&self.action_gate.read().unwrap())
     }
 
     fn escalation_log(&self) -> Arc<EscalationLog> {
@@ -1122,13 +1139,8 @@ impl TaskRunner {
             }
         };
         let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
-        let tool_registry = match self.action_gate() {
-            Some(gate) => {
-                let subject = action_subject_for(&task_id, &queued, identity.as_ref());
-                tool_registry.with_action_gate(gate, subject)
-            }
-            None => tool_registry,
-        };
+        let subject = action_subject_for(&task_id, &queued, identity.as_ref());
+        let tool_registry = tool_registry.with_action_gate(self.action_gate(), subject);
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -3159,7 +3171,7 @@ mod identity_tests {
     }
 
     #[tokio::test]
-    async fn test_no_action_gate_refuses_a_repository_class_call_by_default() {
+    async fn test_default_action_gate_allows_a_call_within_the_identity_ceiling() {
         let repo_dir = repo_with_origin("git@github.com:example/repo.git");
 
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
@@ -3188,15 +3200,8 @@ mod identity_tests {
         );
         let result = manager.get_result(&task_id).await.unwrap();
         assert_eq!(result.action_audit.len(), 1);
-        assert_eq!(
-            result.action_audit[0].verdict.kind(),
-            crate::auditor::VerdictKind::Block
-        );
-        assert!(result.action_audit[0]
-            .verdict
-            .reasons()
-            .iter()
-            .any(|r| r.detail.contains("no action auditor configured")));
+        assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
+        assert!(result.action_audit[0].verdict.is_allow());
     }
 
     #[tokio::test]
