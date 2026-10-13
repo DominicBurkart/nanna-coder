@@ -1,0 +1,20 @@
+[case]
+id = "block-unknown-identity"
+name = "Identity absent from the catalog"
+description = "The planner names a card that does not exist."
+
+[request]
+parent_task_id = "task-4"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "ghost-writer"
+subtask = "Anything at all."
+dev_loop = "inner"
+requested_effect = "none"
+
+[expected]
+verdict = "block"
+reason_codes = ["unknown_identity"]
+
+[metadata]
+tags = ["block", "unknown-identity"]

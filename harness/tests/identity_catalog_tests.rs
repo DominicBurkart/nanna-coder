@@ -15,12 +15,21 @@ fn global_catalog_loads_all_fixture_identities() {
     assert_eq!(
         catalog.names().collect::<Vec<_>>(),
         vec![
+            "auditor",
             "deployer",
             "incident-responder",
             "pr-shepherd",
             "rust-implementer"
         ]
     );
+
+    let auditor = catalog.get("auditor").unwrap();
+    assert_eq!(auditor.scope.max_effect, EffectClass::None);
+    assert!(auditor.scope.tools.is_empty());
+    assert!(auditor
+        .system_prompt_text()
+        .unwrap()
+        .starts_with("# auditor"));
 
     let implementer = catalog.get("rust-implementer").unwrap();
     assert_eq!(implementer.identity.dev_loop, DevLoop::Inner);
@@ -103,9 +112,13 @@ fn fixture_catalog_renders_a_table() {
     );
     assert_eq!(
         lines[1].split_whitespace().collect::<Vec<_>>(),
+        vec!["auditor", "inner", "gemma4:e4b", "none"]
+    );
+    assert_eq!(
+        lines[2].split_whitespace().collect::<Vec<_>>(),
         vec!["deployer", "outer", "gemma4:e4b", "sandbox"]
     );
-    assert_eq!(lines.len(), 5);
+    assert_eq!(lines.len(), 6);
 }
 
 #[test]
