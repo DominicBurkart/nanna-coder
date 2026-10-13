@@ -179,4 +179,6 @@ flowchart TD
 
 ### Identity scope limits
 
+A task submitted without an identity (`TaskManager::submit`, or `submit_with_identity` with `None`) fails closed: its registry keeps only `EffectClass::None` tools, its container has no network, and a call to any effectful tool is refused and recorded as a `ScopeDenial` attributed to `unscoped`. Effectful work needs a named, registered identity. The backlog sinks refuse a task whose `identity_hint` is missing or not registered at enqueue time. The `nanna chat` and `nanna agent` direct modes and the eval runner do not go through `TaskManager`; they build their own full registry for local interactive use.
+
 `run_command` executes `sh -c` in the dev container, so `scope.paths` and `scope.read_paths` cannot be applied to it. An identity whose `scope.paths` does not include `**`, or that sets `scope.read_paths` at all, never receives `run_command`, even when `scope.tools` names it. Only an identity with `paths = ["**"]` and no `read_paths` can run shell commands, and it is bounded by its effect ceiling and network policy alone. The network reach of a `repository`-ceiling identity holding `run_command` is tracked in #714.
