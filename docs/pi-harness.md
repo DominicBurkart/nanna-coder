@@ -56,7 +56,7 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No ambient tools | `--no-builtin-tools --no-extensions --no-skills --no-prompt-templates --no-context-files --no-mcp --no-approve`; one static extension registers the granted capabilities and nothing else |
 | No workspace in the agent container | the plan may mount only the broker socket; the repo is never visible to pi, so repo-borne `.pi/` config cannot influence it |
 | Capabilities are brokered | each call goes over the socket to nanna, which runs the existing Rust `Tool` under identity scope, effect ceiling and incident holds |
-| Network | the plan names exactly one endpoint, the model gateway. The host string is checked (no localhost, loopback, link-local, unspecified, multicast, `metadata.google.internal` or numeric-looking names), but private ranges (10/8, 192.168/16, 100.64/10) are accepted and name checks cannot be complete. Real egress enforcement is the container network, not these checks. How the gateway is reached from inside the container (loopback there is the container itself) is not designed yet and returns with the executor. |
+| Network | the plan names exactly one endpoint, the model gateway. The host string is checked (no localhost, loopback, link-local, unspecified, multicast, `metadata.google.internal` or numeric-looking names), but private ranges (10/8, 192.168/16, 100.64/10) are accepted, names such as `foo.localhost` are accepted, and name checks cannot be complete. Real egress enforcement is the container network, not these checks. How the gateway is reached from inside the container (loopback there is the container itself) is not designed yet and returns with the executor. |
 | No secrets | the environment is an exact (name, value) allowlist (`HOME`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`); there is no secret-name heuristic; the model `apiKey` is a placeholder |
 | Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
 | Fail closed | `Unsupported` for empty capability sets or unrepresentable capability names; `ResolveError::InvalidModel`, `InvalidImage` and `InvalidBrokerSocket` for a bad model name, image reference or socket path; a plan that drops the agent's scope, limits or audited repository is rejected |
@@ -76,22 +76,36 @@ broker, never in the agent container. Middle and outer loop identities
 (`pr-shepherd` at `ci`, `deployer` at `sandbox`, `incident-responder` at
 `production`) receive their effectful tools through the broker exactly as an
 inner-loop identity receives `write_file`; `ResolvedAgent` grants any class up
-to the identity's `max_effect`, and `pi_plan_carries_scope_and_limits_for_enforcement`
-and `middle_and_outer_loop_ceilings_grant_effectful_capabilities` cover this.
+to the identity's `max_effect`. The tests `ceilings_grant_effectful_capabilities_up_to_the_ceiling`
+and `resolve_carries_scope_limits_and_ceiling` cover the grant side.
 
-The broker is the single door. For each capability call it must, in order:
+The broker is the single door. For each capability call it must, in order, and
+**it reimplements none of these gates**; it calls `ToolRegistry::execute` on the
+identity's scoped registry and maps the result. What exists on main today and
+what is new:
 
-1. look the tool up in the registry scoped to the identity (built by the broker
-   from the same identity and scope as the grant, see below); unknown or out-of-grant names are
-   refused;
-2. enforce `scope.paths` / `read_paths` and protected paths on file arguments;
-3. pass the **action gate** (the auditor's per-action review) before
-   execution; there is no unaudited path, and a refusal is returned to the
-   agent as a tool error and surfaced to the human like any other gap;
-4. for `Repository` and above: check the human-availability **window**
-   and take the coordination **lease**, holding it for the call;
-5. check the **production hold** for `Production`;
-6. execute, and record the call for the task result and audit log.
+1. Look the tool up in the scoped registry. Exists: `execute` returns
+   `ScopeDenied` for a name outside the scope, and records the denial.
+2. Enforce `scope.paths` / `read_paths` and protected paths on file arguments.
+   Exists, inside the tools: `read_file`, `write_file`, `list_directory` and
+   `search` are built with `::scoped(root, scope)` and carry the identity's
+   `PathScope`; `write_file` also carries `ProtectedPaths`; `execute` records
+   `ScopeDenied` and `ProtectedPath` denials. The registry must be built with
+   the path-scope-aware constructors (`create_tool_registry_for`,
+   `create_container_tool_registry_for`); `create_tool_registry(root)` followed
+   by `scoped_for` filters names but attaches no path scope. The broker adds
+   nothing here.
+3. Pass the **action gate** (the auditor's per-action review) before
+   execution. New: not on main (#706).
+4. For `Repository` and above: check the human-availability **window** and take
+   the coordination **lease**, holding it for the call. New: not on main
+   (#706).
+5. Check the **production hold** for `Production`. Exists: `execute` does it.
+6. Execute, and record the call for the task result and audit log. The audit
+   log is new broker work; the registry records denials only.
+
+Only steps 3 and 4 (and the audit log) are new. Anything in steps 1, 2 and 5
+that the broker re-implements is a defect.
 
 Spawning goes through the existing spawn gate: a `ResolvedAgent` can only be
 built from an `Allowed` proof, and a `CheckedPlan` only from a `ResolvedAgent`,
@@ -218,9 +232,11 @@ Known gaps, tracked here and not yet fixed:
   `scope.repos`, and the audited repository may be a path.
 - Carry the parent task id for audit-log correlation. The worktree path and
   branch are executor inputs obtained only through `bind_workspace`.
-- Broker contract steps 2-4 (path scope, windows and leases, the action gate)
-  are all new broker work: `ToolRegistry::execute` on main only does lookup, the
-  production hold and denial recording.
+- New broker work is only the action gate, windows and leases (#706, not on
+  main) and the audit log. Path scope and protected paths are already enforced
+  inside the scoped file tools, and `ToolRegistry::execute` already does lookup,
+  the production hold and denial recording; the broker must not reimplement
+  them, and must build its registry with the path-scope-aware constructors.
 
 - A `CheckedPlan` does not remember its agent or repository, so a plan for one
   agent could be handed to a broker built for another. The broker handle and
@@ -260,8 +276,7 @@ reference it when this stack merges.
 
 Reported by the reviewer's verification pass, which installed pi 1.2.0 with
 `--ignore-scripts` in a throwaway directory and ran it on the host (evidence in
-`/var/tmp/pi-verify`, not in this repository). Pin pi to exactly 1.2.0; earlier
-text naming 1.0.3 is superseded.
+`/var/tmp/pi-verify`, not in this repository). Pin pi to exactly 1.2.0.
 
 Confirmed:
 
