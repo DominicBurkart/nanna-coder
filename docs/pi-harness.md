@@ -56,10 +56,10 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No ambient tools | `--no-builtin-tools --no-extensions --no-skills --no-prompt-templates --no-context-files --no-mcp --no-approve`; one static extension registers the granted capabilities and nothing else |
 | No workspace in the agent container | the plan may mount only the broker socket; the repo is never visible to pi, so repo-borne `.pi/` config cannot influence it |
 | Capabilities are brokered | each call goes over the socket to nanna, which runs the existing Rust `Tool` under identity scope, effect ceiling and incident holds |
-| Network | only the model gateway endpoint, or none |
-| No secrets | environment names are an exact-name allowlist (`HOME`, `LANG`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`) plus a secret-marker check; the model `apiKey` is a placeholder |
+| Network | the plan names exactly one endpoint, the model gateway. The host string is checked (no localhost, loopback, link-local, metadata or numeric-looking names), but real egress enforcement is the container network, not name checks. |
+| No secrets | the environment is an exact (name, value) allowlist (`HOME`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`); there is no secret-name heuristic; the model `apiKey` is a placeholder |
 | Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
-| Fail closed | `Unsupported` for empty capability sets, empty model, or unrepresentable capability names; a plan that drops the agent's scope or limits is rejected |
+| Fail closed | `Unsupported` for empty capability sets or unrepresentable capability names; `ResolveError::InvalidModel`, `InvalidImage` and `InvalidBrokerSocket` for a bad model name, image reference or socket path; a plan that drops the agent's scope, limits or audited repository is rejected |
 | Verified lockdown | **Planned.** After start the executor compares the runtime's reported tool set to the plan with `verify_runtime_tools` and aborts on any difference. Nothing calls it yet. |
 
 `IsolationPolicy` encodes the rows that a plan can express. The property test
@@ -93,10 +93,14 @@ The broker is the single door. For each capability call it must, in order:
 5. check the **production hold** for `Production`;
 6. execute, and record the call for the task result and audit log.
 
-Spawning goes through the existing spawn gate: a launch plan is only built
-from an identity the auditor has allowed, and the executor refuses a plan that
-was not built from one. The broker and executor are not written yet; this list
-is their contract and is reviewed before code.
+Spawning goes through the existing spawn gate: a `ResolvedAgent` can only be
+built from an `Allowed` proof, and a `CheckedPlan` only from a `ResolvedAgent`,
+so a plan reaches an executor only through that chain (transitively; the
+executor does not itself inspect the proof). The prompt and repository label
+come from the audited request. Checking that the working repository on disk
+names the audited repository, as `TaskManager::submit_spawn` does, is the
+executor's job. The broker and executor are not written yet; this list is their
+contract and is reviewed before code.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
 tools that cannot honour path scope (`run_command` for path-restricted
@@ -179,6 +183,28 @@ Not yet done (in order):
    override (equality required in `narrows`). Needs the identity owner's
    agreement.
 5. Switch `TaskRunner` to the adapter path, then delete the loop.
+
+## Carried to the broker and executor slice
+
+Known gaps, tracked here and not yet fixed:
+
+- A `CheckedPlan` does not remember its agent or repository, so a plan for one
+  agent could be handed to a broker built for another. The broker handle and
+  plan must be matched at the executor entry point.
+- `ScopedCapabilities::scope` accepts any registry and does not check path
+  scoping; the contract (the registry must come from `create_*_registry_for`)
+  must be documented and tested at the broker.
+- Model-name charset and length cap beyond the current option/whitespace/
+  control-character checks.
+- The extension's reply cap counts UTF-16 units, not bytes; a `null` reply needs
+  a clean error; U+2028/U+2029 handling against pi's framing is undecided (the
+  executor must use strict LF framing).
+- The TypeScript extension has no tests of its own: `TIMEOUT_MS`,
+  `MAX_REPLY_BYTES` and the `!ok` throw survive mutation. It must be exercised
+  by the `NANNA_PI_BIN` real-pi test.
+- argv, stdin and file contents are pinned per adapter by that adapter's tests,
+  not by `IsolationPolicy`; a custom adapter can pass the policy with an
+  arbitrary command.
 
 ## One harness, and deleting the old one
 
