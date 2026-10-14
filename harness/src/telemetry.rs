@@ -1044,4 +1044,162 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_telemetry_default() {
+        let telemetry = TelemetrySystem::default();
+        assert!(!telemetry.initialized);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("region", "us-east-1")
+            .with_global_attribute("tier", "production");
+
+        assert_eq!(
+            telemetry.config.global_attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+        assert_eq!(
+            telemetry.config.global_attributes.get("tier"),
+            Some(&"production".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_config() {
+        let config = TelemetryConfig {
+            service: ServiceInfo {
+                name: "custom-service".to_string(),
+                version: "2.0.0".to_string(),
+                environment: "staging".to_string(),
+                instance_id: "test-instance".to_string(),
+                metadata: HashMap::new(),
+            },
+            enable_logging: false,
+            enable_tracing: true,
+            enable_metrics: true,
+            log_level: "debug".to_string(),
+            metrics_export_interval: Duration::from_secs(30),
+            trace_sample_rate: 0.5,
+            export_endpoints: ExportEndpoints {
+                prometheus_endpoint: None,
+                otlp_endpoint: None,
+                webhook_endpoints: Vec::new(),
+                log_endpoint: None,
+            },
+            global_attributes: HashMap::new(),
+        };
+
+        let telemetry = TelemetrySystem::new().with_config(config);
+        assert_eq!(telemetry.config.service.name, "custom-service");
+        assert_eq!(telemetry.config.service.version, "2.0.0");
+        assert!(!telemetry.config.enable_logging);
+    }
+
+    #[tokio::test]
+    async fn test_add_exporter() {
+        let exporter = PrometheusExporter::new(None);
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(exporter));
+        assert_eq!(telemetry.exporters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        assert!(uptime < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_exporter_returns_none() {
+        let telemetry = TelemetrySystem::new();
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_all_with_exporter() {
+        let exporter = PrometheusExporter::new(None);
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(exporter));
+
+        telemetry.record_counter("requests", 5.0, vec![]);
+        telemetry.record_event("test_event", "testing", serde_json::json!({}));
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+
+        telemetry.export_all().await.unwrap();
+
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_export_all_no_exporter() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("requests", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_exporter_clear_buffer() {
+        let exporter = PrometheusExporter::new(None);
+
+        exporter.add_metric(MetricPoint {
+            name: "test_metric".to_string(),
+            metric_type: MetricType::Gauge,
+            value: 1.0,
+            timestamp: Utc::now(),
+            labels: HashMap::new(),
+            unit: None,
+            description: None,
+        });
+
+        let output = exporter.export_prometheus().await.unwrap();
+        assert!(!output.is_empty());
+
+        exporter.clear_buffer();
+        let output_after = exporter.export_prometheus().await.unwrap();
+        assert!(output_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_with_attribute() {
+        let trace = TraceContext::new("test_op")
+            .with_attribute("key1", "value1")
+            .with_attribute("key2", "value2");
+
+        assert_eq!(trace.attributes.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("test_op");
+        assert_eq!(trace.status, SpanStatus::InProgress);
+
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_lifecycle() {
+        let telemetry = TelemetrySystem::new();
+        let trace = telemetry.start_trace("guard_op");
+        assert_eq!(telemetry.get_active_trace_count(), 1);
+
+        {
+            let mut guard = TraceGuard::new(&telemetry, trace);
+            assert!(guard.trace().is_some());
+            guard.record_error("test error");
+            assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
+            guard.set_status(SpanStatus::Cancelled);
+            assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
+        }
+
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
 }
