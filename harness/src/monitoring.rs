@@ -1242,4 +1242,67 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_metrics_export_custom_format_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(result.is_err());
+        match result {
+            Err(MonitoringError::MetricsCollectionFailed { reason }) => {
+                assert!(reason.contains("xml"));
+            }
+            _ => panic!("Expected MetricsCollectionFailed error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            max_cpu_usage: 0.75,
+            max_memory_usage: 0.80,
+            health_check_timeout: Duration::from_secs(10),
+        };
+
+        let result = manager.configure_thresholds(thresholds).await;
+        assert!(result.is_ok());
+        assert_eq!(manager.thresholds.max_latency_ms, 1000);
+        assert_eq!(manager.thresholds.max_cpu_usage, 0.75);
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_start_and_stop() {
+        let mut system = MonitoringSystem::new();
+
+        let result = system.start_monitoring().await;
+        assert!(result.is_ok());
+        assert!(system.monitoring_task.is_some());
+
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }
