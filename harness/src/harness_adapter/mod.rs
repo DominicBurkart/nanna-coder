@@ -1,52 +1,54 @@
 //! Harness-neutral seam between nanna's agent definitions and the agent
-//! runtimes that execute them.
+//! runtimes that execute them. Nothing here runs a runtime yet: the broker,
+//! executor and `TaskRunner` switch are not written, so this module is
+//! planned infrastructure, not a delivered isolation guarantee.
 //!
-//! An [`AgentIdentity`](crate::identity::AgentIdentity) is resolved against
-//! the capabilities a task can offer into a [`ResolvedAgent`]. A
-//! [`HarnessAdapter`] translates that into a [`LaunchPlan`]: files, argv,
-//! environment and the only mounts and network endpoints the runtime may
-//! have. Every plan passes through [`IsolationPolicy`] before an executor
-//! sees it, so a new adapter cannot widen what an agent can reach.
+//! An audited spawn ([`Allowed`](crate::auditor::Allowed)) is resolved against
+//! the capabilities of its scoped registry into a [`ResolvedAgent`]. A
+//! [`HarnessAdapter`] translates that into a draft [`LaunchPlan`]: files, argv,
+//! environment, the one broker socket and the one model gateway the runtime
+//! may reach. [`launch_plan`] checks the draft against [`IsolationPolicy`] and
+//! returns a [`CheckedPlan`], the only thing an executor may accept.
 //!
-//! The runtime holds no tools of its own. Each capability it exposes is a
-//! stub that forwards the call over the broker socket to nanna, which runs
-//! the real [`Tool`](crate::tools::Tool) under the identity's scope, effect
-//! ceiling and incident holds.
+//! The runtime is meant to hold no tools of its own. Each capability it
+//! exposes is a stub that forwards the call over the broker socket to nanna,
+//! which runs the real [`Tool`](crate::tools::Tool) under the identity's scope,
+//! effect ceiling and incident holds.
 //!
 //! ```
-//! use harness::harness_adapter::{
-//!     launch_plan, Endpoint, HarnessKind, PiAdapter, ResolvedAgent, ScopedCapabilities,
-//! };
+//! # #[tokio::main]
+//! # async fn main() {
+//! use harness::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+//! use harness::effects::EffectClass;
+//! use harness::harness_adapter::{launch_plan, Endpoint, PiAdapter, ResolvedAgent, ScopedCapabilities};
+//! use harness::identity::{DevLoop, IdentityCatalog};
 //! use harness::tools::create_tool_registry;
-//! use harness::identity::AgentIdentity;
 //!
-//! let identity = AgentIdentity::from_toml_str(
-//!     r#"
-//! [identity]
-//! name = "reader"
-//! description = "Reads code."
-//! loop = "inner"
-//! model = "gemma4:e4b"
-//! system_prompt = { inline = "Read carefully." }
+//! let dir = tempfile::tempdir().unwrap();
+//! let card = |name: &str, max_effect: &str, tools: &str| format!(
+//!     "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"inner\"\nmodel = \"m\"\n\
+//!      system_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\n\
+//!      max_effect = \"{max_effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 1\n\
+//!      max_wall_clock_secs = 1\nmax_concurrent = 1\n"
+//! );
+//! std::fs::write(dir.path().join("reader.toml"), card("reader", "workspace", "\"read_file\", \"search\"")).unwrap();
+//! std::fs::write(dir.path().join("auditor.toml"), card("auditor", "none", "")).unwrap();
+//! let catalog = IdentityCatalog::load(dir.path()).unwrap();
+//! let context = AuditContext::new(catalog.clone(), catalog.get("auditor").unwrap().clone()).unwrap();
+//! let request = SpawnRequest {
+//!     parent_task: TaskSummary::new("t1", "Read code", "github.com/example/repo"),
+//!     identity: "reader".to_string(),
+//!     subtask: "Summarise src/lib.rs.".to_string(),
+//!     dev_loop: DevLoop::Inner,
+//!     requested_effect: EffectClass::None,
+//! };
+//! let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+//! let allowed = gate.check(request, &context).await.unwrap();
 //!
-//! [scope]
-//! repos = ["github.com/example/repo"]
-//! paths = ["src/**"]
-//! max_effect = "workspace"
-//! tools = ["read_file", "search"]
-//!
-//! [limits]
-//! max_iterations = 10
-//! max_wall_clock_secs = 60
-//! max_concurrent = 1
-//! "#,
-//!     "reader.toml",
-//! )
-//! .unwrap();
-//!
-//! let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+//! let base = create_tool_registry(std::path::Path::new("."));
+//! let scoped = ScopedCapabilities::scope(base, allowed.identity());
 //! let agent = ResolvedAgent::resolve(
-//!     &identity,
+//!     &allowed,
 //!     &scoped,
 //!     "Summarise src/lib.rs",
 //!     Endpoint::new("model-gateway", 11434).unwrap(),
@@ -56,53 +58,44 @@
 //! .unwrap();
 //! assert_eq!(agent.capability_names(), vec!["read_file", "search"]);
 //!
-//! let plan = launch_plan(&PiAdapter::default(), &agent).unwrap();
+//! let plan = launch_plan(&PiAdapter, &agent).unwrap();
 //! assert_eq!(plan.exposed_capabilities, vec!["read_file", "search"]);
-//! assert_eq!(HarnessKind::Pi.as_str(), "pi");
+//! # }
 //! ```
 
+mod checked;
 mod isolation;
 mod pi;
 mod pi_extension;
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod tests;
 
+pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
 
+use crate::auditor::Allowed;
 use crate::effects::EffectClass;
 use crate::identity::{AgentIdentity, IdentityError, LimitsSection, ScopeSection};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, PATH_UNSCOPABLE_TOOLS};
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Agent runtimes nanna can launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum HarnessKind {
-    /// The pi coding agent, driven over its RPC mode.
-    Pi,
-}
-
-impl HarnessKind {
-    /// Stable lowercase name, identical to the serde representation.
-    ///
-    /// ```
-    /// use harness::harness_adapter::HarnessKind;
-    ///
-    /// assert_eq!(HarnessKind::Pi.as_str(), "pi");
-    /// ```
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            HarnessKind::Pi => "pi",
-        }
-    }
-}
-
 /// A host and port a runtime may reach over the network.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Endpoint` deliberately does not implement `Deserialize`: every value goes
+/// through [`Endpoint::new`] or [`Endpoint::operator_configured`].
+///
+/// ```compile_fail
+/// use harness::harness_adapter::Endpoint;
+///
+/// let _: Endpoint = serde_json::from_str(r#"{"host":"gw:80/@evil.com#","port":80}"#).unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Endpoint {
     host: String,
     port: u16,
@@ -110,18 +103,42 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Validate and build an endpoint. Hosts are restricted to ASCII letters,
-    /// digits, `.` and `-` so they can be embedded in generated URLs.
+    /// digits, `.` and `-` with well-formed labels. `localhost`, loopback,
+    /// link-local, unspecified and multicast addresses are refused, and a host
+    /// whose last label looks numeric (decimal or `0x` hex) must be a plain
+    /// dotted-quad address, so resolver tricks like `2130706433` or `0x7f.1`
+    /// cannot name a loopback address.
     ///
     /// ```
     /// use harness::harness_adapter::Endpoint;
     ///
     /// assert!(Endpoint::new("model-gateway", 11434).is_ok());
+    /// assert!(Endpoint::new("10.0.0.5", 11434).is_ok());
     /// assert!(Endpoint::new("evil/../host", 80).is_err());
-    /// assert!(Endpoint::new("", 80).is_err());
+    /// assert!(Endpoint::new("localhost", 80).is_err());
+    /// assert!(Endpoint::new("127.0.0.1", 80).is_err());
+    /// assert!(Endpoint::new("2130706433", 80).is_err());
     /// ```
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ResolveError> {
         let host = host.into();
-        if !host_is_valid(&host) || port == 0 {
+        if port == 0 || !host_is_well_formed(&host) || host_is_ambient(&host) {
+            return Err(ResolveError::InvalidEndpoint { host, port });
+        }
+        Ok(Self { host, port })
+    }
+
+    /// Build an endpoint the operator has configured explicitly, such as a
+    /// gateway on `localhost`. Only the character set and port are checked.
+    ///
+    /// ```
+    /// use harness::harness_adapter::Endpoint;
+    ///
+    /// assert!(Endpoint::operator_configured("localhost", 11434).is_ok());
+    /// assert!(Endpoint::operator_configured("a b", 11434).is_err());
+    /// ```
+    pub fn operator_configured(host: impl Into<String>, port: u16) -> Result<Self, ResolveError> {
+        let host = host.into();
+        if port == 0 || !host_is_well_formed(&host) {
             return Err(ResolveError::InvalidEndpoint { host, port });
         }
         Ok(Self { host, port })
@@ -138,16 +155,46 @@ impl Endpoint {
     }
 }
 
-fn host_is_valid(host: &str) -> bool {
+fn host_is_well_formed(host: &str) -> bool {
     if host.is_empty() {
         return false;
     }
-    for c in host.chars() {
-        if !c.is_ascii_alphanumeric() && c != '.' && c != '-' {
+    for label in host.split('.') {
+        let bad_edge = label.starts_with('-') || label.ends_with('-');
+        if label.is_empty() || bad_edge {
             return false;
+        }
+        for c in label.chars() {
+            if !c.is_ascii_alphanumeric() && c != '-' {
+                return false;
+            }
         }
     }
     true
+}
+
+fn looks_numeric(label: &str) -> bool {
+    let decimal = label.chars().all(|c| c.is_ascii_digit());
+    let hex = label.len() > 2
+        && (label.starts_with("0x") || label.starts_with("0X"))
+        && label[2..].chars().all(|c| c.is_ascii_hexdigit());
+    decimal || hex
+}
+
+fn host_is_ambient(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let last = host.rsplit('.').next().unwrap_or(host);
+    if !looks_numeric(last) {
+        return false;
+    }
+    match host.parse::<Ipv4Addr>() {
+        Ok(ip) => {
+            ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast()
+        }
+        Err(_) => true,
+    }
 }
 
 /// One capability an agent may call: a tool nanna runs on its behalf.
@@ -194,33 +241,9 @@ impl CapabilitySpec {
 /// another. Repo-local identities share their global identity's name while
 /// narrowing it, so a name alone cannot tell them apart; the bound scope can.
 ///
-/// ```
-/// use harness::harness_adapter::ScopedCapabilities;
-/// use harness::identity::AgentIdentity;
-/// use harness::tools::create_tool_registry;
-///
-/// let toml = r#"
-/// [identity]
-/// name = "a"
-/// description = "d"
-/// loop = "inner"
-/// model = "m"
-/// system_prompt = { inline = "p" }
-/// [scope]
-/// repos = ["r"]
-/// paths = ["**"]
-/// max_effect = "none"
-/// tools = ["read_file"]
-/// [limits]
-/// max_iterations = 1
-/// max_wall_clock_secs = 1
-/// max_concurrent = 1
-/// "#;
-/// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-/// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
-/// assert_eq!(scoped.identity(), "a");
-/// assert_eq!(scoped.specs().len(), 1);
-/// ```
+/// The base registry should already carry the identity's path scope (for
+/// example from `create_tool_registry_for`): `scoped_for` filters tool names
+/// but does not attach path restrictions to file tools.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedCapabilities {
     identity: String,
@@ -266,7 +289,7 @@ impl ScopedCapabilities {
     }
 }
 
-/// Failures resolving an identity into a [`ResolvedAgent`].
+/// Failures resolving an audited spawn into a [`ResolvedAgent`].
 #[derive(Debug, Error)]
 pub enum ResolveError {
     /// The capabilities were scoped by an identity whose name or scope differs
@@ -289,7 +312,7 @@ pub enum ResolveError {
     /// The identity's system prompt could not be read.
     #[error("system prompt: {0}")]
     Prompt(#[from] IdentityError),
-    /// The model endpoint is not a plain host and non-zero port.
+    /// The model endpoint is not an acceptable host and non-zero port.
     #[error("invalid model endpoint {host}:{port}")]
     InvalidEndpoint {
         /// Offending host.
@@ -297,10 +320,42 @@ pub enum ResolveError {
         /// Offending port.
         port: u16,
     },
+    /// The model name could be read as a command-line option or contains
+    /// whitespace or control characters.
+    #[error("invalid model name `{model}`")]
+    InvalidModel {
+        /// Offending model name.
+        model: String,
+    },
+    /// The broker socket path is empty, relative, `/`, escapes with `..`, or
+    /// names a container runtime's control socket.
+    #[error("invalid broker socket path `{path}`")]
+    InvalidBrokerSocket {
+        /// Offending path.
+        path: String,
+    },
 }
 
-/// What an identity may touch, carried so that whatever enforces it can
-/// not be handed a plan that forgot it.
+fn model_is_valid(model: &str) -> bool {
+    let plain = !model.is_empty() && !model.starts_with('-');
+    plain && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+fn broker_socket_is_valid(path: &str) -> bool {
+    let escapes = path.split(['/', '\\']).any(|part| part == "..");
+    let runtime_socket = ["docker.sock", "podman.sock", "containerd.sock"]
+        .iter()
+        .any(|name| path.ends_with(name));
+    path.starts_with('/')
+        && path.len() > 1
+        && !path.ends_with('/')
+        && !path.contains('\0')
+        && !escapes
+        && !runtime_socket
+}
+
+/// What an identity may touch, carried so that whatever enforces it cannot
+/// be handed a plan that forgot it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeGrant {
     /// Repositories the agent may be spawned against.
@@ -311,97 +366,72 @@ pub struct ScopeGrant {
     pub read_paths: Option<Vec<String>>,
 }
 
-/// An identity bound to a task: everything a runtime needs, already narrowed
-/// to what the identity's scope permits.
+/// An audited spawn bound to a task: everything a runtime needs, already
+/// narrowed to what the identity's scope permits. Fields are private and can
+/// only come from [`ResolvedAgent::resolve`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAgent {
-    /// Identity name.
-    pub name: String,
-    /// System prompt text.
-    pub system_prompt: String,
-    /// The task the agent is asked to perform.
-    pub task_prompt: String,
-    /// Model identifier at the gateway.
-    pub model: String,
-    /// The only network endpoint the runtime may reach.
-    pub endpoint: Endpoint,
-    /// Highest effect class any capability may reach.
-    pub max_effect: EffectClass,
-    /// Resource ceilings for the run.
-    pub limits: LimitsSection,
-    /// Path and repository scope the broker must enforce.
-    pub scope: ScopeGrant,
-    /// Container image the runtime starts from.
-    pub image: String,
-    /// Host path of the broker socket mounted into the container.
-    pub broker_socket: PathBuf,
+    name: String,
+    system_prompt: String,
+    task_prompt: String,
+    model: String,
+    endpoint: Endpoint,
+    max_effect: EffectClass,
+    limits: LimitsSection,
+    scope: ScopeGrant,
+    image: String,
+    broker_socket: PathBuf,
     capabilities: Vec<CapabilitySpec>,
 }
 
 impl ResolvedAgent {
-    /// Resolve `identity` against the capabilities of the registry scoped to
-    /// it. The grant is exactly that set: there is no second filter, so what
-    /// the agent is shown is what the broker's registry enforces. Fails when
-    /// the capabilities were scoped by an identity with a different name or
-    /// scope, and refuses any capability the identity does not allow.
-    ///
-    /// ```
-    /// use harness::effects::EffectClass;
-    /// use harness::harness_adapter::{Endpoint, ResolvedAgent, ScopedCapabilities};
-    /// use harness::identity::AgentIdentity;
-    /// use harness::tools::create_tool_registry;
-    ///
-    /// let toml = r#"
-    /// [identity]
-    /// name = "a"
-    /// description = "d"
-    /// loop = "inner"
-    /// model = "m"
-    /// system_prompt = { inline = "p" }
-    /// [scope]
-    /// repos = ["r"]
-    /// paths = ["**"]
-    /// max_effect = "workspace"
-    /// tools = ["*"]
-    /// [limits]
-    /// max_iterations = 1
-    /// max_wall_clock_secs = 1
-    /// max_concurrent = 1
-    /// "#;
-    /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-    /// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
-    /// let agent = ResolvedAgent::resolve(
-    ///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
-    /// ).unwrap();
-    /// assert!(agent.capability_names().iter().all(|n| *n != "run_command"));
-    /// assert!(agent.capabilities().iter().all(|c| c.effect <= EffectClass::Workspace));
-    /// ```
+    /// Resolve an audited spawn against the capabilities of the registry
+    /// scoped to its identity. The identity is taken from `allowed`, never from
+    /// the caller, so an agent can only be resolved from the identity the
+    /// auditor saw. The grant is exactly the scoped set: there is no second
+    /// filter, only an assertion that nothing in it exceeds the identity's
+    /// tool patterns, effect ceiling, or (for a path-restricted identity) the
+    /// tools that cannot honour path scope.
     pub fn resolve(
-        identity: &AgentIdentity,
+        allowed: &Allowed,
         scoped: &ScopedCapabilities,
         task_prompt: impl Into<String>,
         endpoint: Endpoint,
         image: impl Into<String>,
         broker_socket: PathBuf,
     ) -> Result<Self, ResolveError> {
+        let identity = allowed.identity();
         if scoped.identity != identity.name() || scoped.scope != identity.scope {
             return Err(ResolveError::ScopeMismatch {
                 identity: identity.name().to_string(),
             });
         }
+        let restricted = identity.restricts_paths();
         for spec in &scoped.specs {
-            if !identity.allows_tool(&spec.name) || !identity.allows_effect(spec.effect) {
+            let unscopable = restricted && PATH_UNSCOPABLE_TOOLS.contains(&spec.name.as_str());
+            if unscopable
+                || !identity.allows_tool(&spec.name)
+                || !identity.allows_effect(spec.effect)
+            {
                 return Err(ResolveError::GrantWiderThanIdentity {
                     identity: identity.name().to_string(),
                     tool: spec.name.clone(),
                 });
             }
         }
+        let model = identity.identity.model.clone();
+        if !model_is_valid(&model) {
+            return Err(ResolveError::InvalidModel { model });
+        }
+        let socket_text = broker_socket.to_string_lossy().into_owned();
+        if !broker_socket_is_valid(&socket_text) {
+            return Err(ResolveError::InvalidBrokerSocket { path: socket_text });
+        }
         Ok(Self {
             name: identity.name().to_string(),
             system_prompt: identity.system_prompt_text()?,
             task_prompt: task_prompt.into(),
-            model: identity.identity.model.clone(),
+            model,
             endpoint,
             max_effect: identity.scope.max_effect,
             limits: identity.limits,
@@ -412,8 +442,66 @@ impl ResolvedAgent {
             },
             image: image.into(),
             broker_socket,
-            capabilities: scoped.specs().to_vec(),
+            capabilities: scoped.specs.clone(),
         })
+    }
+
+    /// Drop every capability whose effect class exceeds `max`, so the runtime
+    /// is never shown a tool the broker would refuse.
+    pub fn withhold_above(mut self, max: EffectClass) -> Self {
+        self.capabilities.retain(|c| c.effect <= max);
+        self
+    }
+
+    /// Identity name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// System prompt text.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    /// The task the agent is asked to perform.
+    pub fn task_prompt(&self) -> &str {
+        &self.task_prompt
+    }
+
+    /// Model identifier at the gateway.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The only network endpoint the runtime may reach.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Highest effect class any capability may reach.
+    pub fn max_effect(&self) -> EffectClass {
+        self.max_effect
+    }
+
+    /// Resource ceilings for the run.
+    pub fn limits(&self) -> LimitsSection {
+        self.limits
+    }
+
+    /// Path and repository scope the broker must enforce.
+    pub fn scope(&self) -> &ScopeGrant {
+        &self.scope
+    }
+
+    /// Container image the runtime starts from.
+    pub fn image(&self) -> &str {
+        &self.image
+    }
+
+    /// Host path of the broker socket. The executor must also confirm it is a
+    /// socket it created and owns before mounting it.
+    pub fn broker_socket(&self) -> &std::path::Path {
+        &self.broker_socket
     }
 
     /// The capabilities granted, sorted by name.
@@ -430,35 +518,15 @@ impl ResolvedAgent {
 /// A file written into the container before the runtime starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanFile {
-    /// Absolute path inside the container.
+    /// Absolute path inside the container, under `/nanna/`.
     pub path: PathBuf,
     /// File contents.
     pub contents: String,
 }
 
-/// A host path mounted into the container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mount {
-    /// Path on the host.
-    pub host: PathBuf,
-    /// Path inside the container.
-    pub container: PathBuf,
-    /// Whether the mount is read-only.
-    pub read_only: bool,
-}
-
-/// Network access granted to the runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanNetwork {
-    /// No network at all.
-    None,
-    /// Only these endpoints.
-    Only(Vec<Endpoint>),
-}
-
 /// Everything an executor needs to start a runtime, and nothing it can use to
-/// widen the sandbox: privileges, capabilities and device access are fixed by
-/// the executor, not expressible here.
+/// widen the sandbox: privileges, Linux capabilities, devices and any mount
+/// other than the broker socket are not expressible here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
     /// Container image.
@@ -469,11 +537,13 @@ pub struct LaunchPlan {
     pub argv: Vec<String>,
     /// Environment variables.
     pub env: Vec<(String, String)>,
-    /// Host mounts.
-    pub mounts: Vec<Mount>,
-    /// Network access.
-    pub network: PlanNetwork,
-    /// Lines written to the runtime's stdin once it starts.
+    /// Host path of the broker socket, mounted at
+    /// [`BROKER_SOCKET_CONTAINER_PATH`]. It is the only mount.
+    pub broker_socket: PathBuf,
+    /// The only network endpoint: the model gateway.
+    pub gateway: Endpoint,
+    /// Lines written to the runtime's stdin once it starts. Only the executor
+    /// may write to a runtime's RPC stdin.
     pub stdin: Vec<String>,
     /// Names of the capabilities the runtime will expose to the model.
     pub exposed_capabilities: Vec<String>,
@@ -496,25 +566,12 @@ pub struct HandshakeMismatch {
 
 /// Compare the tools a started runtime reports against the plan. Executors
 /// must call this after start and abort the run on any mismatch, because a
-/// runtime that ignores a lockdown flag fails open.
-///
-/// ```
-/// use harness::harness_adapter::{verify_runtime_tools, LaunchPlan, PlanNetwork, ScopeGrant};
-/// use harness::identity::LimitsSection;
-///
-/// let plan = LaunchPlan {
-///     image: "i".into(), files: vec![], argv: vec!["x".into()], env: vec![], mounts: vec![],
-///     network: PlanNetwork::None, stdin: vec![],
-///     exposed_capabilities: vec!["read_file".into()],
-///     limits: LimitsSection { max_iterations: 1, max_wall_clock_secs: 1, max_concurrent: 1 },
-///     scope: ScopeGrant { repos: vec![], paths: vec![], read_paths: None },
-/// };
-/// assert!(verify_runtime_tools(&plan, &["read_file".to_string()]).is_ok());
-/// let err = verify_runtime_tools(&plan, &["read_file".to_string(), "bash".to_string()]).unwrap_err();
-/// assert_eq!(err.unexpected, vec!["bash"]);
-/// ```
+/// runtime that ignores a lockdown flag fails open. For pi 1.2.0 the tool list
+/// appears only in the first system `message_start` event (`toolsAdded`),
+/// emitted after a prompt is sent, so the broker must refuse every call until
+/// this check has passed.
 pub fn verify_runtime_tools(
-    plan: &LaunchPlan,
+    plan: &CheckedPlan,
     reported: &[String],
 ) -> Result<(), HandshakeMismatch> {
     let granted: std::collections::BTreeSet<&String> = plan.exposed_capabilities.iter().collect();
@@ -549,491 +606,4 @@ pub enum Unsupported {
         /// Why it is rejected.
         reason: String,
     },
-    /// The model identifier is empty.
-    #[error("agent `{agent}` names no model")]
-    NoModel {
-        /// Agent name.
-        agent: String,
-    },
-}
-
-/// Why a launch plan was refused.
-#[derive(Debug, Error)]
-pub enum PlanError {
-    /// The adapter cannot honour the agent definition.
-    #[error(transparent)]
-    Unsupported(#[from] Unsupported),
-    /// The adapter produced a plan that breaks the isolation policy.
-    #[error(transparent)]
-    Isolation(#[from] IsolationViolation),
-}
-
-/// Translates a [`ResolvedAgent`] into a [`LaunchPlan`] for one runtime.
-///
-/// Implementations are pure: no I/O, no clock, no environment.
-pub trait HarnessAdapter {
-    /// The runtime this adapter targets.
-    fn kind(&self) -> HarnessKind;
-
-    /// Build the launch plan, or refuse with [`Unsupported`].
-    fn plan(&self, agent: &ResolvedAgent) -> Result<LaunchPlan, Unsupported>;
-}
-
-/// Build a plan with `adapter` and verify it against [`IsolationPolicy`].
-/// Executors must obtain plans only through this function.
-///
-/// ```
-/// use harness::harness_adapter::{
-///     launch_plan, Endpoint, PiAdapter, ResolvedAgent, ScopedCapabilities,
-/// };
-/// use harness::identity::AgentIdentity;
-/// use harness::tools::create_tool_registry;
-///
-/// let toml = r#"
-/// [identity]
-/// name = "a"
-/// description = "d"
-/// loop = "inner"
-/// model = "m"
-/// system_prompt = { inline = "p" }
-/// [scope]
-/// repos = ["r"]
-/// paths = ["**"]
-/// max_effect = "none"
-/// tools = ["nothing_matches"]
-/// [limits]
-/// max_iterations = 1
-/// max_wall_clock_secs = 1
-/// max_concurrent = 1
-/// "#;
-/// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
-/// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
-/// let agent = ResolvedAgent::resolve(
-///     &identity, &scoped, "t", Endpoint::new("gw", 1).unwrap(), "img", "/s".into(),
-/// ).unwrap();
-/// assert!(launch_plan(&PiAdapter::default(), &agent).is_err());
-/// ```
-pub fn launch_plan(
-    adapter: &dyn HarnessAdapter,
-    agent: &ResolvedAgent,
-) -> Result<LaunchPlan, PlanError> {
-    let plan = adapter.plan(agent)?;
-    IsolationPolicy::check(&plan, agent)?;
-    Ok(plan)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::AgentIdentity;
-    use crate::tools::create_tool_registry;
-
-    fn identity_with(prompt: &str, tools: &str, effect: &str) -> AgentIdentity {
-        let toml = format!(
-            r#"
-[identity]
-name = "a"
-description = "d"
-loop = "middle"
-model = "m"
-system_prompt = {prompt}
-[scope]
-repos = ["github.com/x/y"]
-paths = ["api/**"]
-read_paths = ["**"]
-max_effect = "{effect}"
-tools = [{tools}]
-[limits]
-max_iterations = 7
-max_wall_clock_secs = 9
-max_concurrent = 2
-"#
-        );
-        AgentIdentity::from_toml_str(&toml, "a.toml").unwrap()
-    }
-
-    fn inline() -> &'static str {
-        "{ inline = \"p\" }"
-    }
-
-    fn resolve(identity: &AgentIdentity, available: &[CapabilitySpec]) -> ResolvedAgent {
-        let scoped = testing::scoped(identity, available);
-        ResolvedAgent::resolve(
-            identity,
-            &scoped,
-            "t",
-            Endpoint::new("gw", 1).unwrap(),
-            "img",
-            "/s".into(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn endpoint_rejects_port_zero_and_exposes_parts() {
-        assert!(Endpoint::new("gw", 0).is_err());
-        assert!(Endpoint::new("", 80).is_err());
-        assert!(Endpoint::new("evil/../host", 80).is_err());
-        assert!(Endpoint::new("a-b.c-1", 80).is_ok());
-        let endpoint = Endpoint::new("gw.local", 8080).unwrap();
-        assert_eq!((endpoint.host(), endpoint.port()), ("gw.local", 8080));
-        let err = Endpoint::new("a b", 1).unwrap_err();
-        assert!(err.to_string().contains("a b:1"));
-    }
-
-    #[test]
-    fn resolve_carries_scope_limits_and_ceiling() {
-        let agent = resolve(&identity_with(inline(), "\"*\"", "ci"), &[]);
-        assert_eq!(agent.scope.repos, vec!["github.com/x/y"]);
-        assert_eq!(agent.scope.paths, vec!["api/**"]);
-        assert_eq!(agent.scope.read_paths, Some(vec!["**".to_string()]));
-        assert_eq!(agent.limits.max_iterations, 7);
-        assert_eq!(agent.limits.max_wall_clock_secs, 9);
-        assert_eq!(agent.max_effect, EffectClass::Ci);
-    }
-
-    #[test]
-    fn resolve_grants_exactly_the_scoped_set() {
-        let available = vec![
-            CapabilitySpec::new("a_tool", "d", serde_json::json!({}), EffectClass::None),
-            CapabilitySpec::new("b_tool", "d", serde_json::json!({}), EffectClass::None),
-        ];
-        let agent = resolve(&identity_with(inline(), "\"a_tool\"", "none"), &available);
-        assert_eq!(agent.capability_names(), vec!["a_tool"]);
-        assert_eq!(agent.capabilities().len(), 1);
-    }
-
-    #[test]
-    fn resolve_refuses_capabilities_scoped_to_another_identity() {
-        let identity = identity_with(inline(), "\"*\"", "none");
-        let scoped = testing::scoped(&identity, &[]);
-        let other = AgentIdentity::from_toml_str(
-            r#"
-[identity]
-name = "other"
-description = "d"
-loop = "inner"
-model = "m"
-system_prompt = { inline = "p" }
-[scope]
-repos = ["r"]
-paths = ["**"]
-max_effect = "none"
-tools = ["*"]
-[limits]
-max_iterations = 1
-max_wall_clock_secs = 1
-max_concurrent = 1
-"#,
-            "other.toml",
-        )
-        .unwrap();
-        let err = ResolvedAgent::resolve(
-            &other,
-            &scoped,
-            "t",
-            Endpoint::new("gw", 1).unwrap(),
-            "img",
-            "/s".into(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ResolveError::ScopeMismatch { .. }));
-        assert_eq!(
-            err.to_string(),
-            "capabilities were scoped by a different identity than `other`"
-        );
-    }
-
-    fn named(name: &str, tools: &str, effect: &str, paths: &str, read: &str) -> AgentIdentity {
-        let toml = format!(
-            r#"
-[identity]
-name = "{name}"
-description = "d"
-loop = "inner"
-model = "m"
-system_prompt = {{ inline = "p" }}
-[scope]
-repos = ["r"]
-paths = {paths}
-{read}
-max_effect = "{effect}"
-tools = [{tools}]
-[limits]
-max_iterations = 1
-max_wall_clock_secs = 1
-max_concurrent = 1
-"#
-        );
-        AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
-    }
-
-    fn resolve_pair(
-        scoped_by: &AgentIdentity,
-        resolved: &AgentIdentity,
-    ) -> Result<ResolvedAgent, ResolveError> {
-        let scoped =
-            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), scoped_by);
-        ResolvedAgent::resolve(
-            resolved,
-            &scoped,
-            "t",
-            Endpoint::new("gw", 1).unwrap(),
-            "img",
-            "/s".into(),
-        )
-    }
-
-    #[test]
-    fn same_name_narrower_local_identity_cannot_use_the_global_grant() {
-        let global = named("implementer", "\"*\"", "workspace", "[\"**\"]", "");
-        let local = named("implementer", "\"read_file\"", "none", "[\"**\"]", "");
-        let err = resolve_pair(&global, &local).unwrap_err();
-        assert!(matches!(err, ResolveError::ScopeMismatch { .. }));
-        assert_eq!(
-            err.to_string(),
-            "capabilities were scoped by a different identity than `implementer`"
-        );
-        assert!(resolve_pair(&local, &local).is_ok());
-    }
-
-    #[test]
-    fn same_name_identity_with_different_paths_or_read_paths_is_refused() {
-        let base = named("implementer", "\"*\"", "workspace", "[\"**\"]", "");
-        let narrower_paths = named("implementer", "\"*\"", "workspace", "[\"api/**\"]", "");
-        let with_reads = named(
-            "implementer",
-            "\"*\"",
-            "workspace",
-            "[\"**\"]",
-            "read_paths = [\"**\"]",
-        );
-        for other in [&narrower_paths, &with_reads] {
-            assert!(matches!(
-                resolve_pair(&base, other),
-                Err(ResolveError::ScopeMismatch { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn widened_grant_fails_closed() {
-        let identity = named("a", "\"read_file\"", "none", "[\"**\"]", "");
-        let mut scoped = testing::scoped(&identity, &[]);
-        scoped.specs.push(CapabilitySpec::new(
-            "write_file",
-            "d",
-            serde_json::json!({}),
-            EffectClass::Workspace,
-        ));
-        let err = ResolvedAgent::resolve(
-            &identity,
-            &scoped,
-            "t",
-            Endpoint::new("gw", 1).unwrap(),
-            "img",
-            "/s".into(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ResolveError::GrantWiderThanIdentity { .. }));
-        assert_eq!(
-            err.to_string(),
-            "capability `write_file` is wider than identity `a` allows"
-        );
-        scoped.specs[0] = CapabilitySpec::new(
-            "read_file",
-            "d",
-            serde_json::json!({}),
-            EffectClass::Workspace,
-        );
-        scoped.specs.truncate(1);
-        assert!(matches!(
-            ResolvedAgent::resolve(
-                &identity,
-                &scoped,
-                "t",
-                Endpoint::new("gw", 1).unwrap(),
-                "img",
-                "/s".into(),
-            ),
-            Err(ResolveError::GrantWiderThanIdentity { .. })
-        ));
-    }
-
-    #[test]
-    fn real_registry_grant_matches_the_identity_scope() {
-        let identity = identity_with(
-            inline(),
-            "\"read_file\", \"cargo_*\", \"run_command\"",
-            "workspace",
-        );
-        let scoped =
-            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
-        assert_eq!(scoped.identity(), "a");
-        for spec in scoped.specs() {
-            assert!(identity.allows_tool(&spec.name), "{}", spec.name);
-            assert!(identity.allows_effect(spec.effect), "{}", spec.name);
-        }
-        assert!(scoped.specs().iter().all(|s| s.name != "run_command"));
-        assert!(scoped.specs().windows(2).all(|w| w[0].name < w[1].name));
-    }
-
-    #[test]
-    fn middle_and_outer_loop_ceilings_grant_effectful_capabilities() {
-        let available: Vec<CapabilitySpec> = [
-            ("read_file", EffectClass::None),
-            ("git_push", EffectClass::Repository),
-            ("trigger_ci", EffectClass::Ci),
-            ("deploy_sandbox", EffectClass::Sandbox),
-            ("deploy_prod", EffectClass::Production),
-        ]
-        .into_iter()
-        .map(|(n, e)| CapabilitySpec::new(n, "d", serde_json::json!({}), e))
-        .collect();
-        for (ceiling, expected) in [
-            ("none", 1),
-            ("repository", 2),
-            ("ci", 3),
-            ("sandbox", 4),
-            ("production", 5),
-        ] {
-            let agent = resolve(&identity_with(inline(), "\"*\"", ceiling), &available);
-            assert_eq!(agent.capabilities().len(), expected, "{ceiling}");
-            assert!(agent
-                .capabilities()
-                .iter()
-                .all(|c| c.effect <= agent.max_effect));
-        }
-    }
-
-    #[test]
-    fn missing_prompt_file_is_a_resolve_error() {
-        let identity = identity_with("\"prompts/missing.md\"", "\"*\"", "none");
-        let scoped = testing::scoped(&identity, &[]);
-        let err = ResolvedAgent::resolve(
-            &identity,
-            &scoped,
-            "t",
-            Endpoint::new("gw", 1).unwrap(),
-            "img",
-            "/s".into(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().starts_with("system prompt:"));
-    }
-
-    #[test]
-    fn scoped_capabilities_describe_tools_with_their_effect() {
-        let identity = identity_with(inline(), "\"write_file\"", "workspace");
-        let scoped =
-            ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
-        let write = scoped
-            .specs()
-            .iter()
-            .find(|s| s.name == "write_file")
-            .unwrap();
-        assert_eq!(write.effect, EffectClass::Workspace);
-        assert_eq!(write.parameters["type"], "object");
-    }
-
-    #[test]
-    fn adapters_report_their_kind() {
-        assert_eq!(Broken.kind(), HarnessKind::Pi);
-        assert_eq!(PiAdapter.kind().as_str(), "pi");
-    }
-
-    #[test]
-    fn harness_kind_round_trips_through_serde() {
-        let json = serde_json::to_string(&HarnessKind::Pi).unwrap();
-        assert_eq!(json, "\"pi\"");
-        assert_eq!(
-            serde_json::from_str::<HarnessKind>(&json).unwrap(),
-            HarnessKind::Pi
-        );
-    }
-
-    struct Broken;
-
-    impl HarnessAdapter for Broken {
-        fn kind(&self) -> HarnessKind {
-            HarnessKind::Pi
-        }
-
-        fn plan(&self, agent: &ResolvedAgent) -> Result<LaunchPlan, Unsupported> {
-            Ok(LaunchPlan {
-                image: "other".into(),
-                files: vec![],
-                argv: vec!["x".into()],
-                env: vec![],
-                mounts: vec![],
-                network: PlanNetwork::None,
-                stdin: vec![],
-                exposed_capabilities: vec![],
-                limits: agent.limits,
-                scope: agent.scope.clone(),
-            })
-        }
-    }
-
-    #[test]
-    fn launch_plan_rejects_a_misbehaving_adapter() {
-        let agent = resolve(&identity_with(inline(), "\"*\"", "none"), &[]);
-        let err = launch_plan(&Broken, &agent).unwrap_err();
-        assert!(matches!(
-            err,
-            PlanError::Isolation(IsolationViolation::Image { .. })
-        ));
-        assert!(err.to_string().contains("other"));
-    }
-
-    #[test]
-    fn launch_plan_surfaces_unsupported() {
-        let agent = resolve(&identity_with(inline(), "\"*\"", "none"), &[]);
-        let err = launch_plan(&PiAdapter, &agent).unwrap_err();
-        assert!(matches!(
-            err,
-            PlanError::Unsupported(Unsupported::NoCapabilities { .. })
-        ));
-    }
-
-    #[test]
-    fn handshake_reports_unexpected_and_missing_tools() {
-        let agent = resolve(
-            &identity_with(inline(), "\"read_file\", \"search\"", "none"),
-            &[
-                CapabilitySpec::new("read_file", "d", serde_json::json!({}), EffectClass::None),
-                CapabilitySpec::new("search", "d", serde_json::json!({}), EffectClass::None),
-            ],
-        );
-        let plan = launch_plan(&PiAdapter, &agent).unwrap();
-        let ok = ["search".to_string(), "read_file".to_string()];
-        assert!(verify_runtime_tools(&plan, &ok).is_ok());
-        let bad = [
-            "read_file".to_string(),
-            "bash".to_string(),
-            "write".to_string(),
-        ];
-        let err = verify_runtime_tools(&plan, &bad).unwrap_err();
-        assert_eq!(err.unexpected, vec!["bash", "write"]);
-        assert_eq!(err.missing, vec!["search"]);
-        assert!(err.to_string().contains("bash"));
-        assert!(verify_runtime_tools(&plan, &[]).is_err());
-    }
-
-    #[test]
-    fn pi_plan_carries_scope_and_limits_for_enforcement() {
-        let agent = resolve(
-            &identity_with(inline(), "\"deploy_prod\"", "production"),
-            &[CapabilitySpec::new(
-                "deploy_prod",
-                "d",
-                serde_json::json!({}),
-                EffectClass::Production,
-            )],
-        );
-        let plan = launch_plan(&PiAdapter, &agent).unwrap();
-        assert_eq!(plan.limits, agent.limits);
-        assert_eq!(plan.scope, agent.scope);
-        assert_eq!(plan.exposed_capabilities, vec!["deploy_prod"]);
-    }
 }
