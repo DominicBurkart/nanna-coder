@@ -321,6 +321,7 @@ struct TaskRunner {
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
+    escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -469,6 +470,7 @@ impl TaskManager {
             bound: RwLock::new(HashMap::new()),
             escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
             action_gate: std::sync::RwLock::new(action_gate),
+            escalator: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -501,6 +503,15 @@ impl TaskManager {
     /// terminal-transition handling release from.
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
+        self
+    }
+
+    /// Deliver action-auditor escalations through `escalator` and use its
+    /// log as this manager's escalation log. Without one, an escalation is
+    /// recorded in the escalation log only and no sink delivers it.
+    pub fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>) -> Self {
+        *self.runner.escalations.write().unwrap() = Arc::clone(escalator.log());
+        *self.runner.escalator.write().unwrap() = Some(escalator);
         self
     }
 
@@ -897,6 +908,18 @@ impl TaskRunner {
         Arc::clone(&self.action_gate.read().unwrap())
     }
 
+    fn action_escalator(&self) -> Arc<crate::escalation::Escalator> {
+        if let Some(escalator) = self.escalator.read().unwrap().clone() {
+            return escalator;
+        }
+        Arc::new(crate::escalation::Escalator::new(
+            self.escalation_log(),
+            Arc::new(crate::escalation::FanoutSink(Vec::new())),
+            Arc::new(crate::leases::SystemClock),
+            crate::escalation::default_window(),
+        ))
+    }
+
     fn escalation_log(&self) -> Arc<EscalationLog> {
         Arc::clone(&self.escalations.read().unwrap())
     }
@@ -1145,7 +1168,9 @@ impl TaskRunner {
         };
         let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
         let subject = action_subject_for(&task_id, &queued, identity.as_ref());
-        let tool_registry = tool_registry.with_action_gate(self.action_gate(), subject);
+        let tool_registry = tool_registry
+            .with_action_gate(self.action_gate(), subject)
+            .with_action_escalator(self.action_escalator());
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -1294,36 +1319,38 @@ fn bound_patch(patch: String) -> Option<String> {
     }
 }
 
+pub(crate) const UNSCOPED_ACTION_CEILING: EffectClass = EffectClass::Workspace;
+
+fn action_repo_key(repo_path: &std::path::Path) -> String {
+    crate::scope::origin_slug(repo_path)
+        .and_then(|slug| slug.split_once('/').map(|(_, rest)| rest.to_string()))
+        .unwrap_or_else(|| repo_path.display().to_string())
+}
+
 /// The subject a dispatched task's effectful calls are reviewed against:
-/// the identity's effect ceiling (unbounded when the task carries none),
-/// the branch this task pushes to, and no window, pull request or
-/// environment. Nothing in `Task`/`QueuedTask` names a PR or a target
-/// environment yet -- that lands with the middle/outer-loop work (#647,
-/// #649) -- so `Sandbox`/`Production` calls dispatched through
-/// `TaskRunner` correctly `Block` on a missing lease context
-/// ([`RuleActionAuditor`](crate::action_auditor::RuleActionAuditor)) until
-/// then, rather than silently skipping the check. `repo` is
-/// `queued.repo_path`'s filesystem path, not the `owner/name` form
-/// [`ActionSubject::repo`](crate::tools::ActionSubject::repo) is documented
-/// against; harmless today since no lease is ever acquired while `window`
-/// is `None`, but worth fixing alongside the PR/environment metadata.
+/// the identity's effect ceiling ([`UNSCOPED_ACTION_CEILING`] when the task
+/// carries no identity), the repository as `owner/name` (the checkout path
+/// when it has no nameable `origin`), the branch this task pushes to, the
+/// identity's `scope.paths`, and no window, pull request or environment.
+/// Nothing in `Task`/`QueuedTask` names a PR or a target environment yet
+/// (#647, #649), so `Sandbox`/`Production` calls dispatched through
+/// `TaskRunner` stop at the missing lease context.
 fn action_subject_for(
     task_id: &TaskId,
     queued: &QueuedTask,
     identity: Option<&AgentIdentity>,
 ) -> crate::tools::ActionSubject {
-    let max_effect = identity
-        .map(|identity| identity.scope.max_effect)
-        .unwrap_or(EffectClass::Production);
     crate::tools::ActionSubject {
         task_id: task_id.clone(),
-        max_effect,
+        max_effect: identity.map_or(UNSCOPED_ACTION_CEILING, |identity| {
+            identity.scope.max_effect
+        }),
         window: None,
-        repo: queued.repo_path.display().to_string(),
+        repo: action_repo_key(&queued.repo_path),
         branch: Some(queued.branch.clone()),
         pr: None,
         environment: None,
-        paths: Vec::new(),
+        paths: identity.map_or_else(Vec::new, |identity| identity.scope.paths.clone()),
     }
 }
 
@@ -2993,6 +3020,36 @@ mod identity_tests {
     }
 
     #[test]
+    fn test_action_subject_for_a_scoped_task_carries_ceiling_slug_and_paths() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let queued = queued(repo.path());
+        let identity = scoped_identity();
+        let subject = action_subject_for(&TaskId("t1".to_string()), &queued, Some(&identity));
+        assert_eq!(subject.max_effect, EffectClass::Workspace);
+        assert_eq!(subject.repo, "example/repo");
+        assert_eq!(subject.branch.as_deref(), Some(queued.branch.as_str()));
+        assert_eq!(subject.paths, identity.scope.paths);
+        assert!(!subject.paths.is_empty());
+        assert_eq!(subject.window, None);
+    }
+
+    #[test]
+    fn test_action_subject_for_an_unscoped_task_is_capped_below_repository() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let subject = action_subject_for(&TaskId("t1".to_string()), &queued(repo.path()), None);
+        assert_eq!(subject.max_effect, UNSCOPED_ACTION_CEILING);
+        assert_eq!(UNSCOPED_ACTION_CEILING, EffectClass::Workspace);
+        assert!(subject.paths.is_empty());
+    }
+
+    #[test]
+    fn test_action_subject_repo_falls_back_to_the_path_without_an_origin() {
+        let repo = git_repo();
+        let subject = action_subject_for(&TaskId("t1".to_string()), &queued(repo.path()), None);
+        assert_eq!(subject.repo, repo.path().display().to_string());
+    }
+
+    #[test]
     fn test_network_policy_follows_the_identity_ceiling() {
         assert_eq!(network_policy_for(None), NetworkPolicy::Enabled);
         let mut identity = scoped_identity();
@@ -3221,6 +3278,83 @@ mod identity_tests {
         assert!(result.action_audit[0].verdict.reasons()[0]
             .detail
             .contains("model"));
+    }
+
+    struct EscalatesEverything;
+
+    #[async_trait::async_trait]
+    impl crate::action_auditor::ActionAuditor for EscalatesEverything {
+        fn name(&self) -> &str {
+            "escalates-everything"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(crate::action_auditor::ActionVerdict::escalate(vec![
+                crate::auditor::Reason::new(crate::auditor::ReasonCode::Other, "needs a human"),
+            ]))
+        }
+    }
+
+    async fn run_escalating_task(manager: &TaskManager) -> TaskId {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+        wait_for(manager, &task_id, terminal).await;
+        task_id
+    }
+
+    fn escalating_gate() -> Arc<crate::action_auditor::ActionGate> {
+        Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(EscalatesEverything),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_an_escalated_action_reaches_the_configured_escalator() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, log) = crate::test_support::escalation::escalator(&sink);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_action_gate(escalating_gate())
+            .with_escalator(escalator);
+        let task_id = run_escalating_task(&manager).await;
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].task_id, Some(task_id));
+        assert_eq!(seen[0].repo, "example/repo");
+        assert_eq!(seen[0].identity.as_deref(), Some("rust-implementer"));
+        assert_eq!(log.snapshot(Utc::now()).tracked, 1);
+        assert_eq!(manager.escalations().snapshot(Utc::now()).tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_an_escalated_action_is_recorded_in_the_escalation_log_by_default() {
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_gate(escalating_gate());
+        run_escalating_task(&manager).await;
+        let snapshot = manager.escalations().snapshot(Utc::now());
+        assert_eq!(snapshot.tracked, 1);
+        assert_eq!(snapshot.occurrences, 1);
+        assert!(snapshot.holds.is_empty());
     }
 
     #[tokio::test]

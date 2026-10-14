@@ -156,3 +156,67 @@ mod fake {
 
 #[cfg(unix)]
 pub(crate) use fake::FakePodman;
+
+pub(crate) mod escalation {
+    use crate::escalation::{
+        DeliveryOutcome, DeliveryReceipt, Escalation, EscalationError, EscalationLog,
+        EscalationSink, Escalator,
+    };
+    use crate::leases::SystemClock;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) struct CapturingSink {
+        pub(crate) seen: Mutex<Vec<Escalation>>,
+        fail: bool,
+    }
+
+    impl CapturingSink {
+        pub(crate) fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                fail,
+            })
+        }
+
+        pub(crate) fn escalations(&self) -> Vec<Escalation> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl EscalationSink for Arc<CapturingSink> {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn deliver(
+            &self,
+            escalation: &Escalation,
+        ) -> Result<DeliveryReceipt, EscalationError> {
+            self.seen.lock().unwrap().push(escalation.clone());
+            if self.fail {
+                return Err(EscalationError::Status {
+                    url: "capturing".to_string(),
+                    status: 500,
+                });
+            }
+            Ok(DeliveryReceipt {
+                sink: "capturing".to_string(),
+                reference: escalation.title(),
+                outcome: DeliveryOutcome::Posted,
+            })
+        }
+    }
+
+    pub(crate) fn escalator(sink: &Arc<CapturingSink>) -> (Arc<Escalator>, Arc<EscalationLog>) {
+        let log = Arc::new(EscalationLog::in_memory());
+        let escalator = Escalator::new(
+            Arc::clone(&log),
+            Arc::new(Arc::clone(sink)),
+            Arc::new(SystemClock),
+            chrono::Duration::minutes(10),
+        );
+        (Arc::new(escalator), log)
+    }
+}

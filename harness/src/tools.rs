@@ -3,7 +3,7 @@ use crate::action_auditor::{
 };
 use crate::auditor::{Reason, ReasonCode};
 use crate::effects::EffectClass;
-use crate::escalation::EscalationLog;
+use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
 use crate::protected::{ProtectedPathViolation, ProtectedPaths};
@@ -112,6 +112,7 @@ pub struct ToolRegistry {
     action_prior: Mutex<Vec<EffectClass>>,
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
+    action_escalator: Option<Arc<Escalator>>,
 }
 
 struct ProductionHold {
@@ -137,6 +138,7 @@ impl ToolRegistry {
             action_prior: Mutex::new(Vec::new()),
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
+            action_escalator: None,
         }
     }
 
@@ -149,6 +151,14 @@ impl ToolRegistry {
     pub fn with_action_gate(mut self, gate: Arc<ActionGate>, subject: ActionSubject) -> Self {
         self.action_gate = Some(gate);
         self.action_subject = Some(subject);
+        self
+    }
+
+    /// Deliver every [`ActionDenied::Escalate`] this registry returns to
+    /// `escalator` as a `blocked` auditor escalation, so a human hears of
+    /// the halt. A delivery failure is logged and never changes the denial.
+    pub fn with_action_escalator(mut self, escalator: Arc<Escalator>) -> Self {
+        self.action_escalator = Some(escalator);
         self
     }
 
@@ -278,6 +288,9 @@ impl ToolRegistry {
                 self.check_production_hold(class)?;
                 if class >= EffectClass::Repository {
                     if let Err(denied) = self.review_action(name, &args, class).await {
+                        if denied.is_escalation() {
+                            self.escalate_denial(name, &denied).await;
+                        }
                         return Err(ToolError::ActionDenied(denied));
                     }
                 }
@@ -400,6 +413,42 @@ impl ToolRegistry {
             }
             ActionVerdict::Block { reasons } => Err(ActionDenied::Block { reasons }),
             ActionVerdict::Escalate { reasons } => Err(ActionDenied::Escalate { reasons }),
+        }
+    }
+
+    async fn escalate_denial(&self, tool: &str, denied: &ActionDenied) {
+        let Some(escalator) = &self.action_escalator else {
+            return;
+        };
+        let identity = self
+            .identity
+            .clone()
+            .unwrap_or_else(|| UNSCOPED_IDENTITY.to_string());
+        let (repo, task_id) = match &self.action_subject {
+            Some(subject) => (subject.repo.clone(), subject.task_id.clone()),
+            None => (
+                UNSCOPED_IDENTITY.to_string(),
+                TaskId(UNSCOPED_IDENTITY.to_string()),
+            ),
+        };
+        let mut evidence = vec![format!(
+            "tool `{tool}` was refused for identity `{identity}`"
+        )];
+        evidence.extend(denied.reasons().iter().map(ToString::to_string));
+        let escalation = Escalation::new(
+            Severity::Blocked,
+            EscalationSource::Auditor,
+            repo,
+            format!("action auditor escalated `{tool}`"),
+        )
+        .with_task(task_id)
+        .with_identity(identity)
+        .with_evidence(evidence)
+        .with_suggested_action(
+            "Read action_audit in the task result, then re-scope the identity or complete the action by hand; the task is halted until then.",
+        );
+        if let Err(e) = escalator.escalate(escalation).await {
+            tracing::warn!(error = %e, tool, "action escalation delivery failed");
         }
     }
 
@@ -5200,6 +5249,156 @@ mod tests {
             first,
             ToolError::ActionDenied(ActionDenied::Block { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn write_file_to_an_absolute_path_outside_the_workspace_is_refused_and_creates_nothing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("cron.d").join("x");
+        let registry = create_tool_registry(workspace.path())
+            .with_action_gate(allow_gate(), subject(EffectClass::Production));
+        let err = registry
+            .execute(
+                "write_file",
+                json!({ "path": target.to_str().unwrap(), "content": "* * * * * root id" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolError::PathSecurityViolation { .. } | ToolError::InvalidArguments { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(!target.exists());
+        assert!(!outside.path().join("cron.d").exists());
+    }
+
+    #[tokio::test]
+    async fn write_file_through_a_scoped_registry_cannot_leave_the_workspace_either() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("x");
+        let identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        let registry = create_tool_registry_for(workspace.path(), &identity).unwrap();
+        let err = registry
+            .execute(
+                "write_file",
+                json!({ "path": target.to_str().unwrap(), "content": "x" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, ToolError::Io(_)), "{err:?}");
+        assert!(!target.exists());
+    }
+
+    struct EscalatingAuditor;
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for EscalatingAuditor {
+        fn name(&self) -> &str {
+            "escalating"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &ActionReview,
+            _context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            Ok(ActionVerdict::escalate(vec![Reason::new(
+                ReasonCode::Other,
+                "needs a human",
+            )]))
+        }
+    }
+
+    fn escalating_registry(
+        sink: &Arc<crate::test_support::escalation::CapturingSink>,
+    ) -> (ToolRegistry, Arc<EscalationLog>) {
+        let (escalator, log) = crate::test_support::escalation::escalator(sink);
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(EscalatingAuditor),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry = ToolRegistry::new()
+            .with_action_gate(gate, subject(EffectClass::Production))
+            .with_action_escalator(escalator);
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        (registry, log)
+    }
+
+    #[tokio::test]
+    async fn an_escalate_verdict_reaches_the_escalator_with_task_context() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (registry, log) = escalating_registry(&sink);
+        let err = registry.execute("push", json!({})).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ActionDenied(ActionDenied::Escalate { .. })
+        ));
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        let escalation = &seen[0];
+        assert_eq!(escalation.severity, crate::escalation::Severity::Blocked);
+        assert_eq!(
+            escalation.source,
+            crate::escalation::EscalationSource::Auditor
+        );
+        assert_eq!(escalation.repo, "example/repo");
+        assert_eq!(escalation.task_id, Some(TaskId("t1".to_string())));
+        assert!(escalation.summary.contains("push"));
+        assert!(escalation
+            .evidence
+            .iter()
+            .any(|line| line.contains("needs a human")));
+        assert!(!escalation.suggested_action.is_empty());
+        assert!(!log.production_held("example/repo"));
+        assert_eq!(log.snapshot(chrono::Utc::now()).tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_does_not_turn_an_escalation_into_an_allow() {
+        let sink = crate::test_support::escalation::CapturingSink::new(true);
+        let (registry, _log) = escalating_registry(&sink);
+        let err = registry.execute("push", json!({})).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ActionDenied(ActionDenied::Escalate { .. })
+        ));
+        assert_eq!(sink.escalations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocks_are_not_escalated_until_the_third() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _log) = crate::test_support::escalation::escalator(&sink);
+        let (_auditor, gate) = counting_gate();
+        let mut registry = ToolRegistry::new()
+            .with_action_gate(gate, subject(EffectClass::Production))
+            .with_action_escalator(escalator);
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        for _ in 0..2 {
+            registry.execute("push", json!({})).await.unwrap_err();
+        }
+        assert!(sink.escalations().is_empty());
+        registry.execute("push", json!({})).await.unwrap_err();
+        assert_eq!(sink.escalations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_escalation_without_a_subject_uses_the_unscoped_repo_label() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _log) = crate::test_support::escalation::escalator(&sink);
+        let mut registry = ToolRegistry::new().with_action_escalator(escalator);
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        for _ in 0..3 {
+            registry.execute("push", json!({})).await.unwrap_err();
+        }
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].repo, crate::scope::UNSCOPED_IDENTITY);
     }
 
     #[tokio::test]
