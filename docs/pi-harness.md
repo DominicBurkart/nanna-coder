@@ -56,7 +56,7 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No ambient tools | `--no-builtin-tools --no-extensions --no-skills --no-prompt-templates --no-context-files --no-mcp --no-approve`; one static extension registers the granted capabilities and nothing else |
 | No workspace in the agent container | the plan may mount only the broker socket; the repo is never visible to pi, so repo-borne `.pi/` config cannot influence it |
 | Capabilities are brokered | each call goes over the socket to nanna, which runs the existing Rust `Tool` under identity scope, effect ceiling and incident holds |
-| Network | the plan names exactly one endpoint, the model gateway. The host string is checked (no localhost, loopback, link-local, metadata or numeric-looking names), but real egress enforcement is the container network, not name checks. |
+| Network | the plan names exactly one endpoint, the model gateway. The host string is checked (no localhost, loopback, link-local, unspecified, multicast, `metadata.google.internal` or numeric-looking names), but private ranges (10/8, 192.168/16, 100.64/10) are accepted and name checks cannot be complete. Real egress enforcement is the container network, not these checks. How the gateway is reached from inside the container (loopback there is the container itself) is not designed yet and returns with the executor. |
 | No secrets | the environment is an exact (name, value) allowlist (`HOME`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`); there is no secret-name heuristic; the model `apiKey` is a placeholder |
 | Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
 | Fail closed | `Unsupported` for empty capability sets or unrepresentable capability names; `ResolveError::InvalidModel`, `InvalidImage` and `InvalidBrokerSocket` for a bad model name, image reference or socket path; a plan that drops the agent's scope, limits or audited repository is rejected |
@@ -136,9 +136,11 @@ scheduler's.
 
 ## Hardening status
 
-Implemented: mount, network, capability, env-allowlist, file-path, image,
-scope and limits checks in `IsolationPolicy`; fail-closed `Unsupported`;
-handshake comparison.
+Implemented: broker-socket, gateway, capability, env (exact name and value),
+file-path, image, scope, limits and audited-repository checks in
+`IsolationPolicy`; image, model-name and broker-socket-path validation in
+`resolve`; `Allowed`-bound prompt and repository; fail-closed `Unsupported`;
+handshake comparison (no caller yet).
 
 Not implemented yet, all executor work: non-root user, read-only root
 filesystem, dropped Linux capabilities, `no-new-privileges`, and network
@@ -154,9 +156,12 @@ drift. The plan carries a single `gateway` endpoint, so there is no
 
 Landed: `harness_adapter` (types, `IsolationPolicy`, `PiAdapter`, handshake
 comparison), and the corrective hardening of it: private-field `ResolvedAgent`
-built from an `Allowed` spawn proof, `CheckedPlan`, a stricter `Endpoint`, an
-exact env allowlist, one broker socket and one gateway, and removal of unused
-API (`HarnessKind`, `PlanNetwork`, `Mount`).
+built from an `Allowed` spawn proof, with the prompt (the audited subtask) and
+repository label taken from the audit; `CheckedPlan`; a stricter `Endpoint`;
+image, model-name and broker-socket validation; an exact env allowlist; one
+broker socket and one gateway; and removal of unused API (`HarnessKind`,
+`PlanNetwork`, `Mount`, the operator-configured endpoint constructor and
+`withhold_above`, which return with the executor).
 
 Merge rule: the next merge to main makes pi runnable end to end for at least one
 inner-loop identity, behind these isolation checks, with the real-pi test
@@ -184,9 +189,38 @@ Not yet done (in order):
    agreement.
 5. Switch `TaskRunner` to the adapter path, then delete the loop.
 
+## Broker socket path is a placeholder
+
+`resolve` accepts a broker socket only under `/run/nanna/` or
+`/run/user/<digits>/nanna/` with a restricted character set and normalised
+components. Those prefixes are placeholders: nothing on main uses them (nanna
+state derives from `NANNA_CONFIG_DIR` and `XDG_CONFIG_HOME/nanna`), `/run/nanna`
+needs root and conflicts with rootless podman, and `/run/user/<digits>/` is not
+checked against the current uid. The executor will allocate the socket (or
+derive it from `XDG_RUNTIME_DIR`); the validator is kept as a shape check, not
+as proof of ownership.
+
 ## Carried to the broker and executor slice
 
 Known gaps, tracked here and not yet fixed:
+
+- The executor must confirm the broker socket is one it created and owns, not
+  just a validated path.
+- `resolve(&Allowed)` does not compose with the runner as it is today:
+  `submit_spawn` consumes `Allowed` with `into_parts()` and the queued task
+  keeps only `Some(identity)`, so a runner executing later has no `Allowed`. The
+  executor slice must resolve at dispatch time and carry the `ResolvedAgent` (or
+  an equivalent audited launch spec) through the queue: one audit is one launch
+  (a by-value consume), and a caller-supplied identity is never accepted.
+- A `ResolvedAgent::bind_workspace(repo_path)` that runs `names_repo` and
+  `check_repo` from the stored scope, so the executor cannot reimplement them.
+  `resolve` does not assert that the audited repository is within
+  `scope.repos`, and the audited repository may be a path.
+- Carry the parent task id for audit-log correlation. The worktree path and
+  branch are executor inputs obtained only through `bind_workspace`.
+- Broker contract steps 2-4 (path scope, windows and leases, the action gate)
+  are all new broker work: `ToolRegistry::execute` on main only does lookup, the
+  production hold and denial recording.
 
 - A `CheckedPlan` does not remember its agent or repository, so a plan for one
   agent could be handed to a broker built for another. The broker handle and
@@ -256,12 +290,14 @@ Constraints these findings put on the executor (none implemented):
 - The RPC `bash` command runs shell on the host side of the container. Only the
   executor may ever write to RPC stdin, and the framing is strict LF-delimited
   JSON (do not use a reader that splits on U+2028/U+2029).
-- The broker socket the executor mounts must be confirmed to be a socket the
-  executor created and owns, not just a validated path.
 
 The extension asset (`pi_extension.rs`, installed in the container as
 `nanna-capabilities.ts`) sets UTF-8 decoding, rejects on error, close and
 timeout, caps the reply size, and throws when the broker reports `ok: false`.
+It has no tests of its own. A mutation pass found ten surviving TypeScript
+mutants: `TIMEOUT_MS`, `MAX_REPLY_BYTES`, the `!ok` throw, the socket default,
+newline handling, the `done` guard, `clearTimeout`, `destroy`, and the `close`
+and `error` handlers. The real-pi test must cover all of them.
 
 ## Still unverified
 
