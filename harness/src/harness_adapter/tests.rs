@@ -88,7 +88,6 @@ fn resolve_with(
     ResolvedAgent::resolve(
         &allowed,
         &scoped,
-        "do the thing",
         gateway(),
         "nanna-agent:pi",
         socket.into(),
@@ -153,10 +152,29 @@ fn endpoint_rejects_hostile_or_ambient_hosts() {
 }
 
 #[test]
-fn operator_configured_endpoints_may_be_local() {
-    assert!(Endpoint::operator_configured("localhost", 11434).is_ok());
-    assert!(Endpoint::operator_configured("127.0.0.1", 11434).is_ok());
-    assert!(Endpoint::operator_configured("a b", 1).is_err());
+fn operator_configured_allows_local_but_never_metadata_or_link_local() {
+    for host in ["localhost", "127.0.0.1", "gw.internal", "10.0.0.5"] {
+        assert!(Endpoint::operator_configured(host, 11434).is_ok(), "{host}");
+    }
+    let never = [
+        "169.254.169.254",
+        "169.254.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "metadata.google.internal",
+        "METADATA.GOOGLE.INTERNAL",
+        "a b",
+        "2130706433",
+        "0x7f000001",
+        "evil/../x",
+        "",
+    ];
+    for host in never {
+        assert!(
+            Endpoint::operator_configured(host, 11434).is_err(),
+            "{host:?}"
+        );
+    }
     assert!(Endpoint::operator_configured("gw", 0).is_err());
     assert_eq!(
         serde_json::to_string(&gateway()).unwrap(),
@@ -174,7 +192,8 @@ fn resolve_carries_scope_limits_and_ceiling() {
     let a = agent(&card, &[]);
     assert_eq!(a.name(), "a");
     assert_eq!(a.system_prompt(), "Be careful.");
-    assert_eq!(a.task_prompt(), "do the thing");
+    assert_eq!(a.task_prompt(), "Add a regression test.");
+    assert_eq!(a.audited_repo(), "github.com/example/repo");
     assert_eq!(a.model(), "gemma4:e4b");
     assert_eq!(a.endpoint(), &gateway());
     assert_eq!(a.image(), "nanna-agent:pi");
@@ -267,7 +286,7 @@ fn scope_mismatch_requires_both_name_and_scope() {
     ];
     for (label, other) in attempts {
         let wrong = scoped(&other.identity(), &catalog());
-        let result = ResolvedAgent::resolve(&allowed, &wrong, "t", gateway(), "img", SOCKET.into());
+        let result = ResolvedAgent::resolve(&allowed, &wrong, gateway(), "img", SOCKET.into());
         let err = result.unwrap_err();
         assert!(matches!(err, ResolveError::ScopeMismatch { .. }), "{label}");
         assert_eq!(
@@ -277,7 +296,7 @@ fn scope_mismatch_requires_both_name_and_scope() {
         );
     }
     let right = scoped(allowed.identity(), &catalog());
-    assert!(ResolvedAgent::resolve(&allowed, &right, "t", gateway(), "img", SOCKET.into()).is_ok());
+    assert!(ResolvedAgent::resolve(&allowed, &right, gateway(), "img", SOCKET.into()).is_ok());
 }
 
 #[test]
@@ -289,7 +308,6 @@ fn same_name_global_grant_cannot_serve_a_narrower_local_identity() {
     let err = ResolvedAgent::resolve(
         &allowed_local,
         &global_grant,
-        "t",
         gateway(),
         "img",
         SOCKET.into(),
@@ -305,7 +323,7 @@ fn a_widened_grant_fails_closed() {
     let wide = |spec: CapabilitySpec| {
         let mut grant = scoped(allowed.identity(), &[]);
         grant.specs.push(spec);
-        ResolvedAgent::resolve(&allowed, &grant, "t", gateway(), "img", SOCKET.into())
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "img", SOCKET.into())
     };
     let outside_patterns = wide(CapabilitySpec::new(
         "write_file",
@@ -356,8 +374,8 @@ fn path_restricted_identities_never_hold_run_command() {
     let allowed = allowed_for(&restricted.identity());
     let mut forged = scoped(allowed.identity(), &[]);
     forged.specs.push(stub[0].clone());
-    let err = ResolvedAgent::resolve(&allowed, &forged, "t", gateway(), "img", SOCKET.into())
-        .unwrap_err();
+    let err =
+        ResolvedAgent::resolve(&allowed, &forged, gateway(), "img", SOCKET.into()).unwrap_err();
     assert!(matches!(err, ResolveError::GrantWiderThanIdentity { .. }));
 
     let reads = Card {
@@ -371,19 +389,40 @@ fn path_restricted_identities_never_hold_run_command() {
 }
 
 #[test]
-fn broker_socket_must_be_a_plain_absolute_path() {
+fn broker_socket_must_live_under_a_nanna_owned_directory() {
     let card = Card::new("\"*\"", "none");
     let bad = [
         "",
         "relative.sock",
         "/",
-        "/a/../b.sock",
+        "/run",
+        "/etc",
+        "/dev/kvm",
+        "/run/nanna",
         "/run/nanna/",
+        "/run/nanna/../etc/passwd",
+        "/run/nanna/./b.sock",
+        "/run/nanna//b.sock",
+        "/run/nanna/a b.sock",
+        "/run/nanna/a:b.sock",
+        "/run/nanna/a,b.sock",
+        "/run/nanna/\u{e9}.sock",
+        "/run/nanna/a\0b.sock",
+        "/run/nanna/a\\b.sock",
         "/var/run/docker.sock",
-        "/run/podman/podman.sock",
-        "/run/containerd/containerd.sock",
-        "/a\0b.sock",
-        "/a\\..\\b.sock",
+        "/var/run/Docker.sock",
+        "/run/crio/crio.sock",
+        "/run/buildkit/buildkitd.sock",
+        "/run/systemd/private",
+        "/run/dbus/system_bus_socket",
+        "/run/a:/etc:rw.sock",
+        "/run/a,b.sock",
+        "/run/user/x/nanna/b.sock",
+        "/run/user//nanna/b.sock",
+        "/run/user/1000/other/b.sock",
+        "/run/user/1000/nanna/",
+        "/run/user/1000",
+        "/run/nannax/b.sock",
     ];
     for path in bad {
         let err = resolve_with(&card, &[], path).unwrap_err();
@@ -392,14 +431,100 @@ fn broker_socket_must_be_a_plain_absolute_path() {
             "{path:?}"
         );
     }
-    assert!(resolve_with(&card, &[], "/run/nanna/broker.sock").is_ok());
-    let err = resolve_with(&card, &[], "/").unwrap_err();
-    assert_eq!(err.to_string(), "invalid broker socket path `/`");
+    let good = [
+        "/run/nanna/broker.sock",
+        "/run/nanna/a/b-c_d.1.sock",
+        "/run/user/1000/nanna/broker.sock",
+        "/run/nanna/docker.sock",
+        "/run/nanna/mydocker.sock",
+    ];
+    for path in good {
+        assert!(resolve_with(&card, &[], path).is_ok(), "{path:?}");
+    }
+    let err = resolve_with(&card, &[], "/etc").unwrap_err();
+    assert_eq!(err.to_string(), "invalid broker socket path `/etc`");
+}
+
+#[test]
+fn image_must_be_an_image_reference() {
+    let card = Card::new("\"*\"", "none");
+    let bad = [
+        "",
+        "--privileged",
+        "-v /:/h",
+        "img\n--privileged",
+        "img --privileged",
+        "a b",
+        "a\0b",
+        "a\tb",
+        "a;b",
+        "a$b",
+        "a`b",
+        "a\u{e9}",
+        &"a".repeat(256),
+    ];
+    for image in bad {
+        let identity = card.identity();
+        let allowed = allowed_for(&identity);
+        let grant = scoped(allowed.identity(), &[]);
+        let result = ResolvedAgent::resolve(&allowed, &grant, gateway(), image, SOCKET.into());
+        assert!(
+            matches!(result, Err(ResolveError::InvalidImage { .. })),
+            "{image:?}"
+        );
+    }
+    for image in [
+        "nanna-agent:pi",
+        "registry.example/team/img:1.2",
+        "img@sha256:abc123",
+        "a_b.c-d",
+        &"a".repeat(255),
+    ] {
+        let identity = card.identity();
+        let allowed = allowed_for(&identity);
+        let grant = scoped(allowed.identity(), &[]);
+        let result = ResolvedAgent::resolve(&allowed, &grant, gateway(), image, SOCKET.into());
+        assert!(result.is_ok(), "{image:?}");
+    }
+    let identity = card.identity();
+    let allowed = allowed_for(&identity);
+    let grant = scoped(allowed.identity(), &[]);
+    let err = ResolvedAgent::resolve(&allowed, &grant, gateway(), "-x", SOCKET.into()).unwrap_err();
+    assert_eq!(err.to_string(), "invalid container image `-x`");
+}
+
+#[test]
+fn the_agent_is_bound_to_the_audited_subtask_and_repo() {
+    let a = wide_agent();
+    assert_eq!(a.task_prompt(), "Add a regression test.");
+    assert_eq!(a.audited_repo(), "github.com/example/repo");
+    let plan = PiAdapter.plan(&a).unwrap();
+    assert_eq!(plan.audited_repo, "github.com/example/repo");
+    let line: serde_json::Value = serde_json::from_str(&plan.stdin[0]).unwrap();
+    assert_eq!(line["message"], "Add a regression test.");
+    let mut changed = plan;
+    changed.audited_repo = "github.com/example/other".into();
+    assert_eq!(
+        IsolationPolicy::check(&changed, &a),
+        Err(IsolationViolation::RepoChanged)
+    );
+    assert_eq!(
+        IsolationViolation::RepoChanged.to_string(),
+        "plan audited repository differs from the agent's"
+    );
 }
 
 #[test]
 fn model_names_cannot_act_as_options_or_hide_whitespace() {
-    for model in ["--help", "-x", "a b", "a\\nb", "a\\tb"] {
+    for model in [
+        "--help",
+        "-x",
+        "a b",
+        "a\\nb",
+        "a\\tb",
+        "a\\u0007b",
+        "a\\u007fb",
+    ] {
         let card = Card {
             model,
             ..Card::new("\"*\"", "none")
@@ -424,6 +549,15 @@ fn model_names_cannot_act_as_options_or_hide_whitespace() {
 }
 
 #[test]
+fn an_empty_model_is_not_valid() {
+    assert!(!model_is_valid(""));
+    assert!(!model_is_valid("-x"));
+    assert!(!model_is_valid("a b"));
+    assert!(!model_is_valid("a\u{7}b"));
+    assert!(model_is_valid("gemma4:e4b"));
+}
+
+#[test]
 fn missing_prompt_file_is_a_resolve_error() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("p.md"), "prompt").unwrap();
@@ -433,7 +567,7 @@ fn missing_prompt_file_is_a_resolve_error() {
     let grant = scoped(allowed.identity(), &[]);
     std::fs::remove_file(dir.path().join("p.md")).unwrap();
     let err =
-        ResolvedAgent::resolve(&allowed, &grant, "t", gateway(), "img", SOCKET.into()).unwrap_err();
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "img", SOCKET.into()).unwrap_err();
     assert!(err.to_string().starts_with("system prompt:"));
 }
 
@@ -776,7 +910,8 @@ fn pi_models_json_prompt_and_system_files() {
     assert_eq!(file("SYSTEM.md").contents, "Be careful.");
     let line: serde_json::Value = serde_json::from_str(&plan.stdin[0]).unwrap();
     assert_eq!(line["type"], "prompt");
-    assert_eq!(line["message"], "do the thing");
+    assert_eq!(line["id"], "task");
+    assert_eq!(line["message"], "Add a regression test.");
     let ext = &file("nanna-capabilities.ts").contents;
     for needle in [
         "registerTool",
@@ -865,5 +1000,96 @@ proptest! {
                 prop_assert!(spec.effect <= a.max_effect());
             }
         }
+    }
+}
+
+#[test]
+fn real_registry_grant_matches_patterns_and_is_sorted() {
+    let card = Card::new("\"read_file\", \"git_*\", \"search\"", "workspace");
+    let identity = card.identity();
+    let allowed = allowed_for(&identity);
+    let registry = crate::tools::create_tool_registry(Path::new("."));
+    let grant = ScopedCapabilities::scope(registry, allowed.identity());
+    let a = ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+        .unwrap();
+    let names = a.capability_names();
+    assert!(names.contains(&"read_file") && names.contains(&"search"));
+    assert!(names.contains(&"git_status") && names.contains(&"git_diff"));
+    for name in &names {
+        assert!(identity.allows_tool(name), "{name}");
+    }
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted);
+    assert!(a
+        .capabilities()
+        .iter()
+        .all(|c| c.effect <= EffectClass::Workspace));
+}
+
+#[test]
+fn numeric_looking_and_non_ascii_hosts_are_rejected() {
+    let hosts = [
+        "0x",
+        "0X",
+        "0X7f000001",
+        "0x7f000001",
+        "1.0X7f",
+        "gw\u{e9}",
+        "\u{ff47}\u{ff57}",
+        "g\u{e9}.example",
+    ];
+    for host in hosts {
+        assert!(Endpoint::new(host, 80).is_err(), "{host:?}");
+    }
+    assert!(Endpoint::new("0xzz", 80).is_ok());
+    assert!(Endpoint::new("gw1", 80).is_ok());
+}
+
+#[test]
+fn file_paths_reject_backslashes_and_the_broker_mount_path() {
+    let (a, base) = checked_plan();
+    for path in [
+        "/nanna/a\\b",
+        "/nanna/pi\\models.json",
+        "/nanna/broker.sock",
+    ] {
+        let mut plan = base.clone();
+        plan.files[0].path = path.into();
+        let result = first_violation(&plan, &a);
+        assert!(
+            matches!(result, Some(IsolationViolation::FilePath { .. })),
+            "{path:?}"
+        );
+    }
+    assert_eq!(first_violation(&base, &a), None);
+}
+
+#[test]
+fn pi_models_json_pins_provider_fields() {
+    let (_, plan) = checked_plan();
+    let file = plan
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("models.json"))
+        .unwrap();
+    let models: serde_json::Value = serde_json::from_str(&file.contents).unwrap();
+    let provider = &models["providers"]["nanna"];
+    assert_eq!(provider["api"], "openai-completions");
+    assert_eq!(provider["apiKey"], "nanna");
+    assert_eq!(provider["baseUrl"], "http://model-gateway:11434/v1");
+}
+
+#[test]
+fn capability_names_may_contain_digits_and_underscores() {
+    for name in ["cargo_v2", "a1", "t_9", "x_"] {
+        let available = vec![CapabilitySpec::new(
+            name,
+            "d",
+            serde_json::json!({}),
+            EffectClass::None,
+        )];
+        let a = agent(&Card::new("\"*\"", "none"), &available);
+        assert!(PiAdapter.plan(&a).is_ok(), "{name}");
     }
 }

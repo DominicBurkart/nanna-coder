@@ -151,6 +151,7 @@ impl HarnessAdapter for PiAdapter {
                 .collect(),
             limits: agent.limits(),
             scope: agent.scope().clone(),
+            audited_repo: agent.audited_repo().to_string(),
         })
     }
 }

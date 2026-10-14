@@ -3,7 +3,7 @@
 //! executor and `TaskRunner` switch are not written, so this module is
 //! planned infrastructure, not a delivered isolation guarantee.
 //!
-//! An audited spawn ([`Allowed`](crate::auditor::Allowed)) is resolved against
+//! An audited spawn ([`Allowed`]) is resolved against
 //! the capabilities of its scoped registry into a [`ResolvedAgent`]. A
 //! [`HarnessAdapter`] translates that into a draft [`LaunchPlan`]: files, argv,
 //! environment, the one broker socket and the one model gateway the runtime
@@ -50,7 +50,6 @@
 //! let agent = ResolvedAgent::resolve(
 //!     &allowed,
 //!     &scoped,
-//!     "Summarise src/lib.rs",
 //!     Endpoint::new("model-gateway", 11434).unwrap(),
 //!     "nanna-agent:pi",
 //!     "/run/nanna/broker.sock".into(),
@@ -88,7 +87,7 @@ use thiserror::Error;
 /// A host and port a runtime may reach over the network.
 ///
 /// `Endpoint` deliberately does not implement `Deserialize`: every value goes
-/// through [`Endpoint::new`] or [`Endpoint::operator_configured`].
+/// through [`Endpoint::new`] or the crate-internal operator-configured constructor.
 ///
 /// ```compile_fail
 /// use harness::harness_adapter::Endpoint;
@@ -128,17 +127,17 @@ impl Endpoint {
     }
 
     /// Build an endpoint the operator has configured explicitly, such as a
-    /// gateway on `localhost`. Only the character set and port are checked.
-    ///
-    /// ```
-    /// use harness::harness_adapter::Endpoint;
-    ///
-    /// assert!(Endpoint::operator_configured("localhost", 11434).is_ok());
-    /// assert!(Endpoint::operator_configured("a b", 11434).is_err());
-    /// ```
-    pub fn operator_configured(host: impl Into<String>, port: u16) -> Result<Self, ResolveError> {
+    /// gateway on `localhost`. The character set and port are checked, and
+    /// link-local, unspecified, multicast and cloud-metadata hosts are refused
+    /// even here. This is a name check only: real egress enforcement is the
+    /// container network, not the host string.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn operator_configured(
+        host: impl Into<String>,
+        port: u16,
+    ) -> Result<Self, ResolveError> {
         let host = host.into();
-        if port == 0 || !host_is_well_formed(&host) {
+        if port == 0 || !host_is_well_formed(&host) || host_is_never_allowed(&host) {
             return Err(ResolveError::InvalidEndpoint { host, port });
         }
         Ok(Self { host, port })
@@ -175,10 +174,24 @@ fn host_is_well_formed(host: &str) -> bool {
 
 fn looks_numeric(label: &str) -> bool {
     let decimal = label.chars().all(|c| c.is_ascii_digit());
-    let hex = label.len() > 2
+    let hex = label.len() >= 2
         && (label.starts_with("0x") || label.starts_with("0X"))
         && label[2..].chars().all(|c| c.is_ascii_hexdigit());
     decimal || hex
+}
+
+fn host_is_never_allowed(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("metadata.google.internal") {
+        return true;
+    }
+    let last = host.rsplit('.').next().unwrap_or(host);
+    if !looks_numeric(last) {
+        return false;
+    }
+    match host.parse::<Ipv4Addr>() {
+        Ok(ip) => ip.is_link_local() || ip.is_unspecified() || ip.is_multicast(),
+        Err(_) => true,
+    }
 }
 
 fn host_is_ambient(host: &str) -> bool {
@@ -327,8 +340,15 @@ pub enum ResolveError {
         /// Offending model name.
         model: String,
     },
-    /// The broker socket path is empty, relative, `/`, escapes with `..`, or
-    /// names a container runtime's control socket.
+    /// The container image reference is empty, starts with `-`, or contains
+    /// anything but image-reference characters.
+    #[error("invalid container image `{image}`")]
+    InvalidImage {
+        /// Offending image reference.
+        image: String,
+    },
+    /// The broker socket path is not a normalised file path under a
+    /// nanna-owned socket directory.
     #[error("invalid broker socket path `{path}`")]
     InvalidBrokerSocket {
         /// Offending path.
@@ -341,17 +361,34 @@ fn model_is_valid(model: &str) -> bool {
     plain && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
 }
 
+fn image_is_valid(image: &str) -> bool {
+    let plain = !image.is_empty() && image.len() <= 255 && !image.starts_with('-');
+    plain
+        && image
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '@'))
+}
+
 fn broker_socket_is_valid(path: &str) -> bool {
-    let escapes = path.split(['/', '\\']).any(|part| part == "..");
-    let runtime_socket = ["docker.sock", "podman.sock", "containerd.sock"]
-        .iter()
-        .any(|name| path.ends_with(name));
-    path.starts_with('/')
-        && path.len() > 1
-        && !path.ends_with('/')
-        && !path.contains('\0')
-        && !escapes
-        && !runtime_socket
+    let charset = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    let rest = if let Some(rest) = path.strip_prefix("/run/nanna/") {
+        Some(rest)
+    } else if let Some(rest) = path.strip_prefix("/run/user/") {
+        rest.split_once("/nanna/")
+            .filter(|(uid, _)| !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()))
+            .map(|(_, rest)| rest)
+    } else {
+        None
+    };
+    let Some(rest) = rest else {
+        return false;
+    };
+    let normalised = rest
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..");
+    charset && !rest.is_empty() && normalised
 }
 
 /// What an identity may touch, carried so that whatever enforces it cannot
@@ -374,6 +411,7 @@ pub struct ResolvedAgent {
     name: String,
     system_prompt: String,
     task_prompt: String,
+    audited_repo: String,
     model: String,
     endpoint: Endpoint,
     max_effect: EffectClass,
@@ -386,16 +424,18 @@ pub struct ResolvedAgent {
 
 impl ResolvedAgent {
     /// Resolve an audited spawn against the capabilities of the registry
-    /// scoped to its identity. The identity is taken from `allowed`, never from
-    /// the caller, so an agent can only be resolved from the identity the
-    /// auditor saw. The grant is exactly the scoped set: there is no second
+    /// scoped to its identity. The identity, the task prompt (the audited
+    /// subtask) and the repository label all come from `allowed`, never from
+    /// the caller, so an agent can only be resolved from what the auditor saw.
+    /// Checking that the working repository on disk names the audited
+    /// repository (as `TaskManager::submit_spawn` does with `names_repo`) is
+    /// the executor's job. The grant is exactly the scoped set: there is no second
     /// filter, only an assertion that nothing in it exceeds the identity's
     /// tool patterns, effect ceiling, or (for a path-restricted identity) the
     /// tools that cannot honour path scope.
     pub fn resolve(
         allowed: &Allowed,
         scoped: &ScopedCapabilities,
-        task_prompt: impl Into<String>,
         endpoint: Endpoint,
         image: impl Into<String>,
         broker_socket: PathBuf,
@@ -423,6 +463,10 @@ impl ResolvedAgent {
         if !model_is_valid(&model) {
             return Err(ResolveError::InvalidModel { model });
         }
+        let image = image.into();
+        if !image_is_valid(&image) {
+            return Err(ResolveError::InvalidImage { image });
+        }
         let socket_text = broker_socket.to_string_lossy().into_owned();
         if !broker_socket_is_valid(&socket_text) {
             return Err(ResolveError::InvalidBrokerSocket { path: socket_text });
@@ -430,7 +474,8 @@ impl ResolvedAgent {
         Ok(Self {
             name: identity.name().to_string(),
             system_prompt: identity.system_prompt_text()?,
-            task_prompt: task_prompt.into(),
+            task_prompt: allowed.request().subtask.clone(),
+            audited_repo: allowed.repo().to_string(),
             model,
             endpoint,
             max_effect: identity.scope.max_effect,
@@ -440,7 +485,7 @@ impl ResolvedAgent {
                 paths: identity.scope.paths.clone(),
                 read_paths: identity.scope.read_paths.clone(),
             },
-            image: image.into(),
+            image,
             broker_socket,
             capabilities: scoped.specs.clone(),
         })
@@ -463,9 +508,14 @@ impl ResolvedAgent {
         &self.system_prompt
     }
 
-    /// The task the agent is asked to perform.
+    /// The task the agent is asked to perform: the subtask the auditor saw.
     pub fn task_prompt(&self) -> &str {
         &self.task_prompt
+    }
+
+    /// The repository label the auditor allowed this spawn against.
+    pub fn audited_repo(&self) -> &str {
+        &self.audited_repo
     }
 
     /// Model identifier at the gateway.
@@ -552,6 +602,9 @@ pub struct LaunchPlan {
     pub limits: LimitsSection,
     /// Scope the broker enforces on every capability call.
     pub scope: ScopeGrant,
+    /// The repository label the auditor allowed, carried so the executor and
+    /// broker can be held to it.
+    pub audited_repo: String,
 }
 
 /// The runtime reported a tool set that differs from the granted one.

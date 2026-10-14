@@ -57,8 +57,8 @@ pub enum IsolationViolation {
         /// Variable name.
         name: String,
     },
-    /// The plan writes a file outside `/nanna/`, or at a path with `..`, a
-    /// backslash or a NUL.
+    /// The plan writes a file outside `/nanna/`, at the broker mount path, or
+    /// at a path with `..`, a backslash or a NUL.
     #[error("file path {path} must be absolute under /nanna/ with no `..`, backslash or NUL")]
     FilePath {
         /// Offending path.
@@ -76,6 +76,9 @@ pub enum IsolationViolation {
     /// The plan's scope differs from the agent's, so the broker would not enforce it.
     #[error("plan scope differs from the agent's")]
     ScopeDropped,
+    /// The plan's audited repository differs from the agent's.
+    #[error("plan audited repository differs from the agent's")]
+    RepoChanged,
     /// The plan has no command to run.
     #[error("plan has an empty argv")]
     EmptyArgv,
@@ -140,6 +143,9 @@ impl IsolationPolicy {
         if plan.scope != *agent.scope() {
             found.push(IsolationViolation::ScopeDropped);
         }
+        if plan.audited_repo != agent.audited_repo() {
+            found.push(IsolationViolation::RepoChanged);
+        }
         let granted: BTreeSet<&str> = agent.capability_names().into_iter().collect();
         for name in plan
             .exposed_capabilities
@@ -163,7 +169,8 @@ impl IsolationPolicy {
 fn file_path_is_contained(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let escapes = text.split('/').any(|part| part == "..");
-    text.starts_with(FILE_ROOT)
+    text != BROKER_SOCKET_CONTAINER_PATH
+        && text.starts_with(FILE_ROOT)
         && text.len() > FILE_ROOT.len()
         && !text.contains('\\')
         && !text.contains('\0')
