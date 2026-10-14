@@ -349,9 +349,10 @@ mod tests {
             pr: Some(1),
             ..LeaseContext::default()
         };
-        let ctx = deploy_ctx(None, lease);
+        let mut ctx = deploy_ctx(None, lease);
+        ctx.now = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 10, 0, 0).unwrap();
         let verdict = auditor.review_action(&review, &ctx).await.unwrap();
-        assert!(!verdict.is_allow());
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
         assert_eq!(provider.calls(), 0);
     }
 

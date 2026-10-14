@@ -5,7 +5,7 @@ use super::{ActionAuditError, ActionAuditor, ActionContext, ActionReview, Action
 use crate::auditor::{Reason, ReasonCode};
 use crate::effects::EffectClass;
 use crate::leases::{self, LeaseStore};
-use crate::windows::WindowSet;
+use crate::windows::{EffectLevel, Window, WindowSet};
 use async_trait::async_trait;
 use chrono::Duration;
 use std::sync::Arc;
@@ -143,33 +143,61 @@ impl RuleActionAuditor {
         ActionVerdict::Allow
     }
 
+    fn named_window_block(&self, window: &str, ctx: &ActionContext<'_>) -> Option<ActionVerdict> {
+        match self.windows.is_open(window, ctx.now) {
+            Ok(true) => None,
+            Ok(false) => Some(ActionVerdict::block(vec![Reason::new(
+                ReasonCode::WindowClosed,
+                format!("window `{window}` is not open"),
+            )])),
+            Err(e) => Some(ActionVerdict::block(vec![Reason::new(
+                ReasonCode::WindowClosed,
+                format!("window `{window}`: {e}"),
+            )])),
+        }
+    }
+
+    fn covering_window_block(
+        &self,
+        review: &ActionReview,
+        ctx: &ActionContext<'_>,
+    ) -> Option<ActionVerdict> {
+        let level = match review.effect_class {
+            EffectClass::Sandbox => EffectLevel::Sandbox,
+            _ => EffectLevel::Production,
+        };
+        let covering: Vec<&str> = self.windows.windows_for(level).map(Window::name).collect();
+        if covering.is_empty() {
+            return Some(ActionVerdict::block(vec![Reason::new(
+                ReasonCode::WindowClosed,
+                format!("no availability window configured for `{}`", review.tool),
+            )]));
+        }
+        let open = covering
+            .iter()
+            .any(|name| self.windows.is_open(name, ctx.now).unwrap_or(false));
+        if open {
+            None
+        } else {
+            Some(ActionVerdict::block(vec![Reason::new(
+                ReasonCode::WindowClosed,
+                format!("no `{level}` window is open"),
+            )]))
+        }
+    }
+
     fn window_and_lease_check(
         &self,
         review: &ActionReview,
         ctx: &ActionContext<'_>,
         effect: leases::Effect,
     ) -> RuleOutcome {
-        let Some(window) = ctx.window else {
-            let reason = Reason::new(
-                ReasonCode::WindowClosed,
-                format!("no availability window configured for `{}`", review.tool),
-            );
-            return RuleOutcome::Decided(ActionVerdict::block(vec![reason]));
+        let blocked = match ctx.window {
+            Some(window) => self.named_window_block(window, ctx),
+            None => self.covering_window_block(review, ctx),
         };
-        match self.windows.is_open(window, ctx.now) {
-            Ok(true) => {}
-            Ok(false) => {
-                let reason = Reason::new(
-                    ReasonCode::WindowClosed,
-                    format!("window `{window}` is not open"),
-                );
-                return RuleOutcome::Decided(ActionVerdict::block(vec![reason]));
-            }
-            Err(e) => {
-                let reason =
-                    Reason::new(ReasonCode::WindowClosed, format!("window `{window}`: {e}"));
-                return RuleOutcome::Decided(ActionVerdict::block(vec![reason]));
-            }
+        if let Some(verdict) = blocked {
+            return RuleOutcome::Decided(verdict);
         }
         let names = match leases::required_leases(effect, &ctx.lease) {
             Ok(names) => names,
@@ -331,19 +359,80 @@ pub(crate) mod tests {
         assert_eq!(verdict.kind(), VerdictKind::Block);
     }
 
-    #[tokio::test]
-    async fn sandbox_without_a_configured_window_is_blocked() {
-        let rules = auditor();
-        let review = review("sandbox_deploy", EffectClass::Sandbox);
-        let lease = LeaseContext {
+    fn auditor_over(windows: WindowSet) -> RuleActionAuditor {
+        RuleActionAuditor::new(
+            Arc::new(windows),
+            Arc::new(InMemoryLeaseStore::default()),
+            Duration::minutes(10),
+        )
+    }
+
+    fn sandbox_lease() -> LeaseContext<'static> {
+        LeaseContext {
             repo: "example/repo",
             pr: Some(7),
             ..LeaseContext::default()
-        };
-        let context = ctx(EffectClass::Sandbox, None, lease);
-        let verdict = rules.review_action(&review, &context).await.unwrap();
-        assert_eq!(verdict.kind(), VerdictKind::Block);
-        assert_eq!(verdict.reasons()[0].code, ReasonCode::WindowClosed);
+        }
+    }
+
+    fn production_lease() -> LeaseContext<'static> {
+        LeaseContext {
+            repo: "example/repo",
+            environment: Some("production"),
+            ..LeaseContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_window_is_resolved_from_the_windows_covering_the_level() {
+        let rules = auditor();
+        for (class, lease) in [
+            (EffectClass::Sandbox, sandbox_lease()),
+            (EffectClass::Production, production_lease()),
+        ] {
+            let review = review("deploy", class);
+            let context = ctx(class, None, lease);
+            let verdict = rules.review_action(&review, &context).await.unwrap();
+            assert_eq!(verdict.kind(), VerdictKind::Escalate, "{class}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_window_that_is_closed_blocks_both_levels() {
+        let rules = auditor();
+        for (class, lease) in [
+            (EffectClass::Sandbox, sandbox_lease()),
+            (EffectClass::Production, production_lease()),
+        ] {
+            let review = review("deploy", class);
+            let mut context = ctx(class, None, lease);
+            context.now = closed_saturday();
+            let verdict = rules.review_action(&review, &context).await.unwrap();
+            assert_eq!(verdict.kind(), VerdictKind::Block, "{class}");
+            assert_eq!(verdict.reasons()[0].code, ReasonCode::WindowClosed);
+            assert!(verdict.reasons()[0].detail.contains(&class.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_window_with_no_window_covering_the_level_blocks() {
+        for windows in [
+            WindowSet::default(),
+            WindowSet::parse(
+                "[[window]]\nname = \"prod-only\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"00:00\"\nend = \"23:59\"\napplies_to = [\"production\"]\n",
+            )
+            .unwrap(),
+        ] {
+            let rules = auditor_over(windows);
+            let review = review("sandbox_deploy", EffectClass::Sandbox);
+            let context = ctx(EffectClass::Sandbox, None, sandbox_lease());
+            let verdict = rules.review_action(&review, &context).await.unwrap();
+            assert_eq!(verdict.kind(), VerdictKind::Block);
+            assert_eq!(verdict.reasons()[0].code, ReasonCode::WindowClosed);
+            assert!(verdict.reasons()[0]
+                .detail
+                .contains("no availability window configured"));
+        }
     }
 
     #[tokio::test]
