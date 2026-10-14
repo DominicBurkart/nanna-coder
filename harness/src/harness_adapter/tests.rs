@@ -152,30 +152,7 @@ fn endpoint_rejects_hostile_or_ambient_hosts() {
 }
 
 #[test]
-fn operator_configured_allows_local_but_never_metadata_or_link_local() {
-    for host in ["localhost", "127.0.0.1", "gw.internal", "10.0.0.5"] {
-        assert!(Endpoint::operator_configured(host, 11434).is_ok(), "{host}");
-    }
-    let never = [
-        "169.254.169.254",
-        "169.254.0.1",
-        "0.0.0.0",
-        "224.0.0.1",
-        "metadata.google.internal",
-        "METADATA.GOOGLE.INTERNAL",
-        "a b",
-        "2130706433",
-        "0x7f000001",
-        "evil/../x",
-        "",
-    ];
-    for host in never {
-        assert!(
-            Endpoint::operator_configured(host, 11434).is_err(),
-            "{host:?}"
-        );
-    }
-    assert!(Endpoint::operator_configured("gw", 0).is_err());
+fn endpoint_serializes_without_a_deserializer() {
     assert_eq!(
         serde_json::to_string(&gateway()).unwrap(),
         r#"{"host":"model-gateway","port":11434}"#
@@ -241,23 +218,6 @@ fn ceilings_grant_effectful_capabilities_up_to_the_ceiling() {
         assert_eq!(a.capabilities().len(), expected, "{ceiling}");
         assert!(a.capabilities().iter().all(|c| c.effect <= a.max_effect()));
     }
-}
-
-#[test]
-fn withhold_above_drops_higher_effects_only() {
-    let a = wide_agent();
-    assert_eq!(
-        a.capability_names(),
-        vec!["cargo_check", "read_file", "write_file"]
-    );
-    let none_only = a.clone().withhold_above(EffectClass::None);
-    assert_eq!(none_only.capability_names(), vec!["read_file"]);
-    assert_eq!(
-        a.withhold_above(EffectClass::Workspace)
-            .capabilities()
-            .len(),
-        3
-    );
 }
 
 #[test]
@@ -1028,6 +988,16 @@ fn real_registry_grant_matches_patterns_and_is_sorted() {
 }
 
 #[test]
+fn metadata_hosts_are_rejected_but_private_ranges_are_not() {
+    for host in ["metadata.google.internal", "METADATA.GOOGLE.INTERNAL"] {
+        assert!(Endpoint::new(host, 80).is_err(), "{host}");
+    }
+    for host in ["10.0.0.5", "192.168.1.10", "100.64.0.1"] {
+        assert!(Endpoint::new(host, 80).is_ok(), "{host}");
+    }
+}
+
+#[test]
 fn numeric_looking_and_non_ascii_hosts_are_rejected() {
     let hosts = [
         "0x",
@@ -1091,5 +1061,58 @@ fn capability_names_may_contain_digits_and_underscores() {
         )];
         let a = agent(&Card::new("\"*\"", "none"), &available);
         assert!(PiAdapter.plan(&a).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn env_name_must_match_not_just_the_value() {
+    let (a, base) = checked_plan();
+    let mut plan = base;
+    plan.env.push(("FOO".into(), "/nanna/work".into()));
+    assert_eq!(
+        first_violation(&plan, &a),
+        Some(IsolationViolation::EnvNotAllowed { name: "FOO".into() })
+    );
+}
+
+#[test]
+fn gateway_host_must_match_even_with_the_same_port() {
+    let (a, base) = checked_plan();
+    let mut plan = base;
+    plan.gateway = Endpoint::new("evil.example", 11434).unwrap();
+    assert_eq!(
+        first_violation(&plan, &a),
+        Some(IsolationViolation::Gateway {
+            host: "evil.example".into(),
+            port: 11434
+        })
+    );
+}
+
+#[test]
+fn check_returns_the_first_violation() {
+    let (a, base) = checked_plan();
+    let mut plan = base;
+    plan.argv.clear();
+    plan.image = "other".into();
+    plan.audited_repo = "github.com/example/other".into();
+    let all = IsolationPolicy::violations(&plan, &a);
+    assert!(all.len() >= 3);
+    assert_eq!(all[0], IsolationViolation::EmptyArgv);
+    assert_eq!(IsolationPolicy::check(&plan, &a), Err(all[0].clone()));
+}
+
+#[test]
+fn capability_names_may_not_contain_uppercase_after_the_first_character() {
+    for name in ["aB", "cargo_Check", "readFile", "a_B_c"] {
+        let available = vec![CapabilitySpec::new(
+            name,
+            "d",
+            serde_json::json!({}),
+            EffectClass::None,
+        )];
+        let a = agent(&Card::new("\"*\"", "none"), &available);
+        let err = PiAdapter.plan(&a).unwrap_err();
+        assert!(matches!(err, Unsupported::CapabilityName { .. }), "{name}");
     }
 }

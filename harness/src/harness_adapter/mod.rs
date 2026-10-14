@@ -87,7 +87,7 @@ use thiserror::Error;
 /// A host and port a runtime may reach over the network.
 ///
 /// `Endpoint` deliberately does not implement `Deserialize`: every value goes
-/// through [`Endpoint::new`] or the crate-internal operator-configured constructor.
+/// through [`Endpoint::new`].
 ///
 /// ```compile_fail
 /// use harness::harness_adapter::Endpoint;
@@ -121,23 +121,6 @@ impl Endpoint {
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ResolveError> {
         let host = host.into();
         if port == 0 || !host_is_well_formed(&host) || host_is_ambient(&host) {
-            return Err(ResolveError::InvalidEndpoint { host, port });
-        }
-        Ok(Self { host, port })
-    }
-
-    /// Build an endpoint the operator has configured explicitly, such as a
-    /// gateway on `localhost`. The character set and port are checked, and
-    /// link-local, unspecified, multicast and cloud-metadata hosts are refused
-    /// even here. This is a name check only: real egress enforcement is the
-    /// container network, not the host string.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn operator_configured(
-        host: impl Into<String>,
-        port: u16,
-    ) -> Result<Self, ResolveError> {
-        let host = host.into();
-        if port == 0 || !host_is_well_formed(&host) || host_is_never_allowed(&host) {
             return Err(ResolveError::InvalidEndpoint { host, port });
         }
         Ok(Self { host, port })
@@ -180,22 +163,10 @@ fn looks_numeric(label: &str) -> bool {
     decimal || hex
 }
 
-fn host_is_never_allowed(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("metadata.google.internal") {
-        return true;
-    }
-    let last = host.rsplit('.').next().unwrap_or(host);
-    if !looks_numeric(last) {
-        return false;
-    }
-    match host.parse::<Ipv4Addr>() {
-        Ok(ip) => ip.is_link_local() || ip.is_unspecified() || ip.is_multicast(),
-        Err(_) => true,
-    }
-}
-
 fn host_is_ambient(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
+    if host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("metadata.google.internal")
+    {
         return true;
     }
     let last = host.rsplit('.').next().unwrap_or(host);
@@ -489,13 +460,6 @@ impl ResolvedAgent {
             broker_socket,
             capabilities: scoped.specs.clone(),
         })
-    }
-
-    /// Drop every capability whose effect class exceeds `max`, so the runtime
-    /// is never shown a tool the broker would refuse.
-    pub fn withhold_above(mut self, max: EffectClass) -> Self {
-        self.capabilities.retain(|c| c.effect <= max);
-        self
     }
 
     /// Identity name.
