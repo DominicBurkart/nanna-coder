@@ -177,6 +177,11 @@ flowchart TD
     n2 -- Can be promoted to --> n3(["Release"])
 ```
 
+# Agent Runtime
+
+Agents run on pi inside containers, behind a harness-neutral adapter seam and a host-side capability broker. See [docs/pi-harness.md](docs/pi-harness.md).
+
+
 ### Identity scope limits
 
 A task submitted without an identity (`TaskManager::submit`, or `submit_with_identity` with `None`) fails closed: its registry keeps only `EffectClass::None` tools, its container has no network, and a call to any effectful tool is refused and recorded as a `ScopeDenial` attributed to `unscoped`. Effectful work needs a named, registered identity. The backlog sinks refuse a task whose `identity_hint` is missing or not registered at enqueue time. The `nanna chat` and `nanna agent` direct modes and the eval runner do not go through `TaskManager`; they build their own full registry for local interactive use.
