@@ -57,6 +57,11 @@ fn gated_registry(repo: &Path) -> ToolRegistry {
     create_tool_registry(repo).with_action_gate(gate, subject)
 }
 
+#[test]
+fn the_test_auditor_names_itself() {
+    assert_eq!(AllowRepository.name(), "allow-repository");
+}
+
 /// Create a temporary git repository for testing.
 fn create_temp_git_repo() -> TempDir {
     let dir = TempDir::new().expect("Failed to create temp dir");

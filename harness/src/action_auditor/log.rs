@@ -158,6 +158,23 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_log_keeps_appending_after_a_poisoned_lock() {
+        let log = ActionAuditLog::in_memory();
+        let Backing::Memory(entries) = &log.backing else {
+            unreachable!("in_memory builds a memory backing");
+        };
+        let poisoner = Arc::clone(entries);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the audit log lock");
+        })
+        .join();
+        assert!(entries.is_poisoned());
+        log.append(&review(), &ActionVerdict::Allow).unwrap();
+        assert_eq!(log.entries().unwrap().len(), 1);
+    }
+
+    #[test]
     fn in_memory_log_round_trips_multiple_entries_in_order() {
         let log = ActionAuditLog::in_memory();
         assert_eq!(format!("{log:?}"), "ActionAuditLog::in_memory(0 entries)");
