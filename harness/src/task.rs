@@ -326,6 +326,23 @@ struct TaskRunner {
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
+/// The host's availability windows read through `lookup`
+/// ([`crate::deploy::host_windows_from`]): the set is empty when the host
+/// has none or its file cannot be read, so `Sandbox` and `Production`
+/// actions fail closed.
+pub fn action_windows_from(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> crate::windows::WindowSet {
+    match crate::deploy::host_windows_from(lookup) {
+        Ok(Some(windows)) => windows,
+        Ok(None) => crate::windows::WindowSet::default(),
+        Err(e) => {
+            tracing::warn!("Host availability windows unreadable ({e}); Sandbox and Production actions stay blocked");
+            crate::windows::WindowSet::default()
+        }
+    }
+}
+
 fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
     let auditor = crate::action_auditor::RuleActionAuditor::new(
         Arc::new(crate::windows::WindowSet::default()),
@@ -504,6 +521,37 @@ impl TaskManager {
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
         self
+    }
+
+    /// Review every effectful action under the host's availability
+    /// `windows` and `log`, with `model` as the reviewing model when one is
+    /// configured. The auditor shares this manager's lease store, so leases
+    /// it takes are released with the task's others. Without a model only
+    /// rule checks run, and those never allow a `Repository`, `Ci`,
+    /// `Sandbox` or `Production` call.
+    pub fn with_action_policy(
+        self,
+        windows: crate::windows::WindowSet,
+        model: Option<(Arc<dyn ModelProvider>, String)>,
+        log: crate::action_auditor::ActionAuditLog,
+    ) -> Self {
+        let windows = Arc::new(windows);
+        let leases = self.leases();
+        let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
+            Some((provider, name)) => Arc::new(crate::action_auditor::ModelActionAuditor::new(
+                provider,
+                name,
+                windows,
+                leases,
+                DEFAULT_ACTION_LEASE_TTL,
+            )),
+            None => Arc::new(crate::action_auditor::RuleActionAuditor::new(
+                windows,
+                leases,
+                DEFAULT_ACTION_LEASE_TTL,
+            )),
+        };
+        self.with_action_gate(Arc::new(ActionGate::new(auditor, log)))
     }
 
     /// Deliver action-auditor escalations through `escalator` and use its
@@ -3355,6 +3403,98 @@ mod identity_tests {
         assert_eq!(snapshot.tracked, 1);
         assert_eq!(snapshot.occurrences, 1);
         assert!(snapshot.holds.is_empty());
+    }
+
+    async fn run_github_status_task(manager: &TaskManager) -> TaskResult {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Check PR status".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(repository_scoped_identity()),
+            )
+            .await;
+        let task = wait_for(manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        manager.get_result(&task_id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_action_policy_with_a_model_reviews_and_logs_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("action_audit.jsonl");
+        let auditor_provider: Arc<dyn ModelProvider> =
+            MockProvider::new(vec![stop_response(r#"{"verdict":"allow"}"#)]);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_policy(
+            crate::windows::WindowSet::default(),
+            Some((auditor_provider, "auditor-model".to_string())),
+            crate::action_auditor::ActionAuditLog::file(&log_path),
+        );
+        let result = run_github_status_task(&manager).await;
+        assert_eq!(result.action_audit.len(), 1);
+        assert!(result.action_audit[0].verdict.is_allow());
+        let persisted = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(persisted.lines().count(), 1);
+        assert!(persisted.contains("github_pr_status"));
+    }
+
+    #[tokio::test]
+    async fn test_action_policy_without_a_model_never_allows_a_repository_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("action_audit.jsonl");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_policy(
+            crate::windows::WindowSet::default(),
+            None,
+            crate::action_auditor::ActionAuditLog::file(&log_path),
+        );
+        let result = run_github_status_task(&manager).await;
+        assert_eq!(
+            result.action_audit[0].verdict.kind(),
+            crate::auditor::VerdictKind::Block
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap().lines().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_action_windows_come_from_the_host_config_dir_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup_for = |path: std::path::PathBuf| {
+            move |key: &str| (key == "NANNA_CONFIG_DIR").then(|| path.clone().into_os_string())
+        };
+        let none = action_windows_from(&lookup_for(dir.path().to_path_buf()));
+        assert_eq!(none.windows().count(), 0);
+
+        let file = dir.path().join(crate::windows::WINDOWS_FILE_NAME);
+        std::fs::write(&file, "this is not toml [[").unwrap();
+        let malformed = action_windows_from(&lookup_for(dir.path().to_path_buf()));
+        assert_eq!(malformed.windows().count(), 0);
+
+        std::fs::write(
+            &file,
+            "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
+        )
+        .unwrap();
+        let loaded = action_windows_from(&lookup_for(dir.path().to_path_buf()));
+        assert!(loaded.window("business-hours").is_some());
+
+        let unconfigured = action_windows_from(&|_| None);
+        assert_eq!(unconfigured.windows().count(), 0);
     }
 
     #[tokio::test]

@@ -1382,7 +1382,14 @@ async fn run_mcp_server(
             &catalog,
         )
         .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?))
+        .with_action_policy(
+            harness::task::action_windows_from(&|key| std::env::var_os(key)),
+            Some((provider.clone(), model.to_string())),
+            harness::action_auditor::ActionAuditLog::file(
+                queue_path.with_file_name("action_audit.jsonl"),
+            ),
+        ),
     );
 
     info!(
@@ -1429,7 +1436,16 @@ async fn run_delegate(
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let task_manager = Arc::new(TaskManager::default().with_action_policy(
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        model.map(|name| {
+            (
+                provider.clone() as Arc<dyn model::ModelProvider>,
+                name.to_string(),
+            )
+        }),
+        harness::action_auditor::ActionAuditLog::in_memory(),
+    ));
     let gate = build_spawn_gate(&load_identities(), harness::auditor::AuditLog::in_memory())?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
