@@ -179,7 +179,7 @@ flowchart TD
 
 # Agent Runtime
 
-Agents run on pi inside containers, behind a harness-neutral adapter seam and a host-side capability broker. See [docs/pi-harness.md](docs/pi-harness.md).
+Planned: agents run on pi inside containers, behind a harness-neutral adapter seam and a host-side capability broker. Only the adapter seam exists today; nothing launches pi yet. See [docs/pi-harness.md](docs/pi-harness.md).
 
 
 ### Identity scope limits
