@@ -127,21 +127,6 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh",
 ];
 
-const WRAPPERS: &[&str] = &[
-    "env", "command", "exec", "nohup", "time", "timeout", "nice", "ionice", "stdbuf", "setsid",
-    "xargs", "builtin", "taskset", "chrt",
-];
-
-const WRAPPER_VALUE_FLAGS: &[(&str, &[&str])] = &[
-    ("env", &["-u", "-C", "--unset", "--chdir"]),
-    ("timeout", &["-s", "-k", "--signal", "--kill-after"]),
-    ("nice", &["-n", "--adjustment"]),
-    ("ionice", &["-c", "-n", "-p"]),
-    ("stdbuf", &["-i", "-o", "-e"]),
-    ("xargs", &["-n", "-I", "-P", "-d", "-a", "-E", "-L", "-s"]),
-    ("taskset", &["-c"]),
-];
-
 const KEYWORDS: &[&str] = &[
     "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "function", "select",
     "for", "case", "esac", "coproc",
@@ -232,6 +217,10 @@ const SECRET_MARKERS: &[&str] = &[
     "/proc/self/environ",
     "/environ",
     "docker.sock",
+    ".config/gh",
+    ".docker/config",
+    ".kube/",
+    ".npmrc",
 ];
 
 const PATH_WRITERS: &[&str] = &[
@@ -377,6 +366,7 @@ impl Scope {
 struct Env {
     scope: Rc<Scope>,
     budget: Rc<Budget>,
+    cwd: Cwd,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -404,6 +394,7 @@ struct Simple {
     words: Vec<Word>,
     redirects: Vec<Redirect>,
     scope: Rc<Scope>,
+    cwd: Cwd,
 }
 
 pub(super) fn inspect(tool: &str, args: &Value) -> Result<(), String> {
@@ -441,6 +432,7 @@ fn inspect_command(args: &Value) -> Result<(), String> {
     let env = Env {
         scope: Rc::new(Scope::default()),
         budget: Budget::new(),
+        cwd: Cwd::start(),
     };
     inspect_script(command, 0, &env)
 }
@@ -456,10 +448,27 @@ fn inspect_script(script: &str, depth: usize, env: &Env) -> Result<(), String> {
 }
 
 fn check_secret(lowered: &str) -> Result<(), String> {
-    match SECRET_MARKERS.iter().find(|m| lowered.contains(**m)) {
-        Some(marker) => Err(format!("touches credential material (`{marker}`)")),
-        None => Ok(()),
+    let squeezed = squeeze_path_segments(lowered);
+    for haystack in [lowered, squeezed.as_str()] {
+        if let Some(marker) = SECRET_MARKERS.iter().find(|m| haystack.contains(**m)) {
+            return Err(format!("touches credential material (`{marker}`)"));
+        }
     }
+    Ok(())
+}
+
+fn squeeze_path_segments(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                kept.pop();
+            }
+            other => kept.push(other),
+        }
+    }
+    format!("/{}", kept.join("/"))
 }
 
 fn parse_script(src: &str, depth: usize, env: &Env) -> Result<Vec<Simple>, String> {
@@ -486,6 +495,8 @@ fn parse_script(src: &str, depth: usize, env: &Env) -> Result<Vec<Simple>, Strin
         paren: 0,
         block: 0,
         prev_sep: Sep::Plain,
+        cwd: env.cwd.clone(),
+        cwd_stack: Vec::new(),
     };
     parser.run()?;
     Ok(parser.out)
@@ -510,6 +521,8 @@ struct Parser {
     paren: usize,
     block: usize,
     prev_sep: Sep,
+    cwd: Cwd,
+    cwd_stack: Vec<Cwd>,
 }
 
 impl Parser {
@@ -562,11 +575,15 @@ impl Parser {
                 '(' => {
                     self.end_command(Sep::Plain)?;
                     self.paren += 1;
+                    self.cwd_stack.push(self.cwd.clone());
                     self.pos += 1;
                 }
                 ')' => {
                     self.end_command(Sep::Plain)?;
                     self.paren = self.paren.saturating_sub(1);
+                    if let Some(saved) = self.cwd_stack.pop() {
+                        self.cwd = saved;
+                    }
                     self.pos += 1;
                 }
                 '<' | '>' => self.redirect()?,
@@ -659,7 +676,44 @@ impl Parser {
             }
             return self.push_simple(Vec::new(), redirects);
         }
-        self.push_simple(words, redirects)
+        let next = self.next_directory(rest, previous, sep)?;
+        self.push_simple(words, redirects)?;
+        self.cwd = next;
+        Ok(())
+    }
+
+    fn next_directory(&self, rest: &[Word], previous: Sep, sep: Sep) -> Result<Cwd, String> {
+        let mut index = 0;
+        while rest
+            .get(index)
+            .is_some_and(|w| !w.dynamic && ["builtin", "command"].contains(&w.text.as_str()))
+        {
+            index += 1;
+        }
+        let Some(program) = rest.get(index).filter(|w| !w.dynamic) else {
+            return Ok(self.cwd.clone());
+        };
+        let program = program.text.as_str();
+        if !["cd", "pushd", "popd"].contains(&program) {
+            return Ok(self.cwd.clone());
+        }
+        if previous == Sep::Pipe || matches!(sep, Sep::Pipe | Sep::Amp) {
+            return Err("changes directory in a pipeline or background job".to_string());
+        }
+        if self.block > 0 {
+            return Err("changes directory inside a block that cannot be reviewed".to_string());
+        }
+        if previous == Sep::Cond || program == "popd" {
+            return Ok(Cwd::Unknown);
+        }
+        let target = rest[index + 1..]
+            .iter()
+            .find(|w| w.dynamic || !(w.text.starts_with('-') && w.text.len() > 1));
+        Ok(match target {
+            Some(word) if program == "pushd" && word.text.starts_with('+') => Cwd::Unknown,
+            Some(word) => self.cwd.enter(&word.text, !word.dynamic && !word.glob),
+            None => Cwd::Unknown,
+        })
     }
 
     fn push_simple(&mut self, words: Vec<Word>, redirects: Vec<Redirect>) -> Result<(), String> {
@@ -668,6 +722,7 @@ impl Parser {
             words,
             redirects,
             scope: Rc::clone(&self.scope),
+            cwd: self.cwd.clone(),
         });
         Ok(())
     }
@@ -1096,6 +1151,7 @@ impl Parser {
         let env = Env {
             scope: Rc::clone(&self.scope),
             budget: Rc::clone(&self.budget),
+            cwd: self.cwd.clone(),
         };
         let nested = parse_script(body, self.depth + 1, &env)?;
         self.out.extend(nested);
@@ -1188,7 +1244,455 @@ fn positionals(args: &[Word]) -> Vec<&Word> {
     found
 }
 
-fn strip_prefixes(words: &[Word]) -> Result<(&[Word], bool), String> {
+#[derive(Clone, Debug, PartialEq)]
+enum Cwd {
+    Rel(String),
+    Abs(String),
+    Unknown,
+}
+
+impl Cwd {
+    fn start() -> Self {
+        Cwd::Rel(".".to_string())
+    }
+
+    fn resolve(&self, text: &str) -> Result<String, String> {
+        if text.starts_with('/') || text.starts_with('~') {
+            return Ok(text.to_string());
+        }
+        match self {
+            Cwd::Rel(base) if base == "." => Ok(text.to_string()),
+            Cwd::Rel(base) | Cwd::Abs(base) => Ok(format!("{base}/{text}")),
+            Cwd::Unknown => Err("follows a directory change that cannot be resolved".to_string()),
+        }
+    }
+
+    fn enter(&self, text: &str, resolvable: bool) -> Cwd {
+        if !resolvable || text.is_empty() || text == "-" {
+            return Cwd::Unknown;
+        }
+        if text.starts_with('/') || text.starts_with('~') {
+            return Cwd::Abs(normalise(text));
+        }
+        match self {
+            Cwd::Rel(base) => Cwd::Rel(normalise(&format!("{base}/{text}"))),
+            Cwd::Abs(base) => Cwd::Abs(normalise(&format!("{base}/{text}"))),
+            Cwd::Unknown => Cwd::Unknown,
+        }
+    }
+}
+
+fn effective_key(cwd: &Cwd, text: &str) -> String {
+    normalise(&cwd.resolve(text).unwrap_or_else(|_| text.to_string()))
+}
+
+enum Tok {
+    Star,
+    Any,
+    Lit(char),
+    Class(bool, Vec<(char, char)>),
+}
+
+fn parse_glob(pattern: &str) -> Vec<Tok> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => toks.push(Tok::Star),
+            '?' => toks.push(Tok::Any),
+            '[' => {
+                let mut j = i + 1;
+                let negated = matches!(chars.get(j), Some('!' | '^'));
+                if negated {
+                    j += 1;
+                }
+                let body_start = j;
+                let mut ranges = Vec::new();
+                let mut closed = false;
+                while j < chars.len() {
+                    if chars[j] == ']' && j > body_start {
+                        closed = true;
+                        break;
+                    }
+                    if chars.get(j + 1) == Some(&'-') && chars.get(j + 2).is_some_and(|c| *c != ']')
+                    {
+                        ranges.push((chars[j], chars[j + 2]));
+                        j += 3;
+                    } else {
+                        ranges.push((chars[j], chars[j]));
+                        j += 1;
+                    }
+                }
+                if closed {
+                    toks.push(Tok::Class(negated, ranges));
+                    i = j;
+                } else {
+                    toks.push(Tok::Lit('['));
+                }
+            }
+            c => toks.push(Tok::Lit(c)),
+        }
+        i += 1;
+    }
+    toks
+}
+
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let toks = parse_glob(pattern);
+    let chars: Vec<char> = name.chars().collect();
+    let mut state = vec![false; chars.len() + 1];
+    state[0] = true;
+    for tok in &toks {
+        let mut next = vec![false; chars.len() + 1];
+        if let Tok::Star = tok {
+            let mut reached = false;
+            for (i, slot) in next.iter_mut().enumerate() {
+                reached |= state[i];
+                *slot = reached;
+            }
+        } else {
+            for (i, ch) in chars.iter().enumerate() {
+                let hit = match tok {
+                    Tok::Any => true,
+                    Tok::Lit(c) => c == ch,
+                    Tok::Class(negated, ranges) => {
+                        ranges.iter().any(|(lo, hi)| lo <= ch && ch <= hi) != *negated
+                    }
+                    Tok::Star => unreachable!("handled above"),
+                };
+                if state[i] && hit {
+                    next[i + 1] = true;
+                }
+            }
+        }
+        state = next;
+    }
+    state[chars.len()]
+}
+
+fn glob_escape(word: &Word) -> Option<&'static str> {
+    if !word.glob {
+        return None;
+    }
+    let lowered = lower(&word.text);
+    for component in lowered.split('/') {
+        if component.contains('{')
+            && component.contains(',')
+            && (component.starts_with('.') || component.contains("{.") || component.contains(",."))
+        {
+            return Some("uses brace expansion that can reach git internals");
+        }
+        if component.starts_with('.')
+            && component.contains(['*', '?', '['])
+            && [".git", ".."].iter().any(|t| glob_matches(component, t))
+        {
+            return Some("is a glob that can match git internals");
+        }
+    }
+    None
+}
+
+fn target_escape(cwd: &Cwd, word: &Word) -> Option<String> {
+    if word.dynamic {
+        return Some("cannot be resolved".to_string());
+    }
+    if let Some(why) = glob_escape(word) {
+        return Some(why.to_string());
+    }
+    match cwd.resolve(&word.text) {
+        Ok(effective) => path_escape(&effective).map(str::to_string),
+        Err(why) => Some(why),
+    }
+}
+
+struct WrapperSpec {
+    name: &'static str,
+    flags: &'static str,
+    values: &'static str,
+    long_flags: &'static [&'static str],
+    long_values: &'static [&'static str],
+    positionals: usize,
+    unless: &'static str,
+}
+
+const WRAPPERS: &[WrapperSpec] = &[
+    WrapperSpec {
+        name: "env",
+        flags: "i0v",
+        values: "uC",
+        long_flags: &["--ignore-environment", "--null", "--debug"],
+        long_values: &["--unset", "--chdir"],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "command",
+        flags: "pvV",
+        values: "",
+        long_flags: &[],
+        long_values: &[],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "exec",
+        flags: "cl",
+        values: "a",
+        long_flags: &[],
+        long_values: &[],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "nohup",
+        flags: "",
+        values: "",
+        long_flags: &[],
+        long_values: &[],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "time",
+        flags: "pvaq",
+        values: "fo",
+        long_flags: &["--portability", "--verbose", "--append", "--quiet"],
+        long_values: &["--format", "--output"],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "timeout",
+        flags: "v",
+        values: "sk",
+        long_flags: &["--foreground", "--preserve-status", "--verbose"],
+        long_values: &["--signal", "--kill-after"],
+        positionals: 1,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "nice",
+        flags: "",
+        values: "n",
+        long_flags: &[],
+        long_values: &["--adjustment"],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "ionice",
+        flags: "t",
+        values: "cnpPu",
+        long_flags: &["--ignore"],
+        long_values: &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "stdbuf",
+        flags: "",
+        values: "ioe",
+        long_flags: &[],
+        long_values: &["--input", "--output", "--error"],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "setsid",
+        flags: "cfw",
+        values: "",
+        long_flags: &["--ctty", "--fork", "--wait"],
+        long_values: &[],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "builtin",
+        flags: "",
+        values: "",
+        long_flags: &[],
+        long_values: &[],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "xargs",
+        flags: "0rtpxoel",
+        values: "nIPdaELs",
+        long_flags: &[
+            "--null",
+            "--no-run-if-empty",
+            "--verbose",
+            "--interactive",
+            "--exit",
+            "--open-tty",
+        ],
+        long_values: &[
+            "--max-args",
+            "--max-procs",
+            "--delimiter",
+            "--arg-file",
+            "--max-lines",
+            "--max-chars",
+        ],
+        positionals: 0,
+        unless: "",
+    },
+    WrapperSpec {
+        name: "taskset",
+        flags: "pa",
+        values: "c",
+        long_flags: &["--pid", "--all-tasks"],
+        long_values: &["--cpu-list"],
+        positionals: 1,
+        unless: "c",
+    },
+    WrapperSpec {
+        name: "chrt",
+        flags: "fribodmRvpa",
+        values: "",
+        long_flags: &[
+            "--fifo",
+            "--rr",
+            "--batch",
+            "--idle",
+            "--other",
+            "--deadline",
+            "--reset-on-fork",
+            "--verbose",
+            "--pid",
+            "--max",
+        ],
+        long_values: &[],
+        positionals: 1,
+        unless: "pm",
+    },
+];
+
+fn wrapper_spec(name: &str) -> Option<&'static WrapperSpec> {
+    WRAPPERS.iter().find(|spec| spec.name == name)
+}
+
+fn unrecognised(spec: &WrapperSpec, text: &str) -> String {
+    format!("`{}` has an unrecognised option `{text}`", spec.name)
+}
+
+struct Skipped<'a> {
+    rest: &'a [Word],
+    replace: Option<String>,
+}
+
+fn skip_wrapper<'a>(
+    spec: &WrapperSpec,
+    args: &'a [Word],
+    cwd: &mut Cwd,
+) -> Result<Skipped<'a>, String> {
+    let mut rest = args;
+    let mut seen = String::new();
+    let mut replace = None;
+    let mut flags_open = true;
+    while let Some(next) = rest.first() {
+        let text = next.text.as_str();
+        if flags_open && text == "--" {
+            flags_open = false;
+            rest = &rest[1..];
+        } else if spec.name == "env" && (is_assignment(text) || (flags_open && text == "-")) {
+            rest = &rest[1..];
+        } else if flags_open && spec.name == "xargs" && text.starts_with("--replace") {
+            replace = Some(
+                text.split_once('=')
+                    .map_or("{}", |(_, value)| value)
+                    .to_string(),
+            );
+            rest = &rest[1..];
+        } else if flags_open && text.starts_with("--") && text.len() > 2 {
+            if spec.name == "env" && text.starts_with("--split-string") {
+                return Err("`env -S` runs a string as a command line".to_string());
+            }
+            let (name, attached) = match text.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (text, None),
+            };
+            rest = &rest[1..];
+            if spec.long_values.contains(&name) {
+                let value = match attached {
+                    Some(value) => Some((value.to_string(), true)),
+                    None => rest.first().map(|w| (w.text.clone(), !w.dynamic)),
+                };
+                if attached.is_none() && !rest.is_empty() {
+                    rest = &rest[1..];
+                }
+                if spec.name == "env" && name == "--chdir" {
+                    let (value, resolvable) = value.unwrap_or_default();
+                    *cwd = cwd.enter(&value, resolvable);
+                }
+            } else if !spec.long_flags.contains(&name) {
+                return Err(unrecognised(spec, text));
+            }
+        } else if flags_open && spec.name == "xargs" && text.starts_with("-i") {
+            let custom = &text[2..];
+            replace = Some(if custom.is_empty() { "{}" } else { custom }.to_string());
+            rest = &rest[1..];
+        } else if flags_open && text.starts_with('-') && text.len() > 1 {
+            let cluster = &text[1..];
+            if spec.name == "env" && cluster.contains('S') {
+                return Err("`env -S` runs a string as a command line".to_string());
+            }
+            if spec.name == "command" && cluster.contains(['v', 'V']) {
+                return Ok(Skipped {
+                    rest: &args[args.len()..],
+                    replace: None,
+                });
+            }
+            rest = &rest[1..];
+            for (offset, c) in cluster.char_indices() {
+                if c.is_ascii_digit() {
+                    continue;
+                }
+                seen.push(c);
+                if spec.flags.contains(c) {
+                    continue;
+                }
+                if !spec.values.contains(c) {
+                    return Err(unrecognised(spec, text));
+                }
+                let attached = &cluster[offset + c.len_utf8()..];
+                let (value, resolvable) = if attached.is_empty() {
+                    let value = rest.first().map(|w| (w.text.clone(), !w.dynamic));
+                    if !rest.is_empty() {
+                        rest = &rest[1..];
+                    }
+                    value.unwrap_or_default()
+                } else {
+                    (attached.to_string(), true)
+                };
+                if spec.name == "env" && c == 'C' {
+                    *cwd = cwd.enter(&value, resolvable);
+                }
+                if spec.name == "xargs" && c == 'I' {
+                    replace = Some(value);
+                }
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let needed = if spec.unless.chars().any(|c| seen.contains(c)) {
+        0
+    } else {
+        spec.positionals
+    };
+    for _ in 0..needed {
+        if !rest.is_empty() {
+            rest = &rest[1..];
+        }
+    }
+    Ok(Skipped { rest, replace })
+}
+
+fn strip_prefixes<'a>(words: &'a [Word], cwd: &mut Cwd) -> Result<(&'a [Word], bool), String> {
     let mut rest = words;
     let mut xargs = false;
     loop {
@@ -1204,40 +1708,33 @@ fn strip_prefixes(words: &[Word]) -> Result<(&[Word], bool), String> {
             continue;
         }
         let name = basename(&first.text);
-        if first.dynamic || !WRAPPERS.contains(&name.as_str()) {
+        let spec = if first.dynamic {
+            None
+        } else {
+            wrapper_spec(&name)
+        };
+        let Some(spec) = spec else {
             return Ok((rest, xargs));
-        }
+        };
         xargs |= name == "xargs";
-        let value_flags: &[&str] = WRAPPER_VALUE_FLAGS
-            .iter()
-            .find(|(wrapper, _)| *wrapper == name)
-            .map_or(&[], |(_, flags)| flags);
-        rest = &rest[1..];
-        while let Some(next) = rest.first() {
-            let text = next.text.as_str();
-            if name == "command" && (text == "-v" || text == "-V") {
-                return Ok((&[], xargs));
-            }
-            if name == "env" && (text == "-S" || text.starts_with("--split-string")) {
-                return Err("`env -S` runs a string as a command line".to_string());
-            }
-            if text.starts_with('-') {
-                rest = &rest[1..];
-                if value_flags.contains(&text) && !rest.is_empty() {
-                    rest = &rest[1..];
-                }
-            } else if (name == "env" && is_assignment(text))
-                || (!text.is_empty() && text.chars().all(|c| c.is_ascii_digit() || c == '.'))
-            {
-                rest = &rest[1..];
-            } else {
-                break;
+        let skipped = skip_wrapper(spec, &rest[1..], cwd)?;
+        rest = skipped.rest;
+        if let Some(replace) = skipped.replace {
+            if rest.first().is_some_and(|w| w.text.contains(&replace)) {
+                return Err("`xargs` replacement string stands in for the command".to_string());
             }
         }
         if rest.is_empty() && name == "env" {
             return Err("`env` dumps the environment".to_string());
         }
     }
+}
+
+fn is_dynamic_loader(program: &str) -> bool {
+    program.starts_with("ld-linux")
+        || program.starts_with("ld-musl")
+        || program.starts_with("ld64.so")
+        || program == "ld.so"
 }
 
 fn inspect_simple(
@@ -1247,20 +1744,28 @@ fn inspect_simple(
     written: &mut HashSet<String>,
 ) -> Result<(), String> {
     for redirect in &simple.redirects {
-        inspect_redirect(redirect, written)?;
+        inspect_redirect(redirect, &simple.cwd, written)?;
     }
     let env = Env {
         scope: Rc::clone(&simple.scope),
         budget: Rc::clone(budget),
+        cwd: simple.cwd.clone(),
     };
     inspect_words(&simple.words, &env, depth, written)
 }
 
-fn inspect_redirect(redirect: &Redirect, written: &mut HashSet<String>) -> Result<(), String> {
+fn inspect_redirect(
+    redirect: &Redirect,
+    cwd: &Cwd,
+    written: &mut HashSet<String>,
+) -> Result<(), String> {
     let op = redirect.op.as_str();
     let target = &redirect.target;
     let text = lower(&target.text);
     check_secret(&text)?;
+    if let Ok(effective) = cwd.resolve(&target.text) {
+        check_secret(&lower(&effective))?;
+    }
     if text.starts_with("/dev/tcp/") || text.starts_with("/dev/udp/") {
         return Err("redirects to a network device".to_string());
     }
@@ -1273,13 +1778,16 @@ fn inspect_redirect(redirect: &Redirect, written: &mut HashSet<String>) -> Resul
     if target.dynamic {
         return Err("redirects output to a path that cannot be resolved".to_string());
     }
+    if target.glob {
+        return Err("redirects output to a glob".to_string());
+    }
     if ["/dev/null", "/dev/stdout", "/dev/stderr"].contains(&text.as_str()) {
         return Ok(());
     }
-    if let Some(why) = path_escape(&target.text) {
+    if let Some(why) = target_escape(cwd, target) {
         return Err(format!("redirects output to `{}` which {why}", target.text));
     }
-    written.insert(normalise(&target.text));
+    written.insert(effective_key(cwd, &target.text));
     Ok(())
 }
 
@@ -1292,22 +1800,39 @@ fn inspect_words(
     if depth > MAX_NESTING {
         return Err("nests shells too deeply to review".to_string());
     }
-    let (words, xargs) = strip_prefixes(words)?;
+    let mut cwd = env.cwd.clone();
+    let (words, xargs) = strip_prefixes(words, &mut cwd)?;
     let Some(first) = words.first() else {
         return Ok(());
     };
     for word in words {
         check_secret(&lower(&word.text))?;
+        if !word.text.starts_with('-') {
+            if let Ok(effective) = cwd.resolve(&word.text) {
+                check_secret(&lower(&effective))?;
+            }
+        }
+    }
+    if !first.dynamic && matches!(first.text.as_str(), "[" | "[[") {
+        return Ok(());
     }
     if first.dynamic || first.glob {
         return Err("command name cannot be resolved statically".to_string());
     }
-    if written.contains(&normalise(&first.text)) {
+    if written.contains(&effective_key(&cwd, &first.text)) {
         return Err("executes a file written earlier in the same command".to_string());
     }
+    let env = &Env {
+        scope: Rc::clone(&env.scope),
+        budget: Rc::clone(&env.budget),
+        cwd,
+    };
     let program = basename(&first.text);
     let program = program.as_str();
     let args = &words[1..];
+    if is_dynamic_loader(program) {
+        return Err("a dynamic loader can run any binary".to_string());
+    }
     if NETWORK_BINARIES.contains(&program) {
         return Err(format!("`{program}` can send data off the machine"));
     }
@@ -1334,13 +1859,13 @@ fn inspect_words(
         ));
     }
     if SHELLS.contains(&program) {
-        return inspect_shell(args, env, depth);
+        return inspect_shell(args, env, depth, written);
     }
     match program {
         "eval" => return inspect_eval(args, env, depth),
         "source" | "." => return Err("sources a script that cannot be reviewed".to_string()),
         "trap" => return inspect_trap(args, env, depth),
-        "rm" => return inspect_rm(args),
+        "rm" => return inspect_rm(args, &env.cwd),
         "git" => return inspect_git(args),
         "gh" => return inspect_gh(args),
         "find" => return inspect_find(args, env, depth, written),
@@ -1352,45 +1877,72 @@ fn inspect_words(
         inspect_docker(args)?;
     }
     if PATH_WRITERS.contains(&program) || (program == "sed" && has_in_place(args)) {
-        inspect_path_writer(program, args, written)?;
+        inspect_path_writer(program, args, &env.cwd, written)?;
     }
     inspect_publish(program, args)?;
     inspect_interpreter(program, args, written)
 }
 
-fn inspect_shell(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
+fn inspect_shell(
+    args: &[Word],
+    env: &Env,
+    depth: usize,
+    written: &HashSet<String>,
+) -> Result<(), String> {
     let mut i = 0;
     let mut code = None;
+    let mut script = None;
     while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
         if text == "--" {
+            script = args.get(i + 1);
             break;
         }
         if ["-o", "+o", "-O", "+O"].contains(&text) {
             i += 2;
             continue;
         }
+        if text.starts_with("--rcfile") || text.starts_with("--init-file") {
+            return Err("runs a shell startup file that cannot be reviewed".to_string());
+        }
         if text.starts_with("--") || text.starts_with('+') {
             i += 1;
             continue;
         }
         if text.starts_with('-') && text.len() > 1 {
-            if text[1..].contains('c') {
+            let cluster = &text[1..];
+            if cluster.contains('c') {
                 code = args.get(i + 1);
                 break;
+            }
+            if cluster.contains(['s', 'i']) {
+                return Err("runs commands from stdin through a shell".to_string());
             }
             i += 1;
             continue;
         }
+        script = Some(arg);
         break;
     }
-    let Some(code) = code else {
-        return Err("runs a script or stdin through a shell".to_string());
-    };
-    if code.dynamic {
-        return Err("runs a shell command string that cannot be resolved".to_string());
+    if let Some(code) = code {
+        if code.dynamic {
+            return Err("runs a shell command string that cannot be resolved".to_string());
+        }
+        return inspect_script(&code.text, depth + 1, env);
     }
-    inspect_script(&code.text, depth + 1, env)
+    let Some(script) = script else {
+        return Err("runs commands from stdin through a shell".to_string());
+    };
+    if script.dynamic {
+        return Err("runs a shell script that cannot be resolved".to_string());
+    }
+    if script.text == "-" {
+        return Err("runs commands from stdin through a shell".to_string());
+    }
+    if written.contains(&effective_key(&env.cwd, &script.text)) {
+        return Err("runs a script written earlier in the same command".to_string());
+    }
+    Ok(())
 }
 
 fn inspect_eval(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
@@ -1411,7 +1963,7 @@ fn inspect_trap(args: &[Word], env: &Env, depth: usize) -> Result<(), String> {
     inspect_script(&handler.text, depth + 1, env)
 }
 
-fn inspect_rm(args: &[Word]) -> Result<(), String> {
+fn inspect_rm(args: &[Word], cwd: &Cwd) -> Result<(), String> {
     let flags: Vec<&str> = args
         .iter()
         .take_while(|a| a.text != "--")
@@ -1425,17 +1977,14 @@ fn inspect_rm(args: &[Word]) -> Result<(), String> {
         .iter()
         .any(|f| *f == "--recursive" || (!f.starts_with("--") && f.contains(['r', 'R'])));
     for target in positionals(args) {
-        if let Some(why) = path_escape(&target.text) {
+        if let Some(why) = target_escape(cwd, target) {
             return Err(format!("`rm` of `{}` {why}", target.text));
         }
-        if recursive {
-            let normalised = normalise(&target.text);
-            if target.dynamic || [".", "..", "*", ".*"].contains(&normalised.as_str()) {
-                return Err(format!(
-                    "recursive `rm` of `{}` is destructive",
-                    target.text
-                ));
-            }
+        if recursive && [".", "*", "**"].contains(&normalise(&target.text).as_str()) {
+            return Err(format!(
+                "recursive `rm` of `{}` is destructive",
+                target.text
+            ));
         }
     }
     Ok(())
@@ -1458,14 +2007,23 @@ fn inspect_find(
         .iter()
         .take_while(|a| !is_flag(a) && a.text != "!" && a.text != "(")
         .collect();
-    let escaping = roots
-        .iter()
-        .any(|r| r.dynamic || path_escape(&r.text).is_some());
+    let escaping = roots.iter().any(|r| target_escape(&env.cwd, r).is_some());
     let deletes = args.iter().any(|a| a.text == "-delete");
     let mut executes = false;
     let mut i = 0;
     while i < args.len() {
-        if ["-exec", "-execdir", "-ok", "-okdir"].contains(&args[i].text.as_str()) {
+        let text = args[i].text.as_str();
+        if ["-fprint", "-fprint0", "-fprintf", "-fls"].contains(&text) {
+            if let Some(target) = args.get(i + 1) {
+                if let Some(why) = target_escape(&env.cwd, target) {
+                    return Err(format!(
+                        "`find {text}` writes `{}` which {why}",
+                        target.text
+                    ));
+                }
+            }
+        }
+        if ["-exec", "-execdir", "-ok", "-okdir"].contains(&text) {
             executes = true;
             let inner: Vec<Word> = args[i + 1..]
                 .iter()
@@ -1484,21 +2042,56 @@ fn inspect_find(
 }
 
 fn has_in_place(args: &[Word]) -> bool {
-    args.iter()
-        .any(|a| a.text.starts_with("-i") || a.text == "--in-place")
+    args.iter().any(|a| {
+        a.text.starts_with("--in-place")
+            || (a.text.starts_with('-') && !a.text.starts_with("--") && a.text.contains('i'))
+    })
+}
+
+fn sed_files(args: &[Word]) -> Vec<&Word> {
+    let mut files = Vec::new();
+    let mut scripted = false;
+    let mut flags_open = true;
+    let mut i = 0;
+    while i < args.len() {
+        let text = args[i].text.as_str();
+        if flags_open && text == "--" {
+            flags_open = false;
+        } else if flags_open && (text.starts_with("--expression=") || text.starts_with("--file=")) {
+            scripted = true;
+        } else if flags_open
+            && (text == "--expression"
+                || text == "--file"
+                || (text.starts_with('-')
+                    && !text.starts_with("--")
+                    && (text.ends_with('e') || text.ends_with('f'))))
+        {
+            scripted = true;
+            i += 1;
+        } else if !(flags_open && is_flag(&args[i])) {
+            files.push(&args[i]);
+        }
+        i += 1;
+    }
+    if !scripted && !files.is_empty() {
+        files.remove(0);
+    }
+    files
 }
 
 fn inspect_path_writer(
     program: &str,
     args: &[Word],
+    cwd: &Cwd,
     written: &mut HashSet<String>,
 ) -> Result<(), String> {
-    let mut targets = positionals(args);
-    if program == "sed" {
-        targets = targets.last().copied().into_iter().collect();
-    }
+    let targets = if program == "sed" {
+        sed_files(args)
+    } else {
+        positionals(args)
+    };
     for target in &targets {
-        if let Some(why) = path_escape(&target.text) {
+        if let Some(why) = target_escape(cwd, target) {
             return Err(format!("`{program}` writes `{}` which {why}", target.text));
         }
     }
@@ -1508,7 +2101,7 @@ fn inspect_path_writer(
         _ => Vec::new(),
     };
     for target in recorded {
-        written.insert(normalise(&target.text));
+        written.insert(effective_key(cwd, &target.text));
     }
     Ok(())
 }
@@ -2063,5 +2656,196 @@ mod tests {
         blocked("alias c=curl; c x", "alias");
         blocked("coproc curl x", "can send data");
         blocked("time -p curl x", "can send data");
+    }
+
+    #[test]
+    fn env_split_string_in_any_flag_cluster_is_refused() {
+        for command in [
+            "env -S 'curl x'",
+            "env -iS 'curl x'",
+            "env -Si 'curl x'",
+            "env -vS 'curl x'",
+            "env --split-string='curl x'",
+        ] {
+            blocked(command, "`env -S`");
+        }
+    }
+
+    #[test]
+    fn wrapper_arguments_are_not_mistaken_for_the_command() {
+        blocked("xargs -I C C x", "replacement");
+        blocked("xargs -IC C x", "replacement");
+        blocked("xargs --replace=C C x", "replacement");
+        blocked("xargs -i curl {}", "can send data");
+        blocked("exec -a foo curl x", "can send data");
+        blocked("exec -cl -a foo curl x", "can send data");
+        blocked("timeout 1m curl x", "can send data");
+        blocked("timeout 5s curl x", "can send data");
+        blocked("timeout -s KILL 5 curl x", "can send data");
+        blocked(
+            "timeout --signal=KILL --foreground 5 curl x",
+            "can send data",
+        );
+        blocked("taskset 0x1 curl x", "can send data");
+        blocked("taskset -c 0,1 curl x", "can send data");
+        blocked("chrt 10 curl x", "can send data");
+        blocked("chrt -f 10 curl x", "can send data");
+        blocked("nice -5 curl x", "can send data");
+        blocked("nice -n 5 curl x", "can send data");
+        blocked("ionice -c 3 curl x", "can send data");
+        blocked("stdbuf -oL curl x", "can send data");
+        blocked("stdbuf -o L curl x", "can send data");
+        blocked("setsid -f curl x", "can send data");
+        blocked("nohup curl x", "can send data");
+        blocked("time curl x", "can send data");
+        blocked("builtin exec curl x", "can send data");
+        blocked("env -i -u HOME curl x", "can send data");
+        blocked("env A=b -- curl x", "can send data");
+        blocked("env - curl x", "can send data");
+        blocked("command -p curl x", "can send data");
+        blocked("env -u", "dumps the environment");
+        blocked("env A=b", "dumps the environment");
+        allowed("command -v curl");
+        allowed("command -V curl");
+        allowed("timeout 5 cargo test");
+        allowed("nice -n 5 cargo build");
+    }
+
+    #[test]
+    fn unrecognised_wrapper_options_fail_closed() {
+        blocked("timeout --bogus 5 curl x", "unrecognised option");
+        blocked("env -Z curl x", "unrecognised option");
+        blocked("nice -q curl x", "unrecognised option");
+    }
+
+    #[test]
+    fn dynamic_loaders_are_refused() {
+        blocked(
+            "/lib64/ld-linux-x86-64.so.2 /usr/bin/curl x",
+            "dynamic loader",
+        );
+        blocked("ld.so /usr/bin/curl x", "dynamic loader");
+        blocked("/lib/ld-musl-x86_64.so.1 /bin/sh", "dynamic loader");
+    }
+
+    #[test]
+    fn directory_changes_are_tracked() {
+        blocked("cd / && rm -rf home", "outside the workspace");
+        blocked("cd /etc/cron.d && echo x > x", "outside the workspace");
+        blocked("cd /etc; cat shadow", "credential");
+        blocked("pushd /etc; rm -rf cron.d", "outside the workspace");
+        blocked("cd ..; rm -rf x", "escapes the workspace");
+        blocked("cd sub/..; rm -rf ../x", "escapes the workspace");
+        blocked("cd /; touch x", "outside the workspace");
+        blocked("env -C / rm -rf home", "outside the workspace");
+        blocked("env --chdir=/etc touch x", "outside the workspace");
+        blocked("cd $X; rm -rf home", "cannot be resolved");
+        blocked("cd; rm -rf home", "directory change");
+        blocked("cd -; rm -rf home", "directory change");
+        blocked("popd; rm -rf home", "directory change");
+        blocked("pushd; rm -rf home", "directory change");
+        blocked("pushd +1; rm -rf home", "directory change");
+        blocked("cd *; rm -rf home", "directory change");
+        blocked("true && cd /etc; rm -rf home", "directory change");
+        blocked("cd /tmp | cat; rm -rf home", "pipeline");
+        blocked("cd /tmp &", "pipeline");
+        blocked("if true; then cd /; fi", "block");
+        blocked("for i in 1; do rm -rf home; cd /; done", "block");
+        blocked("builtin cd /; rm -rf home", "outside the workspace");
+        blocked("command cd /; rm -rf home", "outside the workspace");
+    }
+
+    #[test]
+    fn directory_changes_inside_the_workspace_and_subshells_are_fine() {
+        allowed("cd sub && cargo test");
+        allowed("cd sub; rm -rf build");
+        allowed("cd -P sub; rm -rf build");
+        allowed("pushd sub; rm -rf build; popd");
+        allowed("(cd /etc; ls)");
+        allowed("(cd /tmp/x; touch f); rm -rf build");
+        allowed("cd /tmp/x; touch f");
+        allowed("env -C sub cargo test");
+        allowed("(cd /etc); rm -rf build");
+    }
+
+    #[test]
+    fn globs_in_redirect_and_rm_targets_are_refused() {
+        blocked("echo x > .g*/config", "glob");
+        blocked("echo x > .gi?/config", "glob");
+        blocked("echo x > .[g]it/config", "glob");
+        blocked("rm -rf .g*", "git internals");
+        blocked("rm -rf .gi?", "git internals");
+        blocked("rm -rf .[g]it", "git internals");
+        blocked("rm -rf .*", "git internals");
+        blocked("rm -rf **", "destructive");
+        blocked("rm -rf *", "destructive");
+        blocked("rm -f {.git,x}", "brace expansion");
+        blocked("touch .g*/x", "git internals");
+        blocked("rm -rf $(echo x)", "cannot be resolved");
+        blocked("touch $(echo /etc/x)", "cannot be resolved");
+        allowed("rm -rf target/*");
+        allowed("rm -f *.log");
+        allowed("rm -f [ab].log");
+        allowed("ls *.rs");
+        allowed("rm -rf build/{a,b}");
+    }
+
+    #[test]
+    fn test_brackets_are_not_treated_as_glob_commands() {
+        allowed("[ -d build ] && ls");
+        allowed("[[ -f x ]] && ls");
+        allowed("X=$(ls); [ -z \"$X\" ]");
+    }
+
+    #[test]
+    fn unquoted_variable_values_with_glob_characters_are_globs() {
+        blocked("X='.g*'; rm -rf $X", "git internals");
+    }
+
+    #[test]
+    fn secret_paths_are_seen_through_dot_segments() {
+        blocked("cat /etc/./shadow", "credential");
+        blocked("cat /etc//shadow", "credential");
+        blocked("cat /etc/x/../shadow", "credential");
+        blocked("cat ~/.config/gh/hosts.yml", "credential");
+        blocked("cat ~/.docker/config.json", "credential");
+        blocked("cat ~/.kube/config", "credential");
+        blocked("cat ~/.npmrc", "credential");
+    }
+
+    #[test]
+    fn shell_scripts_may_run_but_stdin_may_not() {
+        allowed("bash script.sh");
+        allowed("sh script.sh arg");
+        allowed("bash -x script.sh");
+        allowed("bash -- script.sh");
+        allowed("bash -o pipefail script.sh");
+        allowed("bash --norc script.sh");
+        blocked("bash", "stdin");
+        blocked("bash -s", "stdin");
+        blocked("bash -", "stdin");
+        blocked("bash -i", "stdin");
+        blocked("bash $S", "cannot be resolved");
+        blocked("bash --rcfile x script.sh", "startup file");
+        blocked("echo x > s.sh; bash s.sh", "written earlier");
+    }
+
+    #[test]
+    fn quoted_heredoc_bodies_are_literal() {
+        allowed("cat > f <<'EOF'\nuse $(x)\nEOF");
+        allowed("cat > f <<\"EOF\"\nuse `x`\nEOF");
+        allowed("cat > f <<\\EOF\nuse $(x)\nEOF");
+        blocked("cat > f <<EOF\nuse $(curl x)\nEOF", "heredoc body");
+        blocked("cat > f <<EOF\nuse `curl x`\nEOF", "heredoc body");
+        allowed("cat > f <<-EOF\n\tbody\n\tEOF\nls");
+        blocked("cat > f <<EOF\n\tEOF\n$(curl x)\nEOF", "heredoc body");
+    }
+
+    #[test]
+    fn find_file_output_flags_are_path_checked() {
+        blocked("find . -fprint /etc/x", "outside the workspace");
+        blocked("find . -fprintf /etc/x %p", "outside the workspace");
+        blocked("find . -fls ../x", "escapes the workspace");
+        allowed("find . -fprint out.txt");
     }
 }
