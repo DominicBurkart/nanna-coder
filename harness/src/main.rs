@@ -1170,7 +1170,11 @@ async fn run_backlog_sync(
 
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
-    let sink = StoreSink::open(Box::new(store))?;
+    let identities = load_identities()
+        .iter()
+        .map(|identity| identity.name().to_string())
+        .collect::<Vec<_>>();
+    let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
     let report = backlog_sync(&client, &sink, &config).await?;
     println!(
