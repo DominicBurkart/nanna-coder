@@ -105,6 +105,9 @@ pub enum EntityType {
     /// Test/Analysis entity
     Test,
 
+    /// Lint/static-analysis result entity
+    Lint,
+
     /// Environment/Deployment entity
     Env,
 
