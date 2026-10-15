@@ -9,6 +9,7 @@ A coding agent for coding agents. Designed to let background agents delegate str
 - [TESTING.md](TESTING.md) — testing strategy and guidelines
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow
 - [CACHIX_SETUP.md](CACHIX_SETUP.md) — binary-cache setup (maintainers)
+- [docs/ci/](docs/ci/) — CI architecture, troubleshooting, maintenance, onboarding, performance, and security
 
 ## Technologies
 
