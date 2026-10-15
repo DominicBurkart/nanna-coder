@@ -1138,6 +1138,34 @@ async fn build_mcp_task_manager(
     ))
 }
 
+struct McpPaths {
+    lease: std::path::PathBuf,
+    escalation: std::path::PathBuf,
+    action_audit: std::path::PathBuf,
+}
+
+async fn start_mcp_task_manager(
+    provider: std::sync::Arc<OllamaProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+) -> Result<(std::sync::Arc<harness::task::TaskManager>, McpPaths), Box<dyn std::error::Error>> {
+    let paths = McpPaths {
+        lease: resolve_lease_path(queue_path),
+        escalation: resolve_escalation_path(queue_path),
+        action_audit: resolve_action_audit_path(queue_path),
+    };
+    let manager = build_mcp_task_manager(
+        provider,
+        model,
+        queue_path,
+        &paths.lease,
+        &paths.escalation,
+        &paths.action_audit,
+    )
+    .await?;
+    Ok((manager, paths))
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1148,27 +1176,17 @@ async fn run_mcp_server(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
-    let lease_path = resolve_lease_path(&queue_path);
-    let escalation_path = resolve_escalation_path(&queue_path);
-    let action_audit_path = resolve_action_audit_path(&queue_path);
-    let task_manager = build_mcp_task_manager(
-        provider.clone(),
-        model,
-        &queue_path,
-        &lease_path,
-        &escalation_path,
-        &action_audit_path,
-    )
-    .await?;
+    let (task_manager, paths) =
+        start_mcp_task_manager(provider.clone(), model, &queue_path).await?;
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {}, action audit: {})",
         model,
         max_iterations,
         queue_path.display(),
-        lease_path.display(),
-        escalation_path.display(),
-        action_audit_path.display()
+        paths.lease.display(),
+        paths.escalation.display(),
+        paths.action_audit.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
@@ -1264,6 +1282,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(manager.action_log_path(), Some(audit_path));
+        assert!(manager.has_action_model());
+    }
+
+    #[tokio::test]
+    async fn the_mcp_server_wires_the_action_audit_log_to_its_own_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let provider = std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+        let (manager, paths) = start_mcp_task_manager(provider, "strong-model", &queue)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.action_log_path(),
+            Some(resolve_action_audit_path(&queue))
+        );
+        assert_ne!(
+            manager.action_log_path(),
+            Some(resolve_escalation_path(&queue))
+        );
+        assert_ne!(manager.action_log_path(), Some(resolve_lease_path(&queue)));
+        assert_eq!(paths.action_audit, resolve_action_audit_path(&queue));
+        assert_eq!(paths.escalation, resolve_escalation_path(&queue));
+        assert_eq!(paths.lease, resolve_lease_path(&queue));
         assert!(manager.has_action_model());
     }
 
