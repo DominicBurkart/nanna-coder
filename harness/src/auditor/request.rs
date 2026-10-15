@@ -154,8 +154,10 @@ impl SpawnRequest {
     ) -> Self {
         let identity = identity.into();
         let subtask = subtask.into();
-        let derived_effect =
-            RuleAuditor::implied_effect(&subtask).map_or(EffectClass::None, |(effect, _)| effect);
+        let derived_effect = match RuleAuditor::implied_effect(&subtask) {
+            Some((effect, _)) => effect,
+            None => EffectClass::None,
+        };
         let requested_effect = caller_effect.map_or(derived_effect, |c| c.max(derived_effect));
         let card_loop = catalog
             .get(&identity)

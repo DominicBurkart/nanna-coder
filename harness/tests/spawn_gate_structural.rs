@@ -72,7 +72,7 @@ fn code_of(sources: &[(String, String)], file: &str) -> String {
         .iter()
         .find(|(name, _)| name == file)
         .map(|(_, code)| code.clone())
-        .unwrap_or_else(|| panic!("{file} not found"))
+        .expect(file)
 }
 
 #[test]
