@@ -1138,6 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_with_container_no_runtime() {
         use crate::container::detect_runtime;
+        let _path = crate::test_support::hold_path_async().await;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
