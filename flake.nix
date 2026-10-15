@@ -217,6 +217,8 @@
 
         # Checks for CI/CD
         checks = {
+          dev-container-cmd = containers.devContainerCmdCheck;
+
           # Workspace-wide checks
           workspace-test = craneLib.cargoTest {
             inherit src;
