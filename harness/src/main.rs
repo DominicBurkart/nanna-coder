@@ -45,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Record auditor eval results
+    Auditor {
+        #[command(subcommand)]
+        action: AuditorAction,
+    },
     /// Inspect the agent identity catalog
     Agents {
         #[command(subcommand)]
@@ -205,6 +210,23 @@ enum EscalationAction {
         /// escalations.jsonl next to the queue log)
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditorAction {
+    /// Score the rule auditor on the shipped eval cases and append one row,
+    /// labelled as circular (#771), to the auditor scorecard
+    RecordScorecard {
+        /// Commit the scored code is at
+        #[arg(long)]
+        commit: String,
+        /// Branch, when known
+        #[arg(long)]
+        branch: Option<String>,
+        /// Scorecard file (defaults to evals/scorecards/auditor_spawn.jsonl)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -479,6 +501,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             action: EscalationAction::Resolve { id, path },
         } => {
             run_escalation_resolve(&id, path)?;
+        }
+        Commands::Auditor {
+            action:
+                AuditorAction::RecordScorecard {
+                    commit,
+                    branch,
+                    out,
+                },
+        } => {
+            let path = out.unwrap_or_else(harness::auditor::eval::default_scorecard_path);
+            let date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let row = harness::auditor::eval::record_rule_auditor_row(
+                &path,
+                &commit,
+                branch.as_deref(),
+                &date,
+            )
+            .await?;
+            println!("appended to {}: {}", path.display(), row.label);
         }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::Effects { command } => {
