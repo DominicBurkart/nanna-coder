@@ -331,17 +331,11 @@ impl SpawnGate {
         parent_task: TaskSummary,
         identity: impl Into<String>,
         subtask: impl Into<String>,
-        caller_effect: Option<EffectClass>,
-        caller_loop: Option<DevLoop>,
+        effect: Option<EffectClass>,
+        dev_loop: Option<DevLoop>,
     ) -> SpawnRequest {
-        SpawnRequest::derive_tightened(
-            self.context.catalog(),
-            parent_task,
-            identity,
-            subtask,
-            caller_effect,
-            caller_loop,
-        )
+        let catalog = self.context.catalog();
+        SpawnRequest::derive_tightened(catalog, parent_task, identity, subtask, effect, dev_loop)
     }
 
     /// The context every request is reviewed against.
@@ -597,6 +591,37 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, Refused::Verdict { .. }));
         assert_eq!(spawn_gate.log().entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn request_with_caller_only_tightens_what_the_text_derives() {
+        let spawn_gate = SpawnGate::new(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context(true),
+        );
+        let parent = || TaskSummary::new("t", "d", "github.com/example/repo");
+        let raised = spawn_gate.request_with_caller(
+            parent(),
+            "rust-implementer",
+            "Add a test.",
+            Some(EffectClass::Production),
+            None,
+        );
+        assert_eq!(raised.requested_effect, EffectClass::Production);
+        let held = spawn_gate.request_with_caller(
+            parent(),
+            "rust-implementer",
+            "Deploy build 42 to production.",
+            Some(EffectClass::Workspace),
+            Some(DevLoop::Inner),
+        );
+        assert_eq!(held.requested_effect, EffectClass::Production);
+        assert_eq!(held.dev_loop, DevLoop::Outer);
+        let plain =
+            spawn_gate.request_with_caller(parent(), "rust-implementer", "Add a test.", None, None);
+        assert_eq!(plain.requested_effect, EffectClass::None);
+        assert_eq!(plain.dev_loop, DevLoop::Inner);
     }
 
     #[tokio::test]
