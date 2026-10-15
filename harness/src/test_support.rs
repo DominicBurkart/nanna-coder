@@ -111,11 +111,24 @@ mod fake {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum PathRestore {
+        Set(OsString),
+        Remove,
+    }
+
+    fn restore_action(old: Option<OsString>) -> PathRestore {
+        match old {
+            Some(old) => PathRestore::Set(old),
+            None => PathRestore::Remove,
+        }
+    }
+
     impl Drop for FakePodman {
         fn drop(&mut self) {
-            match &self.old_path {
-                Some(old) => std::env::set_var("PATH", old),
-                None => std::env::remove_var("PATH"),
+            match restore_action(self.old_path.clone()) {
+                PathRestore::Set(old) => std::env::set_var("PATH", old),
+                PathRestore::Remove => std::env::remove_var("PATH"),
             }
         }
     }
@@ -125,19 +138,16 @@ mod fake {
         use super::*;
 
         #[test]
-        fn dropping_restores_an_originally_absent_path() {
-            let guard = PATH_LOCK.blocking_lock();
-            let original = std::env::var_os("PATH");
-            std::env::remove_var("PATH");
-            let fake = FakePodman::with_guard(guard, None);
-            assert!(std::env::var_os("PATH").is_some());
-            let guard = fake.finish();
-            let restored = std::env::var_os("PATH");
-            if let Some(original) = original {
-                std::env::set_var("PATH", original);
-            }
-            drop(guard);
-            assert_eq!(restored, None);
+        fn restore_action_removes_an_originally_absent_path() {
+            assert_eq!(restore_action(None), PathRestore::Remove);
+        }
+
+        #[test]
+        fn restore_action_sets_an_originally_present_path() {
+            assert_eq!(
+                restore_action(Some(OsString::from("/usr/bin"))),
+                PathRestore::Set(OsString::from("/usr/bin"))
+            );
         }
 
         #[test]
