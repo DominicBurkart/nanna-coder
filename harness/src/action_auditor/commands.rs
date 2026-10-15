@@ -4195,4 +4195,331 @@ mod tests {
         allowed("env --chdir sub ls");
         allowed("find . -fprint");
     }
+
+    #[test]
+    fn every_listed_binary_is_refused_by_name() {
+        for name in [
+            "curl", "wget", "nc", "ncat", "netcat", "socat", "scp", "sftp", "ssh", "ftp", "telnet",
+            "rsync", "nmap", "tftp", "lftp", "aria2c", "mosh", "http", "https", "xh",
+        ] {
+            blocked(&format!("{name} x"), "can send data");
+        }
+        for name in ["sudo", "su", "doas", "pkexec", "runuser", "setpriv"] {
+            blocked(&format!("{name} x"), "escalates privileges");
+        }
+        for name in [
+            "dd", "shred", "fdisk", "parted", "wipefs", "mkfs", "mkfs.xfs",
+        ] {
+            blocked(&format!("{name} x"), "destructive to storage");
+        }
+        for name in [
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "init",
+            "telinit",
+            "systemctl",
+            "service",
+            "mount",
+            "umount",
+            "chroot",
+            "nsenter",
+            "unshare",
+            "crontab",
+            "at",
+            "batch",
+            "useradd",
+            "usermod",
+            "userdel",
+            "passwd",
+            "iptables",
+            "nft",
+            "modprobe",
+            "insmod",
+            "pkill",
+            "killall",
+            "skill",
+            "busybox",
+            "parallel",
+            "watch",
+            "script",
+            "flock",
+            "strace",
+            "ltrace",
+            "gdb",
+            "systemd-run",
+            "visudo",
+        ] {
+            blocked(&format!("{name} x"), "changes system state");
+        }
+        for name in [
+            "twine",
+            "hub",
+            "glab",
+            "aws",
+            "gcloud",
+            "az",
+            "kubectl",
+            "helm",
+            "terraform",
+            "tofu",
+            "scw",
+            "doctl",
+            "flyctl",
+            "fly",
+            "heroku",
+            "vercel",
+            "netlify",
+            "skopeo",
+            "oras",
+        ] {
+            blocked(&format!("{name} x"), "publishes or deploys");
+        }
+    }
+
+    #[test]
+    fn every_listed_publishing_subcommand_is_refused() {
+        for command in [
+            "cargo publish",
+            "cargo yank",
+            "cargo owner",
+            "cargo login",
+            "cargo logout",
+            "npm publish",
+            "npm unpublish",
+            "npm deprecate",
+            "npm dist-tag",
+            "npm login",
+            "npm adduser",
+            "npm token",
+            "npm owner",
+            "npm access",
+            "npm logout",
+            "pnpm publish",
+            "pnpm unpublish",
+            "pnpm deprecate",
+            "pnpm login",
+            "pnpm adduser",
+            "pnpm token",
+            "pnpm owner",
+            "yarn publish",
+            "yarn unpublish",
+            "yarn deprecate",
+            "yarn login",
+            "yarn npm",
+            "yarn token",
+            "bun publish",
+            "bun login",
+            "pip upload",
+            "pip3 upload",
+            "uv publish",
+            "poetry publish",
+            "flit publish",
+            "gem push",
+            "gem yank",
+            "gem owner",
+            "mvn deploy",
+            "gradle publish",
+            "helm push",
+            "sbt publish",
+        ] {
+            blocked(command, "publish");
+        }
+    }
+
+    #[test]
+    fn every_listed_credential_marker_is_refused() {
+        for marker in [
+            ".ssh/x",
+            ".aws/x",
+            ".gnupg/x",
+            ".netrc",
+            ".git-credentials",
+            "id_rsa",
+            "id_ed25519",
+            "/etc/shadow",
+            "/proc/self/environ",
+            "/proc/1/environ",
+            "docker.sock",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            ".kube/config",
+            ".npmrc",
+        ] {
+            blocked(&format!("cat {marker}"), "credential");
+        }
+    }
+
+    #[test]
+    fn every_listed_interpreter_danger_marker_is_refused() {
+        for marker in [
+            "system",
+            "exec",
+            "popen",
+            "spawn",
+            "subprocess",
+            "socket",
+            "urllib",
+            "http",
+            "requests",
+            "rmtree",
+            "child_process",
+            "getattr",
+            "__",
+            "importlib",
+            "ctypes",
+            "eval",
+            "compile(",
+            "fork",
+            "pty",
+            "shell_exec",
+            "passthru",
+            "qx",
+            "`",
+            "%x",
+            "require(",
+            "process.",
+            "open(",
+            "remove(",
+            "unlink",
+            "rmdir",
+            "globals",
+            "vars(",
+        ] {
+            blocked(&format!("python -c 'x {marker} y'"), "spawn processes");
+        }
+        blocked("ruby -e 'system 1'", "spawn processes");
+        blocked("node -p 'process.exit()'", "spawn processes");
+        blocked("perl -E 'system 1'", "spawn processes");
+        blocked("php -r 'shell_exec(1);'", "spawn processes");
+        blocked("python3.11 -c 'import os; os.system(1)'", "spawn processes");
+    }
+
+    #[test]
+    fn container_flags_and_mount_roots_are_each_refused() {
+        for flag in [
+            "--privileged",
+            "--cap-add=ALL",
+            "--pid=host",
+            "--userns=host",
+            "--device=/dev/sda",
+            "--security-opt=seccomp=unconfined",
+        ] {
+            blocked(&format!("docker run {flag} img"), "weakens confinement");
+        }
+        for root in [
+            "/", "/home", "/etc", "/root", "/var", "/usr", "/bin", "/sbin", "/lib", "/boot",
+            "/proc", "/sys", "/dev", "/run", "/etc/ssh",
+        ] {
+            blocked(&format!("docker run -v {root}:/x img"), "mounts");
+        }
+        for tool in ["docker", "podman", "nerdctl"] {
+            blocked(
+                &format!("{tool} run --privileged img"),
+                "weakens confinement",
+            );
+            blocked(&format!("{tool} push img"), "publishes images");
+            blocked(&format!("{tool} logout"), "publishes images");
+        }
+    }
+
+    #[test]
+    fn every_shell_name_is_inspected() {
+        for shell in [
+            "sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh",
+        ] {
+            blocked(&format!("{shell} -c 'curl x'"), "can send data");
+        }
+    }
+
+    #[test]
+    fn every_path_writer_checks_its_targets() {
+        for writer in [
+            "cp", "mv", "ln", "install", "touch", "mkdir", "tee", "truncate", "rmdir", "unlink",
+            "chmod", "chown", "chgrp", "patch",
+        ] {
+            blocked(&format!("{writer} /etc/x"), "outside the workspace");
+        }
+    }
+
+    #[test]
+    fn every_command_prefix_keyword_is_stripped() {
+        for keyword in [
+            "!", "if", "then", "else", "elif", "do", "while", "until", "function", "select", "for",
+            "case", "coproc",
+        ] {
+            blocked(&format!("{keyword} curl x"), "can send data");
+        }
+    }
+
+    #[test]
+    fn every_variable_writing_builtin_forgets_the_name() {
+        for writer in [
+            "read",
+            "mapfile",
+            "readarray",
+            "getopts",
+            "unset",
+            "let",
+            "printf",
+            "declare",
+            "typeset",
+            "local",
+            "readonly",
+        ] {
+            blocked(
+                &format!("X=ls; {writer} X; $X x"),
+                "cannot be resolved statically",
+            );
+        }
+        blocked("export X=curl; $X x", "can send data");
+        for builtin in ["declare", "readonly", "local", "typeset"] {
+            blocked(
+                &format!("{builtin} X=curl; $X x"),
+                "cannot be resolved statically",
+            );
+        }
+    }
+
+    #[test]
+    fn block_openers_taint_and_closers_restore_straight_line_tracking() {
+        blocked(
+            "X=ls; until true; do X=curl; done; $X x",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "X=ls; case a in a) X=curl;; esac; $X x",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "X=ls; select i in a; do X=curl; done; $X x",
+            "cannot be resolved statically",
+        );
+        blocked("if true; then echo; fi; X=curl; $X x", "can send data");
+        blocked("while false; do echo; done; X=curl; $X x", "can send data");
+        blocked("case a in a) echo;; esac; X=curl; $X x", "can send data");
+        blocked("{ echo; }; X=curl; $X x", "can send data");
+        blocked("for i in a; do echo; done; X=curl; $X x", "can send data");
+    }
+
+    #[test]
+    fn separators_split_commands() {
+        blocked("echo a && curl x", "can send data");
+        blocked("echo a || curl x", "can send data");
+        blocked("echo a | curl x", "can send data");
+        blocked("echo a & curl x", "can send data");
+        blocked("echo a ; curl x", "can send data");
+        blocked("echo a\n\ncurl x", "can send data");
+        blocked("(echo a) ; (curl x)", "can send data");
+        blocked("echo a\r\ncurl x", "can send data");
+        blocked("echo a\t&&\tcurl x", "can send data");
+    }
+
+    #[test]
+    fn backslash_and_quote_forms_build_the_word_the_shell_would() {
+        blocked("c\\url x", "can send data");
+        blocked("'c'\"u\"\\r'l' x", "can send data");
+        blocked("cu\\\nrl x", "can send data");
+    }
 }
