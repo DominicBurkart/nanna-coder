@@ -620,7 +620,11 @@ mod tests {
 
     #[tokio::test]
     async fn qa_browser_runs_a_scenario_and_writes_the_run_directory() {
-        let mut page = StubPage::new(&[json!("complete"), json!("Hello from the fixture")]);
+        let mut page = StubPage::new(&[
+            json!("complete"),
+            json!(true),
+            json!("Hello from the fixture"),
+        ]);
         page.errors.push_back(ConsoleError {
             source: "network".to_string(),
             text: "Failed to load resource: 404".to_string(),
@@ -671,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn qa_browser_loads_a_scenario_file_and_honours_base_url() {
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let f = fixture(probe(&[]), vec![page]);
         let file = f.ctx.workspace_root.join("scenario.json");
         std::fs::write(

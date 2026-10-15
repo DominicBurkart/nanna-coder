@@ -16,8 +16,9 @@
 //! ] }
 //! ```
 //!
-//! `goto` loads `path` on the frontend URL and waits for the document to be
-//! complete; `expect_text` waits until the first element matching the CSS
+//! `goto` loads `path` on the frontend URL, waits for the document to be
+//! complete and then for the dioxus root (`#main`) to have rendered a child,
+//! failing with a mount timeout otherwise; `expect_text` waits until the first element matching the CSS
 //! `selector` has `text` in its text content, so a wasm frontend that
 //! renders after a fetch is given time to do so; `click` and `type` act on
 //! the first matching element (`type` sets the value and dispatches `input`
@@ -61,6 +62,8 @@ pub const DEFAULT_CHROMIUM_BINARY: &str = "chromium";
 pub const DEFAULT_BROWSER_TIMEOUT_SECS: u64 = 120;
 /// How long `goto` and `expect_text` wait for the page.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+/// CSS selector of the element a dioxus web app mounts into.
+pub const DEFAULT_MOUNT_SELECTOR: &str = "#main";
 /// Interval between polls while waiting.
 pub const DEFAULT_POLL: Duration = Duration::from_millis(100);
 /// Viewport of the headless browser.
@@ -187,6 +190,13 @@ pub fn type_expression(selector: &str, text: &str) -> String {
     let sel = Value::String(selector.to_string());
     let val = Value::String(text.to_string());
     format!("(function(){{var e=document.querySelector({sel});if(e===null){{return false;}}e.focus();e.value={val};e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()")
+}
+
+/// JavaScript evaluating to `true` once the first element matching
+/// `selector` exists and has rendered at least one child element.
+pub fn mount_expression(selector: &str) -> String {
+    let sel = Value::String(selector.to_string());
+    format!("(function(){{var e=document.querySelector({sel});return e!==null&&e.childElementCount>0;}})()")
 }
 
 /// JavaScript evaluating to the document's ready state.
@@ -407,6 +417,7 @@ pub struct ScenarioRunner {
     screenshot_dir: PathBuf,
     wait: Duration,
     poll: Duration,
+    mount_selector: Option<String>,
 }
 
 impl ScenarioRunner {
@@ -416,7 +427,15 @@ impl ScenarioRunner {
             screenshot_dir: screenshot_dir.to_path_buf(),
             wait: DEFAULT_WAIT,
             poll: DEFAULT_POLL,
+            mount_selector: Some(DEFAULT_MOUNT_SELECTOR.to_string()),
         }
+    }
+
+    /// The element `goto` waits to have rendered a child before it passes;
+    /// `None` skips the wait for pages that are not mounted by a wasm app.
+    pub fn with_mount_selector(mut self, selector: Option<&str>) -> Self {
+        self.mount_selector = selector.map(str::to_string);
+        self
     }
 
     /// How long readiness and text expectations are polled, and how often.
@@ -484,17 +503,29 @@ impl ScenarioRunner {
                 let url = join_url(frontend_url, path);
                 page.goto(&url)?;
                 let ready = self.wait_for(page, READY_STATE_EXPRESSION, |v| v == "complete")?;
-                Ok(match ready {
-                    Ok(_) => (true, format!("loaded {url}")),
-                    Err(state) => (
+                if let Err(state) = ready {
+                    return Ok((
                         false,
                         format!(
                             "{url} not complete within {:?}: document is {}",
                             self.wait,
                             describe(&state)
                         ),
-                    ),
-                })
+                    ));
+                }
+                if let Some(selector) = &self.mount_selector {
+                    let mounted = self.wait_for(page, &mount_expression(selector), |v| {
+                        *v == Value::Bool(true)
+                    })?;
+                    if mounted.is_err() {
+                        return Err(BrowserError::MountTimeout {
+                            url,
+                            selector: selector.clone(),
+                            wait: self.wait,
+                        });
+                    }
+                }
+                Ok((true, format!("loaded {url}")))
             }
             Step::ExpectText { selector, text } => {
                 let expression = text_expression(selector);
@@ -565,7 +596,9 @@ impl ScenarioRunner {
 fn step_level(error: &BrowserError) -> bool {
     matches!(
         error,
-        BrowserError::Script { .. } | BrowserError::Navigation { .. }
+        BrowserError::Script { .. }
+            | BrowserError::Navigation { .. }
+            | BrowserError::MountTimeout { .. }
     )
 }
 
@@ -885,6 +918,7 @@ mod tests {
         let mut page = StubPage::new(&[
             json!("loading"),
             json!("complete"),
+            json!(true),
             json!("loading"),
             json!("Hello from the fixture"),
             json!(true),
@@ -928,7 +962,8 @@ mod tests {
         assert_eq!(calls[0], "goto http://app:1/");
         assert_eq!(calls[1], "evaluate document.readyState");
         assert_eq!(calls[2], "evaluate document.readyState");
-        assert!(calls[3]
+        assert_eq!(calls[3], format!("evaluate {}", mount_expression("#main")));
+        assert!(calls[4]
             .starts_with("evaluate (function(){var e=document.querySelector(\"#greeting\")"));
         assert_eq!(calls.last().unwrap(), "close");
         assert_eq!(calls.iter().filter(|c| *c == "screenshot").count(), 1);
@@ -1009,7 +1044,7 @@ mod tests {
         assert_eq!(report.steps[3].detail, "no element matches `#missing`");
         assert!(report.render_text().ends_with("scenario failed"));
 
-        let mut page = StubPage::new(&[json!("complete")]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
         page.fallback = json!("  goodbye \n world  ");
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
@@ -1024,7 +1059,7 @@ mod tests {
         assert!(report.steps[0].passed);
         assert!(!report.passed);
 
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
             { "step": "goto", "path": "/" },
@@ -1038,7 +1073,7 @@ mod tests {
     #[test]
     fn runner_continues_after_step_level_errors_and_stops_on_browser_failures() {
         let dir = TempDir::new().unwrap();
-        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true), json!(true)]);
         page.navigation_error = Some("net::ERR_CONNECTION_REFUSED".to_string());
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
@@ -1078,7 +1113,7 @@ mod tests {
         );
         assert!(report.steps[1].passed);
 
-        let mut page = StubPage::new(&[json!("complete")]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
         page.screenshot = Err("target closed".to_string());
         page.close_error = true;
         let driver = StubDriver::new(vec![page]);
@@ -1120,7 +1155,7 @@ mod tests {
 
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let scenario = steps_of(
             json!([{ "step": "goto", "path": "/" }, { "step": "screenshot", "name": "s" }]),
         );
@@ -1326,5 +1361,97 @@ mod tests {
         assert_eq!(describe(&json!("s")), "`s`");
         assert_eq!(describe(&json!(3)), "3");
         assert_eq!(describe(&Value::Null), "null");
+    }
+
+    #[test]
+    fn goto_waits_for_the_root_to_mount_after_ready_state_complete() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete"), json!(false), json!(false), json!(true)]);
+        let calls = Arc::clone(&page.calls);
+        let scenario = steps_of(json!([{ "step": "goto", "path": "/" }]));
+        let report = fast(StubDriver::new(vec![page]), dir.path()).run("http://app", &scenario);
+        assert!(report.passed, "{}", report.render_text());
+        let calls = calls.lock().unwrap().clone();
+        let mounts: Vec<&String> = calls
+            .iter()
+            .filter(|c| **c == format!("evaluate {}", mount_expression("#main")))
+            .collect();
+        assert_eq!(mounts.len(), 3, "{calls:?}");
+        assert_eq!(calls.last().unwrap(), "close");
+    }
+
+    #[test]
+    fn goto_does_not_pass_while_the_root_is_unmounted() {
+        let dir = TempDir::new().unwrap();
+        let mut page = StubPage::new(&[json!("complete")]);
+        page.fallback = json!(false);
+        let scenario = steps_of(
+            json!([{ "step": "goto", "path": "/" }, { "step": "click", "selector": "#b" }]),
+        );
+        let report = ScenarioRunner::new(StubDriver::new(vec![page]), dir.path())
+            .with_wait(Duration::from_millis(20), Duration::from_millis(1))
+            .run("http://app", &scenario);
+        assert!(!report.passed);
+        assert!(!report.steps[0].passed);
+        assert_eq!(
+            report.steps[0].detail,
+            "http://app/ did not mount `#main` within 20ms"
+        );
+        assert_eq!(report.steps.len(), 2);
+    }
+
+    #[test]
+    fn run_step_returns_a_typed_mount_timeout() {
+        let dir = TempDir::new().unwrap();
+        let mut page = StubPage::new(&[json!("complete")]);
+        page.fallback = json!(false);
+        let runner = ScenarioRunner::new(StubDriver::new(vec![]), dir.path())
+            .with_wait(Duration::from_millis(5), Duration::ZERO)
+            .with_mount_selector(Some("#app"));
+        let err = runner
+            .run_step(
+                &mut page,
+                "http://app",
+                &Step::Goto {
+                    path: "/x".to_string(),
+                },
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        match err {
+            BrowserError::MountTimeout {
+                url,
+                selector,
+                wait,
+            } => {
+                assert_eq!(url, "http://app/x");
+                assert_eq!(selector, "#app");
+                assert_eq!(wait, Duration::from_millis(5));
+            }
+            other => panic!("expected MountTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goto_skips_the_mount_wait_when_no_selector_is_configured() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete")]);
+        let calls = Arc::clone(&page.calls);
+        let scenario = steps_of(json!([{ "step": "goto", "path": "/" }]));
+        let report = fast(StubDriver::new(vec![page]), dir.path())
+            .with_mount_selector(None)
+            .run("http://app", &scenario);
+        assert!(report.passed);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn mount_expression_quotes_the_selector_and_requires_a_rendered_child() {
+        let expression = mount_expression("div[id=\"x\"]");
+        assert!(
+            expression.contains("querySelector(\"div[id=\\\"x\\\"]\")"),
+            "{expression}"
+        );
+        assert!(expression.contains("e!==null&&e.childElementCount>0"));
     }
 }

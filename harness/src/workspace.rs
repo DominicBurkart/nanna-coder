@@ -2286,6 +2286,7 @@ mod tests {
             ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
             let page = crate::qa::browser::stub::StubPage::new(&[
                 serde_json::json!("complete"),
+                serde_json::json!(true),
                 serde_json::json!("Hello from the full-stack fixture"),
             ]);
             ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
