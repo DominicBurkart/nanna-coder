@@ -28,6 +28,8 @@ impl AuditLogEntry {
     }
 }
 
+static APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Clone)]
 enum Backing {
     Memory(Arc<Mutex<Vec<AuditLogEntry>>>),
@@ -117,9 +119,11 @@ impl AuditLog {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let line = serde_json::to_string(&entry)?;
+                let mut line = serde_json::to_string(&entry)?;
+                line.push('\n');
+                let _serialized = APPEND_LOCK.lock();
                 let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(file, "{line}")?;
+                file.write_all(line.as_bytes())?;
                 Ok(())
             }
         }
@@ -209,6 +213,29 @@ mod tests {
             entries,
             vec![AuditLogEntry::from_outcome(request, &allow_outcome())]
         );
+    }
+
+    #[test]
+    fn concurrent_appends_keep_every_line_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::file(dir.path().join("audit.jsonl"));
+        let mut big = request(
+            "rust-implementer",
+            "a",
+            DevLoop::Inner,
+            EffectClass::Workspace,
+        );
+        big.subtask = "x".repeat(4096);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        log.append(&big, &allow_outcome()).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(log.entries().unwrap().len(), 16 * 25);
     }
 
     #[test]

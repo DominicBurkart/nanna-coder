@@ -23,6 +23,8 @@ pub struct ActionAuditLogEntry {
     pub verdict: ActionVerdict,
 }
 
+static APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Clone)]
 enum Backing {
     Memory(Arc<Mutex<Vec<ActionAuditLogEntry>>>),
@@ -110,9 +112,11 @@ impl ActionAuditLog {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let line = serde_json::to_string(&entry)?;
+                let mut line = serde_json::to_string(&entry)?;
+                line.push('\n');
+                let _serialized = APPEND_LOCK.lock();
                 let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                writeln!(file, "{line}")?;
+                file.write_all(line.as_bytes())?;
                 Ok(())
             }
         }
@@ -155,6 +159,24 @@ mod tests {
             effect_class: EffectClass::Repository,
             prior_actions: vec![],
         }
+    }
+
+    #[test]
+    fn concurrent_appends_keep_every_line_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ActionAuditLog::file(dir.path().join("audit.jsonl"));
+        let mut big = review();
+        big.args = serde_json::json!({ "blob": "x".repeat(4096) });
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        log.append(&big, &ActionVerdict::Allow).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(log.entries().unwrap().len(), 16 * 25);
     }
 
     #[test]

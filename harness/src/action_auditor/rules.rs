@@ -4,7 +4,7 @@
 use super::{ActionAuditError, ActionAuditor, ActionContext, ActionReview, ActionVerdict};
 use crate::auditor::{Reason, ReasonCode};
 use crate::effects::EffectClass;
-use crate::leases::{self, LeaseStore};
+use crate::leases::{self, Lease, LeaseStore};
 use crate::windows::{EffectLevel, Window, WindowSet};
 use async_trait::async_trait;
 use chrono::Duration;
@@ -31,7 +31,7 @@ pub(crate) enum RuleOutcome {
     /// The ceiling (`Repository`/`Ci`) or the window and lease checks
     /// (`Sandbox`/`Production`) passed; only a configured model may allow
     /// the action.
-    NeedsModel,
+    NeedsModel(Vec<Lease>),
 }
 
 /// Cheap, deterministic review used by unit tests, and as the first pass of
@@ -133,14 +133,15 @@ impl RuleActionAuditor {
                 )]));
             }
         }
+        let ceiling = self.ceiling_check(review, ctx);
+        if !ceiling.is_allow() {
+            return RuleOutcome::Decided(ceiling);
+        }
         match review.effect_class {
             EffectClass::None | EffectClass::Workspace => {
                 RuleOutcome::Decided(ActionVerdict::Allow)
             }
-            EffectClass::Repository | EffectClass::Ci => match self.ceiling_check(review, ctx) {
-                ActionVerdict::Allow => RuleOutcome::NeedsModel,
-                verdict => RuleOutcome::Decided(verdict),
-            },
+            EffectClass::Repository | EffectClass::Ci => RuleOutcome::NeedsModel(Vec::new()),
             EffectClass::Sandbox => {
                 self.window_and_lease_check(review, ctx, leases::Effect::Sandbox)
             }
@@ -162,6 +163,14 @@ impl RuleActionAuditor {
             return ActionVerdict::block(vec![reason]);
         }
         ActionVerdict::Allow
+    }
+
+    pub(crate) fn release(&self, taken: &[Lease]) {
+        for lease in taken.iter().rev() {
+            if let Err(e) = self.leases.release(lease) {
+                tracing::error!(lease = %lease.name, error = %e, "Failed to release an action lease after a refused review");
+            }
+        }
     }
 
     fn named_window_block(&self, window: &str, ctx: &ActionContext<'_>) -> Option<ActionVerdict> {
@@ -227,6 +236,14 @@ impl RuleActionAuditor {
                 return RuleOutcome::Decided(ActionVerdict::block(vec![reason]));
             }
         };
+        let held_before: Vec<leases::LeaseName> = self
+            .leases
+            .snapshot()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|lease| lease.holder == review.task_id.0 && !lease.is_expired(ctx.now))
+            .map(|lease| lease.name)
+            .collect();
         match leases::acquire_all(
             self.leases.as_ref(),
             &names,
@@ -234,7 +251,12 @@ impl RuleActionAuditor {
             self.lease_ttl,
             ctx.now,
         ) {
-            Ok(_leases) => RuleOutcome::NeedsModel,
+            Ok(taken) => RuleOutcome::NeedsModel(
+                taken
+                    .into_iter()
+                    .filter(|lease| !held_before.contains(&lease.name))
+                    .collect(),
+            ),
             Err(e) => {
                 let reason = Reason::new(ReasonCode::LeaseUnavailable, e.to_string());
                 RuleOutcome::Decided(ActionVerdict::block(vec![reason]))
@@ -256,7 +278,8 @@ impl ActionAuditor for RuleActionAuditor {
     ) -> Result<ActionVerdict, ActionAuditError> {
         Ok(match self.evaluate(review, context) {
             RuleOutcome::Decided(verdict) => verdict,
-            RuleOutcome::NeedsModel => {
+            RuleOutcome::NeedsModel(fresh) => {
+                self.release(&fresh);
                 let reason = Reason::new(
                     ReasonCode::Other,
                     format!(
@@ -332,16 +355,61 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn none_and_workspace_are_always_allowed() {
+    async fn none_and_workspace_within_the_ceiling_are_allowed() {
         let rules = auditor();
         for class in [EffectClass::None, EffectClass::Workspace] {
             let review = review("read_file", class);
-            let context = ctx(EffectClass::None, None, LeaseContext::default());
+            let context = ctx(class, None, LeaseContext::default());
             assert_eq!(
                 rules.review_action(&review, &context).await.unwrap(),
                 ActionVerdict::Allow
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_call_above_the_ceiling_is_blocked_for_every_class() {
+        let rules = auditor();
+        let lease = LeaseContext {
+            repo: "example/repo",
+            pr: Some(7),
+            environment: Some("prod"),
+            ..LeaseContext::default()
+        };
+        let cases = [
+            (EffectClass::Workspace, EffectClass::None),
+            (EffectClass::Repository, EffectClass::Workspace),
+            (EffectClass::Ci, EffectClass::Repository),
+            (EffectClass::Sandbox, EffectClass::Workspace),
+            (EffectClass::Production, EffectClass::Workspace),
+            (EffectClass::Production, EffectClass::Sandbox),
+        ];
+        for (class, ceiling) in cases {
+            let review = review("deploy", class);
+            let context = ctx(ceiling, Some("business-hours"), lease);
+            let verdict = rules.review_action(&review, &context).await.unwrap();
+            assert_eq!(verdict.kind(), VerdictKind::Block, "{class} over {ceiling}");
+            assert_eq!(
+                verdict.reasons()[0].code,
+                ReasonCode::EffectAboveCeiling,
+                "{class} over {ceiling}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_over_ceiling_deploy_takes_no_lease() {
+        let store = Arc::new(InMemoryLeaseStore::default());
+        let rules = RuleActionAuditor::new(windows(), store.clone(), Duration::minutes(10));
+        let lease = LeaseContext {
+            repo: "example/repo",
+            environment: Some("prod"),
+            ..LeaseContext::default()
+        };
+        let review = review("deploy", EffectClass::Production);
+        let context = ctx(EffectClass::Workspace, Some("business-hours"), lease);
+        rules.review_action(&review, &context).await.unwrap();
+        assert!(store.snapshot().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -538,6 +606,22 @@ pub(crate) mod tests {
         let context = ctx(EffectClass::Sandbox, Some("business-hours"), lease);
         let verdict = rules.review_action(&review, &context).await.unwrap();
         assert_eq!(verdict.kind(), VerdictKind::Escalate);
+    }
+
+    #[tokio::test]
+    async fn a_bare_rule_escalation_releases_the_lease_it_took() {
+        let store = Arc::new(InMemoryLeaseStore::default());
+        let rules = RuleActionAuditor::new(windows(), store.clone(), Duration::minutes(10));
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+        let lease = LeaseContext {
+            repo: "example/repo",
+            pr: Some(7),
+            ..LeaseContext::default()
+        };
+        let context = ctx(EffectClass::Sandbox, Some("business-hours"), lease);
+        let verdict = rules.review_action(&review, &context).await.unwrap();
+        assert_eq!(verdict.kind(), VerdictKind::Escalate);
+        assert!(store.snapshot().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -153,19 +153,29 @@ impl ActionAuditor for ModelActionAuditor {
     ) -> Result<ActionVerdict, ActionAuditError> {
         match self.rules.evaluate(review, context) {
             RuleOutcome::Decided(verdict) => Ok(verdict),
-            RuleOutcome::NeedsModel => {
+            RuleOutcome::NeedsModel(fresh) => {
                 let messages = Self::build_prompt(review, context);
                 let chat = ChatRequest::new(self.model.clone(), messages).with_temperature(0.0);
-                let response = self.provider.chat(chat).await?;
+                let response = match self.provider.chat(chat).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        self.rules.release(&fresh);
+                        return Err(e.into());
+                    }
+                };
                 let text = response
                     .choices
                     .first()
                     .and_then(|choice| choice.message.content.clone())
                     .unwrap_or_default();
-                Ok(match Self::parse_reply(&text) {
+                let verdict = match Self::parse_reply(&text) {
                     Ok(verdict) => verdict,
                     Err(problem) => Self::unparsable(&problem),
-                })
+                };
+                if !verdict.is_allow() {
+                    self.rules.release(&fresh);
+                }
+                Ok(verdict)
             }
         }
     }
@@ -326,6 +336,105 @@ mod tests {
             .unwrap();
         assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
         assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_over_ceiling_deploy_never_reaches_the_model_even_with_window_and_lease() {
+        for class in [EffectClass::Sandbox, EffectClass::Production] {
+            let (auditor, provider) = auditor(&[r#"{"verdict":"allow"}"#]);
+            let review = review("deploy", class);
+            let lease = LeaseContext {
+                repo: "example/repo",
+                pr: Some(1),
+                environment: Some("prod"),
+                ..LeaseContext::default()
+            };
+            let mut ctx = deploy_ctx(Some("business-hours"), lease);
+            ctx.max_effect = EffectClass::Workspace;
+            let verdict = auditor.review_action(&review, &ctx).await.unwrap();
+            assert_eq!(
+                verdict.kind(),
+                crate::auditor::VerdictKind::Block,
+                "{class}"
+            );
+            assert_eq!(provider.calls(), 0, "{class}");
+        }
+    }
+
+    fn store_auditor(
+        replies: &[&str],
+    ) -> (
+        ModelActionAuditor,
+        Arc<MockProvider>,
+        Arc<InMemoryLeaseStore>,
+    ) {
+        let provider = MockProvider::replying(replies);
+        let store = Arc::new(InMemoryLeaseStore::default());
+        let auditor = ModelActionAuditor::new(
+            provider.clone(),
+            MODEL,
+            windows(),
+            store.clone(),
+            Duration::minutes(10),
+        );
+        (auditor, provider, store)
+    }
+
+    fn sandbox_lease() -> LeaseContext<'static> {
+        LeaseContext {
+            repo: "example/repo",
+            pr: Some(1),
+            ..LeaseContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_block_or_escalate_or_error_releases_the_lease_the_pre_pass_took() {
+        let block = r#"{"verdict":"block","reasons":[{"code":"other","detail":"no"}]}"#;
+        let escalate = r#"{"verdict":"escalate","reasons":[{"code":"other","detail":"ask"}]}"#;
+        for reply in [block, escalate, "not json"] {
+            let (auditor, _provider, store) = store_auditor(&[reply]);
+            let review = review("sandbox_deploy", EffectClass::Sandbox);
+            let ctx = deploy_ctx(Some("business-hours"), sandbox_lease());
+            let verdict = auditor.review_action(&review, &ctx).await.unwrap();
+            assert!(!verdict.is_allow(), "{reply}");
+            assert!(store.snapshot().unwrap().is_empty(), "{reply}");
+        }
+        let (auditor, _provider, store) = store_auditor(&[]);
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+        let ctx = deploy_ctx(Some("business-hours"), sandbox_lease());
+        assert!(auditor.review_action(&review, &ctx).await.is_err());
+        assert!(store.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_allow_keeps_the_lease_held() {
+        let (auditor, _provider, store) = store_auditor(&[r#"{"verdict":"allow"}"#]);
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+        let ctx = deploy_ctx(Some("business-hours"), sandbox_lease());
+        assert!(auditor
+            .review_action(&review, &ctx)
+            .await
+            .unwrap()
+            .is_allow());
+        assert!(!store.snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_block_does_not_release_a_lease_the_task_already_held() {
+        let block = r#"{"verdict":"block","reasons":[{"code":"other","detail":"no"}]}"#;
+        let (auditor, _provider, store) = store_auditor(&[r#"{"verdict":"allow"}"#, block]);
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+        let ctx = deploy_ctx(Some("business-hours"), sandbox_lease());
+        assert!(auditor
+            .review_action(&review, &ctx)
+            .await
+            .unwrap()
+            .is_allow());
+        let held = store.snapshot().unwrap().len();
+        let second = auditor.review_action(&review, &ctx).await.unwrap();
+        assert!(!second.is_allow());
+        assert_eq!(store.snapshot().unwrap().len(), held);
     }
 
     #[tokio::test]
