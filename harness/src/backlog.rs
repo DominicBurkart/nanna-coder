@@ -61,6 +61,12 @@ pub enum BacklogError {
     Parse(#[from] serde_json::Error),
     #[error("queue store failed: {0}")]
     Store(#[from] QueueStoreError),
+    #[error(
+        "backlog task names identity `{identity}`, which is not registered; refusing to enqueue"
+    )]
+    UnresolvedIdentity { identity: String },
+    #[error("backlog task names no identity; refusing to enqueue")]
+    MissingIdentity,
 }
 
 /// Read access to the GitHub data ingestion needs.
@@ -209,7 +215,7 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 /// }
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default()), ["sdlc-dev".to_string()]).unwrap();
 /// let config = BacklogConfig {
 ///     sources: vec![BacklogSource {
 ///         repo: "owner/name".into(),
@@ -292,16 +298,40 @@ pub async fn backlog_sync(
 /// Sink that writes straight into a [`QueueStore`], for a process that does
 /// not run a [`TaskManager`] (the `backlog-sync` CLI). The running manager
 /// picks the entries up when it is next restored from the same store.
+///
+/// Only tasks whose `identity_hint` names one of the identities given to
+/// [`StoreSink::open`] are written; any other hint, or none, is refused.
 pub struct StoreSink {
     store: Box<dyn QueueStore>,
     queue: Mutex<TaskQueue>,
+    identities: HashSet<String>,
 }
 
 impl StoreSink {
-    /// Load the current queue from `store`.
-    pub fn open(store: Box<dyn QueueStore>) -> Result<Self, QueueStoreError> {
+    /// Load the current queue from `store`, accepting only tasks hinting one
+    /// of `identities`.
+    pub fn open(
+        store: Box<dyn QueueStore>,
+        identities: impl IntoIterator<Item = String>,
+    ) -> Result<Self, QueueStoreError> {
         let queue = Mutex::new(TaskQueue::from_entries(store.load()?));
-        Ok(Self { store, queue })
+        Ok(Self {
+            store,
+            queue,
+            identities: identities.into_iter().collect(),
+        })
+    }
+}
+
+fn hinted_identity(task: &QueuedTask) -> Result<&str, BacklogError> {
+    task.identity_hint
+        .as_deref()
+        .ok_or(BacklogError::MissingIdentity)
+}
+
+fn unresolved_identity(name: &str) -> BacklogError {
+    BacklogError::UnresolvedIdentity {
+        identity: name.to_string(),
     }
 }
 
@@ -322,6 +352,10 @@ impl BacklogSink for StoreSink {
     }
 
     async fn enqueue(&self, task: QueuedTask) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.identities.contains(hint) {
+            return Err(unresolved_identity(hint));
+        }
         let mut queue = self.queue.lock().await;
         let stored = queue.push(task);
         self.store.insert(&stored)?;
@@ -358,6 +392,10 @@ impl BacklogSink for ManagerSink {
     }
 
     async fn enqueue(&self, task: QueuedTask) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.manager.has_identity(hint).await {
+            return Err(unresolved_identity(hint));
+        }
         self.manager
             .submit_task(task, Arc::clone(&self.provider))
             .await;
@@ -612,7 +650,7 @@ mod tests {
             pulls: HashMap::new(),
         };
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let cfg = config(vec![source("o/n", "/repo")], None);
 
         let report = backlog_sync(&github, &sink, &cfg).await.unwrap();
@@ -634,7 +672,7 @@ mod tests {
         assert_eq!(again.duplicates, 2);
         assert_eq!(store.load().unwrap().len(), 2);
 
-        let reopened = StoreSink::open(Box::new(store.clone())).unwrap();
+        let reopened = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let third = backlog_sync(&github, &reopened, &cfg).await.unwrap();
         assert_eq!(third.duplicates, 2);
     }
@@ -661,7 +699,8 @@ mod tests {
                 ],
             )]),
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         let report = backlog_sync(&github, &sink, &config(vec![source("o/n", "/repo")], None))
             .await
             .unwrap();
@@ -679,14 +718,12 @@ mod tests {
             ]),
             pulls: HashMap::new(),
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
-        sink.enqueue(QueuedTask::new(
-            "manual",
-            PathBuf::from("/a"),
-            "main",
-            "m",
-            1,
-        ))
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
+        sink.enqueue(
+            QueuedTask::new("manual", PathBuf::from("/a"), "main", "m", 1)
+                .with_identity_hint(Some("sdlc-dev".to_string())),
+        )
         .await
         .unwrap();
         let cfg = config(vec![source("o/a", "/a"), source("o/b", "/b")], Some(2));
@@ -710,6 +747,95 @@ mod tests {
             ]
         );
         assert_eq!(sink.known().await.unwrap().len(), 4);
+    }
+
+    fn known_identities() -> Vec<String> {
+        vec!["sdlc-dev".to_string()]
+    }
+
+    fn sdlc_dev_identity() -> crate::identity::AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.identity.name = "sdlc-dev".to_string();
+        identity
+    }
+
+    struct SilentProvider;
+
+    #[async_trait]
+    impl ModelProvider for SilentProvider {
+        async fn chat(
+            &self,
+            _request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            Err(model::provider::ModelError::Unknown {
+                message: "unused".to_string(),
+            })
+        }
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "silent"
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_an_unregistered_identity_hint_and_queues_nothing() {
+        let manager = Arc::new(TaskManager::new(0));
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+        };
+        let cfg = config(vec![source("o/n", "/repo")], None);
+        let err = backlog_sync(&github, &sink, &cfg).await.unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "sdlc-dev"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("sdlc-dev"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_sink_refuses_unresolved_and_missing_identity_hints_and_stores_nothing() {
+        let store = InMemoryQueueStore::default();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+        };
+        let mut src = source("o/n", "/repo");
+        src.identity = "ghost".to_string();
+        let err = backlog_sync(&github, &sink, &config(vec![src], None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "ghost"),
+            "{err}"
+        );
+        let err = sink
+            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_task_with_no_identity_hint() {
+        let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(sdlc_dev_identity()).await;
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let err = sink
+            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(manager.list().await.is_empty());
     }
 
     #[tokio::test]
@@ -738,6 +864,7 @@ mod tests {
         }
 
         let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(sdlc_dev_identity()).await;
         let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(NoProvider));
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
@@ -778,13 +905,17 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(StoreSink::open(Box::new(Broken)).is_err());
+        assert!(StoreSink::open(Box::new(Broken), known_identities()).is_err());
         let sink = StoreSink {
             store: Box::new(Broken),
             queue: Mutex::new(TaskQueue::new()),
+            identities: known_identities().into_iter().collect(),
         };
         let err = sink
-            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .enqueue(
+                QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1)
+                    .with_identity_hint(Some("sdlc-dev".to_string())),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("queue store failed"));
