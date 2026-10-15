@@ -11,10 +11,9 @@
 //! shared dispatch path, rather than once per tool implementation.
 //!
 //! Two auditors ship here, mirroring [`crate::auditor`]. [`RuleActionAuditor`]
-//! is deterministic: it always allows `None`/`Workspace` calls (the inner
-//! loop is container-isolated and needs no gate), checks the identity's
-//! effect ceiling for `Repository`/`Ci` calls, and for `Sandbox`/`Production`
-//! calls checks the action's availability window and coordination lease. It
+//! is deterministic: it checks the identity's effect ceiling for every class,
+//! allows `None`/`Workspace` calls within it (the inner loop is
+//! container-isolated), and for `Sandbox`/`Production` calls checks the action's availability window and coordination lease. It
 //! never allows a `Repository`/`Ci`/`Sandbox`/`Production` call by itself.
 //! [`ModelActionAuditor`] wraps it, consulting the configured model for
 //! those four classes once the rule checks passed; a rule `Block` always
@@ -41,8 +40,8 @@ pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{ActionAuditLog, ActionAuditLogEntry};
 pub use review::ActionReview;
-pub use rules::RuleActionAuditor;
 pub(crate) use rules::RUN_COMMAND_TOOL;
+pub use rules::{RuleActionAuditor, RULE_ACTION_AUDITOR_NAME};
 pub use verdict::ActionVerdict;
 
 use async_trait::async_trait;

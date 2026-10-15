@@ -48,7 +48,7 @@ fn fenced(text: &str) -> String {
 /// `Sandbox` and `Production` call whose [`RuleActionAuditor`] pre-checks
 /// (effect ceiling, then availability window and lease) already passed.
 ///
-/// `None`/`Workspace` calls are decided by the rule pass alone. The same
+/// `None`/`Workspace` calls are decided by the rule pass alone, and every class is first checked against the ceiling. The same
 /// configured model reviews every class; there is no separate smaller model
 /// for `Repository`/`Ci`. A rule `Block` — an over-ceiling call, a closed
 /// window, an unavailable lease —

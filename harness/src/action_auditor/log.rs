@@ -90,6 +90,14 @@ impl ActionAuditLog {
         }
     }
 
+    /// The file entries are appended to, or `None` for an in-memory log.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match &self.backing {
+            Backing::Memory(_) => None,
+            Backing::File(path) => Some(path),
+        }
+    }
+
     /// Append `verdict` for `review`.
     pub fn append(
         &self,
@@ -177,6 +185,13 @@ mod tests {
             }
         });
         assert_eq!(log.entries().unwrap().len(), 16 * 25);
+    }
+
+    #[test]
+    fn path_is_the_file_for_a_file_log_and_none_in_memory() {
+        assert_eq!(ActionAuditLog::in_memory().path(), None);
+        let log = ActionAuditLog::file("/x/audit.jsonl");
+        assert_eq!(log.path(), Some(std::path::Path::new("/x/audit.jsonl")));
     }
 
     #[test]

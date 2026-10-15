@@ -554,6 +554,11 @@ impl TaskManager {
         self.with_action_gate(Arc::new(ActionGate::new(auditor, log)))
     }
 
+    /// The gate every dispatched task's effectful calls pass through.
+    pub fn action_gate(&self) -> Arc<ActionGate> {
+        self.runner.action_gate()
+    }
+
     /// Deliver action-auditor escalations through `escalator` and use its
     /// log as this manager's escalation log. Without one, an escalation is
     /// recorded in the escalation log only and no sink delivers it.
@@ -3465,6 +3470,33 @@ mod identity_tests {
         let persisted = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(persisted.lines().count(), 1);
         assert!(persisted.contains("github_pr_status"));
+    }
+
+    #[test]
+    fn test_action_policy_names_the_model_auditor_and_the_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("action_audit.jsonl");
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let with_model = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_policy(
+            crate::windows::WindowSet::default(),
+            Some((provider, "auditor-model".to_string())),
+            crate::action_auditor::ActionAuditLog::file(&log_path),
+        );
+        assert_eq!(with_model.action_gate().auditor_name(), "auditor-model");
+        assert_eq!(
+            with_model.action_gate().log().path(),
+            Some(log_path.as_path())
+        );
+        let without = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_policy(
+            crate::windows::WindowSet::default(),
+            None,
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        );
+        assert_eq!(
+            without.action_gate().auditor_name(),
+            crate::action_auditor::RULE_ACTION_AUDITOR_NAME
+        );
+        assert_eq!(without.action_gate().log().path(), None);
     }
 
     #[tokio::test]

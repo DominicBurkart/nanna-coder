@@ -120,6 +120,13 @@ impl ActionGate {
         Self { auditor, log }
     }
 
+    /// Name of the auditor behind this gate: the model for a
+    /// [`ModelActionAuditor`](super::ModelActionAuditor), a fixed rule
+    /// name otherwise.
+    pub fn auditor_name(&self) -> &str {
+        self.auditor.name()
+    }
+
     /// The audit log this gate appends every verdict to.
     pub fn log(&self) -> &ActionAuditLog {
         &self.log

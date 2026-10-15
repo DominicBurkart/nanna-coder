@@ -37,11 +37,12 @@ pub(crate) enum RuleOutcome {
 /// Cheap, deterministic review used by unit tests, and as the first pass of
 /// [`ModelActionAuditor`](super::ModelActionAuditor).
 ///
-/// `None`/`Workspace` calls are always allowed: the inner loop is isolated
-/// by container design and needs no gate. `Repository`/`Ci` calls are first
-/// compared against the identity's effect ceiling (defense in depth: RBAC
-/// should already keep an over-ceiling call out of the tool registry, but
-/// the gate checks again); one within the ceiling still needs a model to
+/// Every call is first compared against the identity's effect ceiling
+/// (defense in depth: RBAC should already keep an over-ceiling call out of
+/// the tool registry, but the gate checks again) and blocked above it, before
+/// any lease or model step. `None`/`Workspace` calls within the ceiling are
+/// allowed: the inner loop is isolated by container design. A
+/// `Repository`/`Ci` call within the ceiling still needs a model to
 /// sign off, so a bare [`RuleActionAuditor`] blocks it with a reason naming
 /// the missing model. `Sandbox`/`Production` calls first require the
 /// action's target availability window to be open and the coordination
