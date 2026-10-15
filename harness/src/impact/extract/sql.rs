@@ -371,6 +371,18 @@ mod tests {
             [w("a")]
         );
         assert_eq!(pairs("SELECT * FROM a FOR UPDATE"), [r("a")]);
+        assert_eq!(pairs("SELECT * FROM a FOR UPDATE NOWAIT"), [r("a")]);
+        assert_eq!(pairs("SELECT * FROM a FOR UPDATE b"), [r("a")]);
+        assert_eq!(
+            pairs("INSERT INTO a VALUES (1) ON CONFLICT (id) DO UPDATE b"),
+            [w("a")]
+        );
+    }
+
+    #[test]
+    fn truncate_lists_every_table() {
+        assert_eq!(pairs("TRUNCATE TABLE a, b, c"), [w("a"), w("b"), w("c")]);
+        assert_eq!(pairs("TRUNCATE a, b"), [w("a"), w("b")]);
     }
 
     #[test]
@@ -412,6 +424,10 @@ mod tests {
             Some("db.public.users")
         );
         assert_eq!(table_asset(&graph(), "nothing"), None);
+        assert_eq!(
+            table_asset(&graph(), "Public.Users").as_deref(),
+            Some("db.public.users")
+        );
     }
 
     #[test]
