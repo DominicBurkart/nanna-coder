@@ -650,6 +650,31 @@ mod tests {
     }
 
     #[test]
+    fn a_diff_that_ends_with_only_one_side_of_a_hunk_unfinished_is_an_error() {
+        let only_new =
+            "diff --git a/a.sql b/a.sql\n--- a/a.sql\n+++ b/a.sql\n@@ -0,0 +1,2 @@\n+x\n";
+        let only_old =
+            "diff --git a/a.sql b/a.sql\n--- a/a.sql\n+++ b/a.sql\n@@ -1,2 +0,0 @@\n-x\n";
+        for diff in [only_new, only_old] {
+            assert_eq!(
+                Change::from_unified_diff(diff),
+                Err(DiffError::TruncatedHunk {
+                    path: "a.sql".into()
+                }),
+                "{diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_after_any_header_path_is_not_part_of_the_path() {
+        let created = "diff --git a/n.sql b/n.sql\nnew file mode 100644\n--- /dev/null\t\n+++ b/n.sql\t\n@@ -0,0 +1 @@\n+x\n";
+        assert_eq!(parse(created).files[0].path, "n.sql");
+        let quoted = "diff --git \"a/\\303\\251.sql\" \"b/\\303\\251.sql\"\n--- \"a/\\303\\251.sql\"\t\n+++ \"b/\\303\\251.sql\"\t\n@@ -1 +1,2 @@\n a\n+b\n";
+        assert_eq!(parse(quoted).files[0].path, "\u{e9}.sql");
+    }
+
+    #[test]
     fn hunk_lines_that_contradict_the_header_counts_are_errors() {
         let extra_add = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,1 @@\n-x\n-y\n+z\n+w\n";
         assert!(matches!(
