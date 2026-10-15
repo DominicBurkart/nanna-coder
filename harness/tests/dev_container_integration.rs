@@ -426,10 +426,12 @@ async fn cargo_check_tool_succeeds_in_nanna_container() {
     let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
 
     let container_name = format!("nanna-cargo-check-test-{}", uuid::Uuid::new_v4());
-    let cargo_home = harness::workspace::container_cargo_home().expect("dev-container.toml parses");
+    let tmp_dir = harness::workspace::dev_container_paths()
+        .expect("dev-container.toml parses")
+        .tmp_dir;
     let additional_args = vec![
         format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display()),
-        format!("--tmpfs={cargo_home}:rw,mode=1777"),
+        format!("--tmpfs={tmp_dir}:rw,mode=1777"),
     ];
 
     let config = ContainerConfig {
