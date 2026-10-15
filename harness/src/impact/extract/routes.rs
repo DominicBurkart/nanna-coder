@@ -533,4 +533,16 @@ mod tests {
             [("a".to_string(), 1, 4), ("b".to_string(), 5, 5)]
         );
     }
+
+    #[test]
+    fn braces_in_line_comments_do_not_end_a_function_early() {
+        assert_eq!(
+            function_spans("fn a() {\n    // }\n    let x = 1;\n}\nfn b() {}\n"),
+            [("a".to_string(), 1, 4), ("b".to_string(), 5, 5)]
+        );
+        assert_eq!(
+            function_spans("fn a() {\n    // \" {\n    let x = 1;\n}\nfn b() {}\n"),
+            [("a".to_string(), 1, 4), ("b".to_string(), 5, 5)]
+        );
+    }
 }
