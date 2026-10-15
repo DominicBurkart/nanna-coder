@@ -1413,6 +1413,7 @@ fn action_subject_for(
         pr: None,
         environment: None,
         paths: identity.map_or_else(Vec::new, |identity| identity.scope.paths.clone()),
+        description: queued.description.clone(),
     }
 }
 
@@ -3091,6 +3092,7 @@ mod identity_tests {
         assert_eq!(subject.repo, "example/repo");
         assert_eq!(subject.branch.as_deref(), Some(queued.branch.as_str()));
         assert_eq!(subject.paths, identity.scope.paths);
+        assert_eq!(subject.description, queued.description);
         assert!(!subject.paths.is_empty());
         assert_eq!(subject.window, None);
     }

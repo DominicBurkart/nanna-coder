@@ -53,6 +53,7 @@ fn gated_registry(repo: &Path) -> ToolRegistry {
         pr: None,
         environment: None,
         paths: vec![],
+        description: String::new(),
     };
     create_tool_registry(repo).with_action_gate(gate, subject)
 }

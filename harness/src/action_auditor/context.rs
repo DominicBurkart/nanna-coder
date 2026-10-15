@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 ///     window: Some("business-hours"),
 ///     lease: LeaseContext { repo: "example/repo", pr: Some(7), ..LeaseContext::default() },
 ///     now: chrono::Utc::now(),
+///     task: "Fix the login bug",
 /// };
 /// assert_eq!(ctx.max_effect, EffectClass::Sandbox);
 /// assert_eq!(ctx.window, Some("business-hours"));
@@ -35,6 +36,8 @@ pub struct ActionContext<'a> {
     pub lease: LeaseContext<'a>,
     /// The instant window and lease checks are evaluated at.
     pub now: DateTime<Utc>,
+    /// The task description the calling agent was given, untrusted text.
+    pub task: &'a str,
 }
 
 #[cfg(test)]
@@ -54,6 +57,7 @@ mod tests {
             window: None,
             lease,
             now,
+            task: "",
         };
         assert_eq!(ctx.max_effect, EffectClass::Repository);
         assert_eq!(ctx.window, None);

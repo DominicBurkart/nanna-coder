@@ -100,6 +100,8 @@ pub struct ActionSubject {
     pub environment: Option<String>,
     /// Path globs the task edits.
     pub paths: Vec<String>,
+    /// The task description, shown to the reviewing model as untrusted text.
+    pub description: String,
 }
 
 pub struct ToolRegistry {
@@ -403,6 +405,7 @@ impl ToolRegistry {
                         paths: &subject.paths,
                     },
                     now: Utc::now(),
+                    task: &subject.description,
                 };
                 gate.run_gate(&review, &ctx).await
             }
@@ -5181,6 +5184,7 @@ mod tests {
             pr: None,
             environment: None,
             paths: vec![],
+            description: String::new(),
         }
     }
 

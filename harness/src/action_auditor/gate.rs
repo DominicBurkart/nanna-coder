@@ -102,6 +102,7 @@ impl fmt::Display for ActionDenied {
 ///     window: None,
 ///     lease: LeaseContext::default(),
 ///     now: chrono::Utc::now(),
+///     task: "",
 /// };
 /// let verdict = gate.run_gate(&review, &ctx).await;
 /// assert!(verdict.is_allow());
@@ -166,6 +167,7 @@ mod tests {
             window: None,
             lease: LeaseContext::default(),
             now: chrono::Utc::now(),
+            task: "",
         }
     }
 

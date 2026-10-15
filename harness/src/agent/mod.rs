@@ -1439,6 +1439,7 @@ mod tests {
             pr: None,
             environment: None,
             paths: vec![],
+            description: String::new(),
         };
         crate::tools::create_tool_registry(root).with_action_gate(gate, subject)
     }

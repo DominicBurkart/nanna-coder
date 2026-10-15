@@ -79,6 +79,7 @@ pub(crate) enum RuleOutcome {
 ///     window: None,
 ///     lease: LeaseContext::default(),
 ///     now: chrono::Utc::now(),
+///     task: "",
 /// };
 /// let verdict = rules.review_action(&review, &ctx).await.unwrap();
 /// assert_eq!(verdict.kind(), VerdictKind::Block);
@@ -351,6 +352,7 @@ pub(crate) mod tests {
             window,
             lease,
             now: open_monday(),
+            task: "",
         }
     }
 
