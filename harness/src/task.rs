@@ -37,14 +37,14 @@ pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 /// imported from here.
 const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
 
-/// Build the system prompt for a task run, appending any repo-level guidance
+/// Base task prompt plus any repo-level guidance
 /// discovered under the task's workspace path (closes #231).
 ///
 /// Precedence: `AGENTS.md` over `CLAUDE.md` (see
 /// [`crate::agent::agents_md::load`]). Missing files produce no injection;
 /// read errors are logged and swallowed so a broken guidance file never blocks
 /// a task from starting.
-fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+fn guidance_system_prompt(workspace_path: &std::path::Path) -> String {
     match crate::agent::agents_md::load(workspace_path) {
         Ok(Some(doc)) => {
             tracing::info!(
@@ -66,6 +66,26 @@ fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
                 "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
             );
             DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
+/// Build the system prompt for a task run: the repo-level guidance prompt
+/// (see [`guidance_system_prompt`]) followed, for a full-stack Rust workspace,
+/// by its topology paragraph (#643). A workspace whose manifests cannot be
+/// parsed is logged and gets no topology paragraph, like a broken guidance
+/// file.
+fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+    let prompt = guidance_system_prompt(workspace_path);
+    match crate::agent::project_prompt::topology_for_workspace(workspace_path) {
+        Ok(Some(topology)) => format!("{prompt}\n\n{topology}"),
+        Ok(None) => prompt,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to detect the full-stack topology for task; continuing without it"
+            );
+            prompt
         }
     }
 }
@@ -1981,6 +2001,65 @@ mod tests {
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
         assert!(prompt.contains("legacy rules"));
+    }
+
+    fn fullstack_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack")
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_includes_topology_for_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let prompt = build_task_system_prompt(&root);
+        let topology = crate::agent::project_prompt::topology_for_workspace(&root)
+            .unwrap()
+            .unwrap();
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.ends_with(&topology));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("`trunk build`"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_keeps_guidance_before_topology() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("cp")
+            .arg("-r")
+            .arg(format!("{}/.", fullstack_fixture().display()))
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        let guidance = prompt.find("<repo-guidance").unwrap();
+        let topology = prompt.find("full-stack Rust workspace").unwrap();
+        assert!(guidance < topology);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_omits_topology_for_plain_crate() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+        assert!(!prompt.contains("full-stack"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_survives_an_unparseable_workspace_manifest() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path());
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     /// Initialise a temporary directory as a git repo with a single initial
