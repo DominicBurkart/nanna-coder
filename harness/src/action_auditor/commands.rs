@@ -4522,4 +4522,20 @@ mod tests {
         blocked("'c'\"u\"\\r'l' x", "can send data");
         blocked("cu\\\nrl x", "can send data");
     }
+
+    #[test]
+    fn a_single_oversized_variable_value_is_refused_on_its_own() {
+        blocked(
+            &format!("a={}; echo $a", "x".repeat(5000)),
+            "variable value",
+        );
+    }
+
+    #[test]
+    fn repeated_expansion_of_a_large_variable_exhausts_the_work_budget() {
+        let mut script = format!("a={};", "y".repeat(4000));
+        script.push_str("echo ");
+        script.push_str(&"$a".repeat(100));
+        blocked(&script, "too large");
+    }
 }
