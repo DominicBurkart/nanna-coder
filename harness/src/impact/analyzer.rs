@@ -1,7 +1,7 @@
 use super::change::Change;
 use super::model::{Access, AssetId, BlastRadius, Evidence, Weight};
 use crate::assets::AssetGraph;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Everything an [`Extractor`] may consult besides the change itself.
 pub struct ExtractContext<'a> {
@@ -240,14 +240,23 @@ fn downstream_depths(graph: &AssetGraph, touched: &BTreeSet<AssetId>) -> BTreeMa
         }
     }
     let mut depths: BTreeMap<AssetId, u32> = BTreeMap::new();
-    let mut queue: VecDeque<(&str, u32)> = touched.iter().map(|name| (name.as_str(), 0)).collect();
-    while let Some((current, depth)) = queue.pop_front() {
-        for &reader in readers.get(current).into_iter().flatten() {
-            if !touched.contains(reader) && !depths.contains_key(reader) {
-                depths.insert(reader.to_string(), depth + 1);
-                queue.push_back((reader, depth + 1));
+    let mut frontier: BTreeSet<&str> = touched.iter().map(String::as_str).collect();
+    for depth in 1..=graph.assets().count() as u32 {
+        let mut next: BTreeSet<&str> = BTreeSet::new();
+        for current in &frontier {
+            for &reader in readers.get(current).into_iter().flatten() {
+                if !touched.contains(reader) && !depths.contains_key(reader) {
+                    next.insert(reader);
+                }
             }
         }
+        if next.is_empty() {
+            break;
+        }
+        for &reader in &next {
+            depths.insert(reader.to_string(), depth);
+        }
+        frontier = next;
     }
     depths
 }
