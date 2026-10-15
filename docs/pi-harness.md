@@ -281,10 +281,10 @@ reference it when this stack merges.
 First reported by the reviewer's verification pass (pi 1.2.0 installed with
 `--ignore-scripts` in a throwaway directory and run on the host; that evidence
 is not in this repository), then reproduced and extended inside a container:
-`node:24-slim` (digest in `docs/pi-spike/logs/01-image-digest.txt`), pi installed
+`node:24-slim` (digest in `docs/pi-spike/evidence/01-image-digest.txt`), pi installed
 with `npm install --ignore-scripts --save-exact @earendil-works/pi-coding-agent@1.2.0`,
 `--network none`, driven over RPC with the adapter's exact flags and files
-against a mock gateway and broker. The scripts, raw logs and checksums are in
+against a mock gateway and broker. The scripts, raw evidence and checksums are in
 `docs/pi-spike/`. 1.2.0 is the npm `latest` dist-tag, so the pin stays.
 
 Confirmed:

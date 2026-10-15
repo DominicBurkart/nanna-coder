@@ -1,11 +1,11 @@
 # Real-pi spike (container), 2026-10-15
 
-Evidence for the pi harness work, kept in the repository so it outlives `/var/tmp`. Raw logs: `logs/<scenario>/`; checksums in `SHA256SUMS`. The scripts were run from `/var/tmp/nanna-pi-spike` (they hard-code that path); `scripts/nanna-capabilities.ts` is a copy of the extension in `harness/src/harness_adapter/pi_extension.rs` as of this run and is not kept in sync.
+Evidence for the pi harness work, kept in the repository so it outlives `/var/tmp`. Raw logs, copied out of the git-ignored `logs/` directory the scripts write to: `evidence/<scenario>/`; checksums in `SHA256SUMS`. The scripts were run from `/var/tmp/nanna-pi-spike` (they hard-code that path); `scripts/nanna-capabilities.ts` is a copy of the extension in `harness/src/harness_adapter/pi_extension.rs` as of this run and is not kept in sync.
 
 ## Setup (exact)
 - Image: `docker.io/library/node:24-slim`, digest `sha256:ec857ea6bb60cb3d0fa4d97495590c5fe7d51be8572c307b55957eeb06569cf7`, Node v24.22.0, npm 11.19.1.
 - Package: `@earendil-works/pi-coding-agent`, npm `latest` dist-tag = **1.2.0** (also `legacy-node20` = 0.74.2). Engines: node >=22.19.0. License MIT.
-- Install (in the container): `npm install --ignore-scripts --save-exact @earendil-works/pi-coding-agent@1.2.0` (see `logs/01-install-command.txt`). `pi --version` printed `1.2.0`.
+- Install (in the container): `npm install --ignore-scripts --save-exact @earendil-works/pi-coding-agent@1.2.0` (see `evidence/01-install-command.txt`). `pi --version` printed `1.2.0`.
 - Runs: `podman run --rm --network none`, pi driven over `--mode rpc` with the adapter's exact flags and files (generated from `harness_adapter` sources: the extension from `pi_extension.rs`, argv from the pinned `pi_argv_is_pinned_exactly`). A mock OpenAI-compatible gateway (`scripts/gateway.js`) and a mock broker (`scripts/broker.js`) ran inside the same container on loopback / a unix socket. Container ran as (rootless-mapped) root; non-root hardening is untested.
 - Scripts: `scripts/{gateway.js,broker.js,run.js,prepare.sh,scenario.sh}`.
 
