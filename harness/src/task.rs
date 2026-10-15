@@ -3968,7 +3968,7 @@ mod impact_tests {
     #[tokio::test]
     async fn test_unreadable_workspace_changes_fail_a_scored_task() {
         let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
-        let (_, task) = run(repo.path(), vec![write_file("sub/.GIT/x", "unindexable")]).await;
+        let (_, task) = run(repo.path(), vec![write_file("git~1/config", "unindexable")]).await;
         let (error_type, error) = failure(&task);
         assert_eq!(error_type, "ImpactError");
         assert!(

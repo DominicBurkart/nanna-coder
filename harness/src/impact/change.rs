@@ -953,6 +953,7 @@ mod tests {
         assert_eq!(change.files[0].content.as_deref(), Some("memory"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_content_surfaces_unreadable_files() {
         let dir = tempfile::tempdir().unwrap();

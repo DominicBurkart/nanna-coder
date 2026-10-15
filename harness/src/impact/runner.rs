@@ -737,6 +737,7 @@ mod tests {
         assert!(error.to_string().starts_with("malformed diff: "));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_changed_file_that_cannot_be_read_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
