@@ -611,6 +611,66 @@ pub(crate) mod tests {
         assert_eq!(verdict.kind(), VerdictKind::Escalate);
     }
 
+    struct UnreleasableStore(InMemoryLeaseStore);
+
+    impl LeaseStore for UnreleasableStore {
+        fn acquire(
+            &self,
+            name: &leases::LeaseName,
+            holder: &str,
+            ttl: Duration,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<leases::Lease, leases::LeaseError> {
+            self.0.acquire(name, holder, ttl, now)
+        }
+
+        fn renew(
+            &self,
+            lease: &leases::Lease,
+            ttl: Duration,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<leases::Lease, leases::LeaseError> {
+            self.0.renew(lease, ttl, now)
+        }
+
+        fn release(&self, lease: &leases::Lease) -> Result<(), leases::LeaseError> {
+            Err(leases::LeaseError::NotHeld {
+                name: lease.name.clone(),
+            })
+        }
+
+        fn release_all(&self, holder: &str) -> Result<Vec<leases::Lease>, leases::LeaseError> {
+            self.0.release_all(holder)
+        }
+
+        fn expired(
+            &self,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<Vec<leases::Lease>, leases::LeaseError> {
+            self.0.expired(now)
+        }
+
+        fn snapshot(&self) -> Result<Vec<leases::Lease>, leases::LeaseError> {
+            self.0.snapshot()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_does_not_change_the_refusal() {
+        let store = Arc::new(UnreleasableStore(InMemoryLeaseStore::default()));
+        let rules = RuleActionAuditor::new(windows(), store.clone(), Duration::minutes(10));
+        let review = review("sandbox_deploy", EffectClass::Sandbox);
+        let lease = LeaseContext {
+            repo: "example/repo",
+            pr: Some(7),
+            ..LeaseContext::default()
+        };
+        let context = ctx(EffectClass::Sandbox, Some("business-hours"), lease);
+        let verdict = rules.review_action(&review, &context).await.unwrap();
+        assert_eq!(verdict.kind(), VerdictKind::Escalate);
+        assert!(!store.snapshot().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_bare_rule_escalation_releases_the_lease_it_took() {
         let store = Arc::new(InMemoryLeaseStore::default());
