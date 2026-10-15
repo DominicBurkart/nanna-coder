@@ -3949,6 +3949,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gate_on_a_read_only_unscoped_registry_adds_no_reach_and_keeps_the_label() {
+        let (auditor, gate) = counting_gate();
+        let registry = create_tool_registry(Path::new("."))
+            .read_only_unscoped()
+            .with_action_gate(gate, subject(EffectClass::None));
+        let err = registry
+            .execute("github_pr_status", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ScopeDenied(_)), "{err:?}");
+        assert_eq!(auditor.calls(), 0);
+        assert!(registry.action_reviews().is_empty());
+        assert_eq!(
+            registry.denials()[0].identity,
+            crate::scope::UNSCOPED_IDENTITY
+        );
+        assert!(registry
+            .execute("echo", json!({"message": "hi"}))
+            .await
+            .is_ok());
+        assert_eq!(auditor.calls(), 0);
+    }
+
+    #[tokio::test]
     async fn path_denials_raised_by_tools_are_recorded_on_the_registry() {
         let ws = scoped_workspace();
         let identity = identity_with(EffectClass::Workspace, &["write_file", "read_file"]);
