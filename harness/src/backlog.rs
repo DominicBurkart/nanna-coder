@@ -81,6 +81,12 @@ pub enum BacklogError {
         task: Option<String>,
         audited: String,
     },
+    #[error(
+        "backlog task names identity `{identity}`, which is not registered; refusing to enqueue"
+    )]
+    UnresolvedIdentity { identity: String },
+    #[error("backlog task names no identity; refusing to enqueue")]
+    MissingIdentity,
 }
 
 fn ensure_audited(task: &QueuedTask, proof: &Allowed) -> Result<(), BacklogError> {
@@ -277,7 +283,7 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 /// let auditor = catalog.get("auditor").unwrap().clone();
 /// let context = AuditContext::new(catalog, auditor).unwrap();
 /// let gate = SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context);
-/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default()), ["sdlc-dev".to_string()]).unwrap();
 /// let config = BacklogConfig {
 ///     sources: vec![BacklogSource {
 ///         repo: "owner/name".into(),
@@ -383,16 +389,40 @@ pub async fn backlog_sync(
 /// Sink that writes straight into a [`QueueStore`], for a process that does
 /// not run a [`TaskManager`] (the `backlog-sync` CLI). The running manager
 /// picks the entries up when it is next restored from the same store.
+///
+/// Only tasks whose `identity_hint` names one of the identities given to
+/// [`StoreSink::open`] are written; any other hint, or none, is refused.
 pub struct StoreSink {
     store: Box<dyn QueueStore>,
     queue: Mutex<TaskQueue>,
+    identities: HashSet<String>,
 }
 
 impl StoreSink {
-    /// Load the current queue from `store`.
-    pub fn open(store: Box<dyn QueueStore>) -> Result<Self, QueueStoreError> {
+    /// Load the current queue from `store`, accepting only tasks hinting one
+    /// of `identities`.
+    pub fn open(
+        store: Box<dyn QueueStore>,
+        identities: impl IntoIterator<Item = String>,
+    ) -> Result<Self, QueueStoreError> {
         let queue = Mutex::new(TaskQueue::from_entries(store.load()?));
-        Ok(Self { store, queue })
+        Ok(Self {
+            store,
+            queue,
+            identities: identities.into_iter().collect(),
+        })
+    }
+}
+
+fn hinted_identity(task: &QueuedTask) -> Result<&str, BacklogError> {
+    task.identity_hint
+        .as_deref()
+        .ok_or(BacklogError::MissingIdentity)
+}
+
+fn unresolved_identity(name: &str) -> BacklogError {
+    BacklogError::UnresolvedIdentity {
+        identity: name.to_string(),
     }
 }
 
@@ -413,6 +443,10 @@ impl BacklogSink for StoreSink {
     }
 
     async fn enqueue(&self, task: QueuedTask, proof: &Allowed) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.identities.contains(hint) {
+            return Err(unresolved_identity(hint));
+        }
         ensure_audited(&task, proof)?;
         let mut queue = self.queue.lock().await;
         let stored = queue.push(task);
@@ -450,6 +484,10 @@ impl BacklogSink for ManagerSink {
     }
 
     async fn enqueue(&self, task: QueuedTask, proof: &Allowed) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.manager.has_identity(hint).await {
+            return Err(unresolved_identity(hint));
+        }
         ensure_audited(&task, proof)?;
         self.manager
             .submit_task(task, Arc::clone(&self.provider))
@@ -752,7 +790,7 @@ mod tests {
             issue(2),
         ]);
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let gate = fixture_gate();
         let cfg = config(vec![source("o/n", "/repo")], None);
         let report = backlog_sync(&github, &sink, &cfg, &gate).await.unwrap();
@@ -816,7 +854,7 @@ mod tests {
             "Deploy build 42 to the production environment.",
         )]);
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let gate = fixture_gate();
         let cfg = config(vec![source("o/n", "/repo")], None);
         let report = backlog_sync(&github, &sink, &cfg, &gate).await.unwrap();
@@ -836,7 +874,7 @@ mod tests {
     async fn a_ci_issue_is_blocked_on_the_derived_loop_through_the_real_path() {
         let github = github_with(vec![issue_with(1, "Re-run CI on the PR.")]);
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let gate = fixture_gate();
         let cfg = config(vec![source("o/n", "/repo")], None);
         let report = backlog_sync(&github, &sink, &cfg, &gate).await.unwrap();
@@ -868,7 +906,7 @@ mod tests {
             "Deploy build 42 to the production environment.",
         )]);
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let mut deploy_source = source("o/n", "/repo");
         deploy_source.identity = "deployer".to_string();
         let cfg = config(vec![deploy_source], None);
@@ -887,7 +925,7 @@ mod tests {
     async fn an_unknown_identity_or_audit_failure_refuses_fail_closed() {
         let github = github_with(vec![issue(1)]);
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let mut ghost = source("o/n", "/repo");
         ghost.identity = "ghost".to_string();
         let report = backlog_sync(&github, &sink, &config(vec![ghost], None), &fixture_gate())
@@ -914,20 +952,25 @@ mod tests {
 
     #[tokio::test]
     async fn sinks_refuse_a_task_that_does_not_match_the_audited_identity() {
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink = StoreSink::open(
+            Box::new(InMemoryQueueStore::default()),
+            ["rust-implementer".to_string(), "deployer".to_string()],
+        )
+        .unwrap();
         let other = QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1)
             .with_identity_hint(Some("deployer".to_string()));
         let err = sink.enqueue(other, &proof().await).await.unwrap_err();
         assert!(matches!(err, BacklogError::ProofMismatch { .. }));
         let unhinted = QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1);
-        assert!(sink.enqueue(unhinted, &proof().await).await.is_err());
+        let err = sink.enqueue(unhinted, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity));
         assert!(sink.known().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn sinks_refuse_a_proof_for_a_different_task_of_the_same_identity() {
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store)).unwrap();
+        let sink = StoreSink::open(Box::new(store), known_identities()).unwrap();
         let task_b = task_for("Delete every branch.", PROOF_REPO, "/r");
         let err = sink.enqueue(task_b, &proof().await).await.unwrap_err();
         assert!(matches!(err, BacklogError::SubtaskMismatch));
@@ -936,7 +979,8 @@ mod tests {
 
     #[tokio::test]
     async fn sinks_refuse_a_proof_for_a_different_repository() {
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         let elsewhere = task_for(PROOF_SUBTASK, "github.com/example/other", "/r");
         let err = sink.enqueue(elsewhere, &proof().await).await.unwrap_err();
         assert!(matches!(err, BacklogError::RepoMismatch { .. }));
@@ -952,7 +996,8 @@ mod tests {
 
     #[tokio::test]
     async fn sinks_accept_a_task_matching_the_proof() {
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         sink.enqueue(audited_task("/r"), &proof().await)
             .await
             .unwrap();
@@ -966,7 +1011,7 @@ mod tests {
             pulls: HashMap::new(),
         };
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let cfg = config(vec![source("o/n", "/repo")], None);
 
         let report = backlog_sync(&github, &sink, &cfg, &fixture_gate())
@@ -992,7 +1037,7 @@ mod tests {
         assert_eq!(again.duplicates, 2);
         assert_eq!(store.load().unwrap().len(), 2);
 
-        let reopened = StoreSink::open(Box::new(store.clone())).unwrap();
+        let reopened = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let third = backlog_sync(&github, &reopened, &cfg, &fixture_gate())
             .await
             .unwrap();
@@ -1021,7 +1066,8 @@ mod tests {
                 ],
             )]),
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         let report = backlog_sync(
             &github,
             &sink,
@@ -1044,7 +1090,8 @@ mod tests {
             ]),
             pulls: HashMap::new(),
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         sink.enqueue(audited_task("/a"), &proof().await)
             .await
             .unwrap();
@@ -1073,6 +1120,106 @@ mod tests {
         assert_eq!(sink.known().await.unwrap().len(), 4);
     }
 
+    fn known_identities() -> Vec<String> {
+        vec!["rust-implementer".to_string()]
+    }
+
+    fn registered_identity() -> crate::identity::AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.identity.name = "rust-implementer".to_string();
+        identity
+    }
+
+    struct SilentProvider;
+
+    #[async_trait]
+    impl ModelProvider for SilentProvider {
+        async fn chat(
+            &self,
+            _request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            Err(model::provider::ModelError::Unknown {
+                message: "unused".to_string(),
+            })
+        }
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "silent"
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_an_unregistered_identity_hint_and_queues_nothing() {
+        let manager = Arc::new(TaskManager::new(0));
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+        };
+        let cfg = config(vec![source("o/n", "/repo")], None);
+        let err = backlog_sync(&github, &sink, &cfg, &fixture_gate())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "rust-implementer"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("rust-implementer"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_sink_refuses_unresolved_and_missing_identity_hints_and_stores_nothing() {
+        let store = InMemoryQueueStore::default();
+        let sink = StoreSink::open(Box::new(store.clone()), vec!["sdlc-dev".to_string()]).unwrap();
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+        };
+        let err = backlog_sync(
+            &github,
+            &sink,
+            &config(vec![source("o/n", "/repo")], None),
+            &fixture_gate(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "rust-implementer"),
+            "{err}"
+        );
+        let err = sink
+            .enqueue(
+                QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1),
+                &proof().await,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_task_with_no_identity_hint() {
+        let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(registered_identity()).await;
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let err = sink
+            .enqueue(
+                QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1),
+                &proof().await,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
     #[tokio::test]
     async fn manager_sink_submits_and_reports_pending_tasks() {
         use crate::task::TaskStatus;
@@ -1099,6 +1246,7 @@ mod tests {
         }
 
         let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(registered_identity()).await;
         let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(NoProvider));
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
@@ -1144,10 +1292,11 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(StoreSink::open(Box::new(Broken)).is_err());
+        assert!(StoreSink::open(Box::new(Broken), known_identities()).is_err());
         let sink = StoreSink {
             store: Box::new(Broken),
             queue: Mutex::new(TaskQueue::new()),
+            identities: known_identities().into_iter().collect(),
         };
         let err = sink
             .enqueue(audited_task("/r"), &proof().await)

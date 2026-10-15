@@ -571,6 +571,13 @@ impl TaskManager {
     }
 
     /// Submit a task that runs as soon as a slot is free.
+    ///
+    /// The task carries no identity, so it fails closed: it runs with the
+    /// read-only (`EffectClass::None`) tools and a network-less container,
+    /// and any call to an effectful tool is refused and recorded as a
+    /// [`crate::scope::ScopeDenial`]. To run effectful work, submit under a
+    /// named, registered identity with [`TaskManager::submit_with_identity`]
+    /// or a hinted [`TaskManager::submit_task`].
     #[cfg(test)]
     pub(crate) async fn submit(
         &self,
@@ -596,6 +603,12 @@ impl TaskManager {
             .write()
             .await
             .insert(identity.name().to_string(), identity);
+    }
+
+    /// Whether an identity named `name` is registered, so a task hinting it
+    /// can be dispatched.
+    pub async fn has_identity(&self, name: &str) -> bool {
+        self.runner.identities.read().await.contains_key(name)
     }
 
     /// Register every identity of `catalog`; see
@@ -660,7 +673,8 @@ impl TaskManager {
     /// [`TaskWorkspace::build_tool_registry_for`] the identity, a dev
     /// container gets [`NetworkPolicy::for_ceiling`] of its `scope.max_effect`,
     /// and the target repository must be in its `scope.repos`. Without an
-    /// identity this is exactly [`TaskManager::submit`].
+    /// identity this is exactly [`TaskManager::submit`]: read-only and
+    /// network-less.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_with_identity(
         &self,
@@ -1193,11 +1207,11 @@ impl TaskRunner {
 }
 
 /// The network policy a task's dev container gets: the identity's ceiling
-/// when running under one, otherwise the runtime default.
+/// when running under one, otherwise the ceiling of an unscoped task.
 fn network_policy_for(identity: Option<&AgentIdentity>) -> NetworkPolicy {
     match identity {
         Some(identity) => NetworkPolicy::for_ceiling(identity.scope.max_effect),
-        None => NetworkPolicy::Enabled,
+        None => NetworkPolicy::for_ceiling(EffectClass::None),
     }
 }
 
@@ -1207,7 +1221,7 @@ fn registry_for(
 ) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
     match identity {
         Some(identity) => workspace.build_tool_registry_for(identity),
-        None => Ok(workspace.build_tool_registry()),
+        None => Ok(workspace.build_tool_registry().read_only_unscoped()),
     }
 }
 
@@ -1290,8 +1304,32 @@ mod tests {
             model::OllamaProvider::new(ollama_config).expect("failed to create provider");
         let provider: Arc<dyn ModelProvider> = Arc::new(provider);
 
+        let identity = crate::identity::AgentIdentity::from_toml_str(
+            r#"
+[identity]
+name = "dev-container-e2e"
+description = "Edits the example repository inside its dev container."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Edit the repository." }
+
+[scope]
+repos = ["DominicBurkart/nanna-coder"]
+paths = []
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "run_command"]
+
+[limits]
+max_iterations = 32
+max_wall_clock_secs = 600
+max_concurrent = 1
+"#,
+            "dev-container-e2e.toml",
+        )
+        .expect("e2e identity must parse");
+
         let task_id = manager
-            .submit(
+            .submit_with_identity(
                 "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
                     .to_string(),
                 repo_path,
@@ -1299,6 +1337,7 @@ mod tests {
                 "gemma4:e4b".to_string(),
                 32,
                 provider,
+                Some(identity),
             )
             .await;
 
@@ -2963,7 +3002,7 @@ mod identity_tests {
 
     #[test]
     fn test_network_policy_follows_the_identity_ceiling() {
-        assert_eq!(network_policy_for(None), NetworkPolicy::Enabled);
+        assert_eq!(network_policy_for(None), NetworkPolicy::Disabled);
         let mut identity = scoped_identity();
         assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Disabled);
         identity.scope.max_effect = EffectClass::Repository;
@@ -3264,12 +3303,17 @@ mod identity_tests {
     }
 
     #[tokio::test]
-    async fn test_submit_with_no_identity_runs_unscoped() {
+    async fn test_submit_with_no_identity_runs_read_only_and_denies_effectful_tools() {
         let repo = git_repo();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(
-            wrap_with_state_machine_responses(vec![stop_response("done")]),
-        );
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": "api/new.rs", "content": "ok"}),
+                ),
+                stop_response("done"),
+            ]));
         let id = manager
             .submit_with_identity(
                 "Test".to_string(),
@@ -3279,6 +3323,42 @@ mod identity_tests {
                 20,
                 provider,
                 None,
+            )
+            .await;
+        let task = wait_for(&manager, &id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&id).await.unwrap();
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert!(matches!(
+            result.denials[0].reason,
+            crate::scope::DenialReason::ToolNotInScope
+        ));
+        assert!(result.files_modified.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unscoped_task_may_still_call_read_only_tools() {
+        let repo = git_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("read_file", serde_json::json!({"path": "README.md"})),
+                stop_response("done"),
+            ]));
+        let id = manager
+            .submit(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
             )
             .await;
         let task = wait_for(&manager, &id, terminal).await;
