@@ -124,12 +124,16 @@ mod fake {
         }
     }
 
+    fn apply_restore(name: &std::ffi::OsStr, action: PathRestore) {
+        match action {
+            PathRestore::Set(value) => std::env::set_var(name, value),
+            PathRestore::Remove => std::env::remove_var(name),
+        }
+    }
+
     impl Drop for FakePodman {
         fn drop(&mut self) {
-            match restore_action(self.old_path.clone()) {
-                PathRestore::Set(old) => std::env::set_var("PATH", old),
-                PathRestore::Remove => std::env::remove_var("PATH"),
-            }
+            apply_restore("PATH".as_ref(), restore_action(self.old_path.clone()));
         }
     }
 
@@ -140,6 +144,29 @@ mod fake {
         #[test]
         fn restore_action_removes_an_originally_absent_path() {
             assert_eq!(restore_action(None), PathRestore::Remove);
+        }
+
+        fn unique_var() -> OsString {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            OsString::from(format!("NANNA_TEST_RESTORE_{}_{n}", std::process::id()))
+        }
+
+        #[test]
+        fn apply_restore_set_assigns_the_value() {
+            let name = unique_var();
+            apply_restore(&name, PathRestore::Set(OsString::from("v1")));
+            let got = std::env::var_os(&name);
+            std::env::remove_var(&name);
+            assert_eq!(got, Some(OsString::from("v1")));
+        }
+
+        #[test]
+        fn apply_restore_remove_unsets_the_variable() {
+            let name = unique_var();
+            std::env::set_var(&name, "present");
+            apply_restore(&name, PathRestore::Remove);
+            assert_eq!(std::env::var_os(&name), None);
         }
 
         #[test]
