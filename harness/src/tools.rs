@@ -224,6 +224,25 @@ impl ToolRegistry {
         self
     }
 
+    /// Fail closed for a task that carries no identity: keep only tools whose
+    /// effect class is [`EffectClass::None`] and attribute every refused call
+    /// to [`crate::scope::UNSCOPED_IDENTITY`], so a call to an effectful tool
+    /// is denied and recorded instead of executing.
+    ///
+    /// ```
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new(".")).read_only_unscoped();
+    /// assert!(registry.get_tool("read_file").is_some());
+    /// assert!(registry.get_tool("write_file").is_none());
+    /// assert_eq!(registry.identity(), Some(harness::scope::UNSCOPED_IDENTITY));
+    /// ```
+    pub fn read_only_unscoped(mut self) -> Self {
+        self.retain_at_most(EffectClass::None);
+        self.identity = Some(crate::scope::UNSCOPED_IDENTITY.to_string());
+        self
+    }
+
     /// Name of the identity this registry is scoped to, if any.
     pub fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
@@ -3907,6 +3926,26 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
         assert_eq!(registry.denial_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_only_unscoped_registry_denies_effectful_tools_and_records_them() {
+        let registry = create_tool_registry(Path::new(".")).read_only_unscoped();
+        assert_eq!(registry.identity(), Some(crate::scope::UNSCOPED_IDENTITY));
+        assert!(registry
+            .at_most(EffectClass::Production)
+            .iter()
+            .all(|tool| tool.effect_class() == EffectClass::None));
+        let err = registry
+            .execute("write_file", json!({"path": "x", "content": "y"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ScopeDenied(_)), "{err:?}");
+        let denials = registry.denials();
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert_eq!(denials[0].tool, "write_file");
+        assert!(matches!(denials[0].reason, DenialReason::ToolNotInScope));
     }
 
     #[tokio::test]
