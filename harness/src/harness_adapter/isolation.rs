@@ -22,6 +22,14 @@ const ALLOWED_ENV: [(&str, &str); 4] = [
 /// A way a plan breaks the isolation contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IsolationViolation {
+    /// The plan names a different agent than the one it was built for.
+    #[error("plan agent `{plan}` differs from the agent `{agent}`")]
+    AgentChanged {
+        /// Agent name in the plan.
+        plan: String,
+        /// Agent the plan was built for.
+        agent: String,
+    },
     /// The plan starts from a different image than the agent was resolved for.
     #[error("plan image `{plan}` differs from the agent image `{agent}`")]
     Image {
@@ -119,6 +127,12 @@ impl IsolationPolicy {
             if !pinned || !seen_env.insert(name.clone()) {
                 found.push(IsolationViolation::EnvNotAllowed { name: name.clone() });
             }
+        }
+        if plan.agent != agent.name() {
+            found.push(IsolationViolation::AgentChanged {
+                plan: plan.agent.clone(),
+                agent: agent.name().to_string(),
+            });
         }
         if plan.image != agent.image() {
             found.push(IsolationViolation::Image {

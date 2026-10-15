@@ -1,4 +1,7 @@
-use super::testing::{allowed_for, allowed_from_dir, scoped};
+use super::testing::{
+    allowed_for, allowed_for_repo, allowed_from_dir, base_registry, calls, fail_with, ok_with,
+    scoped, Behavior, Counters,
+};
 use super::*;
 use crate::identity::AgentIdentity;
 use proptest::prelude::*;
@@ -13,6 +16,8 @@ struct Card<'a> {
     read_paths: &'a str,
     effect: &'a str,
     tools: &'a str,
+    iterations: &'a str,
+    repos: &'a str,
 }
 
 impl<'a> Card<'a> {
@@ -24,6 +29,8 @@ impl<'a> Card<'a> {
             read_paths: "",
             effect,
             tools,
+            iterations: "7",
+            repos: "[\"r\"]",
         }
     }
 
@@ -37,17 +44,24 @@ loop = "inner"
 model = "{}"
 system_prompt = {{ inline = "Be careful." }}
 [scope]
-repos = ["r"]
+repos = {}
 paths = {}
 {}
 max_effect = "{}"
 tools = [{}]
 [limits]
-max_iterations = 7
+max_iterations = {}
 max_wall_clock_secs = 9
 max_concurrent = 2
 "#,
-            self.name, self.model, self.paths, self.read_paths, self.effect, self.tools
+            self.name,
+            self.model,
+            self.repos,
+            self.paths,
+            self.read_paths,
+            self.effect,
+            self.tools,
+            self.iterations
         );
         AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
     }
@@ -1115,4 +1129,699 @@ fn capability_names_may_not_contain_uppercase_after_the_first_character() {
         let err = PiAdapter.plan(&a).unwrap_err();
         assert!(matches!(err, Unsupported::CapabilityName { .. }), "{name}");
     }
+}
+
+fn specs_of(tools: &[(&str, EffectClass, Behavior)]) -> Vec<CapabilitySpec> {
+    tools
+        .iter()
+        .map(|(n, e, _)| {
+            CapabilitySpec::new(
+                *n,
+                format!("{n} tool"),
+                serde_json::json!({"type": "object"}),
+                *e,
+            )
+        })
+        .collect()
+}
+
+struct Rig {
+    broker: Broker,
+    counters: Counters,
+    plan: CheckedPlan,
+    allowed: crate::auditor::Allowed,
+    agent: ResolvedAgent,
+}
+
+impl Rig {
+    fn reported(&self) -> Vec<String> {
+        self.plan.exposed_capabilities.clone()
+    }
+
+    fn arm(&self) {
+        self.broker.arm(&self.plan, &self.reported()).unwrap();
+    }
+}
+
+fn rig_with(card: &Card, tools: Vec<(&str, EffectClass, Behavior)>, policy: BrokerPolicy) -> Rig {
+    let identity = card.identity();
+    let allowed = allowed_for(&identity);
+    let grant = scoped(allowed.identity(), &specs_of(&tools));
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let plan = launch_plan(&PiAdapter, &agent).unwrap();
+    let (registry, counters) = base_registry(tools);
+    let broker =
+        Broker::for_agent(&allowed, &agent, policy, |id| Ok(registry.scoped_for(id))).unwrap();
+    Rig {
+        broker,
+        counters,
+        plan,
+        allowed,
+        agent,
+    }
+}
+
+fn rig(tools: Vec<(&str, EffectClass, Behavior)>) -> Rig {
+    rig_with(
+        &Card::new("\"*\"", "workspace"),
+        tools,
+        BrokerPolicy::default(),
+    )
+}
+
+fn req(tool: &str) -> BrokerRequest {
+    BrokerRequest {
+        tool: tool.to_string(),
+        args: serde_json::json!({"k": 1}),
+    }
+}
+
+fn tool_error_kind(outcome: &BrokerOutcome) -> Option<ToolErrorKind> {
+    match outcome {
+        BrokerOutcome::ToolError { kind, .. } => Some(*kind),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn an_unarmed_broker_refuses_every_call() {
+    let r = rig(vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!("body")),
+    )]);
+    assert!(!r.broker.is_armed());
+    let outcome = r.broker.handle(req("read_file")).await;
+    assert_eq!(tool_error_kind(&outcome), Some(ToolErrorKind::NotReady));
+    assert_eq!(calls(&r.counters, "read_file"), 0);
+    assert_eq!(
+        r.broker.audit()[0].outcome,
+        AuditOutcome::Error(ToolErrorKind::NotReady)
+    );
+}
+
+#[tokio::test]
+async fn arming_requires_the_runtime_to_report_exactly_the_planned_tools() {
+    let r = rig(vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(1)),
+        ),
+        ("search", EffectClass::None, ok_with(serde_json::json!(2))),
+    ]);
+    let extra = vec![
+        "read_file".to_string(),
+        "search".to_string(),
+        "bash".to_string(),
+    ];
+    let err = r.broker.arm(&r.plan, &extra).unwrap_err();
+    assert!(matches!(err, ArmError::Handshake(_)));
+    assert!(err.to_string().contains("bash"));
+    let missing = vec!["read_file".to_string()];
+    assert!(matches!(
+        r.broker.arm(&r.plan, &missing),
+        Err(ArmError::Handshake(_))
+    ));
+    assert!(!r.broker.is_armed());
+    let refused = r.broker.handle(req("read_file")).await;
+    assert_eq!(tool_error_kind(&refused), Some(ToolErrorKind::NotReady));
+    assert_eq!(r.broker.arm(&r.plan, &r.reported()).unwrap(), ());
+    assert!(r.broker.is_armed());
+    let served = r.broker.handle(req("read_file")).await;
+    assert_eq!(served, BrokerOutcome::Output(serde_json::json!(1)));
+}
+
+#[test]
+fn arming_refuses_a_plan_built_for_another_agent_or_task() {
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(1)),
+        )]
+    };
+    let r = rig(tools());
+    let plan_for = |card: &Card, repo: &str, socket: &str| {
+        let identity = card.identity();
+        let allowed = allowed_for_repo(&identity, repo);
+        let grant = scoped(allowed.identity(), &specs_of(&tools()));
+        let agent =
+            ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", socket.into())
+                .unwrap();
+        launch_plan(&PiAdapter, &agent).unwrap()
+    };
+    let names = r.reported();
+    let base = Card::new("\"*\"", "workspace");
+    let other_agent = Card {
+        name: "other",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let other_limits = Card {
+        iterations: "8",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let cases: [(&str, CheckedPlan); 4] = [
+        (
+            "agent",
+            plan_for(&other_agent, "github.com/example/repo", SOCKET),
+        ),
+        (
+            "audited repository",
+            plan_for(&base, "github.com/example/other", SOCKET),
+        ),
+        (
+            "limits",
+            plan_for(&other_limits, "github.com/example/repo", SOCKET),
+        ),
+        (
+            "broker socket",
+            plan_for(&base, "github.com/example/repo", "/run/nanna/other.sock"),
+        ),
+    ];
+    for (field, plan) in cases {
+        let err = r.broker.arm(&plan, &names).unwrap_err();
+        assert!(
+            matches!(err, ArmError::PlanMismatch { field: f } if f == field),
+            "{field}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("plan does not belong to this broker: {field} differs")
+        );
+    }
+    assert!(!r.broker.is_armed());
+    assert!(r
+        .broker
+        .arm(&plan_for(&base, "github.com/example/repo", SOCKET), &names)
+        .is_ok());
+}
+
+#[test]
+fn a_plan_exposing_capabilities_above_the_policy_cannot_arm() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(0)),
+            ),
+            (
+                "git_push",
+                EffectClass::Repository,
+                ok_with(serde_json::json!(1)),
+            ),
+            ("trigger_ci", EffectClass::Ci, ok_with(serde_json::json!(2))),
+            (
+                "deploy_prod",
+                EffectClass::Production,
+                ok_with(serde_json::json!(3)),
+            ),
+        ]
+    };
+    for (ceiling, unserved) in [
+        ("repository", vec!["git_push"]),
+        ("ci", vec!["git_push", "trigger_ci"]),
+        ("production", vec!["deploy_prod", "git_push", "trigger_ci"]),
+    ] {
+        let r = rig_with(
+            &Card::new("\"*\"", ceiling),
+            tools(),
+            BrokerPolicy::default(),
+        );
+        assert_eq!(r.broker.served(), vec!["read_file"], "{ceiling}");
+        let err = r.broker.arm(&r.plan, &r.reported()).unwrap_err();
+        match err {
+            ArmError::ExposedNotServed { names } => assert_eq!(names, unserved, "{ceiling}"),
+            other => panic!("{ceiling}: {other:?}"),
+        }
+        assert!(!r.broker.is_armed(), "{ceiling}");
+        assert_eq!(calls(&r.counters, "git_push"), 0);
+    }
+    let r = rig_with(
+        &Card::new("\"*\"", "ci"),
+        tools(),
+        BrokerPolicy::new(EffectClass::Ci),
+    );
+    assert_eq!(
+        BrokerPolicy::new(EffectClass::Ci).max_effect(),
+        EffectClass::Ci
+    );
+    assert!(BrokerPolicy::new(EffectClass::Ci).admits(EffectClass::Ci));
+    assert!(!BrokerPolicy::new(EffectClass::Ci).admits(EffectClass::Sandbox));
+    assert_eq!(
+        r.broker.served(),
+        vec!["git_push", "read_file", "trigger_ci"]
+    );
+    r.arm();
+    assert!(r.broker.is_armed());
+}
+
+#[tokio::test]
+async fn granted_calls_run_and_are_audited_and_ungranted_calls_never_reach_the_tool() {
+    let r = rig(vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!("body")),
+        ),
+        (
+            "write_file",
+            EffectClass::Workspace,
+            ok_with(serde_json::json!("w")),
+        ),
+    ]);
+    r.arm();
+    assert_eq!(
+        r.broker.handle(req("read_file")).await,
+        BrokerOutcome::Output(serde_json::json!("body"))
+    );
+    assert_eq!(calls(&r.counters, "read_file"), 1);
+    let unknown = r.broker.handle(req("bash")).await;
+    assert_eq!(tool_error_kind(&unknown), Some(ToolErrorKind::NotGranted));
+    let audit = r.broker.audit();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(
+        audit[0],
+        AuditEntry {
+            tool: "read_file".into(),
+            args: serde_json::json!({"k": 1}),
+            effect: Some(EffectClass::None),
+            outcome: AuditOutcome::Ok
+        }
+    );
+    assert_eq!(audit[1].effect, None);
+    assert_eq!(
+        audit[1].outcome,
+        AuditOutcome::Error(ToolErrorKind::NotGranted)
+    );
+}
+
+#[tokio::test]
+async fn a_narrower_identity_is_not_served_what_only_the_global_one_holds() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!("body")),
+            ),
+            (
+                "write_file",
+                EffectClass::Workspace,
+                ok_with(serde_json::json!("w")),
+            ),
+        ]
+    };
+    let r = rig_with(
+        &Card::new("\"read_file\"", "workspace"),
+        tools(),
+        BrokerPolicy::default(),
+    );
+    r.arm();
+    assert_eq!(r.broker.served(), vec!["read_file"]);
+    let outcome = r.broker.handle(req("write_file")).await;
+    assert_eq!(tool_error_kind(&outcome), Some(ToolErrorKind::NotGranted));
+    assert_eq!(calls(&r.counters, "write_file"), 0);
+}
+
+#[tokio::test]
+async fn tool_errors_map_to_kinds_and_the_production_hold_halts_the_task() {
+    use crate::protected::ProtectedPathViolation;
+    use crate::scope::{DenialReason, ScopeDenial};
+    use crate::tools::ToolError;
+    let tools = vec![
+        (
+            "t_args",
+            EffectClass::None,
+            fail_with(|| ToolError::InvalidArguments {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_exec",
+            EffectClass::None,
+            fail_with(|| ToolError::ExecutionFailed {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_nf",
+            EffectClass::None,
+            fail_with(|| ToolError::NotFound { name: "n".into() }),
+        ),
+        (
+            "t_ser",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::Serialization(
+                    serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                )
+            }),
+        ),
+        (
+            "t_path",
+            EffectClass::None,
+            fail_with(|| ToolError::PathSecurityViolation {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_scope",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ScopeDenied(ScopeDenial {
+                    identity: "a".into(),
+                    tool: "t_scope".into(),
+                    reason: DenialReason::ToolNotInScope,
+                })
+            }),
+        ),
+        (
+            "t_prot",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ProtectedPath(ProtectedPathViolation {
+                    path: ".nanna/x".into(),
+                    rule: "r".into(),
+                })
+            }),
+        ),
+        (
+            "t_io",
+            EffectClass::None,
+            fail_with(|| ToolError::Io(std::io::Error::other("io"))),
+        ),
+        (
+            "t_held",
+            EffectClass::None,
+            fail_with(|| ToolError::ProductionHeld {
+                repo: "r".into(),
+                escalation_id: "e1".into(),
+                summary: "down".into(),
+            }),
+        ),
+        (
+            "t_ok",
+            EffectClass::None,
+            ok_with(serde_json::json!("fine")),
+        ),
+    ];
+    let r = rig(tools);
+    r.arm();
+    let expect = [
+        ("t_args", ToolErrorKind::InvalidArguments),
+        ("t_exec", ToolErrorKind::ExecutionFailed),
+        ("t_nf", ToolErrorKind::NotFound),
+        ("t_ser", ToolErrorKind::ExecutionFailed),
+        ("t_path", ToolErrorKind::PathSecurity),
+        ("t_scope", ToolErrorKind::ScopeDenied),
+        ("t_prot", ToolErrorKind::ProtectedPath),
+        ("t_io", ToolErrorKind::ExecutionFailed),
+    ];
+    for (tool, kind) in expect {
+        match r.broker.handle(req(tool)).await {
+            BrokerOutcome::ToolError { kind: got, message } => {
+                assert_eq!(got, kind, "{tool}");
+                assert!(!message.is_empty());
+            }
+            other => panic!("{tool}: {other:?}"),
+        }
+    }
+    assert!(!r.broker.is_halted());
+    let held = r.broker.handle(req("t_held")).await;
+    assert_eq!(
+        held,
+        BrokerOutcome::Halt(HaltReason::ProductionHeld {
+            repo: "r".into(),
+            escalation_id: "e1".into(),
+            summary: "down".into()
+        })
+    );
+    assert!(r.broker.is_halted());
+    assert_eq!(r.broker.audit().pop().unwrap().outcome, AuditOutcome::Halt);
+    let reply = held.to_response();
+    assert!(reply.halt && !reply.ok && reply.kind.is_none());
+    assert!(reply.output.as_str().unwrap().contains("incident e1"));
+    let after = r.broker.handle(req("t_ok")).await;
+    assert_eq!(tool_error_kind(&after), Some(ToolErrorKind::TaskHalted));
+    assert_eq!(calls(&r.counters, "t_ok"), 0);
+}
+
+#[tokio::test]
+async fn path_scope_is_enforced_by_the_tools_the_broker_calls() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("api")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let card = Card {
+        paths: "[\"api/**\"]",
+        ..Card::new("\"write_file\"", "workspace")
+    };
+    let identity = card.identity();
+    let allowed = allowed_for(&identity);
+    let base = crate::tools::create_tool_registry_for(dir.path(), allowed.identity()).unwrap();
+    let grant = ScopedCapabilities::scope(base, allowed.identity());
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let plan = launch_plan(&PiAdapter, &agent).unwrap();
+    let broker = Broker::for_agent(&allowed, &agent, BrokerPolicy::default(), |id| {
+        crate::tools::create_tool_registry_for(dir.path(), id)
+    })
+    .unwrap();
+    broker
+        .arm(&plan, &plan.exposed_capabilities.clone())
+        .unwrap();
+    let denied = broker
+        .handle(BrokerRequest {
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "src/x.rs", "content": "x"}),
+        })
+        .await;
+    assert_eq!(tool_error_kind(&denied), Some(ToolErrorKind::ScopeDenied));
+    assert!(!dir.path().join("src/x.rs").exists());
+    let allowed_write = broker
+        .handle(BrokerRequest {
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "api/x.rs", "content": "x"}),
+        })
+        .await;
+    assert!(matches!(allowed_write, BrokerOutcome::Output(_)));
+    assert!(dir.path().join("api/x.rs").exists());
+}
+
+#[test]
+fn building_refuses_a_mismatched_audit_agent_or_registry() {
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        )]
+    };
+    let r = rig(tools());
+    let attempts: Vec<(&str, Card, &str)> = vec![
+        (
+            "name",
+            Card {
+                name: "other",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "scope",
+            Card {
+                paths: "[\"api/**\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "read paths",
+            Card {
+                read_paths: "read_paths = [\"**\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "repos",
+            Card {
+                repos: "[\"r\", \"s\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "ceiling",
+            Card::new("\"*\"", "none"),
+            "github.com/example/repo",
+        ),
+        (
+            "repo",
+            Card::new("\"*\"", "workspace"),
+            "github.com/example/other",
+        ),
+    ];
+    for (label, card, repo) in attempts {
+        let other_allowed = allowed_for_repo(&card.identity(), repo);
+        let (registry, _) = base_registry(tools());
+        let result = Broker::for_agent(&other_allowed, &r.agent, BrokerPolicy::default(), |id| {
+            Ok(registry.scoped_for(id))
+        });
+        let err = result.err().unwrap_or_else(|| panic!("{label} accepted"));
+        assert!(
+            matches!(err, BrokerError::IdentityMismatch { .. }),
+            "{label}"
+        );
+    }
+    let (registry, _) = base_registry(tools());
+    let err = Broker::for_agent(&r.allowed, &r.agent, BrokerPolicy::default(), |_| {
+        Ok(registry)
+    })
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::RegistryNotScoped { .. }));
+    assert!(err.to_string().contains("not scoped"));
+    let err = Broker::for_agent(&r.allowed, &r.agent, BrokerPolicy::default(), |id| {
+        Err(crate::scope::ScopeError::InvalidGlob {
+            identity: id.name().to_string(),
+            field: "scope.paths",
+            pattern: "[".into(),
+            reason: "bad".into(),
+        })
+    })
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::Scope(_)));
+    assert!(err.to_string().starts_with("scope:"));
+    let mismatch = Broker::for_agent(
+        &allowed_for_repo(
+            &Card {
+                name: "other",
+                ..Card::new("\"*\"", "workspace")
+            }
+            .identity(),
+            "github.com/example/repo",
+        ),
+        &r.agent,
+        BrokerPolicy::default(),
+        |_| unreachable!(),
+    )
+    .err()
+    .unwrap();
+    assert!(mismatch
+        .to_string()
+        .contains("does not match the resolved agent"));
+}
+
+#[tokio::test]
+async fn wire_lines_round_trip_and_bad_requests_are_not_logged() {
+    let r = rig(vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!({"n": 1})),
+    )]);
+    r.arm();
+    let ok: serde_json::Value = serde_json::from_str(
+        &r.broker
+            .handle_line(r#"{"tool":"read_file","args":{}}"#)
+            .await,
+    )
+    .unwrap();
+    assert_eq!(
+        ok,
+        serde_json::json!({"ok": true, "output": {"n": 1}, "halt": false})
+    );
+    let no_args: serde_json::Value =
+        serde_json::from_str(&r.broker.handle_line(r#"{"tool":"read_file"}"#).await).unwrap();
+    assert_eq!(no_args["ok"], true);
+    for bad in ["not json", r#"{"args":{}}"#, ""] {
+        let reply: serde_json::Value =
+            serde_json::from_str(&r.broker.handle_line(bad).await).unwrap();
+        assert_eq!(reply["ok"], false, "{bad}");
+        assert_eq!(reply["kind"], "bad_request", "{bad}");
+        assert_eq!(reply["halt"], false);
+    }
+    assert_eq!(r.broker.audit().len(), 2);
+    let refused: serde_json::Value =
+        serde_json::from_str(&r.broker.handle_line(r#"{"tool":"bash"}"#).await).unwrap();
+    assert_eq!(refused["kind"], "not_granted");
+}
+
+#[tokio::test]
+async fn output_over_the_cap_is_replaced_by_an_error() {
+    let at_cap = "a".repeat(MAX_OUTPUT_BYTES - 2);
+    let over_cap = "a".repeat(MAX_OUTPUT_BYTES - 1);
+    let r = rig(vec![
+        (
+            "at_cap",
+            EffectClass::None,
+            ok_with(serde_json::json!(at_cap)),
+        ),
+        (
+            "over_cap",
+            EffectClass::None,
+            ok_with(serde_json::json!(over_cap)),
+        ),
+    ]);
+    r.arm();
+    assert!(matches!(
+        r.broker.handle(req("at_cap")).await,
+        BrokerOutcome::Output(_)
+    ));
+    let over = r.broker.handle(req("over_cap")).await;
+    assert_eq!(tool_error_kind(&over), Some(ToolErrorKind::ReplyTooLarge));
+    assert_eq!(
+        r.broker.audit()[1].outcome,
+        AuditOutcome::Error(ToolErrorKind::ReplyTooLarge)
+    );
+}
+
+#[test]
+fn outcomes_serialize_to_the_wire_shape() {
+    let ok = BrokerOutcome::Output(serde_json::json!("done")).to_response();
+    assert!(ok.ok && !ok.halt && ok.kind.is_none());
+    let err = BrokerOutcome::ToolError {
+        kind: ToolErrorKind::ScopeDenied,
+        message: "m".into(),
+    }
+    .to_response();
+    assert!(!err.ok && !err.halt);
+    assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "scope_denied");
+    let not_ready = serde_json::to_value(ToolErrorKind::NotReady).unwrap();
+    assert_eq!(not_ready, "not_ready");
+    assert_eq!(
+        serde_json::to_value(ToolErrorKind::TaskHalted).unwrap(),
+        "task_halted"
+    );
+    assert_eq!(
+        serde_json::to_value(ToolErrorKind::ReplyTooLarge).unwrap(),
+        "reply_too_large"
+    );
+}
+
+#[test]
+fn a_plan_naming_another_agent_is_rejected_by_the_policy() {
+    let (a, base) = checked_plan();
+    let mut plan = base;
+    plan.agent = "someone-else".into();
+    assert_eq!(
+        first_violation(&plan, &a),
+        Some(IsolationViolation::AgentChanged {
+            plan: "someone-else".into(),
+            agent: "a".into()
+        })
+    );
+    assert_eq!(
+        IsolationViolation::AgentChanged {
+            plan: "x".into(),
+            agent: "y".into()
+        }
+        .to_string(),
+        "plan agent `x` differs from the agent `y`"
+    );
 }

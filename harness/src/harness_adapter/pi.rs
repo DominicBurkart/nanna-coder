@@ -97,6 +97,7 @@ impl HarnessAdapter for PiAdapter {
         .to_string();
 
         Ok(LaunchPlan {
+            agent: agent.name().to_string(),
             image: agent.image().to_string(),
             files: vec![
                 file("models.json", models_json(agent)),
