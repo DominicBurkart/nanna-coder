@@ -13,6 +13,10 @@ use std::sync::Arc;
 /// Name the rule action auditor records against its verdicts.
 pub const RULE_ACTION_AUDITOR_NAME: &str = "rule-action-auditor";
 
+pub(crate) const RUN_COMMAND_TOOL: &str = "run_command";
+
+type Inspector = fn(&str, &serde_json::Value) -> Result<(), String>;
+
 /// What [`RuleActionAuditor::evaluate`] reached: a final decision, or a
 /// deferral that only a model may resolve.
 ///
@@ -89,6 +93,7 @@ pub struct RuleActionAuditor {
     windows: Arc<WindowSet>,
     leases: Arc<dyn LeaseStore>,
     lease_ttl: Duration,
+    inspector: Inspector,
 }
 
 impl std::fmt::Debug for RuleActionAuditor {
@@ -107,11 +112,27 @@ impl RuleActionAuditor {
             windows,
             leases,
             lease_ttl,
+            inspector: super::commands::inspect,
         }
+    }
+
+    /// Replace the `run_command` content inspector, which by default is the
+    /// explicit not-implemented stub in `commands`.
+    pub fn with_inspector(mut self, inspector: Inspector) -> Self {
+        self.inspector = inspector;
+        self
     }
 
     /// Apply every rule to `review` and return the outcome.
     pub(crate) fn evaluate(&self, review: &ActionReview, ctx: &ActionContext<'_>) -> RuleOutcome {
+        if review.tool == RUN_COMMAND_TOOL {
+            if let Err(detail) = (self.inspector)(&review.tool, &review.args) {
+                return RuleOutcome::Decided(ActionVerdict::block(vec![Reason::new(
+                    ReasonCode::Other,
+                    detail,
+                )]));
+            }
+        }
         match review.effect_class {
             EffectClass::None | EffectClass::Workspace => {
                 RuleOutcome::Decided(ActionVerdict::Allow)
@@ -533,6 +554,83 @@ pub(crate) mod tests {
         let second = rules.review_action(&review, &context).await.unwrap();
         assert_eq!(first.kind(), VerdictKind::Escalate);
         assert_eq!(second.kind(), VerdictKind::Escalate);
+    }
+
+    static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_inspector(_tool: &str, _args: &serde_json::Value) -> Result<(), String> {
+        COUNTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn rejecting_inspector(tool: &str, args: &serde_json::Value) -> Result<(), String> {
+        Err(format!("{tool} refused for {args}"))
+    }
+
+    fn passing_inspector(_tool: &str, _args: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn run_command_review() -> ActionReview {
+        let mut review = review(RUN_COMMAND_TOOL, EffectClass::Workspace);
+        review.args = serde_json::json!({ "command": "echo hi" });
+        review
+    }
+
+    #[tokio::test]
+    async fn a_rejecting_inspector_blocks_run_command() {
+        let rules = auditor().with_inspector(rejecting_inspector);
+        let context = ctx(EffectClass::Workspace, None, LeaseContext::default());
+        let verdict = rules
+            .review_action(&run_command_review(), &context)
+            .await
+            .unwrap();
+        assert_eq!(verdict.kind(), VerdictKind::Block);
+        assert!(verdict.reasons()[0].detail.contains("run_command refused"));
+        assert!(verdict.reasons()[0].detail.contains("echo hi"));
+    }
+
+    #[tokio::test]
+    async fn a_passing_inspector_lets_run_command_through() {
+        let rules = auditor().with_inspector(passing_inspector);
+        let context = ctx(EffectClass::Workspace, None, LeaseContext::default());
+        let verdict = rules
+            .review_action(&run_command_review(), &context)
+            .await
+            .unwrap();
+        assert_eq!(verdict, ActionVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn every_run_command_evaluation_calls_the_inspector_and_no_other_tool_does() {
+        let rules = auditor().with_inspector(counting_inspector);
+        let context = ctx(EffectClass::Workspace, None, LeaseContext::default());
+        let before = COUNTED.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            rules
+                .review_action(&run_command_review(), &context)
+                .await
+                .unwrap();
+        }
+        rules
+            .review_action(&review("write_file", EffectClass::Workspace), &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            COUNTED.load(std::sync::atomic::Ordering::SeqCst) - before,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_inspector_is_the_named_not_implemented_stub() {
+        let rules = auditor();
+        let context = ctx(EffectClass::Workspace, None, LeaseContext::default());
+        let verdict = rules
+            .review_action(&run_command_review(), &context)
+            .await
+            .unwrap();
+        assert_eq!(verdict, ActionVerdict::Allow);
     }
 
     #[test]

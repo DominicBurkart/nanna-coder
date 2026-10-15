@@ -286,7 +286,7 @@ impl ToolRegistry {
             (Some(tool), _) => {
                 let class = tool.effect_class();
                 self.check_production_hold(class)?;
-                if class >= EffectClass::Repository {
+                if class >= EffectClass::Repository || self.inspects_content(name) {
                     if let Err(denied) = self.review_action(name, &args, class).await {
                         if denied.is_escalation() {
                             self.escalate_denial(name, &denied).await;
@@ -414,6 +414,10 @@ impl ToolRegistry {
             ActionVerdict::Block { reasons } => Err(ActionDenied::Block { reasons }),
             ActionVerdict::Escalate { reasons } => Err(ActionDenied::Escalate { reasons }),
         }
+    }
+
+    fn inspects_content(&self, name: &str) -> bool {
+        self.action_gate.is_some() && name == crate::action_auditor::RUN_COMMAND_TOOL
     }
 
     async fn escalate_denial(&self, tool: &str, denied: &ActionDenied) {
@@ -5399,6 +5403,71 @@ mod tests {
         let seen = sink.escalations();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].repo, crate::scope::UNSCOPED_IDENTITY);
+    }
+
+    fn inspecting_registry(inspector: fn(&str, &Value) -> Result<(), String>) -> ToolRegistry {
+        let rules = crate::action_auditor::RuleActionAuditor::new(
+            Arc::new(crate::windows::WindowSet::default()),
+            Arc::new(crate::leases::InMemoryLeaseStore::default()),
+            chrono::Duration::minutes(10),
+        )
+        .with_inspector(inspector);
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(rules),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut registry =
+            ToolRegistry::new().with_action_gate(gate, subject(EffectClass::Workspace));
+        registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
+        registry.register(StubTool::boxed("write_file", EffectClass::Workspace));
+        registry
+    }
+
+    fn reject_every_command(_tool: &str, _args: &Value) -> Result<(), String> {
+        Err("rejected by the inspector".to_string())
+    }
+
+    fn accept_every_command(_tool: &str, _args: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_command_is_refused_when_the_inspector_rejects_it_and_never_runs() {
+        let registry = inspecting_registry(reject_every_command);
+        let err = registry
+            .execute("run_command", json!({ "command": "x" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::ActionDenied(ActionDenied::Block { reasons }) => {
+                assert!(reasons[0].detail.contains("rejected by the inspector"));
+            }
+            other => panic!("expected a block, got {other:?}"),
+        }
+        assert_eq!(registry.action_reviews().len(), 1);
+        assert!(registry.execute("write_file", json!({})).await.is_ok());
+        assert_eq!(registry.action_reviews().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_command_is_reviewed_and_runs_when_the_inspector_accepts_it() {
+        let registry = inspecting_registry(accept_every_command);
+        assert!(registry
+            .execute("run_command", json!({ "command": "x" }))
+            .await
+            .is_ok());
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].review.tool, "run_command");
+        assert!(reviews[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn run_command_on_a_registry_with_no_gate_is_not_refused() {
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
+        assert!(registry.execute("run_command", json!({})).await.is_ok());
+        assert!(registry.action_reviews().is_empty());
     }
 
     #[tokio::test]

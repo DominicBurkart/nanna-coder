@@ -27,6 +27,7 @@
 //! `ActionVerdict` out, every call logged), so it gets its own trait rather
 //! than being bent to fit `AuditHook`.
 
+mod commands;
 mod context;
 mod gate;
 mod llm;
@@ -41,6 +42,7 @@ pub use llm::ModelActionAuditor;
 pub use log::{ActionAuditLog, ActionAuditLogEntry};
 pub use review::ActionReview;
 pub use rules::RuleActionAuditor;
+pub(crate) use rules::RUN_COMMAND_TOOL;
 pub use verdict::ActionVerdict;
 
 use async_trait::async_trait;
