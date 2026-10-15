@@ -133,6 +133,40 @@ capability satisfies the identity's tool patterns and effect ceiling
 tests cover the same-name exploit, different `paths`/`read_paths`, and a
 deliberately widened grant.
 
+## The broker (implemented, not yet connected to anything)
+
+`harness_adapter/broker.rs` implements the broker's decision logic. Nothing
+serves a socket or starts it yet; that is the executor's job. It is built by
+`Broker::for_agent(&Allowed, &ResolvedAgent, policy, build)`: the identity comes
+from the audit proof, the agent must have been resolved from the same audited
+spawn (name, scope, ceiling and audited repository), and `build` receives that
+identity and must return the registry scoped to it with path restrictions
+attached. A registry that is not scoped to the identity is refused.
+
+- **Armed before serving.** Every call is refused (`not_ready`) until the
+  executor calls `Broker::arm(&CheckedPlan, reported)`. `arm` checks that the plan
+  names this agent, audited repository, limits and broker socket, that every
+  exposed capability is one the broker serves, and that the tools the started
+  runtime reports (for pi, `toolsAdded`) equal the plan's. The model already
+  holds its tools before the check, so nothing is served until it passes.
+- **Halt stops everything.** A `ProductionHeld` result halts the task, and the
+  broker serves nothing afterwards (`task_halted`).
+- **Fail closed on effects.** `BrokerPolicy` defaults to `Workspace`. A plan
+  that exposes anything above it cannot arm (`ExposedNotServed`), so an identity
+  with a `ci`, `sandbox` or `production` ceiling cannot run on this broker until
+  the per-action gate is on main and the policy is raised in a separate change.
+- **Errors.** `ToolError` is mapped with an exhaustive match and no wildcard, so
+  a new variant (such as the action gate's denial) breaks the build until it is
+  mapped. Today: `ProductionHeld` halts; every other variant returns to the
+  agent as a typed error. A reply over `MAX_OUTPUT_BYTES` is replaced by an error.
+- **Audit.** `Broker::audit` records every decision in order. It is the intended
+  source for the task result's tool calls and denials.
+
+Not done: serving the socket, the executor, lease release on every exit path,
+and mapping the action gate's `Escalate` to a task halt plus an escalator
+delivery (that gate is not on main; the halt currently lives in the in-house
+loop and must survive the switch).
+
 ## Runtime handshake
 
 A runtime that silently ignores a lockdown flag fails open, and
@@ -169,7 +203,8 @@ drift. The plan carries a single `gateway` endpoint, so there is no
 ## Status of this change
 
 Landed: `harness_adapter` (types, `IsolationPolicy`, `PiAdapter`, handshake
-comparison), and the corrective hardening of it: private-field `ResolvedAgent`
+comparison), the broker's decision logic (not connected to anything), and the
+corrective hardening of it: private-field `ResolvedAgent`
 built from an `Allowed` spawn proof, with the prompt (the audited subtask) and
 repository label taken from the audit; `CheckedPlan`; a stricter `Endpoint`;
 image, model-name and broker-socket validation; an exact env allowlist; one
