@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// The fixed, repository-relative globs every agent is refused, matched
-/// with `*` never crossing `/` and `**` spanning directories. A glob
+/// case-insensitively with `*` never crossing `/` and `**` spanning directories. A glob
 /// ending in `/**` also matches the directory itself.
 pub const PROTECTED_PATTERNS: &[&str] = &[
     ".nanna/**",
@@ -34,10 +34,27 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".github/CODEOWNERS",
     "codecov.yml",
     "windows.toml",
+    "tarpaulin.toml",
+    "deny.toml",
+    "flake.nix",
+    "flake.lock",
+    ".github/rulesets/**",
+    ".githooks/**",
+    ".cargo/**",
+    ".devcontainer/**",
+    "AGENTS.md",
+    "evals/cases/**",
+    "harness/src/protected.rs",
+    ".gitattributes",
+    ".gitmodules",
+    "harness/src/scope.rs",
+    "CODEOWNERS",
+    "docs/CODEOWNERS",
+    "harness/src/auditor/**",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
-    case_sensitive: true,
+    case_sensitive: false,
     require_literal_separator: true,
     require_literal_leading_dot: false,
 };
@@ -262,6 +279,24 @@ mod tests {
             (".github/CODEOWNERS", ".github/CODEOWNERS"),
             ("codecov.yml", "codecov.yml"),
             ("windows.toml", "windows.toml"),
+            ("tarpaulin.toml", "tarpaulin.toml"),
+            ("deny.toml", "deny.toml"),
+            ("flake.nix", "flake.nix"),
+            ("flake.lock", "flake.lock"),
+            (".github/rulesets/**", ".github/rulesets/main.json"),
+            (".github/rulesets/**", ".github/rulesets"),
+            (".githooks/**", ".githooks/pre-commit"),
+            (".cargo/**", ".cargo/config.toml"),
+            (".devcontainer/**", ".devcontainer/devcontainer.json"),
+            ("AGENTS.md", "AGENTS.md"),
+            ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
+            ("harness/src/protected.rs", "harness/src/protected.rs"),
+            (".gitattributes", ".gitattributes"),
+            (".gitmodules", ".gitmodules"),
+            ("harness/src/scope.rs", "harness/src/scope.rs"),
+            ("CODEOWNERS", "CODEOWNERS"),
+            ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+            ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
         ];
         let protected = protected();
         for (rule, path) in table {
@@ -278,6 +313,101 @@ mod tests {
         }
     }
 
+    fn codeowners_paths() -> Vec<String> {
+        include_str!("../../.github/CODEOWNERS")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(|path| path.trim_start_matches('/').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_codeowners_entry_is_protected() {
+        let protected = protected();
+        let entries = codeowners_paths();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            let concrete = entry.replace('*', "example.yml");
+            assert!(protected.is_protected(Path::new(&concrete)), "{entry}");
+            if entry.ends_with("/*") {
+                let nested = format!("{}/nested/file", entry.trim_end_matches("/*"));
+                assert!(protected.is_protected(Path::new(&nested)), "{nested}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_previously_unprotected_path_is_now_protected() {
+        let protected = protected();
+        for path in [
+            ".gitattributes",
+            ".gitmodules",
+            "harness/src/scope.rs",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            ".github/CODEOWNERS",
+            "harness/src/auditor/mod.rs",
+            "harness/src/auditor/review/rules.rs",
+            "harness/src/auditor",
+        ] {
+            assert!(protected.is_protected(Path::new(path)), "{path}");
+        }
+    }
+
+    fn agents_md_protected_paths_line() -> String {
+        include_str!("../../AGENTS.md")
+            .lines()
+            .find(|line| line.contains("PROTECTED_PATTERNS"))
+            .expect("AGENTS.md documents the protected paths")
+            .to_string()
+    }
+
+    #[test]
+    fn agents_md_documents_every_protected_pattern() {
+        let line = agents_md_protected_paths_line();
+        for pattern in PROTECTED_PATTERNS {
+            assert!(
+                line.contains(&format!("`{pattern}`")),
+                "{pattern} missing from AGENTS.md"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_ignores_case() {
+        let protected = protected();
+        for path in [
+            "CODECOV.YML",
+            "Tarpaulin.toml",
+            "DENY.TOML",
+            "Flake.Nix",
+            "agents.md",
+            ".GITHUB/workflows/ci.yml",
+            ".github/WORKFLOWS/ci.yml",
+            ".github/codeowners",
+            ".Github/Rulesets/main.json",
+            ".GIT/config",
+            ".NANNA/deploy.toml",
+            "crates/api/.Nanna/agents/x.toml",
+            ".GitHooks/pre-commit",
+            ".Cargo/Config.toml",
+            ".DevContainer/devcontainer.json",
+            "Evals/Cases/happy-path-001/case.toml",
+            "Harness/Src/Protected.rs",
+            "Harness/SRC/Auditor/mod.rs",
+            ".GitAttributes",
+            ".GITMODULES",
+            "harness/src/SCOPE.rs",
+            "codeowners",
+            "Docs/CodeOwners",
+            "Windows.TOML",
+        ] {
+            assert!(protected.is_protected(Path::new(path)), "{path}");
+        }
+    }
+
     #[test]
     fn ordinary_repository_paths_are_not_protected() {
         let protected = protected();
@@ -291,6 +421,16 @@ mod tests {
             "codecov.yml.bak",
             "docs/windows.toml",
             ".nannax/agents/x.toml",
+            "evals/datasets/x.json",
+            "docs/AGENTS.md",
+            "harness/src/protected_extra.rs",
+            "auditors/x.rs",
+            "auditor/src/lib.rs",
+            "harness/src/auditors/x.rs",
+            "harness/src/scope_extra.rs",
+            "src/CODEOWNERS",
+            "docs/ci/CODEOWNERS",
+            ".gitattributes.bak",
         ] {
             assert!(!protected.is_protected(Path::new(path)), "{path}");
             assert_eq!(protected.check(Path::new(path)), Ok(()));
@@ -368,6 +508,23 @@ mod tests {
                 PathBuf::from(".github/CODEOWNERS"),
                 PathBuf::from("codecov.yml"),
                 PathBuf::from("windows.toml"),
+                PathBuf::from("tarpaulin.toml"),
+                PathBuf::from("deny.toml"),
+                PathBuf::from("flake.nix"),
+                PathBuf::from("flake.lock"),
+                PathBuf::from(".github/rulesets"),
+                PathBuf::from(".githooks"),
+                PathBuf::from(".cargo"),
+                PathBuf::from(".devcontainer"),
+                PathBuf::from("AGENTS.md"),
+                PathBuf::from("evals/cases"),
+                PathBuf::from("harness/src/protected.rs"),
+                PathBuf::from(".gitattributes"),
+                PathBuf::from(".gitmodules"),
+                PathBuf::from("harness/src/scope.rs"),
+                PathBuf::from("CODEOWNERS"),
+                PathBuf::from("docs/CODEOWNERS"),
+                PathBuf::from("harness/src/auditor"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -389,6 +546,23 @@ mod tests {
                 (".github/CODEOWNERS".to_string(), false),
                 ("codecov.yml".to_string(), false),
                 ("windows.toml".to_string(), false),
+                ("tarpaulin.toml".to_string(), false),
+                ("deny.toml".to_string(), false),
+                ("flake.nix".to_string(), false),
+                ("flake.lock".to_string(), false),
+                (".github/rulesets".to_string(), true),
+                (".githooks".to_string(), true),
+                (".cargo".to_string(), true),
+                (".devcontainer".to_string(), true),
+                ("AGENTS.md".to_string(), false),
+                ("evals/cases".to_string(), true),
+                ("harness/src/protected.rs".to_string(), false),
+                (".gitattributes".to_string(), false),
+                (".gitmodules".to_string(), false),
+                ("harness/src/scope.rs".to_string(), false),
+                ("CODEOWNERS".to_string(), false),
+                ("docs/CODEOWNERS".to_string(), false),
+                ("harness/src/auditor".to_string(), true),
             ]
         );
     }
@@ -444,5 +618,15 @@ mod tests {
         }
         assert!(guard.contains(crate::marker::IDENTITY_TRAILER));
         assert!(guard.contains("on:\n  pull_request:"));
+    }
+
+    #[test]
+    fn the_ci_guard_fails_closed_and_matches_case_insensitively() {
+        let guard = include_str!("../../docs/ci/protected-paths-guard.yml");
+        assert!(guard.contains("shopt -s nocasematch"));
+        assert!(guard.contains("PROTECTED_PATTERNS_HUMAN_AUTHORS"));
+        assert!(!guard.contains("not an agent PR, protected paths are not enforced here"));
+        assert!(!guard.contains("if: steps.identity.outputs.name != ''"));
+        assert!(!guard.contains("Human PRs\n# (no marker) are not affected"));
     }
 }
