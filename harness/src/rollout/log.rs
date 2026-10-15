@@ -418,6 +418,63 @@ mod tests {
     }
 
     #[test]
+    fn writers_on_separate_handles_serialise_every_transition() {
+        const THREADS: usize = 8;
+        const APPENDS: usize = 25;
+        let dir = tempfile::tempdir().unwrap();
+        let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
+        log.append(None, &mut record("sandbox")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let log = RolloutLog::open(log.path()).unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut won = Vec::new();
+                    while won.len() < APPENDS {
+                        let mut next = log.load("rollout-1").unwrap();
+                        let from = next.state.clone();
+                        next.traffic_percent = (won.len() % 100) as u8;
+                        next.updated_at = t0();
+                        match log.append(Some(&from), &mut next) {
+                            Ok(()) => won.push(next.revision),
+                            Err(RolloutError::Conflict { .. }) => {}
+                            Err(other) => panic!("unexpected append error: {other}"),
+                        }
+                    }
+                    won
+                })
+            })
+            .collect();
+        let mut revisions: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        revisions.sort_unstable();
+        let total = THREADS * APPENDS;
+        assert_eq!(revisions, (2..=total as u64 + 1).collect::<Vec<_>>());
+
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(raw.ends_with('\n'));
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), total + 1);
+        let parsed: Vec<RolloutTransition> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for pair in parsed.windows(2) {
+            assert_eq!(pair[1].from.as_ref(), Some(&pair[0].record.state));
+        }
+        let history = log.history("rollout-1").unwrap();
+        let history_revisions: Vec<u64> = history.iter().map(|t| t.record.revision).collect();
+        assert_eq!(
+            history_revisions,
+            (1..=total as u64 + 1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn readers_interleaved_with_appends_always_see_whole_lines() {
         let dir = tempfile::tempdir().unwrap();
         let log = RolloutLog::open(&dir.path().join("rollouts.jsonl")).unwrap();
