@@ -1381,7 +1381,7 @@ fn bound_patch(patch: String) -> Option<String> {
     }
 }
 
-pub(crate) const UNSCOPED_ACTION_CEILING: EffectClass = EffectClass::Workspace;
+pub(crate) const UNSCOPED_ACTION_CEILING: EffectClass = EffectClass::None;
 
 fn action_repo_key(repo_path: &std::path::Path) -> String {
     crate::scope::origin_slug(repo_path)
@@ -3096,11 +3096,11 @@ mod identity_tests {
     }
 
     #[test]
-    fn test_action_subject_for_an_unscoped_task_is_capped_below_repository() {
+    fn test_action_subject_for_an_unscoped_task_is_capped_at_none() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let subject = action_subject_for(&TaskId("t1".to_string()), &queued(repo.path()), None);
         assert_eq!(subject.max_effect, UNSCOPED_ACTION_CEILING);
-        assert_eq!(UNSCOPED_ACTION_CEILING, EffectClass::Workspace);
+        assert_eq!(UNSCOPED_ACTION_CEILING, EffectClass::None);
         assert!(subject.paths.is_empty());
     }
 
