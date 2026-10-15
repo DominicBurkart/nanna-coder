@@ -48,7 +48,7 @@ fn parse_cargo_home(src: &str) -> Result<String, WorkspaceError> {
     Ok(config.cargo_home)
 }
 
-fn container_cargo_home() -> Result<String, WorkspaceError> {
+pub fn container_cargo_home() -> Result<String, WorkspaceError> {
     parse_cargo_home(DEV_CONTAINER_CONFIG)
 }
 
