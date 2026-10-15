@@ -48,7 +48,6 @@ pub fn diff_against(repo: &Path, rev: &str) -> Result<String, ImpactError> {
     let tree = repository.revparse_single(rev)?.peel_to_tree()?;
     let mut options = git2::DiffOptions::new();
     options
-        .include_untracked(true)
         .show_untracked_content(true)
         .recurse_untracked_dirs(true);
     let diff = repository.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
@@ -591,6 +590,34 @@ mod tests {
         assert!(whole.touched.contains(&"ui.greeting_page".to_string()));
         assert!(whole.touched.contains(&"http.GET /health/v1".to_string()));
         assert!(whole.score >= deploy.score);
+    }
+
+    #[test]
+    fn task_scoring_restricts_deploys_to_the_templates_environments() {
+        let root = fixture_root();
+        let deploy = |environment: &str| {
+            vec![call(
+                "sandbox_deploy",
+                json!({"environment": environment}),
+                EffectClass::Sandbox,
+            )]
+        };
+        let open = TaskImpact {
+            graph: AssetGraph::load_from_repo(&root).unwrap(),
+            environments: None,
+        };
+        let restricted = TaskImpact {
+            graph: AssetGraph::load_from_repo(&root).unwrap(),
+            environments: Some(vec!["production".to_string()]),
+        };
+        let mut calls = deploy("sandbox");
+        let unrestricted = open.analyze(&root, None, &mut calls).unwrap();
+        assert!(!unrestricted.touched.is_empty());
+        assert!(!radius_of(&calls[0]).touched.is_empty());
+        let mut calls = deploy("sandbox");
+        let blocked = restricted.analyze(&root, None, &mut calls).unwrap();
+        assert!(blocked.touched.is_empty());
+        assert!(radius_of(&calls[0]).touched.is_empty());
     }
 
     #[test]
