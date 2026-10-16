@@ -101,6 +101,9 @@ fn build(graph: &AssetGraph, environments: Option<Vec<String>>) -> ImpactAnalyze
 }
 
 fn relative_to_root(root: &Path, path: &str) -> Result<String, ImpactError> {
+    let outside = || ImpactError::OutsideWorkspace {
+        path: path.to_string(),
+    };
     let given = Path::new(path);
     let anchored = given.is_absolute()
         || given.has_root()
@@ -108,17 +111,30 @@ fn relative_to_root(root: &Path, path: &str) -> Result<String, ImpactError> {
             given.components().next(),
             Some(std::path::Component::Prefix(_))
         );
-    if !anchored {
-        return Ok(path.to_string());
+    let relative = if anchored {
+        given
+            .strip_prefix(root)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(outside)?
+            .to_string()
+    } else {
+        path.to_string()
+    };
+    let mut resolved: Vec<&str> = Vec::new();
+    for component in relative.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                resolved.pop().ok_or_else(outside)?;
+            }
+            name => resolved.push(name),
+        }
     }
-    given
-        .strip_prefix(root)
-        .ok()
-        .and_then(Path::to_str)
-        .map(str::to_string)
-        .ok_or_else(|| ImpactError::OutsideWorkspace {
-            path: path.to_string(),
-        })
+    if resolved.is_empty() {
+        return Err(outside());
+    }
+    Ok(resolved.join("/"))
 }
 
 fn string_argument<'a>(
@@ -670,6 +686,100 @@ mod tests {
         )];
         fixture_impact().analyze(&root, None, &mut calls).unwrap();
         assert_eq!(radius_of(&calls[0]).touched, ["db.greetings"]);
+    }
+
+    #[test]
+    fn dot_dot_components_are_resolved_lexically_against_the_workspace_root() {
+        let root = Path::new("/ws");
+        for (given, expected) in [
+            ("a/../b", "b"),
+            ("./a/./b", "a/b"),
+            ("a//b///c", "a/b/c"),
+            ("a/b/../../c", "c"),
+            ("a/b/..", "a"),
+            ("a\\..\\b", "b"),
+            ("/ws/ui/../migrations/x.sql", "migrations/x.sql"),
+        ] {
+            assert_eq!(relative_to_root(root, given).unwrap(), expected, "{given}");
+        }
+    }
+
+    #[test]
+    fn paths_that_escape_the_root_or_name_the_root_itself_are_errors() {
+        let root = Path::new("/ws");
+        for given in [
+            "..",
+            "../x",
+            "./a/../../escape",
+            "a/../..",
+            "a/b/../../../x",
+            "..\\x",
+            ".",
+            "a/..",
+            "",
+            "/ws/../etc/passwd",
+            "/ws/ui/../../etc/passwd",
+            "/etc/passwd",
+            "/ws",
+        ] {
+            assert!(
+                matches!(
+                    relative_to_root(root, given),
+                    Err(ImpactError::OutsideWorkspace { .. })
+                ),
+                "{given:?} -> {:?}",
+                relative_to_root(root, given)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_prefixed_paths_are_outside_the_workspace() {
+        let root = Path::new("D:\\ws");
+        for given in ["C:\\Windows\\x", "C:x", "\\\\server\\share\\x"] {
+            assert!(
+                matches!(
+                    relative_to_root(root, given),
+                    Err(ImpactError::OutsideWorkspace { .. })
+                ),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_through_dot_dot_is_attributed_to_the_path_it_resolves_to() {
+        let root = fixture_root();
+        let mut calls = vec![
+            call(
+                "write_file",
+                json!({"path": "ui/../migrations/20260925000000_note.sql", "content": ""}),
+                EffectClass::Workspace,
+            ),
+            call(
+                "write_file",
+                json!({"path": "docs/../ui/index.html", "content": ""}),
+                EffectClass::Workspace,
+            ),
+        ];
+        fixture_impact().analyze(&root, None, &mut calls).unwrap();
+        assert_eq!(radius_of(&calls[0]).touched, ["db.greetings"]);
+        assert_eq!(radius_of(&calls[1]).touched, ["ui.greeting_page"]);
+    }
+
+    #[test]
+    fn a_write_that_escapes_the_workspace_through_dot_dot_fails_the_scoring() {
+        let root = fixture_root();
+        let mut calls = vec![call(
+            "write_file",
+            json!({"path": "ui/../../outside.txt", "content": ""}),
+            EffectClass::Workspace,
+        )];
+        let error = fixture_impact()
+            .analyze(&root, None, &mut calls)
+            .unwrap_err();
+        assert!(matches!(error, ImpactError::OutsideWorkspace { .. }));
     }
 
     #[test]
