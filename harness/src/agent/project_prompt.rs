@@ -45,9 +45,13 @@ use std::path::Path;
 /// Maximum allowed size of `.nanna/prompt.md` on disk, in bytes.
 pub const MAX_PROMPT_FILE_BYTES: u64 = 64 * 1024;
 
-/// Relative path of the per-project prompt file within a workspace.
+/// Longest repo-derived value, in characters, quoted in the topology paragraph.
 pub const MAX_VALUE_CHARS: usize = 80;
 
+/// Most proxy backends or shared crates listed before "and N more".
+pub const MAX_LISTED: usize = 8;
+
+/// Relative path of the per-project prompt file within a workspace.
 pub const PROMPT_FILE_REL_PATH: &str = ".nanna/prompt.md";
 
 /// Parsed representation of `.nanna/prompt.md`.
@@ -104,6 +108,44 @@ pub fn load(workspace_root: &Path) -> io::Result<Option<ProjectPromptDoc>> {
 
     let raw = fs::read_to_string(&path)?;
     parse(&raw).map(Some)
+}
+
+fn backend_origin(raw: &str) -> String {
+    const INVALID: &str = "invalid-backend";
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return INVALID.to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || host.starts_with('[') => (host, Some(port)),
+        _ => (host_port, None),
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let host_ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']' | ':'));
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if !(scheme_ok && host_ok && port_ok) {
+        return INVALID.to_string();
+    }
+    match port {
+        Some(port) => clean(&format!("{scheme}://{host}:{port}")),
+        None => clean(&format!("{scheme}://{host}")),
+    }
+}
+
+fn bounded_list(items: Vec<String>) -> String {
+    let total = items.len();
+    let mut shown: Vec<String> = items.into_iter().take(MAX_LISTED).collect();
+    if total > MAX_LISTED {
+        shown.push(format!("and {} more", total - MAX_LISTED));
+    }
+    shown.join(", ")
 }
 
 fn clean(value: &str) -> String {
@@ -174,12 +216,14 @@ pub fn topology_paragraph(profile: &FullStackRust, database_provisioned: bool) -
     if profile.proxy_backends.is_empty() {
         text.push_str(" The frontend calls the backend over HTTP on the same origin.");
     } else {
-        let proxies = profile
-            .proxy_backends
-            .iter()
-            .map(|p| clean(p))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut origins: Vec<String> = Vec::new();
+        for backend in &profile.proxy_backends {
+            let origin = backend_origin(backend);
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        let proxies = bounded_list(origins);
         text.push_str(&format!(
             " In development `trunk serve` proxies {proxies} to the backend; the built frontend \
              calls the backend over HTTP on the same origin."
@@ -191,7 +235,7 @@ pub fn topology_paragraph(profile: &FullStackRust, database_provisioned: bool) -
             .iter()
             .map(|m| format!("`{}`", clean(&m.name)))
             .collect();
-        text.push_str(&format!(" Shared code lives in {}.", names.join(", ")));
+        text.push_str(&format!(" Shared code lives in {}.", bounded_list(names)));
     }
     match &profile.database {
         Some(db) => {
@@ -379,9 +423,7 @@ mod tests {
         assert!(text.contains("`cargo run --bin api`"));
         assert!(text.contains("The `ui` crate (`ui/`) is the dioxus web frontend"));
         assert!(text.contains("`trunk build` inside `ui/`"));
-        assert!(text.contains(
-            "`trunk serve` proxies http://127.0.0.1:8080/api/, http://127.0.0.1:8080/health/ to the backend"
-        ));
+        assert!(text.contains("`trunk serve` proxies http://127.0.0.1:8080 to the backend"));
         assert!(text.contains("Shared code lives in `shared`."));
         assert!(text.contains(
             "uses a Postgres database through sqlx with migrations in `migrations/`; `DATABASE_URL`"
@@ -448,6 +490,45 @@ mod tests {
         assert!(!text.contains("```"), "{text}");
         assert!(!text.contains('<') && !text.contains('>'), "{text}");
         assert!(!text.contains("SYSTEM: ignore"), "{text}");
+    }
+
+    #[test]
+    fn proxy_backends_are_reduced_to_scheme_host_and_port() {
+        let mut profile = FullStackRust::detect(&fixture_root()).unwrap().unwrap();
+        profile.proxy_backends = vec![
+            "https://user:pass@host.example:5432/db?token=abc#frag".to_string(),
+            "http://127.0.0.1:8080/api/".to_string(),
+            "not a url".to_string(),
+            "http://user:pw@/x".to_string(),
+        ];
+        let text = topology_paragraph(&profile, true);
+        assert!(text.contains(
+            "proxies https://host.example:5432, http://127.0.0.1:8080, invalid-backend to the backend"
+        ), "{text}");
+        for secret in ["pass", "token", "user", "frag", "/db", "pw", "/api"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn listed_proxy_backends_and_shared_crates_are_bounded() {
+        let mut profile = FullStackRust::detect(&fixture_root()).unwrap().unwrap();
+        profile.proxy_backends = (0..5000).map(|i| format!("http://h{i}:80")).collect();
+        let template = profile.shared[0].clone();
+        profile.shared = (0..5000)
+            .map(|i| {
+                let mut member = template.clone();
+                member.name = format!("crate{i}");
+                member
+            })
+            .collect();
+        let text = topology_paragraph(&profile, true);
+        assert!(text.len() < 4_000, "{}", text.len());
+        assert!(
+            text.contains(&format!("and {} more", 5000 - MAX_LISTED)),
+            "{text}"
+        );
+        assert!(!text.contains("h5000"));
     }
 
     #[test]
