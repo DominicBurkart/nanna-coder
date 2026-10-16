@@ -115,7 +115,13 @@ fn build(graph: &AssetGraph, environments: Option<Vec<String>>) -> ImpactAnalyze
 
 fn relative_to_root(root: &Path, path: &str) -> Result<String, ImpactError> {
     let given = Path::new(path);
-    if !given.is_absolute() {
+    let anchored = given.is_absolute()
+        || given.has_root()
+        || matches!(
+            given.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if !anchored {
         return Ok(path.to_string());
     }
     given
