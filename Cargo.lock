@@ -624,6 +624,7 @@ dependencies = [
  "git2",
  "glob",
  "image-builder",
+ "libc",
  "model",
  "nanna-effects",
  "proptest",
