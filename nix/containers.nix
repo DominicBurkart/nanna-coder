@@ -32,6 +32,7 @@ let
     pkgs.cacert
     pkgs.pkg-config
     pkgs.openssl
+    pkgs.openssl.dev
     pkgs.stdenv.cc
     pkgs.libssh2
     pkgs.zlib
@@ -64,6 +65,10 @@ let
     fi
     if ! grep -qxF "$(echo "$cmd" | cut -d/ -f1-4)" "$closure/store-paths"; then
       echo "dev container Cmd[0] store path is not in the dev image closure: $cmd" >&2
+      exit 1
+    fi
+    if ! PKG_CONFIG_PATH="$toolEnv/lib/pkgconfig" "$toolEnv/bin/pkg-config" --exists openssl; then
+      echo "openssl.pc is not discoverable through pkg-config in the dev image root: openssl-sys cannot build" >&2
       exit 1
     fi
     touch "$out"
