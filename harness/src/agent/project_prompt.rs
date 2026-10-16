@@ -118,7 +118,7 @@ fn backend_origin(raw: &str) -> String {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or("");
     let (host, port) = match host_port.rsplit_once(':') {
-        Some((host, port)) if !host.ends_with(']') || host.starts_with('[') => (host, Some(port)),
+        Some((host, port)) if !host_port.ends_with(']') => (host, Some(port)),
         _ => (host_port, None),
     };
     let scheme_ok = !scheme.is_empty()
@@ -500,10 +500,13 @@ mod tests {
             "http://127.0.0.1:8080/api/".to_string(),
             "not a url".to_string(),
             "http://user:pw@/x".to_string(),
+            "http://example.com/x".to_string(),
+            "http://[::1]:8080/p".to_string(),
+            "http://[::1]".to_string(),
         ];
         let text = topology_paragraph(&profile, true);
         assert!(text.contains(
-            "proxies https://host.example:5432, http://127.0.0.1:8080, invalid-backend to the backend"
+            "proxies https://host.example:5432, http://127.0.0.1:8080, invalid-backend, http://example.com, http://_::1_:8080, http://_::1_ to the backend"
         ), "{text}");
         for secret in ["pass", "token", "user", "frag", "/db", "pw", "/api"] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
