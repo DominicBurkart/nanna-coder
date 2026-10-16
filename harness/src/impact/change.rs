@@ -676,6 +676,22 @@ mod tests {
     }
 
     #[test]
+    fn an_added_line_after_the_new_side_is_exhausted_is_an_error() {
+        let diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +0,0 @@\n+x\n";
+        assert!(matches!(
+            Change::from_unified_diff(diff),
+            Err(DiffError::UnexpectedLine { line: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn a_symmetric_header_needs_an_odd_separator_layout() {
+        assert_eq!(symmetric_path("a"), None);
+        assert_eq!(symmetric_path("a/x b/xy"), None);
+        assert_eq!(symmetric_path("a/x b/x").as_deref(), Some("x"));
+    }
+
+    #[test]
     fn hunk_lines_that_contradict_the_header_counts_are_errors() {
         let extra_add = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,1 @@\n-x\n-y\n+z\n+w\n";
         assert!(matches!(
