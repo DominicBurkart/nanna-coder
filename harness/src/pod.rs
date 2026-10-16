@@ -723,9 +723,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn bring_up_command_picks_podman_fallback_when_pod_config_set() {
+    async fn assert_podman_fallback_selected_when_pod_config_set() {
         // When `nix` is unavailable OR no flake.nix is present in the
         // lookup dir, but `podman` is installed AND NANNA_POD_CONFIG is
         // set, bring_up_command must return the podman fallback. This
@@ -758,7 +756,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
+    async fn bring_up_command_picks_podman_fallback_when_pod_config_set() {
+        assert_podman_fallback_selected_when_pod_config_set().await;
+    }
+
+    async fn assert_bring_up_failed_when_podman_rejects_config() {
         // Drive the full bring-up branch with a real `podman play kube`
         // call against /dev/null. podman will fail to parse the empty
         // file, surfacing as PodError::BringUpFailed. This exercises the
@@ -802,6 +804,57 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
+    async fn ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
+        assert_bring_up_failed_when_podman_rejects_config().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
+    async fn podman_precheck_tests_are_stable_while_a_runtime_appears_on_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let installer = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let fake = crate::test_support::FakePodman::install_async(None).await;
+                    tokio::time::sleep(Duration::from_millis(4)).await;
+                    drop(fake);
+                    tokio::time::sleep(Duration::from_millis(4)).await;
+                }
+            })
+        };
+
+        let mut failures = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        for _ in 0..400 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let fallback = tokio::spawn(assert_podman_fallback_selected_when_pod_config_set());
+            if let Err(e) = fallback.await {
+                failures.push(e.to_string());
+                break;
+            }
+            let rejects = tokio::spawn(assert_bring_up_failed_when_podman_rejects_config());
+            if let Err(e) = rejects.await {
+                failures.push(e.to_string());
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        installer.await.unwrap();
+        assert!(
+            failures.is_empty(),
+            "podman precheck raced a runtime on PATH: {failures:?}"
+        );
     }
 
     #[tokio::test]
