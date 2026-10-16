@@ -128,12 +128,31 @@ async fn probe_ollama(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
+#[cfg(test)]
+const SERIAL_ENV_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
+
+#[cfg(test)]
+fn require_serial_env_locks(is_locked: impl Fn(&str) -> bool) {
+    for key in SERIAL_ENV_KEYS {
+        if !is_locked(key) {
+            panic!(
+                "test thread {:?} reached the bring-up path without serial lock `{}`: it must hold #[serial_test::serial({})]",
+                std::thread::current().name().unwrap_or("<unnamed>"),
+                key,
+                SERIAL_ENV_KEYS.join(", ")
+            );
+        }
+    }
+}
+
 /// Choose a bring-up command. Prefer `nix run .#start-pod` *only when a
 /// `flake.nix` is reachable from `flake_lookup_dir`* (`nix run .#start-pod`
 /// resolves the flake from CWD; a `nanna agent --work-dir <arbitrary>` run
 /// would otherwise fail with "flake not found"). Fall back to
 /// `podman play kube ${NANNA_POD_CONFIG}` when the env var is set.
 fn bring_up_command(flake_lookup_dir: &Path) -> Option<(String, Vec<String>)> {
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     // Test seam: `NANNA_TEST_BRING_UP_CMD=<path>` overrides every other
     // selection. Lets tests drive the full ensure_running success path
     // against `/usr/bin/true` + a local stub HTTP server.
@@ -213,6 +232,8 @@ async fn ensure_running_inner(
         debug!("pod ensure: skipped ({:?})", reason);
         return Ok(EnsureOutcome::Skipped(reason));
     }
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     if probe_ollama(&cfg.probe_url).await {
         debug!("pod ensure: ollama already reachable at {}", cfg.probe_url);
         return Ok(EnsureOutcome::AlreadyUp);
@@ -847,100 +868,32 @@ mod tests {
         }
     }
 
-    const SERIAL_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
-    const BRING_UP_REACHERS: [&str; 3] = [
-        "ensure_running(",
-        "ensure_running_inner(",
-        "bring_up_command(",
-    ];
-
-    fn unserialised_bring_up_reachers(src: &str) -> Vec<String> {
-        let tests_src = match src.find("mod tests {") {
-            Some(i) => &src[i..],
-            None => return Vec::new(),
-        };
-        let lines: Vec<&str> = tests_src.lines().collect();
-        let mut offenders = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let is_start = matches!(lines[i], "    #[test]" | "    #[tokio::test]");
-            if !is_start {
-                i += 1;
-                continue;
-            }
-            let mut end = i + 1;
-            while end < lines.len() && lines[end] != "    }" {
-                end += 1;
-            }
-            let block = &lines[i..end.min(lines.len() - 1) + 1];
-            let fn_idx = block
-                .iter()
-                .position(|l| {
-                    l.trim_start().starts_with("fn ") || l.trim_start().starts_with("async fn ")
-                })
-                .unwrap_or(block.len());
-            let (attrs, body) = block.split_at(fn_idx);
-            let name = body
-                .first()
-                .and_then(|l| l.split("fn ").nth(1))
-                .and_then(|l| l.split('(').next())
-                .unwrap_or("<unknown>")
-                .to_string();
-            let short_circuits = body.iter().any(|l| {
-                l.contains("disabled: true") || l.contains("ensure_running_inner(&cfg, true)")
-            });
-            let reaches = !name.starts_with("serial_invariant_")
-                && !short_circuits
-                && body
-                    .iter()
-                    .any(|l| BRING_UP_REACHERS.iter().any(|n| l.contains(n)));
-            let serialised = attrs.iter().any(|a| {
-                a.contains("serial_test::serial(") && SERIAL_KEYS.iter().all(|k| a.contains(k))
-            });
-            if reaches && !serialised {
-                offenders.push(name);
-            }
-            i = end + 1;
-        }
-        offenders
+    #[test]
+    fn require_serial_env_locks_passes_when_every_key_is_held() {
+        require_serial_env_locks(|_| true);
     }
 
     #[test]
-    fn serial_invariant_every_bring_up_reaching_test_is_serialised() {
-        let offenders = unserialised_bring_up_reachers(include_str!("pod.rs"));
-        assert!(
-            offenders.is_empty(),
-            "tests that can reach bring_up_command must carry #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]: {:?}",
-            offenders
-        );
+    #[should_panic(expected = "nanna_pod_config_env")]
+    fn require_serial_env_locks_panics_naming_the_missing_key() {
+        require_serial_env_locks(|k| k != "nanna_pod_config_env");
     }
 
     #[test]
-    fn serial_invariant_detects_removed_attribute() {
-        let src = include_str!("pod.rs").replace("\r\n", "\n");
-        let attr =
-            "    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]\n";
-        let target =
-            "    async fn ensure_running_inner_brings_up_via_test_seam_then_health_succeeds()";
-        let at = src.find(target).expect("target test present");
-        let attr_at = src[..at]
-            .rfind(attr)
-            .expect("attribute present before target");
-        let mut mutated = src.clone();
-        mutated.replace_range(attr_at..attr_at + attr.len(), "");
-        let offenders = unserialised_bring_up_reachers(&mutated);
-        assert!(
-            offenders
-                .iter()
-                .any(|n| n == "ensure_running_inner_brings_up_via_test_seam_then_health_succeeds"),
-            "mutation not detected: {:?}",
-            offenders
-        );
+    #[should_panic(expected = "require_serial_env_locks_panics_naming_the_thread")]
+    fn require_serial_env_locks_panics_naming_the_thread() {
+        require_serial_env_locks(|_| false);
     }
 
     #[test]
-    fn serial_invariant_detects_wrong_keys() {
-        let src = "mod tests {\n    #[test]\n    #[serial_test::serial(other)]\n    fn t() {\n        bring_up_command(x);\n    }\n}\n";
-        assert_eq!(unserialised_bring_up_reachers(src), vec!["t".to_string()]);
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    fn require_serial_env_locks_accepts_the_real_serial_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
+    }
+
+    #[test]
+    #[should_panic(expected = "must hold #[serial_test::serial")]
+    fn require_serial_env_locks_rejects_an_unserialised_test_with_the_real_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
     }
 }
