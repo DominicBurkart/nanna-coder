@@ -80,6 +80,15 @@ fn parse_dev_container(src: &str) -> Result<DevContainerPaths, WorkspaceError> {
     })
 }
 
+/// Paths inside the dev container that the harness makes writable, read from
+/// the shared `harness/dev-container.toml`.
+///
+/// ```
+/// let paths = harness::workspace::dev_container_paths().unwrap();
+/// assert_eq!(paths.cargo_home, "/tmp/cargo");
+/// assert_eq!(paths.tmp_dir, "/tmp");
+/// assert!(paths.cargo_home.starts_with(&paths.tmp_dir));
+/// ```
 pub fn dev_container_paths() -> Result<DevContainerPaths, WorkspaceError> {
     parse_dev_container(DEV_CONTAINER_CONFIG)
 }
