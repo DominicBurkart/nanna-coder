@@ -3965,6 +3965,22 @@ mod impact_tests {
         assert_ne!(failure(&task).0, "ImpactError");
     }
 
+    #[tokio::test]
+    async fn test_a_write_with_arguments_the_analyzer_cannot_read_fails_the_scored_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (_, task) = run(
+            repo.path(),
+            vec![tool_call_response(
+                "write_file",
+                serde_json::json!({"path": 5, "content": "x"}),
+            )],
+        )
+        .await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("write_file"), "{error}");
+    }
+
     #[cfg(not(windows))]
     #[tokio::test]
     async fn test_unreadable_workspace_changes_fail_a_scored_task() {
