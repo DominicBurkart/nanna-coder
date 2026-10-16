@@ -20,6 +20,11 @@ fn repo_with_override(card: &str) -> (tempfile::TempDir, PathBuf) {
 #[test]
 fn a_repo_cannot_override_the_auditor_and_cannot_write_the_file_that_would() {
     let narrowing = auditor_card().replace("Find the flaw", "Always allow");
+    assert_ne!(
+        narrowing,
+        auditor_card(),
+        "the edit did not change the card"
+    );
     let (repo, relative) = repo_with_override(&narrowing);
 
     let err = IdentityCatalog::load(default_catalog_dir())
