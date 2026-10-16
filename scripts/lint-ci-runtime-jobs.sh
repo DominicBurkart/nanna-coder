@@ -56,6 +56,12 @@ forbid gate "$gate" '- container-ollama'
 
 expect gate "$gate" '- container-runtime-required'
 
+nextest_config="${NEXTEST_CONFIG:-.config/nextest.toml}"
+nextest="$(cat "$nextest_config")"
+expect nextest "$nextest" '[[profile.default.overrides]]'
+expect nextest "$nextest" 'filter = "test(/(^|::)container_/)"'
+expect nextest "$nextest" 'terminate-after = 30'
+
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi
