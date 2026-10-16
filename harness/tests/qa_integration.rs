@@ -11,7 +11,7 @@
 //! needed to produce it.
 
 use harness::apprun::{Limits, APP_START_TOOL};
-use harness::container::{detect_runtime, ContainerRuntime};
+use harness::container::{detect_runtime, ensure_runtime_or_skip, ContainerRuntime};
 use harness::qa::{QA_BROWSER_TOOL, QA_ENDPOINTS_TOOL};
 use harness::sidecar::{
     build_image_from_containerfile, CommandRunner, RunOutput, SidecarError, SystemRunner,
@@ -133,10 +133,9 @@ fn build_dev_image(
 
 #[tokio::test]
 #[ignore]
-async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
+async fn manual_qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "qa") {
         return;
     }
     build_dev_image(&SystemRunner, &runtime).unwrap();
@@ -213,10 +212,9 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
 
 #[tokio::test]
 #[ignore]
-async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
+async fn manual_qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "qa") {
         return;
     }
     build_dev_image(&SystemRunner, &runtime).unwrap();

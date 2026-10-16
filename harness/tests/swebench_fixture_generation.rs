@@ -78,7 +78,7 @@ fn repo_root() -> PathBuf {
 
 #[test]
 #[ignore = "regenerates vendored fixtures; run explicitly with --ignored"]
-fn regenerate_swebench_verified_task_toml_fixtures() {
+fn manual_regenerate_swebench_verified_task_toml_fixtures() {
     let root = repo_root();
     let dataset = root.join("evals/datasets/swebench-verified-sample.jsonl");
     let tasks: Vec<SWEBenchTask> =

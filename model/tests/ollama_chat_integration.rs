@@ -23,7 +23,7 @@ fn assert_valid_response(response: &ChatResponse) {
 
 #[tokio::test]
 #[ignore]
-async fn test_health_check() {
+async fn ollama_health_check() {
     let provider = make_provider();
 
     let result = tokio::time::timeout(TIMEOUT, provider.health_check()).await;
@@ -45,7 +45,7 @@ async fn test_health_check() {
 
 #[tokio::test]
 #[ignore]
-async fn test_basic_chat() {
+async fn ollama_basic_chat() {
     let provider = make_provider();
     let request = ChatRequest::new(MODEL, vec![ChatMessage::user("What is 2+2?")]);
 
@@ -73,7 +73,7 @@ async fn test_basic_chat() {
 
 #[tokio::test]
 #[ignore]
-async fn test_chat_with_system_message() {
+async fn ollama_chat_with_system_message() {
     let provider = make_provider();
     let request = ChatRequest::new(
         MODEL,
@@ -102,7 +102,7 @@ async fn test_chat_with_system_message() {
 
 #[tokio::test]
 #[ignore]
-async fn test_chat_with_tool_definitions() {
+async fn ollama_chat_with_tool_definitions() {
     let provider = make_provider();
 
     let mut properties = HashMap::new();
@@ -172,7 +172,7 @@ async fn test_chat_with_tool_definitions() {
 
 #[tokio::test]
 #[ignore]
-async fn test_chat_response_structure() {
+async fn ollama_chat_response_structure() {
     let provider = make_provider();
     let request = ChatRequest::new(MODEL, vec![ChatMessage::user("Say hello.")]);
 
@@ -193,7 +193,7 @@ async fn test_chat_response_structure() {
 
 #[tokio::test]
 #[ignore]
-async fn test_invalid_model_returns_error() {
+async fn ollama_invalid_model_returns_error() {
     let provider = make_provider();
     let request = ChatRequest::new("nonexistent-model-xyz", vec![ChatMessage::user("Hello")]);
 
@@ -206,7 +206,7 @@ async fn test_invalid_model_returns_error() {
 
 #[tokio::test]
 #[ignore]
-async fn test_ollama_chat_preserves_roles() {
+async fn ollama_chat_preserves_roles() {
     let provider = make_provider();
 
     let messages = vec![
@@ -239,7 +239,7 @@ async fn test_ollama_chat_preserves_roles() {
 
 #[tokio::test]
 #[ignore]
-async fn test_ollama_tool_calling_roundtrip() {
+async fn ollama_tool_calling_roundtrip() {
     let provider = make_provider();
 
     let mut properties = HashMap::new();

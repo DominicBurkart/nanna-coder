@@ -5,8 +5,8 @@
 
 use harness::container::NetworkPolicy;
 use harness::container::{
-    detect_runtime, exec_in_container, load_image_from_path, start_container_with_fallback,
-    ContainerConfig,
+    detect_runtime, ensure_runtime_or_skip, exec_in_container, load_image_from_path,
+    start_container_with_fallback, ContainerConfig,
 };
 use harness::onboarding::{DeterministicOnboarder, Onboarder};
 use harness::sidecar::{
@@ -72,10 +72,9 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 
 #[tokio::test]
 #[ignore]
-async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
+async fn manual_postgres_sidecar_reachable_from_dev_container_with_injected_url() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "sidecar") {
         return;
     }
     let image_context = tempfile::tempdir().unwrap();
@@ -152,10 +151,9 @@ async fn postgres_sidecar_reachable_from_dev_container_with_injected_url() {
 
 #[tokio::test]
 #[ignore]
-async fn two_tasks_get_distinct_databases() {
+async fn manual_two_tasks_get_distinct_databases() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "sidecar") {
         return;
     }
     let ids = [
@@ -196,10 +194,9 @@ async fn two_tasks_get_distinct_databases() {
 /// wasm target is installed.
 #[tokio::test]
 #[ignore]
-async fn fixture_flake_builds_dev_container_with_profile_tools() {
+async fn manual_fixture_flake_builds_dev_container_with_profile_tools() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !ensure_runtime_or_skip(&runtime, "sidecar") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

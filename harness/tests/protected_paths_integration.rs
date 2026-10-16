@@ -66,9 +66,9 @@ async fn assert_refused(registry: &ToolRegistry, command: &str) {
 }
 
 #[tokio::test]
-async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_dev_container() {
-    if !detect_runtime().is_available() {
-        eprintln!("SKIPPED: no container runtime available");
+async fn container_protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_dev_container(
+) {
+    if !harness::container::ensure_runtime_or_skip(&detect_runtime(), "protected paths test") {
         return;
     }
     let host = tempfile::tempdir().unwrap();
@@ -154,9 +154,8 @@ async fn assert_blocked(registry: &ToolRegistry, command: &str) {
 }
 
 #[tokio::test]
-async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_shell() {
-    if !detect_runtime().is_available() {
-        eprintln!("SKIPPED: no container runtime available");
+async fn container_protected_roots_absent_at_container_start_cannot_be_created_from_the_shell() {
+    if !harness::container::ensure_runtime_or_skip(&detect_runtime(), "protected paths test") {
         return;
     }
     let host = tempfile::tempdir().unwrap();

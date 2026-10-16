@@ -7,3 +7,7 @@
 # Tracked in issue #238.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = "test(/(^|::)container_/)"
+slow-timeout = { period = "60s", terminate-after = 30 }

@@ -8,6 +8,7 @@
 
 use harness::auditor::eval::{default_cases_dir, default_catalog_dir, score, AuditorEvalCase};
 use harness::auditor::{AuditContext, ModelAuditor};
+use harness::container::skip_or_panic;
 use harness::identity::IdentityCatalog;
 use model::{ModelProvider, OllamaConfig, OllamaProvider};
 use std::sync::Arc;
@@ -22,17 +23,15 @@ fn resolve_model() -> Option<String> {
 
 #[tokio::test]
 #[ignore = "requires a reachable Ollama instance and NANNA_EVAL_MODEL"]
-async fn model_auditor_scores_the_shipped_cases() {
+async fn ollama_auditor_scores_the_shipped_cases() {
     let Some(model) = resolve_model() else {
-        eprintln!("model_auditor_scores_the_shipped_cases: NANNA_EVAL_MODEL not set; skipping");
+        skip_or_panic("NANNA_EVAL_MODEL not set");
         return;
     };
     let provider: Arc<dyn ModelProvider> = match OllamaProvider::new(OllamaConfig::default()) {
         Ok(provider) => Arc::new(provider),
         Err(e) => {
-            eprintln!(
-                "model_auditor_scores_the_shipped_cases: provider unavailable ({e}); skipping"
-            );
+            skip_or_panic(&format!("ollama provider unavailable ({e})"));
             return;
         }
     };

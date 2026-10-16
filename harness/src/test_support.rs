@@ -4,6 +4,11 @@ pub(crate) async fn hold_path_async() -> tokio::sync::MutexGuard<'static, ()> {
     PATH_LOCK.lock().await
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn hold_path_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    PATH_LOCK.blocking_lock()
+}
+
 #[cfg(unix)]
 mod fake {
     use super::PATH_LOCK;

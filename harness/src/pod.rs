@@ -725,14 +725,14 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn bring_up_command_picks_podman_fallback_when_pod_config_set() {
+    async fn container_bring_up_command_picks_podman_fallback_when_pod_config_set() {
         // When `nix` is unavailable OR no flake.nix is present in the
         // lookup dir, but `podman` is installed AND NANNA_POD_CONFIG is
         // set, bring_up_command must return the podman fallback. This
         // skips when podman isn't on PATH so non-podman dev hosts don't
         // false-fail.
         if which::which("podman").is_err() {
-            eprintln!("podman not on PATH; skipping podman-fallback test");
+            crate::container::skip_or_panic("podman not on PATH; podman-fallback test");
             return;
         }
         let no_flake_dir = std::env::temp_dir().join("nanna_no_flake_for_podman_test");
@@ -758,14 +758,14 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(nanna_pod_config_env, nanna_test_bring_up_cmd_env)]
-    async fn ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
+    async fn container_ensure_running_returns_bring_up_failed_when_podman_rejects_config() {
         // Drive the full bring-up branch with a real `podman play kube`
         // call against /dev/null. podman will fail to parse the empty
         // file, surfacing as PodError::BringUpFailed. This exercises the
         // ensure_running path from probe-fail through Command spawn,
         // status check, and the BringUpFailed branch.
         if which::which("podman").is_err() {
-            eprintln!("podman not on PATH; skipping bring-up failure test");
+            crate::container::skip_or_panic("podman not on PATH; bring-up failure test");
             return;
         }
         // Make sure the nix branch is NOT chosen.

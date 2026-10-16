@@ -17,7 +17,7 @@ fn cases_dir() -> PathBuf {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_returns_result() {
+async fn ollama_run_eval_returns_result() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
@@ -27,7 +27,9 @@ async fn test_run_eval_returns_result() {
     let result = match run_eval(&case, case_dir, &config).await {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
-            eprintln!("test_run_eval_returns_result: model provider unavailable ({msg}); skipping");
+            harness::container::skip_or_panic(&format!(
+                "ollama_run_eval_returns_result: model provider unavailable ({msg})"
+            ));
             return;
         }
         Err(e) => panic!("run_eval failed unexpectedly: {e:?}"),
@@ -39,7 +41,7 @@ async fn test_run_eval_returns_result() {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_timeout() {
+async fn ollama_run_eval_timeout() {
     let toml_str = r#"
 [case]
 id = "timeout-test"
@@ -74,10 +76,9 @@ timeout_secs = 1
             // if provider init fails (e.g. daemon gone mid-suite), surface it
             // rather than panic so the failure mode is distinct from a real
             // timeout-plumbing regression.
-            eprintln!(
-                "test_run_eval_timeout: model provider unavailable ({msg}); \
-                 skipping timeout assertion"
-            );
+            harness::container::skip_or_panic(&format!(
+                "ollama_run_eval_timeout: model provider unavailable ({msg})"
+            ));
         }
         other => panic!("expected Err(Timeout) (or ModelProvider unavailable), got {other:?}"),
     }
@@ -85,7 +86,7 @@ timeout_secs = 1
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_run_eval_isolation() {
+async fn ollama_run_eval_isolation() {
     let cases_dir = cases_dir();
     let task_toml = cases_dir.join("happy-path-001/task.toml");
     let case = EvalCase::from_toml_file(&task_toml).unwrap();
@@ -95,7 +96,9 @@ async fn test_run_eval_isolation() {
     let result1 = match run_eval(&case, case_dir, &config).await {
         Ok(r) => r,
         Err(EvalRunnerError::ModelProvider(msg)) => {
-            eprintln!("test_run_eval_isolation: model provider unavailable ({msg}); skipping");
+            harness::container::skip_or_panic(&format!(
+                "ollama_run_eval_isolation: model provider unavailable ({msg})"
+            ));
             return;
         }
         Err(e) => panic!("run_eval failed unexpectedly: {e:?}"),
@@ -111,7 +114,7 @@ async fn test_run_eval_isolation() {
 
 #[tokio::test]
 #[ignore] // requires Ollama instance
-async fn test_discover_and_run_all_cases() {
+async fn ollama_discover_and_run_all_cases() {
     let cases_dir = cases_dir();
     let cases = EvalCase::discover(&cases_dir).unwrap();
     assert!(
@@ -126,9 +129,9 @@ async fn test_discover_and_run_all_cases() {
         match run_eval(eval_case, case_path, &config).await {
             Ok(result) => assert_eq!(result.case_id, eval_case.case.id),
             Err(EvalRunnerError::ModelProvider(msg)) => {
-                eprintln!(
-                    "test_discover_and_run_all_cases: model provider unavailable ({msg}); skipping"
-                );
+                harness::container::skip_or_panic(&format!(
+                    "ollama_discover_and_run_all_cases: model provider unavailable ({msg})"
+                ));
                 return;
             }
             Err(e) => panic!(
