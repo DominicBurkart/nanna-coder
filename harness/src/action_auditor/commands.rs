@@ -2067,7 +2067,6 @@ fn inspect_publish(program: &str, args: &[Word]) -> Result<(), String> {
     };
     let leading = args
         .iter()
-        .take_while(|a| a.text != "--")
         .filter(|a| !is_flag(a) && !a.text.starts_with('+'))
         .take(*window);
     for arg in leading {
@@ -4537,5 +4536,79 @@ mod tests {
         script.push_str("echo ");
         script.push_str(&"$a".repeat(100));
         blocked(&script, "too large");
+    }
+
+    #[test]
+    fn matrix_survivors_taint_and_scoping() {
+        blocked(
+            "m=ls; for m in curl; do $m x; done",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "m=ls; select m in a; do $m x; done",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "X=ls; declare -n ref=X; ref=curl; $X x",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "X=curl; (true) && X=ls; $X x",
+            "cannot be resolved statically",
+        );
+        blocked(
+            "X=curl; echo a |& X=ls; $X x",
+            "cannot be resolved statically",
+        );
+        blocked("$(true)env x", "cannot be resolved statically");
+    }
+
+    #[test]
+    fn matrix_survivors_syntax_and_redirects() {
+        blocked("cat > f <<-EOF\n\tbody\n\tEOF\ncurl x", "can send data");
+        allowed("cd sub || exit");
+        allowed("cd sub &> /dev/null; ls");
+        blocked("cat <<< x\ncurl y", "can send data");
+        blocked("2>/dev/null curl x", "can send data");
+        blocked("echo x > out*", "to a glob");
+        allowed("echo x >&2; ./2");
+        blocked("cd $X; cat < .s''sh/k", "credential");
+        blocked("cd $X; cat .s''sh/k", "credential");
+        blocked("cat .ssh/../x", "credential");
+    }
+
+    #[test]
+    fn matrix_survivors_paths_and_directories() {
+        blocked("cd -P /; rm -rf home", "outside the workspace");
+        allowed("echo x > f; cd sub; ./f");
+        blocked("rm --recursive .", "destructive");
+        allowed("rm -- -r .");
+        blocked("sed -i s/a/b/ ../y x", "escapes the workspace");
+        allowed("sed -i -e s/a/b/ -e ../y file.txt");
+        allowed("sed -i --expression s/a/b/ --expression ../y file.txt");
+        blocked("sed -i s/a/b/ -- -/../x", "escapes the workspace");
+        blocked("find . -exec echo {} + -exec curl x ;", "can send data");
+    }
+
+    #[test]
+    fn matrix_survivors_shells_interpreters_publish() {
+        blocked("bash -s script.sh", "stdin");
+        allowed("bash -- -weird.sh");
+        blocked("python -m ftplib", "network service");
+        blocked("npm --a --b publish", "publishes outside the workspace");
+        blocked("npm -- publish", "publishes outside the workspace");
+        allowed("npm run build -- publish");
+    }
+
+    #[test]
+    fn matrix_survivors_git_and_gh() {
+        blocked(
+            "git -c $(true)user.name=x status",
+            "can redirect or execute",
+        );
+        allowed("git --literal-pathspecs status");
+        allowed("git --no-optional-locks status");
+        blocked("git fetch $(true)origin", "configured remote");
+        allowed("gh pr view 5 -R o/r");
     }
 }
