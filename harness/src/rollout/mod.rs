@@ -79,6 +79,16 @@ pub enum RolloutError {
     /// No rollout with this id is in the log.
     #[error("unknown rollout `{0}`")]
     UnknownRollout(String),
+    /// Another writer moved the rollout since it was read.
+    #[error("rollout {id} changed concurrently: expected {expected}, found {actual}")]
+    Conflict {
+        /// Rollout concerned.
+        id: String,
+        /// State the writer read, `created` when it expected no record.
+        expected: String,
+        /// State the log holds now, `created` when it holds no record.
+        actual: String,
+    },
     /// The requested state does not follow the current one.
     #[error("rollout {id} cannot move from {from} to {to}")]
     InvalidTransition {
