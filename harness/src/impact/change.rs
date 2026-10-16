@@ -245,14 +245,15 @@ impl Change {
                 continue;
             }
             let path = root.join(&file.path);
+            if path.is_dir() {
+                continue;
+            }
             match std::fs::read_to_string(&path) {
                 Ok(content) => file.content = Some(content),
                 Err(error)
                     if matches!(
                         error.kind(),
-                        std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::InvalidData
-                            | std::io::ErrorKind::IsADirectory
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
                     ) => {}
                 Err(source) => return Err(ImpactError::Io { path, source }),
             }
