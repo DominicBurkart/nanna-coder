@@ -3965,6 +3965,7 @@ mod impact_tests {
         assert_ne!(failure(&task).0, "ImpactError");
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_unreadable_workspace_changes_fail_a_scored_task() {
         let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
