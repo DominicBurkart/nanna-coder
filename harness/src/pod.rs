@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn serial_invariant_detects_removed_attribute() {
-        let src = include_str!("pod.rs");
+        let src = include_str!("pod.rs").replace("\r\n", "\n");
         let attr =
             "    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]\n";
         let target =
@@ -926,7 +926,7 @@ mod tests {
         let attr_at = src[..at]
             .rfind(attr)
             .expect("attribute present before target");
-        let mut mutated = String::from(src);
+        let mut mutated = src.clone();
         mutated.replace_range(attr_at..attr_at + attr.len(), "");
         let offenders = unserialised_bring_up_reachers(&mutated);
         assert!(
