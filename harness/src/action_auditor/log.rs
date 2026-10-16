@@ -23,6 +23,35 @@ pub struct ActionAuditLogEntry {
     pub verdict: ActionVerdict,
 }
 
+/// Environment variable overriding the action audit log location.
+pub const ACTION_AUDIT_PATH_ENV: &str = "NANNA_ACTION_AUDIT_PATH";
+
+/// Location of the action audit log: `NANNA_ACTION_AUDIT_PATH` when set,
+/// otherwise `action_audit.jsonl` next to the queue log.
+///
+/// ```
+/// use harness::action_auditor::action_audit_path_from;
+/// use std::path::PathBuf;
+///
+/// assert_eq!(
+///     action_audit_path_from(Some("/var/lib/nanna/a.jsonl".into()), None),
+///     Some(PathBuf::from("/var/lib/nanna/a.jsonl"))
+/// );
+/// assert_eq!(
+///     action_audit_path_from(None, Some(PathBuf::from("/home/u/.local/state/nanna/queue.jsonl"))),
+///     Some(PathBuf::from("/home/u/.local/state/nanna/action_audit.jsonl"))
+/// );
+/// assert_eq!(action_audit_path_from(None, None), None);
+/// ```
+pub fn action_audit_path_from(
+    override_path: Option<std::ffi::OsString>,
+    queue_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_path
+        .map(PathBuf::from)
+        .or_else(|| queue_path.map(|q| q.with_file_name("action_audit.jsonl")))
+}
+
 #[derive(Clone)]
 enum Backing {
     Memory(Arc<Mutex<Vec<ActionAuditLogEntry>>>),
@@ -85,6 +114,13 @@ impl ActionAuditLog {
     pub fn file(path: impl Into<PathBuf>) -> Self {
         Self {
             backing: Backing::File(path.into()),
+        }
+    }
+
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        match &self.backing {
+            Backing::File(path) => Some(path),
+            Backing::Memory(_) => None,
         }
     }
 

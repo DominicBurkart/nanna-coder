@@ -829,6 +829,14 @@ fn resolve_escalation_path(queue_path: &std::path::Path) -> std::path::PathBuf {
     .expect("a queue path always yields an escalation path")
 }
 
+fn resolve_action_audit_path(queue_path: &std::path::Path) -> std::path::PathBuf {
+    harness::action_auditor::action_audit_path_from(
+        std::env::var_os(harness::action_auditor::ACTION_AUDIT_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields an action audit path")
+}
+
 fn run_escalation_resolve(
     id: &str,
     path: Option<std::path::PathBuf>,
@@ -1091,22 +1099,20 @@ async fn run_agent(
     Ok(())
 }
 
-async fn run_mcp_server(
+async fn build_mcp_task_manager(
+    provider: std::sync::Arc<OllamaProvider>,
     model: &str,
-    max_iterations: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+    queue_path: &std::path::Path,
+    lease_path: &std::path::Path,
+    escalation_path: &std::path::Path,
+    action_audit_path: &std::path::Path,
+) -> Result<std::sync::Arc<harness::task::TaskManager>, Box<dyn std::error::Error>> {
     use harness::escalation::EscalationLog;
     use harness::leases::JsonlLeaseStore;
-    use harness::mcp::NannaMcpServer;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
-    let provider = Arc::new(OllamaProvider::new(config)?);
-    let queue_path = resolve_queue_path(None)?;
-    let lease_path = resolve_lease_path(&queue_path);
-    let escalation_path = resolve_escalation_path(&queue_path);
     let identities = match harness::identity::IdentityCatalog::load_default() {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1114,26 +1120,73 @@ async fn run_mcp_server(
             harness::identity::IdentityCatalog::default()
         }
     };
-    let task_manager = Arc::new(
+    Ok(Arc::new(
         TaskManager::restore(
             DEFAULT_MAX_CONCURRENT_TASKS,
             Box::new(HybridPolicy::default()),
-            Box::new(JsonlQueueStore::open(&queue_path)?),
-            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+            Box::new(JsonlQueueStore::open(queue_path)?),
+            Arc::new(JsonlLeaseStore::open(lease_path)?),
             provider.clone(),
             &identities,
         )
         .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
-    );
+        .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
+        .with_action_log(harness::action_auditor::ActionAuditLog::file(
+            action_audit_path,
+        ))
+        .with_action_model(provider, model),
+    ))
+}
+
+struct McpPaths {
+    lease: std::path::PathBuf,
+    escalation: std::path::PathBuf,
+    action_audit: std::path::PathBuf,
+}
+
+async fn start_mcp_task_manager(
+    provider: std::sync::Arc<OllamaProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+) -> Result<(std::sync::Arc<harness::task::TaskManager>, McpPaths), Box<dyn std::error::Error>> {
+    let paths = McpPaths {
+        lease: resolve_lease_path(queue_path),
+        escalation: resolve_escalation_path(queue_path),
+        action_audit: resolve_action_audit_path(queue_path),
+    };
+    let manager = build_mcp_task_manager(
+        provider,
+        model,
+        queue_path,
+        &paths.lease,
+        &paths.escalation,
+        &paths.action_audit,
+    )
+    .await?;
+    Ok((manager, paths))
+}
+
+async fn run_mcp_server(
+    model: &str,
+    max_iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::mcp::NannaMcpServer;
+    use std::sync::Arc;
+
+    let config = OllamaConfig::default();
+    let provider = Arc::new(OllamaProvider::new(config)?);
+    let queue_path = resolve_queue_path(None)?;
+    let (task_manager, paths) =
+        start_mcp_task_manager(provider.clone(), model, &queue_path).await?;
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
+        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {}, action audit: {})",
         model,
         max_iterations,
         queue_path.display(),
-        lease_path.display(),
-        escalation_path.display()
+        paths.lease.display(),
+        paths.escalation.display(),
+        paths.action_audit.display()
     );
 
     let server = Arc::new(NannaMcpServer::new(
@@ -1212,6 +1265,48 @@ mod tests {
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
     };
+
+    #[tokio::test]
+    async fn the_production_mcp_task_manager_has_a_file_backed_audit_log_and_a_model_auditor() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("action_audit.jsonl");
+        let provider = std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+        let manager = build_mcp_task_manager(
+            provider,
+            "strong-model",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            &dir.path().join("escalations.jsonl"),
+            &audit_path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.action_log_path(), Some(audit_path));
+        assert!(manager.has_action_model());
+    }
+
+    #[tokio::test]
+    async fn the_mcp_server_wires_the_action_audit_log_to_its_own_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let provider = std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+        let (manager, paths) = start_mcp_task_manager(provider, "strong-model", &queue)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.action_log_path(),
+            Some(resolve_action_audit_path(&queue))
+        );
+        assert_ne!(
+            manager.action_log_path(),
+            Some(resolve_escalation_path(&queue))
+        );
+        assert_ne!(manager.action_log_path(), Some(resolve_lease_path(&queue)));
+        assert_eq!(paths.action_audit, resolve_action_audit_path(&queue));
+        assert_eq!(paths.escalation, resolve_escalation_path(&queue));
+        assert_eq!(paths.lease, resolve_lease_path(&queue));
+        assert!(manager.has_action_model());
+    }
 
     fn fixture_run(scenario: &str) -> SweBenchRunResult {
         SweBenchRunResult {
