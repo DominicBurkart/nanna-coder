@@ -15,6 +15,31 @@
 //! `reads` hop between the asset and the nearest touched asset. Depth 0 counts
 //! in full, depth 1 half, depth 2 a quarter, rounding down. Adding edges or
 //! touched assets can therefore never lower the score.
+//!
+//! # What scores zero without a marker
+//!
+//! The score only counts what the analysis could map to a declared asset, and
+//! nothing in a [`BlastRadius`] says what it could not map. Each of these
+//! contributes zero and leaves no trace: a changed path that no `owners` glob
+//! or extractor attributes to an asset, evidence naming an asset the manifest
+//! does not declare, a deploy to an environment outside the deploy template,
+//! and a repository with no manifest (no radius at all). A score of zero
+//! therefore means "nothing recognised", never "known to be safe". Tracked in
+//! #847.
+//!
+//! Two further inputs are skipped quietly. A changed file that is deleted,
+//! not valid UTF-8 or a directory has no content for the SQL and route
+//! extractors (its path-based owners still apply; #894). A failed agent run
+//! gets no task-level radius (#895).
+//!
+//! # Tool-call paths
+//!
+//! A path given to a workspace-writing tool call is resolved lexically against
+//! the workspace root before it is matched: `.` components and repeated
+//! separators are dropped, `..` removes the previous component, and a path
+//! that climbs above the root, resolves to the root itself, or is absolute
+//! outside the workspace is an [`ImpactError::OutsideWorkspace`] error, not a
+//! score. Symlinks are not followed.
 
 mod analyzer;
 mod change;
