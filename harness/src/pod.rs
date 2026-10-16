@@ -703,6 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     async fn ensure_running_returns_already_up_when_probe_succeeds() {
         let url = start_ok_http_server().await;
         let cfg = EnsureConfig {
@@ -844,5 +845,102 @@ mod tests {
                 other
             ),
         }
+    }
+
+    const SERIAL_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
+    const BRING_UP_REACHERS: [&str; 3] = [
+        "ensure_running(",
+        "ensure_running_inner(",
+        "bring_up_command(",
+    ];
+
+    fn unserialised_bring_up_reachers(src: &str) -> Vec<String> {
+        let tests_src = match src.find("mod tests {") {
+            Some(i) => &src[i..],
+            None => return Vec::new(),
+        };
+        let lines: Vec<&str> = tests_src.lines().collect();
+        let mut offenders = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let is_start = matches!(lines[i], "    #[test]" | "    #[tokio::test]");
+            if !is_start {
+                i += 1;
+                continue;
+            }
+            let mut end = i + 1;
+            while end < lines.len() && lines[end] != "    }" {
+                end += 1;
+            }
+            let block = &lines[i..end.min(lines.len() - 1) + 1];
+            let fn_idx = block
+                .iter()
+                .position(|l| {
+                    l.trim_start().starts_with("fn ") || l.trim_start().starts_with("async fn ")
+                })
+                .unwrap_or(block.len());
+            let (attrs, body) = block.split_at(fn_idx);
+            let name = body
+                .first()
+                .and_then(|l| l.split("fn ").nth(1))
+                .and_then(|l| l.split('(').next())
+                .unwrap_or("<unknown>")
+                .to_string();
+            let short_circuits = body.iter().any(|l| {
+                l.contains("disabled: true") || l.contains("ensure_running_inner(&cfg, true)")
+            });
+            let reaches = !name.starts_with("serial_invariant_")
+                && !short_circuits
+                && body
+                    .iter()
+                    .any(|l| BRING_UP_REACHERS.iter().any(|n| l.contains(n)));
+            let serialised = attrs.iter().any(|a| {
+                a.contains("serial_test::serial(") && SERIAL_KEYS.iter().all(|k| a.contains(k))
+            });
+            if reaches && !serialised {
+                offenders.push(name);
+            }
+            i = end + 1;
+        }
+        offenders
+    }
+
+    #[test]
+    fn serial_invariant_every_bring_up_reaching_test_is_serialised() {
+        let offenders = unserialised_bring_up_reachers(include_str!("pod.rs"));
+        assert!(
+            offenders.is_empty(),
+            "tests that can reach bring_up_command must carry #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]: {:?}",
+            offenders
+        );
+    }
+
+    #[test]
+    fn serial_invariant_detects_removed_attribute() {
+        let src = include_str!("pod.rs");
+        let attr =
+            "    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]\n";
+        let target =
+            "    async fn ensure_running_inner_brings_up_via_test_seam_then_health_succeeds()";
+        let at = src.find(target).expect("target test present");
+        let attr_at = src[..at]
+            .rfind(attr)
+            .expect("attribute present before target");
+        let mut mutated = String::from(src);
+        mutated.replace_range(attr_at..attr_at + attr.len(), "");
+        let offenders = unserialised_bring_up_reachers(&mutated);
+        assert!(
+            offenders
+                .iter()
+                .any(|n| n == "ensure_running_inner_brings_up_via_test_seam_then_health_succeeds"),
+            "mutation not detected: {:?}",
+            offenders
+        );
+    }
+
+    #[test]
+    fn serial_invariant_detects_wrong_keys() {
+        let src = "mod tests {\n    #[test]\n    #[serial_test::serial(other)]\n    fn t() {\n        bring_up_command(x);\n    }\n}\n";
+        assert_eq!(unserialised_bring_up_reachers(src), vec!["t".to_string()]);
     }
 }
