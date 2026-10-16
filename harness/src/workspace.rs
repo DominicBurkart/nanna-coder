@@ -28,6 +28,71 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
+const DEV_CONTAINER_CONFIG: &str = include_str!("../dev-container.toml");
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevContainerConfig {
+    cargo_home: String,
+    tmp_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevContainerPaths {
+    pub cargo_home: String,
+    pub tmp_dir: String,
+}
+
+fn require_posix_absolute(key: &str, value: &str) -> Result<(), WorkspaceError> {
+    if !value.starts_with('/') {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "{key} must be an absolute path, got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_dev_container(src: &str) -> Result<DevContainerPaths, WorkspaceError> {
+    let config: DevContainerConfig = toml::from_str(src)
+        .map_err(|e| WorkspaceError::InvalidDevContainerConfig(e.to_string()))?;
+    require_posix_absolute("cargo_home", &config.cargo_home)?;
+    require_posix_absolute("tmp_dir", &config.tmp_dir)?;
+    if config.tmp_dir.ends_with('/') {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "tmp_dir must name a directory below the root without a trailing slash, got {:?}",
+            config.tmp_dir
+        )));
+    }
+    let inside = config.cargo_home == config.tmp_dir
+        || config
+            .cargo_home
+            .strip_prefix(config.tmp_dir.as_str())
+            .is_some_and(|rest| rest.starts_with('/'));
+    if !inside {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "cargo_home {:?} must be inside tmp_dir {:?}",
+            config.cargo_home, config.tmp_dir
+        )));
+    }
+    Ok(DevContainerPaths {
+        cargo_home: config.cargo_home,
+        tmp_dir: config.tmp_dir,
+    })
+}
+
+/// Paths inside the dev container that the harness makes writable, read from
+/// the shared `harness/dev-container.toml`.
+///
+/// ```
+/// let paths = harness::workspace::dev_container_paths().unwrap();
+/// assert_eq!(paths.cargo_home, "/tmp/cargo");
+/// assert_eq!(paths.tmp_dir, "/tmp");
+/// assert!(paths.cargo_home.starts_with(&paths.tmp_dir));
+/// ```
+pub fn dev_container_paths() -> Result<DevContainerPaths, WorkspaceError> {
+    parse_dev_container(DEV_CONTAINER_CONFIG)
+}
+
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
     #[error("Git worktree creation failed: {0}")]
@@ -42,6 +107,8 @@ pub enum WorkspaceError {
     FormatPatchFailed(String),
     #[error("Container setup failed: {0}")]
     ContainerSetupFailed(String),
+    #[error("Invalid harness/dev-container.toml: {0}")]
+    InvalidDevContainerConfig(String),
     #[error("Refusing to produce a patch: {0}")]
     ProtectedPath(ProtectedPathViolation),
     #[error("IO error: {0}")]
@@ -269,6 +336,7 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
+        let tmp_dir = dev_container_paths()?.tmp_dir;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -295,7 +363,10 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let mut additional_args = vec![worktree_mount_arg(&workspace_path)];
+        let mut additional_args = vec![
+            worktree_mount_arg(&workspace_path),
+            format!("--tmpfs={tmp_dir}:rw,mode=1777"),
+        ];
         let mut env_vars = vec![];
         if let Some(set) = &sidecars {
             additional_args.extend(set.container_args());
@@ -1459,6 +1530,103 @@ mod tests {
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
         assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_parse_dev_container_accepts_a_cargo_home_inside_the_tmp_dir() {
+        let paths =
+            parse_dev_container("cargo_home = \"/opt/t/cargo\"\ntmp_dir = \"/opt/t\"\n").unwrap();
+        assert_eq!(paths.cargo_home, "/opt/t/cargo");
+        assert_eq!(paths.tmp_dir, "/opt/t");
+        let same = parse_dev_container("cargo_home = \"/opt/t\"\ntmp_dir = \"/opt/t\"\n").unwrap();
+        assert_eq!(same.cargo_home, same.tmp_dir);
+    }
+
+    #[test]
+    fn test_parse_dev_container_rejects_invalid_config() {
+        for src in [
+            "",
+            "tmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"",
+            "cargo_home = \"relative/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"C:\\\\cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"C:/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"\\\\cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = 3\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"C:/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"\\\\tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/tmp/\"",
+            "cargo_home = \"/\"\ntmp_dir = \"/\"",
+            "cargo_home = \"/tmp/\"\ntmp_dir = \"/tmp/\"",
+            "cargo_home = \"/tmp2/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/var/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/tmp\"\nextra = 1",
+            "not toml at all =",
+        ] {
+            let err = parse_dev_container(src).unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::InvalidDevContainerConfig(_)),
+                "{src:?} -> {err:?}"
+            );
+            assert!(err.to_string().contains("dev-container.toml"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_shipped_dev_container_config_parses_to_the_tmp_paths() {
+        let paths = dev_container_paths().unwrap();
+        assert_eq!(paths.cargo_home, "/tmp/cargo");
+        assert_eq!(paths.tmp_dir, "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_gives_the_tmp_dir_a_world_writable_tmpfs() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-cargohome"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = config.run_args(&runtime, "mock-image:latest");
+            let tmpfs: Vec<&String> = args.iter().filter(|a| a.starts_with("--tmpfs=")).collect();
+            assert_eq!(
+                tmpfs,
+                vec![&format!(
+                    "--tmpfs={}:rw,mode=1777",
+                    dev_container_paths().unwrap().tmp_dir
+                )],
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "--privileged"));
+        }
         ws.cleanup().unwrap();
     }
 
