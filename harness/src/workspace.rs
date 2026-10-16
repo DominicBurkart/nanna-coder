@@ -1107,6 +1107,7 @@ mod tests {
 
     async fn assert_container_setup_fails_without_runtime() {
         use crate::container::detect_runtime;
+        let _path = crate::test_support::hold_path_async().await;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
