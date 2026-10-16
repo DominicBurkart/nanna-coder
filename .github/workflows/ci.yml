@@ -124,6 +124,7 @@ jobs:
       run: |
         echo "Building example dev container image..."
         nix build path:tests/integration/repo#devContainerImage --no-link
+        nix build .#checks.x86_64-linux.dev-container-cmd --no-link
         echo "Dev container image built successfully"
 
     - name: Run unit tests

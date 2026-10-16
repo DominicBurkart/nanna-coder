@@ -522,7 +522,9 @@ fn fake_rollout_log(
     std::fs::create_dir_all(&dir)?;
     let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
     if let Some(record) = seed {
-        log.append(None, record)?;
+        let mut seed = record.clone();
+        seed.revision = 0;
+        log.append(None, &mut seed)?;
     }
     Ok(log)
 }
@@ -1168,7 +1170,11 @@ async fn run_backlog_sync(
 
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
-    let sink = StoreSink::open(Box::new(store))?;
+    let identities = load_identities()
+        .iter()
+        .map(|identity| identity.name().to_string())
+        .collect::<Vec<_>>();
+    let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
     let report = backlog_sync(&client, &sink, &config).await?;
     println!(
@@ -1653,17 +1659,17 @@ mod tests {
             chrono::Utc::now(),
         );
         let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
-        log.append(None, &record).unwrap();
+        log.append(None, &mut record).unwrap();
         let pending = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
             .unwrap();
-        log.append(Some(&pending), &record).unwrap();
+        log.append(Some(&pending), &mut record).unwrap();
         let stepping = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
             .unwrap();
-        log.append(Some(&stepping), &record).unwrap();
+        log.append(Some(&stepping), &mut record).unwrap();
         let before = std::fs::read_to_string(&real_path).unwrap();
         run_deploy(DeployCommands::RollForward {
             id: "rollout-real".into(),
