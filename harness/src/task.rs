@@ -2013,6 +2013,19 @@ mod tests {
         assert!(prompt.contains("legacy rules"));
     }
 
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
     fn fullstack_fixture() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack")
     }
@@ -2035,13 +2048,7 @@ mod tests {
     fn test_build_task_system_prompt_keeps_guidance_before_topology() {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("cp")
-            .arg("-r")
-            .arg(format!("{}/.", fullstack_fixture().display()))
-            .arg(dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        copy_dir(&fullstack_fixture(), dir.path());
         std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\n").unwrap();
         let prompt = build_task_system_prompt(dir.path(), true);
         let guidance = prompt.find("<repo-guidance").unwrap();
