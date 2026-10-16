@@ -52,29 +52,16 @@ pub fn diff_against(repo: &Path, rev: &str) -> Result<String, ImpactError> {
         .recurse_untracked_dirs(true);
     let diff = repository.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
     let mut out = String::new();
-    let mut invalid_header = false;
     let printed = diff.print(git2::DiffFormat::Patch, |_, _, line| {
         match line.origin() {
             origin @ ('+' | '-' | ' ') => {
                 out.push(origin);
                 out.push_str(&String::from_utf8_lossy(line.content()));
             }
-            'F' | 'H' => match std::str::from_utf8(line.content()) {
-                Ok(text) => out.push_str(text),
-                Err(_) => {
-                    invalid_header = true;
-                    return false;
-                }
-            },
             _ => out.push_str(&String::from_utf8_lossy(line.content())),
         }
         true
     });
-    if invalid_header {
-        return Err(ImpactError::Diff(
-            "a file path in the diff is not valid UTF-8".into(),
-        ));
-    }
     printed?;
     Ok(out)
 }
@@ -472,6 +459,23 @@ mod tests {
         assert!(diff.contains("+one\n+two\n"));
         let change = Change::from_unified_diff(&diff).unwrap();
         assert_eq!(change.files.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_that_is_not_utf8_is_an_error_not_a_lossy_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let (dir, _repo) = committed_fixture();
+        let name = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        std::fs::write(dir.path().join(name), "x").unwrap();
+        let diff = diff_against(dir.path(), "HEAD").unwrap();
+        assert!(diff.contains("bad\\377.txt"), "{diff}");
+        assert!(matches!(
+            impact_of_diff(dir.path(), "HEAD"),
+            Err(ImpactError::Parse(
+                crate::impact::DiffError::PathHeader { .. }
+            ))
+        ));
     }
 
     #[test]
