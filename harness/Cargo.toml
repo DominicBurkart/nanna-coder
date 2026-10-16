@@ -59,6 +59,7 @@ which = "6"
 workspace = true
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
 futures = "0.3"
 serial_test = "3.4"
 proptest = { version = "1.7", default-features = false, features = ["std"] }
