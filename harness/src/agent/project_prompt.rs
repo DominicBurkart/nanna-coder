@@ -153,12 +153,12 @@ fn clean(value: &str) -> String {
 ///
 /// let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
 /// let profile = FullStackRust::detect(&fixture).unwrap().unwrap();
-/// let text = topology_paragraph(&profile);
+/// let text = topology_paragraph(&profile, true);
 /// assert!(text.contains("`api` crate"));
 /// assert!(text.contains("`trunk build`"));
 /// assert!(text.contains("DATABASE_URL"));
 /// ```
-pub fn topology_paragraph(profile: &FullStackRust) -> String {
+pub fn topology_paragraph(profile: &FullStackRust, database_provisioned: bool) -> String {
     let api = &profile.api;
     let frontend = &profile.frontend;
     let api_name = clean(&api.name);
@@ -205,9 +205,15 @@ pub fn topology_paragraph(profile: &FullStackRust) -> String {
                     clean(&dir.display().to_string())
                 ));
             }
-            text.push_str(
-                "; `DATABASE_URL` in this container points at a database reserved for this task.",
-            );
+            if database_provisioned {
+                text.push_str(
+                    "; `DATABASE_URL` in this container points at a database reserved for this task.",
+                );
+            } else {
+                text.push_str(
+                    "; no database is provisioned for this task, so `DATABASE_URL` is not set.",
+                );
+            }
         }
         None => text.push_str(" There is no database."),
     }
@@ -220,10 +226,15 @@ pub fn topology_paragraph(profile: &FullStackRust) -> String {
 
 /// Topology paragraph for `workspace_root`, or `None` when the workspace is
 /// not a full-stack Rust workspace.
-pub fn topology_for_workspace(workspace_root: &Path) -> io::Result<Option<String>> {
+pub fn topology_for_workspace(
+    workspace_root: &Path,
+    database_provisioned: bool,
+) -> io::Result<Option<String>> {
     let profile = FullStackRust::detect(workspace_root)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(profile.as_ref().map(topology_paragraph))
+    Ok(profile
+        .as_ref()
+        .map(|p| topology_paragraph(p, database_provisioned)))
 }
 
 /// Parse a raw prompt-file string into a [`ProjectPromptDoc`].
@@ -361,7 +372,9 @@ mod tests {
 
     #[test]
     fn topology_paragraph_for_fixture_names_every_part() {
-        let text = topology_for_workspace(&fixture_root()).unwrap().unwrap();
+        let text = topology_for_workspace(&fixture_root(), true)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("The `api` crate (`api/`) is the actix-web backend binary"));
         assert!(text.contains("`cargo run --bin api`"));
         assert!(text.contains("The `ui` crate (`ui/`) is the dioxus web frontend"));
@@ -380,7 +393,7 @@ mod tests {
     fn topology_paragraph_without_database_proxies_or_shared_crates() {
         let dir = tempdir().unwrap();
         write_workspace(dir.path(), "");
-        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        let text = topology_for_workspace(dir.path(), true).unwrap().unwrap();
         assert!(text.contains("calls the backend over HTTP on the same origin."));
         assert!(!text.contains("trunk serve"));
         assert!(!text.contains("Shared code"));
@@ -393,7 +406,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write_workspace(dir.path(), "");
         fs::create_dir_all(dir.path().join("migrations")).unwrap();
-        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        let text = topology_for_workspace(dir.path(), true).unwrap().unwrap();
         assert!(text.contains("uses a Postgres database with migrations in `migrations/`;"));
         assert!(!text.contains("through sqlx"));
     }
@@ -405,7 +418,7 @@ mod tests {
             dir.path(),
             "sqlx = { version = \"0.8\", features = [\"postgres\"] }\n",
         );
-        let text = topology_for_workspace(dir.path()).unwrap().unwrap();
+        let text = topology_for_workspace(dir.path(), true).unwrap().unwrap();
         assert!(text.contains("uses a Postgres database through sqlx; `DATABASE_URL`"));
         assert!(!text.contains("migrations in"));
     }
@@ -428,7 +441,7 @@ mod tests {
 
     #[test]
     fn topology_paragraph_neutralises_repo_controlled_values() {
-        let text = topology_paragraph(&hostile_profile());
+        let text = topology_paragraph(&hostile_profile(), true);
         assert!(!text.contains('\n'), "{text}");
         assert!(!text.chars().any(char::is_control), "{text}");
         assert!(!text.contains("</repo-guidance>"), "{text}");
@@ -446,17 +459,37 @@ mod tests {
         profile.shared[0].name = long.clone();
         profile.proxy_backends = vec![long.clone()];
         profile.health_paths = vec![long];
-        let text = topology_paragraph(&profile);
+        let text = topology_paragraph(&profile, true);
         assert!(text.len() < 3_000, "{}", text.len());
         assert!(!text.contains(&"a".repeat(MAX_VALUE_CHARS + 1)));
     }
 
     #[test]
+    fn database_url_claim_is_made_only_when_a_database_is_provisioned() {
+        let provisioned = topology_for_workspace(&fixture_root(), true)
+            .unwrap()
+            .unwrap();
+        assert!(provisioned.contains(
+            "`DATABASE_URL` in this container points at a database reserved for this task."
+        ));
+        let absent = topology_for_workspace(&fixture_root(), false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            absent.contains(
+                "no database is provisioned for this task, so `DATABASE_URL` is not set."
+            ),
+            "{absent}"
+        );
+        assert!(!absent.contains("points at a database reserved"));
+    }
+
+    #[test]
     fn topology_is_none_for_plain_workspace_and_error_for_bad_manifest() {
         let dir = tempdir().unwrap();
-        assert!(topology_for_workspace(dir.path()).unwrap().is_none());
+        assert!(topology_for_workspace(dir.path(), true).unwrap().is_none());
         fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
-        let err = topology_for_workspace(dir.path()).unwrap_err();
+        let err = topology_for_workspace(dir.path(), true).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 

@@ -75,9 +75,13 @@ fn guidance_system_prompt(workspace_path: &std::path::Path) -> String {
 /// by its topology paragraph (#643). A workspace whose manifests cannot be
 /// parsed is logged and gets no topology paragraph, like a broken guidance
 /// file.
-fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+fn build_task_system_prompt(
+    workspace_path: &std::path::Path,
+    database_provisioned: bool,
+) -> String {
     let prompt = guidance_system_prompt(workspace_path);
-    match crate::agent::project_prompt::topology_for_workspace(workspace_path) {
+    match crate::agent::project_prompt::topology_for_workspace(workspace_path, database_provisioned)
+    {
         Ok(Some(topology)) => format!("{prompt}\n\n{topology}"),
         Ok(None) => prompt,
         Err(e) => {
@@ -1131,7 +1135,13 @@ impl TaskRunner {
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
             verbose: false,
-            system_prompt: build_task_system_prompt(&workspace.workspace_path),
+            system_prompt: build_task_system_prompt(
+                &workspace.workspace_path,
+                workspace
+                    .sidecar_env()
+                    .iter()
+                    .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+            ),
             model_name: queued.model.clone(),
         };
         let context = AgentContext {
@@ -1976,7 +1986,7 @@ mod tests {
     fn test_build_task_system_prompt_no_guidance_returns_default() {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
@@ -1985,7 +1995,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
         assert!(prompt.contains("Use nextest."));
@@ -1997,7 +2007,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
         assert!(prompt.contains("legacy rules"));
@@ -2011,8 +2021,8 @@ mod tests {
     fn test_build_task_system_prompt_includes_topology_for_full_stack_workspace() {
         ensure_tracing_subscriber();
         let root = fullstack_fixture();
-        let prompt = build_task_system_prompt(&root);
-        let topology = crate::agent::project_prompt::topology_for_workspace(&root)
+        let prompt = build_task_system_prompt(&root, true);
+        let topology = crate::agent::project_prompt::topology_for_workspace(&root, true)
             .unwrap()
             .unwrap();
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
@@ -2033,10 +2043,21 @@ mod tests {
             .unwrap();
         assert!(status.success());
         std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         let guidance = prompt.find("<repo-guidance").unwrap();
         let topology = prompt.find("full-stack Rust workspace").unwrap();
         assert!(guidance < topology);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_only_claims_database_url_when_provisioned() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let provisioned = build_task_system_prompt(&root, true);
+        assert!(provisioned.contains("points at a database reserved for this task"));
+        let unprovisioned = build_task_system_prompt(&root, false);
+        assert!(unprovisioned.contains("so `DATABASE_URL` is not set"));
+        assert!(!unprovisioned.contains("points at a database reserved"));
     }
 
     #[test]
@@ -2048,7 +2069,7 @@ mod tests {
             "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
         assert!(!prompt.contains("full-stack"));
     }
@@ -2058,7 +2079,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
@@ -2159,7 +2180,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
