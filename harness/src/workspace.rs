@@ -1105,8 +1105,7 @@ mod tests {
         ws2.cleanup().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_create_with_container_no_runtime() {
+    async fn assert_container_setup_fails_without_runtime() {
         use crate::container::detect_runtime;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
@@ -1128,6 +1127,45 @@ mod tests {
             result,
             Err(WorkspaceError::ContainerSetupFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_no_runtime() {
+        assert_container_setup_fails_without_runtime().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_create_with_container_no_runtime_is_stable_while_a_runtime_appears_on_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let installer = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let fake = crate::test_support::FakePodman::install_async(None).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    drop(fake);
+                    tokio::time::sleep(std::time::Duration::from_millis(6)).await;
+                }
+            })
+        };
+
+        let mut failures = Vec::new();
+        for _ in 0..100 {
+            if let Err(e) = tokio::spawn(assert_container_setup_fails_without_runtime()).await {
+                failures.push(e.to_string());
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        installer.await.unwrap();
+        assert!(
+            failures.is_empty(),
+            "no-runtime assertion raced a runtime on PATH: {failures:?}"
+        );
     }
 
     #[tokio::test]
