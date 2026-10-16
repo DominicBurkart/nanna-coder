@@ -343,17 +343,25 @@ mod tests {
         QueuedTask::new("t", PathBuf::from(repo), "HEAD", "m", 1)
     }
 
+    const MAX_SLEEPS: usize = 64;
+
     struct PausedClock {
         origin_wall: DateTime<Utc>,
         origin: tokio::time::Instant,
+        sleeps: std::sync::atomic::AtomicUsize,
     }
 
     impl PausedClock {
         fn start() -> Arc<Self> {
             Arc::new(Self {
-                origin_wall: Utc::now(),
+                origin_wall: chrono::TimeZone::with_ymd_and_hms(&Utc, 2001, 1, 1, 0, 0, 0).unwrap(),
                 origin: tokio::time::Instant::now(),
+                sleeps: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        fn sleeps(&self) -> usize {
+            self.sleeps.load(Ordering::SeqCst)
         }
     }
 
@@ -363,6 +371,9 @@ mod tests {
         }
 
         fn sleep(&self, duration: chrono::Duration) -> crate::leases::SleepFuture<'_> {
+            if self.sleeps.fetch_add(1, Ordering::SeqCst) >= MAX_SLEEPS {
+                return Box::pin(std::future::pending());
+            }
             Box::pin(tokio::time::sleep(duration.to_std().unwrap_or_default()))
         }
     }
@@ -465,6 +476,7 @@ mod tests {
         assert_eq!(launcher.started()[1].0, parked_soon.id);
         assert!(dispatcher.is_queued(&parked_far.id).await);
         assert!(dispatcher.state.lock().await.wake.is_some());
+        assert!(clock.sleeps() < MAX_SLEEPS);
     }
 
     #[tokio::test(start_paused = true)]
@@ -481,22 +493,59 @@ mod tests {
         wait_for_started(&launcher, 1).await;
         assert_eq!(launcher.started()[0].0, parked.id);
         assert!(dispatcher.state.lock().await.wake.is_none());
+        assert!(clock.sleeps() < MAX_SLEEPS);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_runner_between_scheduling_and_enqueue_does_not_unpark_early() {
+    async fn parking_follows_the_injected_clock_not_wall_time() {
         let clock = PausedClock::start();
         let (dispatcher, launcher) =
             dispatcher_with_clock(1, Box::new(InMemoryQueueStore::default()), clock.clone());
         let soon = clock.now() + chrono::Duration::milliseconds(80);
+        std::thread::sleep(Duration::from_millis(300));
         let parked = dispatcher
             .enqueue(task("/r").with_not_before(Some(soon)))
             .await
             .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(launcher.started().is_empty());
+        let metrics = dispatcher.metrics(clock.now()).await;
+        assert_eq!((metrics.queued, metrics.parked, metrics.running), (1, 1, 0));
+
         let ready = dispatcher.enqueue(task("/r")).await.unwrap();
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(launcher.started(), vec![(ready.id.clone(), Side::Newest)]);
         assert!(dispatcher.is_queued(&parked.id).await);
+
+        launcher.finish(&ready.id);
+        wait_for_started(&launcher, 2).await;
+        assert_eq!(launcher.started()[1].0, parked.id);
+        assert!(clock.sleeps() < MAX_SLEEPS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_without_a_clock_parks_against_wall_time() {
+        let launcher = Arc::new(ManualLauncher::default());
+        let dispatcher = Dispatcher::open(
+            Arc::clone(&launcher),
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            1,
+        )
+        .unwrap();
+        let in_the_past = Utc::now() - chrono::Duration::hours(1);
+        let in_the_future = Utc::now() + chrono::Duration::hours(1);
+        let future = dispatcher
+            .enqueue(task("/r").with_not_before(Some(in_the_future)))
+            .await
+            .unwrap();
+        assert!(launcher.started().is_empty());
+        let past = dispatcher
+            .enqueue(task("/r").with_not_before(Some(in_the_past)))
+            .await
+            .unwrap();
+        assert_eq!(launcher.started(), vec![(past.id.clone(), Side::Newest)]);
+        assert!(dispatcher.is_queued(&future.id).await);
+        assert!(dispatcher.state.lock().await.wake.is_some());
     }
 
     #[tokio::test(start_paused = true)]
