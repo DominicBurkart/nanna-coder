@@ -2,6 +2,7 @@ use super::{
     QueueMetrics, QueueStore, QueueStoreError, QueuedTask, SchedulingPolicy, Side, SlotState,
     TaskQueue,
 };
+use crate::leases::{Clock, SystemClock};
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -92,6 +93,7 @@ pub struct Dispatcher<L: Launcher> {
     launcher: L,
     policy: Box<dyn SchedulingPolicy>,
     store: Box<dyn QueueStore>,
+    clock: Arc<dyn Clock>,
     state: Mutex<State>,
     dispatched_newest: AtomicU64,
     dispatched_oldest: AtomicU64,
@@ -107,11 +109,30 @@ impl<L: Launcher> Dispatcher<L> {
         store: Box<dyn QueueStore>,
         max_concurrent: usize,
     ) -> Result<Arc<Self>, QueueStoreError> {
+        Self::open_with_clock(
+            launcher,
+            policy,
+            store,
+            max_concurrent,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Like [`open`](Self::open) but reads time and sleeps through `clock`,
+    /// so parking and wake-ups can be driven without wall-clock waits.
+    pub fn open_with_clock(
+        launcher: L,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        max_concurrent: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Arc<Self>, QueueStoreError> {
         let queue = TaskQueue::from_entries(store.load()?);
         Ok(Arc::new(Self {
             launcher,
             policy,
             store,
+            clock,
             state: Mutex::new(State {
                 queue,
                 slots: SlotState::new(max_concurrent),
@@ -175,7 +196,7 @@ impl<L: Launcher> Dispatcher<L> {
     }
 
     async fn dispatch_now(self: &Arc<Self>) {
-        let now = Utc::now();
+        let now = self.clock.now();
         let mut state = self.state.lock().await;
         while let Some(selection) = self.policy.next(state.queue.entries(), &state.slots, now) {
             let task = state.queue.remove_at(selection.index);
@@ -203,9 +224,10 @@ impl<L: Launcher> Dispatcher<L> {
                     previous.abort();
                 }
                 let this = Arc::clone(self);
-                let delay = (wake_at - now).to_std().unwrap_or_default();
+                let delay = wake_at - now;
                 let handle = tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                    let clock = Arc::clone(&this.clock);
+                    clock.sleep(delay).await;
                     this.state.lock().await.wake = None;
                     this.dispatch().await;
                 });
@@ -321,19 +343,52 @@ mod tests {
         QueuedTask::new("t", PathBuf::from(repo), "HEAD", "m", 1)
     }
 
-    fn dispatcher(
+    struct PausedClock {
+        origin_wall: DateTime<Utc>,
+        origin: tokio::time::Instant,
+    }
+
+    impl PausedClock {
+        fn start() -> Arc<Self> {
+            Arc::new(Self {
+                origin_wall: Utc::now(),
+                origin: tokio::time::Instant::now(),
+            })
+        }
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.origin_wall + chrono::Duration::from_std(self.origin.elapsed()).unwrap()
+        }
+
+        fn sleep(&self, duration: chrono::Duration) -> crate::leases::SleepFuture<'_> {
+            Box::pin(tokio::time::sleep(duration.to_std().unwrap_or_default()))
+        }
+    }
+
+    fn dispatcher_with_clock(
         max_concurrent: usize,
         store: Box<dyn QueueStore>,
+        clock: Arc<dyn Clock>,
     ) -> (Arc<Dispatcher<Arc<ManualLauncher>>>, Arc<ManualLauncher>) {
         let launcher = Arc::new(ManualLauncher::default());
-        let dispatcher = Dispatcher::open(
+        let dispatcher = Dispatcher::open_with_clock(
             Arc::clone(&launcher),
             Box::new(HybridPolicy::default()),
             store,
             max_concurrent,
+            clock,
         )
         .unwrap();
         (dispatcher, launcher)
+    }
+
+    fn dispatcher(
+        max_concurrent: usize,
+        store: Box<dyn QueueStore>,
+    ) -> (Arc<Dispatcher<Arc<ManualLauncher>>>, Arc<ManualLauncher>) {
+        dispatcher_with_clock(max_concurrent, store, Arc::new(SystemClock))
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -350,7 +405,7 @@ mod tests {
         wait_until(|| launcher.started().len() == count).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queues_beyond_capacity_and_refills_same_side() {
         let store = InMemoryQueueStore::default();
         let (dispatcher, launcher) = dispatcher(2, Box::new(store.clone()));
@@ -383,11 +438,13 @@ mod tests {
         assert_eq!(metrics.dispatched_oldest, 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn parked_entries_do_not_hold_slots_and_wake_later() {
-        let (dispatcher, launcher) = dispatcher(1, Box::new(InMemoryQueueStore::default()));
-        let far = Utc::now() + chrono::Duration::hours(1);
-        let soon = Utc::now() + chrono::Duration::milliseconds(80);
+        let clock = PausedClock::start();
+        let (dispatcher, launcher) =
+            dispatcher_with_clock(1, Box::new(InMemoryQueueStore::default()), clock.clone());
+        let far = clock.now() + chrono::Duration::hours(1);
+        let soon = clock.now() + chrono::Duration::milliseconds(80);
         let parked_far = dispatcher
             .enqueue(task("/r").with_not_before(Some(far)))
             .await
@@ -398,7 +455,7 @@ mod tests {
             .unwrap();
         let ready = dispatcher.enqueue(task("/r")).await.unwrap();
         assert_eq!(launcher.started(), vec![(ready.id.clone(), Side::Newest)]);
-        let metrics = dispatcher.metrics(Utc::now()).await;
+        let metrics = dispatcher.metrics(clock.now()).await;
         assert_eq!(metrics.queued, 2);
         assert_eq!(metrics.parked, 2);
         assert_eq!(metrics.running, 1);
@@ -410,10 +467,12 @@ mod tests {
         assert!(dispatcher.state.lock().await.wake.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wake_fires_when_slot_is_already_free() {
-        let (dispatcher, launcher) = dispatcher(1, Box::new(InMemoryQueueStore::default()));
-        let soon = Utc::now() + chrono::Duration::milliseconds(50);
+        let clock = PausedClock::start();
+        let (dispatcher, launcher) =
+            dispatcher_with_clock(1, Box::new(InMemoryQueueStore::default()), clock.clone());
+        let soon = clock.now() + chrono::Duration::milliseconds(50);
         let parked = dispatcher
             .enqueue(task("/r").with_not_before(Some(soon)))
             .await
@@ -424,7 +483,23 @@ mod tests {
         assert!(dispatcher.state.lock().await.wake.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn slow_runner_between_scheduling_and_enqueue_does_not_unpark_early() {
+        let clock = PausedClock::start();
+        let (dispatcher, launcher) =
+            dispatcher_with_clock(1, Box::new(InMemoryQueueStore::default()), clock.clone());
+        let soon = clock.now() + chrono::Duration::milliseconds(80);
+        let parked = dispatcher
+            .enqueue(task("/r").with_not_before(Some(soon)))
+            .await
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let ready = dispatcher.enqueue(task("/r")).await.unwrap();
+        assert_eq!(launcher.started(), vec![(ready.id.clone(), Side::Newest)]);
+        assert!(dispatcher.is_queued(&parked.id).await);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancel_queued_running_and_unknown() {
         let store = InMemoryQueueStore::default();
         let (dispatcher, launcher) = dispatcher(1, Box::new(store.clone()));
@@ -496,7 +571,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn release_logs_store_failures_and_still_dispatches() {
         let (dispatcher, launcher) =
             dispatcher(1, Box::new(RemoveFailsStore(InMemoryQueueStore::default())));
