@@ -109,13 +109,8 @@ impl<L: Launcher> Dispatcher<L> {
         store: Box<dyn QueueStore>,
         max_concurrent: usize,
     ) -> Result<Arc<Self>, QueueStoreError> {
-        Self::open_with_clock(
-            launcher,
-            policy,
-            store,
-            max_concurrent,
-            Arc::new(SystemClock),
-        )
+        let clock = Arc::new(SystemClock);
+        Self::open_with_clock(launcher, policy, store, max_concurrent, clock)
     }
 
     /// Like [`open`](Self::open) but reads time and sleeps through `clock`,
