@@ -512,14 +512,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let path = out.unwrap_or_else(harness::auditor::eval::default_scorecard_path);
             let date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            let row = harness::auditor::eval::record_rule_auditor_row(
+            match harness::auditor::eval::record_rule_auditor_row(
                 &path,
                 &commit,
                 branch.as_deref(),
                 &date,
             )
-            .await?;
-            println!("appended to {}: {}", path.display(), row.label);
+            .await
+            {
+                Ok(row) => println!("appended to {}: {}", path.display(), row.label),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::Effects { command } => {

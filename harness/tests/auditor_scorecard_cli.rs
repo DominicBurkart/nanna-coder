@@ -41,5 +41,10 @@ fn record_scorecard_fails_loudly_when_the_output_cannot_be_written() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("IsADirectory"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("failed to read {}", dir.path().display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Os {"), "{stderr}");
 }
