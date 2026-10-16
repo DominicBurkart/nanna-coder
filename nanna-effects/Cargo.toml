@@ -1,0 +1,14 @@
+[package]
+name = "nanna-effects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-code state-asset declarations for nanna-coder's effect manifest"
+repository.workspace = true
+
+[dependencies]
+inventory = "0.3"
+
+[lints]
+workspace = true

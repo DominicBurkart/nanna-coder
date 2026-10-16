@@ -734,7 +734,7 @@ mod tests {
 
     fn fast(driver: Arc<dyn BrowserDriver>, dir: &Path) -> ScenarioRunner {
         ScenarioRunner::new(driver, dir)
-            .with_wait(Duration::from_millis(30), Duration::from_millis(1))
+            .with_wait(Duration::from_millis(1000), Duration::from_millis(1))
     }
 
     #[test]

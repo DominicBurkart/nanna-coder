@@ -385,7 +385,11 @@ mod tests {
     fn fixture(probe: Arc<MapProbe>, pages: Vec<StubPage>) -> Fixture {
         let workspace = TempDir::new().unwrap();
         let leases = TempDir::new().unwrap();
-        let allocator = Arc::new(PortAllocator::new(45000..=45001, leases.path()));
+        let allocator = Arc::new(PortAllocator::with_probe(
+            45000..=45001,
+            leases.path(),
+            |_| true,
+        ));
         let ctx = QaContext {
             task_id: "qa-task".to_string(),
             apps: Arc::new(RunningApps::new()),

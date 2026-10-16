@@ -1,9 +1,10 @@
 use crate::effects::EffectClass;
 use crate::escalation::EscalationLog;
 use crate::identity::AgentIdentity;
+use crate::protected::{ProtectedPathViolation, ProtectedPaths};
 use crate::scope::{
-    canonical_root, relative_to, resolve_path, validate_path_within_workspace, DenialReason,
-    PathAccess, PathScope, ScopeDenial, ScopeError,
+    canonical_root, relative_to, resolve_path, resolve_path_guarded,
+    validate_path_within_workspace, DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError,
 };
 use async_trait::async_trait;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -33,6 +34,9 @@ pub enum ToolError {
 
     #[error("Scope denial: {0}")]
     ScopeDenied(ScopeDenial),
+
+    #[error("Protected path: {0}")]
+    ProtectedPath(ProtectedPathViolation),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -145,6 +149,25 @@ impl ToolRegistry {
         self
     }
 
+    /// Fail closed for a task that carries no identity: keep only tools whose
+    /// effect class is [`EffectClass::None`] and attribute every refused call
+    /// to [`crate::scope::UNSCOPED_IDENTITY`], so a call to an effectful tool
+    /// is denied and recorded instead of executing.
+    ///
+    /// ```
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let registry = create_tool_registry(std::path::Path::new(".")).read_only_unscoped();
+    /// assert!(registry.get_tool("read_file").is_some());
+    /// assert!(registry.get_tool("write_file").is_none());
+    /// assert_eq!(registry.identity(), Some(harness::scope::UNSCOPED_IDENTITY));
+    /// ```
+    pub fn read_only_unscoped(mut self) -> Self {
+        self.retain_at_most(EffectClass::None);
+        self.identity = Some(crate::scope::UNSCOPED_IDENTITY.to_string());
+        self
+    }
+
     /// Name of the identity this registry is scoped to, if any.
     pub fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
@@ -204,8 +227,16 @@ impl ToolRegistry {
                 name: name.to_string(),
             }),
         };
-        if let Err(ToolError::ScopeDenied(denial)) = &outcome {
-            self.record(denial.clone());
+        match &outcome {
+            Err(ToolError::ScopeDenied(denial)) => self.record(denial.clone()),
+            Err(ToolError::ProtectedPath(violation)) => {
+                let mut denial = ScopeDenial::protected(name, violation);
+                if let Some(identity) = &self.identity {
+                    denial.identity = identity.clone();
+                }
+                self.record(denial);
+            }
+            _ => {}
         }
         outcome
     }
@@ -653,6 +684,7 @@ impl Tool for ReadFileTool {
 pub struct WriteFileTool {
     workspace_root: PathBuf,
     scope: Option<PathScope>,
+    protected: ProtectedPaths,
 }
 
 impl WriteFileTool {
@@ -661,11 +693,23 @@ impl WriteFileTool {
     }
 
     /// A writer that, when `scope` is present, refuses paths outside the
-    /// identity's `scope.paths`.
+    /// identity's `scope.paths`, and always refuses
+    /// [`ProtectedPaths::for_repo`] of the workspace.
     pub fn scoped(workspace_root: PathBuf, scope: Option<PathScope>) -> Self {
+        let protected = ProtectedPaths::for_repo(&workspace_root);
+        Self::guarded(workspace_root, scope, protected)
+    }
+
+    /// [`WriteFileTool::scoped`] with an explicit protected set.
+    pub fn guarded(
+        workspace_root: PathBuf,
+        scope: Option<PathScope>,
+        protected: ProtectedPaths,
+    ) -> Self {
         Self {
             workspace_root,
             scope,
+            protected,
         }
     }
 }
@@ -722,7 +766,9 @@ impl Tool for WriteFileTool {
         let path = Path::new(path_str);
         let scope = self.scope.as_ref();
         let root = &self.workspace_root;
-        let safe_path = resolve_path(scope, "write_file", PathAccess::Write, path, root)?;
+        let access = PathAccess::Write;
+        let protected = &self.protected;
+        let safe_path = resolve_path_guarded(scope, protected, "write_file", access, path, root)?;
 
         if let Some(parent) = safe_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -3606,6 +3652,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_unscoped_registry_denies_effectful_tools_and_records_them() {
+        let registry = create_tool_registry(Path::new(".")).read_only_unscoped();
+        assert_eq!(registry.identity(), Some(crate::scope::UNSCOPED_IDENTITY));
+        assert!(registry
+            .at_most(EffectClass::Production)
+            .iter()
+            .all(|tool| tool.effect_class() == EffectClass::None));
+        let err = registry
+            .execute("write_file", json!({"path": "x", "content": "y"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ScopeDenied(_)), "{err:?}");
+        let denials = registry.denials();
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert_eq!(denials[0].tool, "write_file");
+        assert!(matches!(denials[0].reason, DenialReason::ToolNotInScope));
+    }
+
+    #[tokio::test]
     async fn path_denials_raised_by_tools_are_recorded_on_the_registry() {
         let ws = scoped_workspace();
         let identity = identity_with(EffectClass::Workspace, &["write_file", "read_file"]);
@@ -4342,6 +4408,108 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let registry = create_tool_registry(&cwd);
         assert!(registry.get_tool("github_pr_status").is_some());
+    }
+
+    const PROTECTED_EXAMPLES: [(&str, &str); 9] = [
+        (".nanna/**", ".nanna/agents/x.toml"),
+        ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
+        (".git/**", ".git/config"),
+        (".git/**", ".git/hooks/pre-commit"),
+        (".git/**", ".git"),
+        (".github/workflows/**", ".github/workflows/ci.yml"),
+        (".github/CODEOWNERS", ".github/CODEOWNERS"),
+        ("codecov.yml", "codecov.yml"),
+        ("windows.toml", "windows.toml"),
+    ];
+
+    fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry
+            .at_most(EffectClass::Production)
+            .into_iter()
+            .filter(|tool| tool.effect_class() >= EffectClass::Workspace)
+            .filter(|tool| {
+                let definition = tool.definition();
+                let properties = definition.function.parameters.properties;
+                properties.is_some_and(|props| props.contains_key("path"))
+            })
+            .map(|tool| tool.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn assert_all_protected_writes_refused(registry: &ToolRegistry, root: &Path) {
+        let tools = write_capable_tools(registry);
+        assert_eq!(tools, vec!["write_file".to_string()]);
+        for pattern in crate::protected::PROTECTED_PATTERNS {
+            assert!(
+                PROTECTED_EXAMPLES.iter().any(|(rule, _)| rule == pattern),
+                "{pattern} has no example"
+            );
+        }
+        for tool in &tools {
+            for (rule, path) in PROTECTED_EXAMPLES {
+                let args = json!({ "path": path, "content": "tampered" });
+                let err = registry.execute(tool, args).await.unwrap_err();
+                match err {
+                    ToolError::ProtectedPath(violation) => {
+                        assert_eq!(violation.path, path);
+                        assert_eq!(violation.rule, rule);
+                    }
+                    other => panic!("{tool} on {path}: expected ProtectedPath, got {other:?}"),
+                }
+                assert!(!root.join(path).exists(), "{tool} wrote {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_write_capable_tool_refuses_every_protected_pattern_unscoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = create_tool_registry(dir.path());
+        assert_all_protected_writes_refused(&registry, dir.path()).await;
+        let denials = registry.denials();
+        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert_eq!(denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert_eq!(denials[0].tool, "write_file");
+        assert!(matches!(
+            denials[0].reason,
+            DenialReason::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_write_capable_tool_refuses_every_protected_pattern_under_a_catch_all_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registry = create_tool_registry_for(dir.path(), &identity).unwrap();
+        assert_all_protected_writes_refused(&registry, dir.path()).await;
+        let denials = registry.denials();
+        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert!(denials.iter().all(|d| d.identity == identity.name()));
+        let ok = registry
+            .execute(
+                "write_file",
+                json!({ "path": "src/lib.rs", "content": "fine" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok["success"], true);
+    }
+
+    #[tokio::test]
+    async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("cfg/nanna");
+        let protected =
+            crate::protected::ProtectedPaths::with_config_dir(dir.path(), Some(&config));
+        let tool = WriteFileTool::guarded(dir.path().to_path_buf(), None, protected);
+        let err = tool
+            .execute(json!({ "path": "cfg/nanna/agents/x.toml", "content": "x" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
     }
 
     #[test]

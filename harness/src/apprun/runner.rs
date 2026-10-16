@@ -707,7 +707,9 @@ mod tests {
             }),
             runner,
             apps: Arc::new(RunningApps::new()),
-            ports: Arc::new(PortAllocator::new(41000..=41001, dir.path())),
+            ports: Arc::new(PortAllocator::with_probe(41000..=41001, dir.path(), |_| {
+                true
+            })),
             spec: spec(),
             env: vec![(
                 "DATABASE_URL".to_string(),

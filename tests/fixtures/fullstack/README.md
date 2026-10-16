@@ -4,8 +4,9 @@ A tiny, deterministic full-stack Rust monorepo used by harness tests and evals:
 an actix-web backend (`api/`), a dioxus web frontend built with trunk (`ui/`),
 a `shared/` crate holding the wire types, one sqlx/Postgres migration under
 `migrations/`, a `Containerfile` that packages api + ui into one image, a
-`CHECKS` endpoint manifest and a `.nanna/deploy.toml` describing a fake deploy
-target. It is its own cargo workspace and is excluded from the repository's
+`CHECKS` endpoint manifest, a `.nanna/deploy.toml` describing a fake deploy
+target and a `.nanna/effects.toml` declaring its state assets (`nanna effects
+graph --repo-path tests/fixtures/fullstack` renders them). It is its own cargo workspace and is excluded from the repository's
 root workspace.
 
 ## Endpoints

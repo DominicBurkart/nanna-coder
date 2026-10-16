@@ -109,6 +109,7 @@ async fn run_single_attempt(image_ref: &str) -> Result<(), String> {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = start_container_with_fallback(&config)
@@ -215,8 +216,32 @@ async fn test_task_manager_submit_with_dev_container() {
     let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
     let provider: Arc<dyn ModelProvider> = Arc::new(provider);
 
+    let identity = harness::identity::AgentIdentity::from_toml_str(
+        r#"
+[identity]
+name = "dev-container-e2e"
+description = "Edits the example repository inside its dev container."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Edit the repository." }
+
+[scope]
+repos = ["DominicBurkart/nanna-coder"]
+paths = []
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "run_command"]
+
+[limits]
+max_iterations = 32
+max_wall_clock_secs = 600
+max_concurrent = 1
+"#,
+        "dev-container-e2e.toml",
+    )
+    .expect("e2e identity must parse");
+
     let task_id = manager
-        .submit(
+        .submit_with_identity(
             "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
                 .to_string(),
             repo_path,
@@ -224,6 +249,7 @@ async fn test_task_manager_submit_with_dev_container() {
             E2E_MODEL.to_string(),
             MAX_TURNS,
             provider,
+            Some(identity),
         )
         .await;
 
@@ -303,6 +329,7 @@ async fn cargo_deny_tool_registered_for_nanna_workspace() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(
@@ -349,6 +376,7 @@ async fn cargo_deny_tool_output_has_command_field() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(
@@ -411,6 +439,7 @@ async fn cargo_check_tool_succeeds_in_nanna_container() {
         env_vars: vec![],
         additional_args,
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: harness::container::NO_READ_ONLY_MOUNTS,
     };
 
     let handle = Arc::new(

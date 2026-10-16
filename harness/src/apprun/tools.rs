@@ -40,7 +40,9 @@ fn definition(name: &str, description: &str) -> ToolDefinition {
 /// `app_start`: build the frontend with trunk, build the API, start it on a
 /// per-task port inside the dev container and wait for its health endpoint.
 /// Takes no arguments. Returns `{ task_id, base_url, api_url, frontend_url,
-/// pid, log_path, port }`; a second call returns the running instance.
+/// pid, log_path, port }`; a second call returns the running instance. The
+/// URLs are valid inside the dev container only (reach them with
+/// `run_command`, for example `curl`); the port is not published to the host.
 pub struct AppStartTool {
     ctx: AppContext,
 }
@@ -60,7 +62,7 @@ impl Tool for AppStartTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             APP_START_TOOL,
-            "Build the frontend and the API, start the API inside the dev container on a per-task port and wait for its health endpoint. Idempotent: returns the running instance. Result: { task_id, base_url, api_url, frontend_url, pid, log_path, port }.",
+            "Build the frontend and the API, start the API inside the dev container on a per-task port and wait for its health endpoint. Idempotent: returns the running instance. The URLs are valid inside the dev container only (reach them with run_command, for example curl); the port is not published to the host. Result: { task_id, base_url, api_url, frontend_url, pid, log_path, port }.",
         )
     }
 
@@ -249,7 +251,9 @@ mod tests {
             }),
             runner: Arc::new(Scripted { healthy }),
             apps: Arc::new(RunningApps::new()),
-            ports: Arc::new(PortAllocator::new(42000..=42000, dir.path())),
+            ports: Arc::new(PortAllocator::with_probe(42000..=42000, dir.path(), |_| {
+                true
+            })),
             spec: AppSpec {
                 api_package: "api".to_string(),
                 workspace_dir: "/workspace".to_string(),
@@ -292,6 +296,10 @@ mod tests {
         let def = tool.definition();
         assert_eq!(def.function.name, "app_start");
         assert!(def.function.description.contains("base_url"));
+        assert!(def
+            .function
+            .description
+            .contains("valid inside the dev container only"));
         let result = registry.execute(APP_START_TOOL, Value::Null).await.unwrap();
         assert_eq!(result["task_id"], "tool-task");
         assert_eq!(result["base_url"], "http://127.0.0.1:42000");
