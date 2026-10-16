@@ -2120,6 +2120,109 @@ mod tests {
         assert!(out.status.success(), "init commit failed");
     }
 
+    struct RecordingProvider {
+        inner: Arc<dyn ModelProvider>,
+        system_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingProvider {
+        async fn chat(
+            &self,
+            request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            for message in &request.messages {
+                if message.role == model::types::MessageRole::System {
+                    self.system_prompts
+                        .lock()
+                        .unwrap()
+                        .push(message.content.clone().unwrap_or_default());
+                }
+            }
+            self.inner.chat(request).await
+        }
+
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            self.inner.list_models().await
+        }
+
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            self.inner.health_check().await
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    async fn system_prompt_received_by_the_agent(repo: &std::path::Path) -> String {
+        let recording = Arc::new(RecordingProvider {
+            inner: MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+                "done",
+            )])),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider: Arc<dyn ModelProvider> = recording.clone();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(20);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+            ) {
+                assert!(
+                    matches!(task.status, TaskStatus::Completed { .. }),
+                    "expected task to complete successfully, got {:?}",
+                    task.status
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        let prompts = recording.system_prompts.lock().unwrap().clone();
+        assert!(!prompts.is_empty(), "the agent sent no system prompt");
+        prompts[0].clone()
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_the_topology_for_a_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        copy_dir(&fullstack_fixture(), repo_dir.path());
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("The `api` crate"));
+        assert!(prompt.contains("so `DATABASE_URL` is not set"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_no_topology_for_a_plain_crate() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+    }
+
     #[tokio::test]
     async fn test_submit_injects_agents_md_into_task_prompt() {
         // Exercises the production call site of `build_task_system_prompt`
