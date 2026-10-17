@@ -51,7 +51,6 @@ pub struct GithubPullRequest {
     pub body: Option<String>,
 }
 
-/// The pull request GitHub hands back right after creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubPullRequestCreated {
     pub number: u64,
@@ -59,7 +58,6 @@ pub struct GithubPullRequestCreated {
     pub node_id: String,
 }
 
-/// The subset of a pull request's detail view the PR lifecycle tools need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubPullRequestDetail {
     pub number: u64,
@@ -71,7 +69,6 @@ pub struct GithubPullRequestDetail {
     pub html_url: String,
 }
 
-/// A single review or issue comment on a pull request or issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubComment {
     pub id: u64,
@@ -80,7 +77,6 @@ pub struct GithubComment {
     pub html_url: String,
 }
 
-/// The subset of an issue's detail view the issue-read tool needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIssueDetail {
     pub number: u64,
@@ -150,9 +146,6 @@ pub trait GithubClient: Send + Sync {
         body: &str,
     ) -> Result<(), BacklogError>;
 
-    /// Open a pull request from `head` into `base` of `repo`. Always created
-    /// as a draft: the method takes no `draft` parameter, so there is no
-    /// argument that could make it create a ready-for-review pull request.
     async fn create_draft_pull_request(
         &self,
         repo: &str,
@@ -162,39 +155,28 @@ pub trait GithubClient: Send + Sync {
         base: &str,
     ) -> Result<GithubPullRequestCreated, BacklogError>;
 
-    /// Fetch pull request `number` of `repo`.
     async fn get_pull_request(
         &self,
         repo: &str,
         number: u64,
     ) -> Result<GithubPullRequestDetail, BacklogError>;
 
-    /// Convert draft pull request `number` of `repo` to ready for review.
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
 
-    /// Close pull request `number` of `repo`. Never touches an issue: the
-    /// implementation always addresses the `pulls` endpoint, so this method
-    /// cannot be used to close an issue.
     async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
 
-    /// Review comments (inline code comments) on pull request `number` of
-    /// `repo`.
     async fn list_review_comments(
         &self,
         repo: &str,
         number: u64,
     ) -> Result<Vec<GithubComment>, BacklogError>;
 
-    /// Issue-style (conversation) comments on issue or pull request `number`
-    /// of `repo`. GitHub treats a pull request as an issue for this
-    /// endpoint, so the same method serves both.
     async fn list_issue_comments(
         &self,
         repo: &str,
         number: u64,
     ) -> Result<Vec<GithubComment>, BacklogError>;
 
-    /// Fetch issue `number` of `repo`.
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
 }
 
@@ -522,30 +504,29 @@ impl BacklogSink for ManagerSink {
     }
 }
 
-/// Number of attempts [`ReqwestGithubClient`] makes for a call that keeps
-/// meeting a rate-limit response, including the first.
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
-/// Base delay [`ReqwestGithubClient`] waits before the second attempt,
-/// doubled for each attempt after that. The actual wait is at least the
-/// response's `Retry-After` (or rate-limit reset) delay, when it gave one.
 const DEFAULT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// A `Retry-After`/rate-limit-reset delay longer than this fails the call
-/// immediately with [`BacklogError::RateLimited`] rather than blocking the
-/// caller for that long, and rather than resending a request GitHub has
-/// asked to be held back that long (repeatedly ignoring `Retry-After` risks
-/// the integration being blocked).
 const MAX_RETRY_AFTER_SECS: u64 = 60;
 
-/// Ceiling [`ReqwestGithubClient::with_retry_policy`] clamps `max_attempts`
-/// to: the exponential backoff shift in [`ReqwestGithubClient::request_json`]
-/// is only defined for shift amounts below `u32::BITS`, so an unbounded
-/// caller-supplied `max_attempts` would panic (debug) or silently wrap
-/// (release) on the last attempt before the cap kicked in anyway.
 const MAX_RETRY_ATTEMPTS: u32 = 32;
 
-/// One of the HTTP methods [`ReqwestGithubClient`] issues.
+fn retry_wait(
+    base_backoff: std::time::Duration,
+    attempt: u32,
+    retry_after: Option<u64>,
+) -> std::time::Duration {
+    let factor = 1u32 << (attempt - 1).min(MAX_RETRY_ATTEMPTS - 1);
+    let backoff = base_backoff
+        .saturating_mul(factor)
+        .min(std::time::Duration::from_secs(MAX_RETRY_AFTER_SECS));
+    match retry_after {
+        Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
+        None => backoff,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HttpMethod {
     Get,
@@ -553,9 +534,6 @@ enum HttpMethod {
     Patch,
 }
 
-/// The `Retry-After` delay, in seconds, a rate-limited response asked for,
-/// derived from the `Retry-After` header or a `X-RateLimit-Remaining: 0` /
-/// `X-RateLimit-Reset` pair. `None` means the response carried neither.
 fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     if let Some(secs) = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -676,19 +654,26 @@ impl From<RawPrCreated> for GithubPullRequestCreated {
 /// [`GithubClient`] over the GitHub REST API using `reqwest`.
 ///
 /// Results are paginated `GITHUB_PAGE_SIZE` at a time until a short page is
-/// returned. A token, when given, is sent as a bearer token. A response that
-/// carries a `429`, or a `403` with a `Retry-After` header or an exhausted
-/// `X-RateLimit-Remaining`, is retried with exponential backoff up to
-/// [`ReqwestGithubClient::with_retry_policy`]'s configured attempts before
-/// surfacing [`BacklogError::RateLimited`]. Any other non-success status
-/// fails immediately.
-#[derive(Debug, Clone)]
+/// returned. A token, when given, is sent as a bearer token and is redacted
+/// from the `Debug` output.
+#[derive(Clone)]
 pub struct ReqwestGithubClient {
     http: reqwest::Client,
     base_url: String,
     token: Option<String>,
     max_attempts: u32,
     base_backoff: std::time::Duration,
+}
+
+impl std::fmt::Debug for ReqwestGithubClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReqwestGithubClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("max_attempts", &self.max_attempts)
+            .field("base_backoff", &self.base_backoff)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqwestGithubClient {
@@ -708,9 +693,6 @@ impl ReqwestGithubClient {
         Self::new(GITHUB_API_URL, token)
     }
 
-    /// Override the rate-limit retry policy: `max_attempts` total tries
-    /// (including the first) and `base_backoff` doubled for each attempt
-    /// after the first. Tests use a small `base_backoff` to avoid sleeping.
     pub fn with_retry_policy(
         mut self,
         max_attempts: u32,
@@ -747,9 +729,6 @@ impl ReqwestGithubClient {
             .await
     }
 
-    /// Issue `method path`, rebuilding and resending the request on every
-    /// retry attempt (a [`reqwest::RequestBuilder`] is consumed by `send`,
-    /// so it cannot be reused across attempts).
     async fn request_json(
         &self,
         method: HttpMethod,
@@ -791,13 +770,7 @@ impl ReqwestGithubClient {
             }
             let exceeds_cap = retry_after.is_some_and(|secs| secs > MAX_RETRY_AFTER_SECS);
             if !exceeds_cap && attempt < self.max_attempts {
-                let factor = 1u32 << (attempt - 1);
-                let backoff = self.base_backoff * factor;
-                let wait = match retry_after {
-                    Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
-                    None => backoff,
-                };
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(retry_wait(self.base_backoff, attempt, retry_after)).await;
                 continue;
             }
             return Err(BacklogError::RateLimited {
@@ -988,19 +961,11 @@ impl GithubClient for ReqwestGithubClient {
     }
 }
 
-/// Test doubles shared by `backlog`'s own tests and by other modules'
-/// (`pr_tools`) tests that need a mocked [`GithubClient`], so there is one
-/// mocked-client pattern for the whole crate rather than a parallel one per
-/// consumer.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// A [`GithubClient`] double configured with canned responses. Every
-    /// call is appended to [`MockGithub::calls`] so a test can assert on
-    /// exactly what was sent (for example, that a created pull request's
-    /// payload carried `draft: true`).
     #[derive(Default)]
     pub(crate) struct MockGithub {
         pub issues: HashMap<String, Vec<GithubIssue>>,
@@ -1010,15 +975,11 @@ pub(crate) mod test_support {
         pub review_comments: HashMap<(String, u64), Vec<GithubComment>>,
         pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
         pub created_pr: Option<GithubPullRequestCreated>,
-        /// When set, every call below except `get_pull_request`/`get_issue`
-        /// (which fail on a missing map entry instead) returns this status
-        /// as a [`BacklogError::Status`].
         pub fail_status: Option<u16>,
         pub(crate) calls: StdMutex<Vec<String>>,
     }
 
     impl MockGithub {
-        /// Every call made so far, in order, as a human-readable summary.
         pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("mock call log poisoned").clone()
         }
@@ -1553,11 +1514,6 @@ mod tests {
         assert!(backlog_sync(&github, &sink, &cfg).await.is_err());
     }
 
-    /// One scripted response for [`fake_github_ext`]: `method` is an HTTP
-    /// verb or `"*"` for any, `path_contains` a substring of the request
-    /// target. Routes are consumed in the order they match, so the same
-    /// target can be scripted to answer differently across attempts (for
-    /// example a `429` followed by a `200`, to exercise retry).
     struct MockRoute {
         method: &'static str,
         path_contains: &'static str,
@@ -1583,8 +1539,6 @@ mod tests {
         }
     }
 
-    /// A mock GitHub server. Returns the base URL, the raw request lines
-    /// received so far (`"METHOD target body"`), and the server task handle.
     async fn fake_github_ext(
         routes: Vec<MockRoute>,
     ) -> (
@@ -2051,6 +2005,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_failure_mode_puts_the_token_in_an_error_string() {
+        const TOKEN: &str = "ghp_SECRET_TOKEN_123";
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 500, "{}"),
+            MockRoute::new("GET", "/repos/o/n/issues/2", 429, "{}"),
+            MockRoute::new("GET", "/repos/o/n/issues/3", 200, "not json"),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"errors": [{"message": "Resource not accessible"}]}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some(TOKEN.to_string()))
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let errors = vec![
+            client.get_issue("o/n", 1).await.unwrap_err(),
+            client.get_issue("o/n", 2).await.unwrap_err(),
+            client.get_issue("o/n", 3).await.unwrap_err(),
+            client.mark_pull_request_ready("o/n", 7).await.unwrap_err(),
+        ];
+        assert!(matches!(
+            errors[0],
+            BacklogError::Status { status: 500, .. }
+        ));
+        assert!(matches!(errors[1], BacklogError::RateLimited { .. }));
+        assert!(matches!(errors[2], BacklogError::Parse(_)));
+        assert!(matches!(errors[3], BacklogError::GraphQl { .. }));
+        for err in &errors {
+            assert!(!err.to_string().contains(TOKEN), "{err}");
+            assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
+        }
+        let dead = ReqwestGithubClient::new("http://127.0.0.1:1", Some(TOKEN.to_string()));
+        let err = dead.get_issue("o/n", 1).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Http(_)));
+        assert!(!err.to_string().contains(TOKEN), "{err}");
+        assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn reqwest_client_403_with_remaining_zero_retries_then_exhausts() {
         let route = || {
             MockRoute::new("GET", "/repos/o/n/issues/1", 403, "{}").with_headers(vec![
@@ -2101,13 +2103,48 @@ mod tests {
 
     #[test]
     fn with_retry_policy_clamps_an_oversized_max_attempts() {
-        // The exponential backoff shift (`1u32 << (attempt - 1)`) is only
-        // defined for shift amounts below 32; an unclamped caller-supplied
-        // max_attempts would panic (debug) or wrap (release) once enough
-        // retries were exhausted to reach it.
         let client = ReqwestGithubClient::new("http://example.invalid", None)
             .with_retry_policy(u32::MAX, std::time::Duration::from_millis(1));
         assert_eq!(client.max_attempts, MAX_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_wait_never_exceeds_the_retry_after_ceiling_however_many_attempts() {
+        let base = std::time::Duration::from_secs(1);
+        for attempt in 1..=MAX_RETRY_ATTEMPTS {
+            let wait = retry_wait(base, attempt, None);
+            assert!(
+                wait <= std::time::Duration::from_secs(MAX_RETRY_AFTER_SECS),
+                "attempt {attempt} would sleep {wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_wait_doubles_until_the_ceiling_and_honours_retry_after() {
+        let base = std::time::Duration::from_millis(200);
+        assert_eq!(retry_wait(base, 1, None), base);
+        assert_eq!(retry_wait(base, 2, None), base * 2);
+        assert_eq!(retry_wait(base, 3, None), base * 4);
+        assert_eq!(
+            retry_wait(base, 1, Some(5)),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(retry_wait(base, 1, Some(0)), base);
+    }
+
+    #[test]
+    fn client_debug_output_never_contains_the_token() {
+        let client =
+            ReqwestGithubClient::new("http://example.invalid", Some("ghp_SECRET123".into()));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("ghp_SECRET123"), "{rendered}");
+        assert!(rendered.contains("example.invalid"));
+        let anonymous = format!(
+            "{:?}",
+            ReqwestGithubClient::new("http://example.invalid", None)
+        );
+        assert!(anonymous.contains("None"), "{anonymous}");
     }
 
     #[test]
