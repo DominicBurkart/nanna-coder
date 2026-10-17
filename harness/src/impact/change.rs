@@ -494,7 +494,7 @@ fn check_side(number: usize, line: &str, rest: &str, prefix: &str) -> Result<(),
 
 fn symmetric_path(rest: &str) -> Option<String> {
     let total = rest.len();
-    if total < 5 || (total - 5) % 2 != 0 {
+    if total < 5 || !(total - 5).is_multiple_of(2) {
         return None;
     }
     let len = (total - 5) / 2;
