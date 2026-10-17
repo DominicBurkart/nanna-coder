@@ -37,14 +37,14 @@ pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 /// imported from here.
 const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
 
-/// Build the system prompt for a task run, appending any repo-level guidance
+/// Base task prompt plus any repo-level guidance
 /// discovered under the task's workspace path (closes #231).
 ///
 /// Precedence: `AGENTS.md` over `CLAUDE.md` (see
 /// [`crate::agent::agents_md::load`]). Missing files produce no injection;
 /// read errors are logged and swallowed so a broken guidance file never blocks
 /// a task from starting.
-fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+fn guidance_system_prompt(workspace_path: &std::path::Path) -> String {
     match crate::agent::agents_md::load(workspace_path) {
         Ok(Some(doc)) => {
             tracing::info!(
@@ -66,6 +66,30 @@ fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
                 "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
             );
             DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
+/// Build the system prompt for a task run: the repo-level guidance prompt
+/// (see [`guidance_system_prompt`]) followed, for a full-stack Rust workspace,
+/// by its topology paragraph (#643). A workspace whose manifests cannot be
+/// parsed is logged and gets no topology paragraph, like a broken guidance
+/// file.
+fn build_task_system_prompt(
+    workspace_path: &std::path::Path,
+    database_provisioned: bool,
+) -> String {
+    let prompt = guidance_system_prompt(workspace_path);
+    match crate::agent::project_prompt::topology_for_workspace(workspace_path, database_provisioned)
+    {
+        Ok(Some(topology)) => format!("{prompt}\n\n{topology}"),
+        Ok(None) => prompt,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to detect the full-stack topology for task; continuing without it"
+            );
+            prompt
         }
     }
 }
@@ -1111,7 +1135,13 @@ impl TaskRunner {
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
             verbose: false,
-            system_prompt: build_task_system_prompt(&workspace.workspace_path),
+            system_prompt: build_task_system_prompt(
+                &workspace.workspace_path,
+                workspace
+                    .sidecar_env()
+                    .iter()
+                    .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+            ),
             model_name: queued.model.clone(),
         };
         let context = AgentContext {
@@ -1956,7 +1986,7 @@ mod tests {
     fn test_build_task_system_prompt_no_guidance_returns_default() {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
@@ -1965,7 +1995,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
         assert!(prompt.contains("Use nextest."));
@@ -1977,10 +2007,87 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
         assert!(prompt.contains("legacy rules"));
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn fullstack_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack")
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_includes_topology_for_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let prompt = build_task_system_prompt(&root, true);
+        let topology = crate::agent::project_prompt::topology_for_workspace(&root, true)
+            .unwrap()
+            .unwrap();
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.ends_with(&topology));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("`trunk build`"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_keeps_guidance_before_topology() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(&fullstack_fixture(), dir.path());
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        let guidance = prompt.find("<repo-guidance").unwrap();
+        let topology = prompt.find("full-stack Rust workspace").unwrap();
+        assert!(guidance < topology);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_only_claims_database_url_when_provisioned() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let provisioned = build_task_system_prompt(&root, true);
+        assert!(provisioned.contains("points at a database reserved for this task"));
+        let unprovisioned = build_task_system_prompt(&root, false);
+        assert!(unprovisioned.contains("so `DATABASE_URL` is not set"));
+        assert!(!unprovisioned.contains("points at a database reserved"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_omits_topology_for_plain_crate() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+        assert!(!prompt.contains("full-stack"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_survives_an_unparseable_workspace_manifest() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     /// Initialise a temporary directory as a git repo with a single initial
@@ -2011,6 +2118,109 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "init commit failed");
+    }
+
+    struct RecordingProvider {
+        inner: Arc<dyn ModelProvider>,
+        system_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingProvider {
+        async fn chat(
+            &self,
+            request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            for message in &request.messages {
+                if message.role == model::types::MessageRole::System {
+                    self.system_prompts
+                        .lock()
+                        .unwrap()
+                        .push(message.content.clone().unwrap_or_default());
+                }
+            }
+            self.inner.chat(request).await
+        }
+
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            self.inner.list_models().await
+        }
+
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            self.inner.health_check().await
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    async fn system_prompt_received_by_the_agent(repo: &std::path::Path) -> String {
+        let recording = Arc::new(RecordingProvider {
+            inner: MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+                "done",
+            )])),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider: Arc<dyn ModelProvider> = recording.clone();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(20);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+            ) {
+                assert!(
+                    matches!(task.status, TaskStatus::Completed { .. }),
+                    "expected task to complete successfully, got {:?}",
+                    task.status
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        let prompts = recording.system_prompts.lock().unwrap().clone();
+        assert!(!prompts.is_empty(), "the agent sent no system prompt");
+        prompts[0].clone()
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_the_topology_for_a_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        copy_dir(&fullstack_fixture(), repo_dir.path());
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("The `api` crate"));
+        assert!(prompt.contains("so `DATABASE_URL` is not set"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_no_topology_for_a_plain_crate() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     #[tokio::test]
@@ -2080,7 +2290,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
