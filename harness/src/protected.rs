@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// The fixed, repository-relative globs every agent is refused, matched
-/// case-insensitively with `*` never crossing `/` and `**` spanning directories. A glob
+/// with `*` never crossing `/` and `**` spanning directories. A glob
 /// ending in `/**` also matches the directory itself.
 pub const PROTECTED_PATTERNS: &[&str] = &[
     ".nanna/**",
@@ -51,6 +51,18 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "CODEOWNERS",
     "docs/CODEOWNERS",
     "harness/src/auditor/**",
+    ".github/**",
+    ".cargo-husky/**",
+    ".envrc",
+    ".config/**",
+    ".claude/**",
+    "nix/**",
+    "CLAUDE.md",
+    "docs/ci/protected-paths-guard.yml",
+    "harness/src/workspace.rs",
+    "harness/src/tools.rs",
+    "harness/src/marker.rs",
+    "harness/src/identity/**",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -231,6 +243,7 @@ impl ProtectedPaths {
             if roots.iter().any(|root| path.starts_with(&root.path)) {
                 continue;
             }
+            roots.retain(|root| !root.path.starts_with(&path));
             let directory = rule.glob.ends_with(RECURSIVE_SUFFIX);
             roots.push(MountRoot { path, directory });
         }
@@ -263,51 +276,69 @@ mod tests {
         ProtectedPaths::with_config_dir(Path::new("/repo"), None)
     }
 
+    const EXAMPLES: &[(&str, &str)] = &[
+        (".nanna/**", ".nanna/agents/rust-implementer.toml"),
+        (".nanna/**", ".nanna/deploy.toml"),
+        (".nanna/**", ".nanna/windows.toml"),
+        (".nanna/**", ".nanna"),
+        ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
+        ("**/.nanna/**", "crates/api/.nanna"),
+        (".git/**", ".git/config"),
+        (".git/**", ".git/hooks/pre-commit"),
+        (".github/workflows/**", ".github/workflows/ci.yml"),
+        (".github/workflows/**", ".github/workflows"),
+        (".github/CODEOWNERS", ".github/CODEOWNERS"),
+        ("codecov.yml", "codecov.yml"),
+        ("windows.toml", "windows.toml"),
+        ("tarpaulin.toml", "tarpaulin.toml"),
+        ("deny.toml", "deny.toml"),
+        ("flake.nix", "flake.nix"),
+        ("flake.lock", "flake.lock"),
+        (".github/rulesets/**", ".github/rulesets/main.json"),
+        (".github/rulesets/**", ".github/rulesets"),
+        (".githooks/**", ".githooks/pre-commit"),
+        (".cargo/**", ".cargo/config.toml"),
+        (".devcontainer/**", ".devcontainer/devcontainer.json"),
+        ("AGENTS.md", "AGENTS.md"),
+        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
+        ("harness/src/protected.rs", "harness/src/protected.rs"),
+        (".gitattributes", ".gitattributes"),
+        (".gitmodules", ".gitmodules"),
+        ("harness/src/scope.rs", "harness/src/scope.rs"),
+        ("CODEOWNERS", "CODEOWNERS"),
+        ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
+        (".github/**", ".github/actions/setup/action.yml"),
+        (".github/**", ".github/dependabot.yml"),
+        (".github/**", ".github/ISSUE_TEMPLATE/bug.md"),
+        (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
+        (".envrc", ".envrc"),
+        (".config/**", ".config/nextest.toml"),
+        (".claude/**", ".claude/settings.json"),
+        ("nix/**", "nix/containers.nix"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        (
+            "docs/ci/protected-paths-guard.yml",
+            "docs/ci/protected-paths-guard.yml",
+        ),
+        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
+        ("harness/src/tools.rs", "harness/src/tools.rs"),
+        ("harness/src/marker.rs", "harness/src/marker.rs"),
+        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
+    ];
+
     #[test]
     fn every_fixed_pattern_protects_its_example_path() {
-        let table = [
-            (".nanna/**", ".nanna/agents/rust-implementer.toml"),
-            (".nanna/**", ".nanna/deploy.toml"),
-            (".nanna/**", ".nanna/windows.toml"),
-            (".nanna/**", ".nanna"),
-            ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
-            ("**/.nanna/**", "crates/api/.nanna"),
-            (".git/**", ".git/config"),
-            (".git/**", ".git/hooks/pre-commit"),
-            (".github/workflows/**", ".github/workflows/ci.yml"),
-            (".github/workflows/**", ".github/workflows"),
-            (".github/CODEOWNERS", ".github/CODEOWNERS"),
-            ("codecov.yml", "codecov.yml"),
-            ("windows.toml", "windows.toml"),
-            ("tarpaulin.toml", "tarpaulin.toml"),
-            ("deny.toml", "deny.toml"),
-            ("flake.nix", "flake.nix"),
-            ("flake.lock", "flake.lock"),
-            (".github/rulesets/**", ".github/rulesets/main.json"),
-            (".github/rulesets/**", ".github/rulesets"),
-            (".githooks/**", ".githooks/pre-commit"),
-            (".cargo/**", ".cargo/config.toml"),
-            (".devcontainer/**", ".devcontainer/devcontainer.json"),
-            ("AGENTS.md", "AGENTS.md"),
-            ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
-            ("harness/src/protected.rs", "harness/src/protected.rs"),
-            (".gitattributes", ".gitattributes"),
-            (".gitmodules", ".gitmodules"),
-            ("harness/src/scope.rs", "harness/src/scope.rs"),
-            ("CODEOWNERS", "CODEOWNERS"),
-            ("docs/CODEOWNERS", "docs/CODEOWNERS"),
-            ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
-        ];
         let protected = protected();
-        for (rule, path) in table {
+        for (rule, path) in EXAMPLES {
             let violation = protected.check(Path::new(path)).unwrap_err();
-            assert_eq!(violation.rule, rule, "{path}");
-            assert_eq!(violation.path, path);
+            assert_eq!(violation.rule, *rule, "{path}");
+            assert_eq!(violation.path, *path);
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
         for pattern in PROTECTED_PATTERNS {
             assert!(
-                table.iter().any(|(rule, _)| rule == pattern),
+                EXAMPLES.iter().any(|(rule, _)| rule == pattern),
                 "{pattern} has no example in the table"
             );
         }
@@ -351,6 +382,19 @@ mod tests {
             "harness/src/auditor/mod.rs",
             "harness/src/auditor/review/rules.rs",
             "harness/src/auditor",
+            ".github/actions/setup/action.yml",
+            ".github/dependabot.yml",
+            ".cargo-husky/hooks/pre-commit",
+            ".envrc",
+            ".config/nextest.toml",
+            ".claude/settings.json",
+            "nix/containers.nix",
+            "CLAUDE.md",
+            "docs/ci/protected-paths-guard.yml",
+            "harness/src/workspace.rs",
+            "harness/src/tools.rs",
+            "harness/src/marker.rs",
+            "harness/src/identity/schema.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -414,9 +458,6 @@ mod tests {
         for path in [
             "src/main.rs",
             "README.md",
-            ".github/dependabot.yml",
-            ".github/ISSUE_TEMPLATE/bug.md",
-            "docs/ci/protected-paths-guard.yml",
             "nanna/agents/x.toml",
             "codecov.yml.bak",
             "docs/windows.toml",
@@ -428,6 +469,14 @@ mod tests {
             "auditor/src/lib.rs",
             "harness/src/auditors/x.rs",
             "harness/src/scope_extra.rs",
+            "harness/src/identity.rs",
+            "harness/src/workspace_extra.rs",
+            "src/CLAUDE.md",
+            "src/.envrc",
+            ".configs/x.toml",
+            "nix.md",
+            ".claudex/x.json",
+            ".githubx/x.yml",
             "src/CODEOWNERS",
             "docs/ci/CODEOWNERS",
             ".gitattributes.bak",
@@ -496,6 +545,29 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "protected glob is valid")]
+    fn an_uncompilable_pattern_panics_instead_of_being_skipped() {
+        Rule::new("[".to_string());
+    }
+
+    #[test]
+    fn a_later_ancestor_replaces_the_nested_roots_mounted_before_it() {
+        let targets = protected().mount_targets();
+        let paths: Vec<String> = targets
+            .iter()
+            .map(|t| t.path.display().to_string())
+            .collect();
+        for nested in [
+            ".github/workflows",
+            ".github/CODEOWNERS",
+            ".github/rulesets",
+        ] {
+            assert!(!paths.iter().any(|p| p == nested), "{nested} still mounted");
+        }
+        assert_eq!(paths.iter().filter(|p| p.as_str() == ".github").count(), 1);
+    }
+
+    #[test]
     fn mount_roots_are_the_literal_prefixes_without_nested_duplicates() {
         let protected =
             ProtectedPaths::with_config_dir(Path::new("/repo"), Some(Path::new("/repo/cfg")));
@@ -504,15 +576,12 @@ mod tests {
             vec![
                 PathBuf::from(".nanna"),
                 PathBuf::from(".git"),
-                PathBuf::from(".github/workflows"),
-                PathBuf::from(".github/CODEOWNERS"),
                 PathBuf::from("codecov.yml"),
                 PathBuf::from("windows.toml"),
                 PathBuf::from("tarpaulin.toml"),
                 PathBuf::from("deny.toml"),
                 PathBuf::from("flake.nix"),
                 PathBuf::from("flake.lock"),
-                PathBuf::from(".github/rulesets"),
                 PathBuf::from(".githooks"),
                 PathBuf::from(".cargo"),
                 PathBuf::from(".devcontainer"),
@@ -525,6 +594,18 @@ mod tests {
                 PathBuf::from("CODEOWNERS"),
                 PathBuf::from("docs/CODEOWNERS"),
                 PathBuf::from("harness/src/auditor"),
+                PathBuf::from(".github"),
+                PathBuf::from(".cargo-husky"),
+                PathBuf::from(".envrc"),
+                PathBuf::from(".config"),
+                PathBuf::from(".claude"),
+                PathBuf::from("nix"),
+                PathBuf::from("CLAUDE.md"),
+                PathBuf::from("docs/ci/protected-paths-guard.yml"),
+                PathBuf::from("harness/src/workspace.rs"),
+                PathBuf::from("harness/src/tools.rs"),
+                PathBuf::from("harness/src/marker.rs"),
+                PathBuf::from("harness/src/identity"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -542,15 +623,12 @@ mod tests {
             vec![
                 (".nanna".to_string(), true),
                 (".git".to_string(), true),
-                (".github/workflows".to_string(), true),
-                (".github/CODEOWNERS".to_string(), false),
                 ("codecov.yml".to_string(), false),
                 ("windows.toml".to_string(), false),
                 ("tarpaulin.toml".to_string(), false),
                 ("deny.toml".to_string(), false),
                 ("flake.nix".to_string(), false),
                 ("flake.lock".to_string(), false),
-                (".github/rulesets".to_string(), true),
                 (".githooks".to_string(), true),
                 (".cargo".to_string(), true),
                 (".devcontainer".to_string(), true),
@@ -563,6 +641,18 @@ mod tests {
                 ("CODEOWNERS".to_string(), false),
                 ("docs/CODEOWNERS".to_string(), false),
                 ("harness/src/auditor".to_string(), true),
+                (".github".to_string(), true),
+                (".cargo-husky".to_string(), true),
+                (".envrc".to_string(), false),
+                (".config".to_string(), true),
+                (".claude".to_string(), true),
+                ("nix".to_string(), true),
+                ("CLAUDE.md".to_string(), false),
+                ("docs/ci/protected-paths-guard.yml".to_string(), false),
+                ("harness/src/workspace.rs".to_string(), false),
+                ("harness/src/tools.rs".to_string(), false),
+                ("harness/src/marker.rs".to_string(), false),
+                ("harness/src/identity".to_string(), true),
             ]
         );
     }
@@ -628,5 +718,210 @@ mod tests {
         assert!(!guard.contains("not an agent PR, protected paths are not enforced here"));
         assert!(!guard.contains("if: steps.identity.outputs.name != ''"));
         assert!(!guard.contains("Human PRs\n# (no marker) are not affected"));
+    }
+
+    #[cfg(target_os = "linux")]
+    mod guard {
+        use super::EXAMPLES;
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Output};
+
+        const GUARD: &str = include_str!("../../docs/ci/protected-paths-guard.yml");
+
+        fn step_script(step_name: &str) -> String {
+            let marker = format!("- name: {step_name}");
+            let start = GUARD.find(&marker).expect("guard step exists");
+            let after = &GUARD[start..];
+            let run = after.find("run: |\n").expect("step has a run block") + "run: |\n".len();
+            after[run..]
+                .lines()
+                .take_while(|line| line.is_empty() || line.starts_with("          "))
+                .map(|line| line.strip_prefix("          ").unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        struct Repo {
+            dir: tempfile::TempDir,
+            base: String,
+            head: String,
+        }
+
+        fn repo_changing(paths: &[&str], message: &str) -> Repo {
+            let dir = tempfile::tempdir().unwrap();
+            git(dir.path(), &["init", "-q"]);
+            std::fs::write(dir.path().join("README.md"), "base").unwrap();
+            git(dir.path(), &["add", "-A"]);
+            git(dir.path(), &["commit", "-q", "-m", "base"]);
+            let base = git(dir.path(), &["rev-parse", "HEAD"]);
+            for path in paths {
+                let file = dir.path().join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "changed").unwrap();
+            }
+            git(dir.path(), &["add", "-A"]);
+            git(dir.path(), &["commit", "-q", "-m", message]);
+            let head = git(dir.path(), &["rev-parse", "HEAD"]);
+            Repo { dir, base, head }
+        }
+
+        fn run(repo: &Path, script: &str, env: &[(&str, &str)]) -> Output {
+            let mut command = Command::new("bash");
+            command.current_dir(repo).arg("-c").arg(script);
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            command.output().unwrap()
+        }
+
+        fn enforce(repo: &Repo, identity: &str, author: &str, humans: &str) -> Output {
+            run(
+                repo.dir.path(),
+                &step_script("Refuse protected paths unless a listed human authored the PR"),
+                &[
+                    ("BASE_SHA", &repo.base),
+                    ("HEAD_SHA", &repo.head),
+                    ("IDENTITY", identity),
+                    ("PR_AUTHOR", author),
+                    ("PROTECTED_PATTERNS_HUMAN_AUTHORS", humans),
+                ],
+            )
+        }
+
+        fn detect(repo: &Repo, base: &str, head: &str, body: &str) -> (Output, String) {
+            let outputs: PathBuf = repo.dir.path().join("github-output");
+            let _ = std::fs::remove_file(&outputs);
+            let output = run(
+                repo.dir.path(),
+                &step_script("Detect the Nanna-Identity marker"),
+                &[
+                    ("BASE_SHA", base),
+                    ("HEAD_SHA", head),
+                    ("PR_BODY", body),
+                    ("GITHUB_OUTPUT", outputs.to_str().unwrap()),
+                ],
+            );
+            let written = std::fs::read_to_string(&outputs).unwrap_or_default();
+            (output, written)
+        }
+
+        fn stderr(output: &Output) -> String {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        }
+
+        #[test]
+        fn an_agent_pr_touching_every_protected_example_fails_naming_the_rust_rule() {
+            let files: Vec<&(&str, &str)> = EXAMPLES
+                .iter()
+                .filter(|(_, path)| {
+                    !path.starts_with(".git/")
+                        && !EXAMPLES
+                            .iter()
+                            .any(|(_, other)| other.starts_with(&format!("{path}/")))
+                })
+                .collect();
+            let paths: Vec<&str> = files.iter().map(|(_, path)| *path).collect();
+            let repo = repo_changing(&paths, "agent work");
+            let output = enforce(&repo, "", "agent-bot", "owner");
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let stderr = stderr(&output);
+            for (rule, path) in files {
+                assert!(
+                    stderr.contains(&format!("  - {path} (rule: {rule})")),
+                    "{path} / {rule} missing from:\n{stderr}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_listed_human_author_may_touch_protected_paths_case_insensitively() {
+            let repo = repo_changing(&["flake.nix"], "human work");
+            let output = enforce(&repo, "", "OwNeR", " other , owner ");
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("listed human author"));
+        }
+
+        #[test]
+        fn an_unlisted_author_or_an_empty_allow_list_fails_closed() {
+            let repo = repo_changing(&["flake.nix"], "work");
+            assert_eq!(
+                enforce(&repo, "", "stranger", "owner").status.code(),
+                Some(1)
+            );
+            assert_eq!(enforce(&repo, "", "owner", "").status.code(), Some(1));
+            assert_eq!(enforce(&repo, "", "owner", " , ").status.code(), Some(1));
+        }
+
+        #[test]
+        fn an_identity_marker_blocks_even_a_listed_human() {
+            let repo = repo_changing(&["flake.nix"], "work");
+            let output = enforce(&repo, "rust-implementer", "owner", "owner");
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(stderr(&output).contains("identity marker: 'rust-implementer'"));
+        }
+
+        #[test]
+        fn a_pr_touching_only_ordinary_paths_passes_for_anyone() {
+            let repo = repo_changing(&["src/main.rs", "docs/notes.md"], "work");
+            let output = enforce(&repo, "rust-implementer", "stranger", "");
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("no protected path touched"));
+        }
+
+        #[test]
+        fn matching_is_case_insensitive_and_nested_nanna_directories_are_caught() {
+            let repo = repo_changing(&["FLAKE.NIX", "crates/api/.Nanna/agents/x.toml"], "work");
+            let stderr = stderr(&enforce(&repo, "", "stranger", "owner"));
+            assert!(
+                stderr.contains("  - FLAKE.NIX (rule: flake.nix)"),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("  - crates/api/.Nanna/agents/x.toml (rule: **/.nanna/**)"),
+                "{stderr}"
+            );
+        }
+
+        #[test]
+        fn unresolvable_commits_fail_closed_in_marker_detection() {
+            let repo = repo_changing(&["src/a.rs"], "work");
+            let zeros = "0000000000000000000000000000000000000000";
+            for (base, head) in [(zeros, repo.head.as_str()), (repo.base.as_str(), zeros)] {
+                let (output, written) = detect(&repo, base, head, "");
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("fail-closed"));
+                assert!(written.is_empty());
+            }
+        }
+
+        #[test]
+        fn the_marker_is_read_from_the_body_or_a_commit_trailer_and_absent_otherwise() {
+            let repo = repo_changing(&["src/a.rs"], "work\n\nNanna-Identity: from-commit");
+            let (output, written) = detect(&repo, &repo.base, &repo.head, "");
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert_eq!(written, "name=from-commit\n");
+            let plain = repo_changing(&["src/a.rs"], "work");
+            let (_, written) = detect(
+                &plain,
+                &plain.base,
+                &plain.head,
+                "text\n<!-- Nanna-Identity: from-body -->\n",
+            );
+            assert_eq!(written, "name=from-body\n");
+            let (_, written) = detect(&plain, &plain.base, &plain.head, "no marker here");
+            assert_eq!(written, "name=\n");
+        }
     }
 }

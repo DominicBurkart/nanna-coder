@@ -1898,8 +1898,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 14] = [
-        ".github/CODEOWNERS",
+    const PLACEHOLDER_FILES: [&str; 19] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1913,6 +1912,12 @@ mod tests {
         "harness/src/scope.rs",
         "CODEOWNERS",
         "docs/CODEOWNERS",
+        ".envrc",
+        "CLAUDE.md",
+        "docs/ci/protected-paths-guard.yml",
+        "harness/src/workspace.rs",
+        "harness/src/tools.rs",
+        "harness/src/marker.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1925,15 +1930,12 @@ mod tests {
         [
             ".nanna",
             ".git",
-            ".github/workflows",
-            ".github/CODEOWNERS",
             "codecov.yml",
             "windows.toml",
             "tarpaulin.toml",
             "deny.toml",
             "flake.nix",
             "flake.lock",
-            ".github/rulesets",
             ".githooks",
             ".cargo",
             ".devcontainer",
@@ -1946,6 +1948,18 @@ mod tests {
             "CODEOWNERS",
             "docs/CODEOWNERS",
             "harness/src/auditor",
+            ".github",
+            ".cargo-husky",
+            ".envrc",
+            ".config",
+            ".claude",
+            "nix",
+            "CLAUDE.md",
+            "docs/ci/protected-paths-guard.yml",
+            "harness/src/workspace.rs",
+            "harness/src/tools.rs",
+            "harness/src/marker.rs",
+            "harness/src/identity",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -1993,9 +2007,14 @@ mod tests {
 
         assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
         assert!(root.join(".nanna").is_dir());
-        assert!(root.join(".github/workflows").is_dir());
+        assert!(root.join(".github").is_dir());
         for dir in [
-            ".github/rulesets",
+            ".github",
+            ".cargo-husky",
+            ".config",
+            ".claude",
+            "nix",
+            "harness/src/identity",
             ".githooks",
             ".cargo",
             ".devcontainer",
@@ -2052,10 +2071,10 @@ mod tests {
     async fn test_an_unpreparable_protected_root_fails_container_setup_and_removes_the_worktree() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        std::fs::write(source.path().join(".github"), "not a directory").unwrap();
+        std::fs::write(source.path().join("harness"), "not a directory").unwrap();
         git_cmd(source.path()).args(["add", "."]).output().unwrap();
         git_cmd(source.path())
-            .args(["commit", "-m", "github is a file"])
+            .args(["commit", "-m", "harness is a file"])
             .output()
             .unwrap();
 
@@ -2105,7 +2124,7 @@ mod tests {
     #[test]
     fn test_protected_mounts_report_an_unwritable_parent() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".github"), "file").unwrap();
+        std::fs::write(dir.path().join("harness"), "file").unwrap();
         let protected = ProtectedPaths::with_config_dir(dir.path(), None);
         let err = protected_mounts(&protected, dir.path()).unwrap_err();
         assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");

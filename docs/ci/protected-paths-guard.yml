@@ -38,7 +38,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1 || ! git rev-parse --verify "$HEAD_SHA" >/dev/null 2>&1; then
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null || ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
             echo "::error::base or head commit not resolvable; fail-closed per policy"
             exit 1
           fi
@@ -84,6 +84,18 @@ jobs:
             "CODEOWNERS"
             "docs/CODEOWNERS"
             "harness/src/auditor/**"
+            ".github/**"
+            ".cargo-husky/**"
+            ".envrc"
+            ".config/**"
+            ".claude/**"
+            "nix/**"
+            "CLAUDE.md"
+            "docs/ci/protected-paths-guard.yml"
+            "harness/src/workspace.rs"
+            "harness/src/tools.rs"
+            "harness/src/marker.rs"
+            "harness/src/identity/**"
           )
           shopt -s nocasematch
           VIOLATIONS=()

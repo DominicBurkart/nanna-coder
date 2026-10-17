@@ -4714,7 +4714,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 26] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 39] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4741,6 +4741,22 @@ mod tests {
         ("CODEOWNERS", "CODEOWNERS"),
         ("docs/CODEOWNERS", "docs/CODEOWNERS"),
         ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
+        (".github/**", ".github/actions/setup/action.yml"),
+        (".github/**", ".github/dependabot.yml"),
+        (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
+        (".envrc", ".envrc"),
+        (".config/**", ".config/nextest.toml"),
+        (".claude/**", ".claude/settings.json"),
+        ("nix/**", "nix/containers.nix"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        (
+            "docs/ci/protected-paths-guard.yml",
+            "docs/ci/protected-paths-guard.yml",
+        ),
+        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
+        ("harness/src/tools.rs", "harness/src/tools.rs"),
+        ("harness/src/marker.rs", "harness/src/marker.rs"),
+        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
