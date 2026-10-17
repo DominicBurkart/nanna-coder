@@ -520,19 +520,14 @@ fn unprintable_mask(text: &str, shape: Shape) -> Vec<bool> {
 }
 
 fn strip_unprintable(raw: &str) -> String {
-    let mut current = raw.replace('\r', "");
-    loop {
-        let mask = unprintable_mask(&current, Shape::Block);
-        if !mask.contains(&true) {
-            return current;
-        }
-        current = current
-            .chars()
-            .zip(mask)
-            .filter(|(_, bad)| !*bad)
-            .map(|(c, _)| c)
-            .collect();
-    }
+    let current = raw.replace('\r', "");
+    let mask = unprintable_mask(&current, Shape::Block);
+    current
+        .chars()
+        .zip(mask)
+        .filter(|(_, bad)| !*bad)
+        .map(|(c, _)| c)
+        .collect()
 }
 
 fn redact_resilient(text: &str) -> String {
