@@ -1,0 +1,1 @@
+{"schema_version":2,"date":"2026-10-15T19:38:57Z","commit":"e0e73867a5f7092a424274681bea4ba9316d7f4d","branch":"main","pr":null,"auditor":"rule-auditor","label":"rule-auditor scored on its own authored cases: circular (#771), not a model-measured false-allow rate","summary":{"total":14,"correct":14,"false_allows":0,"false_blocks":0,"false_allow_rate":0.0,"false_block_rate":0.0}}

@@ -210,7 +210,7 @@ impl Escalation {
         summary: impl Into<String>,
         request: &CardRequest,
     ) -> Self {
-        let action = format!("Review the proposed identity `{}` below, adjust its model and limits, and add it to the identity catalog; then re-run the task.", request.name);
+        let action = format!("Review the proposed identity `{}` below, fill in `identity.model`, `identity.system_prompt`, `scope.repos` and `scope.paths`, adjust its limits, and add it to the identity catalog; then re-run the task.", request.name);
         Self::new(Severity::NeedsCard, source, repo, summary)
             .with_suggested_action(action)
             .with_proposed_identity(request.to_toml())
@@ -676,10 +676,109 @@ mod tests {
             .next()
             .unwrap();
         let table: toml::Table = toml::from_str(block).unwrap();
-        assert_eq!(table["name"].as_str(), Some("sandbox-qa"));
+        assert_eq!(table["identity"]["name"].as_str(), Some("sandbox-qa"));
         assert_eq!(table["scope"]["max_effect"].as_str(), Some("sandbox"));
         assert_eq!(table["scope"]["tools"].as_array().unwrap().len(), 2);
-        assert_eq!(table["loop"].as_str(), Some("middle"));
+        assert_eq!(table["identity"]["loop"].as_str(), Some("middle"));
+    }
+
+    fn needs_card_skeleton(request: &CardRequest) -> String {
+        let e = Escalation::needs_card(
+            EscalationSource::Auditor,
+            "example/repo",
+            "no card fits",
+            request,
+        );
+        let body = e.body();
+        body.split("```toml\n")
+            .nth(1)
+            .unwrap()
+            .split("\n```")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn sandbox_request() -> CardRequest {
+        CardRequest {
+            name: "sandbox-qa".to_string(),
+            dev_loop: "middle".to_string(),
+            max_effect: "sandbox".to_string(),
+            tools: vec!["cargo_test".to_string(), "deploy_sandbox".to_string()],
+            reason: "the task needs a sandbox deploy and no card allows it".to_string(),
+        }
+    }
+
+    fn load_through_catalog(
+        toml: &str,
+    ) -> Result<crate::identity::IdentityCatalog, crate::identity::IdentityError> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sandbox-qa.toml"), toml).unwrap();
+        crate::identity::IdentityCatalog::load(dir.path())
+    }
+
+    fn fill(skeleton: &str, skip: Option<&str>) -> String {
+        let mut table: toml::Table = toml::from_str(skeleton).unwrap();
+        let identity = table["identity"].as_table_mut().unwrap();
+        if skip != Some("identity.model") {
+            identity.insert("model".into(), "gemma4:e4b".into());
+        }
+        if skip != Some("identity.system_prompt") {
+            let mut prompt = toml::Table::new();
+            prompt.insert("inline".into(), "You run sandbox QA.".into());
+            identity.insert("system_prompt".into(), prompt.into());
+        }
+        let scope = table["scope"].as_table_mut().unwrap();
+        if skip != Some("scope.repos[0]") {
+            scope.insert(
+                "repos".into(),
+                vec!["github.com/example/repo".to_string()].into(),
+            );
+        }
+        if skip != Some("scope.paths[0]") {
+            scope.insert("paths".into(), vec!["src/**".to_string()].into());
+        }
+        toml::to_string(&table).unwrap()
+    }
+
+    #[test]
+    fn needs_card_skeleton_loads_through_the_identity_catalog_once_filled_in() {
+        let request = sandbox_request();
+        let filled = fill(&needs_card_skeleton(&request), None);
+        let catalog = load_through_catalog(&filled).unwrap();
+        let identity = catalog.get("sandbox-qa").unwrap();
+        assert_eq!(identity.identity.dev_loop.as_str(), "middle");
+        assert_eq!(identity.scope.max_effect.as_str(), "sandbox");
+        assert_eq!(identity.scope.tools.len(), 2);
+        assert!(identity.allows_tool("cargo_test"));
+        assert!(identity.allows_tool("deploy_sandbox"));
+        assert_eq!(identity.limits.max_iterations, 100);
+        assert_eq!(identity.limits.max_wall_clock_secs, 3600);
+        assert!(identity.limits.max_concurrent > 0);
+    }
+
+    #[test]
+    fn needs_card_skeleton_is_rejected_by_the_loader_until_every_placeholder_is_filled() {
+        let skeleton = needs_card_skeleton(&sandbox_request());
+        for field in [
+            "identity.model",
+            "identity.system_prompt",
+            "scope.repos[0]",
+            "scope.paths[0]",
+        ] {
+            let err = load_through_catalog(&fill(&skeleton, Some(field))).unwrap_err();
+            match err {
+                crate::identity::IdentityError::InvalidField { field: got, .. } => {
+                    assert_eq!(got, field)
+                }
+                other => panic!("{field}: expected InvalidField, got {other:?}"),
+            }
+        }
+        let err = load_through_catalog(&skeleton).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::identity::IdentityError::InvalidField { .. }
+        ));
     }
 
     #[test]

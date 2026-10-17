@@ -306,7 +306,7 @@ impl Tool for QaBrowserTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             QA_BROWSER_TOOL,
-            "Run a browser scenario in headless Chromium inside the dev container against the running frontend: steps goto {path}, click {selector}, type {selector, text}, expect_text {selector, text} (waits for the text) and screenshot {name}. The first step must be a goto. Result: { frontend_url, steps: [{ step, passed, detail }], passed, screenshots, console_errors: [{ source, text, url }], artifact_dir, text }.",
+            "Run a browser scenario in headless Chromium inside the dev container against the running frontend: scenario field \"mount\" (absent: wait for the dioxus root #main; a CSS selector: wait for that; null or an empty string: no mount wait), steps goto {path}, click {selector}, type {selector, text}, expect_text {selector, text} (waits for the text) and screenshot {name}. The first step must be a goto. Result: { frontend_url, steps: [{ step, passed, detail }], passed, screenshots, console_errors: [{ source, text, url }], artifact_dir, text }.",
             vec![
                 ("scenario", property(SchemaType::Object, "{ \"steps\": [{ \"step\": \"goto\", \"path\": \"/\" }, { \"step\": \"expect_text\", \"selector\": \"#greeting\", \"text\": \"Hello\" }, { \"step\": \"screenshot\", \"name\": \"home\" }] }, or the path of such a JSON file relative to the workspace root")),
                 ("base_url", property(SchemaType::String, "Origin to drive instead of the running application's frontend")),
@@ -620,7 +620,11 @@ mod tests {
 
     #[tokio::test]
     async fn qa_browser_runs_a_scenario_and_writes_the_run_directory() {
-        let mut page = StubPage::new(&[json!("complete"), json!("Hello from the fixture")]);
+        let mut page = StubPage::new(&[
+            json!("complete"),
+            json!(true),
+            json!("Hello from the fixture"),
+        ]);
         page.errors.push_back(ConsoleError {
             source: "network".to_string(),
             text: "Failed to load resource: 404".to_string(),
@@ -671,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn qa_browser_loads_a_scenario_file_and_honours_base_url() {
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let f = fixture(probe(&[]), vec![page]);
         let file = f.ctx.workspace_root.join("scenario.json");
         std::fs::write(
@@ -689,6 +693,24 @@ mod tests {
             "loaded https://sandbox.invalid/login"
         );
         assert_eq!(result["passed"], true);
+    }
+
+    #[tokio::test]
+    async fn qa_browser_honours_the_scenario_mount_field_end_to_end() {
+        let page = StubPage::new(&[json!("complete")]);
+        let f = fixture(probe(&[]), vec![page]);
+        let result = QaBrowserTool::new(f.ctx.clone())
+            .execute(json!({
+                "scenario": { "mount": null, "steps": [{ "step": "goto", "path": "/" }] },
+                "base_url": "https://plain.invalid"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["passed"], true, "{result}");
+        assert_eq!(
+            result["steps"][0]["detail"],
+            "loaded https://plain.invalid/"
+        );
     }
 
     #[tokio::test]
