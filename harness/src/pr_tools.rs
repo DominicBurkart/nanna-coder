@@ -149,10 +149,9 @@ fn validate_text(key: &str, text: &str, shape: Shape, max: usize) -> ToolResult<
 }
 
 fn text_arg<'a>(args: &'a Value, key: &str, shape: Shape, max: usize) -> ToolResult<&'a str> {
-    let text = args
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(format!("'{key}' must be a string")))?;
+    let Some(text) = args.get(key).and_then(Value::as_str) else {
+        return Err(invalid(format!("'{key}' must be a string")));
+    };
     validate_text(key, text, shape, max)?;
     Ok(text)
 }
@@ -333,20 +332,23 @@ fn git_binary() -> String {
     "git".to_string()
 }
 
-fn null_device() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
-}
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
 
 fn git_cmd(workspace_root: &Path) -> Command {
     let mut cmd = Command::new(git_binary());
     cmd.current_dir(workspace_root);
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "nanna")
+        .env("GIT_AUTHOR_EMAIL", "nanna@local")
+        .env("GIT_COMMITTER_NAME", "nanna")
+        .env("GIT_COMMITTER_EMAIL", "nanna@local");
     cmd.arg("-c")
-        .arg(format!("core.hooksPath={}", null_device()));
+        .arg(format!("core.hooksPath={NULL_DEVICE}"))
+        .arg("-c")
+        .arg("commit.gpgsign=false");
     cmd
 }
 
@@ -663,11 +665,8 @@ impl Tool for GitCommitTool {
             add_args.extend(to_stage.iter().map(String::as_str));
             run_git_raw(&self.workspace_root, &add_args)?;
         }
-        let nothing_staged = git_cmd(&self.workspace_root)
-            .args(["diff", "--cached", "--quiet"])
-            .status()
-            .map_err(|e| failed(format!("failed to run git diff: {e}")))?
-            .success();
+        let staged = run_git_raw(&self.workspace_root, &["diff", "--cached", "--name-only"])?;
+        let nothing_staged = staged.trim().is_empty();
         if nothing_staged {
             return Err(failed("nothing to commit"));
         }
@@ -3405,5 +3404,263 @@ mod tests {
         let mut names = registry.list_tools();
         names.sort_unstable();
         assert_eq!(names, ALL_TOOL_NAMES.to_vec());
+    }
+
+    const BENIGN_LINE: [&str; 11] = [
+        "## Heading-like",
+        "# x",
+        "a..b",
+        "what?",
+        "issue #5 and a/b#c",
+        "```",
+        "~~~",
+        "Nanna\u{2011}Identity: lookalike",
+        "\u{ff46}\u{ff55}\u{ff4c}\u{ff4c}",
+        "m\u{0430}in",
+        "../../etc/passwd",
+    ];
+
+    const BENIGN_BLOCK: [&str; 8] = [
+        "## Heading-like\n# another\n---",
+        "a..b\nwhat?\n#5",
+        "```\nfenced ## inside\n```",
+        "~~~\nx\n~~~\ntrailing",
+        "Nanna\u{2011}Identity: lookalike",
+        "\u{ff46}\u{ff55}\u{ff4c}\u{ff4c}\nm\u{0430}in",
+        "../../etc/passwd",
+        "inline ``` not a fence`",
+    ];
+
+    #[tokio::test]
+    async fn benign_special_text_is_forwarded_verbatim_and_never_displaces_the_marker() {
+        let dir = feature_repo();
+        let mock = rich_mock();
+        let open = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let comment =
+            GithubIssueCommentTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        let close = GithubPrCloseTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
+        for text in BENIGN_LINE {
+            open.execute(json!({ "title": text, "body": "b", "base": "main" }))
+                .await
+                .unwrap_or_else(|e| panic!("title {text:?}: {e}"));
+            let reason = format!("{text} #1");
+            close
+                .execute(json!({ "pr_number": 3, "reason": reason }))
+                .await
+                .unwrap_or_else(|e| panic!("reason {text:?}: {e}"));
+        }
+        for text in BENIGN_BLOCK {
+            open.execute(json!({ "title": "t", "body": text, "base": "main" }))
+                .await
+                .unwrap_or_else(|e| panic!("body {text:?}: {e}"));
+            comment
+                .execute(json!({ "issue_number": 3, "body": text }))
+                .await
+                .unwrap_or_else(|e| panic!("comment {text:?}: {e}"));
+        }
+        let calls = mock.calls();
+        let marker = render_html_marker("sdlc-dev");
+        let mut cursor = 0;
+        for text in BENIGN_LINE {
+            let sent = &calls[cursor];
+            assert!(sent.contains(&format!("title={text}\nbody=")), "{text:?}");
+            let comment_call = &calls[cursor + 1];
+            cursor += 3;
+            assert!(
+                comment_call.contains(&format!("{text} #1\n\n{marker}\n")),
+                "{text:?}"
+            );
+        }
+        for text in BENIGN_BLOCK {
+            let sent = &calls[cursor];
+            let comment_call = &calls[cursor + 1];
+            cursor += 2;
+            let sent_body = sent.split("body=").nth(1).unwrap();
+            assert!(sent_body.starts_with(&format!("{text}\n\n")), "{text:?}");
+            assert!(sent_body.trim_end().ends_with(&marker), "{text:?}");
+            assert_eq!(
+                parse_identity_from_text(sent_body).as_deref(),
+                Some("sdlc-dev")
+            );
+            assert!(
+                comment_call.ends_with(&format!("{text}\n\n{marker}\n")),
+                "{text:?}"
+            );
+            assert_eq!(
+                parse_identity_from_text(comment_call).as_deref(),
+                Some("sdlc-dev")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn benign_special_text_is_committed_verbatim_with_the_trailer_last() {
+        let dir = feature_repo();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        for (i, text) in BENIGN_LINE.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("s{i}.txt")), "s").unwrap();
+            tool.execute(json!({ "subject": text }))
+                .await
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let message = run_git(dir.path(), &["log", "-1", "--format=%B"]).unwrap();
+            assert_eq!(
+                message,
+                format!("{text}\n\nNanna-Identity: sdlc-dev"),
+                "{text:?}"
+            );
+        }
+        for (i, text) in BENIGN_BLOCK.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("b{i}.txt")), "b").unwrap();
+            tool.execute(json!({ "subject": "s", "body": text }))
+                .await
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let message = run_git(dir.path(), &["log", "-1", "--format=%B"]).unwrap();
+            assert_eq!(
+                message,
+                format!("s\n\n{}\n\nNanna-Identity: sdlc-dev", text.trim()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fence_balance_follows_the_markdown_opening_and_closing_rules() {
+        for balanced in [
+            "no fences",
+            "    ```\nindented four spaces is code, not a fence",
+            "``\ntwo backticks are not a fence",
+            "``` has `inline` backticks\nso it is not an opener",
+            "```\nx\n````",
+            "   ~~~\nx\n~~~",
+            "~~~ info string\nx\n~~~",
+        ] {
+            assert!(fences_balanced(balanced), "{balanced:?}");
+        }
+        for unbalanced in [
+            "```",
+            "~~~\n```",
+            "```\n~~~",
+            "````\n```",
+            "```\nx\n``` trailing",
+            "~~~\nx\n~~~ trailing",
+        ] {
+            assert!(!fences_balanced(unbalanced), "{unbalanced:?}");
+        }
+    }
+
+    #[test]
+    fn git_invocations_disable_repository_hooks_and_signing() {
+        let cmd = git_cmd(Path::new("."));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with("core.hooksPath="));
+        assert!(args[1].ends_with(NULL_DEVICE));
+        assert_eq!(args[2], "-c");
+        assert_eq!(args[3], "commit.gpgsign=false");
+    }
+
+    #[tokio::test]
+    async fn commits_are_authored_by_nanna_not_the_host_identity() {
+        let dir = feature_repo();
+        std::fs::write(dir.path().join("n.txt"), "n").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let author = run_git(dir.path(), &["log", "-1", "--format=%an <%ae>"]).unwrap();
+        assert_eq!(author, "nanna <nanna@local>");
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_git_file_cannot_be_rewritten_by_write_file() {
+        let source = github_repo_fixture();
+        let holder = TempDir::new().unwrap();
+        let worktree = holder.path().join("wt");
+        git(
+            source.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-wt",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        assert!(worktree.join(".git").is_file());
+        let registry = crate::tools::create_tool_registry(&worktree);
+        for path in [".git", ".git/config", "sub/../.git"] {
+            let result = registry
+                .execute(
+                    "write_file",
+                    json!({ "path": path, "content": "gitdir: /elsewhere" }),
+                )
+                .await;
+            assert!(result.is_err(), "{path}");
+        }
+        assert_eq!(resolve_repo(&worktree).unwrap(), "example/repo");
+    }
+
+    #[tokio::test]
+    async fn every_second_client_call_failure_is_surfaced_as_an_execution_failure() {
+        let dir = feature_repo();
+        let cases: [(&str, &str, Value); 5] = [
+            (
+                "mock:list_issue_comments",
+                "github_pr_comments",
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "mock:list_issue_comments",
+                "github_issue_read",
+                json!({ "issue_number": 3 }),
+            ),
+            (
+                "mock:mark_pull_request_ready",
+                "github_pr_promote",
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "mock:comment_on_issue",
+                "github_pr_close",
+                json!({ "pr_number": 3, "reason": "#1" }),
+            ),
+            (
+                "mock:close_pull_request",
+                "github_pr_close",
+                json!({ "pr_number": 3, "reason": "#1" }),
+            ),
+        ];
+        for (failing, tool_name, args) in cases {
+            let mut mock = MockGithub {
+                fail_only: Some(failing),
+                fail_status: Some(502),
+                ..Default::default()
+            };
+            mock.pr_details.insert(
+                ("example/repo".to_string(), 3),
+                pr_detail(3, true, "sdlc-dev"),
+            );
+            mock.issue_details.insert(
+                ("example/repo".to_string(), 3),
+                GithubIssueDetail {
+                    number: 3,
+                    title: "t".to_string(),
+                    body: None,
+                    labels: vec![],
+                    html_url: "u".to_string(),
+                },
+            );
+            let tools = api_tools(dir.path(), Arc::new(mock));
+            let (_, tool, _) = tools.iter().find(|(n, _, _)| *n == tool_name).unwrap();
+            let err = tool.execute(args).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ExecutionFailed { .. }),
+                "{failing}: {err:?}"
+            );
+            assert!(err.to_string().contains("502"), "{failing}: {err}");
+        }
     }
 }
