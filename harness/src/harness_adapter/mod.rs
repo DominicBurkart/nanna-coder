@@ -62,6 +62,8 @@
 //! # }
 //! ```
 
+mod bind;
+mod broker;
 mod checked;
 mod isolation;
 mod pi;
@@ -71,6 +73,12 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use bind::{BindError, BoundWorkspace};
+pub use broker::{
+    ArmError, ArmedBroker, AuditOutcome, AuditSink, Broker, BrokerError, BrokerOutcome,
+    BrokerPolicy, BrokerRequest, BrokerResponse, CallRecord, HaltReason, RingAuditSink,
+    ToolErrorKind, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES,
+};
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
@@ -543,6 +551,10 @@ pub struct PlanFile {
 /// other than the broker socket are not expressible here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
+    /// Name of the agent the plan was built for.
+    pub agent: String,
+    /// Model name the runtime is told to use.
+    pub model: String,
     /// Container image.
     pub image: String,
     /// Files to place in the container.

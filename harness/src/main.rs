@@ -45,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Record auditor eval results
+    Auditor {
+        #[command(subcommand)]
+        action: AuditorAction,
+    },
     /// Inspect the agent identity catalog
     Agents {
         #[command(subcommand)]
@@ -205,6 +210,23 @@ enum EscalationAction {
         /// escalations.jsonl next to the queue log)
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditorAction {
+    /// Score the rule auditor on the shipped eval cases and append one row,
+    /// labelled as circular (#771), to the auditor scorecard
+    RecordScorecard {
+        /// Commit the scored code is at
+        #[arg(long)]
+        commit: String,
+        /// Branch, when known
+        #[arg(long)]
+        branch: Option<String>,
+        /// Scorecard file (defaults to evals/scorecards/auditor_spawn.jsonl)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -480,6 +502,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_escalation_resolve(&id, path)?;
         }
+        Commands::Auditor {
+            action:
+                AuditorAction::RecordScorecard {
+                    commit,
+                    branch,
+                    out,
+                },
+        } => {
+            let path = out.unwrap_or_else(harness::auditor::eval::default_scorecard_path);
+            let date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            match harness::auditor::eval::record_rule_auditor_row(
+                &path,
+                &commit,
+                branch.as_deref(),
+                &date,
+            )
+            .await
+            {
+                Ok(row) => println!("appended to {}: {}", path.display(), row.label),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::Effects { command } => {
             if let Err(err) = run_effects(command) {
@@ -522,7 +569,9 @@ fn fake_rollout_log(
     std::fs::create_dir_all(&dir)?;
     let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
     if let Some(record) = seed {
-        log.append(None, record)?;
+        let mut seed = record.clone();
+        seed.revision = 0;
+        log.append(None, &mut seed)?;
     }
     Ok(log)
 }
@@ -1168,7 +1217,11 @@ async fn run_backlog_sync(
 
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
-    let sink = StoreSink::open(Box::new(store))?;
+    let identities = load_identities()
+        .iter()
+        .map(|identity| identity.name().to_string())
+        .collect::<Vec<_>>();
+    let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
     let report = backlog_sync(&client, &sink, &config).await?;
     println!(
@@ -1653,17 +1706,17 @@ mod tests {
             chrono::Utc::now(),
         );
         let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
-        log.append(None, &record).unwrap();
+        log.append(None, &mut record).unwrap();
         let pending = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
             .unwrap();
-        log.append(Some(&pending), &record).unwrap();
+        log.append(Some(&pending), &mut record).unwrap();
         let stepping = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
             .unwrap();
-        log.append(Some(&stepping), &record).unwrap();
+        log.append(Some(&stepping), &mut record).unwrap();
         let before = std::fs::read_to_string(&real_path).unwrap();
         run_deploy(DeployCommands::RollForward {
             id: "rollout-real".into(),
