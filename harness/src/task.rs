@@ -6,6 +6,7 @@ use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
+use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
@@ -131,6 +132,10 @@ pub struct TaskResult {
     pub denials: Vec<ScopeDenial>,
     pub iterations: usize,
     pub model_used: String,
+    /// What the task's patch and actions reach in the repository's
+    /// state-asset graph; `None` when the repository declares no manifest.
+    #[serde(default)]
+    pub blast_radius: Option<BlastRadius>,
     #[serde(default)]
     pub qa_summary: QaSummary,
 }
@@ -163,6 +168,7 @@ impl TaskResult {
             "denial_count": self.denial_count(),
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "blast_radius": self.blast_radius,
             "qa_summary": self.qa_summary.to_json(),
         })
     }
@@ -1131,6 +1137,14 @@ impl TaskRunner {
             }
         };
         let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
+        let task_impact = match crate::impact::TaskImpact::load(&workspace.workspace_path) {
+            Ok(task_impact) => task_impact,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e.to_string(), "ImpactError").await;
+                return;
+            }
+        };
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
@@ -1152,10 +1166,37 @@ impl TaskRunner {
 
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
-        let run_result = agent.run(context).await;
+        let mut run_result = agent.run(context).await;
 
         let extracted = workspace.extract_changes();
-        let changes_patch = extracted.as_ref().ok().cloned().and_then(bound_patch);
+        let impact_required =
+            impact_required(task_impact.is_some(), run_result.is_ok(), &extracted);
+        let raw_patch = match changes_for_impact(&extracted, impact_required) {
+            Ok(patch) => patch,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e, "ImpactError").await;
+                return;
+            }
+        };
+
+        let blast_radius = match (run_result.as_mut(), task_impact.as_ref()) {
+            (Ok(result), Some(task_impact)) if impact_required => match task_impact.analyze(
+                &workspace.workspace_path,
+                raw_patch.as_deref(),
+                &mut result.tool_calls_made,
+            ) {
+                Ok(blast_radius) => Some(blast_radius),
+                Err(e) => {
+                    let _ = workspace.cleanup();
+                    self.fail(&task_id, e.to_string(), "ImpactError").await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+
+        let changes_patch = raw_patch.and_then(bound_patch);
 
         let format_patch = match &extracted {
             Err(WorkspaceError::ProtectedPath(_)) => None,
@@ -1192,6 +1233,7 @@ impl TaskRunner {
                     denials: result.denials,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    blast_radius,
                     qa_summary,
                 };
                 self.set_status(
@@ -1268,6 +1310,25 @@ fn agent_error_type(error: &AgentError) -> &'static str {
 }
 
 /// Drop an empty patch and truncate one larger than `MAX_DIFF_BYTES`.
+fn changes_for_impact(
+    extracted: &Result<String, crate::workspace::WorkspaceError>,
+    required: bool,
+) -> Result<Option<String>, String> {
+    match extracted {
+        Ok(patch) => Ok(Some(patch.clone())),
+        Err(e) if required => Err(format!("failed to read the workspace changes: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+fn impact_required(
+    has_impact: bool,
+    run_succeeded: bool,
+    extracted: &Result<String, crate::workspace::WorkspaceError>,
+) -> bool {
+    has_impact && run_succeeded && !matches!(extracted, Err(WorkspaceError::ProtectedPath(_)))
+}
+
 fn bound_patch(patch: String) -> Option<String> {
     if patch.is_empty() {
         None
@@ -1403,6 +1464,7 @@ mod tests {
             }],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            blast_radius: None,
             qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
@@ -1509,8 +1571,41 @@ mod tests {
             denials: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            blast_radius: None,
             qa_summary: QaSummary::default(),
         }
+    }
+
+    #[test]
+    fn test_task_result_json_shows_blast_radius() {
+        let mut result = result_with_calls(vec![]);
+        assert!(result.to_json()["blast_radius"].is_null());
+        result.blast_radius = Some(BlastRadius {
+            touched: vec!["db.orders".to_string()],
+            score: 10,
+            ..BlastRadius::default()
+        });
+        let json = result.to_json();
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(json["blast_radius"]["score"], 10);
+        let back: TaskResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.blast_radius, result.blast_radius);
+    }
+
+    #[test]
+    fn test_tool_call_json_carries_blast_radius_next_to_effect_class() {
+        let mut call = record("write_file", Some(EffectClass::Workspace));
+        let effect = call.effect.take().unwrap();
+        call.effect = Some(effect.with_blast_radius(BlastRadius {
+            score: 4,
+            ..BlastRadius::default()
+        }));
+        let json = result_with_calls(vec![call]).to_json();
+        assert_eq!(json["tool_calls_made"][0]["effect"]["class"], "workspace");
+        assert_eq!(
+            json["tool_calls_made"][0]["effect"]["blast_radius"]["score"],
+            4
+        );
     }
 
     #[test]
@@ -3080,7 +3175,7 @@ mod identity_tests {
         repo
     }
 
-    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+    pub(super) fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
         use model::types::{FunctionCall, ToolCall};
         ChatResponse {
             choices: vec![Choice {
@@ -3852,5 +3947,295 @@ mod spawn_tests {
             assert_eq!(task.description, "Add a regression test.");
             assert_eq!(task.identity_hint.as_deref(), Some("rust-implementer"));
         }
+    }
+}
+
+#[cfg(test)]
+mod impact_tests {
+    use super::identity_tests::tool_call_response;
+    use super::scheduler_tests::{git_repo, wait_for};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::workspace::WorkspaceError;
+
+    const MANIFEST: &str = "[concern.revenue]\nweight = 10\n[concern.availability]\nweight = 6\n[asset.\"db.orders\"]\nkind = \"table\"\nconcerns = [\"revenue\"]\n[asset.\"http.POST /checkout\"]\nkind = \"endpoint\"\nconcerns = [\"revenue\", \"availability\"]\nreads = [\"db.orders\"]\n";
+
+    fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = git_repo();
+        for (path, content) in files {
+            let target = repo.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, content).unwrap();
+        }
+        for args in [vec!["add", "-A"], vec!["commit", "-m", "fixture files"]] {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        repo
+    }
+
+    fn write_file(path: &str, content: &str) -> model::types::ChatResponse {
+        tool_call_response(
+            "write_file",
+            serde_json::json!({"path": path, "content": content}),
+        )
+    }
+
+    async fn run(
+        repo: &std::path::Path,
+        calls: Vec<model::types::ChatResponse>,
+    ) -> (TaskManager, Task) {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let mut tool_responses = calls;
+        tool_responses.push(stop_response("done"));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(tool_responses));
+        let remote = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["remote", "add", "origin", "git@github.com:example/repo.git"])
+            .output()
+            .unwrap();
+        assert!(remote.status.success());
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.paths = vec!["**".to_string()];
+        identity.scope.tools = vec!["write_file".parse().unwrap()];
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &id, |s| s.is_terminal()).await;
+        (manager, task)
+    }
+
+    fn failure(task: &Task) -> (&str, &str) {
+        match &task.status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (diagnostics.error_type.as_str(), error.as_str()),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_task_run_attaches_the_blast_radius_to_the_result_and_to_each_write() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (manager, task) = run(
+            repo.path(),
+            vec![write_file(
+                "migrations/2_note.sql",
+                "ALTER TABLE orders ADD COLUMN note TEXT;\n",
+            )],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        let radius = result.blast_radius.as_ref().unwrap();
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.downstream, ["http.POST /checkout"]);
+        assert_eq!(radius.score, 10 + 16 / 2);
+        let json = result.to_json();
+        assert_eq!(json["blast_radius"]["score"], 18);
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        let call = &json["tool_calls_made"][0];
+        assert_eq!(call["effect"]["class"], "workspace");
+        assert_eq!(call["effect"]["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(result.files_modified, ["migrations/2_note.sql"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_repository_without_a_manifest_has_no_blast_radius() {
+        let repo = git_repo();
+        let (manager, task) = run(
+            repo.path(),
+            vec![write_file(
+                "migrations/2_note.sql",
+                "ALTER TABLE orders ADD x INT;\n",
+            )],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.blast_radius, None);
+        assert!(result.to_json()["blast_radius"].is_null());
+        assert!(result.tool_calls_made[0]
+            .effect
+            .as_ref()
+            .unwrap()
+            .blast_radius
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_manifest_fails_the_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", "[asset\n")]);
+        let (_, task) = run(repo.path(), vec![write_file("a.txt", "x")]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("effects.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_deploy_template_fails_the_task() {
+        let repo = repo_with(&[
+            (".nanna/effects.toml", MANIFEST),
+            (".nanna/deploy.toml", "[target\n"),
+        ]);
+        let (_, task) = run(repo.path(), vec![]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("deploy.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_task_cannot_rewrite_the_manifest_that_scores_it() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (manager, task) = run(
+            repo.path(),
+            vec![
+                write_file(".nanna/effects.toml", ""),
+                write_file("migrations/2_note.sql", "DROP TABLE orders;\n"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let radius = manager
+            .get_result(&task.id)
+            .await
+            .unwrap()
+            .blast_radius
+            .unwrap();
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.score, 18);
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_longer_than_the_stored_limit_is_still_analysed_to_the_end() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let big = "a".repeat(MAX_DIFF_BYTES + 100_000);
+        let (manager, task) = run(
+            repo.path(),
+            vec![
+                write_file("big.txt", &big),
+                write_file("migrations/9_last.sql", "ALTER TABLE orders ADD y INT;\n"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        let stored = result.changes_patch.as_ref().unwrap();
+        assert_eq!(stored.len(), MAX_DIFF_BYTES);
+        assert!(!stored.contains("9_last.sql"));
+        assert_eq!(result.blast_radius.unwrap().touched, ["db.orders"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_agent_run_is_reported_as_the_agent_failure() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+        let task = wait_for(&manager, &id, |s| s.is_terminal()).await;
+        assert_ne!(failure(&task).0, "ImpactError");
+    }
+
+    #[tokio::test]
+    async fn test_a_write_with_arguments_the_analyzer_cannot_read_fails_the_scored_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (_, task) = run(
+            repo.path(),
+            vec![tool_call_response(
+                "write_file",
+                serde_json::json!({"path": 5, "content": "x"}),
+            )],
+        )
+        .await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("write_file"), "{error}");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_unreadable_workspace_changes_fail_a_scored_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (_, task) = run(repo.path(), vec![write_file("git~1/config", "unindexable")]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(
+            error.starts_with("failed to read the workspace changes: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_changes_for_impact_only_fails_when_a_score_needs_the_changes() {
+        let broken = || WorkspaceError::ExtractChangesFailed("boom".to_string());
+        assert_eq!(
+            changes_for_impact(&Ok("p".into()), true),
+            Ok(Some("p".to_string()))
+        );
+        assert_eq!(
+            changes_for_impact(&Ok("p".into()), false),
+            Ok(Some("p".to_string()))
+        );
+        assert_eq!(changes_for_impact(&Err(broken()), false), Ok(None));
+        let error = changes_for_impact(&Err(broken()), true).unwrap_err();
+        assert!(error.starts_with("failed to read the workspace changes: "));
+        assert!(error.contains("boom"));
+    }
+
+    #[test]
+    fn test_impact_required_needs_impact_a_clean_run_and_no_protected_violation() {
+        let ok: Result<String, WorkspaceError> = Ok(String::new());
+        let broken: Result<String, WorkspaceError> =
+            Err(WorkspaceError::ExtractChangesFailed("boom".to_string()));
+        assert!(impact_required(true, true, &ok));
+        assert!(!impact_required(false, true, &ok));
+        assert!(!impact_required(true, false, &ok));
+        assert!(impact_required(true, true, &broken));
+        let protected: Result<String, WorkspaceError> = Err(WorkspaceError::ProtectedPath(
+            crate::protected::ProtectedPathViolation {
+                path: "codecov.yml".to_string(),
+                rule: "codecov.yml".to_string(),
+            },
+        ));
+        assert!(!impact_required(true, true, &protected));
     }
 }
