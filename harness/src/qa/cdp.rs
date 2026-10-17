@@ -45,6 +45,12 @@ pub enum BrowserError {
     },
     #[error("navigation to {url} failed: {error}")]
     Navigation { url: String, error: String },
+    #[error("{url} did not mount `{selector}` within {wait:?}")]
+    MountTimeout {
+        url: String,
+        selector: String,
+        wait: std::time::Duration,
+    },
     #[error("script failed: {message}")]
     Script { message: String },
     #[error("screenshot data is not base64: {0}")]
