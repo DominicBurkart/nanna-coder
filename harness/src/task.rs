@@ -7,6 +7,7 @@ use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{EscalationLog, EscalationSnapshot};
 use crate::identity::AgentIdentity;
+use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
@@ -38,14 +39,14 @@ pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
 /// imported from here.
 const DEFAULT_TASK_SYSTEM_PROMPT: &str = "You are a helpful coding assistant. Use the available tools to accomplish tasks. When you have completed the task, respond with a summary.";
 
-/// Build the system prompt for a task run, appending any repo-level guidance
+/// Base task prompt plus any repo-level guidance
 /// discovered under the task's workspace path (closes #231).
 ///
 /// Precedence: `AGENTS.md` over `CLAUDE.md` (see
 /// [`crate::agent::agents_md::load`]). Missing files produce no injection;
 /// read errors are logged and swallowed so a broken guidance file never blocks
 /// a task from starting.
-fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
+fn guidance_system_prompt(workspace_path: &std::path::Path) -> String {
     match crate::agent::agents_md::load(workspace_path) {
         Ok(Some(doc)) => {
             tracing::info!(
@@ -67,6 +68,30 @@ fn build_task_system_prompt(workspace_path: &std::path::Path) -> String {
                 "Failed to read AGENTS.md / CLAUDE.md for task; continuing without repo guidance"
             );
             DEFAULT_TASK_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
+/// Build the system prompt for a task run: the repo-level guidance prompt
+/// (see [`guidance_system_prompt`]) followed, for a full-stack Rust workspace,
+/// by its topology paragraph (#643). A workspace whose manifests cannot be
+/// parsed is logged and gets no topology paragraph, like a broken guidance
+/// file.
+fn build_task_system_prompt(
+    workspace_path: &std::path::Path,
+    database_provisioned: bool,
+) -> String {
+    let prompt = guidance_system_prompt(workspace_path);
+    match crate::agent::project_prompt::topology_for_workspace(workspace_path, database_provisioned)
+    {
+        Ok(Some(topology)) => format!("{prompt}\n\n{topology}"),
+        Ok(None) => prompt,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Failed to detect the full-stack topology for task; continuing without it"
+            );
+            prompt
         }
     }
 }
@@ -112,6 +137,10 @@ pub struct TaskResult {
     pub action_audit: Vec<ActionAuditLogEntry>,
     pub iterations: usize,
     pub model_used: String,
+    /// What the task's patch and actions reach in the repository's
+    /// state-asset graph; `None` when the repository declares no manifest.
+    #[serde(default)]
+    pub blast_radius: Option<BlastRadius>,
     #[serde(default)]
     pub qa_summary: QaSummary,
 }
@@ -145,6 +174,7 @@ impl TaskResult {
             "action_audit": self.action_audit,
             "iterations": self.iterations,
             "model_used": self.model_used,
+            "blast_radius": self.blast_radius,
             "qa_summary": self.qa_summary.to_json(),
         })
     }
@@ -1238,11 +1268,25 @@ impl TaskRunner {
         let tool_registry = tool_registry
             .with_action_gate(self.action_gate(), subject)
             .with_action_escalator(self.action_escalator());
+        let task_impact = match crate::impact::TaskImpact::load(&workspace.workspace_path) {
+            Ok(task_impact) => task_impact,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e.to_string(), "ImpactError").await;
+                return;
+            }
+        };
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
             max_iterations: queued.max_iterations,
             verbose: false,
-            system_prompt: build_task_system_prompt(&workspace.workspace_path),
+            system_prompt: build_task_system_prompt(
+                &workspace.workspace_path,
+                workspace
+                    .sidecar_env()
+                    .iter()
+                    .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+            ),
             model_name: queued.model.clone(),
         };
         let context = AgentContext {
@@ -1253,14 +1297,41 @@ impl TaskRunner {
 
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
-        let run_result = agent.run(context).await;
+        let mut run_result = agent.run(context).await;
         let action_audit = agent
             .tool_registry()
             .map(crate::tools::ToolRegistry::action_reviews)
             .unwrap_or_default();
 
         let extracted = workspace.extract_changes();
-        let changes_patch = extracted.as_ref().ok().cloned().and_then(bound_patch);
+        let impact_required =
+            impact_required(task_impact.is_some(), run_result.is_ok(), &extracted);
+        let raw_patch = match changes_for_impact(&extracted, impact_required) {
+            Ok(patch) => patch,
+            Err(e) => {
+                let _ = workspace.cleanup();
+                self.fail(&task_id, e, "ImpactError").await;
+                return;
+            }
+        };
+
+        let blast_radius = match (run_result.as_mut(), task_impact.as_ref()) {
+            (Ok(result), Some(task_impact)) if impact_required => match task_impact.analyze(
+                &workspace.workspace_path,
+                raw_patch.as_deref(),
+                &mut result.tool_calls_made,
+            ) {
+                Ok(blast_radius) => Some(blast_radius),
+                Err(e) => {
+                    let _ = workspace.cleanup();
+                    self.fail(&task_id, e.to_string(), "ImpactError").await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+
+        let changes_patch = raw_patch.and_then(bound_patch);
 
         let format_patch = match &extracted {
             Err(WorkspaceError::ProtectedPath(_)) => None,
@@ -1299,6 +1370,7 @@ impl TaskRunner {
                     action_audit,
                     iterations: result.iterations,
                     model_used: queued.model,
+                    blast_radius,
                     qa_summary,
                 };
                 self.set_status(
@@ -1376,6 +1448,25 @@ fn agent_error_type(error: &AgentError) -> &'static str {
 }
 
 /// Drop an empty patch and truncate one larger than `MAX_DIFF_BYTES`.
+fn changes_for_impact(
+    extracted: &Result<String, crate::workspace::WorkspaceError>,
+    required: bool,
+) -> Result<Option<String>, String> {
+    match extracted {
+        Ok(patch) => Ok(Some(patch.clone())),
+        Err(e) if required => Err(format!("failed to read the workspace changes: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+fn impact_required(
+    has_impact: bool,
+    run_succeeded: bool,
+    extracted: &Result<String, crate::workspace::WorkspaceError>,
+) -> bool {
+    has_impact && run_succeeded && !matches!(extracted, Err(WorkspaceError::ProtectedPath(_)))
+}
+
 fn bound_patch(patch: String) -> Option<String> {
     if patch.is_empty() {
         None
@@ -1552,6 +1643,7 @@ mod tests {
             action_audit: vec![],
             iterations: 3,
             model_used: "qwen3:0.6b".to_string(),
+            blast_radius: None,
             qa_summary: QaSummary::default(),
         };
         assert_eq!(result.denial_count(), 1);
@@ -1661,8 +1753,41 @@ mod tests {
             action_audit: vec![],
             iterations: 1,
             model_used: "mock".to_string(),
+            blast_radius: None,
             qa_summary: QaSummary::default(),
         }
+    }
+
+    #[test]
+    fn test_task_result_json_shows_blast_radius() {
+        let mut result = result_with_calls(vec![]);
+        assert!(result.to_json()["blast_radius"].is_null());
+        result.blast_radius = Some(BlastRadius {
+            touched: vec!["db.orders".to_string()],
+            score: 10,
+            ..BlastRadius::default()
+        });
+        let json = result.to_json();
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(json["blast_radius"]["score"], 10);
+        let back: TaskResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.blast_radius, result.blast_radius);
+    }
+
+    #[test]
+    fn test_tool_call_json_carries_blast_radius_next_to_effect_class() {
+        let mut call = record("write_file", Some(EffectClass::Workspace));
+        let effect = call.effect.take().unwrap();
+        call.effect = Some(effect.with_blast_radius(BlastRadius {
+            score: 4,
+            ..BlastRadius::default()
+        }));
+        let json = result_with_calls(vec![call]).to_json();
+        assert_eq!(json["tool_calls_made"][0]["effect"]["class"], "workspace");
+        assert_eq!(
+            json["tool_calls_made"][0]["effect"]["blast_radius"]["score"],
+            4
+        );
     }
 
     #[test]
@@ -2138,7 +2263,7 @@ mod tests {
     fn test_build_task_system_prompt_no_guidance_returns_default() {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
@@ -2147,7 +2272,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\nUse nextest.\n").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"AGENTS.md\">"));
         assert!(prompt.contains("Use nextest."));
@@ -2159,10 +2284,87 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "legacy rules").unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("<repo-guidance source=\"CLAUDE.md\">"));
         assert!(prompt.contains("legacy rules"));
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn fullstack_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack")
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_includes_topology_for_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let prompt = build_task_system_prompt(&root, true);
+        let topology = crate::agent::project_prompt::topology_for_workspace(&root, true)
+            .unwrap()
+            .unwrap();
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.ends_with(&topology));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("`trunk build`"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_keeps_guidance_before_topology() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(&fullstack_fixture(), dir.path());
+        std::fs::write(dir.path().join("AGENTS.md"), "# Repo rules\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        let guidance = prompt.find("<repo-guidance").unwrap();
+        let topology = prompt.find("full-stack Rust workspace").unwrap();
+        assert!(guidance < topology);
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_only_claims_database_url_when_provisioned() {
+        ensure_tracing_subscriber();
+        let root = fullstack_fixture();
+        let provisioned = build_task_system_prompt(&root, true);
+        assert!(provisioned.contains("points at a database reserved for this task"));
+        let unprovisioned = build_task_system_prompt(&root, false);
+        assert!(unprovisioned.contains("so `DATABASE_URL` is not set"));
+        assert!(!unprovisioned.contains("points at a database reserved"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_omits_topology_for_plain_crate() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+        assert!(!prompt.contains("full-stack"));
+    }
+
+    #[test]
+    fn test_build_task_system_prompt_survives_an_unparseable_workspace_manifest() {
+        ensure_tracing_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace\n").unwrap();
+        let prompt = build_task_system_prompt(dir.path(), true);
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     /// Initialise a temporary directory as a git repo with a single initial
@@ -2193,6 +2395,109 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "init commit failed");
+    }
+
+    struct RecordingProvider {
+        inner: Arc<dyn ModelProvider>,
+        system_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingProvider {
+        async fn chat(
+            &self,
+            request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            for message in &request.messages {
+                if message.role == model::types::MessageRole::System {
+                    self.system_prompts
+                        .lock()
+                        .unwrap()
+                        .push(message.content.clone().unwrap_or_default());
+                }
+            }
+            self.inner.chat(request).await
+        }
+
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            self.inner.list_models().await
+        }
+
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            self.inner.health_check().await
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    async fn system_prompt_received_by_the_agent(repo: &std::path::Path) -> String {
+        let recording = Arc::new(RecordingProvider {
+            inner: MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+                "done",
+            )])),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider: Arc<dyn ModelProvider> = recording.clone();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(20);
+        loop {
+            let task = manager.poll(&task_id).await.unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+            ) {
+                assert!(
+                    matches!(task.status, TaskStatus::Completed { .. }),
+                    "expected task to complete successfully, got {:?}",
+                    task.status
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        let prompts = recording.system_prompts.lock().unwrap().clone();
+        assert!(!prompts.is_empty(), "the agent sent no system prompt");
+        prompts[0].clone()
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_the_topology_for_a_full_stack_workspace() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        copy_dir(&fullstack_fixture(), repo_dir.path());
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains("This repository is a full-stack Rust workspace."));
+        assert!(prompt.contains("The `api` crate"));
+        assert!(prompt.contains("so `DATABASE_URL` is not set"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_gives_the_agent_no_topology_for_a_plain_crate() {
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"plain\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        init_test_git_repo(repo_dir.path());
+        let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
+        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
     #[tokio::test]
@@ -2262,7 +2567,7 @@ mod tests {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), [0x48u8, 0xFFu8, 0x49u8]).unwrap();
-        let prompt = build_task_system_prompt(dir.path());
+        let prompt = build_task_system_prompt(dir.path(), true);
         assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
     }
 
@@ -3052,7 +3357,7 @@ mod identity_tests {
         repo
     }
 
-    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
+    pub(super) fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
         use model::types::{FunctionCall, ToolCall};
         ChatResponse {
             choices: vec![Choice {
@@ -4218,5 +4523,295 @@ mod spawn_tests {
             assert_eq!(task.description, "Add a regression test.");
             assert_eq!(task.identity_hint.as_deref(), Some("rust-implementer"));
         }
+    }
+}
+
+#[cfg(test)]
+mod impact_tests {
+    use super::identity_tests::tool_call_response;
+    use super::scheduler_tests::{git_repo, wait_for};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::workspace::WorkspaceError;
+
+    const MANIFEST: &str = "[concern.revenue]\nweight = 10\n[concern.availability]\nweight = 6\n[asset.\"db.orders\"]\nkind = \"table\"\nconcerns = [\"revenue\"]\n[asset.\"http.POST /checkout\"]\nkind = \"endpoint\"\nconcerns = [\"revenue\", \"availability\"]\nreads = [\"db.orders\"]\n";
+
+    fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = git_repo();
+        for (path, content) in files {
+            let target = repo.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, content).unwrap();
+        }
+        for args in [vec!["add", "-A"], vec!["commit", "-m", "fixture files"]] {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        repo
+    }
+
+    fn write_file(path: &str, content: &str) -> model::types::ChatResponse {
+        tool_call_response(
+            "write_file",
+            serde_json::json!({"path": path, "content": content}),
+        )
+    }
+
+    async fn run(
+        repo: &std::path::Path,
+        calls: Vec<model::types::ChatResponse>,
+    ) -> (TaskManager, Task) {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let mut tool_responses = calls;
+        tool_responses.push(stop_response("done"));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(tool_responses));
+        let remote = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["remote", "add", "origin", "git@github.com:example/repo.git"])
+            .output()
+            .unwrap();
+        assert!(remote.status.success());
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.paths = vec!["**".to_string()];
+        identity.scope.tools = vec!["write_file".parse().unwrap()];
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &id, |s| s.is_terminal()).await;
+        (manager, task)
+    }
+
+    fn failure(task: &Task) -> (&str, &str) {
+        match &task.status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (diagnostics.error_type.as_str(), error.as_str()),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_task_run_attaches_the_blast_radius_to_the_result_and_to_each_write() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (manager, task) = run(
+            repo.path(),
+            vec![write_file(
+                "migrations/2_note.sql",
+                "ALTER TABLE orders ADD COLUMN note TEXT;\n",
+            )],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        let radius = result.blast_radius.as_ref().unwrap();
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.downstream, ["http.POST /checkout"]);
+        assert_eq!(radius.score, 10 + 16 / 2);
+        let json = result.to_json();
+        assert_eq!(json["blast_radius"]["score"], 18);
+        assert_eq!(json["blast_radius"]["touched"][0], "db.orders");
+        let call = &json["tool_calls_made"][0];
+        assert_eq!(call["effect"]["class"], "workspace");
+        assert_eq!(call["effect"]["blast_radius"]["touched"][0], "db.orders");
+        assert_eq!(result.files_modified, ["migrations/2_note.sql"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_repository_without_a_manifest_has_no_blast_radius() {
+        let repo = git_repo();
+        let (manager, task) = run(
+            repo.path(),
+            vec![write_file(
+                "migrations/2_note.sql",
+                "ALTER TABLE orders ADD x INT;\n",
+            )],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.blast_radius, None);
+        assert!(result.to_json()["blast_radius"].is_null());
+        assert!(result.tool_calls_made[0]
+            .effect
+            .as_ref()
+            .unwrap()
+            .blast_radius
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_manifest_fails_the_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", "[asset\n")]);
+        let (_, task) = run(repo.path(), vec![write_file("a.txt", "x")]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("effects.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_deploy_template_fails_the_task() {
+        let repo = repo_with(&[
+            (".nanna/effects.toml", MANIFEST),
+            (".nanna/deploy.toml", "[target\n"),
+        ]);
+        let (_, task) = run(repo.path(), vec![]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("deploy.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_task_cannot_rewrite_the_manifest_that_scores_it() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (manager, task) = run(
+            repo.path(),
+            vec![
+                write_file(".nanna/effects.toml", ""),
+                write_file("migrations/2_note.sql", "DROP TABLE orders;\n"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let radius = manager
+            .get_result(&task.id)
+            .await
+            .unwrap()
+            .blast_radius
+            .unwrap();
+        assert_eq!(radius.touched, ["db.orders"]);
+        assert_eq!(radius.score, 18);
+    }
+
+    #[tokio::test]
+    async fn test_a_patch_longer_than_the_stored_limit_is_still_analysed_to_the_end() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let big = "a".repeat(MAX_DIFF_BYTES + 100_000);
+        let (manager, task) = run(
+            repo.path(),
+            vec![
+                write_file("big.txt", &big),
+                write_file("migrations/9_last.sql", "ALTER TABLE orders ADD y INT;\n"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        let stored = result.changes_patch.as_ref().unwrap();
+        assert_eq!(stored.len(), MAX_DIFF_BYTES);
+        assert!(!stored.contains("9_last.sql"));
+        assert_eq!(result.blast_radius.unwrap().touched, ["db.orders"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_agent_run_is_reported_as_the_agent_failure() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit(
+                "Test".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+        let task = wait_for(&manager, &id, |s| s.is_terminal()).await;
+        assert_ne!(failure(&task).0, "ImpactError");
+    }
+
+    #[tokio::test]
+    async fn test_a_write_with_arguments_the_analyzer_cannot_read_fails_the_scored_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (_, task) = run(
+            repo.path(),
+            vec![tool_call_response(
+                "write_file",
+                serde_json::json!({"path": 5, "content": "x"}),
+            )],
+        )
+        .await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(error.contains("write_file"), "{error}");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_unreadable_workspace_changes_fail_a_scored_task() {
+        let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
+        let (_, task) = run(repo.path(), vec![write_file("git~1/config", "unindexable")]).await;
+        let (error_type, error) = failure(&task);
+        assert_eq!(error_type, "ImpactError");
+        assert!(
+            error.starts_with("failed to read the workspace changes: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_changes_for_impact_only_fails_when_a_score_needs_the_changes() {
+        let broken = || WorkspaceError::ExtractChangesFailed("boom".to_string());
+        assert_eq!(
+            changes_for_impact(&Ok("p".into()), true),
+            Ok(Some("p".to_string()))
+        );
+        assert_eq!(
+            changes_for_impact(&Ok("p".into()), false),
+            Ok(Some("p".to_string()))
+        );
+        assert_eq!(changes_for_impact(&Err(broken()), false), Ok(None));
+        let error = changes_for_impact(&Err(broken()), true).unwrap_err();
+        assert!(error.starts_with("failed to read the workspace changes: "));
+        assert!(error.contains("boom"));
+    }
+
+    #[test]
+    fn test_impact_required_needs_impact_a_clean_run_and_no_protected_violation() {
+        let ok: Result<String, WorkspaceError> = Ok(String::new());
+        let broken: Result<String, WorkspaceError> =
+            Err(WorkspaceError::ExtractChangesFailed("boom".to_string()));
+        assert!(impact_required(true, true, &ok));
+        assert!(!impact_required(false, true, &ok));
+        assert!(!impact_required(true, false, &ok));
+        assert!(impact_required(true, true, &broken));
+        let protected: Result<String, WorkspaceError> = Err(WorkspaceError::ProtectedPath(
+            crate::protected::ProtectedPathViolation {
+                path: "codecov.yml".to_string(),
+                rule: "codecov.yml".to_string(),
+            },
+        ));
+        assert!(!impact_required(true, true, &protected));
     }
 }

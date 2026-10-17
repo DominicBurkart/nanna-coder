@@ -1,4 +1,5 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
+use crate::impact::BlastRadius;
 use crate::windows;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -542,6 +543,23 @@ impl DeployTemplate {
                 .map(|s| thresholds.classify(s))
                 .ok_or(DeployError::ScoreRequired),
         }
+    }
+
+    /// The effective risk class for a change with this blast radius.
+    ///
+    /// ```
+    /// use harness::deploy::{DeployTemplate, RiskClass};
+    /// use harness::impact::BlastRadius;
+    ///
+    /// let template = DeployTemplate::parse(
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\ninternal = 10\nedge = 50\n[rollout]\nstrategy = \"gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n",
+    /// )
+    /// .unwrap();
+    /// let radius = BlastRadius { score: 60, ..BlastRadius::default() };
+    /// assert_eq!(template.resolve_risk_for(&radius).unwrap(), RiskClass::Edge);
+    /// ```
+    pub fn resolve_risk_for(&self, radius: &BlastRadius) -> Result<RiskClass, DeployError> {
+        self.resolve_risk(Some(radius.score))
     }
 
     fn parse_named(toml_src: &str, file: &Path) -> Result<Self, DeployError> {
@@ -1263,6 +1281,47 @@ compare = ["status", "latency"]
         assert_eq!(t.resolve_risk(Some(u32::MAX)).unwrap(), RiskClass::Core);
         assert_eq!(t.highest_risk(), RiskClass::Core);
         assert_eq!(thresholds.highest(), RiskClass::Core);
+    }
+
+    #[test]
+    fn derived_class_is_chosen_from_an_analyzed_blast_radius() {
+        use crate::assets::AssetGraph;
+        use crate::impact::ImpactAnalyzer;
+
+        let graph = AssetGraph::parse(
+            "[concern.content]\nweight = 3\n[concern.revenue]\nweight = 40\n[asset.\"db.notes\"]\nkind = \"table\"\nconcerns = [\"content\"]\n[asset.\"db.orders\"]\nkind = \"table\"\nconcerns = [\"revenue\"]\n[asset.\"http.POST /checkout\"]\nkind = \"endpoint\"\nconcerns = [\"revenue\"]\nreads = [\"db.orders\"]\n",
+        )
+        .unwrap();
+        let analyzer = ImpactAnalyzer::new(&graph);
+        let t = DeployTemplate::parse(&derived(DERIVED)).unwrap();
+        let notes = analyzer.radius_of_assets(["db.notes"]);
+        let orders = analyzer.radius_of_assets(["db.orders"]);
+        assert_eq!(notes.score, 3);
+        assert_eq!(orders.score, 60);
+        assert_eq!(
+            t.resolve_risk_for(&BlastRadius::default()).unwrap(),
+            RiskClass::Unused
+        );
+        assert_eq!(t.resolve_risk_for(&notes).unwrap(), RiskClass::Unused);
+        assert_eq!(t.resolve_risk_for(&orders).unwrap(), RiskClass::Edge);
+        let plan = t.plan_with_score("sandbox", Some(orders.score)).unwrap();
+        assert_eq!(plan.risk_class, RiskClass::Edge);
+    }
+
+    #[test]
+    fn derived_class_never_decreases_as_the_score_grows() {
+        let t = DeployTemplate::parse(&derived(DERIVED)).unwrap();
+        let mut previous = RiskClass::Unused;
+        for score in (0..400).chain([u32::MAX]) {
+            let class = t
+                .resolve_risk_for(&BlastRadius {
+                    score,
+                    ..BlastRadius::default()
+                })
+                .unwrap();
+            assert!(class >= previous);
+            previous = class;
+        }
     }
 
     #[test]
