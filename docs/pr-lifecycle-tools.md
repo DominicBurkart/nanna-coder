@@ -21,3 +21,7 @@ The credentials must not carry merge scope; no tool merges.
 ## Limits
 
 The `Nanna-Identity` trailer and the PR body marker are attribution, not authentication. Repository hooks are disabled for the tools' git calls. GitHub-sourced text returned to the model is escaped, capped and fenced as untrusted data.
+
+## Accepted characters
+
+Tool arguments and GitHub-sourced text are checked against a printable allow-list: ASCII, letters and digits of any script, common punctuation, currency, arrows, mathematical and technical symbols, CJK and fullwidth punctuation (but not U+3000), and emoji. Context-dependent characters are accepted only in context: U+FE0F after an emoji or symbol base (or a keycap base), U+20E3 after U+FE0F or a keycap base, U+200D and U+200C only between two non-ASCII printable characters, combining marks (including Indic viramas) only after a non-space base, and a carriage return only as part of CRLF in multi-line fields. Everything else is refused in arguments and escaped as `\u{hex}` or removed in output: control characters, format characters, tag characters, variation selectors outside those contexts, no-break and other Unicode spaces, private use and unassigned code points. Combining-mark coverage is a block table, not the full Unicode general-category data.
