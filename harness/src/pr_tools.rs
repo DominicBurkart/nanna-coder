@@ -1327,7 +1327,7 @@ pub fn register(
     workspace_root: &Path,
     identity: &crate::identity::AgentIdentity,
 ) {
-    register_granted(registry, workspace_root, identity.name(), |name| {
+    register_granted(registry, workspace_root, identity.name(), &|name| {
         identity
             .scope
             .tools
@@ -1340,7 +1340,7 @@ fn register_granted(
     registry: &mut ToolRegistry,
     workspace_root: &Path,
     identity_name: &str,
-    granted: impl Fn(&str) -> bool,
+    granted: &dyn Fn(&str) -> bool,
 ) {
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client: Arc<dyn GithubClient> =
@@ -1349,7 +1349,7 @@ fn register_granted(
         parse_allowed_authors(std::env::var(TRUSTED_PR_COMMENTERS_ENV).ok().as_deref());
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GitCommitTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1357,7 +1357,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GitPushBranchTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1365,7 +1365,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubPrOpenTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1374,7 +1374,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubPrCommentsTool::new(
             workspace_root.to_path_buf(),
             Arc::clone(&client),
@@ -1383,7 +1383,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubPrPromoteTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1392,7 +1392,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubPrCloseTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1401,7 +1401,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubIssueReadTool::new(
             workspace_root.to_path_buf(),
             Arc::clone(&client),
@@ -1410,7 +1410,7 @@ fn register_granted(
     );
     register_if(
         registry,
-        &granted,
+        granted,
         Box::new(GithubIssueCommentTool::new(
             workspace_root.to_path_buf(),
             identity_name,
@@ -1419,7 +1419,7 @@ fn register_granted(
     );
 }
 
-fn register_if(registry: &mut ToolRegistry, granted: &impl Fn(&str) -> bool, tool: Box<dyn Tool>) {
+fn register_if(registry: &mut ToolRegistry, granted: &dyn Fn(&str) -> bool, tool: Box<dyn Tool>) {
     if granted(tool.name()) {
         registry.register(tool);
     }
@@ -3626,7 +3626,7 @@ mod tests {
     fn register_never_adds_a_tool_outside_the_pinned_set() {
         let dir = github_repo_fixture();
         let mut registry = ToolRegistry::new();
-        register_granted(&mut registry, dir.path(), "sdlc-dev", |_| true);
+        register_granted(&mut registry, dir.path(), "sdlc-dev", &|_| true);
         let mut names = registry.list_tools();
         names.sort_unstable();
         assert_eq!(names, ALL_TOOL_NAMES.to_vec());
