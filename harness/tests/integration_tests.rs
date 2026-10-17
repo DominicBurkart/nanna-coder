@@ -1937,12 +1937,7 @@ async fn submit_audited(
         .success();
     if !has_origin {
         let remote = git_cmd_clean(&repo_path)
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/example/repo.git",
-            ])
+            .args(["remote", "add", "origin", "git@github.com:example/repo.git"])
             .output()
             .unwrap();
         assert!(remote.status.success());

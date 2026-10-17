@@ -342,7 +342,6 @@ impl SpawnGate {
         Self::with_hook(auditor, log, context, Box::new(NoopEscalationHook))
     }
 
-    /// A gate that also hands every escalated spawn to `hook`.
     pub fn with_hook(
         auditor: Box<dyn Auditor>,
         log: AuditLog,
@@ -355,9 +354,6 @@ impl SpawnGate {
         }
     }
 
-    /// A request for `identity` to run `subtask` under `parent_task`, with
-    /// its effect and loop derived by [`SpawnRequest::derive`] against this
-    /// gate's own catalog.
     pub fn request(
         &self,
         parent_task: TaskSummary,
@@ -367,8 +363,6 @@ impl SpawnGate {
         SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
     }
 
-    /// [`request`](Self::request) with an effect and loop stated by the
-    /// caller, which can only tighten what the task text derives.
     pub fn request_with_caller(
         &self,
         parent_task: TaskSummary,

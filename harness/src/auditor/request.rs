@@ -85,29 +85,6 @@ pub struct SpawnRequest {
 }
 
 impl SpawnRequest {
-    /// Build a request whose `requested_effect` and `dev_loop` come from the
-    /// task text and the identity catalog rather than from anything the
-    /// caller or the card declares about itself.
-    ///
-    /// The effect is the highest one `subtask` plainly asks for
-    /// ([`RuleAuditor::implied_effect`]), or `none` when it names none. The
-    /// loop follows that effect: deploys are `outer`, CI triggers are
-    /// `middle`, and anything else takes the loop of the named card (`inner`
-    /// when the card is unknown). Because the effect no longer echoes the
-    /// card's own ceiling, the ceiling and loop rules can fire for spawns
-    /// that do not come from a planner.
-    ///
-    /// ```
-    /// use harness::auditor::{SpawnRequest, TaskSummary};
-    /// use harness::effects::EffectClass;
-    /// use harness::identity::{DevLoop, IdentityCatalog};
-    ///
-    /// let catalog = IdentityCatalog::default();
-    /// let parent = TaskSummary::new("t", "d", "github.com/example/repo");
-    /// let request = SpawnRequest::derive(&catalog, parent, "ghost", "Deploy build 42 to production.");
-    /// assert_eq!(request.requested_effect, EffectClass::Production);
-    /// assert_eq!(request.dev_loop, DevLoop::Outer);
-    /// ```
     pub fn derive(
         catalog: &IdentityCatalog,
         parent_task: TaskSummary,
@@ -117,33 +94,6 @@ impl SpawnRequest {
         Self::derive_tightened(catalog, parent_task, identity, subtask, None, None)
     }
 
-    /// [`derive`](Self::derive), but a caller may also state an effect and a
-    /// loop of its own, which can only tighten the request.
-    ///
-    /// The effective effect is the greater of the caller's effect and the one
-    /// derived from the task text, so neither source can lower the other. The
-    /// loop is the caller's when the caller names one other than the card's
-    /// (so the loop rule blocks it), and the derived loop otherwise (so a
-    /// derived mismatch blocks even when the caller agreed with the card).
-    ///
-    /// ```
-    /// use harness::auditor::{SpawnRequest, TaskSummary};
-    /// use harness::effects::EffectClass;
-    /// use harness::identity::{DevLoop, IdentityCatalog};
-    ///
-    /// let catalog = IdentityCatalog::default();
-    /// let parent = TaskSummary::new("t", "d", "github.com/example/repo");
-    /// let request = SpawnRequest::derive_tightened(
-    ///     &catalog,
-    ///     parent,
-    ///     "ghost",
-    ///     "Deploy build 42 to production.",
-    ///     Some(EffectClass::Workspace),
-    ///     Some(DevLoop::Inner),
-    /// );
-    /// assert_eq!(request.requested_effect, EffectClass::Production);
-    /// assert_eq!(request.dev_loop, DevLoop::Outer);
-    /// ```
     pub fn derive_tightened(
         catalog: &IdentityCatalog,
         parent_task: TaskSummary,

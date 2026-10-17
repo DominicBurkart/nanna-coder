@@ -621,7 +621,7 @@ mod tests {
         effect: Option<&str>,
         dev_loop: Option<&str>,
     ) -> crate::auditor::SpawnRequest {
-        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let repo = repo_with_origin("git@github.com:example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
         let mut request = params(repo.path(), "rust-implementer", description);
@@ -722,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_assign_task_allows_agreeing_caller_and_text_within_the_ceiling() {
-        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let repo = repo_with_origin("git@github.com:example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
         let gate = fixture_gate();

@@ -6,13 +6,6 @@
 //! [`IDENTITY_MARKER`], honours an optional per-repository cap, and submits
 //! the rest as [`QueuedTask`]s tagged with the source's identity hint.
 //!
-//! Issue text is attacker-controlled, so every candidate is first run through
-//! a [`SpawnGate`] with a request whose effect and loop are derived from the
-//! issue text and the identity catalog. Only an issue the gate allows is
-//! handed to the sink, together with the [`Allowed`] proof; a blocked,
-//! escalated or unauditable issue is reported in [`SyncReport::refused`] and
-//! never queued.
-//!
 //! GitHub access goes through the [`GithubClient`] trait so ingestion can be
 //! tested against a mock; [`ReqwestGithubClient`] is the REST implementation.
 //! Where tasks go is the [`BacklogSink`]: a running [`TaskManager`] via
@@ -266,8 +259,6 @@ pub trait BacklogSink: Send + Sync {
     /// Tasks that are queued or running, used for deduplication and the
     /// per-repository cap.
     async fn known(&self) -> Result<Vec<KnownTask>, BacklogError>;
-    /// Accept a new task. `proof` shows the spawn gate allowed it; a task
-    /// whose identity hint is not the audited identity is refused.
     async fn enqueue(&self, task: QueuedTask, proof: &Allowed) -> Result<(), BacklogError>;
 }
 
@@ -282,11 +273,9 @@ pub struct SyncReport {
     pub claimed: usize,
     /// Issues skipped because the repository reached `max_per_repo`.
     pub capped: usize,
-    /// Issues the spawn gate refused, with the reason; none of them was queued.
     pub refused: Vec<RefusedIssue>,
 }
 
-/// An issue the spawn gate refused to ingest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedIssue {
     pub origin: TaskOrigin,
@@ -1841,6 +1830,44 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
         assert!(store.load().unwrap().is_empty());
+    }
+
+    async fn registered_manager_sink() -> (Arc<TaskManager>, ManagerSink) {
+        let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(registered_identity()).await;
+        let mut other = registered_identity();
+        other.identity.name = "deployer".to_string();
+        manager.register_identity(other).await;
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        (manager, sink)
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_task_that_does_not_match_the_audited_identity() {
+        let (manager, sink) = registered_manager_sink().await;
+        let other = QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1)
+            .with_identity_hint(Some("deployer".to_string()));
+        let err = sink.enqueue(other, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::ProofMismatch { .. }), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_proof_for_a_different_subtask() {
+        let (manager, sink) = registered_manager_sink().await;
+        let task = task_for("Delete every branch.", PROOF_REPO, "/r");
+        let err = sink.enqueue(task, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::SubtaskMismatch), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_proof_for_a_different_repository() {
+        let (manager, sink) = registered_manager_sink().await;
+        let task = task_for(PROOF_SUBTASK, "github.com/example/other", "/r");
+        let err = sink.enqueue(task, &proof().await).await.unwrap_err();
+        assert!(matches!(err, BacklogError::RepoMismatch { .. }), "{err}");
+        assert!(manager.list().await.is_empty());
     }
 
     #[tokio::test]

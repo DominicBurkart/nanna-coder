@@ -4,19 +4,11 @@ use crate::task::TaskId;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Records every auditor `Escalate` verdict through the [`Escalator`] as a
-/// `needs-card` escalation, so it lands in the durable
-/// [`EscalationLog`](super::EscalationLog) and in every configured sink.
-///
-/// The subtask text is deliberately left out of the escalation: it may be
-/// attacker-controlled (a GitHub issue body) and escalations are published
-/// to humans and external sinks.
 pub struct EscalatorSpawnHook {
     escalator: Arc<Escalator>,
 }
 
 impl EscalatorSpawnHook {
-    /// Deliver spawn escalations through `escalator`.
     pub fn new(escalator: Arc<Escalator>) -> Self {
         Self { escalator }
     }
