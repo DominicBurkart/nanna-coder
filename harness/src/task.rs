@@ -578,7 +578,8 @@ impl TaskManager {
     /// [`crate::scope::ScopeDenial`]. To run effectful work, submit under a
     /// named, registered identity with [`TaskManager::submit_with_identity`]
     /// or a hinted [`TaskManager::submit_task`].
-    pub async fn submit(
+    #[cfg(test)]
+    pub(crate) async fn submit(
         &self,
         description: String,
         repo_path: PathBuf,
@@ -675,7 +676,7 @@ impl TaskManager {
     /// identity this is exactly [`TaskManager::submit`]: read-only and
     /// network-less.
     #[allow(clippy::too_many_arguments)]
-    pub async fn submit_with_identity(
+    pub(crate) async fn submit_with_identity(
         &self,
         description: String,
         repo_path: PathBuf,
@@ -704,7 +705,7 @@ impl TaskManager {
     /// The task is `Pending` until the scheduler starts it. If the queue
     /// store rejects the entry the task is recorded as `Failed` with error
     /// type `QueuePersistFailed` rather than dropped silently.
-    pub async fn submit_task(
+    pub(crate) async fn submit_task(
         &self,
         queued: QueuedTask,
         provider: Arc<dyn ModelProvider>,
@@ -1270,6 +1271,100 @@ mod tests {
         ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole, ModelInfo,
     };
     use std::sync::Mutex;
+
+    #[tokio::test]
+    #[ignore]
+    async fn task_manager_submit_with_dev_container() {
+        let repo_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests/integration/repo");
+        assert!(
+            repo_path.exists(),
+            "Example repo not found at {:?}",
+            repo_path
+        );
+
+        assert!(
+            crate::container::detect_runtime().is_available(),
+            "no container runtime available: podman or docker is required to run this ignored test"
+        );
+
+        assert!(
+            tokio::net::TcpStream::connect("127.0.0.1:11434")
+                .await
+                .is_ok(),
+            "Ollama not reachable on 127.0.0.1:11434: required to run this ignored test"
+        );
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+
+        let ollama_config = model::OllamaConfig::default();
+        let provider =
+            model::OllamaProvider::new(ollama_config).expect("failed to create provider");
+        let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+
+        let identity = crate::identity::AgentIdentity::from_toml_str(
+            r#"
+[identity]
+name = "dev-container-e2e"
+description = "Edits the example repository inside its dev container."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Edit the repository." }
+
+[scope]
+repos = ["DominicBurkart/nanna-coder"]
+paths = []
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "run_command"]
+
+[limits]
+max_iterations = 32
+max_wall_clock_secs = 600
+max_concurrent = 1
+"#,
+            "dev-container-e2e.toml",
+        )
+        .expect("e2e identity must parse");
+
+        let task_id = manager
+            .submit_with_identity(
+                "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
+                    .to_string(),
+                repo_path,
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                32,
+                provider,
+                Some(identity),
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(700);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("Task did not complete within timeout");
+            }
+
+            let task = manager.poll(&task_id).await.expect("task not found");
+            match &task.status {
+                TaskStatus::Completed { result, .. } => {
+                    assert!(
+                        result.changes_patch.is_some(),
+                        "expected non-empty changes_patch"
+                    );
+                    return;
+                }
+                TaskStatus::Failed { error, .. } => {
+                    panic!("Task failed: {}", error);
+                }
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
 
     type ChatHook = Box<dyn Fn() + Send + Sync>;
 
