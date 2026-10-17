@@ -23,13 +23,56 @@ use std::fmt;
 /// that proposed the spawn can manufacture one, or substitute a different
 /// catalog's copy of the identity.
 ///
-/// `Allowed`'s fields are private, so a spawn cannot be authorized by
-/// writing a struct literal directly:
+/// Each way of building an `Allowed` outside this module is a compile error.
+/// A struct literal is refused because every field is private:
 ///
-/// ```compile_fail
-/// use harness::auditor::Allowed;
+/// ```compile_fail,E0451
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// # let request: SpawnRequest = todo!();
+/// # let identity: AgentIdentity = todo!();
+/// let _ = Allowed {
+///     request,
+///     identity,
+///     repo: String::new(),
+///     model: String::new(),
+/// };
+/// ```
 ///
-/// let _ = Allowed { request: todo!(), identity: todo!() };
+/// The internal constructor is private:
+///
+/// ```compile_fail,E0624
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// # let request: SpawnRequest = todo!();
+/// # let identity: AgentIdentity = todo!();
+/// let _ = Allowed::new(request, identity);
+/// ```
+///
+/// There is no `Default`:
+///
+/// ```compile_fail,E0599
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let _ = Allowed::default();
+/// ```
+///
+/// A proof cannot be duplicated, so one audit cannot authorise several
+/// spawns:
+///
+/// ```compile_fail,E0599
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let allowed: Allowed = todo!();
+/// let _ = allowed.clone();
+/// ```
+///
+/// And it cannot be deserialized from attacker-controlled data:
+///
+/// ```compile_fail,E0277
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let _ = serde_json::from_str::<Allowed>("{}");
 /// ```
 #[derive(Debug)]
 pub struct Allowed {
@@ -510,16 +553,6 @@ mod tests {
             .starts_with("spawn refused: audit failed:"));
         assert!(refused.source().is_some());
         assert_eq!(gate.log().entries().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn allowed_proof_has_no_public_constructor() {
-        let request = fitting();
-        let identity = crate::identity::example();
-        let allowed = Allowed::new(request.clone(), identity.clone());
-        assert_eq!(allowed.request(), &request);
-        assert_eq!(allowed.identity().name(), identity.name());
-        assert_eq!(allowed.into_parts(), (request, identity));
     }
 
     struct AlwaysAllows;

@@ -4,14 +4,64 @@
 //! execution at both L0 and L1 levels, and error handling.
 //! Tests gracefully handle environments where git or GITHUB_TOKEN may be unavailable.
 
+use async_trait::async_trait;
+use harness::action_auditor::{
+    ActionAuditError, ActionAuditLog, ActionAuditor, ActionContext, ActionGate, ActionReview,
+    ActionVerdict,
+};
+use harness::effects::EffectClass;
+use harness::task::TaskId;
 use harness::tools::{
-    create_tool_registry, GitHubPrStatusTool, GitHubStatus, PrStatusData, Tool, ToolError,
+    create_tool_registry, ActionSubject, GitHubPrStatusTool, GitHubStatus, PrStatusData, Tool,
+    ToolError, ToolRegistry,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 // ── Helper ───────────────────────────────────────────────────────────────────
+
+struct AllowRepository;
+
+#[async_trait]
+impl ActionAuditor for AllowRepository {
+    fn name(&self) -> &str {
+        "allow-repository"
+    }
+
+    async fn review_action(
+        &self,
+        _review: &ActionReview,
+        _context: &ActionContext<'_>,
+    ) -> Result<ActionVerdict, ActionAuditError> {
+        Ok(ActionVerdict::Allow)
+    }
+}
+
+fn gated_registry(repo: &Path) -> ToolRegistry {
+    let gate = Arc::new(ActionGate::new(
+        Arc::new(AllowRepository),
+        ActionAuditLog::in_memory(),
+    ));
+    let subject = ActionSubject {
+        task_id: TaskId("github-pr-status-integration-test".to_string()),
+        max_effect: EffectClass::Production,
+        window: None,
+        repo: "example/repo".to_string(),
+        branch: None,
+        pr: None,
+        environment: None,
+        paths: vec![],
+        description: String::new(),
+    };
+    create_tool_registry(repo).with_action_gate(gate, subject)
+}
+
+#[test]
+fn the_test_auditor_names_itself() {
+    assert_eq!(AllowRepository.name(), "allow-repository");
+}
 
 /// Create a temporary git repository for testing.
 fn create_temp_git_repo() -> TempDir {
@@ -579,7 +629,7 @@ async fn test_execute_via_registry() {
     }
 
     let repo = create_temp_git_repo();
-    let registry = create_tool_registry(repo.path());
+    let registry = gated_registry(repo.path());
 
     // Execute L0 through the registry interface
     let result = registry.execute("github_pr_status", json!({})).await;
@@ -597,7 +647,7 @@ async fn test_execute_l1_via_registry() {
     }
 
     let repo = create_temp_git_repo();
-    let registry = create_tool_registry(repo.path());
+    let registry = gated_registry(repo.path());
 
     let result = registry
         .execute(

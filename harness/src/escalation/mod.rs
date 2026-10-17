@@ -26,7 +26,7 @@ mod sink;
 mod spawn_hook;
 mod webhook;
 
-pub use card::{CardRequest, MODEL_PLACEHOLDER};
+pub use card::{CardRequest, PLACEHOLDER};
 pub use escalator::{default_window, EscalationOutcome, Escalator};
 pub use github::{GithubIssueSink, ESCALATION_LABEL};
 pub use log::{
