@@ -786,6 +786,19 @@ mod tests {
         assert!(!user.contains("cat x > /etc/passwd"));
     }
 
+    #[test]
+    fn ampersands_are_escaped_so_the_escaping_is_reversible() {
+        let user = hostile_prompt(
+            "example/repo",
+            None,
+            &[],
+            "a&b &lt;",
+            serde_json::json!({ "command": "a && b" }),
+        );
+        assert!(user.contains("a&amp;b &amp;lt;"));
+        assert!(user.contains("a &amp;&amp; b"));
+    }
+
     const CONTROLS: &str = "a\u{2028}b\u{2029}c\u{0085}d\u{7f}e\u{1b}f\rg\u{0}h";
 
     fn assert_no_line_breaking_or_control_characters(user: &str, field: &str) {
