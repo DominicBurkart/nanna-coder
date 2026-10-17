@@ -9,10 +9,11 @@
 //! not read as a good score.
 
 use super::{
-    AuditContext, AuditError, Auditor, ReasonCode, SpawnRequest, TaskSummary, VerdictKind,
+    AuditContext, AuditError, Auditor, ReasonCode, RuleAuditor, SpawnRequest, TaskSummary,
+    VerdictKind, RULE_AUDITOR_NAME,
 };
 use crate::effects::EffectClass;
-use crate::identity::DevLoop;
+use crate::identity::{DevLoop, IdentityCatalog};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,14 @@ pub enum AuditorEvalError {
     /// A case file is not valid TOML for this schema.
     #[error("failed to parse {0}: {1}")]
     Parse(PathBuf, #[source] toml::de::Error),
+    /// The identity catalog the cases run against could not be assembled.
+    #[error("failed to load the eval catalog {dir}: {message}")]
+    Catalog {
+        /// The catalog directory.
+        dir: PathBuf,
+        /// What went wrong.
+        message: String,
+    },
     /// Scoring itself failed (the auditor under test returned an error).
     #[error("auditor failed on case `{case_id}`: {source}")]
     Audit {
@@ -281,12 +290,79 @@ pub struct AuditorScorecardRow {
     pub pr: Option<u64>,
     /// `"rule-auditor"`, or the model name for a model-backed run.
     pub auditor: String,
+    /// What the number means and how it was measured; see
+    /// [`RULE_AUDITOR_LABEL`].
+    pub label: String,
     /// The aggregate summary for this run.
     pub summary: AuditorEvalSummary,
 }
 
 /// Schema version for [`AuditorScorecardRow`].
-pub const AUDITOR_SCORECARD_SCHEMA_VERSION: u32 = 1;
+pub const AUDITOR_SCORECARD_SCHEMA_VERSION: u32 = 2;
+
+/// Label on every row recorded for the rule auditor: its cases were written
+/// against its own rules, so the rate says nothing about a model auditor.
+pub const RULE_AUDITOR_LABEL: &str = "rule-auditor scored on its own authored cases: circular (#771), not a model-measured false-allow rate";
+
+/// The default location of the auditor scorecard, relative to the harness
+/// crate root.
+pub fn default_scorecard_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../evals/scorecards/auditor_spawn.jsonl")
+}
+
+/// Score the [`RuleAuditor`] on the shipped cases and append one row,
+/// labelled with [`RULE_AUDITOR_LABEL`], to `path`.
+pub async fn record_rule_auditor_row(
+    path: &Path,
+    commit: &str,
+    branch: Option<&str>,
+    date: &str,
+) -> Result<AuditorScorecardRow, AuditorEvalError> {
+    record_rule_auditor_row_from(
+        &default_cases_dir(),
+        &default_catalog_dir(),
+        path,
+        commit,
+        branch,
+        date,
+    )
+    .await
+}
+
+async fn record_rule_auditor_row_from(
+    cases_dir: &Path,
+    catalog_dir: &Path,
+    path: &Path,
+    commit: &str,
+    branch: Option<&str>,
+    date: &str,
+) -> Result<AuditorScorecardRow, AuditorEvalError> {
+    let catalog_error = |message: String| AuditorEvalError::Catalog {
+        dir: catalog_dir.to_path_buf(),
+        message,
+    };
+    let cases = AuditorEvalCase::discover(cases_dir)?;
+    let catalog = IdentityCatalog::load(catalog_dir).map_err(|e| catalog_error(e.to_string()))?;
+    let auditor_identity = catalog
+        .get("auditor")
+        .ok_or_else(|| catalog_error("no `auditor` identity".to_string()))?
+        .clone();
+    let context =
+        AuditContext::new(catalog, auditor_identity).map_err(|e| catalog_error(e.to_string()))?;
+    let (_, summary) = score(&RuleAuditor::new(), &context, &cases).await?;
+    let row = AuditorScorecardRow {
+        schema_version: AUDITOR_SCORECARD_SCHEMA_VERSION,
+        date: date.to_string(),
+        commit: commit.to_string(),
+        branch: branch.map(str::to_string),
+        pr: None,
+        auditor: RULE_AUDITOR_NAME.to_string(),
+        label: RULE_AUDITOR_LABEL.to_string(),
+        summary,
+    };
+    append_scorecard_row(path, &row)?;
+    Ok(row)
+}
 
 /// Append `row` as one JSON line to `path`, creating parent directories as
 /// needed.
@@ -311,8 +387,6 @@ pub fn append_scorecard_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auditor::{RuleAuditor, RULE_AUDITOR_NAME};
-    use crate::identity::IdentityCatalog;
 
     fn shipped_cases() -> Vec<AuditorEvalCase> {
         AuditorEvalCase::discover(&default_cases_dir()).unwrap()
@@ -491,6 +565,7 @@ reason_codes = ["not_a_real_code"]
             branch: Some("feat/sdlc-auditor-spawn".to_string()),
             pr: None,
             auditor: RULE_AUDITOR_NAME.to_string(),
+            label: RULE_AUDITOR_LABEL.to_string(),
             summary: AuditorEvalSummary {
                 total: 14,
                 correct: 14,
@@ -520,6 +595,7 @@ reason_codes = ["not_a_real_code"]
             branch: None,
             pr: None,
             auditor: RULE_AUDITOR_NAME.to_string(),
+            label: RULE_AUDITOR_LABEL.to_string(),
             summary: AuditorEvalSummary {
                 total: 0,
                 correct: 0,
@@ -534,5 +610,96 @@ reason_codes = ["not_a_real_code"]
             matches!(&err, AuditorEvalError::Io(p, _) if *p == path),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn committed_scorecard_is_valid_jsonl_labelled_as_circular() {
+        let text = fs::read_to_string(default_scorecard_path()).unwrap();
+        let rows: Vec<AuditorScorecardRow> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert_eq!(row.auditor, RULE_AUDITOR_NAME);
+            assert_eq!(row.label, RULE_AUDITOR_LABEL);
+            assert!(row.label.contains("circular"));
+            assert!(row.label.contains("#771"));
+            assert!(row.label.contains("not a model-measured"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_the_rule_auditor_appends_one_labelled_row_for_the_shipped_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scorecards/auditor_spawn.jsonl");
+        let row = record_rule_auditor_row(&path, "abc123", Some("main"), "2026-10-15T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(row.label, RULE_AUDITOR_LABEL);
+        assert_eq!(row.auditor, RULE_AUDITOR_NAME);
+        assert_eq!(row.commit, "abc123");
+        assert_eq!(row.branch.as_deref(), Some("main"));
+        assert_eq!(row.summary.total, shipped_cases().len());
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        let parsed: AuditorScorecardRow = serde_json::from_str(content.trim_end()).unwrap();
+        assert_eq!(parsed, row);
+    }
+
+    #[tokio::test]
+    async fn recording_reports_a_missing_catalog_and_a_missing_auditor_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.jsonl");
+        let missing = dir.path().join("missing");
+        let err = record_rule_auditor_row_from(
+            &default_cases_dir(),
+            &missing,
+            &out,
+            "c",
+            None,
+            "2026-10-15T00:00:00Z",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&err, AuditorEvalError::Catalog { dir, .. } if *dir == missing));
+
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let err = record_rule_auditor_row_from(
+            &default_cases_dir(),
+            &empty,
+            &out,
+            "c",
+            None,
+            "2026-10-15T00:00:00Z",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no `auditor` identity"), "{err}");
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn recording_reports_an_auditor_identity_the_context_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.jsonl");
+        let catalog = dir.path().join("catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        let shipped = fs::read_to_string(default_catalog_dir().join("auditor.toml")).unwrap();
+        let widened = shipped.replace("max_effect = \"none\"", "max_effect = \"workspace\"");
+        assert_ne!(widened, shipped);
+        fs::write(catalog.join("auditor.toml"), widened).unwrap();
+        let err = record_rule_auditor_row_from(
+            &default_cases_dir(),
+            &catalog,
+            &out,
+            "c",
+            None,
+            "2026-10-15T00:00:00Z",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuditorEvalError::Catalog { .. }), "{err}");
     }
 }
