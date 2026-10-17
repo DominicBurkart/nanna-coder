@@ -784,6 +784,12 @@ pub(crate) mod tests {
         assert_eq!(verdict, ActionVerdict::Allow);
     }
 
+    #[test]
+    fn debug_output_omits_stores_but_names_the_field_present() {
+        let rules = auditor();
+        assert!(format!("{rules:?}").contains("RuleActionAuditor"));
+    }
+
     #[tokio::test]
     async fn name_is_the_stable_constant() {
         assert_eq!(auditor().name(), RULE_ACTION_AUDITOR_NAME);
