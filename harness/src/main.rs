@@ -1487,10 +1487,9 @@ async fn build_mcp_task_manager(
     model: &str,
     queue_path: &std::path::Path,
     lease_path: &std::path::Path,
-    escalation_path: &std::path::Path,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
     catalog: &IdentityCatalog,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
-    use harness::escalation::EscalationLog;
     use harness::leases::JsonlLeaseStore;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -1505,7 +1504,7 @@ async fn build_mcp_task_manager(
         catalog,
     )
     .await?
-    .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
+    .with_escalations(escalation_log)
     .with_action_policy(
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
         Some((provider, model.to_string())),
@@ -1546,11 +1545,10 @@ async fn run_mcp_server(
             model,
             &queue_path,
             &lease_path,
-            &escalation_path,
+            Arc::clone(&escalation_log),
             &catalog,
         )
-        .await?
-        .with_escalations(Arc::clone(&escalation_log)),
+        .await?,
     );
 
     info!(
@@ -1664,7 +1662,7 @@ mod tests {
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
-            &dir.path().join("escalations.jsonl"),
+            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
             &IdentityCatalog::default(),
         )
         .await
@@ -1675,6 +1673,62 @@ mod tests {
             gate.log().path(),
             Some(dir.path().join("action_audit.jsonl").as_path())
         );
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_uses_the_escalation_log_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
+        let manager = build_mcp_task_manager(
+            offline_provider(),
+            "reviewer-model",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            std::sync::Arc::clone(&log),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&manager.escalations(), &log));
+    }
+
+    #[tokio::test]
+    async fn the_spawn_escalation_hook_records_an_escalate_verdict_in_the_log() {
+        fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/identities/global"),
+            dir.path(),
+        );
+        std::fs::remove_file(dir.path().join("incident-responder.toml")).unwrap();
+        let catalog = IdentityCatalog::load(dir.path()).unwrap();
+        let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
+        let gate = build_spawn_gate(
+            &catalog,
+            harness::auditor::AuditLog::in_memory(),
+            spawn_escalation_hook(std::sync::Arc::clone(&log)),
+        )
+        .unwrap();
+        let request = gate.request(
+            harness::auditor::TaskSummary::new("task-1", "d", "example/repo"),
+            "deployer",
+            "Deploy build 42 to the production environment.",
+        );
+        let refused = gate.check(request).await.unwrap_err();
+        assert!(matches!(refused, harness::auditor::Refused::Verdict { .. }));
+        assert_eq!(log.states().len(), 1);
     }
 
     #[test]
