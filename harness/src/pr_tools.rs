@@ -34,6 +34,7 @@ const ISSUE_BODY_CAP: usize = 4_000;
 const LABEL_CAP: usize = 100;
 const URL_CAP: usize = 300;
 const MAX_LABELS: usize = 20;
+const MAX_MARK_RUN: usize = 4;
 const MAX_COMMENTS: usize = 30;
 const GIT_OUTPUT_CAP: usize = 500;
 const ERROR_CAP: usize = 300;
@@ -58,7 +59,7 @@ const GIT_ENV_ALLOW: [&str; 17] = [
 ];
 
 fn map_backlog_error(err: BacklogError) -> ToolError {
-    let text = crate::escalation::redact(&strip_unprintable(&err.to_string()));
+    let text = redact_resilient(&strip_unprintable(&err.to_string()));
     failed(fenced_untrusted(
         &text,
         ERROR_CAP,
@@ -128,85 +129,352 @@ fn is_printable(c: char) -> bool {
         )
 }
 
+const MARK_RANGES: &[(u32, u32)] = &[
+    (0x300, 0x34e),
+    (0x350, 0x36f),
+    (0x483, 0x489),
+    (0x591, 0x5bd),
+    (0x5bf, 0x5bf),
+    (0x5c1, 0x5c2),
+    (0x5c4, 0x5c5),
+    (0x5c7, 0x5c7),
+    (0x610, 0x61a),
+    (0x64b, 0x65f),
+    (0x670, 0x670),
+    (0x6d6, 0x6dc),
+    (0x6df, 0x6e4),
+    (0x6e7, 0x6e8),
+    (0x6ea, 0x6ed),
+    (0x711, 0x711),
+    (0x730, 0x74a),
+    (0x7a6, 0x7b0),
+    (0x7eb, 0x7f3),
+    (0x7fd, 0x7fd),
+    (0x816, 0x819),
+    (0x81b, 0x823),
+    (0x825, 0x827),
+    (0x829, 0x82d),
+    (0x859, 0x85b),
+    (0x898, 0x89f),
+    (0x8ca, 0x8e1),
+    (0x8e3, 0x903),
+    (0x93a, 0x93c),
+    (0x93e, 0x94f),
+    (0x951, 0x957),
+    (0x962, 0x963),
+    (0x981, 0x983),
+    (0x9bc, 0x9bc),
+    (0x9be, 0x9c4),
+    (0x9c7, 0x9c8),
+    (0x9cb, 0x9cd),
+    (0x9d7, 0x9d7),
+    (0x9e2, 0x9e3),
+    (0x9fe, 0x9fe),
+    (0xa01, 0xa03),
+    (0xa3c, 0xa3c),
+    (0xa3e, 0xa42),
+    (0xa47, 0xa48),
+    (0xa4b, 0xa4d),
+    (0xa51, 0xa51),
+    (0xa70, 0xa71),
+    (0xa75, 0xa75),
+    (0xa81, 0xa83),
+    (0xabc, 0xabc),
+    (0xabe, 0xac5),
+    (0xac7, 0xac9),
+    (0xacb, 0xacd),
+    (0xae2, 0xae3),
+    (0xafa, 0xaff),
+    (0xb01, 0xb03),
+    (0xb3c, 0xb3c),
+    (0xb3e, 0xb44),
+    (0xb47, 0xb48),
+    (0xb4b, 0xb4d),
+    (0xb55, 0xb57),
+    (0xb62, 0xb63),
+    (0xb82, 0xb82),
+    (0xbbe, 0xbc2),
+    (0xbc6, 0xbc8),
+    (0xbca, 0xbcd),
+    (0xbd7, 0xbd7),
+    (0xc00, 0xc04),
+    (0xc3c, 0xc3c),
+    (0xc3e, 0xc44),
+    (0xc46, 0xc48),
+    (0xc4a, 0xc4d),
+    (0xc55, 0xc56),
+    (0xc62, 0xc63),
+    (0xc81, 0xc83),
+    (0xcbc, 0xcbc),
+    (0xcbe, 0xcc4),
+    (0xcc6, 0xcc8),
+    (0xcca, 0xccd),
+    (0xcd5, 0xcd6),
+    (0xce2, 0xce3),
+    (0xcf3, 0xcf3),
+    (0xd00, 0xd03),
+    (0xd3b, 0xd3c),
+    (0xd3e, 0xd44),
+    (0xd46, 0xd48),
+    (0xd4a, 0xd4d),
+    (0xd57, 0xd57),
+    (0xd62, 0xd63),
+    (0xd81, 0xd83),
+    (0xdca, 0xdca),
+    (0xdcf, 0xdd4),
+    (0xdd6, 0xdd6),
+    (0xdd8, 0xddf),
+    (0xdf2, 0xdf3),
+    (0xe31, 0xe31),
+    (0xe34, 0xe3a),
+    (0xe47, 0xe4e),
+    (0xeb1, 0xeb1),
+    (0xeb4, 0xebc),
+    (0xec8, 0xece),
+    (0xf18, 0xf19),
+    (0xf35, 0xf35),
+    (0xf37, 0xf37),
+    (0xf39, 0xf39),
+    (0xf3e, 0xf3f),
+    (0xf71, 0xf84),
+    (0xf86, 0xf87),
+    (0xf8d, 0xf97),
+    (0xf99, 0xfbc),
+    (0xfc6, 0xfc6),
+    (0x102b, 0x103e),
+    (0x1056, 0x1059),
+    (0x105e, 0x1060),
+    (0x1062, 0x1064),
+    (0x1067, 0x106d),
+    (0x1071, 0x1074),
+    (0x1082, 0x108d),
+    (0x108f, 0x108f),
+    (0x109a, 0x109d),
+    (0x135d, 0x135f),
+    (0x1712, 0x1715),
+    (0x1732, 0x1734),
+    (0x1752, 0x1753),
+    (0x1772, 0x1773),
+    (0x17b6, 0x17d3),
+    (0x17dd, 0x17dd),
+    (0x180f, 0x180f),
+    (0x1885, 0x1886),
+    (0x18a9, 0x18a9),
+    (0x1920, 0x192b),
+    (0x1930, 0x193b),
+    (0x1a17, 0x1a1b),
+    (0x1a55, 0x1a5e),
+    (0x1a60, 0x1a7c),
+    (0x1a7f, 0x1a7f),
+    (0x1ab0, 0x1ace),
+    (0x1b00, 0x1b04),
+    (0x1b34, 0x1b44),
+    (0x1b6b, 0x1b73),
+    (0x1b80, 0x1b82),
+    (0x1ba1, 0x1bad),
+    (0x1be6, 0x1bf3),
+    (0x1c24, 0x1c37),
+    (0x1cd0, 0x1cd2),
+    (0x1cd4, 0x1ce8),
+    (0x1ced, 0x1ced),
+    (0x1cf4, 0x1cf4),
+    (0x1cf7, 0x1cf9),
+    (0x1dc0, 0x1dff),
+    (0x20d0, 0x20e2),
+    (0x20e4, 0x20f0),
+    (0x2cef, 0x2cf1),
+    (0x2d7f, 0x2d7f),
+    (0x2de0, 0x2dff),
+    (0x302a, 0x302f),
+    (0x3099, 0x309a),
+    (0xa66f, 0xa672),
+    (0xa674, 0xa67d),
+    (0xa69e, 0xa69f),
+    (0xa6f0, 0xa6f1),
+    (0xa802, 0xa802),
+    (0xa806, 0xa806),
+    (0xa80b, 0xa80b),
+    (0xa823, 0xa827),
+    (0xa82c, 0xa82c),
+    (0xa880, 0xa881),
+    (0xa8b4, 0xa8c5),
+    (0xa8e0, 0xa8f1),
+    (0xa8ff, 0xa8ff),
+    (0xa926, 0xa92d),
+    (0xa947, 0xa953),
+    (0xa980, 0xa983),
+    (0xa9b3, 0xa9c0),
+    (0xa9e5, 0xa9e5),
+    (0xaa29, 0xaa36),
+    (0xaa43, 0xaa43),
+    (0xaa4c, 0xaa4d),
+    (0xaa7b, 0xaa7d),
+    (0xaab0, 0xaab0),
+    (0xaab2, 0xaab4),
+    (0xaab7, 0xaab8),
+    (0xaabe, 0xaabf),
+    (0xaac1, 0xaac1),
+    (0xaaeb, 0xaaef),
+    (0xaaf5, 0xaaf6),
+    (0xabe3, 0xabea),
+    (0xabec, 0xabed),
+    (0xfb1e, 0xfb1e),
+    (0xfe20, 0xfe2f),
+    (0x101fd, 0x101fd),
+    (0x102e0, 0x102e0),
+    (0x10376, 0x1037a),
+    (0x10a01, 0x10a03),
+    (0x10a05, 0x10a06),
+    (0x10a0c, 0x10a0f),
+    (0x10a38, 0x10a3a),
+    (0x10a3f, 0x10a3f),
+    (0x10ae5, 0x10ae6),
+    (0x10d24, 0x10d27),
+    (0x10eab, 0x10eac),
+    (0x10efd, 0x10eff),
+    (0x10f46, 0x10f50),
+    (0x10f82, 0x10f85),
+    (0x11000, 0x11002),
+    (0x11038, 0x11046),
+    (0x11070, 0x11070),
+    (0x11073, 0x11074),
+    (0x1107f, 0x11082),
+    (0x110b0, 0x110ba),
+    (0x110c2, 0x110c2),
+    (0x11100, 0x11102),
+    (0x11127, 0x11134),
+    (0x11145, 0x11146),
+    (0x11173, 0x11173),
+    (0x11180, 0x11182),
+    (0x111b3, 0x111c0),
+    (0x111c9, 0x111cc),
+    (0x111ce, 0x111cf),
+    (0x1122c, 0x11237),
+    (0x1123e, 0x1123e),
+    (0x11241, 0x11241),
+    (0x112df, 0x112ea),
+    (0x11300, 0x11303),
+    (0x1133b, 0x1133c),
+    (0x1133e, 0x11344),
+    (0x11347, 0x11348),
+    (0x1134b, 0x1134d),
+    (0x11357, 0x11357),
+    (0x11362, 0x11363),
+    (0x11366, 0x1136c),
+    (0x11370, 0x11374),
+    (0x11435, 0x11446),
+    (0x1145e, 0x1145e),
+    (0x114b0, 0x114c3),
+    (0x115af, 0x115b5),
+    (0x115b8, 0x115c0),
+    (0x115dc, 0x115dd),
+    (0x11630, 0x11640),
+    (0x116ab, 0x116b7),
+    (0x1171d, 0x1172b),
+    (0x1182c, 0x1183a),
+    (0x11930, 0x11935),
+    (0x11937, 0x11938),
+    (0x1193b, 0x1193e),
+    (0x11940, 0x11940),
+    (0x11942, 0x11943),
+    (0x119d1, 0x119d7),
+    (0x119da, 0x119e0),
+    (0x119e4, 0x119e4),
+    (0x11a01, 0x11a0a),
+    (0x11a33, 0x11a39),
+    (0x11a3b, 0x11a3e),
+    (0x11a47, 0x11a47),
+    (0x11a51, 0x11a5b),
+    (0x11a8a, 0x11a99),
+    (0x11c2f, 0x11c36),
+    (0x11c38, 0x11c3f),
+    (0x11c92, 0x11ca7),
+    (0x11ca9, 0x11cb6),
+    (0x11d31, 0x11d36),
+    (0x11d3a, 0x11d3a),
+    (0x11d3c, 0x11d3d),
+    (0x11d3f, 0x11d45),
+    (0x11d47, 0x11d47),
+    (0x11d8a, 0x11d8e),
+    (0x11d90, 0x11d91),
+    (0x11d93, 0x11d97),
+    (0x11ef3, 0x11ef6),
+    (0x11f00, 0x11f01),
+    (0x11f03, 0x11f03),
+    (0x11f34, 0x11f3a),
+    (0x11f3e, 0x11f42),
+    (0x13440, 0x13440),
+    (0x13447, 0x13455),
+    (0x16af0, 0x16af4),
+    (0x16b30, 0x16b36),
+    (0x16f4f, 0x16f4f),
+    (0x16f51, 0x16f87),
+    (0x16f8f, 0x16f92),
+    (0x16fe4, 0x16fe4),
+    (0x16ff0, 0x16ff1),
+    (0x1bc9d, 0x1bc9e),
+    (0x1cf00, 0x1cf2d),
+    (0x1cf30, 0x1cf46),
+    (0x1d165, 0x1d169),
+    (0x1d16d, 0x1d172),
+    (0x1d17b, 0x1d182),
+    (0x1d185, 0x1d18b),
+    (0x1d1aa, 0x1d1ad),
+    (0x1d242, 0x1d244),
+    (0x1da00, 0x1da36),
+    (0x1da3b, 0x1da6c),
+    (0x1da75, 0x1da75),
+    (0x1da84, 0x1da84),
+    (0x1da9b, 0x1da9f),
+    (0x1daa1, 0x1daaf),
+    (0x1e000, 0x1e006),
+    (0x1e008, 0x1e018),
+    (0x1e01b, 0x1e021),
+    (0x1e023, 0x1e024),
+    (0x1e026, 0x1e02a),
+    (0x1e08f, 0x1e08f),
+    (0x1e130, 0x1e136),
+    (0x1e2ae, 0x1e2ae),
+    (0x1e2ec, 0x1e2ef),
+    (0x1e4ec, 0x1e4ef),
+    (0x1e8d0, 0x1e8d6),
+    (0x1e944, 0x1e94a),
+];
+
 fn is_combining_mark(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0300}'..='\u{034e}'
-            | '\u{0350}'..='\u{036f}'
-            | '\u{0483}'..='\u{0489}'
-            | '\u{0591}'..='\u{05bd}'
-            | '\u{05bf}'
-            | '\u{05c1}'..='\u{05c2}'
-            | '\u{05c4}'..='\u{05c5}'
-            | '\u{05c7}'
-            | '\u{0610}'..='\u{061a}'
-            | '\u{064b}'..='\u{065f}'
-            | '\u{0670}'
-            | '\u{06d6}'..='\u{06dc}'
-            | '\u{06df}'..='\u{06e4}'
-            | '\u{06e7}'..='\u{06e8}'
-            | '\u{06ea}'..='\u{06ed}'
-            | '\u{0900}'..='\u{0903}'
-            | '\u{093a}'..='\u{094f}'
-            | '\u{0951}'..='\u{0957}'
-            | '\u{0962}'..='\u{0963}'
-            | '\u{0981}'..='\u{0983}'
-            | '\u{09bc}'..='\u{09cd}'
-            | '\u{0a01}'..='\u{0a03}'
-            | '\u{0a3c}'..='\u{0a51}'
-            | '\u{0a81}'..='\u{0a83}'
-            | '\u{0abc}'..='\u{0acd}'
-            | '\u{0b01}'..='\u{0b03}'
-            | '\u{0b3c}'..='\u{0b57}'
-            | '\u{0b82}'
-            | '\u{0bbe}'..='\u{0bcd}'
-            | '\u{0c00}'..='\u{0c04}'
-            | '\u{0c3c}'..='\u{0c56}'
-            | '\u{0c81}'..='\u{0c83}'
-            | '\u{0cbc}'..='\u{0cd6}'
-            | '\u{0d00}'..='\u{0d03}'
-            | '\u{0d3b}'..='\u{0d4d}'
-            | '\u{0d82}'..='\u{0d83}'
-            | '\u{0dca}'..='\u{0ddf}'
-            | '\u{0e31}'
-            | '\u{0e34}'..='\u{0e3a}'
-            | '\u{0e47}'..='\u{0e4e}'
-            | '\u{0eb1}'
-            | '\u{0eb4}'..='\u{0ebc}'
-            | '\u{0ec8}'..='\u{0ecd}'
-            | '\u{0f71}'..='\u{0f84}'
-            | '\u{0f86}'..='\u{0f87}'
-            | '\u{0f8d}'..='\u{0fbc}'
-            | '\u{102b}'..='\u{103e}'
-            | '\u{17b6}'..='\u{17d3}'
-            | '\u{1ab0}'..='\u{1aff}'
-            | '\u{1dc0}'..='\u{1dff}'
-            | '\u{20d0}'..='\u{20dc}'
-            | '\u{20e1}'
-            | '\u{20e5}'..='\u{20f0}'
-            | '\u{302a}'..='\u{302f}'
-            | '\u{3099}'..='\u{309a}'
-            | '\u{fe20}'..='\u{fe2f}'
-    )
+    let cp = c as u32;
+    MARK_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+fn is_keycap_base(c: char) -> bool {
+    c.is_ascii_digit() || c == '#' || c == '*'
 }
 
 fn is_emoji_base(c: char) -> bool {
-    c.is_ascii_digit()
-        || matches!(
-            c,
-            '#' | '*'
-                | '\u{00a9}'
-                | '\u{00ae}'
-                | '\u{203c}'
-                | '\u{2049}'
-                | '\u{2100}'..='\u{214f}'
-                | '\u{2190}'..='\u{23ff}'
-                | '\u{2500}'..='\u{27bf}'
-                | '\u{2b00}'..='\u{2bff}'
-                | '\u{3030}'
-                | '\u{303d}'
-                | '\u{1f000}'..='\u{1faff}'
-        )
+    matches!(
+        c,
+        '\u{00a9}'
+            | '\u{00ae}'
+            | '\u{203c}'
+            | '\u{2049}'
+            | '\u{2100}'..='\u{214f}'
+            | '\u{2190}'..='\u{23ff}'
+            | '\u{2500}'..='\u{27bf}'
+            | '\u{2b00}'..='\u{2bff}'
+            | '\u{3030}'
+            | '\u{303d}'
+            | '\u{1f000}'..='\u{1faff}'
+    )
 }
 
 fn is_joiner(c: char) -> bool {
@@ -216,6 +484,7 @@ fn is_joiner(c: char) -> bool {
 fn unprintable_mask(text: &str, shape: Shape) -> Vec<bool> {
     let chars: Vec<char> = text.chars().collect();
     let mut bad = vec![false; chars.len()];
+    let mut run = 0usize;
     for (i, c) in chars.iter().copied().enumerate() {
         let prev = i.checked_sub(1).map(|j| chars[j]).filter(|_| !bad[i - 1]);
         let next = chars.get(i + 1).copied();
@@ -224,23 +493,62 @@ fn unprintable_mask(text: &str, shape: Shape) -> Vec<bool> {
             '\r' => !(matches!(shape, Shape::Block) && next == Some('\n')),
             '\u{200c}' | '\u{200d}' => {
                 !(prev.is_some_and(|p| !p.is_ascii() && !p.is_whitespace() && !is_joiner(p))
-                    && next.is_some_and(|n| !n.is_ascii() && is_printable(n) && !n.is_whitespace()))
+                    && next.is_some_and(|n| {
+                        !n.is_ascii()
+                            && is_printable(n)
+                            && !n.is_whitespace()
+                            && !is_combining_mark(n)
+                    }))
             }
-            '\u{fe0f}' => !prev.is_some_and(is_emoji_base),
-            '\u{20e3}' => !prev.is_some_and(|p| p == '\u{fe0f}' || is_emoji_base(p)),
-            c if is_combining_mark(c) => !prev.is_some_and(|p| !p.is_whitespace() && !is_joiner(p)),
+            '\u{fe0f}' => !prev.is_some_and(|p| {
+                is_emoji_base(p) || (is_keycap_base(p) && next == Some('\u{20e3}'))
+            }),
+            '\u{20e3}' => !prev.is_some_and(|p| p == '\u{fe0f}' || is_keycap_base(p)),
+            c if is_combining_mark(c) => {
+                !(run < MAX_MARK_RUN
+                    && prev.is_some_and(|p| p.is_alphabetic() || is_combining_mark(p)))
+            }
             c => !is_printable(c),
+        };
+        run = if is_combining_mark(c) && !bad[i] {
+            run + 1
+        } else {
+            0
         };
     }
     bad
 }
 
 fn strip_unprintable(raw: &str) -> String {
-    raw.chars()
-        .zip(unprintable_mask(raw, Shape::Block))
-        .filter(|(c, bad)| !*bad && *c != '\r')
-        .map(|(c, _)| c)
-        .collect()
+    let mut current = raw.replace('\r', "");
+    loop {
+        let mask = unprintable_mask(&current, Shape::Block);
+        if !mask.contains(&true) {
+            return current;
+        }
+        current = current
+            .chars()
+            .zip(mask)
+            .filter(|(_, bad)| !*bad)
+            .map(|(c, _)| c)
+            .collect();
+    }
+}
+
+fn redact_resilient(text: &str) -> String {
+    let compact: String = text
+        .chars()
+        .filter(|c| {
+            !matches!(c, '\u{fe0f}' | '\u{20e3}' | '\u{200c}' | '\u{200d}')
+                && !is_combining_mark(*c)
+        })
+        .collect();
+    let redacted_compact = crate::escalation::redact(&compact);
+    if redacted_compact == compact {
+        crate::escalation::redact(text)
+    } else {
+        redacted_compact
+    }
 }
 
 fn untrusted_notice() -> String {
@@ -539,7 +847,7 @@ fn git_cmd(workspace_root: &Path) -> Command {
 }
 
 fn sanitize_git_output(raw: &str) -> String {
-    let redacted = crate::escalation::redact(&strip_unprintable(raw));
+    let redacted = redact_resilient(&strip_unprintable(raw));
     let trimmed = redacted.trim();
     match trimmed.char_indices().nth(GIT_OUTPUT_CAP) {
         Some((end, _)) => format!("{}[truncated]", &trimmed[..end]),
@@ -557,30 +865,39 @@ impl Budget {
     }
 }
 
-fn escape_untrusted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (ch, bad) in text.chars().zip(unprintable_mask(text, Shape::Block)) {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '[' => out.push_str("&#91;"),
-            ']' => out.push_str("&#93;"),
-            '\r' if !bad => {}
-            c if bad => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
-            c => out.push(c),
-        }
+fn escape_char(ch: char, bad: bool) -> String {
+    match ch {
+        '\\' => "\\\\".to_string(),
+        '&' => "&amp;".to_string(),
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '[' => "&#91;".to_string(),
+        ']' => "&#93;".to_string(),
+        '\r' if !bad => String::new(),
+        c if bad => format!("\\u{{{:x}}}", c as u32),
+        c => c.to_string(),
     }
-    out
 }
 
 fn fenced_untrusted(text: &str, cap: usize, budget: &mut Budget) -> String {
     let allowed = cap.min(budget.remaining);
-    let taken: String = text.chars().take(allowed).collect();
-    budget.remaining -= taken.chars().count();
-    let mut body = escape_untrusted(&taken);
-    if text.chars().nth(allowed).is_some() {
+    let window: String = text.chars().take(allowed.saturating_add(1)).collect();
+    let mask = unprintable_mask(&window, Shape::Block);
+    let mut cut = window.chars().count() > allowed;
+    let mut body = String::new();
+    let mut used = 0usize;
+    for (ch, bad) in window.chars().zip(mask).take(allowed) {
+        let piece = escape_char(ch, bad);
+        let size = piece.chars().count();
+        if used + size > allowed {
+            cut = true;
+            break;
+        }
+        body.push_str(&piece);
+        used += size;
+    }
+    budget.remaining -= used;
+    if cut {
         body.push_str("\n[truncated]");
     }
     format!("{FENCE_OPEN}\n{body}\n{FENCE_CLOSE}")
@@ -1531,6 +1848,10 @@ mod tests {
     use crate::backlog::{GithubIssueDetail, GithubPullRequestCreated, GithubPullRequestDetail};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
+
+    fn escape_untrusted(text: &str) -> String {
+        fenced_untrusted(text, 100_000, &mut Budget::new(1_000_000))
+    }
 
     fn is_forbidden_char(c: char, shape: Shape) -> bool {
         unprintable_mask(&c.to_string(), shape)[0]
@@ -4986,158 +5307,10 @@ mod tests {
         assert!(notice.contains("untrusted"));
     }
 
-    struct HostileGithub;
-
     fn hostile_failure() -> crate::backlog::BacklogError {
         crate::backlog::BacklogError::GraphQl {
             url: "u".to_string(),
             message: hostile_error_text(),
-        }
-    }
-
-    #[async_trait]
-    impl GithubClient for HostileGithub {
-        async fn search_open_issues(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<crate::backlog::GithubIssue>, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn open_pull_requests(
-            &self,
-            _: &str,
-        ) -> Result<Vec<crate::backlog::GithubPullRequest>, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn create_issue(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &[String],
-        ) -> Result<crate::backlog::GithubIssue, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn comment_on_issue(&self, _: &str, _: u64, _: &str) -> Result<(), BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn create_draft_pull_request(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<GithubPullRequestCreated, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn get_pull_request(
-            &self,
-            _: &str,
-            _: u64,
-        ) -> Result<GithubPullRequestDetail, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn close_pull_request(&self, _: &str, _: u64) -> Result<(), BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn list_review_comments(
-            &self,
-            _: &str,
-            _: u64,
-        ) -> Result<Vec<GithubComment>, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn list_issue_comments(
-            &self,
-            _: &str,
-            _: u64,
-        ) -> Result<Vec<GithubComment>, BacklogError> {
-            Err(hostile_failure())
-        }
-        async fn get_issue(&self, _: &str, _: u64) -> Result<GithubIssueDetail, BacklogError> {
-            Err(hostile_failure())
-        }
-    }
-
-    #[tokio::test]
-    async fn every_api_tool_fences_hostile_client_errors() {
-        let dir = feature_repo();
-        let client: Arc<dyn GithubClient> = Arc::new(HostileGithub);
-        let root = dir.path().to_path_buf();
-        let tools: Vec<(&str, Box<dyn Tool>, Value)> = vec![
-            (
-                "open",
-                Box::new(GithubPrOpenTool::new(
-                    root.clone(),
-                    "sdlc-dev",
-                    Arc::clone(&client),
-                )),
-                json!({ "title": "t", "body": "b", "base": "main" }),
-            ),
-            (
-                "comments",
-                Box::new(GithubPrCommentsTool::new(
-                    root.clone(),
-                    Arc::clone(&client),
-                    vec![],
-                )),
-                json!({ "pr_number": 3 }),
-            ),
-            (
-                "promote",
-                Box::new(GithubPrPromoteTool::new(
-                    root.clone(),
-                    "sdlc-dev",
-                    Arc::clone(&client),
-                )),
-                json!({ "pr_number": 3 }),
-            ),
-            (
-                "close",
-                Box::new(GithubPrCloseTool::new(
-                    root.clone(),
-                    "sdlc-dev",
-                    Arc::clone(&client),
-                )),
-                json!({ "pr_number": 3, "reason": "#1" }),
-            ),
-            (
-                "issue_read",
-                Box::new(GithubIssueReadTool::new(
-                    root.clone(),
-                    Arc::clone(&client),
-                    vec![],
-                )),
-                json!({ "issue_number": 3 }),
-            ),
-            (
-                "issue_comment",
-                Box::new(GithubIssueCommentTool::new(
-                    root,
-                    "sdlc-dev",
-                    Arc::clone(&client),
-                )),
-                json!({ "issue_number": 3, "body": "b" }),
-            ),
-        ];
-        for (name, tool, args) in tools {
-            match tool.execute(args).await {
-                Err(ToolError::ExecutionFailed { message }) => {
-                    assert_fenced(&message, name);
-                    assert!(message.chars().count() < 1000, "{name}");
-                    assert!(
-                        !message.contains("ghp_abcdefghijklmnopqrstuvwxyz"),
-                        "{name}"
-                    );
-                    assert!(!message.contains('\u{202e}'), "{name}");
-                }
-                other => panic!("{name}: {other:?}"),
-            }
         }
     }
 
@@ -5171,7 +5344,7 @@ mod tests {
         match map_backlog_error(error) {
             ToolError::ExecutionFailed { message } => {
                 assert!(
-                    message.chars().count() < 300 * 4 + 120,
+                    message.chars().count() < 300 + 120,
                     "{}",
                     message.chars().count()
                 );
@@ -5201,6 +5374,454 @@ mod tests {
             let registry = crate::tools::create_tool_registry_for(dir.path(), &identity).unwrap();
             for name in ALL_TOOL_NAMES {
                 assert!(registry.get_tool(name).is_none(), "{file} {name}");
+            }
+        }
+    }
+
+    fn fuzz_alphabet() -> Vec<char> {
+        vec![
+            'a',
+            '1',
+            ' ',
+            '\n',
+            '\u{200d}',
+            '\u{200c}',
+            '\u{fe0f}',
+            '\u{20e3}',
+            '\u{301}',
+            '\u{903}',
+            '\u{f8f}',
+            '\u{102f}',
+            '\u{a41}',
+            '\u{2014}',
+            '\u{200b}',
+            '\u{915}',
+            '#',
+            '\u{1f468}',
+        ]
+    }
+
+    fn for_each_fuzz_string(max_len: usize, mut f: impl FnMut(&str)) {
+        let alphabet = fuzz_alphabet();
+        let mut current: Vec<Vec<char>> = vec![vec![]];
+        f("");
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &current {
+                for c in &alphabet {
+                    let mut s = prefix.clone();
+                    s.push(*c);
+                    f(&s.iter().collect::<String>());
+                    next.push(s);
+                }
+            }
+            current = next;
+        }
+    }
+
+    #[test]
+    fn validate_escape_and_strip_agree_on_every_short_string_over_the_hostile_alphabet() {
+        for_each_fuzz_string(4, |s| {
+            let escaped = escape_untrusted(s);
+            assert!(
+                !unprintable_mask(&escaped, Shape::Block).contains(&true),
+                "escape {}",
+                s.escape_unicode()
+            );
+            let stripped = strip_unprintable(s);
+            assert!(
+                !unprintable_mask(&stripped, Shape::Block).contains(&true),
+                "strip {}",
+                s.escape_unicode()
+            );
+            assert_eq!(
+                strip_unprintable(&stripped),
+                stripped,
+                "{}",
+                s.escape_unicode()
+            );
+            let git = sanitize_git_output(s);
+            assert!(
+                !unprintable_mask(&git, Shape::Block).contains(&true),
+                "git {}",
+                s.escape_unicode()
+            );
+            if !unprintable_mask(s, Shape::Block).contains(&true) {
+                assert_eq!(stripped, s, "{}", s.escape_unicode());
+            }
+        });
+    }
+
+    #[test]
+    fn a_joiner_before_a_mark_is_refused_consistently_everywhere() {
+        let text = "\u{2014}\u{200d}\u{903}";
+        assert!(validate_text("f", text, Shape::Block, 100).is_err());
+        let escaped = escape_untrusted(text);
+        assert!(
+            !escaped.contains('\u{200d}') && !escaped.contains('\u{903}'),
+            "{escaped}"
+        );
+        assert_eq!(strip_unprintable(text), "\u{2014}");
+        assert_eq!(sanitize_git_output(text), "\u{2014}");
+    }
+
+    #[test]
+    fn variation_selector_and_keycap_need_a_real_keycap_or_symbol_base() {
+        for bad in [
+            "1\u{fe0f}x",
+            "ghp_1\u{fe0f}2",
+            "#1\u{fe0f}2",
+            "v1\u{fe0f}.0",
+            "a\u{20e3}",
+            "\u{fe0f}\u{20e3}",
+            "1\u{fe0f}",
+        ] {
+            assert!(
+                validate_text("f", bad, Shape::Line, 100).is_err(),
+                "{}",
+                bad.escape_unicode()
+            );
+        }
+        for good in [
+            "1\u{fe0f}\u{20e3}",
+            "#\u{fe0f}\u{20e3}",
+            "*\u{fe0f}\u{20e3}",
+            "1\u{20e3}",
+            "\u{2764}\u{fe0f}",
+        ] {
+            assert!(
+                validate_text("f", good, Shape::Line, 100).is_ok(),
+                "{}",
+                good.escape_unicode()
+            );
+        }
+    }
+
+    #[test]
+    fn invisible_joiners_cannot_hide_a_secret_from_the_redactor() {
+        let tail = "abcdefghijklmnopqrstuvwxyz0123456789";
+        for inserted in ["\u{fe0f}", "\u{20e3}", "\u{200d}", "\u{200b}", "\u{301}"] {
+            let secret = format!("ghp_{}{inserted}{tail}", &tail[..6]);
+            let git = sanitize_git_output(&format!("denied {secret}"));
+            assert!(
+                !git.contains(&tail[6..]),
+                "{}: {git}",
+                inserted.escape_unicode()
+            );
+            let error = crate::backlog::BacklogError::GraphQl {
+                url: "u".to_string(),
+                message: format!("denied {secret}"),
+            };
+            match map_backlog_error(error) {
+                ToolError::ExecutionFailed { message } => {
+                    assert!(
+                        !message.contains(&tail[6..]),
+                        "{}: {message}",
+                        inserted.escape_unicode()
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let digit_secret = format!("ghp_1\u{20e3}2{tail}");
+        assert!(!sanitize_git_output(&digit_secret).contains(&tail[..20]));
+    }
+
+    #[test]
+    fn combining_marks_need_a_letter_base_and_are_capped_in_chains() {
+        let marks = |n: usize| format!("e{}", "\u{301}".repeat(n));
+        assert!(validate_text("f", &marks(4), Shape::Line, 100).is_ok());
+        assert!(validate_text("f", &marks(5), Shape::Line, 100).is_err());
+        assert!(validate_text("f", &marks(5000), Shape::Line, 6000).is_err());
+        assert_eq!(strip_unprintable(&marks(6)).chars().count(), 5);
+        for bad in [
+            "\u{301}",
+            " \u{301}",
+            "a \u{301}",
+            "a\n\u{301}",
+            "1\u{301}",
+            ".\u{301}",
+            "\u{903}",
+            "a \u{903}",
+            "\u{f8f}",
+            "\u{102f}",
+            "\u{a41}",
+            "x\u{200d}\u{301}",
+            "e\u{34f}",
+            "\u{350}",
+            "\u{36f}",
+        ] {
+            assert!(
+                validate_text("f", bad, Shape::Block, 100).is_err(),
+                "{}",
+                bad.escape_unicode()
+            );
+        }
+        for good in [
+            "e\u{350}",
+            "e\u{36f}",
+            "\u{915}\u{903}",
+            "\u{915}\u{94d}\u{937}",
+        ] {
+            assert!(
+                validate_text("f", good, Shape::Block, 100).is_ok(),
+                "{}",
+                good.escape_unicode()
+            );
+        }
+        assert!(is_forbidden_char('\u{34f}', Shape::Line));
+    }
+
+    #[test]
+    fn fullwidth_range_boundary_is_exact() {
+        assert!(!is_forbidden_char('\u{ff60}', Shape::Line));
+        for cp in 0xff61u32..=0xff65 {
+            assert!(
+                is_forbidden_char(char::from_u32(cp).unwrap(), Shape::Line),
+                "{cp:x}"
+            );
+        }
+        assert!(!is_forbidden_char('\u{ff66}', Shape::Line));
+    }
+
+    #[test]
+    fn escaped_output_is_capped_by_its_escaped_length() {
+        let heavy = "\u{10ffff}".repeat(300);
+        let mut budget = Budget::new(TOTAL_BUDGET);
+        let capped = fenced_untrusted(&heavy, 300, &mut budget);
+        assert!(capped.contains("[truncated]"));
+        assert!(
+            capped.chars().count() <= 300 + FENCE_OPEN.len() + FENCE_CLOSE.len() + 20,
+            "{}",
+            capped.chars().count()
+        );
+        assert!(budget.remaining >= TOTAL_BUDGET - 300);
+        assert_fenced(&capped, "heavy");
+        let mut budget = Budget::new(TOTAL_BUDGET);
+        let roomy = fenced_untrusted(&heavy, 3000, &mut budget);
+        assert!(!roomy.contains("[truncated]"));
+        assert_eq!(roomy.matches("\\u{10ffff}").count(), 300);
+        assert_eq!(budget.remaining, TOTAL_BUDGET - 3000);
+        let mut budget = Budget::new(25);
+        let tight = fenced_untrusted("ab\u{10ffff}cd", 100, &mut budget);
+        assert!(tight.contains("[truncated]") || tight.contains("cd"));
+        assert!(budget.remaining <= 25);
+    }
+
+    struct ScriptedGithub {
+        failing: &'static str,
+        inner: MockGithub,
+    }
+
+    #[async_trait]
+    impl GithubClient for ScriptedGithub {
+        async fn search_open_issues(
+            &self,
+            repo: &str,
+            query: &str,
+        ) -> Result<Vec<crate::backlog::GithubIssue>, BacklogError> {
+            self.inner.search_open_issues(repo, query).await
+        }
+        async fn open_pull_requests(
+            &self,
+            repo: &str,
+        ) -> Result<Vec<crate::backlog::GithubPullRequest>, BacklogError> {
+            self.inner.open_pull_requests(repo).await
+        }
+        async fn create_issue(
+            &self,
+            repo: &str,
+            title: &str,
+            body: &str,
+            labels: &[String],
+        ) -> Result<crate::backlog::GithubIssue, BacklogError> {
+            self.inner.create_issue(repo, title, body, labels).await
+        }
+        async fn comment_on_issue(
+            &self,
+            repo: &str,
+            number: u64,
+            body: &str,
+        ) -> Result<(), BacklogError> {
+            if self.failing == "comment_on_issue" {
+                return Err(hostile_failure());
+            }
+            self.inner.comment_on_issue(repo, number, body).await
+        }
+        async fn create_draft_pull_request(
+            &self,
+            repo: &str,
+            title: &str,
+            body: &str,
+            head: &str,
+            base: &str,
+        ) -> Result<GithubPullRequestCreated, BacklogError> {
+            if self.failing == "create_draft_pull_request" {
+                return Err(hostile_failure());
+            }
+            self.inner
+                .create_draft_pull_request(repo, title, body, head, base)
+                .await
+        }
+        async fn get_pull_request(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubPullRequestDetail, BacklogError> {
+            if self.failing == "get_pull_request" {
+                return Err(hostile_failure());
+            }
+            self.inner.get_pull_request(repo, number).await
+        }
+        async fn mark_pull_request_ready(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<(), BacklogError> {
+            if self.failing == "mark_pull_request_ready" {
+                return Err(hostile_failure());
+            }
+            self.inner.mark_pull_request_ready(repo, number).await
+        }
+        async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+            if self.failing == "close_pull_request" {
+                return Err(hostile_failure());
+            }
+            self.inner.close_pull_request(repo, number).await
+        }
+        async fn list_review_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            if self.failing == "list_review_comments" {
+                return Err(hostile_failure());
+            }
+            self.inner.list_review_comments(repo, number).await
+        }
+        async fn list_issue_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            if self.failing == "list_issue_comments" {
+                return Err(hostile_failure());
+            }
+            self.inner.list_issue_comments(repo, number).await
+        }
+        async fn get_issue(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubIssueDetail, BacklogError> {
+            if self.failing == "get_issue" {
+                return Err(hostile_failure());
+            }
+            self.inner.get_issue(repo, number).await
+        }
+    }
+
+    fn scripted(failing: &'static str) -> Arc<dyn GithubClient> {
+        let mut inner = MockGithub::default();
+        inner.pr_details.insert(
+            ("example/repo".to_string(), 3),
+            pr_detail(3, true, "sdlc-dev"),
+        );
+        inner.issue_details.insert(
+            ("example/repo".to_string(), 3),
+            GithubIssueDetail {
+                number: 3,
+                title: "t".to_string(),
+                body: None,
+                labels: vec![],
+                html_url: "u".to_string(),
+            },
+        );
+        inner.created_pr = Some(GithubPullRequestCreated {
+            number: 9,
+            html_url: "u".to_string(),
+            node_id: "n".to_string(),
+        });
+        Arc::new(ScriptedGithub { failing, inner })
+    }
+
+    #[tokio::test]
+    async fn every_client_call_site_fences_a_hostile_error() {
+        let dir = feature_repo();
+        let root = dir.path().to_path_buf();
+        let allow = vec!["alice".to_string()];
+        type Build = fn(PathBuf, Arc<dyn GithubClient>, Vec<String>) -> Box<dyn Tool>;
+        let cases: Vec<(&str, Build, Value)> = vec![
+            (
+                "create_draft_pull_request",
+                |r, c, _| Box::new(GithubPrOpenTool::new(r, "sdlc-dev", c)),
+                json!({ "title": "t", "body": "b", "base": "main" }),
+            ),
+            (
+                "list_review_comments",
+                |r, c, a| Box::new(GithubPrCommentsTool::new(r, c, a)),
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "list_issue_comments",
+                |r, c, a| Box::new(GithubPrCommentsTool::new(r, c, a)),
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "get_pull_request",
+                |r, c, _| Box::new(GithubPrPromoteTool::new(r, "sdlc-dev", c)),
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "mark_pull_request_ready",
+                |r, c, _| Box::new(GithubPrPromoteTool::new(r, "sdlc-dev", c)),
+                json!({ "pr_number": 3 }),
+            ),
+            (
+                "get_pull_request",
+                |r, c, _| Box::new(GithubPrCloseTool::new(r, "sdlc-dev", c)),
+                json!({ "pr_number": 3, "reason": "#1" }),
+            ),
+            (
+                "comment_on_issue",
+                |r, c, _| Box::new(GithubPrCloseTool::new(r, "sdlc-dev", c)),
+                json!({ "pr_number": 3, "reason": "#1" }),
+            ),
+            (
+                "close_pull_request",
+                |r, c, _| Box::new(GithubPrCloseTool::new(r, "sdlc-dev", c)),
+                json!({ "pr_number": 3, "reason": "#1" }),
+            ),
+            (
+                "get_issue",
+                |r, c, a| Box::new(GithubIssueReadTool::new(r, c, a)),
+                json!({ "issue_number": 3 }),
+            ),
+            (
+                "list_issue_comments",
+                |r, c, a| Box::new(GithubIssueReadTool::new(r, c, a)),
+                json!({ "issue_number": 3 }),
+            ),
+            (
+                "comment_on_issue",
+                |r, c, _| Box::new(GithubIssueCommentTool::new(r, "sdlc-dev", c)),
+                json!({ "issue_number": 3, "body": "b" }),
+            ),
+        ];
+        for (failing, build, args) in cases {
+            let tool = build(root.clone(), scripted(failing), allow.clone());
+            let label = format!("{} {failing}", tool.name());
+            match tool.execute(args).await {
+                Err(ToolError::ExecutionFailed { message }) => {
+                    assert_fenced(&message, &label);
+                    assert!(message.chars().count() < 1000, "{label}");
+                    assert!(
+                        !message.contains("ghp_abcdefghijklmnopqrstuvwxyz"),
+                        "{label}"
+                    );
+                    assert!(!message.contains('\u{202e}'), "{label}");
+                }
+                other => panic!("{label}: {other:?}"),
             }
         }
     }
