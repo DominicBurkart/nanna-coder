@@ -1066,6 +1066,7 @@ pub(crate) mod test_support {
         pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
         pub created_pr: Option<GithubPullRequestCreated>,
         pub fail_status: Option<u16>,
+        pub fail_only: Option<&'static str>,
         pub(crate) calls: StdMutex<Vec<String>>,
     }
 
@@ -1082,6 +1083,9 @@ pub(crate) mod test_support {
         }
 
         fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            if self.fail_only.is_some_and(|only| !url.contains(only)) {
+                return Ok(());
+            }
             match self.fail_status {
                 Some(status) => Err(BacklogError::Status {
                     url: url.to_string(),
