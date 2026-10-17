@@ -441,7 +441,14 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
     ) -> Result<Self, QueueStoreError> {
-        Self::build(max_concurrent_tasks, policy, store, leases, None)
+        Self::build(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            None,
+            Arc::new(EscalationLog::in_memory()),
+        )
     }
 
     /// Build a manager over `store`, re-queue every entry the store still
@@ -481,7 +488,36 @@ impl TaskManager {
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
     ) -> Result<Self, QueueStoreError> {
-        let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
+        Self::restore_with_escalations(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            Arc::new(EscalationLog::in_memory()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_with_escalations(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        provider: Arc<dyn ModelProvider>,
+        identities: &crate::identity::IdentityCatalog,
+        escalations: Arc<EscalationLog>,
+    ) -> Result<Self, QueueStoreError> {
+        let manager = Self::build(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            Some(provider),
+            escalations,
+        )?;
         manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
@@ -501,6 +537,7 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
+        escalations: Arc<EscalationLog>,
     ) -> Result<Self, QueueStoreError> {
         let action_gate = default_action_gate(Arc::clone(&leases));
         let runner = Arc::new(TaskRunner {
@@ -515,7 +552,7 @@ impl TaskManager {
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::Mutex::new(Arc::new(NoopAuditHook)),
             bound: RwLock::new(HashMap::new()),
-            escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
+            escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
         });
@@ -3195,6 +3232,38 @@ mod scheduler_tests {
             }
             other => panic!("unexpected status {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_restore_installs_the_supplied_escalation_log_before_dispatching() {
+        let store = InMemoryQueueStore::default();
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("unused")]);
+        let entry = queued(Path::new("/nonexistent"));
+        store.insert(&entry).unwrap();
+        let log = Arc::new(EscalationLog::in_memory());
+        let manager = TaskManager::restore_with_escalations(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+            &crate::identity::IdentityCatalog::default(),
+            Arc::clone(&log),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&manager.escalations(), &log));
+        assert!(Arc::ptr_eq(manager.runner.action_escalator().log(), &log));
+        let default = TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            MockProvider::new(vec![]),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&default.escalations(), &log));
     }
 
     #[tokio::test]

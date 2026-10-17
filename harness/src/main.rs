@@ -1495,16 +1495,16 @@ async fn build_mcp_task_manager(
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
-    Ok(TaskManager::restore_with_identities(
+    Ok(TaskManager::restore_with_escalations(
         DEFAULT_MAX_CONCURRENT_TASKS,
         Box::new(HybridPolicy::default()),
         Box::new(JsonlQueueStore::open(queue_path)?),
         Arc::new(JsonlLeaseStore::open(lease_path)?),
         provider.clone(),
         catalog,
+        escalation_log,
     )
     .await?
-    .with_escalations(escalation_log)
     .with_action_policy(
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
         Some((provider, model.to_string())),
