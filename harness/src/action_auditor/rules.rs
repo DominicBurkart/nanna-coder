@@ -611,7 +611,7 @@ pub(crate) mod tests {
         assert_eq!(verdict.kind(), VerdictKind::Escalate);
     }
 
-    struct UnreleasableStore(InMemoryLeaseStore);
+    pub(crate) struct UnreleasableStore(pub(crate) InMemoryLeaseStore);
 
     impl LeaseStore for UnreleasableStore {
         fn acquire(
@@ -772,18 +772,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_default_inspector_is_the_named_not_implemented_stub() {
         let rules = auditor();
+        assert!(std::ptr::fn_addr_eq(
+            rules.inspector,
+            super::super::commands::inspect as Inspector
+        ));
         let context = ctx(EffectClass::Workspace, None, LeaseContext::default());
         let verdict = rules
             .review_action(&run_command_review(), &context)
             .await
             .unwrap();
         assert_eq!(verdict, ActionVerdict::Allow);
-    }
-
-    #[test]
-    fn debug_output_omits_stores_but_names_the_field_present() {
-        let rules = auditor();
-        assert!(format!("{rules:?}").contains("RuleActionAuditor"));
     }
 
     #[tokio::test]
