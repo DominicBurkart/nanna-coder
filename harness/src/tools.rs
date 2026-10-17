@@ -3252,7 +3252,7 @@ pub fn create_tool_registry_for(
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
     Ok(
-        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity.name()))
+        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity))
             .scoped_for(identity),
     )
 }
@@ -3260,7 +3260,7 @@ pub fn create_tool_registry_for(
 fn create_tool_registry_with_scope(
     workspace_root: &std::path::Path,
     scope: Option<PathScope>,
-    pr_identity: Option<&str>,
+    pr_identity: Option<&AgentIdentity>,
 ) -> ToolRegistry {
     let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
@@ -3275,8 +3275,8 @@ fn create_tool_registry_with_scope(
     registry.register(Box::new(GitHubPrStatusTool::new(
         workspace_root.to_path_buf(),
     )));
-    if let Some(identity_name) = pr_identity {
-        crate::pr_tools::register(&mut registry, workspace_root, identity_name);
+    if let Some(identity) = pr_identity {
+        crate::pr_tools::register(&mut registry, workspace_root, identity);
     }
     registry
 }
@@ -3356,8 +3356,7 @@ pub fn create_container_tool_registry_for(
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    let mut registry =
-        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity.name()));
+    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity));
     let working_dir = Some(container_working_dir.to_string());
     registry.register(Box::new(RunCommandTool::new(container_handle, working_dir)));
     Ok(registry.scoped_for(identity))
