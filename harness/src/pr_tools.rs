@@ -2327,6 +2327,13 @@ mod tests {
         }
     }
 
+    fn new_branch(dir: &Path, name: &str) {
+        if name.eq_ignore_ascii_case("main") && name != "main" {
+            git(dir, &["branch", "-m", "main", "trunk"]);
+        }
+        git(dir, &["checkout", "-q", "-b", name]);
+    }
+
     fn remote_has(dir: &Path, branch: &str) -> bool {
         let out = StdCommand::new("git")
             .args(["ls-remote", "origin", &format!("refs/heads/{branch}")])
@@ -2616,7 +2623,7 @@ mod tests {
         for head in ["main", "master", "Main", "MASTER"] {
             let dir = github_repo_fixture();
             if head != "main" {
-                git(dir.path(), &["checkout", "-q", "-b", head]);
+                new_branch(dir.path(), head);
             }
             let mock = rich_mock();
             let tool = GithubPrOpenTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone());
@@ -2833,7 +2840,7 @@ mod tests {
     async fn push_refuses_default_and_protected_branch_names_in_any_case() {
         for name in ["master", "Main", "MASTER"] {
             let fixture = push_fixture();
-            git(fixture.work.path(), &["checkout", "-q", "-b", name]);
+            new_branch(fixture.work.path(), name);
             commit_file(
                 fixture.work.path(),
                 "f.txt",
@@ -3119,7 +3126,7 @@ mod tests {
         for name in ["main", "master", "Main", "feat+x"] {
             let dir = github_repo_fixture();
             if name != "main" {
-                git(dir.path(), &["checkout", "-q", "-b", name]);
+                new_branch(dir.path(), name);
             }
             std::fs::write(dir.path().join("n.txt"), "n").unwrap();
             let before = head_sha(dir.path());
