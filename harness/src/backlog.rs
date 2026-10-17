@@ -14,6 +14,7 @@
 use crate::scheduler::{QueueStore, QueueStoreError, QueuedTask, TaskOrigin, TaskQueue};
 use crate::task::TaskManager;
 use async_trait::async_trait;
+use chrono::Utc;
 use model::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -50,6 +51,43 @@ pub struct GithubPullRequest {
     pub body: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPullRequestCreated {
+    pub number: u64,
+    pub html_url: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPullRequestDetail {
+    pub number: u64,
+    pub node_id: String,
+    pub draft: bool,
+    pub state: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubIssueDetail {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub html_url: String,
+}
+
 /// Failure during ingestion.
 #[derive(Debug, Error)]
 pub enum BacklogError {
@@ -61,6 +99,24 @@ pub enum BacklogError {
     Parse(#[from] serde_json::Error),
     #[error("queue store failed: {0}")]
     Store(#[from] QueueStoreError),
+    #[error(
+        "backlog task names identity `{identity}`, which is not registered; refusing to enqueue"
+    )]
+    UnresolvedIdentity { identity: String },
+    #[error("backlog task names no identity; refusing to enqueue")]
+    MissingIdentity,
+    #[error("GitHub rate limit exceeded for {url} after {attempts} attempt(s), retry after {retry_after_secs:?}s")]
+    RateLimited {
+        url: String,
+        attempts: u32,
+        retry_after_secs: Option<u64>,
+    },
+    #[error("invalid repository {repo:?}: expected owner/name")]
+    InvalidRepo { repo: String },
+    #[error("GitHub request to {url} timed out")]
+    Timeout { url: String },
+    #[error("GitHub GraphQL error for {url}: {message}")]
+    GraphQl { url: String, message: String },
 }
 
 /// Read access to the GitHub data ingestion needs.
@@ -93,6 +149,39 @@ pub trait GithubClient: Send + Sync {
         number: u64,
         body: &str,
     ) -> Result<(), BacklogError>;
+
+    async fn create_draft_pull_request(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<GithubPullRequestCreated, BacklogError>;
+
+    async fn get_pull_request(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<GithubPullRequestDetail, BacklogError>;
+
+    async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
+
+    async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
+
+    async fn list_review_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError>;
+
+    async fn list_issue_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError>;
+
+    async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
 }
 
 /// A repository whose backlog is ingested.
@@ -185,8 +274,9 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///
 /// ```
 /// use harness::backlog::{
-///     backlog_sync, BacklogConfig, BacklogError, BacklogSource, GithubClient, GithubIssue,
-///     GithubPullRequest, StoreSink,
+///     backlog_sync, BacklogConfig, BacklogError, BacklogSource, GithubClient, GithubComment,
+///     GithubIssue, GithubIssueDetail, GithubPullRequest, GithubPullRequestCreated,
+///     GithubPullRequestDetail, StoreSink,
 /// };
 /// use harness::scheduler::InMemoryQueueStore;
 /// use std::path::PathBuf;
@@ -206,10 +296,31 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     async fn comment_on_issue(&self, _: &str, _: u64, _: &str) -> Result<(), BacklogError> {
 ///         unreachable!("ingestion never comments")
 ///     }
+///     async fn create_draft_pull_request(&self, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<GithubPullRequestCreated, BacklogError> {
+///         unreachable!("ingestion never opens pull requests")
+///     }
+///     async fn get_pull_request(&self, _: &str, _: u64) -> Result<GithubPullRequestDetail, BacklogError> {
+///         unreachable!("ingestion never reads pull request detail")
+///     }
+///     async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
+///         unreachable!("ingestion never promotes pull requests")
+///     }
+///     async fn close_pull_request(&self, _: &str, _: u64) -> Result<(), BacklogError> {
+///         unreachable!("ingestion never closes pull requests")
+///     }
+///     async fn list_review_comments(&self, _: &str, _: u64) -> Result<Vec<GithubComment>, BacklogError> {
+///         unreachable!("ingestion never reads review comments")
+///     }
+///     async fn list_issue_comments(&self, _: &str, _: u64) -> Result<Vec<GithubComment>, BacklogError> {
+///         unreachable!("ingestion never reads issue comments")
+///     }
+///     async fn get_issue(&self, _: &str, _: u64) -> Result<GithubIssueDetail, BacklogError> {
+///         unreachable!("ingestion never reads issue detail")
+///     }
 /// }
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+/// let sink = StoreSink::open(Box::new(InMemoryQueueStore::default()), ["sdlc-dev".to_string()]).unwrap();
 /// let config = BacklogConfig {
 ///     sources: vec![BacklogSource {
 ///         repo: "owner/name".into(),
@@ -292,16 +403,40 @@ pub async fn backlog_sync(
 /// Sink that writes straight into a [`QueueStore`], for a process that does
 /// not run a [`TaskManager`] (the `backlog-sync` CLI). The running manager
 /// picks the entries up when it is next restored from the same store.
+///
+/// Only tasks whose `identity_hint` names one of the identities given to
+/// [`StoreSink::open`] are written; any other hint, or none, is refused.
 pub struct StoreSink {
     store: Box<dyn QueueStore>,
     queue: Mutex<TaskQueue>,
+    identities: HashSet<String>,
 }
 
 impl StoreSink {
-    /// Load the current queue from `store`.
-    pub fn open(store: Box<dyn QueueStore>) -> Result<Self, QueueStoreError> {
+    /// Load the current queue from `store`, accepting only tasks hinting one
+    /// of `identities`.
+    pub fn open(
+        store: Box<dyn QueueStore>,
+        identities: impl IntoIterator<Item = String>,
+    ) -> Result<Self, QueueStoreError> {
         let queue = Mutex::new(TaskQueue::from_entries(store.load()?));
-        Ok(Self { store, queue })
+        Ok(Self {
+            store,
+            queue,
+            identities: identities.into_iter().collect(),
+        })
+    }
+}
+
+fn hinted_identity(task: &QueuedTask) -> Result<&str, BacklogError> {
+    task.identity_hint
+        .as_deref()
+        .ok_or(BacklogError::MissingIdentity)
+}
+
+fn unresolved_identity(name: &str) -> BacklogError {
+    BacklogError::UnresolvedIdentity {
+        identity: name.to_string(),
     }
 }
 
@@ -322,6 +457,10 @@ impl BacklogSink for StoreSink {
     }
 
     async fn enqueue(&self, task: QueuedTask) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.identities.contains(hint) {
+            return Err(unresolved_identity(hint));
+        }
         let mut queue = self.queue.lock().await;
         let stored = queue.push(task);
         self.store.insert(&stored)?;
@@ -358,6 +497,10 @@ impl BacklogSink for ManagerSink {
     }
 
     async fn enqueue(&self, task: QueuedTask) -> Result<(), BacklogError> {
+        let hint = hinted_identity(&task)?;
+        if !self.manager.has_identity(hint).await {
+            return Err(unresolved_identity(hint));
+        }
         self.manager
             .submit_task(task, Arc::clone(&self.provider))
             .await;
@@ -365,25 +508,259 @@ impl BacklogSink for ManagerSink {
     }
 }
 
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+const DEFAULT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+
+const MAX_RETRY_ATTEMPTS: u32 = 32;
+
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn transport_error(error: reqwest::Error, url: &str) -> BacklogError {
+    if error.is_timeout() {
+        BacklogError::Timeout {
+            url: url.to_string(),
+        }
+    } else {
+        BacklogError::Http(error)
+    }
+}
+
+const MAX_REPO_OWNER_LEN: usize = 39;
+const MAX_REPO_NAME_LEN: usize = 100;
+const MAX_REPO_ECHO_CHARS: usize = 64;
+
+fn valid_repo_segment(segment: &str, max_len: usize) -> bool {
+    !segment.is_empty()
+        && segment.len() <= max_len
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn validate_repo(repo: &str) -> Result<(), BacklogError> {
+    let valid = match repo.split_once('/') {
+        Some((owner, name)) => {
+            valid_repo_segment(owner, MAX_REPO_OWNER_LEN)
+                && valid_repo_segment(name, MAX_REPO_NAME_LEN)
+        }
+        None => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BacklogError::InvalidRepo {
+            repo: repo.chars().take(MAX_REPO_ECHO_CHARS).collect(),
+        })
+    }
+}
+
+fn build_http(
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .expect("reqwest client configuration is valid")
+}
+
+fn retry_wait(
+    base_backoff: std::time::Duration,
+    attempt: u32,
+    retry_after: Option<u64>,
+) -> std::time::Duration {
+    let factor = 1u32 << (attempt - 1).min(MAX_RETRY_ATTEMPTS - 1);
+    let backoff = base_backoff
+        .saturating_mul(factor)
+        .min(std::time::Duration::from_secs(MAX_RETRY_AFTER_SECS));
+    match retry_after {
+        Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
+        None => backoff,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+    Patch,
+}
+
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(secs);
+    }
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok());
+    if remaining != Some("0") {
+        return None;
+    }
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    match reset {
+        Some(reset) => Some((reset - Utc::now().timestamp()).max(0) as u64),
+        None => Some(0),
+    }
+}
+
+#[derive(Deserialize)]
+struct RawUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct RawComment {
+    id: u64,
+    user: RawUser,
+    body: String,
+    html_url: String,
+}
+
+impl From<RawComment> for GithubComment {
+    fn from(raw: RawComment) -> Self {
+        Self {
+            id: raw.id,
+            author: raw.user.login,
+            body: raw.body,
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawLabel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RawIssueDetail {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    html_url: String,
+}
+
+impl From<RawIssueDetail> for GithubIssueDetail {
+    fn from(raw: RawIssueDetail) -> Self {
+        Self {
+            number: raw.number,
+            title: raw.title,
+            body: raw.body,
+            labels: raw.labels.into_iter().map(|label| label.name).collect(),
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPrDetail {
+    number: u64,
+    node_id: String,
+    draft: bool,
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    html_url: String,
+}
+
+impl From<RawPrDetail> for GithubPullRequestDetail {
+    fn from(raw: RawPrDetail) -> Self {
+        Self {
+            number: raw.number,
+            node_id: raw.node_id,
+            draft: raw.draft,
+            state: raw.state,
+            body: raw.body,
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPrCreated {
+    number: u64,
+    node_id: String,
+    html_url: String,
+}
+
+impl From<RawPrCreated> for GithubPullRequestCreated {
+    fn from(raw: RawPrCreated) -> Self {
+        Self {
+            number: raw.number,
+            html_url: raw.html_url,
+            node_id: raw.node_id,
+        }
+    }
+}
+
 /// [`GithubClient`] over the GitHub REST API using `reqwest`.
 ///
 /// Results are paginated `GITHUB_PAGE_SIZE` at a time until a short page is
-/// returned. A token, when given, is sent as a bearer token.
-#[derive(Debug, Clone)]
+/// returned. A token, when given, is sent as a bearer token and is redacted
+/// from the `Debug` output.
+#[derive(Clone)]
 pub struct ReqwestGithubClient {
     http: reqwest::Client,
     base_url: String,
     token: Option<String>,
+    max_attempts: u32,
+    base_backoff: std::time::Duration,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for ReqwestGithubClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReqwestGithubClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("max_attempts", &self.max_attempts)
+            .field("base_backoff", &self.base_backoff)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqwestGithubClient {
     /// Client for the API rooted at `base_url` (no trailing slash).
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http(DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
             base_url: base_url.into(),
             token,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_backoff: DEFAULT_BASE_BACKOFF,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.request_timeout = request_timeout;
+        self.http = build_http(connect_timeout, request_timeout);
+        self
     }
 
     /// Client for the public GitHub API.
@@ -391,14 +768,22 @@ impl ReqwestGithubClient {
         Self::new(GITHUB_API_URL, token)
     }
 
+    pub fn with_retry_policy(
+        mut self,
+        max_attempts: u32,
+        base_backoff: std::time::Duration,
+    ) -> Self {
+        self.max_attempts = max_attempts.clamp(1, MAX_RETRY_ATTEMPTS);
+        self.base_backoff = base_backoff;
+        self
+    }
+
     async fn get_json(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Result<serde_json::Value, BacklogError> {
-        let url = format!("{}{}", self.base_url, path);
-        let request = self.http.get(&url).query(query);
-        self.send(url, request).await
+        self.request_json(HttpMethod::Get, path, query, None).await
     }
 
     async fn post_json(
@@ -406,31 +791,73 @@ impl ReqwestGithubClient {
         path: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, BacklogError> {
-        let url = format!("{}{}", self.base_url, path);
-        let request = self.http.post(&url).json(payload);
-        self.send(url, request).await
+        self.request_json(HttpMethod::Post, path, &[], Some(payload))
+            .await
     }
 
-    async fn send(
+    async fn patch_json(
         &self,
-        url: String,
-        request: reqwest::RequestBuilder,
+        path: &str,
+        payload: &serde_json::Value,
     ) -> Result<serde_json::Value, BacklogError> {
-        let mut request = request
-            .header(reqwest::header::USER_AGENT, "nanna-coder")
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(BacklogError::Status {
+        self.request_json(HttpMethod::Patch, path, &[], Some(payload))
+            .await
+    }
+
+    async fn request_json(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, String)],
+        payload: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let mut request = match method {
+                HttpMethod::Get => self.http.get(&url).query(query),
+                HttpMethod::Post => self.http.post(&url),
+                HttpMethod::Patch => self.http.patch(&url),
+            };
+            if let Some(payload) = payload {
+                request = request.json(payload);
+            }
+            request = request
+                .header(reqwest::header::USER_AGENT, "nanna-coder")
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+            if let Some(token) = &self.token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.map_err(|e| transport_error(e, &url))?;
+            let status = response.status();
+            if status.is_success() {
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| transport_error(e, &url))?;
+                return Ok(serde_json::from_str(&text)?);
+            }
+            let retry_after = retry_after_secs(response.headers());
+            let rate_limited =
+                status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some());
+            if !rate_limited {
+                return Err(BacklogError::Status {
+                    url,
+                    status: status.as_u16(),
+                });
+            }
+            let exceeds_cap = retry_after.is_some_and(|secs| secs > MAX_RETRY_AFTER_SECS);
+            if !exceeds_cap && attempt < self.max_attempts {
+                tokio::time::sleep(retry_wait(self.base_backoff, attempt, retry_after)).await;
+                continue;
+            }
+            return Err(BacklogError::RateLimited {
                 url,
-                status: status.as_u16(),
+                attempts: attempt,
+                retry_after_secs: retry_after,
             });
         }
-        Ok(serde_json::from_str(&response.text().await?)?)
     }
 
     async fn paginate<T: for<'de> Deserialize<'de>>(
@@ -463,12 +890,14 @@ impl GithubClient for ReqwestGithubClient {
         repo: &str,
         query: &str,
     ) -> Result<Vec<GithubIssue>, BacklogError> {
+        validate_repo(repo)?;
         let q = format!("repo:{repo} is:issue is:open {query}");
         self.paginate("/search/issues", &[("q", q)], |v| v["items"].clone())
             .await
     }
 
     async fn open_pull_requests(&self, repo: &str) -> Result<Vec<GithubPullRequest>, BacklogError> {
+        validate_repo(repo)?;
         self.paginate(
             &format!("/repos/{repo}/pulls"),
             &[("state", "open".to_string())],
@@ -484,6 +913,7 @@ impl GithubClient for ReqwestGithubClient {
         body: &str,
         labels: &[String],
     ) -> Result<GithubIssue, BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({ "title": title, "body": body, "labels": labels });
         let value = self
             .post_json(&format!("/repos/{repo}/issues"), &payload)
@@ -497,23 +927,169 @@ impl GithubClient for ReqwestGithubClient {
         number: u64,
         body: &str,
     ) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({ "body": body });
         self.post_json(&format!("/repos/{repo}/issues/{number}/comments"), &payload)
             .await?;
         Ok(())
     }
+
+    async fn create_draft_pull_request(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<GithubPullRequestCreated, BacklogError> {
+        validate_repo(repo)?;
+        let payload = serde_json::json!({
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+            "draft": true,
+        });
+        let value = self
+            .post_json(&format!("/repos/{repo}/pulls"), &payload)
+            .await?;
+        let raw: RawPrCreated = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
+
+    async fn get_pull_request(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<GithubPullRequestDetail, BacklogError> {
+        validate_repo(repo)?;
+        let value = self
+            .get_json(&format!("/repos/{repo}/pulls/{number}"), &[])
+            .await?;
+        let raw: RawPrDetail = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
+
+    async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
+        let detail = self.get_pull_request(repo, number).await?;
+        let payload = serde_json::json!({
+            "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
+            "variables": { "id": detail.node_id },
+        });
+        let url = format!("{}/graphql", self.base_url);
+        let value = self.post_json("/graphql", &payload).await?;
+        if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let message = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(BacklogError::GraphQl { url, message });
+            }
+        }
+        let is_draft = value
+            .pointer("/data/markPullRequestReadyForReview/pullRequest/isDraft")
+            .and_then(|v| v.as_bool());
+        if is_draft != Some(false) {
+            return Err(BacklogError::GraphQl {
+                url,
+                message: "markPullRequestReadyForReview reported no errors but did not confirm pullRequest.isDraft is false".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
+        let payload = serde_json::json!({ "state": "closed" });
+        self.patch_json(&format!("/repos/{repo}/pulls/{number}"), &payload)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_review_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError> {
+        validate_repo(repo)?;
+        let raw: Vec<RawComment> = self
+            .paginate(
+                &format!("/repos/{repo}/pulls/{number}/comments"),
+                &[],
+                |v| v,
+            )
+            .await?;
+        Ok(raw.into_iter().map(GithubComment::from).collect())
+    }
+
+    async fn list_issue_comments(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubComment>, BacklogError> {
+        validate_repo(repo)?;
+        let raw: Vec<RawComment> = self
+            .paginate(
+                &format!("/repos/{repo}/issues/{number}/comments"),
+                &[],
+                |v| v,
+            )
+            .await?;
+        Ok(raw.into_iter().map(GithubComment::from).collect())
+    }
+
+    async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError> {
+        validate_repo(repo)?;
+        let value = self
+            .get_json(&format!("/repos/{repo}/issues/{number}"), &[])
+            .await?;
+        let raw: RawIssueDetail = serde_json::from_value(value)?;
+        Ok(raw.into())
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::scheduler::InMemoryQueueStore;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use std::sync::Mutex as StdMutex;
 
-    struct MockGithub {
-        issues: HashMap<String, Vec<GithubIssue>>,
-        pulls: HashMap<String, Vec<GithubPullRequest>>,
+    #[derive(Default)]
+    pub(crate) struct MockGithub {
+        pub issues: HashMap<String, Vec<GithubIssue>>,
+        pub pulls: HashMap<String, Vec<GithubPullRequest>>,
+        pub pr_details: HashMap<(String, u64), GithubPullRequestDetail>,
+        pub issue_details: HashMap<(String, u64), GithubIssueDetail>,
+        pub review_comments: HashMap<(String, u64), Vec<GithubComment>>,
+        pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
+        pub created_pr: Option<GithubPullRequestCreated>,
+        pub fail_status: Option<u16>,
+        pub(crate) calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockGithub {
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("mock call log poisoned").clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .expect("mock call log poisoned")
+                .push(call.into());
+        }
+
+        fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            match self.fail_status {
+                Some(status) => Err(BacklogError::Status {
+                    url: url.to_string(),
+                    status,
+                }),
+                None => Ok(()),
+            }
+        }
     }
 
     #[async_trait]
@@ -545,13 +1121,110 @@ mod tests {
 
         async fn comment_on_issue(
             &self,
-            _repo: &str,
-            _number: u64,
-            _body: &str,
+            repo: &str,
+            number: u64,
+            body: &str,
         ) -> Result<(), BacklogError> {
-            unreachable!("ingestion never comments")
+            self.record(format!("comment_on_issue {repo}#{number}: {body}"));
+            self.maybe_fail("mock:comment_on_issue")
+        }
+
+        async fn create_draft_pull_request(
+            &self,
+            repo: &str,
+            title: &str,
+            body: &str,
+            head: &str,
+            base: &str,
+        ) -> Result<GithubPullRequestCreated, BacklogError> {
+            self.record(format!(
+                "create_draft_pull_request {repo} {head}->{base} title={title}\nbody={body}"
+            ));
+            self.maybe_fail("mock:create_draft_pull_request")?;
+            self.created_pr.clone().ok_or_else(|| BacklogError::Status {
+                url: "mock:create_draft_pull_request".to_string(),
+                status: 500,
+            })
+        }
+
+        async fn get_pull_request(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubPullRequestDetail, BacklogError> {
+            self.pr_details
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:pulls/{number}"),
+                    status: 404,
+                })
+        }
+
+        async fn mark_pull_request_ready(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<(), BacklogError> {
+            self.record(format!("mark_pull_request_ready {repo}#{number}"));
+            self.maybe_fail("mock:mark_pull_request_ready")
+        }
+
+        async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+            self.record(format!("close_pull_request {repo}#{number}"));
+            self.maybe_fail("mock:close_pull_request")
+        }
+
+        async fn list_review_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            self.maybe_fail("mock:list_review_comments")?;
+            Ok(self
+                .review_comments
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn list_issue_comments(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubComment>, BacklogError> {
+            self.maybe_fail("mock:list_issue_comments")?;
+            Ok(self
+                .issue_comments
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn get_issue(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<GithubIssueDetail, BacklogError> {
+            self.issue_details
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:issues/{number}"),
+                    status: 404,
+                })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::MockGithub;
+    use super::*;
+    use crate::scheduler::InMemoryQueueStore;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn issue(number: u64) -> GithubIssue {
         GithubIssue {
@@ -610,9 +1283,10 @@ mod tests {
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(1), issue(2)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let store = InMemoryQueueStore::default();
-        let sink = StoreSink::open(Box::new(store.clone())).unwrap();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let cfg = config(vec![source("o/n", "/repo")], None);
 
         let report = backlog_sync(&github, &sink, &cfg).await.unwrap();
@@ -634,7 +1308,7 @@ mod tests {
         assert_eq!(again.duplicates, 2);
         assert_eq!(store.load().unwrap().len(), 2);
 
-        let reopened = StoreSink::open(Box::new(store.clone())).unwrap();
+        let reopened = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
         let third = backlog_sync(&github, &reopened, &cfg).await.unwrap();
         assert_eq!(third.duplicates, 2);
     }
@@ -660,8 +1334,10 @@ mod tests {
                     },
                 ],
             )]),
+            ..Default::default()
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
         let report = backlog_sync(&github, &sink, &config(vec![source("o/n", "/repo")], None))
             .await
             .unwrap();
@@ -678,15 +1354,14 @@ mod tests {
                 ("o/b".to_string(), vec![issue(1), issue(2)]),
             ]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
-        let sink = StoreSink::open(Box::new(InMemoryQueueStore::default())).unwrap();
-        sink.enqueue(QueuedTask::new(
-            "manual",
-            PathBuf::from("/a"),
-            "main",
-            "m",
-            1,
-        ))
+        let sink =
+            StoreSink::open(Box::new(InMemoryQueueStore::default()), known_identities()).unwrap();
+        sink.enqueue(
+            QueuedTask::new("manual", PathBuf::from("/a"), "main", "m", 1)
+                .with_identity_hint(Some("sdlc-dev".to_string())),
+        )
         .await
         .unwrap();
         let cfg = config(vec![source("o/a", "/a"), source("o/b", "/b")], Some(2));
@@ -710,6 +1385,132 @@ mod tests {
             ]
         );
         assert_eq!(sink.known().await.unwrap().len(), 4);
+    }
+
+    fn known_identities() -> Vec<String> {
+        vec!["sdlc-dev".to_string()]
+    }
+
+    fn sdlc_dev_identity() -> crate::identity::AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.identity.name = "sdlc-dev".to_string();
+        identity
+    }
+
+    struct SilentProvider;
+
+    #[async_trait]
+    impl ModelProvider for SilentProvider {
+        async fn chat(
+            &self,
+            _request: model::types::ChatRequest,
+        ) -> model::provider::ModelResult<model::types::ChatResponse> {
+            Err(model::provider::ModelError::Unknown {
+                message: "unused".to_string(),
+            })
+        }
+        async fn list_models(&self) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> model::provider::ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "silent"
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_an_unregistered_identity_hint_and_queues_nothing() {
+        let manager = Arc::new(TaskManager::new(0));
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+            ..Default::default()
+        };
+        let cfg = config(vec![source("o/n", "/repo")], None);
+        let err = backlog_sync(&github, &sink, &cfg).await.unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "sdlc-dev"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("sdlc-dev"));
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_sink_refuses_unresolved_and_missing_identity_hints_and_stores_nothing() {
+        let store = InMemoryQueueStore::default();
+        let sink = StoreSink::open(Box::new(store.clone()), known_identities()).unwrap();
+        let github = MockGithub {
+            issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
+            pulls: HashMap::new(),
+            ..Default::default()
+        };
+        let mut src = source("o/n", "/repo");
+        src.identity = "ghost".to_string();
+        let err = backlog_sync(&github, &sink, &config(vec![src], None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BacklogError::UnresolvedIdentity { identity } if identity == "ghost"),
+            "{err}"
+        );
+        let err = sink
+            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_sink_refuses_a_task_with_no_identity_hint() {
+        let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(sdlc_dev_identity()).await;
+        let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(SilentProvider));
+        let err = sink
+            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::MissingIdentity), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_github_records_pr_lifecycle_calls() {
+        let mock = MockGithub {
+            created_pr: Some(GithubPullRequestCreated {
+                number: 1,
+                html_url: "u".to_string(),
+                node_id: "n".to_string(),
+            }),
+            pr_details: HashMap::from([(
+                ("o/n".to_string(), 1),
+                GithubPullRequestDetail {
+                    number: 1,
+                    node_id: "n".to_string(),
+                    draft: true,
+                    state: "open".to_string(),
+                    body: None,
+                    html_url: "u".to_string(),
+                },
+            )]),
+            ..Default::default()
+        };
+        mock.create_draft_pull_request("o/n", "t", "b", "feature", "main")
+            .await
+            .unwrap();
+        mock.mark_pull_request_ready("o/n", 1).await.unwrap();
+        mock.close_pull_request("o/n", 1).await.unwrap();
+        mock.comment_on_issue("o/n", 1, "reason").await.unwrap();
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].starts_with("create_draft_pull_request"));
+        assert!(calls[1].starts_with("mark_pull_request_ready"));
+        assert!(calls[2].starts_with("close_pull_request"));
+        assert!(calls[3].starts_with("comment_on_issue"));
     }
 
     #[tokio::test]
@@ -738,10 +1539,12 @@ mod tests {
         }
 
         let manager = Arc::new(TaskManager::new(0));
+        manager.register_identity(sdlc_dev_identity()).await;
         let sink = ManagerSink::new(Arc::clone(&manager), Arc::new(NoProvider));
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(7)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let cfg = config(vec![source("o/n", "/repo")], None);
         let report = backlog_sync(&github, &sink, &cfg).await.unwrap();
@@ -778,49 +1581,123 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(StoreSink::open(Box::new(Broken)).is_err());
+        assert!(StoreSink::open(Box::new(Broken), known_identities()).is_err());
         let sink = StoreSink {
             store: Box::new(Broken),
             queue: Mutex::new(TaskQueue::new()),
+            identities: known_identities().into_iter().collect(),
         };
         let err = sink
-            .enqueue(QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1))
+            .enqueue(
+                QueuedTask::new("t", PathBuf::from("/r"), "main", "m", 1)
+                    .with_identity_hint(Some("sdlc-dev".to_string())),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("queue store failed"));
         let github = MockGithub {
             issues: HashMap::from([("o/n".to_string(), vec![issue(1)])]),
             pulls: HashMap::new(),
+            ..Default::default()
         };
         let cfg = config(vec![source("o/n", "/repo")], None);
         assert!(backlog_sync(&github, &sink, &cfg).await.is_err());
     }
 
-    async fn fake_github(
-        routes: Vec<(&'static str, u16, String)>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    struct MockRoute {
+        method: &'static str,
+        path_contains: &'static str,
+        status: u16,
+        body: String,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl MockRoute {
+        fn new(method: &'static str, path_contains: &'static str, status: u16, body: &str) -> Self {
+            Self {
+                method,
+                path_contains,
+                status,
+                body: body.to_string(),
+                headers: Vec::new(),
+            }
+        }
+
+        fn with_headers(mut self, headers: Vec<(&'static str, &'static str)>) -> Self {
+            self.headers = headers;
+            self
+        }
+    }
+
+    async fn fake_github_ext(
+        routes: Vec<MockRoute>,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = Arc::new(StdMutex::new(routes));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let requests_for_server = Arc::clone(&requests);
         let handle = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; 65536];
                 let n = socket.read(&mut buf).await.unwrap();
-                let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                let target = head.split_whitespace().nth(1).unwrap().to_string();
-                let (status, body) = routes
-                    .iter()
-                    .find(|(needle, _, _)| target.contains(needle))
-                    .map(|(_, status, body)| (*status, body.clone()))
-                    .unwrap_or((404, "{}".to_string()));
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = raw.split("\r\n").next().unwrap_or("").to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let body = raw
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(format!("{method} {target} {body}"));
+                let (status, body, headers) = {
+                    let mut guard = routes.lock().unwrap();
+                    let idx = guard.iter().position(|route| {
+                        (route.method == "*" || route.method == method)
+                            && target.contains(route.path_contains)
+                    });
+                    match idx {
+                        Some(i) => {
+                            let route = guard.remove(i);
+                            (route.status, route.body, route.headers)
+                        }
+                        None => (404, "{}".to_string(), Vec::new()),
+                    }
+                };
+                let mut extra_headers = String::new();
+                for (key, value) in &headers {
+                    extra_headers.push_str(&format!("{key}: {value}\r\n"));
+                }
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             }
         });
+        (base, requests, handle)
+    }
+
+    async fn fake_github(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let routes = routes
+            .into_iter()
+            .map(|(path, status, body)| MockRoute::new("*", path, status, &body))
+            .collect();
+        let (base, _requests, handle) = fake_github_ext(routes).await;
         (base, handle)
     }
 
@@ -908,5 +1785,661 @@ mod tests {
             BacklogError::Http(_)
         ));
         assert_eq!(ReqwestGithubClient::github(None).base_url, GITHUB_API_URL);
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_creates_draft_pull_request_always_sends_draft_true() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/repos/o/n/pulls",
+            201,
+            r#"{"number": 42, "node_id": "PR_kwid", "html_url": "https://example.invalid/pr/42"}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some("token".to_string()));
+        let created = client
+            .create_draft_pull_request("o/n", "title", "body", "feature", "main")
+            .await
+            .unwrap();
+        assert_eq!(created.number, 42);
+        assert_eq!(created.node_id, "PR_kwid");
+        assert_eq!(created.html_url, "https://example.invalid/pr/42");
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("\"draft\":true"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_pull_request_detail() {
+        let (base, server) = fake_github(vec![(
+            "/repos/o/n/pulls/7",
+            200,
+            r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": "desc", "html_url": "u"}"#.to_string(),
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let detail = client.get_pull_request("o/n", 7).await.unwrap();
+        assert_eq!(detail.number, 7);
+        assert_eq!(detail.node_id, "PR_x");
+        assert!(detail.draft);
+        assert_eq!(detail.state, "open");
+        assert_eq!(detail.body.as_deref(), Some("desc"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_marks_pull_request_ready_via_graphql() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": false}}}}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some("token".to_string()));
+        client.mark_pull_request_ready("o/n", 7).await.unwrap();
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].starts_with("POST /graphql"));
+        assert!(sent[1].contains("markPullRequestReadyForReview"));
+        assert!(sent[1].contains("PR_x"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_surfaces_graphql_errors() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"errors": [{"message": "Could not resolve to a node"}]}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        assert!(err.to_string().contains("Could not resolve to a node"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_rejects_a_silent_no_op() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": true}}}}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        assert!(err.to_string().contains("did not confirm"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_mark_pull_request_ready_rejects_a_missing_is_draft_field() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new("POST", "/graphql", 200, r#"{"data": {}}"#),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.mark_pull_request_ready("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::GraphQl { .. }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_closes_pull_request_patches_state_closed() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "PATCH",
+            "/repos/o/n/pulls/9",
+            200,
+            r#"{"number": 9, "state": "closed"}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client.close_pull_request("o/n", 9).await.unwrap();
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("PATCH /repos/o/n/pulls/9"));
+        assert!(sent[0].contains("\"state\":\"closed\""));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_review_and_issue_comments() {
+        let (base, server) = fake_github(vec![
+            (
+                "/repos/o/n/pulls/3/comments?per_page=100&page=1",
+                200,
+                r#"[{"id": 1, "user": {"login": "alice"}, "body": "inline", "html_url": "u1"}]"#.to_string(),
+            ),
+            (
+                "/repos/o/n/issues/3/comments?per_page=100&page=1",
+                200,
+                r#"[{"id": 2, "user": {"login": "bob"}, "body": "conversation", "html_url": "u2"}]"#.to_string(),
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let review = client.list_review_comments("o/n", 3).await.unwrap();
+        assert_eq!(
+            review,
+            vec![GithubComment {
+                id: 1,
+                author: "alice".to_string(),
+                body: "inline".to_string(),
+                html_url: "u1".to_string()
+            }]
+        );
+        let issue = client.list_issue_comments("o/n", 3).await.unwrap();
+        assert_eq!(
+            issue,
+            vec![GithubComment {
+                id: 2,
+                author: "bob".to_string(),
+                body: "conversation".to_string(),
+                html_url: "u2".to_string()
+            }]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_issue_detail_with_labels() {
+        let (base, server) = fake_github(vec![(
+            "/repos/o/n/issues/5",
+            200,
+            r#"{"number": 5, "title": "t", "body": "b", "labels": [{"name": "bug"}, {"name": "sdlc"}], "html_url": "u"}"#.to_string(),
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let detail = client.get_issue("o/n", 5).await.unwrap();
+        assert_eq!(detail.number, 5);
+        assert_eq!(detail.title, "t");
+        assert_eq!(detail.body.as_deref(), Some("b"));
+        assert_eq!(detail.labels, vec!["bug".to_string(), "sdlc".to_string()]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retries_429_then_succeeds() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}")
+                .with_headers(vec![("Retry-After", "0")]),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let detail = client.get_issue("o/n", 1).await.unwrap();
+        assert_eq!(detail.number, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retries_a_bare_429_with_no_rate_limit_headers() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}"),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let detail = client.get_issue("o/n", 1).await.unwrap();
+        assert_eq!(detail.number, 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retry_waits_at_least_as_long_as_retry_after() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 429, "{}")
+                .with_headers(vec![("Retry-After", "1")]),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/issues/1",
+                200,
+                r#"{"number": 1, "title": "t", "body": null, "labels": [], "html_url": "u"}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        client.get_issue("o/n", 1).await.unwrap();
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(1),
+            "must wait at least the server's Retry-After, not just the base backoff"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_retry_after_beyond_the_cap_fails_immediately() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            429,
+            "{}",
+        )
+        .with_headers(vec![("Retry-After", "120")])])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(5, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                attempts,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(attempts, 1);
+                assert_eq!(retry_after_secs, Some(120));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must not sleep when Retry-After exceeds the cap"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    async fn stalled_server(
+        partial_response: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = socket.read(&mut buf).await.unwrap();
+                if let Some(partial) = partial_response {
+                    socket.write_all(partial.as_bytes()).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+                held.push(socket);
+            }
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_yields_a_typed_timeout_within_the_bound() {
+        let (base, server) = stalled_server(None).await;
+        let client = ReqwestGithubClient::new(base, Some("ghp_SECRET".into()))
+            .with_timeouts(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(300),
+            )
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_issue("o/n", 1),
+        )
+        .await;
+        let err = outcome
+            .expect("client call must not outlive its request timeout")
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Timeout { .. }), "{err:?}");
+        assert!(err.to_string().contains("timed out"));
+        assert!(!err.to_string().contains("ghp_SECRET"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stalls_mid_body_yields_a_typed_timeout() {
+        let (base, server) = stalled_server(Some(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        ))
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_timeouts(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(300),
+            )
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_issue("o/n", 1),
+        )
+        .await;
+        let err = outcome
+            .expect("client call must not outlive its request timeout")
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Timeout { .. }), "{err:?}");
+        server.abort();
+    }
+
+    #[test]
+    fn production_timeouts_are_bounded() {
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, std::time::Duration::from_secs(60));
+        let client = ReqwestGithubClient::new("http://example.invalid", None);
+        assert_eq!(client.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(client.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn validate_repo_accepts_owner_slash_name() {
+        for ok in ["o/r", "Some-Org/my_repo.rs", "a/.github", "a-b/c.d_e-f"] {
+            assert!(validate_repo(ok).is_ok(), "{ok}");
+        }
+        let longest = format!("{}/{}", "a".repeat(39), "b".repeat(100));
+        assert!(validate_repo(&longest).is_ok());
+    }
+
+    #[test]
+    fn validate_repo_rejects_anything_that_could_alter_the_url() {
+        let bad_owner = format!("{}/r", "a".repeat(40));
+        let bad_name = format!("o/{}", "b".repeat(101));
+        let overlong = "a".repeat(5000);
+        for bad in [
+            "o/r/../../x",
+            "o/r?x",
+            "o/r#x",
+            "/r",
+            "o/",
+            "o//r",
+            "",
+            "o",
+            "o/r/s",
+            "./r",
+            "o/.",
+            "../r",
+            "o/..",
+            "o/r x",
+            "o/r%2e",
+            "o\\r",
+            "o/r\n",
+            "o:p/r",
+            "o@p/r",
+            "\u{e9}/r",
+            bad_owner.as_str(),
+            bad_name.as_str(),
+            overlong.as_str(),
+        ] {
+            let err = validate_repo(bad).unwrap_err();
+            assert!(
+                matches!(&err, BacklogError::InvalidRepo { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_repo_error_does_not_echo_an_overlong_value() {
+        let err = validate_repo(&"a".repeat(5000)).unwrap_err();
+        assert!(err.to_string().len() < 200, "{}", err.to_string().len());
+    }
+
+    #[tokio::test]
+    async fn every_client_method_refuses_an_invalid_repo_before_any_request() {
+        let (base, requests, server) = fake_github_ext(vec![]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        for bad in ["o/r/../../x", "o/r?x", "o/r#x", "/r", "o/", "o//r"] {
+            let results = vec![
+                client.search_open_issues(bad, "q").await.map(|_| ()),
+                client.open_pull_requests(bad).await.map(|_| ()),
+                client.create_issue(bad, "t", "b", &[]).await.map(|_| ()),
+                client.comment_on_issue(bad, 1, "b").await,
+                client
+                    .create_draft_pull_request(bad, "t", "b", "h", "m")
+                    .await
+                    .map(|_| ()),
+                client.get_pull_request(bad, 1).await.map(|_| ()),
+                client.mark_pull_request_ready(bad, 1).await,
+                client.close_pull_request(bad, 1).await,
+                client.list_review_comments(bad, 1).await.map(|_| ()),
+                client.list_issue_comments(bad, 1).await.map(|_| ()),
+                client.get_issue(bad, 1).await.map(|_| ()),
+            ];
+            for (i, result) in results.into_iter().enumerate() {
+                assert!(
+                    matches!(result, Err(BacklogError::InvalidRepo { .. })),
+                    "method {i} accepted {bad:?}"
+                );
+            }
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_valid_repo_is_still_sent_as_is() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/Some-Org/my_repo.rs/issues/1",
+            200,
+            r#"{"number": 1, "title": "t", "body": null, "state": "open", "html_url": "u", "user": {"login": "a"}}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let _ = client.get_issue("Some-Org/my_repo.rs", 1).await;
+        assert_eq!(
+            requests.lock().unwrap()[0],
+            "GET /repos/Some-Org/my_repo.rs/issues/1 "
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn no_failure_mode_puts_the_token_in_an_error_string() {
+        const TOKEN: &str = "ghp_SECRET_TOKEN_123";
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/repos/o/n/issues/1", 500, "{}"),
+            MockRoute::new("GET", "/repos/o/n/issues/2", 429, "{}"),
+            MockRoute::new("GET", "/repos/o/n/issues/3", 200, "not json"),
+            MockRoute::new(
+                "GET",
+                "/repos/o/n/pulls/7",
+                200,
+                r#"{"number": 7, "node_id": "PR_x", "draft": true, "state": "open", "body": null, "html_url": "u"}"#,
+            ),
+            MockRoute::new(
+                "POST",
+                "/graphql",
+                200,
+                r#"{"errors": [{"message": "Resource not accessible"}]}"#,
+            ),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, Some(TOKEN.to_string()))
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let errors = vec![
+            client.get_issue("o/n", 1).await.unwrap_err(),
+            client.get_issue("o/n", 2).await.unwrap_err(),
+            client.get_issue("o/n", 3).await.unwrap_err(),
+            client.mark_pull_request_ready("o/n", 7).await.unwrap_err(),
+        ];
+        assert!(matches!(
+            errors[0],
+            BacklogError::Status { status: 500, .. }
+        ));
+        assert!(matches!(errors[1], BacklogError::RateLimited { .. }));
+        assert!(matches!(errors[2], BacklogError::Parse(_)));
+        assert!(matches!(errors[3], BacklogError::GraphQl { .. }));
+        for err in &errors {
+            assert!(!err.to_string().contains(TOKEN), "{err}");
+            assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
+        }
+        let dead = ReqwestGithubClient::new("http://127.0.0.1:1", Some(TOKEN.to_string()));
+        let err = dead.get_issue("o/n", 1).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Http(_)));
+        assert!(!err.to_string().contains(TOKEN), "{err}");
+        assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_403_with_remaining_zero_retries_then_exhausts() {
+        let route = || {
+            MockRoute::new("GET", "/repos/o/n/issues/1", 403, "{}").with_headers(vec![
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset", "0"),
+            ])
+        };
+        let (base, requests, server) = fake_github_ext(vec![route(), route()]).await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(2, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                attempts,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(attempts, 2);
+                assert_eq!(retry_after_secs, Some(0));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_403_with_remaining_zero_and_no_reset_header_defaults_to_zero() {
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            403,
+            "{}",
+        )
+        .with_headers(vec![("X-RateLimit-Remaining", "0")])])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        match err {
+            BacklogError::RateLimited {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, Some(0)),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn with_retry_policy_clamps_an_oversized_max_attempts() {
+        let client = ReqwestGithubClient::new("http://example.invalid", None)
+            .with_retry_policy(u32::MAX, std::time::Duration::from_millis(1));
+        assert_eq!(client.max_attempts, MAX_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_wait_never_exceeds_the_retry_after_ceiling_however_many_attempts() {
+        let base = std::time::Duration::from_secs(1);
+        for attempt in 1..=MAX_RETRY_ATTEMPTS {
+            let wait = retry_wait(base, attempt, None);
+            assert!(
+                wait <= std::time::Duration::from_secs(MAX_RETRY_AFTER_SECS),
+                "attempt {attempt} would sleep {wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_wait_doubles_until_the_ceiling_and_honours_retry_after() {
+        let base = std::time::Duration::from_millis(200);
+        assert_eq!(retry_wait(base, 1, None), base);
+        assert_eq!(retry_wait(base, 2, None), base * 2);
+        assert_eq!(retry_wait(base, 3, None), base * 4);
+        assert_eq!(
+            retry_wait(base, 1, Some(5)),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(retry_wait(base, 1, Some(0)), base);
+    }
+
+    #[test]
+    fn client_debug_output_never_contains_the_token() {
+        let client =
+            ReqwestGithubClient::new("http://example.invalid", Some("ghp_SECRET123".into()));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("ghp_SECRET123"), "{rendered}");
+        assert!(rendered.contains("example.invalid"));
+        let anonymous = format!(
+            "{:?}",
+            ReqwestGithubClient::new("http://example.invalid", None)
+        );
+        assert!(anonymous.contains("None"), "{anonymous}");
+    }
+
+    #[test]
+    fn with_retry_policy_still_floors_at_one() {
+        let client = ReqwestGithubClient::new("http://example.invalid", None)
+            .with_retry_policy(0, std::time::Duration::from_millis(1));
+        assert_eq!(client.max_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_plain_403_is_not_retried() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/issues/1",
+            403,
+            "{}",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_retry_policy(3, std::time::Duration::from_millis(1));
+        let err = client.get_issue("o/n", 1).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 403, .. }));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
     }
 }

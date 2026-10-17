@@ -392,18 +392,43 @@ mod tests {
         assert!(IncidentIdentity::from_toml_str("not valid toml =").is_err());
     }
 
+    fn catalog_responder() -> crate::identity::AgentIdentity {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/identities/global");
+        crate::identity::IdentityCatalog::load(dir)
+            .unwrap()
+            .get("incident-responder")
+            .unwrap()
+            .clone()
+    }
+
     #[test]
-    fn fixture_identity_registry_contains_exactly_the_allowed_tools() {
-        let identity = IncidentIdentity::incident_responder();
-        let mut tools = identity.tools().to_vec();
-        tools.sort();
+    fn catalog_identity_is_bounded_to_the_outer_loop_production_and_exactly_the_three_tools() {
+        let responder = catalog_responder();
+        assert_eq!(responder.identity.dev_loop, crate::identity::DevLoop::Outer);
+        assert_eq!(
+            responder.scope.max_effect,
+            crate::effects::EffectClass::Production
+        );
+        let mut catalog_tools: Vec<String> = responder
+            .scope
+            .tools
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        catalog_tools.sort();
         let mut expected = vec![
             READ_LOGS_TOOL.to_string(),
             ROLLBACK_TOOL.to_string(),
             ROLL_FORWARD_PR_TOOL.to_string(),
         ];
         expected.sort();
-        assert_eq!(tools, expected);
+        assert_eq!(catalog_tools, expected);
+        let mut registry = IncidentIdentity::incident_responder().tools().to_vec();
+        registry.sort();
+        assert_eq!(registry, catalog_tools);
+        assert!(!responder.allows_tool("run_command"));
+        assert!(!responder.allows_tool("write_file"));
     }
 
     #[tokio::test]
@@ -445,7 +470,7 @@ mod tests {
             t0(),
         );
         record.state = RolloutState::Step(0);
-        log.append(None, &record).unwrap();
+        log.append(None, &mut record).unwrap();
         let later = t0() + Duration::minutes(5);
         record
             .transition(
@@ -456,7 +481,8 @@ mod tests {
                 later,
             )
             .unwrap();
-        log.append(Some(&RolloutState::Step(0)), &record).unwrap();
+        log.append(Some(&RolloutState::Step(0)), &mut record)
+            .unwrap();
         let history = log.history("rollout-1").unwrap();
         let postmortem = incident.postmortem(
             &ProposedAction::Rollback,

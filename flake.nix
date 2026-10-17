@@ -121,6 +121,7 @@
             (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
             (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
             (pkgs.lib.hasInfix "/docs/" path) ||
+            (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
             (type == "directory");
         };
 
@@ -219,6 +220,8 @@
 
         # Checks for CI/CD
         checks = {
+          dev-container-cmd = containers.devContainerCmdCheck;
+
           # Workspace-wide checks
           workspace-test = craneLib.cargoTest {
             inherit src;
@@ -308,7 +311,8 @@
               (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
               (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
               (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
-            (pkgs.lib.hasInfix "/docs/" path) ||
+              (pkgs.lib.hasInfix "/docs/" path) ||
+              (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
               (type == "directory");
           };
 
