@@ -3531,10 +3531,10 @@ mod tests {
         assert!(!remote_has(fixture.work.path(), "feature-g"));
     }
 
-    fn non_test_source() -> &'static str {
-        let source = include_str!("pr_tools.rs");
+    fn non_test_source() -> String {
+        let source = include_str!("pr_tools.rs").replace("\r\n", "\n");
         let end = source.find("#[cfg(test)]\nmod tests").unwrap();
-        &source[..end]
+        source[..end].to_string()
     }
 
     #[test]
@@ -3556,7 +3556,7 @@ mod tests {
 
     #[test]
     fn the_github_client_surface_has_no_merge_method_and_is_pinned() {
-        let backlog = include_str!("backlog.rs");
+        let backlog = include_str!("backlog.rs").replace("\r\n", "\n");
         let start = backlog.find("pub trait GithubClient").unwrap();
         let body = &backlog[start..];
         let end = body.find("\n}\n").unwrap();
