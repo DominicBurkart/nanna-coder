@@ -8,6 +8,11 @@ use thiserror::Error;
 
 /// Where the broker socket appears inside the container. Fixed so that no
 /// adapter chooses it.
+/// ```
+/// use harness::harness_adapter::BROKER_SOCKET_CONTAINER_PATH;
+///
+/// assert_eq!(BROKER_SOCKET_CONTAINER_PATH, "/nanna/broker.sock");
+/// ```
 pub const BROKER_SOCKET_CONTAINER_PATH: &str = "/nanna/broker.sock";
 
 const FILE_ROOT: &str = "/nanna/";
@@ -21,6 +26,15 @@ const ALLOWED_ENV: [(&str, &str); 4] = [
 
 /// A way a plan breaks the isolation contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// ```
+/// use harness::harness_adapter::IsolationViolation;
+///
+/// assert_eq!(IsolationViolation::EmptyArgv.to_string(), "plan has an empty argv");
+/// assert_eq!(
+///     IsolationViolation::RepoChanged.to_string(),
+///     "plan audited repository differs from the agent's"
+/// );
+/// ```
 pub enum IsolationViolation {
     /// The plan names a different agent than the one it was built for.
     #[error("plan agent `{plan}` differs from the agent `{agent}`")]
@@ -28,6 +42,14 @@ pub enum IsolationViolation {
         /// Agent name in the plan.
         plan: String,
         /// Agent the plan was built for.
+        agent: String,
+    },
+    /// The plan names a different model than the agent was resolved with.
+    #[error("plan model `{plan}` differs from the agent model `{agent}`")]
+    ModelChanged {
+        /// Model in the plan.
+        plan: String,
+        /// Model the agent was resolved with.
         agent: String,
     },
     /// The plan starts from a different image than the agent was resolved for.
@@ -100,10 +122,24 @@ pub enum IsolationViolation {
 /// (name, value) pairs from a fixed list; the agent's limits and scope are
 /// carried unchanged; files are placed under `/nanna/` without duplicates; the
 /// image is the one the agent resolved with.
+/// ```
+/// use harness::harness_adapter::{IsolationPolicy, LaunchPlan, ResolvedAgent};
+///
+/// fn acceptable(plan: &LaunchPlan, agent: &ResolvedAgent) -> bool {
+///     IsolationPolicy::check(plan, agent).is_ok()
+/// }
+/// ```
 pub struct IsolationPolicy;
 
 impl IsolationPolicy {
     /// Every violation in `plan`.
+    /// ```
+    /// use harness::harness_adapter::{IsolationPolicy, IsolationViolation, LaunchPlan, ResolvedAgent};
+    ///
+    /// fn problems(plan: &LaunchPlan, agent: &ResolvedAgent) -> Vec<IsolationViolation> {
+    ///     IsolationPolicy::violations(plan, agent)
+    /// }
+    /// ```
     pub fn violations(plan: &LaunchPlan, agent: &ResolvedAgent) -> Vec<IsolationViolation> {
         let mut found = Vec::new();
         if plan.argv.is_empty() {
@@ -132,6 +168,12 @@ impl IsolationPolicy {
             found.push(IsolationViolation::AgentChanged {
                 plan: plan.agent.clone(),
                 agent: agent.name().to_string(),
+            });
+        }
+        if plan.model != agent.model() {
+            found.push(IsolationViolation::ModelChanged {
+                plan: plan.model.clone(),
+                agent: agent.model().to_string(),
             });
         }
         if plan.image != agent.image() {
@@ -172,6 +214,13 @@ impl IsolationPolicy {
     }
 
     /// `Ok` when the plan has no violations, otherwise the first one.
+    /// ```
+    /// use harness::harness_adapter::{IsolationPolicy, IsolationViolation, LaunchPlan, ResolvedAgent};
+    ///
+    /// fn first(plan: &LaunchPlan, agent: &ResolvedAgent) -> Result<(), IsolationViolation> {
+    ///     IsolationPolicy::check(plan, agent)
+    /// }
+    /// ```
     pub fn check(plan: &LaunchPlan, agent: &ResolvedAgent) -> Result<(), IsolationViolation> {
         match Self::violations(plan, agent).into_iter().next() {
             Some(violation) => Err(violation),

@@ -1,56 +1,105 @@
 //! Host-side capability broker: the single door through which a sandboxed
 //! runtime acts.
 //!
-//! The broker owns the identity's scoped [`ToolRegistry`] and calls
-//! [`ToolRegistry::execute`] for every request. It reimplements no gate: scope,
-//! path restrictions, protected paths and the production hold stay where they
-//! are, inside the registry and its tools. It only decides which requests reach
-//! the registry, maps the registry's errors onto what the runtime and the
-//! executor must do, and keeps the audit log that becomes the task result's
-//! tool-call history.
+//! A [`Broker`] is built from the audit proof, a [`ResolvedAgent`] and the
+//! [`BoundWorkspace`] that agent was bound to. It owns the registry that bound
+//! workspace built and calls [`ToolRegistry::execute`] for every request, so it
+//! reimplements no gate: scope, path restrictions, protected paths and the
+//! production hold stay inside the registry and its tools. It only decides
+//! which requests reach the registry, maps the registry's errors onto what the
+//! runtime and the executor must do, and records each call.
 //!
-//! A broker serves nothing until the executor has armed it with
-//! [`Broker::arm`], which checks the launch plan against this broker and the
-//! tool set the started runtime reports. After a halt it serves nothing more.
+//! An unarmed [`Broker`] cannot serve. [`Broker::arm`] consumes it and returns
+//! an [`ArmedBroker`], the only type with `handle`, after checking the launch
+//! plan against this broker and the tool set the started runtime reports. A
+//! failed arm returns no [`ArmedBroker`], so there is no half-armed state.
+//!
+//! ```compile_fail
+//! use harness::harness_adapter::{Broker, BrokerRequest};
+//!
+//! async fn unarmed_cannot_serve(broker: Broker, request: BrokerRequest) {
+//!     broker.handle(request).await;
+//! }
+//! ```
 
-use super::{verify_runtime_tools, CheckedPlan, HandshakeMismatch, ResolvedAgent};
-use crate::auditor::Allowed;
+use super::bind::BoundWorkspace;
+use super::{verify_runtime_tools, CheckedPlan, HandshakeMismatch, ResolvedAgent, ScopeGrant};
+use crate::auditor::{content_hash, Allowed};
 use crate::effects::EffectClass;
-use crate::identity::{AgentIdentity, LimitsSection};
-use crate::scope::ScopeError;
+use crate::identity::LimitsSection;
 use crate::tools::{ToolError, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Largest tool output the broker will return, in bytes of its JSON text. It is
-/// below the extension's reply cap so the reply envelope still fits.
+/// below the extension's reply cap so the reply envelope still fits. The tool
+/// has already run when this is exceeded; the output is replaced, not undone.
+/// ```
+/// use harness::harness_adapter::MAX_OUTPUT_BYTES;
+///
+/// assert_eq!(MAX_OUTPUT_BYTES, 1_000_000);
+/// ```
 pub const MAX_OUTPUT_BYTES: usize = 1_000_000;
+
+/// Largest request line the broker will parse, in bytes.
+/// ```
+/// use harness::harness_adapter::MAX_REQUEST_BYTES;
+///
+/// assert_eq!(MAX_REQUEST_BYTES, 1_048_576);
+/// ```
+pub const MAX_REQUEST_BYTES: usize = 1_048_576;
+
+const HALT_NOTICE: &str = "the task was halted by the host";
+const MAX_LOGGED_NAME: usize = 128;
 
 /// Which effect classes the broker will run. The default is
 /// [`EffectClass::Workspace`]: the per-action gate (window, lease, ceiling,
 /// escalation) is not on main yet, so anything above Workspace would run with
-/// no window or lease check. Raise it only when that gate is merged.
+/// no window or lease check. It can only be widened inside the crate, by the
+/// change that adds that gate.
+///
+/// ```
+/// use harness::effects::EffectClass;
+/// use harness::harness_adapter::BrokerPolicy;
+///
+/// let policy = BrokerPolicy::default();
+/// assert!(policy.admits(EffectClass::Workspace));
+/// assert!(!policy.admits(EffectClass::Repository));
+/// assert_eq!(policy.max_effect(), EffectClass::Workspace);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrokerPolicy {
     max_effect: EffectClass,
 }
 
 impl BrokerPolicy {
-    /// A policy admitting every class up to and including `max_effect`.
-    pub const fn new(max_effect: EffectClass) -> Self {
+    pub(crate) const fn new(max_effect: EffectClass) -> Self {
         Self { max_effect }
     }
 
     /// Whether a capability of class `effect` may run.
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::harness_adapter::BrokerPolicy;
+    ///
+    /// assert!(BrokerPolicy::default().admits(EffectClass::None));
+    /// assert!(!BrokerPolicy::default().admits(EffectClass::Ci));
+    /// ```
     pub fn admits(&self, effect: EffectClass) -> bool {
         effect <= self.max_effect
     }
 
     /// The highest admitted class.
+    /// ```
+    /// use harness::effects::EffectClass;
+    /// use harness::harness_adapter::BrokerPolicy;
+    ///
+    /// assert_eq!(BrokerPolicy::default().max_effect(), EffectClass::Workspace);
+    /// ```
     pub fn max_effect(&self) -> EffectClass {
         self.max_effect
     }
@@ -63,12 +112,16 @@ impl Default for BrokerPolicy {
 }
 
 /// Failures building a [`Broker`].
+///
+/// ```
+/// use harness::harness_adapter::BrokerError;
+///
+/// let error = BrokerError::IdentityMismatch { identity: "a".into(), agent: "b".into() };
+/// assert!(error.to_string().contains("does not match the resolved agent"));
+/// ```
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    /// The registry builder rejected the identity's scope.
-    #[error("scope: {0}")]
-    Scope(#[from] ScopeError),
-    /// The audited identity is not the one the agent was resolved from.
+    /// The audited spawn is not the one the agent was resolved from.
     #[error("audited identity `{identity}` does not match the resolved agent `{agent}`")]
     IdentityMismatch {
         /// Identity from the audit proof.
@@ -76,19 +129,20 @@ pub enum BrokerError {
         /// Agent the broker was built for.
         agent: String,
     },
-    /// The registry the builder returned is not scoped to the identity.
-    #[error("registry is not scoped to identity `{identity}`")]
-    RegistryNotScoped {
-        /// Identity the registry should have been scoped to.
-        identity: String,
-    },
 }
 
-/// Why a broker refused to be armed.
+/// Why a broker refused to arm.
+///
+/// ```
+/// use harness::harness_adapter::ArmError;
+///
+/// let error = ArmError::PlanMismatch { field: "model" };
+/// assert_eq!(error.to_string(), "plan does not belong to this broker: model differs");
+/// ```
 #[derive(Debug, Error)]
 pub enum ArmError {
-    /// The plan was built for a different agent, repository, scope, limits or
-    /// broker socket than this broker.
+    /// The plan was built for a different agent, repository, model, image,
+    /// limits, scope, capability set or broker socket than this broker.
     #[error("plan does not belong to this broker: {field} differs")]
     PlanMismatch {
         /// The field that differs.
@@ -107,6 +161,13 @@ pub enum ArmError {
 
 /// A capability call arriving over the broker socket, one JSON object per line.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+/// ```
+/// use harness::harness_adapter::BrokerRequest;
+///
+/// let request: BrokerRequest = serde_json::from_str(r#"{"tool":"read_file"}"#).unwrap();
+/// assert_eq!(request.tool, "read_file");
+/// assert!(request.args.is_null());
+/// ```
 pub struct BrokerRequest {
     /// Capability name.
     pub tool: String,
@@ -117,6 +178,15 @@ pub struct BrokerRequest {
 
 /// The reply written back to the runtime, one JSON object per line.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+/// ```
+/// use harness::harness_adapter::BrokerOutcome;
+///
+/// let reply = BrokerOutcome::Output(serde_json::json!("done")).to_response();
+/// assert_eq!(
+///     serde_json::to_value(&reply).unwrap(),
+///     serde_json::json!({"ok": true, "output": "done", "halt": false})
+/// );
+/// ```
 pub struct BrokerResponse {
     /// Whether the call succeeded.
     pub ok: bool,
@@ -130,16 +200,20 @@ pub struct BrokerResponse {
 }
 
 /// Why a call returned an error to the agent without stopping the task.
+///
+/// ```
+/// use harness::harness_adapter::ToolErrorKind;
+///
+/// assert_eq!(serde_json::to_string(&ToolErrorKind::NotGranted).unwrap(), "\"not_granted\"");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolErrorKind {
-    /// The broker has not been armed yet.
-    NotReady,
     /// The task already halted; nothing more is served.
     TaskHalted,
     /// The capability was never granted to this agent.
     NotGranted,
-    /// The request was not valid JSON of the expected shape.
+    /// The request was not valid JSON of the expected shape, or too large.
     BadRequest,
     /// The identity's scope refused the call.
     ScopeDenied,
@@ -157,7 +231,19 @@ pub enum ToolErrorKind {
     ReplyTooLarge,
 }
 
-/// Why the task must stop.
+/// Why the task must stop. The detail stays host-side: the runtime is only told
+/// that the task was halted.
+///
+/// ```
+/// use harness::harness_adapter::HaltReason;
+///
+/// let reason = HaltReason::ProductionHeld {
+///     repo: "r".into(),
+///     escalation_id: "e1".into(),
+///     summary: "down".into(),
+/// };
+/// assert!(matches!(reason, HaltReason::ProductionHeld { .. }));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HaltReason {
     /// An incident hold blocks production effects.
@@ -172,6 +258,13 @@ pub enum HaltReason {
 }
 
 /// What the broker decided for one request.
+///
+/// ```
+/// use harness::harness_adapter::BrokerOutcome;
+///
+/// let reply = BrokerOutcome::Output(serde_json::json!("done")).to_response();
+/// assert!(reply.ok && !reply.halt);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrokerOutcome {
     /// The tool ran; its output.
@@ -188,7 +281,19 @@ pub enum BrokerOutcome {
 }
 
 impl BrokerOutcome {
-    /// The wire reply for this outcome.
+    /// The wire reply for this outcome. A halt carries a fixed notice only.
+    /// ```
+    /// use harness::harness_adapter::{BrokerOutcome, HaltReason};
+    ///
+    /// let halt = BrokerOutcome::Halt(HaltReason::ProductionHeld {
+    ///     repo: "r".into(),
+    ///     escalation_id: "e1".into(),
+    ///     summary: "down".into(),
+    /// });
+    /// let reply = halt.to_response();
+    /// assert!(reply.halt && !reply.ok);
+    /// assert_eq!(reply.output, "the task was halted by the host");
+    /// ```
     pub fn to_response(&self) -> BrokerResponse {
         match self {
             BrokerOutcome::Output(output) => BrokerResponse {
@@ -203,15 +308,9 @@ impl BrokerOutcome {
                 kind: Some(*kind),
                 halt: false,
             },
-            BrokerOutcome::Halt(HaltReason::ProductionHeld {
-                repo,
-                escalation_id,
-                summary,
-            }) => BrokerResponse {
+            BrokerOutcome::Halt(_) => BrokerResponse {
                 ok: false,
-                output: json!(format!(
-                    "production effects held for {repo} by incident {escalation_id}: {summary}"
-                )),
+                output: json!(HALT_NOTICE),
                 kind: None,
                 halt: true,
             },
@@ -220,6 +319,12 @@ impl BrokerOutcome {
 }
 
 /// How a recorded call ended.
+///
+/// ```
+/// use harness::harness_adapter::{AuditOutcome, ToolErrorKind};
+///
+/// assert_ne!(AuditOutcome::Ok, AuditOutcome::Error(ToolErrorKind::NotGranted));
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuditOutcome {
     /// The tool ran successfully.
@@ -230,50 +335,200 @@ pub enum AuditOutcome {
     Halt,
 }
 
-/// One broker decision, in call order. This log is the authoritative source
-/// for the task result's tool calls and denials.
+/// One broker decision. It holds no argument content: only the size and a
+/// non-cryptographic fingerprint, so the log cannot leak secrets or file
+/// contents and cannot grow with argument size.
+///
+/// ```
+/// use harness::harness_adapter::{AuditOutcome, CallRecord};
+///
+/// let record = CallRecord {
+///     started: 0,
+///     completed: 0,
+///     tool: "read_file".into(),
+///     args_bytes: 2,
+///     args_fingerprint: "00".into(),
+///     effect: None,
+///     outcome: AuditOutcome::Ok,
+/// };
+/// assert_eq!(record.tool, "read_file");
+/// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct AuditEntry {
-    /// Capability name as requested.
+pub struct CallRecord {
+    /// Sequence number assigned when the call started: this is call order.
+    pub started: u64,
+    /// Sequence number assigned when the call finished: this is completion order.
+    pub completed: u64,
+    /// The requested name, escaped and truncated.
     pub tool: String,
-    /// Call arguments as requested.
-    pub args: Value,
+    /// Size in bytes of the compact JSON of the arguments.
+    pub args_bytes: usize,
+    /// FNV-1a fingerprint of that JSON, for correlation only. It is not a
+    /// cryptographic digest and must not be relied on to hide low-entropy secrets.
+    pub args_fingerprint: String,
     /// Effect class when the capability is one the agent was granted.
     pub effect: Option<EffectClass>,
     /// How the call ended.
     pub outcome: AuditOutcome,
 }
 
-/// The broker for one task.
-pub struct Broker {
+/// Where the broker records each call. The executor injects the sink; a
+/// durable one is the executor slice's job. The existing `auditor::AuditLog`
+/// records spawn reviews (a `SpawnRequest` and verdict), not tool calls, so it
+/// does not fit and no bridge is attempted here.
+///
+/// ```
+/// use harness::harness_adapter::{AuditSink, RingAuditSink};
+///
+/// let sink = RingAuditSink::new(1);
+/// assert!(sink.entries().is_empty());
+/// ```
+pub trait AuditSink: Send + Sync {
+    /// Record one finished call.
+    fn record(&self, record: CallRecord);
+}
+
+/// A bounded in-memory [`AuditSink`]: when full it drops the oldest record and
+/// counts the drop.
+///
+/// ```
+/// use harness::harness_adapter::RingAuditSink;
+///
+/// let sink = RingAuditSink::default();
+/// assert_eq!(sink.dropped(), 0);
+/// ```
+#[derive(Debug)]
+pub struct RingAuditSink {
+    capacity: usize,
+    state: Mutex<(VecDeque<CallRecord>, u64)>,
+}
+
+impl RingAuditSink {
+    /// A sink keeping the most recent `capacity` records (at least one).
+    /// ```
+    /// use harness::harness_adapter::RingAuditSink;
+    ///
+    /// let sink = RingAuditSink::new(0);
+    /// assert!(sink.entries().is_empty());
+    /// ```
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new((VecDeque::new(), 0)),
+        }
+    }
+
+    /// The retained records, oldest first.
+    /// ```
+    /// use harness::harness_adapter::RingAuditSink;
+    ///
+    /// assert!(RingAuditSink::default().entries().is_empty());
+    /// ```
+    pub fn entries(&self) -> Vec<CallRecord> {
+        let state = self.state.lock().expect("audit sink poisoned");
+        state.0.iter().cloned().collect()
+    }
+
+    /// How many records were dropped because the sink was full.
+    /// ```
+    /// use harness::harness_adapter::RingAuditSink;
+    ///
+    /// assert_eq!(RingAuditSink::new(2).dropped(), 0);
+    /// ```
+    pub fn dropped(&self) -> u64 {
+        self.state.lock().expect("audit sink poisoned").1
+    }
+}
+
+impl Default for RingAuditSink {
+    fn default() -> Self {
+        Self::new(10_000)
+    }
+}
+
+impl AuditSink for RingAuditSink {
+    fn record(&self, record: CallRecord) {
+        let mut state = self.state.lock().expect("audit sink poisoned");
+        if state.0.len() >= self.capacity {
+            state.0.pop_front();
+            state.1 += 1;
+        }
+        state.0.push_back(record);
+    }
+}
+
+struct Core {
     agent: String,
     audited_repo: String,
+    model: String,
+    image: String,
     limits: LimitsSection,
+    scope: ScopeGrant,
     broker_socket: std::path::PathBuf,
+    capabilities: Vec<String>,
     registry: ToolRegistry,
     served: BTreeSet<String>,
     effects: Vec<(String, EffectClass)>,
-    audit: Mutex<Vec<AuditEntry>>,
-    armed: AtomicBool,
+    sink: Arc<dyn AuditSink>,
+    started: AtomicU64,
+    completed: AtomicU64,
     halted: AtomicBool,
+}
+
+/// A broker that has not been armed. It cannot serve; see [`Broker::arm`].
+/// ```
+/// use harness::harness_adapter::{ArmedBroker, ArmError, Broker, CheckedPlan};
+///
+/// fn arm(broker: Broker, plan: &CheckedPlan, reported: &[String]) -> Result<ArmedBroker, ArmError> {
+///     broker.arm(plan, reported)
+/// }
+/// ```
+pub struct Broker {
+    core: Core,
+}
+
+/// An armed broker: the only type that serves capability calls.
+/// ```compile_fail
+/// use harness::harness_adapter::ArmedBroker;
+///
+/// fn forge() -> ArmedBroker {
+///     ArmedBroker { core: todo!() }
+/// }
+/// ```
+pub struct ArmedBroker {
+    core: Core,
 }
 
 impl Broker {
     /// Build the broker for `agent`. The identity comes from the audit proof
-    /// `allowed`, never from the caller. `build` receives that identity and must
-    /// return the registry scoped to it with path restrictions attached (for
-    /// example `create_container_tool_registry_for`); no externally built
-    /// registry is accepted.
+    /// `allowed`, never from the caller, and `bound` is the registry built for
+    /// that audited spawn by [`ResolvedAgent::bind_workspace`]; there is no way
+    /// to supply a registry built elsewhere. `agent` must be the one resolved
+    /// from `allowed`. Capabilities above `policy` are not served, and a plan
+    /// that exposes one cannot arm. Every call is recorded in `sink`.
+    /// ```
+    /// use std::sync::Arc;
     ///
-    /// `agent` must have been resolved from the same audited spawn: same
-    /// identity name, scope and ceiling, and the same audited repository.
-    /// Capabilities above `policy` are not served; a plan that exposes one cannot
-    /// arm the broker.
+    /// use harness::auditor::Allowed;
+    /// use harness::harness_adapter::{
+    ///     BoundWorkspace, Broker, BrokerError, BrokerPolicy, ResolvedAgent, RingAuditSink,
+    /// };
+    ///
+    /// fn build(
+    ///     allowed: &Allowed,
+    ///     agent: &ResolvedAgent,
+    ///     bound: BoundWorkspace,
+    /// ) -> Result<Broker, BrokerError> {
+    ///     let sink = Arc::new(RingAuditSink::default());
+    ///     Broker::for_agent(allowed, agent, bound, BrokerPolicy::default(), sink)
+    /// }
+    /// ```
     pub fn for_agent(
         allowed: &Allowed,
         agent: &ResolvedAgent,
+        bound: BoundWorkspace,
         policy: BrokerPolicy,
-        build: impl FnOnce(&AgentIdentity) -> Result<ToolRegistry, ScopeError>,
+        sink: Arc<dyn AuditSink>,
     ) -> Result<Self, BrokerError> {
         let identity = allowed.identity();
         let scope = agent.scope();
@@ -289,12 +544,6 @@ impl Broker {
                 agent: agent.name().to_string(),
             });
         }
-        let registry = build(identity)?;
-        if registry.identity() != Some(identity.name()) {
-            return Err(BrokerError::RegistryNotScoped {
-                identity: identity.name().to_string(),
-            });
-        }
         let mut served = BTreeSet::new();
         let mut effects = Vec::new();
         for capability in agent.capabilities() {
@@ -304,46 +553,72 @@ impl Broker {
             }
         }
         Ok(Self {
-            agent: agent.name().to_string(),
-            audited_repo: agent.audited_repo().to_string(),
-            limits: agent.limits(),
-            broker_socket: agent.broker_socket().to_path_buf(),
-            registry,
-            served,
-            effects,
-            audit: Mutex::new(Vec::new()),
-            armed: AtomicBool::new(false),
-            halted: AtomicBool::new(false),
+            core: Core {
+                agent: agent.name().to_string(),
+                audited_repo: agent.audited_repo().to_string(),
+                model: agent.model().to_string(),
+                image: agent.image().to_string(),
+                limits: agent.limits(),
+                scope: agent.scope().clone(),
+                broker_socket: agent.broker_socket().to_path_buf(),
+                capabilities: agent
+                    .capability_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                registry: bound.into_registry(),
+                served,
+                effects,
+                sink,
+                started: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+                halted: AtomicBool::new(false),
+            },
         })
     }
 
     /// Names the broker will run, sorted.
+    /// ```
+    /// use harness::harness_adapter::Broker;
+    ///
+    /// fn served(broker: &Broker) -> Vec<&str> {
+    ///     broker.served()
+    /// }
+    /// ```
     pub fn served(&self) -> Vec<&str> {
-        self.served.iter().map(String::as_str).collect()
-    }
-
-    /// Whether the broker has been armed.
-    pub fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::SeqCst)
-    }
-
-    /// Whether the task has halted.
-    pub fn is_halted(&self) -> bool {
-        self.halted.load(Ordering::SeqCst)
+        self.core.served.iter().map(String::as_str).collect()
     }
 
     /// Arm the broker. The executor calls this once the runtime has started and
     /// reported its tools (for pi, the `toolsAdded` list in the first system
-    /// `message_start`). It checks that `plan` was built for this broker, that
-    /// every exposed capability is one the broker serves, and that the runtime's
-    /// reported tools equal the plan's. Until it succeeds, every call is
-    /// refused, because the model already holds its tools before the check.
-    pub fn arm(&self, plan: &CheckedPlan, reported: &[String]) -> Result<(), ArmError> {
-        let checks: [(&'static str, bool); 4] = [
-            ("agent", plan.agent == self.agent),
-            ("audited repository", plan.audited_repo == self.audited_repo),
-            ("limits", plan.limits == self.limits),
-            ("broker socket", plan.broker_socket == self.broker_socket),
+    /// `message_start`). It consumes the broker: on success it returns the
+    /// [`ArmedBroker`], on failure nothing, so no state survives a rejected
+    /// arm. It checks that `plan` names this agent, audited repository, model,
+    /// image, limits, scope, capability set and broker socket, that every
+    /// exposed capability is one the broker serves, and that the runtime's
+    /// reported tools equal the plan's. The model already holds its tools before
+    /// the check, so nothing is served until it passes.
+    /// ```
+    /// use harness::harness_adapter::{ArmedBroker, ArmError, Broker, CheckedPlan};
+    ///
+    /// fn arm(broker: Broker, plan: &CheckedPlan, reported: &[String]) -> Result<ArmedBroker, ArmError> {
+    ///     broker.arm(plan, reported)
+    /// }
+    /// ```
+    pub fn arm(self, plan: &CheckedPlan, reported: &[String]) -> Result<ArmedBroker, ArmError> {
+        let core = &self.core;
+        let checks: [(&'static str, bool); 8] = [
+            ("agent", plan.agent == core.agent),
+            ("audited repository", plan.audited_repo == core.audited_repo),
+            ("model", plan.model == core.model),
+            ("image", plan.image == core.image),
+            ("limits", plan.limits == core.limits),
+            ("scope", plan.scope == core.scope),
+            ("broker socket", plan.broker_socket == core.broker_socket),
+            (
+                "capabilities",
+                plan.exposed_capabilities == core.capabilities,
+            ),
         ];
         if let Some((field, _)) = checks.iter().find(|(_, same)| !same) {
             return Err(ArmError::PlanMismatch { field });
@@ -351,69 +626,90 @@ impl Broker {
         let unserved: Vec<String> = plan
             .exposed_capabilities
             .iter()
-            .filter(|name| !self.served.contains(name.as_str()))
+            .filter(|name| !core.served.contains(name.as_str()))
             .cloned()
             .collect();
         if !unserved.is_empty() {
             return Err(ArmError::ExposedNotServed { names: unserved });
         }
         verify_runtime_tools(plan, reported)?;
-        self.armed.store(true, Ordering::SeqCst);
-        Ok(())
+        Ok(ArmedBroker { core: self.core })
+    }
+}
+
+impl ArmedBroker {
+    /// Whether the task has halted.
+    /// ```
+    /// use harness::harness_adapter::ArmedBroker;
+    ///
+    /// fn stopped(broker: &ArmedBroker) -> bool {
+    ///     broker.is_halted()
+    /// }
+    /// ```
+    pub fn is_halted(&self) -> bool {
+        self.core.halted.load(Ordering::SeqCst)
     }
 
-    /// Every decision so far, in order.
-    pub fn audit(&self) -> Vec<AuditEntry> {
-        self.audit.lock().expect("audit log poisoned").clone()
-    }
-
-    /// Handle one request.
+    /// Handle one request. The halt flag is set inside the decision, the moment
+    /// the registry returns the hold; calls already running when it is set
+    /// complete.
+    /// ```
+    /// use harness::harness_adapter::{ArmedBroker, BrokerOutcome, BrokerRequest};
+    ///
+    /// async fn call(broker: &ArmedBroker, request: BrokerRequest) -> BrokerOutcome {
+    ///     broker.handle(request).await
+    /// }
+    /// ```
     pub async fn handle(&self, request: BrokerRequest) -> BrokerOutcome {
-        let effect = self
+        let core = &self.core;
+        let started = core.started.fetch_add(1, Ordering::SeqCst);
+        let effect = core
             .effects
             .iter()
             .find(|(name, _)| *name == request.tool)
             .map(|(_, effect)| *effect);
+        let args_text = request.args.to_string();
         let outcome = self.decide(&request).await;
-        if matches!(outcome, BrokerOutcome::Halt(_)) {
-            self.halted.store(true, Ordering::SeqCst);
-        }
-        let audited = match &outcome {
+        let outcome_kind = match &outcome {
             BrokerOutcome::Output(_) => AuditOutcome::Ok,
             BrokerOutcome::ToolError { kind, .. } => AuditOutcome::Error(*kind),
             BrokerOutcome::Halt(_) => AuditOutcome::Halt,
         };
-        self.audit
-            .lock()
-            .expect("audit log poisoned")
-            .push(AuditEntry {
-                tool: request.tool,
-                args: request.args,
-                effect,
-                outcome: audited,
-            });
+        let mut tool: String = request.tool.escape_debug().collect();
+        tool.truncate(MAX_LOGGED_NAME);
+        core.sink.record(CallRecord {
+            started,
+            completed: core.completed.fetch_add(1, Ordering::SeqCst),
+            tool,
+            args_bytes: args_text.len(),
+            args_fingerprint: content_hash(&args_text),
+            effect,
+            outcome: outcome_kind,
+        });
         outcome
     }
 
     async fn decide(&self, request: &BrokerRequest) -> BrokerOutcome {
+        let core = &self.core;
         let refuse = |kind, message: String| BrokerOutcome::ToolError { kind, message };
         if self.is_halted() {
             return refuse(ToolErrorKind::TaskHalted, "the task has halted".into());
         }
-        if !self.is_armed() {
-            return refuse(ToolErrorKind::NotReady, "the broker is not armed".into());
-        }
-        if !self.served.contains(&request.tool) {
+        if !core.served.contains(&request.tool) {
             return refuse(
                 ToolErrorKind::NotGranted,
                 format!("capability `{}` is not granted", request.tool),
             );
         }
-        let result = self
+        let result = core
             .registry
             .execute(&request.tool, request.args.clone())
             .await;
-        match map_result(result) {
+        let outcome = map_result(result);
+        if matches!(outcome, BrokerOutcome::Halt(_)) {
+            core.halted.store(true, Ordering::SeqCst);
+        }
+        match outcome {
             BrokerOutcome::Output(value) if value.to_string().len() > MAX_OUTPUT_BYTES => refuse(
                 ToolErrorKind::ReplyTooLarge,
                 format!(
@@ -425,18 +721,31 @@ impl Broker {
         }
     }
 
-    /// Handle one wire line and return the reply line. A line that is not a
-    /// valid request is answered with a `bad_request` error and is not logged
+    /// Handle one wire line and return the reply line. A line over
+    /// [`MAX_REQUEST_BYTES`] is rejected before it is parsed, and a line that is
+    /// not a valid request is answered with `bad_request`; neither is recorded
     /// as a call.
+    /// ```
+    /// use harness::harness_adapter::ArmedBroker;
+    ///
+    /// async fn line(broker: &ArmedBroker, text: &str) -> String {
+    ///     broker.handle_line(text).await
+    /// }
+    /// ```
     pub async fn handle_line(&self, line: &str) -> String {
-        let response = match serde_json::from_str::<BrokerRequest>(line) {
-            Ok(request) => self.handle(request).await.to_response(),
-            Err(error) => BrokerResponse {
-                ok: false,
-                output: json!(format!("bad request: {error}")),
-                kind: Some(ToolErrorKind::BadRequest),
-                halt: false,
-            },
+        let bad = |message: String| BrokerResponse {
+            ok: false,
+            output: json!(message),
+            kind: Some(ToolErrorKind::BadRequest),
+            halt: false,
+        };
+        let response = if line.len() > MAX_REQUEST_BYTES {
+            bad("request too large".to_string())
+        } else {
+            match serde_json::from_str::<BrokerRequest>(line) {
+                Ok(request) => self.handle(request).await.to_response(),
+                Err(error) => bad(format!("bad request: {error}")),
+            }
         };
         serde_json::to_string(&response).expect("broker responses are plain JSON")
     }
