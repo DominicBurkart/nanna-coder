@@ -1448,15 +1448,55 @@ fn build_spawn_gate(
     Ok(SpawnGate::new(Box::new(RuleAuditor::new()), log, context))
 }
 
+async fn build_mcp_task_manager(
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+    lease_path: &std::path::Path,
+    escalation_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+    use harness::leases::JsonlLeaseStore;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
+    use std::sync::Arc;
+
+    Ok(TaskManager::restore_with_identities(
+        DEFAULT_MAX_CONCURRENT_TASKS,
+        Box::new(HybridPolicy::default()),
+        Box::new(JsonlQueueStore::open(queue_path)?),
+        Arc::new(JsonlLeaseStore::open(lease_path)?),
+        provider.clone(),
+        catalog,
+    )
+    .await?
+    .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
+    .with_action_policy(
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        Some((provider, model.to_string())),
+        harness::action_auditor::ActionAuditLog::file(
+            queue_path.with_file_name("action_audit.jsonl"),
+        ),
+    ))
+}
+
+fn build_delegate_task_manager(
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    model: Option<&str>,
+) -> harness::task::TaskManager {
+    harness::task::TaskManager::default().with_action_policy(
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        model.map(|name| (provider, name.to_string())),
+        harness::action_auditor::ActionAuditLog::in_memory(),
+    )
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::escalation::EscalationLog;
-    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
-    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
-    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
@@ -1466,16 +1506,15 @@ async fn run_mcp_server(
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
     let task_manager = Arc::new(
-        TaskManager::restore_with_identities(
-            DEFAULT_MAX_CONCURRENT_TASKS,
-            Box::new(HybridPolicy::default()),
-            Box::new(JsonlQueueStore::open(&queue_path)?),
-            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+        build_mcp_task_manager(
             provider.clone(),
+            model,
+            &queue_path,
+            &lease_path,
+            &escalation_path,
             &catalog,
         )
-        .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+        .await?,
     );
 
     info!(
@@ -1517,12 +1556,11 @@ async fn run_delegate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let task_manager = Arc::new(build_delegate_task_manager(provider.clone(), model));
     let gate = build_spawn_gate(&load_identities(), harness::auditor::AuditLog::in_memory())?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1567,6 +1605,44 @@ async fn run_delegate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness::action_auditor::RULE_ACTION_AUDITOR_NAME;
+
+    fn offline_provider() -> std::sync::Arc<dyn model::ModelProvider> {
+        std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_reviews_actions_with_the_model_and_a_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let manager = build_mcp_task_manager(
+            offline_provider(),
+            "reviewer-model",
+            &queue,
+            &dir.path().join("leases.jsonl"),
+            &dir.path().join("escalations.jsonl"),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        let gate = manager.action_gate();
+        assert_eq!(gate.auditor_name(), "reviewer-model");
+        assert_eq!(
+            gate.log().path(),
+            Some(dir.path().join("action_audit.jsonl").as_path())
+        );
+    }
+
+    #[test]
+    fn the_delegate_task_manager_attaches_the_model_only_when_one_is_given() {
+        let with_model = build_delegate_task_manager(offline_provider(), Some("delegate-model"));
+        assert_eq!(with_model.action_gate().auditor_name(), "delegate-model");
+        let without = build_delegate_task_manager(offline_provider(), None);
+        assert_eq!(
+            without.action_gate().auditor_name(),
+            RULE_ACTION_AUDITOR_NAME
+        );
+    }
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
     };
