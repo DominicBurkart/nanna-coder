@@ -1,51 +1,3 @@
-//! PR lifecycle tools for the middle loop: draft, comments, promote, close,
-//! plus the issue read/comment tools that close out #187 for this branch.
-//!
-//! Every tool here is [`EffectClass::Repository`], so each call is reviewed
-//! by the action auditor before it runs (see
-//! [`crate::tools::ToolRegistry::execute`]); classifying a tool correctly is
-//! the whole of its gating story.
-//!
-//! `git_push_branch` never calls GitHub: it shells out to the host `git`
-//! binary against the task's worktree, matching
-//! [`crate::tools::GitStatusTool`]/[`crate::tools::GitDiffTool`]'s existing
-//! harness-side pattern rather than running inside the dev container. It
-//! refuses to push the repository's default branch, a detached `HEAD`, or
-//! any unpushed commit whose message is missing this identity's trailer --
-//! the commit-side half of the identity marker the epic requires.
-//!
-//! `github_pr_open` is the first tool that calls GitHub. GitHub access goes
-//! through the [`GithubClient`] trait ([`crate::backlog`]) so it can be
-//! tested against a mock rather than a real HTTP server. Credentials follow
-//! [`crate::tools::GitHubPrStatusTool`]'s existing pattern: a `GITHUB_TOKEN`
-//! read from the harness process's environment, never passed into the dev
-//! container. No tool here accepts a `repo` argument: the repository is
-//! always resolved from the worktree's own `origin` remote, so a
-//! compromised or careless model cannot aim the harness's token at an
-//! arbitrary repository. The pull request it opens is always a draft: the
-//! body carries this identity's marker (a trailer-style line and a hidden
-//! HTML comment, via [`crate::marker`]); a caller-supplied body that already
-//! carries a `Nanna-Identity` marker is rejected rather than silently
-//! overridden, so a model cannot forge or displace it.
-//!
-//! ## Author allow-list for [`GithubPrCommentsTool`] and [`GithubIssueReadTool`]
-//!
-//! The allow-list is a plain constructor parameter (`Vec<String>`), sourced
-//! by [`register`] from the `NANNA_TRUSTED_PR_COMMENTERS` environment
-//! variable (a comma-separated list of GitHub logins, matched
-//! case-insensitively), mirroring how [`crate::tools::GitHubPrStatusTool`]
-//! sources its token from `GITHUB_TOKEN`. An identity-scoped TOML field would
-//! also fit; a constructor parameter was simpler and needed no schema
-//! change, and it keeps the allow-list out of the model's own tool-call
-//! arguments so an adversarial commenter cannot add themselves to it.
-//!
-//! [`GithubIssueReadTool`] applies the same filter, not a separate one:
-//! GitHub's issue-comments endpoint answers identically whether the number
-//! given names an issue or a pull request, so an allow-list enforced only
-//! on [`GithubPrCommentsTool`] is not enforced at all -- calling
-//! `github_issue_read` with a PR's number would return every comment
-//! [`GithubPrCommentsTool`] would have filtered out.
-
 use crate::backlog::{BacklogError, GithubClient, GithubComment};
 use crate::effects::EffectClass;
 use crate::marker::{parse_identity_from_text, render_html_marker, render_trailer};
@@ -59,9 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-/// Environment variable naming the comma-separated GitHub logins
-/// [`GithubPrCommentsTool`] keeps comments from; unset means the allow-list
-/// is empty and every comment is filtered out.
 pub const TRUSTED_PR_COMMENTERS_ENV: &str = "NANNA_TRUSTED_PR_COMMENTERS";
 
 fn map_backlog_error(err: BacklogError) -> ToolError {
@@ -95,9 +44,6 @@ fn comment_json(comment: &GithubComment) -> Value {
     })
 }
 
-/// Confirm `body` carries this identity's marker before a tool acts on the
-/// pull request it belongs to, so one identity cannot close or promote
-/// another identity's (or a human's) pull request.
 fn ensure_owned_by_identity(
     body: Option<&str>,
     identity_name: &str,
@@ -123,17 +69,12 @@ fn issue_url_regex() -> &'static Regex {
     })
 }
 
-/// Whether `text` references an issue as `#123` or as a full GitHub issue
-/// URL, the two forms [`GithubPrCloseTool`] accepts as a valid close reason.
 fn contains_issue_reference(text: &str) -> bool {
     !crate::backlog::referenced_issues(text).is_empty() || issue_url_regex().is_match(text)
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Per-thread override for the `git` binary [`git_cmd`] invokes, so a
-    /// test can force a process-spawn failure deterministically without
-    /// mutating process-global state (`std::env`) that parallel tests share.
     static TEST_GIT_BIN_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -148,8 +89,6 @@ fn git_binary() -> String {
     "git".to_string()
 }
 
-/// A `git` invocation against `workspace_root` with no terminal prompt, so a
-/// missing credential fails fast instead of hanging the task.
 fn git_cmd(workspace_root: &Path) -> Command {
     let mut cmd = Command::new(git_binary());
     cmd.current_dir(workspace_root);
@@ -173,10 +112,6 @@ fn run_git(workspace_root: &Path, args: &[&str]) -> ToolResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// The `owner/name` GitHub repository the worktree's `origin` remote points
-/// at. Never accepted as a tool argument: always read from the worktree
-/// itself, so a tool call cannot aim the harness's token at another
-/// repository.
 fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
     let remote_url = run_git(workspace_root, &["remote", "get-url", "origin"])?;
     parse_github_remote(&remote_url)
@@ -186,9 +121,6 @@ fn resolve_repo(workspace_root: &Path) -> ToolResult<String> {
         })
 }
 
-/// The worktree's current branch. Refuses a detached `HEAD`, since pushing
-/// one would push whatever commit `HEAD` happens to point at under no
-/// branch name at all.
 fn current_branch(workspace_root: &Path) -> ToolResult<String> {
     let branch = run_git(workspace_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch.is_empty() || branch == "HEAD" {
@@ -199,9 +131,6 @@ fn current_branch(workspace_root: &Path) -> ToolResult<String> {
     Ok(branch)
 }
 
-/// The repository's default branch, resolved from `origin/HEAD` and, when
-/// that symbolic ref is absent, from a `main`/`master` fallback. `None` when
-/// neither could be determined.
 fn default_branch(workspace_root: &Path) -> Option<String> {
     if let Ok(target) = run_git(
         workspace_root,
@@ -235,14 +164,6 @@ fn empty_object_schema() -> JsonSchema {
     }
 }
 
-/// Pushes the task's current branch to its configured `origin` remote. Runs
-/// on the harness side, against the worktree's own git configuration and
-/// credential helpers, never inside the dev container.
-///
-/// Refuses to push the repository's default branch (that would be pushing
-/// straight to the branch other work merges into) and refuses a detached
-/// `HEAD`. Always pushes `HEAD:refs/heads/<branch>` explicitly, never a bare
-/// branch name or a force/`+` refspec.
 pub struct GitPushBranchTool {
     workspace_root: PathBuf,
     identity_name: String,
@@ -257,11 +178,6 @@ impl GitPushBranchTool {
     }
 }
 
-/// Refuse to push if any commit reachable from `HEAD` but not yet on any
-/// `origin` remote-tracking ref is missing this identity's trailer. This is
-/// how the identity marker required "on commits" (as well as on PR bodies)
-/// is enforced: nothing on this branch authors commits yet, so this check
-/// fails closed until whatever does include the trailer itself.
 fn ensure_unpushed_commits_carry_the_identity_trailer(
     workspace_root: &Path,
     identity_name: &str,
@@ -327,11 +243,6 @@ impl Tool for GitPushBranchTool {
     }
 }
 
-/// Opens a pull request. Always a draft: there is no argument that can
-/// change this. The body carries this identity's marker (a trailer-style
-/// line and a hidden HTML comment, via [`crate::marker`]); a caller-supplied
-/// body that already carries a `Nanna-Identity` marker is rejected rather
-/// than silently overridden, so a model cannot forge or displace it.
 pub struct GithubPrOpenTool {
     workspace_root: PathBuf,
     identity_name: String,
@@ -465,7 +376,6 @@ impl Tool for GithubPrOpenTool {
     }
 }
 
-/// Normalizes `allowed_authors` for [`comment_is_allowed`] comparisons.
 fn normalize_allowed_authors(allowed_authors: Vec<String>) -> Vec<String> {
     allowed_authors
         .into_iter()
@@ -473,19 +383,10 @@ fn normalize_allowed_authors(allowed_authors: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Whether `comment`'s author (case-insensitive) appears in
-/// `allowed_authors`. Shared by every tool that surfaces GitHub comment
-/// text to an agent, since `list_issue_comments` answers for a PR number
-/// exactly as it does for an issue number and a filter applied to only one
-/// caller is not a filter at all.
 fn comment_is_allowed(comment: &GithubComment, allowed_authors: &[String]) -> bool {
     allowed_authors.contains(&comment.author.to_lowercase())
 }
 
-/// Fetches a pull request's review comments and issue (conversation)
-/// comments, filtered to a configured allow-list of authors so an arbitrary
-/// commenter cannot inject instructions into an agent's context. See the
-/// module docs for where the allow-list comes from.
 pub struct GithubPrCommentsTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubClient>,
@@ -571,10 +472,6 @@ impl Tool for GithubPrCommentsTool {
     }
 }
 
-/// The allow-list [`GithubPrCommentsTool`] is constructed with by
-/// [`register`]: [`TRUSTED_PR_COMMENTERS_ENV`] split on commas, trimmed,
-/// lowercased, and emptied of blanks. `None` (the variable unset) yields an
-/// empty allow-list, so every comment is filtered out until it is set.
 pub(crate) fn parse_allowed_authors(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(',')
@@ -583,8 +480,6 @@ pub(crate) fn parse_allowed_authors(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Converts a draft pull request to ready for review. Refuses a pull
-/// request whose body marker does not name this identity.
 pub struct GithubPrPromoteTool {
     workspace_root: PathBuf,
     identity_name: String,
@@ -661,9 +556,6 @@ impl Tool for GithubPrPromoteTool {
     }
 }
 
-/// Closes a pull request this identity owns. Requires a `reason` that
-/// references the originating issue (`#123` or a full GitHub issue URL) and
-/// posts it as a comment before closing.
 pub struct GithubPrCloseTool {
     workspace_root: PathBuf,
     identity_name: String,
@@ -756,13 +648,6 @@ impl Tool for GithubPrCloseTool {
     }
 }
 
-/// Reads a GitHub issue's title, body, labels and comments. Closes the #187
-/// ask on this branch.
-///
-/// `list_issue_comments` answers identically for a PR number as for an
-/// issue number, so this tool honors the same author allow-list as
-/// [`GithubPrCommentsTool`] — otherwise calling it with a PR's number would
-/// bypass that filter entirely.
 pub struct GithubIssueReadTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubClient>,
@@ -848,8 +733,6 @@ impl Tool for GithubIssueReadTool {
     }
 }
 
-/// Posts a comment on a GitHub issue. Deliberately has no way to close an
-/// issue: agents close pull requests, never issues.
 pub struct GithubIssueCommentTool {
     workspace_root: PathBuf,
     client: Arc<dyn GithubClient>,
@@ -919,8 +802,6 @@ impl Tool for GithubIssueCommentTool {
     }
 }
 
-/// Register every PR lifecycle tool against `registry`, scoped to
-/// `workspace_root` and `identity_name`.
 pub fn register(registry: &mut ToolRegistry, workspace_root: &Path, identity_name: &str) {
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client: Arc<dyn GithubClient> =
@@ -983,8 +864,6 @@ mod tests {
         );
     }
 
-    /// A bare `origin` plus a working checkout on `main` with one commit,
-    /// for `git_push_branch` tests.
     struct PushFixture {
         _bare: TempDir,
         work: TempDir,
@@ -1147,9 +1026,6 @@ mod tests {
         git(work.path(), &["remote", "add", "origin", &bare_path]);
         git(work.path(), &["push", "-q", "origin", "main"]);
         git(work.path(), &["fetch", "-q", "origin"]);
-        // `git fetch` auto-populates `refs/remotes/origin/HEAD` on some git
-        // versions; delete it so this test actually exercises the
-        // `main`/`master` rev-parse fallback rather than the symref path.
         let _ = StdCommand::new("git")
             .args(["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"])
             .current_dir(work.path())
@@ -1227,8 +1103,6 @@ mod tests {
         dir
     }
 
-    // ---- github_pr_open ----
-
     #[tokio::test]
     async fn github_pr_open_definition_and_effect_class() {
         let dir = github_repo_fixture();
@@ -1268,9 +1142,6 @@ mod tests {
         assert!(calls[0].contains("example/repo"));
         assert!(calls[0].contains("->main"));
 
-        // Round-trip: the body the mock received carries both the trailer
-        // line and the hidden HTML comment, and marker.rs's own parser (not
-        // a bespoke one here) parses either back to the same identity.
         let sent_body = calls[0]
             .split("body=")
             .nth(1)
@@ -1449,8 +1320,6 @@ mod tests {
         assert!(err.to_string().contains("422"));
     }
 
-    // ---- github_pr_comments ----
-
     fn comment(id: u64, author: &str, body: &str) -> GithubComment {
         GithubComment {
             id,
@@ -1534,8 +1403,6 @@ mod tests {
         let err = tool.execute(json!({ "pr_number": 1 })).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
     }
-
-    // ---- github_pr_promote ----
 
     fn pr_detail(number: u64, draft: bool, owner: &str) -> GithubPullRequestDetail {
         GithubPullRequestDetail {
@@ -1626,8 +1493,6 @@ mod tests {
             ToolError::InvalidArguments { .. }
         ));
     }
-
-    // ---- github_pr_close ----
 
     #[tokio::test]
     async fn github_pr_close_definition_and_effect_class() {
@@ -1753,8 +1618,6 @@ mod tests {
         ));
     }
 
-    // ---- github_issue_read ----
-
     #[tokio::test]
     async fn github_issue_read_definition_and_effect_class() {
         let dir = github_repo_fixture();
@@ -1795,10 +1658,6 @@ mod tests {
 
     #[tokio::test]
     async fn github_issue_read_filters_comments_by_the_same_author_allow_list_as_pr_comments() {
-        // A PR's number is also a valid "issue number" on GitHub's
-        // list-comments endpoint (this is finding #2 from PR #708's
-        // review: github_issue_read was a complete bypass of the
-        // github_pr_comments allow-list for exactly this reason).
         let dir = github_repo_fixture();
         let mock = Arc::new(MockGithub {
             issue_details: HashMap::from([(
@@ -1874,8 +1733,6 @@ mod tests {
             ToolError::InvalidArguments { .. }
         ));
     }
-
-    // ---- github_issue_comment ----
 
     #[tokio::test]
     async fn github_issue_comment_definition_and_effect_class() {
