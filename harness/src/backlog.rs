@@ -111,6 +111,10 @@ pub enum BacklogError {
         attempts: u32,
         retry_after_secs: Option<u64>,
     },
+    #[error("invalid repository {repo:?}: expected owner/name")]
+    InvalidRepo { repo: String },
+    #[error("GitHub request to {url} timed out")]
+    Timeout { url: String },
     #[error("GitHub GraphQL error for {url}: {message}")]
     GraphQl { url: String, message: String },
 }
@@ -512,6 +516,62 @@ const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 const MAX_RETRY_ATTEMPTS: u32 = 32;
 
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn transport_error(error: reqwest::Error, url: &str) -> BacklogError {
+    if error.is_timeout() {
+        BacklogError::Timeout {
+            url: url.to_string(),
+        }
+    } else {
+        BacklogError::Http(error)
+    }
+}
+
+const MAX_REPO_OWNER_LEN: usize = 39;
+const MAX_REPO_NAME_LEN: usize = 100;
+const MAX_REPO_ECHO_CHARS: usize = 64;
+
+fn valid_repo_segment(segment: &str, max_len: usize) -> bool {
+    !segment.is_empty()
+        && segment.len() <= max_len
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn validate_repo(repo: &str) -> Result<(), BacklogError> {
+    let valid = match repo.split_once('/') {
+        Some((owner, name)) => {
+            valid_repo_segment(owner, MAX_REPO_OWNER_LEN)
+                && valid_repo_segment(name, MAX_REPO_NAME_LEN)
+        }
+        None => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BacklogError::InvalidRepo {
+            repo: repo.chars().take(MAX_REPO_ECHO_CHARS).collect(),
+        })
+    }
+}
+
+fn build_http(
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .expect("reqwest client configuration is valid")
+}
+
 fn retry_wait(
     base_backoff: std::time::Duration,
     attempt: u32,
@@ -663,6 +723,8 @@ pub struct ReqwestGithubClient {
     token: Option<String>,
     max_attempts: u32,
     base_backoff: std::time::Duration,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for ReqwestGithubClient {
@@ -680,12 +742,25 @@ impl ReqwestGithubClient {
     /// Client for the API rooted at `base_url` (no trailing slash).
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http(DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT),
             base_url: base_url.into(),
             token,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             base_backoff: DEFAULT_BASE_BACKOFF,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.request_timeout = request_timeout;
+        self.http = build_http(connect_timeout, request_timeout);
+        self
     }
 
     /// Client for the public GitHub API.
@@ -754,10 +829,14 @@ impl ReqwestGithubClient {
             if let Some(token) = &self.token {
                 request = request.bearer_auth(token);
             }
-            let response = request.send().await?;
+            let response = request.send().await.map_err(|e| transport_error(e, &url))?;
             let status = response.status();
             if status.is_success() {
-                return Ok(serde_json::from_str(&response.text().await?)?);
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|e| transport_error(e, &url))?;
+                return Ok(serde_json::from_str(&text)?);
             }
             let retry_after = retry_after_secs(response.headers());
             let rate_limited =
@@ -811,12 +890,14 @@ impl GithubClient for ReqwestGithubClient {
         repo: &str,
         query: &str,
     ) -> Result<Vec<GithubIssue>, BacklogError> {
+        validate_repo(repo)?;
         let q = format!("repo:{repo} is:issue is:open {query}");
         self.paginate("/search/issues", &[("q", q)], |v| v["items"].clone())
             .await
     }
 
     async fn open_pull_requests(&self, repo: &str) -> Result<Vec<GithubPullRequest>, BacklogError> {
+        validate_repo(repo)?;
         self.paginate(
             &format!("/repos/{repo}/pulls"),
             &[("state", "open".to_string())],
@@ -832,6 +913,7 @@ impl GithubClient for ReqwestGithubClient {
         body: &str,
         labels: &[String],
     ) -> Result<GithubIssue, BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({ "title": title, "body": body, "labels": labels });
         let value = self
             .post_json(&format!("/repos/{repo}/issues"), &payload)
@@ -845,6 +927,7 @@ impl GithubClient for ReqwestGithubClient {
         number: u64,
         body: &str,
     ) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({ "body": body });
         self.post_json(&format!("/repos/{repo}/issues/{number}/comments"), &payload)
             .await?;
@@ -859,6 +942,7 @@ impl GithubClient for ReqwestGithubClient {
         head: &str,
         base: &str,
     ) -> Result<GithubPullRequestCreated, BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({
             "title": title,
             "body": body,
@@ -878,6 +962,7 @@ impl GithubClient for ReqwestGithubClient {
         repo: &str,
         number: u64,
     ) -> Result<GithubPullRequestDetail, BacklogError> {
+        validate_repo(repo)?;
         let value = self
             .get_json(&format!("/repos/{repo}/pulls/{number}"), &[])
             .await?;
@@ -886,6 +971,7 @@ impl GithubClient for ReqwestGithubClient {
     }
 
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
         let detail = self.get_pull_request(repo, number).await?;
         let payload = serde_json::json!({
             "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
@@ -916,6 +1002,7 @@ impl GithubClient for ReqwestGithubClient {
     }
 
     async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
         let payload = serde_json::json!({ "state": "closed" });
         self.patch_json(&format!("/repos/{repo}/pulls/{number}"), &payload)
             .await?;
@@ -927,6 +1014,7 @@ impl GithubClient for ReqwestGithubClient {
         repo: &str,
         number: u64,
     ) -> Result<Vec<GithubComment>, BacklogError> {
+        validate_repo(repo)?;
         let raw: Vec<RawComment> = self
             .paginate(
                 &format!("/repos/{repo}/pulls/{number}/comments"),
@@ -942,6 +1030,7 @@ impl GithubClient for ReqwestGithubClient {
         repo: &str,
         number: u64,
     ) -> Result<Vec<GithubComment>, BacklogError> {
+        validate_repo(repo)?;
         let raw: Vec<RawComment> = self
             .paginate(
                 &format!("/repos/{repo}/issues/{number}/comments"),
@@ -953,6 +1042,7 @@ impl GithubClient for ReqwestGithubClient {
     }
 
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError> {
+        validate_repo(repo)?;
         let value = self
             .get_json(&format!("/repos/{repo}/issues/{number}"), &[])
             .await?;
@@ -2001,6 +2091,188 @@ mod tests {
             "must not sleep when Retry-After exceeds the cap"
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    async fn stalled_server(
+        partial_response: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = socket.read(&mut buf).await.unwrap();
+                if let Some(partial) = partial_response {
+                    socket.write_all(partial.as_bytes()).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+                held.push(socket);
+            }
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_yields_a_typed_timeout_within_the_bound() {
+        let (base, server) = stalled_server(None).await;
+        let client = ReqwestGithubClient::new(base, Some("ghp_SECRET".into()))
+            .with_timeouts(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(300),
+            )
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_issue("o/n", 1),
+        )
+        .await;
+        let err = outcome
+            .expect("client call must not outlive its request timeout")
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Timeout { .. }), "{err:?}");
+        assert!(err.to_string().contains("timed out"));
+        assert!(!err.to_string().contains("ghp_SECRET"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stalls_mid_body_yields_a_typed_timeout() {
+        let (base, server) = stalled_server(Some(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        ))
+        .await;
+        let client = ReqwestGithubClient::new(base, None)
+            .with_timeouts(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(300),
+            )
+            .with_retry_policy(1, std::time::Duration::from_millis(1));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_issue("o/n", 1),
+        )
+        .await;
+        let err = outcome
+            .expect("client call must not outlive its request timeout")
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Timeout { .. }), "{err:?}");
+        server.abort();
+    }
+
+    #[test]
+    fn production_timeouts_are_bounded() {
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, std::time::Duration::from_secs(60));
+        let client = ReqwestGithubClient::new("http://example.invalid", None);
+        assert_eq!(client.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(client.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn validate_repo_accepts_owner_slash_name() {
+        for ok in ["o/r", "Some-Org/my_repo.rs", "a/.github", "a-b/c.d_e-f"] {
+            assert!(validate_repo(ok).is_ok(), "{ok}");
+        }
+        let longest = format!("{}/{}", "a".repeat(39), "b".repeat(100));
+        assert!(validate_repo(&longest).is_ok());
+    }
+
+    #[test]
+    fn validate_repo_rejects_anything_that_could_alter_the_url() {
+        let bad_owner = format!("{}/r", "a".repeat(40));
+        let bad_name = format!("o/{}", "b".repeat(101));
+        let overlong = "a".repeat(5000);
+        for bad in [
+            "o/r/../../x",
+            "o/r?x",
+            "o/r#x",
+            "/r",
+            "o/",
+            "o//r",
+            "",
+            "o",
+            "o/r/s",
+            "./r",
+            "o/.",
+            "../r",
+            "o/..",
+            "o/r x",
+            "o/r%2e",
+            "o\\r",
+            "o/r\n",
+            "o:p/r",
+            "o@p/r",
+            "\u{e9}/r",
+            bad_owner.as_str(),
+            bad_name.as_str(),
+            overlong.as_str(),
+        ] {
+            let err = validate_repo(bad).unwrap_err();
+            assert!(
+                matches!(&err, BacklogError::InvalidRepo { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_repo_error_does_not_echo_an_overlong_value() {
+        let err = validate_repo(&"a".repeat(5000)).unwrap_err();
+        assert!(err.to_string().len() < 200, "{}", err.to_string().len());
+    }
+
+    #[tokio::test]
+    async fn every_client_method_refuses_an_invalid_repo_before_any_request() {
+        let (base, requests, server) = fake_github_ext(vec![]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        for bad in ["o/r/../../x", "o/r?x", "o/r#x", "/r", "o/", "o//r"] {
+            let results = vec![
+                client.search_open_issues(bad, "q").await.map(|_| ()),
+                client.open_pull_requests(bad).await.map(|_| ()),
+                client.create_issue(bad, "t", "b", &[]).await.map(|_| ()),
+                client.comment_on_issue(bad, 1, "b").await,
+                client
+                    .create_draft_pull_request(bad, "t", "b", "h", "m")
+                    .await
+                    .map(|_| ()),
+                client.get_pull_request(bad, 1).await.map(|_| ()),
+                client.mark_pull_request_ready(bad, 1).await,
+                client.close_pull_request(bad, 1).await,
+                client.list_review_comments(bad, 1).await.map(|_| ()),
+                client.list_issue_comments(bad, 1).await.map(|_| ()),
+                client.get_issue(bad, 1).await.map(|_| ()),
+            ];
+            for (i, result) in results.into_iter().enumerate() {
+                assert!(
+                    matches!(result, Err(BacklogError::InvalidRepo { .. })),
+                    "method {i} accepted {bad:?}"
+                );
+            }
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_valid_repo_is_still_sent_as_is() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/Some-Org/my_repo.rs/issues/1",
+            200,
+            r#"{"number": 1, "title": "t", "body": null, "state": "open", "html_url": "u", "user": {"login": "a"}}"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let _ = client.get_issue("Some-Org/my_repo.rs", 1).await;
+        assert_eq!(
+            requests.lock().unwrap()[0],
+            "GET /repos/Some-Org/my_repo.rs/issues/1 "
+        );
         server.abort();
     }
 
