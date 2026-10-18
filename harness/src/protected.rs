@@ -63,6 +63,17 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "harness/src/tools.rs",
     "harness/src/marker.rs",
     "harness/src/identity/**",
+    "harness/src/action_auditor/**",
+    "harness/src/windows.rs",
+    "harness/src/capabilities.rs",
+    "harness/src/container.rs",
+    "harness/src/harness_adapter/isolation.rs",
+    "harness/src/harness_adapter/checked.rs",
+    "scripts/**",
+    "tests/security/**",
+    "tests/lib/**",
+    "tests/run-all-tests.sh",
+    "harness/dev-container.toml",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -325,6 +336,27 @@ mod tests {
         ("harness/src/tools.rs", "harness/src/tools.rs"),
         ("harness/src/marker.rs", "harness/src/marker.rs"),
         ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
+        (
+            "harness/src/action_auditor/**",
+            "harness/src/action_auditor/gate.rs",
+        ),
+        ("harness/src/windows.rs", "harness/src/windows.rs"),
+        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
+        ("harness/src/container.rs", "harness/src/container.rs"),
+        (
+            "harness/src/harness_adapter/isolation.rs",
+            "harness/src/harness_adapter/isolation.rs",
+        ),
+        (
+            "harness/src/harness_adapter/checked.rs",
+            "harness/src/harness_adapter/checked.rs",
+        ),
+        ("scripts/**", "scripts/install.sh"),
+        ("scripts/**", "scripts/check-flake-source-filter.nix"),
+        ("tests/security/**", "tests/security/test-ai-security.sh"),
+        ("tests/lib/**", "tests/lib/test-helpers.sh"),
+        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
+        ("harness/dev-container.toml", "harness/dev-container.toml"),
     ];
 
     #[test]
@@ -395,6 +427,10 @@ mod tests {
             "harness/src/tools.rs",
             "harness/src/marker.rs",
             "harness/src/identity/schema.rs",
+            "harness/src/action_auditor/rules.rs",
+            "harness/src/action_auditor",
+            "scripts/install.ps1",
+            "tests/security/test-environment.sh",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -472,6 +508,17 @@ mod tests {
             "harness/src/identity.rs",
             "harness/src/workspace_extra.rs",
             "src/CLAUDE.md",
+            "harness/src/action_auditors/x.rs",
+            "harness/src/scheduler/policy.rs",
+            "harness/src/rollout/executor.rs",
+            "harness/src/deploy/validate.rs",
+            "harness/src/windows_extra.rs",
+            "script/install.sh",
+            "tests/integration/run.sh",
+            "tests/cachix_integration_test.sh",
+            "tests/security_notes.md",
+            "docs/scripts/x.md",
+            ".gitignore",
             "src/.envrc",
             ".configs/x.toml",
             "nix.md",
@@ -551,6 +598,16 @@ mod tests {
     }
 
     #[test]
+    fn a_descendant_listed_after_its_ancestor_adds_no_mount_root() {
+        let protected =
+            ProtectedPaths::with_config_dir(Path::new("/repo"), Some(Path::new("/repo/nix/inner")));
+        let roots = protected.mount_roots();
+        assert!(roots.contains(&PathBuf::from("nix")));
+        assert!(!roots.contains(&PathBuf::from("nix/inner")));
+        assert!(protected.is_protected(Path::new("nix/inner/x")));
+    }
+
+    #[test]
     fn a_later_ancestor_replaces_the_nested_roots_mounted_before_it() {
         let targets = protected().mount_targets();
         let paths: Vec<String> = targets
@@ -606,6 +663,17 @@ mod tests {
                 PathBuf::from("harness/src/tools.rs"),
                 PathBuf::from("harness/src/marker.rs"),
                 PathBuf::from("harness/src/identity"),
+                PathBuf::from("harness/src/action_auditor"),
+                PathBuf::from("harness/src/windows.rs"),
+                PathBuf::from("harness/src/capabilities.rs"),
+                PathBuf::from("harness/src/container.rs"),
+                PathBuf::from("harness/src/harness_adapter/isolation.rs"),
+                PathBuf::from("harness/src/harness_adapter/checked.rs"),
+                PathBuf::from("scripts"),
+                PathBuf::from("tests/security"),
+                PathBuf::from("tests/lib"),
+                PathBuf::from("tests/run-all-tests.sh"),
+                PathBuf::from("harness/dev-container.toml"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -653,6 +721,20 @@ mod tests {
                 ("harness/src/tools.rs".to_string(), false),
                 ("harness/src/marker.rs".to_string(), false),
                 ("harness/src/identity".to_string(), true),
+                ("harness/src/action_auditor".to_string(), true),
+                ("harness/src/windows.rs".to_string(), false),
+                ("harness/src/capabilities.rs".to_string(), false),
+                ("harness/src/container.rs".to_string(), false),
+                (
+                    "harness/src/harness_adapter/isolation.rs".to_string(),
+                    false
+                ),
+                ("harness/src/harness_adapter/checked.rs".to_string(), false),
+                ("scripts".to_string(), true),
+                ("tests/security".to_string(), true),
+                ("tests/lib".to_string(), true),
+                ("tests/run-all-tests.sh".to_string(), false),
+                ("harness/dev-container.toml".to_string(), false),
             ]
         );
     }

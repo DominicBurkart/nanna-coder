@@ -1898,7 +1898,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 19] = [
+    const PLACEHOLDER_FILES: [&str; 26] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1918,6 +1918,13 @@ mod tests {
         "harness/src/workspace.rs",
         "harness/src/tools.rs",
         "harness/src/marker.rs",
+        "harness/src/windows.rs",
+        "harness/src/capabilities.rs",
+        "harness/src/container.rs",
+        "harness/src/harness_adapter/isolation.rs",
+        "harness/src/harness_adapter/checked.rs",
+        "tests/run-all-tests.sh",
+        "harness/dev-container.toml",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1960,6 +1967,17 @@ mod tests {
             "harness/src/tools.rs",
             "harness/src/marker.rs",
             "harness/src/identity",
+            "harness/src/action_auditor",
+            "harness/src/windows.rs",
+            "harness/src/capabilities.rs",
+            "harness/src/container.rs",
+            "harness/src/harness_adapter/isolation.rs",
+            "harness/src/harness_adapter/checked.rs",
+            "scripts",
+            "tests/security",
+            "tests/lib",
+            "tests/run-all-tests.sh",
+            "harness/dev-container.toml",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -2015,6 +2033,10 @@ mod tests {
             ".claude",
             "nix",
             "harness/src/identity",
+            "harness/src/action_auditor",
+            "scripts",
+            "tests/security",
+            "tests/lib",
             ".githooks",
             ".cargo",
             ".devcontainer",

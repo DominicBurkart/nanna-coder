@@ -4714,7 +4714,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 39] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 50] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4757,6 +4757,26 @@ mod tests {
         ("harness/src/tools.rs", "harness/src/tools.rs"),
         ("harness/src/marker.rs", "harness/src/marker.rs"),
         ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
+        (
+            "harness/src/action_auditor/**",
+            "harness/src/action_auditor/gate.rs",
+        ),
+        ("harness/src/windows.rs", "harness/src/windows.rs"),
+        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
+        ("harness/src/container.rs", "harness/src/container.rs"),
+        (
+            "harness/src/harness_adapter/isolation.rs",
+            "harness/src/harness_adapter/isolation.rs",
+        ),
+        (
+            "harness/src/harness_adapter/checked.rs",
+            "harness/src/harness_adapter/checked.rs",
+        ),
+        ("scripts/**", "scripts/install.sh"),
+        ("tests/security/**", "tests/security/test-ai-security.sh"),
+        ("tests/lib/**", "tests/lib/test-helpers.sh"),
+        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
+        ("harness/dev-container.toml", "harness/dev-container.toml"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {

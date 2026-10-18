@@ -96,6 +96,17 @@ jobs:
             "harness/src/tools.rs"
             "harness/src/marker.rs"
             "harness/src/identity/**"
+            "harness/src/action_auditor/**"
+            "harness/src/windows.rs"
+            "harness/src/capabilities.rs"
+            "harness/src/container.rs"
+            "harness/src/harness_adapter/isolation.rs"
+            "harness/src/harness_adapter/checked.rs"
+            "scripts/**"
+            "tests/security/**"
+            "tests/lib/**"
+            "tests/run-all-tests.sh"
+            "harness/dev-container.toml"
           )
           shopt -s nocasematch
           VIOLATIONS=()

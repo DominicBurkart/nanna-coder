@@ -195,6 +195,14 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/CLAUDE.md").await;
     assert_refused(&registry, "mkdir -p /workspace/nix/sub").await;
     assert_refused(&registry, "echo x > /workspace/harness/src/tools.rs").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/container.rs").await;
+    assert_refused(&registry, "echo x > /workspace/scripts/install.sh").await;
+    assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/action_auditor/gate.rs",
+    )
+    .await;
     assert_refused(&registry, "echo x > /workspace/harness/src/identity/new.rs").await;
     assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
     assert_refused(&registry, "echo x > /workspace/windows.toml").await;
