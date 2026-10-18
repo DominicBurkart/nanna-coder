@@ -151,21 +151,19 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.owner.push(type_name(&node.self_ty));
+            syn::visit::visit_item_impl(self, node);
+            self.owner.pop();
         }
-        self.owner.push(type_name(&node.self_ty));
-        syn::visit::visit_item_impl(self, node);
-        self.owner.pop();
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.owner.push(node.ident.to_string());
+            syn::visit::visit_item_trait(self, node);
+            self.owner.pop();
         }
-        self.owner.push(node.ident.to_string());
-        syn::visit::visit_item_trait(self, node);
-        self.owner.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
