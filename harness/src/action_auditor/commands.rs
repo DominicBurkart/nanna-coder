@@ -441,6 +441,10 @@ impl Parser {
                     self.pos += if self.peek_at(1) == Some('&') { 2 } else { 1 };
                 }
                 '(' => {
+                    if (self.started || !self.words.is_empty()) && self.function_definition_ahead()
+                    {
+                        return Err("function definitions cannot be reviewed".to_string());
+                    }
                     self.end_command(Sep::Plain)?;
                     self.paren += 1;
                     self.cwd_stack.push(self.cwd.clone());
@@ -459,6 +463,14 @@ impl Parser {
             }
         }
         self.end_command(Sep::Plain)
+    }
+
+    fn function_definition_ahead(&self) -> bool {
+        let mut at = self.pos + 1;
+        while self.chars.get(at).is_some_and(|c| *c == ' ' || *c == '\t') {
+            at += 1;
+        }
+        self.chars.get(at) == Some(&')')
     }
 
     fn finish_word(&mut self) -> Result<(), String> {
@@ -1356,12 +1368,6 @@ fn glob_escape(word: &Word) -> Option<&'static str> {
     }
     let lowered = lower(&word.text);
     for component in lowered.split('/') {
-        if component.contains('{')
-            && component.contains(',')
-            && (component.starts_with('.') || component.contains("{.") || component.contains(",."))
-        {
-            return Some("uses brace expansion that can reach git internals");
-        }
         if component.starts_with('.')
             && component.contains(['*', '?', '['])
             && [".git", ".."].iter().any(|t| glob_matches(component, t))
@@ -1675,6 +1681,13 @@ fn inspect_simple(simple: &Simple, depth: usize, budget: &Rc<Budget>) -> Result<
     inspect_words(&simple.words, &env, depth)
 }
 
+fn has_brace_expansion(word: &Word) -> bool {
+    !word.quoted
+        && word.text.contains('{')
+        && word.text.contains('}')
+        && (word.text.contains(',') || word.text.contains(".."))
+}
+
 fn is_device(text: &str) -> bool {
     DEVICES.contains(&text)
 }
@@ -1729,6 +1742,9 @@ fn inspect_words(words: &[Word], env: &Env, depth: usize) -> Result<(), String> 
         check_secret(&lower(&cwd.resolve(&word.text)))?;
         if let Some(name) = unsafe_reference(word, &env.scope) {
             return Err(format!("reads the unresolved variable `${name}`"));
+        }
+        if has_brace_expansion(word) {
+            return Err(format!("`{}` uses brace expansion", word.text));
         }
     }
     if !first.dynamic && matches!(first.text.as_str(), "[" | "[[") {
@@ -1907,11 +1923,7 @@ fn write_target_escape(cwd: &Cwd, word: &Word, removes: bool) -> Option<String> 
     if let Some(why) = target_escape(cwd, word) {
         return Some(why);
     }
-    let resolved = cwd.resolve(&word.text);
-    if is_device(&lower(&clean(&resolved))) {
-        return None;
-    }
-    protected_hit(&resolved, removes).then(|| "is a protected path".to_string())
+    protected_hit(&cwd.resolve(&word.text), removes).then(|| "is a protected path".to_string())
 }
 
 fn inspect_rm(args: &[Word], cwd: &Cwd) -> Result<(), String> {
@@ -2161,51 +2173,53 @@ struct Program {
     operands: Operands,
 }
 
-const fn program(name: &'static str, flags: FlagSpec, operands: Operands) -> Program {
-    Program {
-        name,
-        flags,
-        operands,
-    }
+macro_rules! program {
+    ($name:expr, $flags:expr, $operands:expr $(,)?) => {
+        Program {
+            name: $name,
+            flags: $flags,
+            operands: $operands,
+        }
+    };
 }
 
-const fn spec(
-    shorts: &'static str,
-    short_values: &'static str,
-    longs: &'static [&'static str],
-    long_values: &'static [&'static str],
-    long_optional: &'static [&'static str],
-) -> FlagSpec {
-    FlagSpec {
-        shorts,
-        short_values,
-        longs,
-        long_values,
-        long_optional,
-    }
+macro_rules! spec {
+    ($shorts:expr, $short_values:expr, $longs:expr, $long_values:expr, $long_optional:expr $(,)?) => {
+        FlagSpec {
+            shorts: $shorts,
+            short_values: $short_values,
+            longs: $longs,
+            long_values: $long_values,
+            long_optional: $long_optional,
+        }
+    };
 }
 
 const PROGRAMS: &[Program] = &[
-    program("echo", NO_FLAGS, Operands::Text),
-    program("printf", NO_FLAGS, Operands::Text),
-    program("true", NO_FLAGS, Operands::Text),
-    program("false", NO_FLAGS, Operands::Text),
-    program(":", NO_FLAGS, Operands::Text),
-    program("test", NO_FLAGS, Operands::Text),
-    program("exit", NO_FLAGS, Operands::Text),
-    program("yes", NO_FLAGS, Operands::Text),
-    program("pwd", spec("LP", "", &[], &[], &[]), Operands::Strict),
-    program("sleep", NO_FLAGS, Operands::Strict),
-    program("seq", spec("w", "fs", &[], &[], &[]), Operands::Strict),
-    program("date", spec("uI", "d", &[], &[], &[]), Operands::Strict),
-    program("which", spec("a", "", &[], &[], &[]), Operands::Strict),
-    program("type", spec("ap", "", &[], &[], &[]), Operands::Strict),
-    program("basename", spec("az", "s", &[], &[], &[]), Operands::Strict),
-    program("dirname", spec("z", "", &[], &[], &[]), Operands::Strict),
-    program("tr", spec("cdsCt", "", &[], &[], &[]), Operands::Strict),
-    program(
+    program!("echo", NO_FLAGS, Operands::Text),
+    program!("printf", NO_FLAGS, Operands::Text),
+    program!("true", NO_FLAGS, Operands::Text),
+    program!("false", NO_FLAGS, Operands::Text),
+    program!(":", NO_FLAGS, Operands::Text),
+    program!("test", NO_FLAGS, Operands::Text),
+    program!("exit", NO_FLAGS, Operands::Text),
+    program!("yes", NO_FLAGS, Operands::Text),
+    program!("pwd", spec!("LP", "", &[], &[], &[]), Operands::Strict),
+    program!("sleep", NO_FLAGS, Operands::Strict),
+    program!("seq", spec!("w", "fs", &[], &[], &[]), Operands::Strict),
+    program!("date", spec!("uI", "d", &[], &[], &[]), Operands::Strict),
+    program!("which", spec!("a", "", &[], &[], &[]), Operands::Strict),
+    program!("type", spec!("ap", "", &[], &[], &[]), Operands::Strict),
+    program!(
+        "basename",
+        spec!("az", "s", &[], &[], &[]),
+        Operands::Strict
+    ),
+    program!("dirname", spec!("z", "", &[], &[], &[]), Operands::Strict),
+    program!("tr", spec!("cdsCt", "", &[], &[], &[]), Operands::Strict),
+    program!(
         "ls",
-        spec(
+        spec!(
             "lahAFRSdt1rsiLgGHpC",
             "I",
             &[
@@ -2225,9 +2239,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "cat",
-        spec(
+        spec!(
             "nAbEsTvu",
             "",
             &[
@@ -2241,9 +2255,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "head",
-        spec(
+        spec!(
             "qv",
             "nc",
             &["--quiet", "--silent", "--verbose"],
@@ -2252,9 +2266,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "tail",
-        spec(
+        spec!(
             "qv",
             "nc",
             &["--quiet", "--silent", "--verbose"],
@@ -2263,9 +2277,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "wc",
-        spec(
+        spec!(
             "lwcmL",
             "",
             &[
@@ -2280,9 +2294,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "stat",
-        spec(
+        spec!(
             "Lft",
             "c",
             &["--dereference", "--file-system", "--terse"],
@@ -2291,9 +2305,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "file",
-        spec(
+        spec!(
             "bLiNk",
             "",
             &[
@@ -2308,9 +2322,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "du",
-        spec(
+        spec!(
             "shackxLbmP",
             "dB",
             &[
@@ -2327,9 +2341,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "df",
-        spec(
+        spec!(
             "hHTikPal",
             "",
             &["--human-readable", "--si", "--all", "--local"],
@@ -2338,9 +2352,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "tree",
-        spec(
+        spec!(
             "adfFpusDilCnqxhNQ",
             "LPI",
             &["--dirsfirst", "--noreport", "--du", "--prune"],
@@ -2349,9 +2363,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "sort",
-        spec(
+        spec!(
             "bdfgiMhnRrsuVzc",
             "kt",
             &[
@@ -2369,9 +2383,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "uniq",
-        spec(
+        spec!(
             "cdiuz",
             "fsw",
             &["--count", "--repeated", "--unique", "--ignore-case"],
@@ -2380,9 +2394,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::PathsMax(1),
     ),
-    program(
+    program!(
         "cut",
-        spec(
+        spec!(
             "sz",
             "bcdf",
             &["--only-delimited", "--complement"],
@@ -2391,9 +2405,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "diff",
-        spec(
+        spec!(
             "uqrNsiwBbyEaZ",
             "UC",
             &[
@@ -2409,44 +2423,44 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "md5sum",
-        spec("bt", "", &["--binary", "--text"], &[], &[]),
+        spec!("bt", "", &["--binary", "--text"], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "sha1sum",
-        spec("bt", "", &["--binary", "--text"], &[], &[]),
+        spec!("bt", "", &["--binary", "--text"], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "sha256sum",
-        spec("bt", "", &["--binary", "--text"], &[], &[]),
+        spec!("bt", "", &["--binary", "--text"], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "sha512sum",
-        spec("bt", "", &["--binary", "--text"], &[], &[]),
+        spec!("bt", "", &["--binary", "--text"], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "xxd",
-        spec("pbuiEaC", "cgls", &[], &[], &[]),
+        spec!("pbuiEaC", "cgls", &[], &[], &[]),
         Operands::PathsMax(1),
     ),
-    program(
+    program!(
         "hexdump",
-        spec("CbcdoxvV", "ens", &[], &[], &[]),
+        spec!("CbcdoxvV", "ens", &[], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "od",
-        spec("bcdfhilosuvxaDOIL", "AjNtw", &[], &[], &[]),
+        spec!("bcdfhilosuvxaDOIL", "AjNtw", &[], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "realpath",
-        spec(
+        spec!(
             "esLPqmz",
             "",
             &["--canonicalize-existing", "--no-symlinks"],
@@ -2455,14 +2469,14 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Paths,
     ),
-    program(
+    program!(
         "readlink",
-        spec("fenmqsvz", "", &[], &[], &[]),
+        spec!("fenmqsvz", "", &[], &[], &[]),
         Operands::Paths,
     ),
-    program(
+    program!(
         "rg",
-        spec(
+        spec!(
             "nilcvwxFHhNSsoqUauP",
             "ACBmgtTeEjMdr",
             &[
@@ -2512,9 +2526,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::PatternThenPaths,
     ),
-    program(
+    program!(
         "grep",
-        spec(
+        spec!(
             "rRnivclLwxFEGPoqshHaIUzZ",
             "emABCdD",
             &[
@@ -2554,9 +2568,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::PatternThenPaths,
     ),
-    program(
+    program!(
         "jq",
-        spec(
+        spec!(
             "rcenjsSaMCRh",
             "",
             &[
@@ -2580,29 +2594,29 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::FilterThenPaths,
     ),
-    program(
+    program!(
         "mkdir",
-        spec("pv", "m", &["--parents", "--verbose"], &["--mode"], &[]),
+        spec!("pv", "m", &["--parents", "--verbose"], &["--mode"], &[]),
         Operands::WriteAll,
     ),
-    program(
+    program!(
         "touch",
-        spec("acm", "dt", &[], &[], &[]),
+        spec!("acm", "dt", &[], &[], &[]),
         Operands::WriteAll,
     ),
-    program(
+    program!(
         "tee",
-        spec("ai", "", &["--append"], &[], &[]),
+        spec!("ai", "", &["--append"], &[], &[]),
         Operands::WriteAll,
     ),
-    program(
+    program!(
         "chmod",
-        spec("Rcvf", "", &["--recursive"], &[], &[]),
+        spec!("Rcvf", "", &["--recursive"], &[], &[]),
         Operands::ModeThenWrite,
     ),
-    program(
+    program!(
         "cp",
-        spec(
+        spec!(
             "rRpvnfuT",
             "",
             &[
@@ -2617,9 +2631,9 @@ const PROGRAMS: &[Program] = &[
         ),
         Operands::Copy,
     ),
-    program(
+    program!(
         "mv",
-        spec(
+        spec!(
             "fnvuT",
             "",
             &["--verbose", "--no-clobber", "--force", "--update"],
@@ -2731,7 +2745,7 @@ fn check_writes(name: &str, operands: &[&Word], cwd: &Cwd, removes: bool) -> Res
     Ok(())
 }
 
-const CARGO_COMMON: FlagSpec = spec(
+const CARGO_COMMON: FlagSpec = spec!(
     "qvr",
     "pjFei",
     &[
@@ -3526,6 +3540,12 @@ fn inspect_git(args: &[Word], cwd: &Cwd) -> Result<(), String> {
         _ => {}
     }
     for operand in &parsed.operands {
+        if operand.text.starts_with(':') {
+            return Err(format!(
+                "`git {name}` operand `{}` is a pathspec magic form",
+                operand.text
+            ));
+        }
         if let Some(why) = target_escape(&cwd, operand) {
             return Err(format!("`git {name}` operand `{}` {why}", operand.text));
         }
@@ -3713,6 +3733,9 @@ fn inspect_gh_api(args: &[Word]) -> Result<(), String> {
     };
     if endpoint.dynamic {
         return Err("`gh api` endpoint cannot be resolved".to_string());
+    }
+    if endpoint.text.contains("://") || endpoint.text.starts_with("//") {
+        return Err("`gh api` endpoint must be a path on the configured host".to_string());
     }
     if lower(&endpoint.text).starts_with("graphql") {
         return Err("`gh api graphql` can run merge mutations".to_string());
@@ -6154,5 +6177,275 @@ mod tests {
             ],
             "",
         );
+    }
+
+    #[test]
+    fn function_definitions_and_brace_expansion_are_refused() {
+        refuse_all(
+            &[
+                ":(){ :|:& };:",
+                "f() { ls; }",
+                "f ()  { ls; }",
+                "echo ok; g(){ ls; }",
+                "echo {a,b}",
+                "echo {1..3}",
+                "echo {1..100000}{1..100000}",
+                "ls {a,b}",
+                "for i in {1..3}; do echo $i; done",
+                "rm -f x{1,2}",
+            ],
+            "",
+        );
+        blocked(":(){ :|:& };:", "function definitions");
+        blocked("echo {a,b}", "uses brace expansion");
+        allow_all(&[
+            "(cd sub; ls)",
+            "((i=1))",
+            "echo \"{a,b}\"",
+            "echo '{a,b}'",
+            "echo a\"{b,c}\"",
+            "git log HEAD@{1}",
+            "find . -name '*.{rs,toml}'",
+            "echo {a}",
+            "echo {}",
+            "echo {",
+        ]);
+    }
+
+    #[test]
+    fn gh_api_endpoints_are_paths_and_git_pathspecs_are_plain() {
+        refuse_all(
+            &[
+                "gh api https://evil.test/x",
+                "gh api http://evil.test/x",
+                "gh api //evil.test/x",
+            ],
+            "path on the configured host",
+        );
+        blocked("git diff HEAD~1 -- ':(top)/etc/passwd'", "pathspec magic");
+        blocked("git add :/", "pathspec magic");
+        blocked("git add :(top)x", "pathspec magic");
+        allow_all(&["gh api user", "gh api repos/o/r/pulls/5 --paginate"]);
+    }
+
+    #[test]
+    fn every_listed_program_has_an_accepted_form() {
+        allow_all(&[
+            "sha1sum Cargo.toml",
+            "sha512sum Cargo.toml",
+            "md5sum -b Cargo.toml",
+            "tree -a",
+            "od -An -tx1 Cargo.toml",
+            "hexdump -n 16 Cargo.toml",
+            "xxd -l 16 Cargo.toml",
+            "df",
+            "file -b Cargo.toml",
+            "stat -L Cargo.toml",
+            "uniq -c x",
+            "cut -b1-5 x",
+            "sort -rn x y",
+            "diff -r a b",
+            "realpath -s src",
+            "readlink -n src",
+            "ls -1 -t -r",
+            "wc",
+            "cat",
+            "head",
+            "tail",
+            "sleep 1",
+            "seq -w 1 3",
+            "date -d yesterday",
+            "which -a git",
+            "type -p git",
+            "basename -a a b",
+            "basename -s .rs a.rs",
+            "dirname -z a/b",
+            "tr -cs a-z '\\n'",
+            "mkdir -p -v a/b",
+            "mkdir --parents --mode 755 a",
+            "touch -a -m a",
+            "tee -a out.log",
+            "cp -p -v a b",
+            "cp --recursive a b",
+            "mv -n a b",
+            "mv --force a b",
+            "chmod --recursive 755 d",
+            "rg --max-count 5 foo",
+            "rg --glob '*.rs' foo",
+            "rg -m 3 -A 1 -B 1 foo",
+            "rg --sort path --files",
+            "grep --max-count=5 foo f",
+            "grep -m 5 -A1 -B1 foo f",
+            "grep --exclude-dir=target -r foo .",
+            "grep -rIl foo .",
+            "jq --raw-output --compact-output . x",
+            "jq -S -c -r -e -M -C . x",
+            "echo hi | jq -R .",
+        ]);
+    }
+
+    #[test]
+    fn per_program_flag_tables_reject_unlisted_flags() {
+        refuse_all(
+            &[
+                "ls --bogus",
+                "ls -Z",
+                "cat -z f",
+                "head --bogus f",
+                "wc --files0-from f",
+                "stat --bogus f",
+                "file -C",
+                "du --exclude-from=x .",
+                "df -x tmpfs",
+                "tree -o out",
+                "sort -S 1G f",
+                "uniq -x f",
+                "cut -x f",
+                "diff --to-file=x a",
+                "md5sum -c f",
+                "xxd -r f",
+                "hexdump -x2 f",
+                "od --bogus f",
+                "realpath --bogus f",
+                "readlink --bogus f",
+                "mkdir --bogus x",
+                "touch -r ref x",
+                "tee -p x",
+                "chmod --reference=a b",
+                "cp --link a b",
+                "mv --backup a b",
+                "grep --bogus f",
+                "rg --bogus f",
+                "jq --bogus .",
+                "date --bogus",
+                "seq --bogus 3",
+                "which --bogus x",
+                "pwd --bogus",
+            ],
+            "",
+        );
+        blocked("ls --bogus", "not an allow-listed option");
+        blocked("rg --bogus f", "not an allow-listed option");
+    }
+
+    #[test]
+    fn wrapper_option_forms_are_consumed_correctly() {
+        allow_all(&[
+            "env -- ls",
+            "env - ls",
+            "env -i -- ls",
+            "env -u HOME ls",
+            "env -uHOME ls",
+            "env -Csub ls",
+            "env --unset HOME ls",
+            "env --ignore-environment ls",
+            "timeout --kill-after 5 5 ls",
+            "timeout --kill-after=5 5 ls",
+            "timeout -k 5 5 ls",
+            "timeout -- 5 ls",
+            "time --format x ls",
+            "time -p ls",
+            "nice -5 ls",
+            "nice -n5 ls",
+            "nice -n 5 ls",
+            "stdbuf -oL ls",
+            "stdbuf -o L ls",
+            "ionice -c 3 ls",
+            "setsid -f ls",
+            "nohup ls",
+            "builtin cd sub",
+            "taskset -c 0,1 ls",
+            "taskset 0x1 ls",
+            "taskset --cpu-list 0 ls",
+            "chrt 10 ls",
+            "chrt -f 10 ls",
+            "exec -a name ls",
+            "exec -cl ls",
+            "exec",
+            "command -p ls",
+            "command ls",
+        ]);
+        refuse_all(
+            &[
+                "env -u",
+                "env",
+                "env A=b",
+                "env -",
+                "timeout --bogus 5 ls",
+                "env --bogus ls",
+                "nice -q ls",
+            ],
+            "",
+        );
+    }
+
+    #[test]
+    fn trap_and_read_and_assignment_builtins_are_reviewed() {
+        allow_all(&[
+            "trap",
+            "trap -p",
+            "trap 'ls' EXIT",
+            "trap 'echo done' EXIT INT",
+            "export RUST_LOG",
+            "declare x",
+            "readonly y",
+            "typeset z",
+            "local w",
+            "read",
+            "read -r a b",
+        ]);
+        blocked("trap $H EXIT", "cannot be resolved");
+        blocked("trap 'curl x' EXIT", "can send data");
+        blocked("trap $(echo ls) EXIT", "handler cannot be resolved");
+        blocked("export -x", "can change how programs behave");
+        blocked("export FOO", "can change how programs behave");
+        blocked("declare -p", "can change how programs behave");
+        blocked("read PATH", "can change how programs behave");
+        blocked("read -r PATH", "can change how programs behave");
+        blocked("printf -v x y", "assigns variables");
+    }
+
+    #[test]
+    fn ansi_c_escapes_and_nested_backticks_decode() {
+        blocked(
+            "$'\\a\\b\\e\\E\\f\\r\\v\\\\\\'\\\"\\?' x",
+            "not an allow-listed program",
+        );
+        allow_all(&["echo $'\\a\\b\\e\\E\\f\\r\\v\\\\\\'\\\"\\?'"]);
+        blocked("$'\\U00000063url' x", "can send data");
+        blocked("$'\\U110000' x", "ANSI-C");
+        blocked("echo `echo \\`curl x\\``", "can send data");
+        allow_all(&["echo `echo \\`ls\\``", "echo `echo \\\\x`"]);
+    }
+
+    #[test]
+    fn function_definition_spacing_variants_are_refused() {
+        refuse_all(
+            &["f( ) { ls; }", "f(\t) { ls; }", "f ( ) { ls; }"],
+            "function definitions",
+        );
+    }
+
+    #[test]
+    fn sed_and_find_corner_cases() {
+        refuse_all(
+            &[
+                "sed -n '1,/ab' f",
+                "sed -n '1,/a\\/b/p' f",
+                "sed -n '/a\\/b/p' f",
+                "find . -name x $(echo -delete)",
+                "find . -name x -bogus",
+            ],
+            "",
+        );
+        blocked("find . -name x $(echo -delete)", "cannot be resolved");
+        allow_all(&["sed -n '1,3p' f", "sed -n '2,$p' f", "sed -n '/a/,5p' f"]);
+    }
+
+    #[test]
+    fn copy_and_pattern_programs_without_operands() {
+        allow_all(&[
+            "cp", "timeout", "grep", "rg", "jq", "sed -n p", "mkdir", "touch", "rm", "tee", "mv",
+        ]);
     }
 }
