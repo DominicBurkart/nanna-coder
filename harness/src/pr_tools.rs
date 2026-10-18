@@ -102,7 +102,21 @@ enum Shape {
 fn is_printable(c: char) -> bool {
     if matches!(
         c,
-        '\u{00ad}' | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'
+        '\u{00ad}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{3164}'
+            | '\u{ffa0}'
+            | '\u{0897}'
+            | '\u{105c0}'..='\u{105ff}'
+            | '\u{10d40}'..='\u{10d8f}'
+            | '\u{11380}'..='\u{113ff}'
+            | '\u{116d0}'..='\u{116ff}'
+            | '\u{11bc0}'..='\u{11bff}'
+            | '\u{13460}'..='\u{143ff}'
+            | '\u{16100}'..='\u{1613f}'
+            | '\u{16d40}'..='\u{16d7f}'
+            | '\u{1e5d0}'..='\u{1e5ff}'
     ) {
         return false;
     }
@@ -845,7 +859,7 @@ fn sanitize_git_output(raw: &str) -> String {
     let redacted = redact_resilient(&strip_unprintable(raw));
     let trimmed = redacted.trim();
     match trimmed.char_indices().nth(GIT_OUTPUT_CAP) {
-        Some((end, _)) => format!("{}[truncated]", &trimmed[..end]),
+        Some((end, _)) => format!("{}[truncated]", strip_unprintable(&trimmed[..end])),
         None => trimmed.to_string(),
     }
 }
@@ -874,25 +888,36 @@ fn escape_char(ch: char, bad: bool) -> String {
     }
 }
 
+fn render_escaped(chars: &[char]) -> String {
+    let text: String = chars.iter().collect();
+    chars
+        .iter()
+        .zip(unprintable_mask(&text, Shape::Block))
+        .map(|(ch, bad)| escape_char(*ch, bad))
+        .collect()
+}
+
 fn fenced_untrusted(text: &str, cap: usize, budget: &mut Budget) -> String {
     let allowed = cap.min(budget.remaining);
-    let window: String = text.chars().take(allowed.saturating_add(1)).collect();
-    let mask = unprintable_mask(&window, Shape::Block);
-    let mut cut = window.chars().count() > allowed;
-    let mut body = String::new();
+    let window: Vec<char> = text.chars().take(allowed.saturating_add(1)).collect();
+    let mask = unprintable_mask(&window.iter().collect::<String>(), Shape::Block);
+    let mut keep = 0usize;
     let mut used = 0usize;
-    for (ch, bad) in window.chars().zip(mask).take(allowed) {
-        let piece = escape_char(ch, bad);
-        let size = piece.chars().count();
+    for (ch, bad) in window.iter().zip(mask).take(allowed) {
+        let size = escape_char(*ch, bad).chars().count();
         if used + size > allowed {
-            cut = true;
             break;
         }
-        body.push_str(&piece);
         used += size;
+        keep += 1;
     }
-    budget.remaining -= used;
-    if cut {
+    let mut body = render_escaped(&window[..keep]);
+    while body.chars().count() > allowed {
+        keep -= 1;
+        body = render_escaped(&window[..keep]);
+    }
+    budget.remaining -= body.chars().count();
+    if keep < window.len() {
         body.push_str("\n[truncated]");
     }
     format!("{FENCE_OPEN}\n{body}\n{FENCE_CLOSE}")
@@ -5819,5 +5844,153 @@ mod tests {
                 other => panic!("{label}: {other:?}"),
             }
         }
+    }
+
+    fn body_of(fenced: &str) -> String {
+        fenced
+            .strip_prefix(FENCE_OPEN)
+            .and_then(|rest| rest.strip_suffix(FENCE_CLOSE))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn truncation_never_leaves_a_dangling_joiner_keycap_or_mark() {
+        for (text, cap) in [
+            ("\u{e9}\u{a1}\u{200d}\u{f1}", 3usize),
+            ("1\u{fe0f}\u{20e3}", 2),
+            ("\u{1f468}\u{200d}\u{1f469}", 2),
+            ("\u{915}\u{94d}\u{200d}\u{937}", 3),
+            ("e\u{301}\u{301}\u{301}\u{301}", 3),
+            ("\u{2764}\u{fe0f}", 1),
+        ] {
+            let mut budget = Budget::new(TOTAL_BUDGET);
+            let fenced = fenced_untrusted(text, cap, &mut budget);
+            let shown = text.escape_unicode().to_string();
+            assert!(fenced.contains("[truncated]"), "{shown}");
+            assert!(
+                !unprintable_mask(&fenced, Shape::Block).contains(&true),
+                "{shown}"
+            );
+            for c in ['\u{200d}', '\u{fe0f}', '\u{20e3}'] {
+                let kept = text.chars().take(cap).any(|t| t == c);
+                if kept && fenced.contains(c) {
+                    let idx = fenced.find(c).unwrap();
+                    assert!(
+                        fenced[idx + c.len_utf8()..].starts_with(|n: char| n != '\n'),
+                        "{shown}"
+                    );
+                }
+            }
+        }
+        let mut budget = Budget::new(TOTAL_BUDGET);
+        let zwj = fenced_untrusted("\u{e9}\u{a1}\u{200d}\u{f1}", 3, &mut budget);
+        assert!(!zwj.contains('\u{200d}'), "{zwj}");
+        let mut budget = Budget::new(TOTAL_BUDGET);
+        let keycap = fenced_untrusted("1\u{fe0f}\u{20e3}", 2, &mut budget);
+        assert!(!keycap.contains('\u{fe0f}'), "{keycap}");
+    }
+
+    #[test]
+    fn every_truncation_point_of_every_short_string_yields_clean_bounded_output() {
+        for_each_fuzz_string(3, |s| {
+            let len = s.chars().count();
+            for cap in 0..=len + 1 {
+                let mut budget = Budget::new(TOTAL_BUDGET);
+                let fenced = fenced_untrusted(s, cap, &mut budget);
+                assert!(
+                    !unprintable_mask(&fenced, Shape::Block).contains(&true),
+                    "{} cap {cap}",
+                    s.escape_unicode()
+                );
+                let inner = body_of(&fenced);
+                let body = inner
+                    .strip_prefix('\n')
+                    .unwrap()
+                    .strip_suffix('\n')
+                    .unwrap();
+                let body = body.strip_suffix("\n[truncated]").unwrap_or(body);
+                assert!(
+                    body.chars().count() <= cap,
+                    "{} cap {cap}: {body:?}",
+                    s.escape_unicode()
+                );
+                assert!(TOTAL_BUDGET - budget.remaining <= cap);
+            }
+        });
+    }
+
+    #[test]
+    fn git_output_truncation_never_leaves_a_dangling_joiner_or_selector() {
+        let filler = "x".repeat(GIT_OUTPUT_CAP - 2);
+        for tail in [
+            "\u{e9}\u{200d}\u{f1}",
+            "1\u{fe0f}\u{20e3}",
+            "\u{a1}\u{200d}\u{a1}",
+            "\u{2764}\u{fe0f}\u{200d}\u{1f525}",
+        ] {
+            let out = sanitize_git_output(&format!("{filler}{tail}{tail}"));
+            let shown = tail.escape_unicode().to_string();
+            assert!(out.ends_with("[truncated]"), "{shown}");
+            assert!(
+                !unprintable_mask(&out, Shape::Block).contains(&true),
+                "{shown}"
+            );
+            let before_marker = out.strip_suffix("[truncated]").unwrap();
+            assert!(!before_marker.ends_with('\u{200d}'), "{shown}");
+        }
+        let keycap = sanitize_git_output(&format!("{filler}1\u{fe0f}\u{20e3}"));
+        assert!(!keycap.contains('\u{fe0f}'), "{keycap}");
+        let joiner = sanitize_git_output(&format!("{filler}\u{e9}\u{200d}\u{f1}"));
+        assert!(!joiner.contains('\u{200d}'), "{joiner}");
+    }
+
+    #[test]
+    fn the_last_basic_combining_block_character_is_accepted_after_a_letter() {
+        assert!(validate_text("f", "a\u{34e}", Shape::Line, 10).is_ok());
+        assert!(validate_text("f", "a\u{34f}", Shape::Line, 10).is_err());
+    }
+
+    #[test]
+    fn mark_table_is_sorted_disjoint_and_of_the_pinned_size() {
+        let mut total = 0u32;
+        let mut previous_end = 0u32;
+        for (i, (lo, hi)) in MARK_RANGES.iter().enumerate() {
+            assert!(lo <= hi, "{lo:x}");
+            assert!(
+                i == 0 || *lo > previous_end + 1,
+                "{lo:x} touches or overlaps the previous range"
+            );
+            previous_end = *hi;
+            total += hi - lo + 1;
+        }
+        assert_eq!(total, 2187);
+        for cp in [0x300u32, 0x34e, 0x350, 0x903, 0x94d, 0x1abe, 0x20dd, 0xfe20] {
+            assert!(is_combining_mark(char::from_u32(cp).unwrap()), "{cp:x}");
+        }
+        for cp in [
+            0x34fu32, 0x17b4, 0x17b5, 0x180b, 0x20e3, 0xfe00, 0xfe0f, 0xe0100, 0x61,
+        ] {
+            assert!(!is_combining_mark(char::from_u32(cp).unwrap()), "{cp:x}");
+        }
+    }
+
+    #[test]
+    fn unicode_16_marks_and_scripts_are_refused_until_the_table_is_regenerated() {
+        for cp in [
+            0x897u32, 0x10d40, 0x10d69, 0x105c0, 0x11380, 0x11bc0, 0x116d0, 0x16100, 0x16d40,
+            0x16d63, 0x1e5d0, 0x13460,
+        ] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(is_forbidden_char(c, Shape::Line), "{cp:x}");
+            assert!(
+                validate_text("f", &format!("\u{915}{c}"), Shape::Line, 10).is_err(),
+                "{cp:x}"
+            );
+        }
+        assert!(
+            std::char::UNICODE_VERSION <= (16, 0, 0),
+            "std Unicode data moved past 16.0: regenerate MARK_RANGES with scripts/gen-unicode-marks.py and review the Unicode additions"
+        );
     }
 }
