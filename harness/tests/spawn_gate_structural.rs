@@ -25,14 +25,16 @@ fn cfg_holds_outside_tests(meta: &syn::Meta) -> bool {
                     syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
                 )
                 .unwrap();
-            if list.path.is_ident("not") {
-                !nested.iter().all(cfg_holds_outside_tests)
-            } else if list.path.is_ident("all") {
-                nested.iter().all(cfg_holds_outside_tests)
-            } else if list.path.is_ident("any") {
-                nested.iter().any(cfg_holds_outside_tests)
-            } else {
-                true
+            let holds: Vec<bool> = nested.iter().map(cfg_holds_outside_tests).collect();
+            match list
+                .path
+                .get_ident()
+                .map(|ident| ident.to_string())
+                .as_deref()
+            {
+                Some("not") => !holds.iter().all(|held| *held),
+                Some("any") => holds.iter().any(|held| *held),
+                _ => holds.iter().all(|held| *held),
             }
         }
     }
@@ -133,12 +135,11 @@ impl Scan {
         true
     }
 
-    fn conditional<T>(&mut self, visit: impl FnOnce(&mut Self) -> T) -> T {
+    fn conditional(&mut self, visit: impl FnOnce(&mut Self)) {
         self.branches += 1;
         self.branch.push(self.branches);
-        let out = visit(self);
+        visit(self);
         self.branch.pop();
-        out
     }
 }
 
@@ -153,16 +154,7 @@ impl<'ast> Visit<'ast> for Scan {
         if is_cfg_test(&node.attrs) {
             return;
         }
-        let owner = match &*node.self_ty {
-            syn::Type::Path(path) => path
-                .path
-                .segments
-                .last()
-                .map(|segment| segment.ident.to_string())
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
-        self.owner.push(owner);
+        self.owner.push(type_name(&node.self_ty));
         syn::visit::visit_item_impl(self, node);
         self.owner.pop();
     }
@@ -191,11 +183,8 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if self.enter_fn(
-            &node.sig.ident.to_string(),
-            &syn::Visibility::Inherited,
-            &node.attrs,
-        ) {
+        let vis = syn::Visibility::Inherited;
+        if self.enter_fn(&node.sig.ident.to_string(), &vis, &node.attrs) {
             syn::visit::visit_trait_item_fn(self, node);
             self.function.pop();
         }
@@ -254,6 +243,20 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         self.scan_tokens(node.tokens.clone());
     }
+}
+
+fn type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(path) => last_segment(&path.path),
+        syn::Type::Reference(reference) => type_name(&reference.elem),
+        _ => String::new(),
+    }
+}
+
+fn last_segment(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map_or(String::new(), |s| s.ident.to_string())
 }
 
 fn scan_source(file: &str, source: &str) -> Scan {
@@ -362,15 +365,21 @@ fn calls_in(function: &str, file: &str) -> Calls {
 }
 
 fn dominates(calls: &Calls, first: &str, then: &str) -> bool {
-    let Some((index, (_, guard))) = calls.iter().enumerate().find(|(_, (n, _))| n == first) else {
-        panic!("`{first}` is not called");
-    };
     calls
         .iter()
-        .skip(index + 1)
-        .filter(|(name, _)| name == then)
-        .all(|(_, path)| path.starts_with(guard))
-        && calls.iter().any(|(name, _)| name == then)
+        .position(|(name, _)| name == first)
+        .is_some_and(|index| {
+            let guard = &calls[index].1;
+            let dispatches: Vec<_> = calls
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, _))| name == then)
+                .collect();
+            !dispatches.is_empty()
+                && dispatches
+                    .iter()
+                    .all(|(at, (_, path))| *at > index && path.starts_with(guard))
+        })
 }
 
 #[test]
@@ -392,10 +401,7 @@ fn the_backlog_sinks_verify_the_proof_on_every_path_to_dispatching() {
         ("ManagerSink::enqueue", "submit_task"),
     ] {
         let calls = calls_in(function, "backlog.rs");
-        assert!(
-            dominates(&calls, "ensure_audited", dispatch),
-            "{function} must verify the proof before `{dispatch}`"
-        );
+        assert!(dominates(&calls, "ensure_audited", dispatch), "{function}");
     }
 }
 
@@ -409,16 +415,18 @@ fn a_check_in_a_dead_branch_does_not_guard_a_dispatch() {
     assert!(!dominates(calls, "check", "enqueue"));
     let scan = scan_source("x.rs", "fn f(g: G, s: S) { g.check(); s.enqueue(); }");
     assert!(dominates(&scan.sequences["f"], "check", "enqueue"));
+    assert!(!dominates(&scan.sequences["f"], "missing", "enqueue"));
+    assert!(!dominates(&scan.sequences["f"], "check", "missing"));
+    let scan = scan_source("x.rs", "fn f(g: G, s: S) { s.enqueue(); g.check(); }");
+    assert!(!dominates(&scan.sequences["f"], "check", "enqueue"));
 }
 
 #[test]
 fn raw_task_manager_submission_methods_are_not_public() {
     let declared = union(|scan| &scan.declarations);
     for name in ["submit_with_identity", "submit_task"] {
-        assert!(
-            declared.contains(&format!("task.rs: TaskManager::{name} (pub(restricted))")),
-            "`{name}` must be pub(crate)"
-        );
+        let restricted = format!("task.rs: TaskManager::{name} (pub(restricted))");
+        assert!(declared.contains(&restricted));
         assert!(
             !declared.contains(&format!("task.rs: TaskManager::{name} (pub)")),
             "`{name}` must not be public"
@@ -456,10 +464,22 @@ fn cfg_not_test_and_cfg_any_test_items_are_scanned_as_production() {
 #[cfg(any(test, feature = \"x\"))] pub fn submit_b() {}
 #[cfg(test)] pub fn submit_c() {}
 #[cfg(all(test, unix))] pub fn submit_d() {}
+#[cfg(test)] impl T { pub fn submit_e() {} }
+#[cfg(test)] trait Q { fn submit_f(); }
+#[cfg(test)] mod m { pub fn submit_g() {} }
+impl R for &X { fn submit_h() {} }
+trait P { fn submit_i(); }
+impl R for (A, B) { fn submit_j() {} }
 ",
     );
     assert_eq!(
         scan.declarations,
-        expected(&["x.rs: submit_a (pub)", "x.rs: submit_b (pub)"])
+        expected(&[
+            "x.rs: submit_a (pub)",
+            "x.rs: submit_b (pub)",
+            "x.rs: X::submit_h (private)",
+            "x.rs: P::submit_i (private)",
+            "x.rs: ::submit_j (private)",
+        ])
     );
 }
