@@ -216,8 +216,32 @@ async fn test_task_manager_submit_with_dev_container() {
     let provider = model::OllamaProvider::new(ollama_config).expect("failed to create provider");
     let provider: Arc<dyn ModelProvider> = Arc::new(provider);
 
+    let identity = harness::identity::AgentIdentity::from_toml_str(
+        r#"
+[identity]
+name = "dev-container-e2e"
+description = "Edits the example repository inside its dev container."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Edit the repository." }
+
+[scope]
+repos = ["DominicBurkart/nanna-coder"]
+paths = []
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "run_command"]
+
+[limits]
+max_iterations = 32
+max_wall_clock_secs = 600
+max_concurrent = 1
+"#,
+        "dev-container-e2e.toml",
+    )
+    .expect("e2e identity must parse");
+
     let task_id = manager
-        .submit(
+        .submit_with_identity(
             "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
                 .to_string(),
             repo_path,
@@ -225,6 +249,7 @@ async fn test_task_manager_submit_with_dev_container() {
             E2E_MODEL.to_string(),
             MAX_TURNS,
             provider,
+            Some(identity),
         )
         .await;
 
@@ -401,7 +426,13 @@ async fn cargo_check_tool_succeeds_in_nanna_container() {
     let image_ref = load_image_from_path(&runtime, &image_path).expect("failed to load image");
 
     let container_name = format!("nanna-cargo-check-test-{}", uuid::Uuid::new_v4());
-    let additional_args = vec![format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display())];
+    let tmp_dir = harness::workspace::dev_container_paths()
+        .expect("dev-container.toml parses")
+        .tmp_dir;
+    let additional_args = vec![
+        format!("-v={}:{CONTAINER_WORKSPACE_DIR}", root.display()),
+        format!("--tmpfs={tmp_dir}:rw,mode=1777"),
+    ];
 
     let config = ContainerConfig {
         base_image: image_ref,

@@ -1169,6 +1169,7 @@ mod tests {
             tool_calls_made: vec![],
             conversation_snapshot: vec![],
             denials: vec![],
+            action_audit: vec![],
             token_usage: Some(TokenUsage {
                 prompt_tokens: 5,
                 completion_tokens: 6,
@@ -1194,6 +1195,7 @@ mod tests {
             tool_calls_made: vec![],
             conversation_snapshot: vec![],
             denials: vec![],
+            action_audit: vec![],
             token_usage: None,
         };
         assert!(AgentOutcome::InProcess(r).token_usage().is_none());

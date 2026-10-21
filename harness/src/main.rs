@@ -45,6 +45,11 @@ enum Commands {
     Models,
     /// List available tools
     Tools,
+    /// Record auditor eval results
+    Auditor {
+        #[command(subcommand)]
+        action: AuditorAction,
+    },
     /// Inspect the agent identity catalog
     Agents {
         #[command(subcommand)]
@@ -177,6 +182,18 @@ enum Commands {
         #[command(subcommand)]
         command: EffectsCommands,
     },
+    /// Print the blast radius of the working tree against a git revision
+    Impact {
+        /// Revision to diff the working tree against
+        #[arg(long)]
+        diff: String,
+        /// Repository root containing .nanna/effects.toml (defaults to cwd)
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate a SWE-bench report from JSON results
     SweBenchReport {
         /// Path to the JSON results file
@@ -205,6 +222,23 @@ enum EscalationAction {
         /// escalations.jsonl next to the queue log)
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditorAction {
+    /// Score the rule auditor on the shipped eval cases and append one row,
+    /// labelled as circular (#771), to the auditor scorecard
+    RecordScorecard {
+        /// Commit the scored code is at
+        #[arg(long)]
+        commit: String,
+        /// Branch, when known
+        #[arg(long)]
+        branch: Option<String>,
+        /// Scorecard file (defaults to evals/scorecards/auditor_spawn.jsonl)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -480,9 +514,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             run_escalation_resolve(&id, path)?;
         }
+        Commands::Auditor {
+            action:
+                AuditorAction::RecordScorecard {
+                    commit,
+                    branch,
+                    out,
+                },
+        } => {
+            let path = out.unwrap_or_else(harness::auditor::eval::default_scorecard_path);
+            let date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            match harness::auditor::eval::record_rule_auditor_row(
+                &path,
+                &commit,
+                branch.as_deref(),
+                &date,
+            )
+            .await
+            {
+                Ok(row) => println!("appended to {}: {}", path.display(), row.label),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::Effects { command } => {
             if let Err(err) = run_effects(command) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Impact {
+            diff,
+            repo_path,
+            json,
+        } => {
+            if let Err(err) = run_impact(&diff, repo_path, json) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }
@@ -522,7 +591,9 @@ fn fake_rollout_log(
     std::fs::create_dir_all(&dir)?;
     let log = harness::rollout::RolloutLog::open(&dir.join("rollouts.jsonl"))?;
     if let Some(record) = seed {
-        log.append(None, record)?;
+        let mut seed = record.clone();
+        seed.revision = 0;
+        log.append(None, &mut seed)?;
     }
     Ok(log)
 }
@@ -561,6 +632,24 @@ async fn run_fake_to_a_stop(
 
 const NO_REAL_TARGET: &str =
     "no production target adapter and health source are wired yet; run with --fake for a dry run";
+
+fn run_impact(
+    rev: &str,
+    repo_path: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = match repo_path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let radius = harness::impact::impact_of_diff(&repo, rev)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&radius)?);
+    } else {
+        print!("{}", radius.render_text());
+    }
+    Ok(())
+}
 
 fn run_effects(command: EffectsCommands) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -1168,7 +1257,11 @@ async fn run_backlog_sync(
 
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
-    let sink = StoreSink::open(Box::new(store))?;
+    let identities = load_identities()
+        .iter()
+        .map(|identity| identity.name().to_string())
+        .collect::<Vec<_>>();
+    let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
     let report = backlog_sync(&client, &sink, &config).await?;
     println!(
@@ -1355,15 +1448,55 @@ fn build_spawn_gate(
     Ok(SpawnGate::new(Box::new(RuleAuditor::new()), log, context))
 }
 
+async fn build_mcp_task_manager(
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+    lease_path: &std::path::Path,
+    escalation_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
+    use harness::escalation::EscalationLog;
+    use harness::leases::JsonlLeaseStore;
+    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
+    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
+    use std::sync::Arc;
+
+    Ok(TaskManager::restore_with_identities(
+        DEFAULT_MAX_CONCURRENT_TASKS,
+        Box::new(HybridPolicy::default()),
+        Box::new(JsonlQueueStore::open(queue_path)?),
+        Arc::new(JsonlLeaseStore::open(lease_path)?),
+        provider.clone(),
+        catalog,
+    )
+    .await?
+    .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
+    .with_action_policy(
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        Some((provider, model.to_string())),
+        harness::action_auditor::ActionAuditLog::file(
+            queue_path.with_file_name("action_audit.jsonl"),
+        ),
+    ))
+}
+
+fn build_delegate_task_manager(
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    model: Option<&str>,
+) -> harness::task::TaskManager {
+    harness::task::TaskManager::default().with_action_policy(
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        model.map(|name| (provider, name.to_string())),
+        harness::action_auditor::ActionAuditLog::in_memory(),
+    )
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::escalation::EscalationLog;
-    use harness::leases::JsonlLeaseStore;
     use harness::mcp::NannaMcpServer;
-    use harness::scheduler::{HybridPolicy, JsonlQueueStore};
-    use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
@@ -1373,16 +1506,15 @@ async fn run_mcp_server(
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
     let task_manager = Arc::new(
-        TaskManager::restore_with_identities(
-            DEFAULT_MAX_CONCURRENT_TASKS,
-            Box::new(HybridPolicy::default()),
-            Box::new(JsonlQueueStore::open(&queue_path)?),
-            Arc::new(JsonlLeaseStore::open(&lease_path)?),
+        build_mcp_task_manager(
             provider.clone(),
+            model,
+            &queue_path,
+            &lease_path,
+            &escalation_path,
             &catalog,
         )
-        .await?
-        .with_escalations(Arc::new(EscalationLog::open(&escalation_path)?)),
+        .await?,
     );
 
     info!(
@@ -1424,12 +1556,11 @@ async fn run_delegate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
-    use harness::task::TaskManager;
     use std::sync::Arc;
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(TaskManager::default());
+    let task_manager = Arc::new(build_delegate_task_manager(provider.clone(), model));
     let gate = build_spawn_gate(&load_identities(), harness::auditor::AuditLog::in_memory())?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1474,6 +1605,44 @@ async fn run_delegate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness::action_auditor::RULE_ACTION_AUDITOR_NAME;
+
+    fn offline_provider() -> std::sync::Arc<dyn model::ModelProvider> {
+        std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_reviews_actions_with_the_model_and_a_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let manager = build_mcp_task_manager(
+            offline_provider(),
+            "reviewer-model",
+            &queue,
+            &dir.path().join("leases.jsonl"),
+            &dir.path().join("escalations.jsonl"),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        let gate = manager.action_gate();
+        assert_eq!(gate.auditor_name(), "reviewer-model");
+        assert_eq!(
+            gate.log().path(),
+            Some(dir.path().join("action_audit.jsonl").as_path())
+        );
+    }
+
+    #[test]
+    fn the_delegate_task_manager_attaches_the_model_only_when_one_is_given() {
+        let with_model = build_delegate_task_manager(offline_provider(), Some("delegate-model"));
+        assert_eq!(with_model.action_gate().auditor_name(), "delegate-model");
+        let without = build_delegate_task_manager(offline_provider(), None);
+        assert_eq!(
+            without.action_gate().auditor_name(),
+            RULE_ACTION_AUDITOR_NAME
+        );
+    }
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,
     };
@@ -1653,17 +1822,17 @@ mod tests {
             chrono::Utc::now(),
         );
         let log = harness::rollout::RolloutLog::open(&real_path).unwrap();
-        log.append(None, &record).unwrap();
+        log.append(None, &mut record).unwrap();
         let pending = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Step(0), chrono::Utc::now())
             .unwrap();
-        log.append(Some(&pending), &record).unwrap();
+        log.append(Some(&pending), &mut record).unwrap();
         let stepping = record.state.clone();
         record
             .transition(harness::rollout::RolloutState::Halted, chrono::Utc::now())
             .unwrap();
-        log.append(Some(&stepping), &record).unwrap();
+        log.append(Some(&stepping), &mut record).unwrap();
         let before = std::fs::read_to_string(&real_path).unwrap();
         run_deploy(DeployCommands::RollForward {
             id: "rollout-real".into(),
