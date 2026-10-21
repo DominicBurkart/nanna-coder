@@ -96,16 +96,23 @@ what is new:
    by `scoped_for` filters names but attaches no path scope. The broker adds
    nothing here.
 3. Pass the **action gate** (the auditor's per-action review) before
-   execution. New: not on main (#706).
+   execution. Exists on main (#876): `execute` runs it after the production
+   hold. `TaskRunner` installs the hold, the gate (with the task's action
+   subject) and the escalator on every model-facing registry through one
+   constructor, `model_facing_registry`; the broker must install exactly the
+   same layers through that constructor and build no registry any other way.
 4. For `Repository` and above: check the human-availability **window** and take
-   the coordination **lease**, holding it for the call. New: not on main
-   (#706).
+   the coordination **lease**, holding it for the call. New: the runner's
+   action subject carries no window, pull request or environment today, so
+   `Sandbox` and `Production` calls dispatched through it stop at the missing
+   lease context, and the broker has no window or lease handling.
 5. Check the **production hold** for `Production`. Exists: `execute` does it.
 6. Execute, and record the call for the task result and audit log. The audit
    log is new broker work; the registry records denials only.
 
-Only steps 3 and 4 (and the audit log) are new. Anything in steps 1, 2 and 5
-that the broker re-implements is a defect.
+Only step 4 (and the audit log) are new broker work; step 3 exists and must be
+installed, not re-implemented. Anything in steps 1, 2, 3 and 5 that the broker
+re-implements is a defect.
 
 Spawning goes through the existing spawn gate: a `ResolvedAgent` can only be
 built from an `Allowed` proof, and a `CheckedPlan` only from a `ResolvedAgent`,
@@ -187,7 +194,8 @@ Not yet done (in order):
 
 1. Broker, per the contract above and the real-pi constraints (refuse every call
    until `toolsAdded` has been verified; capabilities above Workspace withheld
-   until the per-action gate #706 is on main).
+   until windows and leases are handled; the per-action gate itself is on main
+   since #876).
 2. Executor trait plus a container executor (hardening above) with a fake for
    tests; RPC event parsing (`agent_settled`, tool events) into the existing
    `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
@@ -236,8 +244,8 @@ Known gaps, tracked here and not yet fixed:
   findings".
 - Carry the parent task id for audit-log correlation. The worktree path and
   branch are executor inputs obtained only through `bind_workspace`.
-- New broker work is only the action gate, windows and leases (#706, not on
-  main) and the audit log. Path scope and protected paths are already enforced
+- New broker work is only windows and leases and the audit log; the per-action
+  gate is on main (#876) and is installed through `model_facing_registry`. Path scope and protected paths are already enforced
   inside the scoped file tools, and `ToolRegistry::execute` already does lookup,
   the production hold and denial recording; the broker must not reimplement
   them, and must build its registry with the path-scope-aware constructors.
