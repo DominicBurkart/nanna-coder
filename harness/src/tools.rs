@@ -122,6 +122,25 @@ struct ProductionHold {
     repo: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InstalledLayers {
+    pub(crate) scope: bool,
+    pub(crate) production_hold: bool,
+    pub(crate) action_gate: bool,
+    pub(crate) action_escalator: bool,
+}
+
+#[cfg(test)]
+impl InstalledLayers {
+    pub(crate) const ALL: Self = Self {
+        scope: true,
+        production_hold: true,
+        action_gate: true,
+        action_escalator: true,
+    };
+}
+
 /// Tools whose reach cannot be confined to path globs. `run_command` hands
 /// the model `sh -c` inside the container, so `scope.paths` and
 /// `scope.read_paths` cannot apply to it; [`ToolRegistry::scoped_for`] removes
@@ -162,6 +181,16 @@ impl ToolRegistry {
     pub fn with_action_escalator(mut self, escalator: Arc<Escalator>) -> Self {
         self.action_escalator = Some(escalator);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_layers(&self) -> InstalledLayers {
+        InstalledLayers {
+            scope: self.identity.is_some(),
+            production_hold: self.production_hold.is_some(),
+            action_gate: self.action_gate.is_some() && self.action_subject.is_some(),
+            action_escalator: self.action_escalator.is_some(),
+        }
     }
 
     /// Every action review recorded so far for this registry's task, in
