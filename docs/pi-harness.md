@@ -96,16 +96,31 @@ what is new:
    by `scoped_for` filters names but attaches no path scope. The broker adds
    nothing here.
 3. Pass the **action gate** (the auditor's per-action review) before
-   execution. New: not on main (#706).
+   execution. Exists on main (#876): `execute` runs it after the production
+   hold. `TaskRunner` installs the hold, the gate (with the task's action
+   subject) and the escalator on every model-facing registry through one
+   constructor, `model_facing_registry`; the broker must install exactly the
+   same layers through that constructor and build no registry any other way.
 4. For `Repository` and above: check the human-availability **window** and take
-   the coordination **lease**, holding it for the call. New: not on main
-   (#706).
+   the coordination **lease**, holding it for the call. New: the runner's
+   action subject carries no window, pull request or environment today, so
+   `Sandbox` and `Production` calls dispatched through it stop at the missing
+   lease context, and the broker has no window or lease handling.
 5. Check the **production hold** for `Production`. Exists: `execute` does it.
 6. Execute, and record the call for the task result and audit log. The audit
    log is new broker work; the registry records denials only.
 
-Only steps 3 and 4 (and the audit log) are new. Anything in steps 1, 2 and 5
-that the broker re-implements is a defect.
+`ModelFacingLayers` (the escalation log for the production hold, the action
+gate, the escalator and the task's action subject) is what `TaskRunner` builds
+per task, and `model_facing_registry` is the one place that turns a workspace's
+registry into the one a model may call: identity scope (or the read-only
+unscoped registry), then the hold, then the gate, then the escalator. Anything
+else that serves tool calls to a model must build its registry from the same
+value through that function, or it is a second door.
+
+Only step 4 (and the audit log) are new broker work; step 3 exists and must be
+installed, not re-implemented. Anything in steps 1, 2, 3 and 5 that the broker
+re-implements is a defect.
 
 Spawning goes through the existing spawn gate: a `ResolvedAgent` can only be
 built from an `Allowed` proof, and a `CheckedPlan` only from a `ResolvedAgent`,
@@ -187,7 +202,8 @@ Not yet done (in order):
 
 1. Broker, per the contract above and the real-pi constraints (refuse every call
    until `toolsAdded` has been verified; capabilities above Workspace withheld
-   until the per-action gate #706 is on main).
+   until windows and leases are handled; the per-action gate itself is on main
+   since #876).
 2. Executor trait plus a container executor (hardening above) with a fake for
    tests; RPC event parsing (`agent_settled`, tool events) into the existing
    `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
@@ -230,13 +246,18 @@ Known gaps, tracked here and not yet fixed:
   `check_repo` from the stored scope, so the executor cannot reimplement them.
   `resolve` does not assert that the audited repository is within
   `scope.repos`, and the audited repository may be a path.
+- The executor must detect all three pi failure signals (prompt `success:
+  false`, a final `stopReason: "error"`, the deadline) and map each to a
+  `FailureDiagnostics.error_type`, with the golden-JSON test; see "Real-pi
+  findings".
 - Carry the parent task id for audit-log correlation. The worktree path and
   branch are executor inputs obtained only through `bind_workspace`.
-- New broker work is only the action gate, windows and leases (#706, not on
-  main) and the audit log. Path scope and protected paths are already enforced
-  inside the scoped file tools, and `ToolRegistry::execute` already does lookup,
-  the production hold and denial recording; the broker must not reimplement
-  them, and must build its registry with the path-scope-aware constructors.
+- New broker work is only windows and leases and the audit log. The per-action
+  gate is on main (#876) and is installed through `model_facing_registry`. Path
+  scope and protected paths are already enforced inside the scoped file tools,
+  and `ToolRegistry::execute` already does lookup, the production hold and
+  denial recording; the broker must not reimplement them, and must build its
+  registry with the path-scope-aware constructors.
 
 - A `CheckedPlan` does not remember its agent or repository, so a plan for one
   agent could be handed to a broker built for another. The broker handle and
@@ -274,9 +295,14 @@ reference it when this stack merges.
 
 ## Real-pi findings (pi 1.2.0)
 
-Reported by the reviewer's verification pass, which installed pi 1.2.0 with
-`--ignore-scripts` in a throwaway directory and ran it on the host (evidence in
-`/var/tmp/pi-verify`, not in this repository). Pin pi to exactly 1.2.0.
+First reported by the reviewer's verification pass (pi 1.2.0 installed with
+`--ignore-scripts` in a throwaway directory and run on the host; that evidence
+is not in this repository), then reproduced and extended inside a container:
+`node:24-slim` (digest in `docs/pi-spike/evidence/01-image-digest.txt`), pi installed
+with `npm install --ignore-scripts --save-exact @earendil-works/pi-coding-agent@1.2.0`,
+`--network none`, driven over RPC with the adapter's exact flags and files
+against a mock gateway and broker. The scripts, raw evidence and checksums are in
+`docs/pi-spike/`. 1.2.0 is the npm `latest` dist-tag, so the pin stays.
 
 Confirmed:
 
@@ -291,7 +317,26 @@ Confirmed:
   replaced the nanna prompt. `--no-extensions` also stops pi auto-loading
   `$PI_CODING_AGENT_DIR/extensions/*.ts`.
 
+Further findings from the container run:
+
+- pi does **not** reject an unknown model name: it warns (`Using custom model
+  id`), returns `success: true` and exits 0. Model names must be validated by
+  nanna (`resolve` does).
+- A failing gateway (HTTP 500) still gives `success: true` and exit 0. The
+  failure appears only as an assistant message with `stopReason: "error"` in
+  `agent_end`, after pi has retried three times.
+- With a read-only agent directory the prompt returns `success: false`
+  (`EROFS`), and pi then does **not** exit.
+
 Constraints these findings put on the executor (none implemented):
+
+- There are three failure signals, and the executor must handle each: (a) a
+  prompt response with `success: false` means abort, kill the container and do
+  not wait for exit; (b) a final assistant message in `agent_end` with
+  `stopReason: "error"` is a task failure, because `success: true` and exit 0
+  hide a dead gateway; (c) the wall-clock deadline. Each must map to an existing
+  `FailureDiagnostics.error_type`, and the mapping is covered by the golden-JSON
+  test that keeps `tasks/result` unchanged.
 
 - There is no `get_tools` RPC command. The registered tool list appears only in
   the first system `message_start` event (`toolsAdded`), emitted after a prompt
@@ -316,9 +361,18 @@ and `error` handlers. The real-pi test must cover all of them.
 
 ## Still unverified
 
-- RPC event field schemas beyond `toolsAdded`, and exit codes.
-- Behaviour under the container hardening flags (nothing runs a container yet).
+These stay unverified, and labelled as such, until a test proves them:
 
-A real-pi integration test (`NANNA_PI_BIN`) must assert against real pi that no
-tool other than the granted ones is reachable, and it must **fail**, not skip,
-when pi is absent in CI.
+- Running as a non-root user, with a read-only root filesystem and with all
+  Linux capabilities dropped (the spike ran as the container's default,
+  rootless-mapped root).
+- The extension's timeout, oversize-reply and close handlers against real pi
+  (ten TypeScript mutants survive).
+- U+2028/U+2029 in RPC framing (the executor must use strict LF framing).
+- A real model, and how the container reaches the real model gateway.
+- RPC event field schemas beyond the fields used above.
+
+The real-pi test (`NANNA_PI_BIN`) must assert against real pi that no tool other
+than the granted ones is reachable. It must run in CI and must **fail**, not
+skip, when pi is absent. The CI job installs pi by exact version (1.2.0), in a
+container, with `--ignore-scripts`.

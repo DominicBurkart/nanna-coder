@@ -122,6 +122,25 @@ struct ProductionHold {
     repo: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InstalledLayers {
+    pub(crate) scope: bool,
+    pub(crate) production_hold: bool,
+    pub(crate) action_gate: bool,
+    pub(crate) action_escalator: bool,
+}
+
+#[cfg(test)]
+impl InstalledLayers {
+    pub(crate) const ALL: Self = Self {
+        scope: true,
+        production_hold: true,
+        action_gate: true,
+        action_escalator: true,
+    };
+}
+
 /// Tools whose reach cannot be confined to path globs. `run_command` hands
 /// the model `sh -c` inside the container, so `scope.paths` and
 /// `scope.read_paths` cannot apply to it; [`ToolRegistry::scoped_for`] removes
@@ -162,6 +181,16 @@ impl ToolRegistry {
     pub fn with_action_escalator(mut self, escalator: Arc<Escalator>) -> Self {
         self.action_escalator = Some(escalator);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_layers(&self) -> InstalledLayers {
+        InstalledLayers {
+            scope: self.identity.is_some(),
+            production_hold: self.production_hold.is_some(),
+            action_gate: self.action_gate.is_some() && self.action_subject.is_some(),
+            action_escalator: self.action_escalator.is_some(),
+        }
     }
 
     /// Every action review recorded so far for this registry's task, in
@@ -4716,7 +4745,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 9] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 58] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4726,6 +4755,79 @@ mod tests {
         (".github/CODEOWNERS", ".github/CODEOWNERS"),
         ("codecov.yml", "codecov.yml"),
         ("windows.toml", "windows.toml"),
+        ("tarpaulin.toml", "tarpaulin.toml"),
+        ("deny.toml", "deny.toml"),
+        ("flake.nix", "flake.nix"),
+        ("flake.lock", "flake.lock"),
+        (".github/rulesets/**", ".github/rulesets/main.json"),
+        (".githooks/**", ".githooks/pre-commit"),
+        (".cargo/**", ".cargo/config.toml"),
+        (".devcontainer/**", ".devcontainer/devcontainer.json"),
+        ("AGENTS.md", "AGENTS.md"),
+        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
+        ("harness/src/protected.rs", "harness/src/protected.rs"),
+        (".gitattributes", ".gitattributes"),
+        (".gitmodules", ".gitmodules"),
+        ("harness/src/scope.rs", "harness/src/scope.rs"),
+        ("CODEOWNERS", "CODEOWNERS"),
+        ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
+        (".github/**", ".github/actions/setup/action.yml"),
+        (".github/**", ".github/dependabot.yml"),
+        (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
+        (".envrc", ".envrc"),
+        (".config/**", ".config/nextest.toml"),
+        (".claude/**", ".claude/settings.json"),
+        ("nix/**", "nix/containers.nix"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        (
+            "docs/ci/protected-paths-guard.yml",
+            "docs/ci/protected-paths-guard.yml",
+        ),
+        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
+        ("harness/src/tools.rs", "harness/src/tools.rs"),
+        ("harness/src/marker.rs", "harness/src/marker.rs"),
+        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
+        (
+            "harness/src/action_auditor/**",
+            "harness/src/action_auditor/gate.rs",
+        ),
+        ("harness/src/windows.rs", "harness/src/windows.rs"),
+        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
+        ("harness/src/container.rs", "harness/src/container.rs"),
+        (
+            "harness/src/harness_adapter/isolation.rs",
+            "harness/src/harness_adapter/isolation.rs",
+        ),
+        (
+            "harness/src/harness_adapter/checked.rs",
+            "harness/src/harness_adapter/checked.rs",
+        ),
+        ("scripts/**", "scripts/install.sh"),
+        ("tests/security/**", "tests/security/test-ai-security.sh"),
+        ("tests/lib/**", "tests/lib/test-helpers.sh"),
+        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
+        ("harness/dev-container.toml", "harness/dev-container.toml"),
+        (
+            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/executor.rs",
+        ),
+        (
+            "harness/src/rollout/hooks.rs",
+            "harness/src/rollout/hooks.rs",
+        ),
+        (
+            "harness/src/rollout/serverless.rs",
+            "harness/src/rollout/serverless.rs",
+        ),
+        (
+            "harness/src/rollout/state.rs",
+            "harness/src/rollout/state.rs",
+        ),
+        ("harness/src/effects.rs", "harness/src/effects.rs"),
+        ("harness/src/leases/**", "harness/src/leases/store.rs"),
+        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
+        ("test-agentic-security.sh", "test-agentic-security.sh"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {

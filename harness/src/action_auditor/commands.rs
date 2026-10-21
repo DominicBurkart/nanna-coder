@@ -5328,6 +5328,8 @@ mod tests {
             ] {
                 let needle = if rule.starts_with(".git/") {
                     "git internals"
+                } else if rule.starts_with(".env") {
+                    "credential material"
                 } else {
                     "protected path"
                 };

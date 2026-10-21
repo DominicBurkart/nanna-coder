@@ -118,6 +118,8 @@
             (pkgs.lib.hasSuffix "\.toml" path) ||
             (pkgs.lib.hasSuffix "\.lock" path) ||
             (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
+            (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+            (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
             (pkgs.lib.hasInfix "/docs/" path) ||
             (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
             (type == "directory");
@@ -307,6 +309,8 @@
               (pkgs.lib.hasSuffix "\.toml" path) ||
               (pkgs.lib.hasSuffix "\.lock" path) ||
               (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
+              (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+              (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
               (pkgs.lib.hasInfix "/docs/" path) ||
               (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
               (type == "directory");
