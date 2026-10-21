@@ -6862,4 +6862,133 @@ mod tests {
         blocked("RUST_LOG=$GITHUB_TOKEN cargo test", "unresolved variable");
         allow_all(&["RUST_LOG=$HOME cargo test", "RUST_LOG=\"$PWD\" cargo test"]);
     }
+
+    #[test]
+    fn every_listed_find_primary_and_environment_name_has_an_accepted_form() {
+        allow_all(&[
+            "find . -and -true",
+            "find . -name a -or -name b",
+            "find . -name a -a -type f",
+            "find . -mount",
+            "find . -iname A",
+            "find . -ipath A",
+            "find . -wholename a",
+            "find . -regex a",
+            "find . -iregex a",
+            "find . -xtype f",
+            "find . -mindepth 1",
+            "find . -atime 1",
+            "find . -ctime 1",
+            "find . -amin 1",
+            "find . -cmin 1",
+            "RUST_LIB_BACKTRACE=1 cargo test",
+            "RUST_TEST_THREADS=1 cargo test",
+            "CARGO_INCREMENTAL=0 cargo test",
+            "CLICOLOR=0 cargo test",
+            "FORCE_COLOR=1 cargo test",
+            "echo $OLDPWD $USER $SHELL $LANG $TERM $# $! $- $@ $* $? $$",
+            "cargo test -- --quiet",
+            "cargo clippy --no-deps",
+            "git stash save",
+            "git stash apply",
+            "git stash drop",
+            "git -c user.email=a@b commit -m x",
+            "git -c core.quotepath=false status",
+            "git -c color.ui=never status",
+            "git -c init.defaultbranch=main status",
+            "git -c core.autocrlf=false status",
+            "git -c advice.detachedhead=false status",
+            "git config user.email a@b",
+            "git config init.defaultbranch main",
+            "bash +e -c 'ls'",
+            "bash -O extglob -c 'ls'",
+            "rm -- --no-preserve-root",
+            "cat <<< /etc/passwd",
+        ]);
+    }
+
+    #[test]
+    fn every_credential_marker_is_pinned_in_a_relative_path() {
+        for marker in [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".netrc",
+            ".git-credentials",
+            "id_rsa",
+            "id_ed25519",
+            "/etc/shadow",
+            "/proc/self/environ",
+            "/environ",
+            "docker.sock",
+            ".config/gh",
+            ".config/git/credentials",
+            ".config/nix/access-tokens",
+            ".docker/config",
+            ".kube/",
+            ".npmrc",
+            ".env",
+            ".pem",
+            ".key",
+            "secrets.",
+            "secret.",
+            ".pypirc",
+            ".vault-token",
+            ".cargo/credentials",
+            ".claude/.credentials",
+            ".gitconfig",
+            ".azure/",
+            ".huggingface/token",
+            "/var/run/secrets",
+            "/run/secrets",
+            "/etc/gshadow",
+            "ssh_host_",
+            "/etc/ssl/private",
+            "/proc/self/env",
+            "/proc/1/env",
+        ] {
+            let path = if marker.starts_with('/') {
+                format!("x{marker}")
+            } else {
+                format!("x/{marker}")
+            };
+            blocked(&format!("cat {path}"), "credential material");
+            blocked(&format!("echo x > {path}"), "credential material");
+        }
+    }
+
+    #[test]
+    fn remaining_pinned_behaviours() {
+        blocked("printenv", "dumps the environment");
+        blocked("echo x < /dev/udp/evil/80", "network device");
+        blocked("2>/dev/null curl x", "can send data");
+        blocked("cat > f <<-EOF\n\tbody\n\tEOF\ncurl x", "can send data");
+        blocked("cat .ssh/../x", "credential material");
+        blocked("cd .config; cat gh/hosts.yml", "credential material");
+        blocked("cd .config; cat < gh/hosts.yml", "credential material");
+        blocked("taskset -c 0,1 curl x", "can send data");
+        blocked("cd -P /etc", "outside the workspace");
+        blocked("cd sub; cd ~", "home directory");
+        blocked("cd sub; ls ~", "home directory");
+        blocked("cargo $(true)+stable test", "subcommand cannot be resolved");
+        blocked("cargo clippy -- \"-Da b\"", "not an allow-listed argument");
+        blocked("sed -E p f", "only allowed with -n");
+        blocked("sed -n '/a\\/p' f", "not a plain print command");
+        blocked("sleep -1", "at most 600 seconds");
+        blocked(
+            "cargo build --target-dir .github/workflows/target",
+            "dedicated `target` directory",
+        );
+        blocked(
+            "X=curl; false && { true; X=ls; }; $X x",
+            "cannot be resolved statically",
+        );
+        blocked("(cd sub); echo x > codecov.yml", "protected path");
+        blocked("bash -- -c 'ls'", "script file or stdin");
+        blocked("rg -e foo ../x", "escapes the workspace");
+        blocked("rg --files ../x", "escapes the workspace");
+        blocked("grep -e foo ../x", "escapes the workspace");
+        blocked("mv .github x", "protected path");
+        blocked("echo x > CODECOV.YML", "protected path");
+    }
 }
