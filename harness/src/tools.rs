@@ -301,7 +301,9 @@ impl ToolRegistry {
     /// review nor counts towards the three-denial escalation. This is the
     /// only chokepoint tool calls pass through, so the review is structural
     /// rather than something each `Tool` implementation must remember.
-    /// Calls below `Repository` reach the tool with no action review.
+    /// `run_command` is also reviewed, whatever its effect class, and is
+    /// refused when no gate is attached; other calls below `Repository`
+    /// reach the tool with no action review.
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult<Value> {
         let outcome = match (self.tools.get(name), &self.identity) {
             (Some(tool), _) => {
