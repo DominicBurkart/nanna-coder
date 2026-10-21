@@ -1,0 +1,1 @@
+podman run --rm -v /var/tmp/nanna-pi-spike/inst:/inst:Z node:24-slim sh -c "cd /inst && npm init -y >/dev/null && npm install --ignore-scripts --save-exact @earendil-works/pi-coding-agent@1.2.0"
