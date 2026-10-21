@@ -40,3 +40,8 @@ pub fn allow_gated(registry: ToolRegistry) -> ToolRegistry {
     };
     registry.with_action_gate(gate, subject)
 }
+
+#[test]
+fn the_allow_auditor_is_named_allow() {
+    assert_eq!(AllowAuditor.name(), "allow");
+}
