@@ -1898,7 +1898,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 26] = [
+    const PLACEHOLDER_FILES: [&str; 33] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1925,6 +1925,13 @@ mod tests {
         "harness/src/harness_adapter/checked.rs",
         "tests/run-all-tests.sh",
         "harness/dev-container.toml",
+        "harness/src/rollout/executor.rs",
+        "harness/src/rollout/hooks.rs",
+        "harness/src/rollout/serverless.rs",
+        "harness/src/rollout/state.rs",
+        "harness/src/effects.rs",
+        "auto-issue-pr.sh",
+        "test-agentic-security.sh",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1978,6 +1985,14 @@ mod tests {
             "tests/lib",
             "tests/run-all-tests.sh",
             "harness/dev-container.toml",
+            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/hooks.rs",
+            "harness/src/rollout/serverless.rs",
+            "harness/src/rollout/state.rs",
+            "harness/src/effects.rs",
+            "harness/src/leases",
+            "auto-issue-pr.sh",
+            "test-agentic-security.sh",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -2034,6 +2049,7 @@ mod tests {
             "nix",
             "harness/src/identity",
             "harness/src/action_auditor",
+            "harness/src/leases",
             "scripts",
             "tests/security",
             "tests/lib",

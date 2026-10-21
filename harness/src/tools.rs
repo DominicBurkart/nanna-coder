@@ -4714,7 +4714,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 50] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 58] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4777,6 +4777,26 @@ mod tests {
         ("tests/lib/**", "tests/lib/test-helpers.sh"),
         ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
         ("harness/dev-container.toml", "harness/dev-container.toml"),
+        (
+            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/executor.rs",
+        ),
+        (
+            "harness/src/rollout/hooks.rs",
+            "harness/src/rollout/hooks.rs",
+        ),
+        (
+            "harness/src/rollout/serverless.rs",
+            "harness/src/rollout/serverless.rs",
+        ),
+        (
+            "harness/src/rollout/state.rs",
+            "harness/src/rollout/state.rs",
+        ),
+        ("harness/src/effects.rs", "harness/src/effects.rs"),
+        ("harness/src/leases/**", "harness/src/leases/store.rs"),
+        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
+        ("test-agentic-security.sh", "test-agentic-security.sh"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {

@@ -5,11 +5,7 @@
 #
 # A pull request authored by a Nanna identity carries the marker from
 # harness::marker (a `Nanna-Identity: <name>` commit trailer or a
-# `<!-- Nanna-Identity: <name> -->` comment in the PR body). The check fails
-# closed: any PR touching a protected path fails, marker or not, unless it has
-# no marker and its author is listed in the repository variable
-# PROTECTED_PATTERNS_HUMAN_AUTHORS (comma-separated logins). Matching is
-# case-insensitive. The pattern list mirrors
+# `<!-- Nanna-Identity: <name> -->` comment in the PR body). The pattern list mirrors
 # harness::protected::PROTECTED_PATTERNS; a unit test keeps them in sync.
 
 name: protected-paths-guard
@@ -107,6 +103,14 @@ jobs:
             "tests/lib/**"
             "tests/run-all-tests.sh"
             "harness/dev-container.toml"
+            "harness/src/rollout/executor.rs"
+            "harness/src/rollout/hooks.rs"
+            "harness/src/rollout/serverless.rs"
+            "harness/src/rollout/state.rs"
+            "harness/src/effects.rs"
+            "harness/src/leases/**"
+            "auto-issue-pr.sh"
+            "test-agentic-security.sh"
           )
           shopt -s nocasematch
           VIOLATIONS=()

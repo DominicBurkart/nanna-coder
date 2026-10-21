@@ -74,6 +74,14 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "tests/lib/**",
     "tests/run-all-tests.sh",
     "harness/dev-container.toml",
+    "harness/src/rollout/executor.rs",
+    "harness/src/rollout/hooks.rs",
+    "harness/src/rollout/serverless.rs",
+    "harness/src/rollout/state.rs",
+    "harness/src/effects.rs",
+    "harness/src/leases/**",
+    "auto-issue-pr.sh",
+    "test-agentic-security.sh",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -357,6 +365,26 @@ mod tests {
         ("tests/lib/**", "tests/lib/test-helpers.sh"),
         ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
         ("harness/dev-container.toml", "harness/dev-container.toml"),
+        (
+            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/executor.rs",
+        ),
+        (
+            "harness/src/rollout/hooks.rs",
+            "harness/src/rollout/hooks.rs",
+        ),
+        (
+            "harness/src/rollout/serverless.rs",
+            "harness/src/rollout/serverless.rs",
+        ),
+        (
+            "harness/src/rollout/state.rs",
+            "harness/src/rollout/state.rs",
+        ),
+        ("harness/src/effects.rs", "harness/src/effects.rs"),
+        ("harness/src/leases/**", "harness/src/leases/store.rs"),
+        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
+        ("test-agentic-security.sh", "test-agentic-security.sh"),
     ];
 
     #[test]
@@ -431,6 +459,9 @@ mod tests {
             "harness/src/action_auditor",
             "scripts/install.ps1",
             "tests/security/test-environment.sh",
+            "harness/src/leases/acquire.rs",
+            "harness/src/leases",
+            "auto-issue-pr.sh",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -510,7 +541,10 @@ mod tests {
             "src/CLAUDE.md",
             "harness/src/action_auditors/x.rs",
             "harness/src/scheduler/policy.rs",
-            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/health.rs",
+            "harness/src/rollout/executor_extra.rs",
+            "harness/src/task.rs",
+            "harness/src/lib.rs",
             "harness/src/deploy/validate.rs",
             "harness/src/windows_extra.rs",
             "script/install.sh",
@@ -674,6 +708,14 @@ mod tests {
                 PathBuf::from("tests/lib"),
                 PathBuf::from("tests/run-all-tests.sh"),
                 PathBuf::from("harness/dev-container.toml"),
+                PathBuf::from("harness/src/rollout/executor.rs"),
+                PathBuf::from("harness/src/rollout/hooks.rs"),
+                PathBuf::from("harness/src/rollout/serverless.rs"),
+                PathBuf::from("harness/src/rollout/state.rs"),
+                PathBuf::from("harness/src/effects.rs"),
+                PathBuf::from("harness/src/leases"),
+                PathBuf::from("auto-issue-pr.sh"),
+                PathBuf::from("test-agentic-security.sh"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -735,6 +777,14 @@ mod tests {
                 ("tests/lib".to_string(), true),
                 ("tests/run-all-tests.sh".to_string(), false),
                 ("harness/dev-container.toml".to_string(), false),
+                ("harness/src/rollout/executor.rs".to_string(), false),
+                ("harness/src/rollout/hooks.rs".to_string(), false),
+                ("harness/src/rollout/serverless.rs".to_string(), false),
+                ("harness/src/rollout/state.rs".to_string(), false),
+                ("harness/src/effects.rs".to_string(), false),
+                ("harness/src/leases".to_string(), true),
+                ("auto-issue-pr.sh".to_string(), false),
+                ("test-agentic-security.sh".to_string(), false),
             ]
         );
     }

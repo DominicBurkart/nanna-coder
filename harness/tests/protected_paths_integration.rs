@@ -197,6 +197,14 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/harness/src/tools.rs").await;
     assert_refused(&registry, "echo x > /workspace/harness/src/container.rs").await;
     assert_refused(&registry, "echo x > /workspace/scripts/install.sh").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/effects.rs").await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/rollout/executor.rs",
+    )
+    .await;
+    assert_refused(&registry, "mkdir /workspace/harness/src/leases/sub").await;
+    assert_refused(&registry, "echo x > /workspace/auto-issue-pr.sh").await;
     assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
     assert_refused(
         &registry,
