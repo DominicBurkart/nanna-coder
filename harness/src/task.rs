@@ -1076,6 +1076,20 @@ impl TaskRunner {
         Arc::clone(&self.escalations.read().unwrap())
     }
 
+    fn model_facing_layers(
+        &self,
+        task_id: &TaskId,
+        queued: &QueuedTask,
+        identity: Option<&AgentIdentity>,
+    ) -> ModelFacingLayers {
+        ModelFacingLayers {
+            escalation_log: self.escalation_log(),
+            action_gate: self.action_gate(),
+            action_escalator: self.action_escalator(),
+            subject: action_subject_for(task_id, queued, identity),
+        }
+    }
+
     /// Record a queued entry as a `Pending` task and open its status watch.
     /// The receiver is retained as a keep-alive (see `StatusSenders`).
     async fn register(&self, queued: &QueuedTask, provider: Option<Arc<dyn ModelProvider>>) {
@@ -1310,7 +1324,8 @@ impl TaskRunner {
             }
         };
 
-        let tool_registry = match registry_for(&workspace, identity.as_ref()) {
+        let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
+        let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
             Ok(registry) => registry,
             Err(e) => {
                 let _ = workspace.cleanup();
@@ -1318,11 +1333,6 @@ impl TaskRunner {
                 return;
             }
         };
-        let tool_registry = tool_registry.with_production_hold(self.escalation_log(), None);
-        let subject = action_subject_for(&task_id, &queued, identity.as_ref());
-        let tool_registry = tool_registry
-            .with_action_gate(self.action_gate(), subject)
-            .with_action_escalator(self.action_escalator());
         let task_impact = match crate::impact::TaskImpact::load(&workspace.workspace_path) {
             Ok(task_impact) => task_impact,
             Err(e) => {
@@ -1487,6 +1497,24 @@ fn registry_for(
         Some(identity) => workspace.build_tool_registry_for(identity),
         None => Ok(workspace.build_tool_registry().read_only_unscoped()),
     }
+}
+
+pub(crate) struct ModelFacingLayers {
+    pub(crate) escalation_log: Arc<EscalationLog>,
+    pub(crate) action_gate: Arc<ActionGate>,
+    pub(crate) action_escalator: Arc<crate::escalation::Escalator>,
+    pub(crate) subject: crate::tools::ActionSubject,
+}
+
+pub(crate) fn model_facing_registry(
+    workspace: &TaskWorkspace,
+    identity: Option<&AgentIdentity>,
+    layers: ModelFacingLayers,
+) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
+    Ok(registry_for(workspace, identity)?
+        .with_production_hold(layers.escalation_log, None)
+        .with_action_gate(layers.action_gate, layers.subject)
+        .with_action_escalator(layers.action_escalator))
 }
 
 fn reject(e: crate::leases::LeaseError) -> QueueStoreError {
@@ -3539,6 +3567,30 @@ mod identity_tests {
             } => (diagnostics.error_type.as_str(), error.as_str()),
             other => panic!("expected a failed task, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_the_shared_constructor_installs_every_layer_for_scoped_and_unscoped_tasks() {
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let mut workspace = TaskWorkspace::create(repo.path(), "t-layers", "HEAD").unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let queued = queued(repo.path());
+        let identity = scoped_identity();
+        for id in [Some(&identity), None] {
+            let layers =
+                manager
+                    .runner
+                    .model_facing_layers(&TaskId("t-layers".to_string()), &queued, id);
+            let registry = model_facing_registry(&workspace, id, layers).unwrap();
+            assert_eq!(
+                registry.installed_layers(),
+                crate::tools::InstalledLayers::ALL
+            );
+        }
+        let bare = workspace.build_tool_registry_for(&identity).unwrap();
+        assert_ne!(bare.installed_layers(), crate::tools::InstalledLayers::ALL);
+        workspace.cleanup().unwrap();
     }
 
     #[test]
