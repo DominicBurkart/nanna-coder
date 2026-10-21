@@ -171,6 +171,46 @@ mod tests {
     }
 
     #[test]
+    fn test_file_type_from_extension_all_variants() {
+        // JavaScript variants
+        assert_eq!(FileType::from_extension("js"), FileType::JavaScript);
+        assert_eq!(FileType::from_extension("mjs"), FileType::JavaScript);
+        assert_eq!(FileType::from_extension("cjs"), FileType::JavaScript);
+
+        // TypeScript variants
+        assert_eq!(FileType::from_extension("tsx"), FileType::TypeScript);
+
+        // Other languages
+        assert_eq!(FileType::from_extension("go"), FileType::Go);
+        assert_eq!(FileType::from_extension("java"), FileType::Java);
+
+        // Data / config formats
+        assert_eq!(FileType::from_extension("json"), FileType::Json);
+        assert_eq!(FileType::from_extension("yaml"), FileType::Yaml);
+        assert_eq!(FileType::from_extension("yml"), FileType::Yaml);
+        assert_eq!(FileType::from_extension("nix"), FileType::Nix);
+
+        // Documentation
+        assert_eq!(FileType::from_extension("md"), FileType::Markdown);
+        assert_eq!(FileType::from_extension("markdown"), FileType::Markdown);
+
+        // Shell scripts
+        assert_eq!(FileType::from_extension("sh"), FileType::Shell);
+        assert_eq!(FileType::from_extension("bash"), FileType::Shell);
+        assert_eq!(FileType::from_extension("zsh"), FileType::Shell);
+
+        // Dockerfile as extension (lowercase)
+        assert_eq!(FileType::from_extension("dockerfile"), FileType::Dockerfile);
+
+        // Case-insensitive matching
+        assert_eq!(FileType::from_extension("RS"), FileType::Rust);
+        assert_eq!(FileType::from_extension("PY"), FileType::Python);
+        assert_eq!(FileType::from_extension("TS"), FileType::TypeScript);
+        assert_eq!(FileType::from_extension("JS"), FileType::JavaScript);
+        assert_eq!(FileType::from_extension("GO"), FileType::Go);
+    }
+
+    #[test]
     fn test_file_type_from_path() {
         use std::path::Path;
 
@@ -183,6 +223,118 @@ mod tests {
             FileType::Dockerfile
         );
         assert_eq!(FileType::from_path(Path::new("flake.nix")), FileType::Nix);
+    }
+
+    #[test]
+    fn test_file_type_from_path_extended() {
+        use std::path::Path;
+
+        // No extension
+        assert_eq!(
+            FileType::from_path(Path::new("README")),
+            FileType::Other("unknown".to_string())
+        );
+
+        // Case-insensitive dockerfile filename matching
+        assert_eq!(
+            FileType::from_path(Path::new("dockerfile")),
+            FileType::Dockerfile
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("DOCKERFILE")),
+            FileType::Dockerfile
+        );
+
+        // Python, Go, Java paths
+        assert_eq!(
+            FileType::from_path(Path::new("src/app.py")),
+            FileType::Python
+        );
+        assert_eq!(FileType::from_path(Path::new("cmd/main.go")), FileType::Go);
+        assert_eq!(FileType::from_path(Path::new("App.java")), FileType::Java);
+
+        // JSON / YAML
+        assert_eq!(
+            FileType::from_path(Path::new("config.json")),
+            FileType::Json
+        );
+        assert_eq!(FileType::from_path(Path::new("ci.yaml")), FileType::Yaml);
+        assert_eq!(
+            FileType::from_path(Path::new("docker-compose.yml")),
+            FileType::Yaml
+        );
+
+        // Shell and Markdown
+        assert_eq!(FileType::from_path(Path::new("run.sh")), FileType::Shell);
+        assert_eq!(
+            FileType::from_path(Path::new("README.md")),
+            FileType::Markdown
+        );
+    }
+
+    fn make_file_entity(file_type: FileType) -> FileEntity {
+        use crate::entities::{EntityMetadata, EntityType};
+        FileEntity {
+            metadata: EntityMetadata::new(EntityType::Ast),
+            path: std::path::PathBuf::from("dummy"),
+            relative_path: "dummy".to_string(),
+            file_type,
+            size_bytes: 0,
+            content_preview: String::new(),
+            line_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_is_source_code_true_for_all_source_variants() {
+        for ft in [
+            FileType::Rust,
+            FileType::Python,
+            FileType::JavaScript,
+            FileType::TypeScript,
+            FileType::Go,
+            FileType::Java,
+        ] {
+            let entity = make_file_entity(ft.clone());
+            assert!(entity.is_source_code(), "{:?} should be source code", ft);
+            assert!(!entity.is_config(), "{:?} should not be config", ft);
+        }
+    }
+
+    #[test]
+    fn test_is_config_true_for_all_config_variants() {
+        for ft in [
+            FileType::Toml,
+            FileType::Json,
+            FileType::Yaml,
+            FileType::Dockerfile,
+            FileType::Nix,
+        ] {
+            let entity = make_file_entity(ft.clone());
+            assert!(entity.is_config(), "{:?} should be config", ft);
+            assert!(
+                !entity.is_source_code(),
+                "{:?} should not be source code",
+                ft
+            );
+        }
+    }
+
+    #[test]
+    fn test_neither_source_nor_config_for_other_types() {
+        for ft in [
+            FileType::Markdown,
+            FileType::Shell,
+            FileType::Other("bin".to_string()),
+        ] {
+            let entity = make_file_entity(ft.clone());
+            assert!(
+                !entity.is_source_code(),
+                "{:?} should not be source code",
+                ft
+            );
+            assert!(!entity.is_config(), "{:?} should not be config", ft);
+        }
     }
 
     #[tokio::test]
@@ -199,6 +351,22 @@ mod tests {
         assert_eq!(entity.line_count, 3);
         assert!(entity.is_source_code());
         assert!(!entity.is_config());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_entity_is_config_toml() {
+        let temp_dir = std::env::temp_dir().join("nanna_test_file_entity_toml");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("Cargo.toml");
+        std::fs::write(&test_file, "[package]\nname = \"test\"\n").unwrap();
+
+        let entity = FileEntity::from_path(test_file.clone(), &temp_dir).unwrap();
+
+        assert_eq!(entity.file_type, FileType::Toml);
+        assert!(entity.is_config());
+        assert!(!entity.is_source_code());
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
