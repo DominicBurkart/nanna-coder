@@ -1444,12 +1444,6 @@ fn registry_for(
     }
 }
 
-/// What a task's registry needs on top of its identity scope before a model may
-/// call it: the production hold, the per-action gate with the subject its
-/// calls are reviewed against, and the escalator that delivers a halt. The
-/// runner builds one per task, and anything else that serves tool calls to a
-/// model must build its registry from the same value through
-/// [`model_facing_registry`], so no path reaches the tools without them.
 pub(crate) struct ModelFacingLayers {
     pub(crate) escalation_log: Arc<EscalationLog>,
     pub(crate) action_gate: Arc<ActionGate>,
@@ -1457,9 +1451,6 @@ pub(crate) struct ModelFacingLayers {
     pub(crate) subject: crate::tools::ActionSubject,
 }
 
-/// The one place a model-facing registry is assembled: the workspace's
-/// identity-scoped (or read-only unscoped) registry, then the production hold,
-/// then the action gate, then the escalator.
 pub(crate) fn model_facing_registry(
     workspace: &TaskWorkspace,
     identity: Option<&AgentIdentity>,

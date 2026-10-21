@@ -110,6 +110,14 @@ what is new:
 6. Execute, and record the call for the task result and audit log. The audit
    log is new broker work; the registry records denials only.
 
+`ModelFacingLayers` (the escalation log for the production hold, the action
+gate, the escalator and the task's action subject) is what `TaskRunner` builds
+per task, and `model_facing_registry` is the one place that turns a workspace's
+registry into the one a model may call: identity scope (or the read-only
+unscoped registry), then the hold, then the gate, then the escalator. Anything
+else that serves tool calls to a model must build its registry from the same
+value through that function, or it is a second door.
+
 Only step 4 (and the audit log) are new broker work; step 3 exists and must be
 installed, not re-implemented. Anything in steps 1, 2, 3 and 5 that the broker
 re-implements is a defect.
@@ -244,11 +252,12 @@ Known gaps, tracked here and not yet fixed:
   findings".
 - Carry the parent task id for audit-log correlation. The worktree path and
   branch are executor inputs obtained only through `bind_workspace`.
-- New broker work is only windows and leases and the audit log; the per-action
-  gate is on main (#876) and is installed through `model_facing_registry`. Path scope and protected paths are already enforced
-  inside the scoped file tools, and `ToolRegistry::execute` already does lookup,
-  the production hold and denial recording; the broker must not reimplement
-  them, and must build its registry with the path-scope-aware constructors.
+- New broker work is only windows and leases and the audit log. The per-action
+  gate is on main (#876) and is installed through `model_facing_registry`. Path
+  scope and protected paths are already enforced inside the scoped file tools,
+  and `ToolRegistry::execute` already does lookup, the production hold and
+  denial recording; the broker must not reimplement them, and must build its
+  registry with the path-scope-aware constructors.
 
 - A `CheckedPlan` does not remember its agent or repository, so a plan for one
   agent could be handed to a broker built for another. The broker handle and
