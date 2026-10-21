@@ -1906,6 +1906,7 @@ mod tests {
             ".github/CODEOWNERS",
             "codecov.yml",
             "windows.toml",
+            "harness/src/pr_tools.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -1954,7 +1955,12 @@ mod tests {
         assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
         assert!(root.join(".nanna").is_dir());
         assert!(root.join(".github/workflows").is_dir());
-        for file in ["codecov.yml", "windows.toml", ".github/CODEOWNERS"] {
+        for file in [
+            "codecov.yml",
+            "windows.toml",
+            ".github/CODEOWNERS",
+            "harness/src/pr_tools.rs",
+        ] {
             let meta = std::fs::metadata(root.join(file)).unwrap();
             assert!(meta.is_file() && meta.len() == 0, "{file}");
         }
@@ -1965,6 +1971,7 @@ mod tests {
             vec![
                 PathBuf::from(".github/CODEOWNERS"),
                 PathBuf::from("codecov.yml"),
+                PathBuf::from("harness/src/pr_tools.rs"),
                 PathBuf::from("windows.toml"),
             ]
         );
@@ -2053,6 +2060,7 @@ mod tests {
             placeholders,
             vec![
                 PathBuf::from(".github/CODEOWNERS"),
+                PathBuf::from("harness/src/pr_tools.rs"),
                 PathBuf::from("windows.toml"),
             ]
         );

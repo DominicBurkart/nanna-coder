@@ -34,6 +34,7 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".github/CODEOWNERS",
     "codecov.yml",
     "windows.toml",
+    "harness/src/pr_tools.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -262,6 +263,7 @@ mod tests {
             (".github/CODEOWNERS", ".github/CODEOWNERS"),
             ("codecov.yml", "codecov.yml"),
             ("windows.toml", "windows.toml"),
+            ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
         ];
         let protected = protected();
         for (rule, path) in table {
@@ -290,6 +292,11 @@ mod tests {
             "nanna/agents/x.toml",
             "codecov.yml.bak",
             "docs/windows.toml",
+            "harness/src/pr_tool.rs",
+            "harness/src/pr_tools.rs.bak",
+            "harness/src/pr_tools",
+            "other/harness/src/pr_tools.rs",
+            "harness/pr_tools.rs",
             ".nannax/agents/x.toml",
         ] {
             assert!(!protected.is_protected(Path::new(path)), "{path}");
@@ -368,6 +375,7 @@ mod tests {
                 PathBuf::from(".github/CODEOWNERS"),
                 PathBuf::from("codecov.yml"),
                 PathBuf::from("windows.toml"),
+                PathBuf::from("harness/src/pr_tools.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -389,6 +397,7 @@ mod tests {
                 (".github/CODEOWNERS".to_string(), false),
                 ("codecov.yml".to_string(), false),
                 ("windows.toml".to_string(), false),
+                ("harness/src/pr_tools.rs".to_string(), false),
             ]
         );
     }
@@ -444,5 +453,14 @@ mod tests {
         }
         assert!(guard.contains(crate::marker::IDENTITY_TRAILER));
         assert!(guard.contains("on:\n  pull_request:"));
+    }
+
+    #[test]
+    fn agents_md_documents_every_protected_pattern() {
+        let agents = include_str!("../../AGENTS.md").replace("\r\n", "\n");
+        for pattern in PROTECTED_PATTERNS {
+            let quoted = format!("`{pattern}`");
+            assert!(agents.contains(&quoted), "{pattern} missing from AGENTS.md");
+        }
     }
 }

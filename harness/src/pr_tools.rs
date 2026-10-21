@@ -6791,4 +6791,57 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn commit_and_push_refuse_a_change_to_the_pr_tools_source_itself() {
+        let fixture = push_fixture();
+        commit_file(
+            fixture.work.path(),
+            "harness/src/pr_tools.rs",
+            "a\n",
+            "base",
+        );
+        git(fixture.work.path(), &["push", "-q", "origin", "main"]);
+        git(
+            fixture.work.path(),
+            &["checkout", "-q", "-b", "feature-self"],
+        );
+        std::fs::write(
+            fixture.work.path().join("harness/src/pr_tools.rs"),
+            "tampered\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.work.path().join("ok.txt"), "ok").unwrap();
+        let before = head_sha(fixture.work.path());
+        let commit = GitCommitTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+        let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("protected"), "{err}");
+        assert_eq!(head_sha(fixture.work.path()), before);
+
+        git(fixture.work.path(), &["add", "-A"]);
+        git(
+            fixture.work.path(),
+            &["commit", "-q", "-m", "self\n\nNanna-Identity: sdlc-dev"],
+        );
+        let push = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+        let err = push.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("protected"), "{err}");
+        assert!(!remote_has(fixture.work.path(), "feature-self"));
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_an_untracked_pr_tools_source_out_of_the_commit() {
+        let dir = feature_repo();
+        std::fs::create_dir_all(dir.path().join("harness/src")).unwrap();
+        std::fs::write(dir.path().join("harness/src/pr_tools.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(
+            result["skipped_protected"],
+            json!(["harness/src/pr_tools.rs"])
+        );
+        let tracked = run_git(dir.path(), &["ls-files"]).unwrap();
+        assert!(!tracked.contains("pr_tools.rs"));
+    }
 }

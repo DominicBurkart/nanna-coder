@@ -69,6 +69,7 @@ jobs:
             ".github/CODEOWNERS"
             "codecov.yml"
             "windows.toml"
+            "harness/src/pr_tools.rs"
           )
           VIOLATIONS=()
           while IFS= read -r -d '' path; do

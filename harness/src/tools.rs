@@ -4750,7 +4750,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 9] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 10] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4760,6 +4760,7 @@ mod tests {
         (".github/CODEOWNERS", ".github/CODEOWNERS"),
         ("codecov.yml", "codecov.yml"),
         ("windows.toml", "windows.toml"),
+        ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
