@@ -50,7 +50,12 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+fn plain(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
 fn dispatch_name(name: &str) -> bool {
+    let name = plain(name);
     name.starts_with("submit") || name == "enqueue" || name.starts_with("enqueue_")
 }
 
@@ -73,7 +78,9 @@ struct Scan {
     branches: usize,
     declarations: BTreeSet<String>,
     calls: BTreeMap<String, usize>,
-    macro_mentions: BTreeSet<String>,
+    item_uses: BTreeSet<String>,
+    field_writes: BTreeSet<String>,
+    functions: BTreeSet<String>,
     sequences: BTreeMap<String, Calls>,
 }
 
@@ -86,7 +93,12 @@ impl Scan {
     }
 
     fn record_call(&mut self, name: &str) {
+        let name = plain(name);
         let Some(function) = self.function.last().cloned() else {
+            if dispatch_name(name) {
+                self.item_uses
+                    .insert(format!("{}: item-level use of {name}", self.file));
+            }
             return;
         };
         let branch = self.branch.clone();
@@ -107,15 +119,7 @@ impl Scan {
             match token {
                 TokenTree::Group(group) => self.scan_tokens(group.stream()),
                 TokenTree::Ident(ident) => {
-                    let name = ident.to_string();
-                    if self.function.is_empty() {
-                        if dispatch_name(&name) {
-                            self.macro_mentions
-                                .insert(format!("{}: item macro mentions {name}", self.file));
-                        }
-                    } else {
-                        self.record_call(&name);
-                    }
+                    self.record_call(&ident.to_string());
                 }
                 _ => {}
             }
@@ -126,7 +130,9 @@ impl Scan {
         if is_cfg_test(attrs) {
             return false;
         }
+        let name = plain(name);
         let qualified = self.qualified(name);
+        self.functions.insert(format!("{}: {qualified}", self.file));
         if dispatch_name(name) {
             self.declarations
                 .insert(format!("{}: {qualified} ({})", self.file, visibility(vis)));
@@ -146,6 +152,10 @@ impl Scan {
 impl<'ast> Visit<'ast> for Scan {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         if !is_cfg_test(&node.attrs) {
+            if node.attrs.iter().any(|attr| attr.path().is_ident("path")) {
+                self.item_uses
+                    .insert(format!("{}: #[path] module {}", self.file, node.ident));
+            }
             syn::visit::visit_item_mod(self, node);
         }
     }
@@ -191,6 +201,17 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         syn::visit::visit_expr_method_call(self, node);
         self.record_call(&node.method.to_string());
+        if node.method == "write" {
+            if let syn::Expr::Field(field) = &*node.receiver {
+                if let syn::Member::Named(member) = &field.member {
+                    if member == "escalations" || member == "escalator" {
+                        let function = self.function.last().cloned().unwrap_or_default();
+                        self.field_writes
+                            .insert(format!("{}: {function} writes {member}", self.file));
+                    }
+                }
+            }
+        }
     }
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
@@ -239,6 +260,10 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if last_segment(&node.path) == "include" {
+            self.item_uses
+                .insert(format!("{}: include! macro", self.file));
+        }
         self.scan_tokens(node.tokens.clone());
     }
 }
@@ -317,8 +342,17 @@ fn the_set_of_submit_and_enqueue_functions_is_pinned() {
 }
 
 #[test]
-fn no_macro_outside_a_function_mentions_a_submit_or_enqueue_name() {
-    assert_eq!(union(|scan| &scan.macro_mentions), BTreeSet::new());
+fn no_item_level_code_mentions_a_submit_or_enqueue_name_or_pulls_in_files() {
+    assert_eq!(union(|scan| &scan.item_uses), BTreeSet::new());
+}
+
+#[test]
+fn the_escalation_log_is_installed_at_construction_and_never_swapped_in_production() {
+    assert_eq!(union(|scan| &scan.field_writes), BTreeSet::new());
+    let functions = union(|scan| &scan.functions);
+    assert!(!functions.contains("task.rs: TaskManager::with_escalations"));
+    assert!(!functions.contains("task.rs: TaskManager::with_escalator"));
+    assert!(functions.contains("task.rs: TaskManager::restore_with_escalations"));
 }
 
 #[test]
@@ -446,12 +480,56 @@ fn function_references_macro_bodies_and_item_macros_are_seen() {
         "macro_rules! hit { ($m:expr) => { $m.submit_task(1) }; }",
     );
     assert!(definition
-        .macro_mentions
-        .contains("x.rs: item macro mentions submit_task"));
+        .item_uses
+        .contains("x.rs: item-level use of submit_task"));
     let generated = scan_source("x.rs", "gen! { pub async fn submit_zz() {} }");
     assert!(generated
-        .macro_mentions
-        .contains("x.rs: item macro mentions submit_zz"));
+        .item_uses
+        .contains("x.rs: item-level use of submit_zz"));
+}
+
+#[test]
+fn function_pointers_in_items_path_modules_includes_and_raw_identifiers_are_seen() {
+    for source in [
+        "const F: fn() = TaskManager::submit_task as fn();",
+        "pub static F: Option<fn()> = Some(TaskManager::submit_task as fn());",
+        "struct H { f: fn() } const S: H = H { f: TaskManager::submit_task as fn() };",
+        "impl H { const F: fn() = TaskManager::submit_task; }",
+        "const G: () = { m.submit_task(1); };",
+    ] {
+        let scan = scan_source("x.rs", source);
+        assert!(
+            scan.item_uses
+                .contains("x.rs: item-level use of submit_task"),
+            "{source}"
+        );
+    }
+    let path = scan_source("x.rs", "#[path = \"../tests/ext.rs\"] mod ext;");
+    assert!(path.item_uses.contains("x.rs: #[path] module ext"));
+    let include = scan_source("x.rs", "include!(\"../tests/ext.rs\");");
+    assert!(include.item_uses.contains("x.rs: include! macro"));
+    let nested = scan_source("x.rs", "fn f() { include!(\"zz.txt\"); }");
+    assert!(nested.item_uses.contains("x.rs: include! macro"));
+    let raw = scan_source("x.rs", "fn f() { m.r#submit_task(1); }");
+    assert_eq!(raw.calls["x.rs: f uses submit_task"], 1);
+    let raw_fn = scan_source("x.rs", "pub fn r#submit_zz() {}");
+    assert!(raw_fn.declarations.contains("x.rs: submit_zz (pub)"));
+}
+
+#[test]
+fn a_late_write_of_the_escalation_log_is_seen() {
+    let late = scan_source(
+        "x.rs",
+        "impl M { fn restore(&self) { *self.runner.escalations.write().unwrap() = log; } }",
+    );
+    assert!(late
+        .field_writes
+        .contains("x.rs: M::restore writes escalations"));
+    let escalator = scan_source(
+        "x.rs",
+        "fn f(m: M) { *m.escalator.write().unwrap() = None; }",
+    );
+    assert!(escalator.field_writes.contains("x.rs: f writes escalator"));
 }
 
 #[test]
