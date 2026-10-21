@@ -448,6 +448,7 @@ impl TaskManager {
             leases,
             None,
             Arc::new(EscalationLog::in_memory()),
+            None,
         )
     }
 
@@ -488,6 +489,7 @@ impl TaskManager {
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
     ) -> Result<Self, QueueStoreError> {
+        let gate_leases = Arc::clone(&leases);
         Self::restore_with_escalations(
             max_concurrent_tasks,
             policy,
@@ -496,6 +498,7 @@ impl TaskManager {
             provider,
             identities,
             Arc::new(EscalationLog::in_memory()),
+            default_action_gate(gate_leases),
         )
         .await
     }
@@ -509,6 +512,7 @@ impl TaskManager {
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
         escalations: Arc<EscalationLog>,
+        action_gate: Arc<ActionGate>,
     ) -> Result<Self, QueueStoreError> {
         let manager = Self::build(
             max_concurrent_tasks,
@@ -517,6 +521,7 @@ impl TaskManager {
             leases,
             Some(provider),
             escalations,
+            Some(action_gate),
         )?;
         manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
@@ -538,8 +543,9 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
         escalations: Arc<EscalationLog>,
+        action_gate: Option<Arc<ActionGate>>,
     ) -> Result<Self, QueueStoreError> {
-        let action_gate = default_action_gate(Arc::clone(&leases));
+        let action_gate = action_gate.unwrap_or_else(|| default_action_gate(Arc::clone(&leases)));
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -569,7 +575,8 @@ impl TaskManager {
 
     /// Use `escalations` (for example the persisted log under `mcp-serve`)
     /// instead of the in-memory default.
-    pub fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
         *self.runner.escalations.write().unwrap() = escalations;
         self
     }
@@ -602,8 +609,17 @@ impl TaskManager {
         model: Option<(Arc<dyn ModelProvider>, String)>,
         log: crate::action_auditor::ActionAuditLog,
     ) -> Self {
+        let gate = Self::action_policy_gate(self.leases(), windows, model, log);
+        self.with_action_gate(gate)
+    }
+
+    pub fn action_policy_gate(
+        leases: Arc<dyn LeaseStore>,
+        windows: crate::windows::WindowSet,
+        model: Option<(Arc<dyn ModelProvider>, String)>,
+        log: crate::action_auditor::ActionAuditLog,
+    ) -> Arc<ActionGate> {
         let windows = Arc::new(windows);
-        let leases = self.leases();
         let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
             Some((provider, name)) => Arc::new(crate::action_auditor::ModelActionAuditor::new(
                 provider,
@@ -618,7 +634,7 @@ impl TaskManager {
                 DEFAULT_ACTION_LEASE_TTL,
             )),
         };
-        self.with_action_gate(Arc::new(ActionGate::new(auditor, log)))
+        Arc::new(ActionGate::new(auditor, log))
     }
 
     /// The gate every dispatched task's effectful calls pass through.
@@ -629,7 +645,8 @@ impl TaskManager {
     /// Deliver action-auditor escalations through `escalator` and use its
     /// log as this manager's escalation log. Without one, an escalation is
     /// recorded in the escalation log only and no sink delivers it.
-    pub fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>) -> Self {
         *self.runner.escalations.write().unwrap() = Arc::clone(escalator.log());
         *self.runner.escalator.write().unwrap() = Some(escalator);
         self
@@ -3235,38 +3252,6 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
-    async fn test_restore_installs_the_supplied_escalation_log_before_dispatching() {
-        let store = InMemoryQueueStore::default();
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("unused")]);
-        let entry = queued(Path::new("/nonexistent"));
-        store.insert(&entry).unwrap();
-        let log = Arc::new(EscalationLog::in_memory());
-        let manager = TaskManager::restore_with_escalations(
-            1,
-            Box::new(HybridPolicy::default()),
-            Box::new(store),
-            Arc::new(InMemoryLeaseStore::default()),
-            provider,
-            &crate::identity::IdentityCatalog::default(),
-            Arc::clone(&log),
-        )
-        .await
-        .unwrap();
-        assert!(Arc::ptr_eq(&manager.escalations(), &log));
-        assert!(Arc::ptr_eq(manager.runner.action_escalator().log(), &log));
-        let default = TaskManager::restore(
-            1,
-            Box::new(HybridPolicy::default()),
-            Box::new(InMemoryQueueStore::default()),
-            Arc::new(InMemoryLeaseStore::default()),
-            MockProvider::new(vec![]),
-        )
-        .await
-        .unwrap();
-        assert!(!Arc::ptr_eq(&default.escalations(), &log));
-    }
-
-    #[tokio::test]
     async fn test_cancel_queued_task_removes_it_from_store() {
         let store = InMemoryQueueStore::default();
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![stop_response("unused")]);
@@ -3893,6 +3878,60 @@ mod identity_tests {
         assert_eq!(snapshot.tracked, 1);
         assert_eq!(snapshot.occurrences, 1);
         assert!(snapshot.holds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_task_escalates_into_the_supplied_log_through_the_supplied_gate() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let entry = QueuedTask::new(
+            "Check PR status",
+            repo_dir.path().to_path_buf(),
+            "HEAD",
+            "mock",
+            20,
+        )
+        .with_identity_hint(Some("pr-shepherd".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let log = Arc::new(EscalationLog::in_memory());
+        let leases: Arc<dyn LeaseStore> = Arc::new(InMemoryLeaseStore::default());
+        let manager = TaskManager::restore_with_escalations(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            leases,
+            provider,
+            &catalog,
+            Arc::clone(&log),
+            escalating_gate(),
+        )
+        .await
+        .unwrap();
+        wait_for(&manager, &entry.id, terminal).await;
+        assert!(Arc::ptr_eq(&manager.escalations(), &log));
+        let snapshot = log.snapshot(Utc::now());
+        assert_eq!(snapshot.tracked, 1);
+        assert_eq!(snapshot.occurrences, 1);
+        let default = TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            MockProvider::new(vec![]),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&default.escalations(), &log));
     }
 
     async fn run_github_status_task(manager: &TaskManager) -> TaskResult {

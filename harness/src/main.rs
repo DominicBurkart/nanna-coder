@@ -1495,23 +1495,26 @@ async fn build_mcp_task_manager(
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
+    let leases: Arc<dyn harness::leases::LeaseStore> = Arc::new(JsonlLeaseStore::open(lease_path)?);
+    let action_gate = TaskManager::action_policy_gate(
+        Arc::clone(&leases),
+        harness::task::action_windows_from(&|key| std::env::var_os(key)),
+        Some((provider.clone(), model.to_string())),
+        harness::action_auditor::ActionAuditLog::file(
+            queue_path.with_file_name("action_audit.jsonl"),
+        ),
+    );
     Ok(TaskManager::restore_with_escalations(
         DEFAULT_MAX_CONCURRENT_TASKS,
         Box::new(HybridPolicy::default()),
         Box::new(JsonlQueueStore::open(queue_path)?),
-        Arc::new(JsonlLeaseStore::open(lease_path)?),
-        provider.clone(),
+        leases,
+        provider,
         catalog,
         escalation_log,
+        action_gate,
     )
-    .await?
-    .with_action_policy(
-        harness::task::action_windows_from(&|key| std::env::var_os(key)),
-        Some((provider, model.to_string())),
-        harness::action_auditor::ActionAuditLog::file(
-            queue_path.with_file_name("action_audit.jsonl"),
-        ),
-    ))
+    .await?)
 }
 
 fn build_delegate_task_manager(
