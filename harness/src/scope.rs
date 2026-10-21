@@ -824,6 +824,24 @@ mod tests {
     }
 
     #[test]
+    fn writes_reject_parent_components_even_when_the_path_stays_inside_the_worktree() {
+        let ws = workspace();
+        let root = ws.path();
+        for path in [
+            "api/../new.rs",
+            "api/x/../../.nanna/agents/x.toml",
+            "./api/../a",
+        ] {
+            let rejected = validate_path_for_write(Path::new(path), root);
+            assert!(
+                matches!(&rejected, Err(ToolError::PathSecurityViolation { message }) if message == "Path contains '..' components"),
+                "{path}: {rejected:?}"
+            );
+        }
+        assert!(validate_path_for_write(Path::new("api/new.rs"), root).is_ok());
+    }
+
+    #[test]
     fn unscoped_writes_allow_new_files_and_reject_escapes() {
         let ws = workspace();
         let root = ws.path();

@@ -189,8 +189,30 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "mkdir -p /workspace/.nanna/agents").await;
     assert_refused(&registry, "echo x > /workspace/.nanna/new.toml").await;
     assert_refused(&registry, "mkdir -p /workspace/.github/workflows/sub").await;
-    assert_refused(&registry, "echo x > /workspace/.github/workflows/ci.yml").await;
-    assert_refused(&registry, "echo x > /workspace/.github/CODEOWNERS").await;
+    assert_refused(&registry, "echo x > /workspace/.github/dependabot.yml").await;
+    assert_refused(&registry, "mkdir -p /workspace/.github/actions/setup").await;
+    assert_refused(&registry, "echo x > /workspace/.envrc").await;
+    assert_refused(&registry, "echo x > /workspace/CLAUDE.md").await;
+    assert_refused(&registry, "mkdir -p /workspace/nix/sub").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/tools.rs").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/container.rs").await;
+    assert_refused(&registry, "echo x > /workspace/scripts/install.sh").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/effects.rs").await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/rollout/executor.rs",
+    )
+    .await;
+    assert_refused(&registry, "mkdir /workspace/harness/src/leases/sub").await;
+    assert_refused(&registry, "echo x > /workspace/auto-issue-pr.sh").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/pr_tools.rs").await;
+    assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/action_auditor/gate.rs",
+    )
+    .await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/identity/new.rs").await;
     assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
     assert_refused(&registry, "echo x > /workspace/windows.toml").await;
     assert_blocked(&registry, "echo 'gitdir: /tmp/evil' > /workspace/.git").await;
@@ -208,12 +230,19 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         0
     );
     assert_eq!(
-        std::fs::read_dir(workspace.join(".github/workflows"))
+        std::fs::read_dir(workspace.join(".github"))
             .unwrap()
             .count(),
         0
     );
-    for placeholder in ["codecov.yml", "windows.toml", ".github/CODEOWNERS"] {
+    for placeholder in [
+        "codecov.yml",
+        "windows.toml",
+        ".envrc",
+        "CLAUDE.md",
+        "harness/src/tools.rs",
+        "harness/src/pr_tools.rs",
+    ] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
                 .unwrap()

@@ -4750,7 +4750,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 10] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 59] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4760,6 +4760,79 @@ mod tests {
         (".github/CODEOWNERS", ".github/CODEOWNERS"),
         ("codecov.yml", "codecov.yml"),
         ("windows.toml", "windows.toml"),
+        ("tarpaulin.toml", "tarpaulin.toml"),
+        ("deny.toml", "deny.toml"),
+        ("flake.nix", "flake.nix"),
+        ("flake.lock", "flake.lock"),
+        (".github/rulesets/**", ".github/rulesets/main.json"),
+        (".githooks/**", ".githooks/pre-commit"),
+        (".cargo/**", ".cargo/config.toml"),
+        (".devcontainer/**", ".devcontainer/devcontainer.json"),
+        ("AGENTS.md", "AGENTS.md"),
+        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
+        ("harness/src/protected.rs", "harness/src/protected.rs"),
+        (".gitattributes", ".gitattributes"),
+        (".gitmodules", ".gitmodules"),
+        ("harness/src/scope.rs", "harness/src/scope.rs"),
+        ("CODEOWNERS", "CODEOWNERS"),
+        ("docs/CODEOWNERS", "docs/CODEOWNERS"),
+        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
+        (".github/**", ".github/actions/setup/action.yml"),
+        (".github/**", ".github/dependabot.yml"),
+        (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
+        (".envrc", ".envrc"),
+        (".config/**", ".config/nextest.toml"),
+        (".claude/**", ".claude/settings.json"),
+        ("nix/**", "nix/containers.nix"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        (
+            "docs/ci/protected-paths-guard.yml",
+            "docs/ci/protected-paths-guard.yml",
+        ),
+        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
+        ("harness/src/tools.rs", "harness/src/tools.rs"),
+        ("harness/src/marker.rs", "harness/src/marker.rs"),
+        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
+        (
+            "harness/src/action_auditor/**",
+            "harness/src/action_auditor/gate.rs",
+        ),
+        ("harness/src/windows.rs", "harness/src/windows.rs"),
+        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
+        ("harness/src/container.rs", "harness/src/container.rs"),
+        (
+            "harness/src/harness_adapter/isolation.rs",
+            "harness/src/harness_adapter/isolation.rs",
+        ),
+        (
+            "harness/src/harness_adapter/checked.rs",
+            "harness/src/harness_adapter/checked.rs",
+        ),
+        ("scripts/**", "scripts/install.sh"),
+        ("tests/security/**", "tests/security/test-ai-security.sh"),
+        ("tests/lib/**", "tests/lib/test-helpers.sh"),
+        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
+        ("harness/dev-container.toml", "harness/dev-container.toml"),
+        (
+            "harness/src/rollout/executor.rs",
+            "harness/src/rollout/executor.rs",
+        ),
+        (
+            "harness/src/rollout/hooks.rs",
+            "harness/src/rollout/hooks.rs",
+        ),
+        (
+            "harness/src/rollout/serverless.rs",
+            "harness/src/rollout/serverless.rs",
+        ),
+        (
+            "harness/src/rollout/state.rs",
+            "harness/src/rollout/state.rs",
+        ),
+        ("harness/src/effects.rs", "harness/src/effects.rs"),
+        ("harness/src/leases/**", "harness/src/leases/store.rs"),
+        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
+        ("test-agentic-security.sh", "test-agentic-security.sh"),
         ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
     ];
 
