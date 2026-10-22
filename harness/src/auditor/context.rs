@@ -180,11 +180,7 @@ impl AuditContext {
         &self,
         repo_root: impl AsRef<std::path::Path>,
     ) -> Result<Self, IdentityError> {
-        let catalog = self
-            .catalog
-            .as_ref()
-            .clone()
-            .with_repo_overrides(repo_root)?;
+        let catalog = IdentityCatalog::clone(&self.catalog).with_repo_overrides(repo_root)?;
         Ok(Self {
             catalog: Arc::new(catalog),
             ..self.clone()
