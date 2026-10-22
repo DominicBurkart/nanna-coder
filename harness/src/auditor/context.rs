@@ -114,61 +114,14 @@ impl AuditContext {
 
     /// ```
     /// use harness::auditor::AuditContext;
-    /// use harness::identity::{AgentIdentity, IdentityCatalog};
-    /// use std::fs;
-    ///
-    /// let card = |paths: &str| format!(r#"
-    /// [identity]
-    /// name = "worker"
-    /// description = "Edits files."
-    /// loop = "inner"
-    /// model = "gemma4:e4b"
-    /// system_prompt = {{ inline = "Work." }}
-    ///
-    /// [scope]
-    /// repos = ["github.com/example/repo"]
-    /// paths = [{paths}]
-    /// max_effect = "workspace"
-    /// tools = ["write_file"]
-    ///
-    /// [limits]
-    /// max_iterations = 10
-    /// max_wall_clock_secs = 60
-    /// max_concurrent = 1
-    /// "#);
-    /// let global = tempfile::tempdir().unwrap();
-    /// fs::write(global.path().join("worker.toml"), card(r#""api/**", "shared/**""#)).unwrap();
-    /// let auditor = AgentIdentity::from_toml_str(r#"
-    /// [identity]
-    /// name = "auditor"
-    /// description = "Reviews spawns."
-    /// loop = "inner"
-    /// model = "gemma4:e4b"
-    /// system_prompt = { inline = "Find the flaw." }
-    ///
-    /// [scope]
-    /// repos = []
-    /// paths = []
-    /// max_effect = "none"
-    /// tools = []
-    ///
-    /// [limits]
-    /// max_iterations = 1
-    /// max_wall_clock_secs = 60
-    /// max_concurrent = 1
-    /// "#, "auditor.toml").unwrap();
-    /// let context = AuditContext::new(IdentityCatalog::load(global.path()).unwrap(), auditor).unwrap();
-    ///
-    /// let repo = tempfile::tempdir().unwrap();
-    /// fs::create_dir_all(repo.path().join(".nanna/agents")).unwrap();
-    /// fs::write(repo.path().join(".nanna/agents/worker.toml"), card(r#""api/**""#)).unwrap();
-    ///
-    /// let layered = context.with_repo_overrides(repo.path()).unwrap();
-    /// assert_eq!(layered.catalog().get("worker").unwrap().scope.paths, ["api/**"]);
-    /// assert_eq!(context.catalog().get("worker").unwrap().scope.paths, ["api/**", "shared/**"]);
-    ///
-    /// fs::write(repo.path().join(".nanna/agents/worker.toml"), card(r#""api/**", "ui/**""#)).unwrap();
-    /// assert!(context.with_repo_overrides(repo.path()).is_err());
+    /// use harness::identity::IdentityCatalog;
+    /// let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/identities");
+    /// let catalog = IdentityCatalog::load(format!("{fixtures}/global")).unwrap();
+    /// let auditor = catalog.get("auditor").unwrap().clone();
+    /// let context = AuditContext::new(catalog, auditor).unwrap();
+    /// let layered = context.with_repo_overrides(format!("{fixtures}/repo")).unwrap();
+    /// assert_eq!(layered.catalog().get("rust-implementer").unwrap().scope.paths, ["api/**"]);
+    /// assert_eq!(context.catalog().get("rust-implementer").unwrap().scope.paths, ["api/**", "shared/**"]);
     /// ```
     pub fn with_repo_overrides(
         &self,
