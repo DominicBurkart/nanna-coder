@@ -24,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 const IDENTITY: &str = "pr-shepherd";
+const TOKEN: &str = "ghp_SENTINEL_e2e_token_0123456789";
 const OPEN_FENCE: &str = "<<<UNTRUSTED_GITHUB_TEXT";
 const CLOSE_FENCE: &str = "UNTRUSTED_GITHUB_TEXT>>>";
 const PR_NUMBER: u64 = 7;
@@ -74,6 +75,8 @@ struct Seen {
     method: String,
     path: String,
     body: Option<Value>,
+    text: String,
+    auth: Option<String>,
 }
 
 struct PrState {
@@ -122,7 +125,10 @@ impl FakeGithub {
     }
 
     fn client(&self) -> Arc<dyn GithubClient> {
-        Arc::new(ReqwestGithubClient::new(self.base.clone(), None))
+        Arc::new(ReqwestGithubClient::new(
+            self.base.clone(),
+            Some(TOKEN.to_string()),
+        ))
     }
 
     fn requests(&self) -> Vec<Seen> {
@@ -183,10 +189,22 @@ async fn serve(
     let target = request_line.next().unwrap_or("").to_string();
     let path = target.split('?').next().unwrap_or("").to_string();
     let body: Option<Value> = serde_json::from_slice(&raw[head_end..]).ok();
+    let text = String::from_utf8_lossy(&raw[head_end..]).to_string();
+    let auth = head.lines().find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        key.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_string())
+    });
     let (status, payload) = {
         let mut guard = state.lock().unwrap();
         let reply = respond(&mut guard.pr, &method, &path, body.as_ref(), &routes);
-        guard.requests.push(Seen { method, path, body });
+        guard.requests.push(Seen {
+            method,
+            path,
+            body,
+            text,
+            auth,
+        });
         reply
     };
     let response = format!(
@@ -360,6 +378,7 @@ fn subject() -> ActionSubject {
 
 fn gated(registry: ToolRegistry) -> ToolRegistry {
     let gate = ActionGate::new(Arc::new(AllowAll), ActionAuditLog::in_memory());
+    assert_eq!(gate.auditor_name(), "allow-all");
     registry.with_action_gate(Arc::new(gate), subject())
 }
 
@@ -408,7 +427,8 @@ fn fenced_fields(entries: &Value) -> Vec<String> {
 
 fn assert_never_merged(fake: &FakeGithub) {
     for seen in fake.requests() {
-        let merged = seen.method == "PUT" || seen.path.contains("merge");
+        let text = format!("{} {} {}", seen.method, seen.path, seen.text).to_lowercase();
+        let merged = seen.method == "PUT" || text.contains("merge");
         assert!(
             !merged,
             "merge endpoint reached: {} {}",
@@ -489,7 +509,14 @@ async fn open_comments_promote_and_close_reach_the_server_through_the_gated_regi
         .await
         .unwrap();
     assert_eq!(promoted["promoted"], json!(true));
-    assert_eq!(fake.matching("POST", "/graphql").len(), 1);
+    let graphql = fake.matching("POST", "/graphql");
+    assert_eq!(graphql.len(), 1);
+    let query = graphql[0].body.as_ref().unwrap()["query"].as_str().unwrap();
+    assert!(query.contains("markPullRequestReadyForReview"), "{query}");
+    assert_eq!(
+        graphql[0].body.as_ref().unwrap()["variables"]["id"],
+        json!("PR_7")
+    );
     assert!(!fake.state.lock().unwrap().pr.draft);
 
     let before_refusals = fake.request_count();
@@ -542,6 +569,14 @@ async fn open_comments_promote_and_close_reach_the_server_through_the_gated_regi
     assert_eq!(patches[0].body.as_ref().unwrap()["state"], json!("closed"));
 
     assert_never_merged(&fake);
+    let shown = [&opened, &comments, &promoted, &closed].map(Value::to_string);
+    let refused = [no_reference.to_string(), foreign.to_string()];
+    for text in shown.iter().chain(refused.iter()) {
+        let leaked = text.contains(TOKEN);
+        assert!(!leaked, "token leaked: {text}");
+    }
+    let expected = Some(format!("Bearer {TOKEN}"));
+    assert!(fake.requests().iter().all(|r| r.auth == expected));
     assert_eq!(registry.action_reviews().len(), 6);
     assert_eq!(registry.denial_count(), 0);
 }
@@ -599,11 +634,6 @@ async fn an_identity_whose_ceiling_is_below_repository_gets_none_of_the_tools() 
     assert_eq!(fake.request_count(), 0);
 }
 
-#[test]
-fn the_test_auditor_names_itself() {
-    assert_eq!(AllowAll.name(), "allow-all");
-}
-
 #[tokio::test]
 #[should_panic(expected = "merge endpoint reached: PUT /repos/example/repo/pulls/7/merge")]
 async fn the_merge_detector_fires_when_the_merge_endpoint_is_called() {
@@ -614,5 +644,21 @@ async fn the_merge_detector_fires_when_the_merge_endpoint_is_called() {
     assert_eq!(merged.status().as_u16(), 200);
     let unknown = client.get(format!("{}/nope", fake.base)).send().await;
     assert_eq!(unknown.unwrap().status().as_u16(), 404);
+    assert_never_merged(&fake);
+}
+
+#[tokio::test]
+#[should_panic(expected = "merge endpoint reached: POST /graphql")]
+async fn the_merge_detector_fires_on_a_graphql_merge_mutation() {
+    let fake = FakeGithub::start(vec![], vec![]).await;
+    let body = json!({ "query": "mutation { mergePullRequest(input: {}) { clientMutationId } }" });
+    let url = format!("{}/graphql", fake.base);
+    let sent = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status().as_u16(), 200);
     assert_never_merged(&fake);
 }
