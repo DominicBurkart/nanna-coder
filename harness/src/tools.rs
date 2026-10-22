@@ -330,7 +330,9 @@ impl ToolRegistry {
     /// review nor counts towards the three-denial escalation. This is the
     /// only chokepoint tool calls pass through, so the review is structural
     /// rather than something each `Tool` implementation must remember.
-    /// Calls below `Repository` reach the tool with no action review.
+    /// `run_command` is also reviewed, whatever its effect class, and is
+    /// refused when no gate is attached; other calls below `Repository`
+    /// reach the tool with no action review.
     pub async fn execute(&self, name: &str, args: Value) -> ToolResult<Value> {
         let outcome = match (self.tools.get(name), &self.identity) {
             (Some(tool), _) => {
@@ -468,7 +470,7 @@ impl ToolRegistry {
     }
 
     fn inspects_content(&self, name: &str) -> bool {
-        self.action_gate.is_some() && name == crate::action_auditor::RUN_COMMAND_TOOL
+        name == crate::action_auditor::RUN_COMMAND_TOOL
     }
 
     async fn escalate_denial(&self, tool: &str, denied: &ActionDenied) {
@@ -5632,11 +5634,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_on_a_registry_with_no_gate_is_not_refused() {
+    async fn run_command_on_a_registry_with_no_gate_is_refused_by_default() {
         let mut registry = ToolRegistry::new();
         registry.register(StubTool::boxed("run_command", EffectClass::Workspace));
-        assert!(registry.execute("run_command", json!({})).await.is_ok());
-        assert!(registry.action_reviews().is_empty());
+        let err = registry
+            .execute("run_command", json!({"command": "ls"}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::ActionDenied(ActionDenied::Block { reasons }) => {
+                assert!(reasons
+                    .iter()
+                    .any(|r| r.detail.contains("no action auditor configured")));
+            }
+            other => panic!("expected a block, got {other:?}"),
+        }
     }
 
     #[tokio::test]
