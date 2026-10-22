@@ -360,15 +360,13 @@ fn wired_registry(root: &Path, fake: &FakeGithub, allowed_authors: &[&str]) -> T
 }
 
 #[rustfmt::skip]
+fn subject() -> ActionSubject {
+    ActionSubject { task_id: TaskId("pr-lifecycle-e2e".to_string()), max_effect: EffectClass::Repository, window: None, repo: "example/repo".to_string(), branch: None, pr: None, environment: None, paths: Vec::new(), description: String::new() }
+}
+
 fn gated(registry: ToolRegistry) -> ToolRegistry {
-    let auditor = Arc::new(AllowAll);
-    let gate = Arc::new(ActionGate::new(auditor, ActionAuditLog::in_memory()));
-    let task_id = TaskId("pr-lifecycle-e2e".to_string());
-    let (repo, max_effect) = ("example/repo".to_string(), EffectClass::Repository);
-    let (window, branch, pr, environment) = (None, None, None, None);
-    let (paths, description) = (Vec::new(), String::new());
-    let subject = ActionSubject { task_id, max_effect, window, repo, branch, pr, environment, paths, description };
-    registry.with_action_gate(gate, subject)
+    let gate = ActionGate::new(Arc::new(AllowAll), ActionAuditLog::in_memory());
+    registry.with_action_gate(Arc::new(gate), subject())
 }
 
 fn lifecycle_calls() -> Vec<(&'static str, Value)> {
