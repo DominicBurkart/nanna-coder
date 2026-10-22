@@ -118,6 +118,32 @@ pub struct NoopAuditHook;
 
 impl AuditHook for NoopAuditHook {}
 
+/// The rule reported for a write refused because the target has other hard
+/// links.
+pub const HARDLINK_RULE: &str = "hard link (link count above one)";
+
+/// Whether `metadata` describes a file that other names also reach.
+#[cfg(unix)]
+pub fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+/// Whether `metadata` describes a file that other names also reach. Link
+/// counts are not available on this platform, so no file is reported.
+#[cfg(not(unix))]
+pub fn is_hardlinked(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The violation for a write to `path`, which has other hard links.
+pub fn hardlink_violation(path: &Path) -> ProtectedPathViolation {
+    ProtectedPathViolation {
+        path: crate::scope::denial_path(path),
+        rule: HARDLINK_RULE.to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Rule {
     glob: String,
@@ -799,6 +825,48 @@ mod tests {
             protected.existing_roots(dir.path()),
             vec![PathBuf::from(".nanna"), PathBuf::from("codecov.yml")]
         );
+    }
+
+    #[cfg(unix)]
+    mod hardlinks {
+        use super::*;
+
+        fn link_count_fixture(links: usize) -> (tempfile::TempDir, std::fs::Metadata) {
+            let dir = tempfile::tempdir().unwrap();
+            let original = dir.path().join("original");
+            std::fs::write(&original, "x").unwrap();
+            for index in 1..links {
+                std::fs::hard_link(&original, dir.path().join(format!("link{index}"))).unwrap();
+            }
+            let metadata = std::fs::symlink_metadata(&original).unwrap();
+            (dir, metadata)
+        }
+
+        #[test]
+        fn a_single_link_is_not_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(1);
+            assert!(!is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn exactly_two_links_is_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(2);
+            assert!(is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn many_links_is_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(5);
+            assert!(is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn the_hardlink_violation_names_the_path_and_the_fixed_rule() {
+            let violation = hardlink_violation(Path::new("docs/alias.md"));
+            assert_eq!(violation.path, "docs/alias.md");
+            assert_eq!(violation.rule, HARDLINK_RULE);
+            assert!(violation.to_string().contains("docs/alias.md"));
+        }
     }
 
     #[test]
