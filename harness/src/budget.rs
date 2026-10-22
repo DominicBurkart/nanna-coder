@@ -536,6 +536,23 @@ pub enum BudgetStoreError {
     },
 }
 
+fn lock_outcome(
+    path: &std::path::Path,
+    lock_path: &std::path::Path,
+    attempt: Result<(), fs4::TryLockError>,
+) -> Result<(), BudgetStoreError> {
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(fs4::TryLockError::WouldBlock) => Err(BudgetStoreError::Locked {
+            path: path.to_path_buf(),
+        }),
+        Err(fs4::TryLockError::Error(source)) => Err(BudgetStoreError::Io {
+            path: lock_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 impl FileBudgetStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BudgetStoreError> {
         let path = path.into();
@@ -578,13 +595,7 @@ impl FileBudgetStore {
             .write(true)
             .open(&lock_path)
             .map_err(io)?;
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => Ok(file),
-            Err(fs4::TryLockError::WouldBlock) => Err(BudgetStoreError::Locked {
-                path: path.to_path_buf(),
-            }),
-            Err(fs4::TryLockError::Error(source)) => Err(io(source)),
-        }
+        lock_outcome(path, &lock_path, fs4::FileExt::try_lock(&file)).map(|()| file)
     }
 
     fn persist(&self, ledger: &Ledger) -> std::io::Result<()> {
@@ -1801,5 +1812,84 @@ mod tests {
             FileBudgetStore::open(&path),
             Err(BudgetStoreError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn a_lock_attempt_maps_to_ok_locked_or_io() {
+        let path = std::path::Path::new("b.json");
+        let lock = std::path::Path::new("b.json.lock");
+        assert!(lock_outcome(path, lock, Ok(())).is_ok());
+        assert!(matches!(
+            lock_outcome(path, lock, Err(fs4::TryLockError::WouldBlock)),
+            Err(BudgetStoreError::Locked { path: p }) if p == path
+        ));
+        let failure = std::io::Error::other("flock failed");
+        assert!(matches!(
+            lock_outcome(path, lock, Err(fs4::TryLockError::Error(failure))),
+            Err(BudgetStoreError::Io { path: p, .. }) if p == lock
+        ));
+    }
+
+    #[test]
+    fn opening_when_the_lock_file_cannot_be_created_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        std::fs::create_dir(dir.path().join("budget.json.lock")).unwrap();
+        assert!(matches!(
+            FileBudgetStore::open(&path),
+            Err(BudgetStoreError::Io { path: p, .. }) if p.ends_with("budget.json.lock")
+        ));
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_in_memory_ledger_enforcing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let store = FileBudgetStore::open(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let key = ChargeKey {
+            identity: "id",
+            task_id: "t1",
+            repo: "o/n",
+            class: BudgetClass::Ci,
+            day: now().date_naive(),
+        };
+        let limits = BudgetLimits {
+            max_count_per_task: Some(1),
+            ..BudgetLimits::UNLIMITED
+        };
+        store.try_charge(&key, &limits).unwrap();
+        assert!(path.is_dir());
+        assert_eq!(store.task_usage("t1", BudgetClass::Ci).count, 1);
+        assert!(store.try_charge(&key, &limits).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_file_store_records_and_reloads_minutes_per_task_day_and_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        {
+            let accountant = CostAccountant::new(
+                Arc::new(FileBudgetStore::open(&path).unwrap()),
+                BudgetConfig::UNLIMITED,
+            );
+            accountant
+                .record_minutes("id", "t1", "o/n", BudgetClass::Sandbox, 7.5, now())
+                .await;
+        }
+        let reopened = FileBudgetStore::open(&path).unwrap();
+        let day = now().date_naive();
+        assert_eq!(reopened.task_usage("t1", BudgetClass::Sandbox).minutes, 7.5);
+        assert_eq!(
+            reopened.day_usage("id", BudgetClass::Sandbox, day).minutes,
+            7.5
+        );
+        assert_eq!(
+            reopened
+                .repo_day_usage("o/n", BudgetClass::Sandbox, day)
+                .minutes,
+            7.5
+        );
+        assert_eq!(reopened.day_usage("id", BudgetClass::Ci, day).minutes, 0.0);
     }
 }
