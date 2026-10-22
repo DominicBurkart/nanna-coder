@@ -3444,6 +3444,92 @@ mod identity_tests {
         workspace.cleanup().unwrap();
     }
 
+    struct ProductionStub;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ProductionStub {
+        fn definition(&self) -> model::types::ToolDefinition {
+            model::types::ToolDefinition {
+                function: model::types::FunctionDefinition {
+                    name: "deploy_prod".to_string(),
+                    description: "deploys".to_string(),
+                    parameters: model::types::JsonSchema {
+                        schema_type: model::types::SchemaType::Object,
+                        properties: None,
+                        required: None,
+                    },
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> crate::tools::ToolResult<serde_json::Value> {
+            Ok(serde_json::json!("ran"))
+        }
+
+        fn name(&self) -> &str {
+            "deploy_prod"
+        }
+
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::Production
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_shared_constructor_holds_production_for_every_repository() {
+        use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let mut workspace = TaskWorkspace::create(repo.path(), "t-hold", "HEAD").unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let queued = queued(repo.path());
+        let identity = scoped_identity();
+        let task_id = TaskId("t-hold".to_string());
+        let build = |log: Arc<EscalationLog>| {
+            let mut layers = manager
+                .runner
+                .model_facing_layers(&task_id, &queued, Some(&identity));
+            layers.escalation_log = log;
+            let mut registry = model_facing_registry(&workspace, Some(&identity), layers).unwrap();
+            registry.register(Box::new(ProductionStub));
+            registry
+        };
+
+        let open = Arc::new(EscalationLog::in_memory());
+        let without_hold = build(open)
+            .execute("deploy_prod", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(without_hold, crate::tools::ToolError::ActionDenied(_)),
+            "{without_hold}"
+        );
+
+        for held_repo in ["example/repo", "some/other-repo"] {
+            let log = Arc::new(EscalationLog::in_memory());
+            let incident = Escalation::new(
+                Severity::Incident,
+                EscalationSource::Rollout,
+                held_repo,
+                "down",
+            )
+            .with_id("inc-1");
+            log.hold(&incident, Utc::now()).unwrap();
+            let err = build(log)
+                .execute("deploy_prod", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, crate::tools::ToolError::ProductionHeld { repo, escalation_id, .. } if repo == held_repo && escalation_id == "inc-1"),
+                "{held_repo}: {err}"
+            );
+        }
+        workspace.cleanup().unwrap();
+    }
+
     #[test]
     fn test_action_subject_for_a_scoped_task_carries_ceiling_slug_and_paths() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
