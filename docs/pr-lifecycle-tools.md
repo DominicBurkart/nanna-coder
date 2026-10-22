@@ -24,7 +24,7 @@ The `Nanna-Identity` trailer and the PR body marker are attribution, not authent
 
 ## Accepted characters
 
-Tool arguments and GitHub-sourced text are checked character by character against one function (`unprintable_mask`) that validation, escaping and stripping all share. A character passes if it is ASCII graphic or a space, any letter or digit Rust classes as alphanumeric, a character in the allowed punctuation, currency, arrow, mathematical, technical, symbol, CJK-punctuation (not U+3000), fullwidth (U+FF01-FF60) and emoji ranges, or one of the context-dependent characters below. Unassigned code points inside the hand-written symbol, punctuation and emoji ranges do pass; letters, digits and marks are checked against exact tables.
+Tool arguments and GitHub-sourced text are checked character by character against one function (`unprintable_mask`) that validation, escaping and stripping all share. A character passes if it is ASCII graphic or a space, any letter or digit in the generated Unicode 15.1 table, a character in the allowed punctuation, currency, arrow, mathematical, technical, symbol, CJK-punctuation (not U+3000), fullwidth (U+FF01-FF60) and emoji ranges, or one of the context-dependent characters below. Unassigned code points inside the hand-written symbol, punctuation and emoji ranges do pass; letters, digits and marks are checked against exact tables.
 
 Context-dependent characters:
 - U+FE0F is accepted after an emoji or symbol base, and after a digit, `#` or `*` only when U+20E3 follows; U+20E3 is accepted after U+FE0F or a bare digit, `#` or `*`.

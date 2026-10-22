@@ -2,6 +2,8 @@
 import sys
 import unicodedata
 
+assert unicodedata.unidata_version == "15.1.0", unicodedata.unidata_version
+
 EXCLUDED = (
     set(range(0xFE00, 0xFE10))
     | set(range(0xE0100, 0xE01F0))

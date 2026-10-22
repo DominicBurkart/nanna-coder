@@ -6844,4 +6844,69 @@ mod tests {
         let tracked = run_git(dir.path(), &["ls-files"]).unwrap();
         assert!(!tracked.contains("pr_tools.rs"));
     }
+
+    fn table_checksum(table: &[(u32, u32)]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for (lo, hi) in table {
+            for value in [lo, hi] {
+                for byte in value.to_le_bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn checked_in_tables_match_the_generator_output_by_checksum() {
+        assert_eq!(ALNUM_RANGES.len(), 748);
+        assert_eq!(MARK_RANGES.len(), 309);
+        assert_eq!(table_checksum(ALNUM_RANGES), 0x09f0_2106_7c49_70cc);
+        assert_eq!(table_checksum(MARK_RANGES), 0xc05c_8ad4_3a5a_8ea4);
+        let shifted: Vec<(u32, u32)> = ALNUM_RANGES
+            .iter()
+            .map(|&(lo, hi)| {
+                if lo == 0x20000 {
+                    (lo + 1, hi + 1)
+                } else {
+                    (lo, hi)
+                }
+            })
+            .collect();
+        assert_ne!(table_checksum(&shifted), table_checksum(ALNUM_RANGES));
+    }
+
+    #[tokio::test]
+    async fn push_refuses_an_unpushed_root_commit_that_touches_a_protected_path() {
+        let fixture = push_fixture();
+        let dir = fixture.work.path();
+        git(dir, &["checkout", "-q", "--orphan", "feature-root"]);
+        git(dir, &["rm", "-rfq", "."]);
+        commit_file(
+            dir,
+            ".github/workflows/ci.yml",
+            "on: push\n",
+            "root\n\nNanna-Identity: sdlc-dev",
+        );
+        let count = run_git(dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(count, "1");
+        let tool = GitPushBranchTool::new(dir.to_path_buf(), "sdlc-dev");
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("protected"), "{err}");
+        assert!(!remote_has(dir, "feature-root"));
+    }
+
+    #[test]
+    fn mark_runs_reset_after_each_base_letter() {
+        let five_pairs = "e\u{301}".repeat(5);
+        assert!(validate_text("f", &five_pairs, Shape::Line, 100).is_ok());
+        let long_text = "a\u{300}e\u{301}i\u{302}o\u{303}u\u{308}y\u{301}";
+        assert!(validate_text("f", long_text, Shape::Line, 100).is_ok());
+        assert!(!unprintable_mask(&five_pairs, Shape::Line).contains(&true));
+        let five_marks = format!("e{}", "\u{301}".repeat(5));
+        assert!(validate_text("f", &five_marks, Shape::Line, 100).is_err());
+        let mask = unprintable_mask(&five_marks, Shape::Line);
+        assert_eq!(mask.iter().filter(|bad| **bad).count(), 1);
+    }
 }
