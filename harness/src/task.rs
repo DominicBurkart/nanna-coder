@@ -1,14 +1,17 @@
 use crate::action_auditor::{ActionAuditLogEntry, ActionGate};
 use crate::agent::{AgentConfig, AgentContext, AgentError, AgentLoop, AgentRunResult};
 use crate::auditor::Allowed;
+use crate::budget::{
+    BudgetConfig, BudgetReport, BudgetStore, CostAccountant, FileBudgetStore, InMemoryBudgetStore,
+};
 use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
-use crate::escalation::{EscalationLog, EscalationSnapshot};
+use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escalator, FanoutSink};
 use crate::identity::AgentIdentity;
 use crate::impact::BlastRadius;
-use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore};
+use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, SystemClock};
 use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
 use crate::scheduler::{
@@ -143,6 +146,8 @@ pub struct TaskResult {
     pub blast_radius: Option<BlastRadius>,
     #[serde(default)]
     pub qa_summary: QaSummary,
+    #[serde(default)]
+    pub budget: BudgetReport,
 }
 
 impl TaskResult {
@@ -176,6 +181,7 @@ impl TaskResult {
             "model_used": self.model_used,
             "blast_radius": self.blast_radius,
             "qa_summary": self.qa_summary.to_json(),
+            "budget": self.budget.to_json(),
         })
     }
 }
@@ -352,6 +358,7 @@ struct TaskRunner {
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
     escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
+    cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -371,6 +378,28 @@ pub fn action_windows_from(
             crate::windows::WindowSet::default()
         }
     }
+}
+
+fn escalating_cost_accountant(
+    store: Arc<dyn BudgetStore>,
+    config: BudgetConfig,
+    escalations: &Arc<EscalationLog>,
+) -> Arc<CostAccountant> {
+    let escalator = Arc::new(Escalator::new(
+        Arc::clone(escalations),
+        Arc::new(FanoutSink(vec![])),
+        Arc::new(SystemClock),
+        default_window(),
+    ));
+    Arc::new(CostAccountant::new(store, config).with_escalator(escalator))
+}
+
+fn fail_closed_cost_accountant(escalations: &Arc<EscalationLog>) -> Arc<CostAccountant> {
+    escalating_cost_accountant(
+        Arc::new(InMemoryBudgetStore::new()),
+        BudgetConfig::DENY_ALL,
+        escalations,
+    )
 }
 
 fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
@@ -546,6 +575,7 @@ impl TaskManager {
         action_gate: Option<Arc<ActionGate>>,
     ) -> Result<Self, QueueStoreError> {
         let action_gate = action_gate.unwrap_or_else(|| default_action_gate(Arc::clone(&leases)));
+        let cost_accountant = fail_closed_cost_accountant(&escalations);
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -561,6 +591,7 @@ impl TaskManager {
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
+            cost_accountant: std::sync::RwLock::new(cost_accountant),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -635,6 +666,44 @@ impl TaskManager {
             )),
         };
         Arc::new(ActionGate::new(auditor, log))
+    }
+
+    pub fn with_durable_budget(self, location: Option<PathBuf>) -> Self {
+        let escalations = self.runner.escalation_log();
+        let accountant = match location.map(FileBudgetStore::open) {
+            Some(Ok(store)) => {
+                escalating_cost_accountant(Arc::new(store), BudgetConfig::default(), &escalations)
+            }
+            Some(Err(e)) => {
+                tracing::error!("durable budget unavailable, denying budgeted actions: {e}");
+                fail_closed_cost_accountant(&escalations)
+            }
+            None => {
+                tracing::error!(
+                    "no durable budget location resolved (set {} or a queue path), denying budgeted actions",
+                    crate::budget::BUDGET_PATH_ENV
+                );
+                fail_closed_cost_accountant(&escalations)
+            }
+        };
+        self.with_cost_accountant(accountant)
+    }
+
+    #[doc = r#"The accountant every dispatched task's budgeted actions are charged against.
+
+```
+use harness::task::TaskManager;
+
+let manager = TaskManager::new(1);
+assert_eq!(manager.cost_accountant().task_summary("t1").ci.count, 0);
+```"#]
+    pub fn cost_accountant(&self) -> Arc<CostAccountant> {
+        self.runner.cost_accountant()
+    }
+
+    pub fn with_cost_accountant(self, accountant: Arc<CostAccountant>) -> Self {
+        *self.runner.cost_accountant.write().unwrap() = accountant;
+        self
     }
 
     /// The gate every dispatched task's effectful calls pass through.
@@ -1076,6 +1145,10 @@ impl TaskRunner {
         Arc::clone(&self.escalations.read().unwrap())
     }
 
+    fn cost_accountant(&self) -> Arc<CostAccountant> {
+        Arc::clone(&self.cost_accountant.read().unwrap())
+    }
+
     fn model_facing_layers(
         &self,
         task_id: &TaskId,
@@ -1403,6 +1476,7 @@ impl TaskRunner {
             _ => workspace.format_patch().ok().flatten(),
         };
         let qa_summary = workspace.persist_qa_summary();
+        let budget = self.cost_accountant().task_summary(&task_id.0);
 
         let _ = workspace.cleanup();
 
@@ -1437,6 +1511,7 @@ impl TaskRunner {
                     model_used: queued.model,
                     blast_radius,
                     qa_summary,
+                    budget,
                 };
                 self.set_status(
                     &task_id,
@@ -1822,6 +1897,13 @@ max_concurrent = 1
             model_used: "qwen3:0.6b".to_string(),
             blast_radius: None,
             qa_summary: QaSummary::default(),
+            budget: crate::budget::BudgetReport {
+                ci: crate::budget::Usage {
+                    count: 2,
+                    minutes: 9.0,
+                },
+                sandbox: crate::budget::Usage::default(),
+            },
         };
         assert_eq!(result.denial_count(), 1);
         let json = result.to_json();
@@ -1841,6 +1923,9 @@ max_concurrent = 1
         assert!(json["format_patch"].is_string());
         assert_eq!(json["qa_summary"]["endpoint_runs"], 0);
         assert_eq!(json["qa_summary"]["artifacts"], serde_json::json!([]));
+        assert_eq!(json["budget"]["ci"]["count"], 2);
+        assert_eq!(json["budget"]["ci"]["minutes"], 9.0);
+        assert_eq!(json["budget"]["sandbox"]["count"], 0);
     }
 
     #[test]
@@ -1857,6 +1942,7 @@ max_concurrent = 1
         let result: TaskResult = serde_json::from_value(stored).unwrap();
         assert!(result.qa_summary.is_empty());
         assert_eq!(result.qa_summary, QaSummary::default());
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
     }
 
     #[test]
@@ -1932,6 +2018,7 @@ max_concurrent = 1
             model_used: "mock".to_string(),
             blast_radius: None,
             qa_summary: QaSummary::default(),
+            budget: Default::default(),
         }
     }
 
@@ -4070,6 +4157,210 @@ mod identity_tests {
         .await
         .unwrap();
         assert!(!Arc::ptr_eq(&default.escalations(), &log));
+    }
+
+    struct FixedTaskUsage;
+
+    impl crate::budget::BudgetStore for FixedTaskUsage {
+        fn task_usage(
+            &self,
+            task_id: &str,
+            class: crate::budget::BudgetClass,
+        ) -> crate::budget::Usage {
+            if Uuid::parse_str(task_id).is_err() {
+                return crate::budget::Usage::default();
+            }
+            match class {
+                crate::budget::BudgetClass::Ci => crate::budget::Usage {
+                    count: 7,
+                    minutes: 3.5,
+                },
+                crate::budget::BudgetClass::Sandbox => crate::budget::Usage::default(),
+            }
+        }
+
+        fn day_usage(
+            &self,
+            _identity: &str,
+            _class: crate::budget::BudgetClass,
+            _day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            crate::budget::Usage::default()
+        }
+
+        fn repo_day_usage(
+            &self,
+            _repo: &str,
+            _class: crate::budget::BudgetClass,
+            _day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            crate::budget::Usage::default()
+        }
+
+        fn record(&self, _key: &crate::budget::ChargeKey<'_>, _delta: crate::budget::Usage) {}
+
+        fn try_charge(
+            &self,
+            _key: &crate::budget::ChargeKey<'_>,
+            _limits: &crate::budget::BudgetLimits,
+        ) -> Result<(), crate::budget::BudgetExceeded> {
+            Ok(())
+        }
+
+        fn note_run(&self, _repo: &str, _run_id: u64) {}
+
+        fn pending_runs(&self, _repo: &str) -> Vec<u64> {
+            Vec::new()
+        }
+
+        fn claim_run(&self, _repo: &str, _run_id: u64) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_task_reports_the_budget_its_accountant_recorded() {
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(FixedTaskUsage),
+            BudgetConfig::UNLIMITED,
+        ));
+        let manager = TaskManager::new(1).with_cost_accountant(accountant);
+        let result = run_github_status_task(&manager).await;
+        assert_eq!(result.budget.ci.count, 7);
+        assert_eq!(result.budget.ci.minutes, 3.5);
+        assert_eq!(result.budget.sandbox, crate::budget::Usage::default());
+    }
+
+    #[tokio::test]
+    async fn default_cost_accountant_escalates_budget_exhaustion_into_the_managers_own_log() {
+        use crate::budget::BudgetClass;
+        let manager = TaskManager::new(0);
+        let accountant = manager.runner.cost_accountant();
+        assert_eq!(manager.escalation_snapshot().tracked, 0);
+        let denied = accountant
+            .charge_count("id", "t1", "example/repo", BudgetClass::Sandbox, Utc::now())
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(
+            manager.escalation_snapshot().tracked,
+            1,
+            "the default accountant must escalate into the same log tasks/list reports"
+        );
+    }
+
+    async fn charge_ci(manager: &TaskManager) -> Result<(), crate::budget::BudgetExceeded> {
+        use crate::budget::BudgetClass;
+        manager
+            .runner
+            .cost_accountant()
+            .charge_count("id", "t1", "example/repo", BudgetClass::Ci, Utc::now())
+            .await
+            .map(|_| ())
+    }
+
+    async fn production_manager(budget: Option<PathBuf>) -> TaskManager {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        TaskManager::restore(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+        )
+        .await
+        .unwrap()
+        .with_durable_budget(budget)
+    }
+
+    #[tokio::test]
+    async fn a_manager_without_a_durable_budget_denies_every_charge() {
+        let manager = TaskManager::new(0);
+        assert!(charge_ci(&manager).await.is_err());
+        assert_eq!(manager.escalation_snapshot().tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_denies_when_no_budget_location_resolves() {
+        let manager = production_manager(None).await;
+        assert!(charge_ci(&manager).await.is_err());
+        assert_eq!(manager.escalation_snapshot().tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_denies_when_the_budget_file_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("budget.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert!(charge_ci(&production_manager(Some(corrupt)).await)
+            .await
+            .is_err());
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, b"x").unwrap();
+        let under_a_file = blocked.join("budget.json");
+        assert!(charge_ci(&production_manager(Some(under_a_file)).await)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_charges_a_usable_budget_and_keeps_it_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = production_manager(Some(path.clone())).await;
+        charge_ci(&first).await.unwrap();
+        charge_ci(&first).await.unwrap();
+        assert_eq!(
+            first.runner.cost_accountant().task_summary("t1").ci.count,
+            2
+        );
+        drop(first);
+        let mut second = production_manager(Some(path.clone())).await;
+        for _ in 0..250 {
+            if second.runner.cost_accountant().task_summary("t1").ci.count == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            second = production_manager(Some(path.clone())).await;
+        }
+        assert_eq!(
+            second.runner.cost_accountant().task_summary("t1").ci.count,
+            2
+        );
+        assert!(charge_ci(&second).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_enforces_the_default_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = production_manager(Some(dir.path().join("budget.json"))).await;
+        let limit = BudgetConfig::default().ci.max_count_per_task.unwrap();
+        for _ in 0..limit {
+            charge_ci(&manager).await.unwrap();
+        }
+        let denied = charge_ci(&manager).await.unwrap_err();
+        assert_eq!(denied.scope, crate::budget::BudgetScope::Task);
+        assert_eq!(manager.escalation_snapshot().tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_manager_on_the_same_budget_file_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.json");
+        let first = production_manager(Some(path.clone())).await;
+        assert!(charge_ci(&first).await.is_ok());
+        let second = production_manager(Some(path)).await;
+        assert!(charge_ci(&second).await.is_err());
+        assert!(charge_ci(&first).await.is_ok());
+    }
+
+    #[test]
+    fn with_cost_accountant_replaces_the_fail_closed_default() {
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let manager = TaskManager::new(0).with_cost_accountant(Arc::clone(&accountant));
+        assert!(Arc::ptr_eq(&manager.runner.cost_accountant(), &accountant));
     }
 
     async fn run_github_status_task(manager: &TaskManager) -> TaskResult {
