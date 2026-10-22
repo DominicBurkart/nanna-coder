@@ -116,11 +116,19 @@ jobs:
           VIOLATIONS=()
           while IFS= read -r -d '' path; do
             [ -z "$path" ] && continue
+            folded="$(printf '%s' "$path" | sed -E 's/:[^/]*//g; s/[. ]+(\/|$)/\1/g')"
             for pattern in "${PROTECTED_PATTERNS[@]}"; do
               shell_glob="${pattern//\*\*/*}"
               directory="${shell_glob%/\*}"
               # shellcheck disable=SC2254
               case "$path" in
+                $shell_glob|$directory)
+                  VIOLATIONS+=("$path (rule: $pattern)")
+                  break
+                  ;;
+              esac
+              # shellcheck disable=SC2254
+              case "$folded" in
                 $shell_glob|$directory)
                   VIOLATIONS+=("$path (rule: $pattern)")
                   break

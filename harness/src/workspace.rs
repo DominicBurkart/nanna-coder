@@ -1882,6 +1882,25 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_changes_refuses_windows_aliases_of_protected_files() {
+        for (name, rule) in [
+            ("flake.nix.", "flake.nix"),
+            ("codecov.yml ", "codecov.yml"),
+            ("CODECO~1.YML", "codecov.yml"),
+        ] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-alias"), "HEAD").unwrap();
+            std::fs::write(ws.workspace_path.join(name), "evil").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{name}");
+            assert_eq!(violation.path, name);
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[test]
     fn test_unprotected_changes_still_produce_patches_and_call_no_hook() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());

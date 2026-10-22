@@ -1383,6 +1383,26 @@ mod tests {
     }
 
     #[test]
+    fn windows_name_aliases_of_a_protected_file_are_refused_and_nothing_is_created() {
+        let ws = workspace();
+        let root = ws.path();
+        for (path, rule) in [
+            ("flake.nix.", "flake.nix"),
+            ("flake.nix ", "flake.nix"),
+            ("FLAKEN~1.NIX", "flake.nix"),
+            ("CODECO~1.YML", "codecov.yml"),
+            ("flake.nix:stream", "flake.nix"),
+            (".github./workflows/ci.yml", ".github/workflows/**"),
+        ] {
+            let violation = protected_error(guarded(None, PathAccess::Write, path, root));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+            assert!(!root.join(path).exists(), "{path}");
+        }
+        assert!(guarded(None, PathAccess::Write, "flake.nix.bak", root).is_ok());
+    }
+
+    #[test]
     fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
         let ws = workspace();
         let root = ws.path();

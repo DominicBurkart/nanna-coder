@@ -1942,10 +1942,14 @@ fn protected_hit(resolved: &str, removes: bool) -> bool {
     }
     removes
         && (cleaned == "."
-            || protected
-                .mount_roots()
-                .iter()
-                .any(|root| root.starts_with(path)))
+            || protected.variants(path).is_some_and(|variants| {
+                variants.iter().any(|variant| {
+                    protected
+                        .mount_roots()
+                        .iter()
+                        .any(|root| root.starts_with(variant))
+                })
+            }))
 }
 
 fn write_escape(cwd: &Cwd, word: &Word) -> Option<String> {
@@ -7019,5 +7023,20 @@ mod tests {
         blocked("grep -e foo ../x", "escapes the workspace");
         blocked("mv .github x", "protected path");
         blocked("echo x > CODECOV.YML", "protected path");
+        blocked("echo x > flake.nix.", "protected path");
+        blocked("echo x > 'flake.nix '", "protected path");
+        blocked("echo x > FLAKEN~1.NIX", "protected path");
+        blocked("echo x > CODECO~1.YML", "protected path");
+        blocked("echo x > flake.nix:stream", "protected path");
+        blocked("echo x > .github./workflows/ci.yml", "protected path");
+        blocked("rm -rf GITHUB~1", "protected path");
+        blocked("rm -rf HARNES~1", "protected path");
+        blocked("rm -rf HARNES~1/src", "protected path");
+        blocked("rm -rf harness.", "protected path");
+        blocked(
+            "rm -rf src/G~1/G~1/G~1/G~1/G~1/G~1/G~1/G~1/x",
+            "protected path",
+        );
+        blocked("mv 'harness ' x", "protected path");
     }
 }
