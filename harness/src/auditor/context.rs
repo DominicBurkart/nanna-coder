@@ -112,12 +112,6 @@ impl AuditContext {
         out
     }
 
-    /// A copy of this context whose catalog has `<repo_root>/.nanna/agents/`
-    /// layered over it (see [`IdentityCatalog::with_repo_overrides`]): each
-    /// file must name a catalog identity and may only narrow it. The context
-    /// it is called on is unchanged, and a repository without overrides yields
-    /// an equivalent context.
-    ///
     /// ```
     /// use harness::auditor::AuditContext;
     /// use harness::identity::{AgentIdentity, IdentityCatalog};
