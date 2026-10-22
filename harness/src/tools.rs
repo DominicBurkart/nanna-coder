@@ -4940,13 +4940,6 @@ mod tests {
             WriteFileTool::guarded(dir.to_path_buf(), None, protected)
         }
 
-        fn refused_as_hardlink(err: ToolError) -> crate::protected::ProtectedPathViolation {
-            match err {
-                ToolError::ProtectedPath(violation) => violation,
-                other => panic!("expected ProtectedPath, got {other:?}"),
-            }
-        }
-
         #[tokio::test]
         async fn a_hardlink_to_a_protected_file_cannot_be_written_through() {
             let dir = tempfile::tempdir().unwrap();
@@ -4956,9 +4949,11 @@ mod tests {
                 .execute(json!({ "path": "alias.txt", "content": "evil" }))
                 .await
                 .unwrap_err();
-            let violation = refused_as_hardlink(err);
-            assert_eq!(violation.path, "alias.txt");
-            assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.path == "alias.txt" && v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("flake.nix")).unwrap(),
                 "original"
@@ -4997,6 +4992,18 @@ mod tests {
                 std::fs::read_to_string(dir.path().join("plain.txt")).unwrap(),
                 "new"
             );
+        }
+
+        #[tokio::test]
+        async fn a_directory_target_is_an_io_error_and_is_left_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("occupied")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "occupied", "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Io(_)), "{err:?}");
+            assert!(dir.path().join("occupied").is_dir());
         }
 
         #[tokio::test]
