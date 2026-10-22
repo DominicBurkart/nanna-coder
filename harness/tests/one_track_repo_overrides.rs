@@ -250,3 +250,16 @@ async fn a_widened_one_track_override_fails_the_assignment_closed() {
     assert!(err.contains("widens"), "{err}");
     assert!(manager.list().await.is_empty());
 }
+
+#[tokio::test]
+async fn the_scripted_provider_reports_its_surface_and_runs_dry() {
+    let model = provider(vec![]);
+    assert_eq!(model.provider_name(), "script");
+    assert!(model.list_models().await.unwrap().is_empty());
+    model.health_check().await.unwrap();
+    let request = ChatRequest::new("m", vec![]);
+    for _ in 0..3 {
+        model.chat(request.clone()).await.unwrap();
+    }
+    model.chat(request).await.unwrap_err();
+}
