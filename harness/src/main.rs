@@ -1841,7 +1841,7 @@ mod tests {
 
     async fn charge_ci_once(
         manager: &harness::task::TaskManager,
-    ) -> Result<harness::budget::BudgetReport, harness::budget::BudgetExceeded> {
+    ) -> Result<harness::budget::BudgetReport, harness::budget::BudgetError> {
         manager
             .cost_accountant()
             .charge_count(

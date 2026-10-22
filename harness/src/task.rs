@@ -796,7 +796,7 @@ impl TaskManager {
 use harness::task::TaskManager;
 
 let manager = TaskManager::new(1);
-assert_eq!(manager.cost_accountant().task_summary("t1").ci.count, 0);
+assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
 ```"#]
     pub fn cost_accountant(&self) -> Arc<CostAccountant> {
         self.runner.cost_accountant()
@@ -1577,7 +1577,9 @@ impl TaskRunner {
             _ => workspace.format_patch().ok().flatten(),
         };
         let qa_summary = workspace.persist_qa_summary();
-        let budget = self.cost_accountant().task_summary(&task_id.0);
+        let budget = self
+            .cost_accountant()
+            .task_summary(identity.as_ref().map_or("", |i| i.name()), &task_id.0);
 
         let _ = workspace.cleanup();
 
@@ -4266,6 +4268,7 @@ mod identity_tests {
     impl crate::budget::BudgetStore for FixedTaskUsage {
         fn task_usage(
             &self,
+            _identity: &str,
             task_id: &str,
             class: crate::budget::BudgetClass,
         ) -> crate::budget::Usage {
@@ -4299,24 +4302,32 @@ mod identity_tests {
             crate::budget::Usage::default()
         }
 
-        fn record(&self, _key: &crate::budget::ChargeKey<'_>, _delta: crate::budget::Usage) {}
+        fn record(
+            &self,
+            _key: &crate::budget::ChargeKey<'_>,
+            _delta: crate::budget::Usage,
+        ) -> Result<(), crate::budget::BudgetError> {
+            Ok(())
+        }
 
         fn try_charge(
             &self,
             _key: &crate::budget::ChargeKey<'_>,
             _limits: &crate::budget::BudgetLimits,
-        ) -> Result<(), crate::budget::BudgetExceeded> {
+        ) -> Result<(), crate::budget::BudgetError> {
             Ok(())
         }
 
-        fn note_run(&self, _repo: &str, _run_id: u64) {}
+        fn note_run(&self, _repo: &str, _run_id: u64) -> Result<(), crate::budget::BudgetError> {
+            Ok(())
+        }
 
         fn pending_runs(&self, _repo: &str) -> Vec<u64> {
             Vec::new()
         }
 
-        fn claim_run(&self, _repo: &str, _run_id: u64) -> bool {
-            true
+        fn claim_run(&self, _repo: &str, _run_id: u64) -> Result<bool, crate::budget::BudgetError> {
+            Ok(true)
         }
     }
 
@@ -4350,7 +4361,7 @@ mod identity_tests {
         );
     }
 
-    async fn charge_ci(manager: &TaskManager) -> Result<(), crate::budget::BudgetExceeded> {
+    async fn charge_ci(manager: &TaskManager) -> Result<(), crate::budget::BudgetError> {
         use crate::budget::BudgetClass;
         manager
             .runner
@@ -4412,20 +4423,37 @@ mod identity_tests {
         charge_ci(&first).await.unwrap();
         charge_ci(&first).await.unwrap();
         assert_eq!(
-            first.runner.cost_accountant().task_summary("t1").ci.count,
+            first
+                .runner
+                .cost_accountant()
+                .task_summary("id", "t1")
+                .ci
+                .count,
             2
         );
         drop(first);
         let mut second = production_manager(Some(path.clone())).await;
         for _ in 0..250 {
-            if second.runner.cost_accountant().task_summary("t1").ci.count == 2 {
+            if second
+                .runner
+                .cost_accountant()
+                .task_summary("id", "t1")
+                .ci
+                .count
+                == 2
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             second = production_manager(Some(path.clone())).await;
         }
         assert_eq!(
-            second.runner.cost_accountant().task_summary("t1").ci.count,
+            second
+                .runner
+                .cost_accountant()
+                .task_summary("id", "t1")
+                .ci
+                .count,
             2
         );
         assert!(charge_ci(&second).await.is_ok());
@@ -4440,7 +4468,10 @@ mod identity_tests {
             charge_ci(&manager).await.unwrap();
         }
         let denied = charge_ci(&manager).await.unwrap_err();
-        assert_eq!(denied.scope, crate::budget::BudgetScope::Task);
+        assert_eq!(
+            denied.exceeded().unwrap().scope,
+            crate::budget::BudgetScope::Task
+        );
         assert_eq!(manager.escalation_snapshot().tracked, 1);
     }
 
