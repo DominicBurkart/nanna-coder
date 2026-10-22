@@ -1898,7 +1898,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 33] = [
+    const PLACEHOLDER_FILES: [&str; 35] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1932,6 +1932,8 @@ mod tests {
         "harness/src/effects.rs",
         "auto-issue-pr.sh",
         "test-agentic-security.sh",
+        "harness/src/pr_tools.rs",
+        "docs/pr-lifecycle-tools.md",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1993,6 +1995,8 @@ mod tests {
             "harness/src/leases",
             "auto-issue-pr.sh",
             "test-agentic-security.sh",
+            "harness/src/pr_tools.rs",
+            "docs/pr-lifecycle-tools.md",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
