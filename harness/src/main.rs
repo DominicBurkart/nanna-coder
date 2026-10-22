@@ -1490,6 +1490,31 @@ async fn build_mcp_task_manager(
     escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
     catalog: &IdentityCatalog,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
+    let budget_path = harness::budget::budget_path_from(
+        std::env::var_os(harness::budget::BUDGET_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    );
+    build_mcp_task_manager_with_budget(
+        provider,
+        model,
+        queue_path,
+        lease_path,
+        escalation_log,
+        budget_path,
+        catalog,
+    )
+    .await
+}
+
+async fn build_mcp_task_manager_with_budget(
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    model: &str,
+    queue_path: &std::path::Path,
+    lease_path: &std::path::Path,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    budget_path: Option<std::path::PathBuf>,
+    catalog: &IdentityCatalog,
+) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
     use harness::leases::JsonlLeaseStore;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
@@ -1514,7 +1539,8 @@ async fn build_mcp_task_manager(
         escalation_log,
         action_gate,
     )
-    .await?)
+    .await?
+    .with_durable_budget(budget_path))
 }
 
 fn build_delegate_task_manager(
@@ -1693,6 +1719,75 @@ mod tests {
         .await
         .unwrap();
         assert!(std::sync::Arc::ptr_eq(&manager.escalations(), &log));
+    }
+
+    async fn charge_ci_once(
+        manager: &harness::task::TaskManager,
+    ) -> Result<harness::budget::BudgetReport, harness::budget::BudgetExceeded> {
+        manager
+            .cost_accountant()
+            .charge_count(
+                "id",
+                "t1",
+                "example/repo",
+                harness::budget::BudgetClass::Ci,
+                chrono::Utc::now(),
+            )
+            .await
+    }
+
+    async fn manager_with_budget(
+        dir: &std::path::Path,
+        budget: Option<std::path::PathBuf>,
+    ) -> harness::task::TaskManager {
+        build_mcp_task_manager_with_budget(
+            offline_provider(),
+            "reviewer-model",
+            &dir.join("queue.jsonl"),
+            &dir.join("leases.jsonl"),
+            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            budget,
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_charges_a_durable_budget_at_the_given_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = dir.path().join("elsewhere").join("budget.json");
+        let manager = manager_with_budget(dir.path(), Some(budget.clone())).await;
+        let report = charge_ci_once(&manager).await.unwrap();
+        assert_eq!(report.ci.count, 1);
+        assert!(budget.is_file());
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_denies_budgeted_actions_without_a_budget_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_with_budget(dir.path(), None).await;
+        assert!(charge_ci_once(&manager).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_keeps_its_budget_next_to_the_queue_unless_overridden() {
+        if std::env::var_os(harness::budget::BUDGET_PATH_ENV).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let manager = build_mcp_task_manager(
+            offline_provider(),
+            "reviewer-model",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        charge_ci_once(&manager).await.unwrap();
+        assert!(dir.path().join("budget.json").is_file());
     }
 
     #[tokio::test]
