@@ -1058,7 +1058,18 @@ impl Tool for WriteFileTool {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&safe_path, content)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&safe_path)?;
+        if crate::protected::is_hardlinked(&file.metadata()?) {
+            return Err(ToolError::ProtectedPath(
+                crate::protected::hardlink_violation(path),
+            ));
+        }
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
 
         Ok(json!({
             "path": path_str,
@@ -4918,6 +4929,89 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
+    }
+
+    #[cfg(unix)]
+    mod hardlink_writes {
+        use super::*;
+
+        fn tool_in(dir: &std::path::Path) -> WriteFileTool {
+            let protected = crate::protected::ProtectedPaths::with_config_dir(dir, None);
+            WriteFileTool::guarded(dir.to_path_buf(), None, protected)
+        }
+
+        fn refused_as_hardlink(err: ToolError) -> crate::protected::ProtectedPathViolation {
+            match err {
+                ToolError::ProtectedPath(violation) => violation,
+                other => panic!("expected ProtectedPath, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_hardlink_to_a_protected_file_cannot_be_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("flake.nix"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("flake.nix"), dir.path().join("alias.txt")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "alias.txt", "content": "evil" }))
+                .await
+                .unwrap_err();
+            let violation = refused_as_hardlink(err);
+            assert_eq!(violation.path, "alias.txt");
+            assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("flake.nix")).unwrap(),
+                "original"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+                "original"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_hardlink_write_does_not_truncate_the_shared_inode() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            let result = tool_in(dir.path())
+                .execute(json!({ "path": "b.txt", "content": "" }))
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_file_with_one_link_is_still_overwritten() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("plain.txt"), "old content that is long").unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "plain.txt", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("plain.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_new_file_is_created_with_the_content() {
+            let dir = tempfile::tempdir().unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sub/new.txt", "content": "hello" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["bytes_written"], 5);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("sub/new.txt")).unwrap(),
+                "hello"
+            );
+        }
     }
 
     #[test]

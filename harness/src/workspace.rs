@@ -727,13 +727,24 @@ impl TaskWorkspace {
 
     fn refuse_protected_changes(&self) -> Result<(), WorkspaceError> {
         for path in self.changed_paths()? {
-            if let Err(violation) = self.protected.check(Path::new(&path)) {
+            let violation = self
+                .protected
+                .check(Path::new(&path))
+                .err()
+                .or_else(|| self.hardlink_violation(&path));
+            if let Some(violation) = violation {
                 self.audit
                     .on_protected_path_violation(&self.task_id, &violation);
                 return Err(WorkspaceError::ProtectedPath(violation));
             }
         }
         Ok(())
+    }
+
+    fn hardlink_violation(&self, path: &str) -> Option<ProtectedPathViolation> {
+        let metadata = std::fs::symlink_metadata(self.workspace_path.join(path)).ok()?;
+        crate::protected::is_hardlinked(&metadata)
+            .then(|| crate::protected::hardlink_violation(Path::new(path)))
     }
 
     /// The staged diff against `HEAD`, refused with
@@ -1878,6 +1889,64 @@ mod tests {
         assert_eq!(violation.path, "codecov.yml");
         let paths = ws.changed_paths().unwrap();
         assert_eq!(paths, vec!["README.md", "codecov.yml", "windows.toml"]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_a_hardlinked_path_without_listing_the_target() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let task_id = unique_id("ws-hardlink");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "innocuous.txt");
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![(task_id, violation)]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_format_patch_refuses_a_hardlinked_path_and_commits_nothing() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-fp"), "HEAD").unwrap();
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        assert_eq!(commit_count(&ws.workspace_path), 1);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_deleted_path_and_single_link_files_are_not_hardlink_violations() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-ok"), "HEAD").unwrap();
+        std::fs::remove_file(ws.workspace_path.join("README.md")).unwrap();
+        std::fs::write(ws.workspace_path.join("fresh.txt"), "one link").unwrap();
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("fresh.txt"));
+        assert!(diff.contains("README.md"));
         ws.cleanup().unwrap();
     }
 
