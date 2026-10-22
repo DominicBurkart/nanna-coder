@@ -21,6 +21,7 @@ pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
 pub mod pod;
+pub mod pr_tools;
 pub mod protected;
 pub mod qa;
 pub mod rollout;
@@ -56,6 +57,10 @@ pub use monitoring::{
 pub use observability::{
     AlertCategory, AlertInfo, AlertPolicy, ComprehensiveStatus, HealthThreshold,
     ObservabilityError, ObservabilitySystem, PerformanceTrends, TrendDirection,
+};
+pub use pr_tools::{
+    GitCommitTool, GitPushBranchTool, GithubIssueCommentTool, GithubIssueReadTool,
+    GithubPrCloseTool, GithubPrCommentsTool, GithubPrOpenTool, GithubPrPromoteTool,
 };
 pub use protected::{
     AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,

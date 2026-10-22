@@ -11,6 +11,7 @@ fn patterns() -> &'static [(Regex, &'static str)] {
     PATTERNS.get_or_init(|| {
         [
             (r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})", "<redacted:github-token>"),
+            (r"\bglpat-[A-Za-z0-9_\-]{16,}", "<redacted:gitlab-token>"),
             (r"\bsk-[A-Za-z0-9_\-]{16,}", "<redacted:api-key>"),
             (r"\bAKIA[0-9A-Z]{16}\b", "<redacted:aws-key>"),
             (r"(?i)\bbearer\s+[A-Za-z0-9\-._~+/]+=*", "Bearer <redacted:bearer>"),
@@ -109,6 +110,15 @@ mod tests {
             redact("ssh://bob@host/x"),
             "ssh://<redacted:userinfo>@host/x"
         );
+    }
+
+    #[test]
+    fn masks_gitlab_personal_access_tokens() {
+        assert_eq!(
+            redact("clone with glpat-AbCdEfGhIjKlMnOpQrSt0 now"),
+            "clone with <redacted:gitlab-token> now"
+        );
+        assert_eq!(redact("glpat-short"), "glpat-short");
     }
 
     #[test]
