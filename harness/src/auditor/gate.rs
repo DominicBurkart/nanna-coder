@@ -408,6 +408,15 @@ pub(crate) struct RepoSpawnGate<'a> {
 }
 
 impl RepoSpawnGate<'_> {
+    pub(crate) fn request(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
     pub(crate) fn request_with_caller(
         &self,
         parent_task: TaskSummary,
