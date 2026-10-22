@@ -135,10 +135,7 @@ fn nfc(text: &str) -> String {
 }
 
 fn fold_path(path: &Path) -> PathBuf {
-    match path.to_str() {
-        Some(text) => PathBuf::from(nfc(text)),
-        None => path.to_path_buf(),
-    }
+    PathBuf::from(nfc(&path.to_string_lossy()))
 }
 
 impl Rule {
@@ -624,6 +621,19 @@ mod tests {
         }
 
         #[test]
+        fn the_directory_itself_matches_when_the_configuration_directory_is_decomposed() {
+            let protected = with_config(&format!("cfg/{NFD}"));
+            assert!(protected.is_protected(Path::new(&format!("cfg/{PRECOMPOSED}"))));
+        }
+
+        #[test]
+        fn a_configuration_directory_equal_to_the_repository_root_adds_no_rule() {
+            let root = Path::new("/repo");
+            let protected = ProtectedPaths::with_config_dir(root, Some(root));
+            assert_eq!(protected.rules().len(), PROTECTED_PATTERNS.len());
+        }
+
+        #[test]
         fn combining_marks_are_reordered_canonically() {
             let protected = with_config("cfg/a\u{323}\u{301}");
             assert!(protected.is_protected(Path::new("cfg/a\u{301}\u{323}/x")));
@@ -667,6 +677,26 @@ mod tests {
                 let violation = protected.check(Path::new(path)).unwrap_err();
                 assert_eq!(violation.rule, rule, "{path}");
                 assert_eq!(violation.path, path);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_path_that_is_not_valid_utf8_is_still_matched() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let protected = protected();
+            let inside = Path::new(OsStr::from_bytes(b".nanna/agents/\xff.toml"));
+            assert!(protected.is_protected(inside));
+            let outside = Path::new(OsStr::from_bytes(b"docs/\xff.md"));
+            assert!(!protected.is_protected(outside));
+        }
+
+        #[test]
+        fn compatibility_forms_that_no_file_system_folds_stay_unprotected() {
+            let protected = protected();
+            for path in ["\u{fb02}ake.nix", "\u{ff46}lake.nix", "codecov\u{ff0e}yml"] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
             }
         }
 
