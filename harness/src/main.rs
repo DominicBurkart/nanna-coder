@@ -1253,7 +1253,9 @@ async fn run_backlog_sync(
     queue_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
+    use harness::escalation::EscalationLog;
     use harness::scheduler::JsonlQueueStore;
+    use std::sync::Arc;
 
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
@@ -1263,17 +1265,27 @@ async fn run_backlog_sync(
         .collect::<Vec<_>>();
     let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
-    let report = backlog_sync(&client, &sink, &config).await?;
+    let escalation_log = Arc::new(EscalationLog::open(&resolve_escalation_path(&path))?);
+    let gate = build_spawn_gate(
+        &load_identities(),
+        harness::auditor::AuditLog::file(path.with_file_name("audit.jsonl")),
+        spawn_escalation_hook(escalation_log),
+    )?;
+    let report = backlog_sync(&client, &sink, &config, &gate).await?;
     println!(
-        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}",
+        "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}, refused by the auditor {}",
         path.display(),
         report.enqueued.len(),
         report.duplicates,
         report.claimed,
-        report.capped
+        report.capped,
+        report.refused.len()
     );
     for origin in &report.enqueued {
         println!("  + {origin}");
+    }
+    for refused in &report.refused {
+        println!("  ! {}: {}", refused.origin, refused.reason);
     }
     Ok(())
 }
@@ -1434,9 +1446,26 @@ fn load_identities() -> IdentityCatalog {
     })
 }
 
+fn spawn_escalation_hook(
+    log: std::sync::Arc<harness::escalation::EscalationLog>,
+) -> Box<dyn harness::auditor::SpawnEscalationHook> {
+    use harness::escalation::{default_window, Escalator, EscalatorSpawnHook, FanoutSink};
+    use harness::leases::SystemClock;
+    use std::sync::Arc;
+
+    let escalator = Escalator::new(
+        log,
+        Arc::new(FanoutSink(vec![])),
+        Arc::new(SystemClock),
+        default_window(),
+    );
+    Box::new(EscalatorSpawnHook::new(Arc::new(escalator)))
+}
+
 fn build_spawn_gate(
     catalog: &IdentityCatalog,
     log: harness::auditor::AuditLog,
+    hook: Box<dyn harness::auditor::SpawnEscalationHook>,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
     use harness::auditor::{AuditContext, RuleAuditor, SpawnGate};
     use harness::identity::AUDITOR_IDENTITY;
@@ -1445,7 +1474,12 @@ fn build_spawn_gate(
         format!("the identity catalog has no `{AUDITOR_IDENTITY}` identity, so assign_task cannot be gated")
     })?;
     let context = AuditContext::new(catalog.clone(), auditor.clone())?;
-    Ok(SpawnGate::new(Box::new(RuleAuditor::new()), log, context))
+    Ok(SpawnGate::with_hook(
+        Box::new(RuleAuditor::new()),
+        log,
+        context,
+        hook,
+    ))
 }
 
 async fn build_mcp_task_manager(
@@ -1453,32 +1487,34 @@ async fn build_mcp_task_manager(
     model: &str,
     queue_path: &std::path::Path,
     lease_path: &std::path::Path,
-    escalation_path: &std::path::Path,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
     catalog: &IdentityCatalog,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
-    use harness::escalation::EscalationLog;
     use harness::leases::JsonlLeaseStore;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
     use harness::task::{TaskManager, DEFAULT_MAX_CONCURRENT_TASKS};
     use std::sync::Arc;
 
-    Ok(TaskManager::restore_with_identities(
-        DEFAULT_MAX_CONCURRENT_TASKS,
-        Box::new(HybridPolicy::default()),
-        Box::new(JsonlQueueStore::open(queue_path)?),
-        Arc::new(JsonlLeaseStore::open(lease_path)?),
-        provider.clone(),
-        catalog,
-    )
-    .await?
-    .with_escalations(Arc::new(EscalationLog::open(escalation_path)?))
-    .with_action_policy(
+    let leases: Arc<dyn harness::leases::LeaseStore> = Arc::new(JsonlLeaseStore::open(lease_path)?);
+    let action_gate = TaskManager::action_policy_gate(
+        Arc::clone(&leases),
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
-        Some((provider, model.to_string())),
+        Some((provider.clone(), model.to_string())),
         harness::action_auditor::ActionAuditLog::file(
             queue_path.with_file_name("action_audit.jsonl"),
         ),
-    ))
+    );
+    Ok(TaskManager::restore_with_escalations(
+        DEFAULT_MAX_CONCURRENT_TASKS,
+        Box::new(HybridPolicy::default()),
+        Box::new(JsonlQueueStore::open(queue_path)?),
+        leases,
+        provider,
+        catalog,
+        escalation_log,
+        action_gate,
+    )
+    .await?)
 }
 
 fn build_delegate_task_manager(
@@ -1505,13 +1541,14 @@ async fn run_mcp_server(
     let lease_path = resolve_lease_path(&queue_path);
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
+    let escalation_log = Arc::new(harness::escalation::EscalationLog::open(&escalation_path)?);
     let task_manager = Arc::new(
         build_mcp_task_manager(
             provider.clone(),
             model,
             &queue_path,
             &lease_path,
-            &escalation_path,
+            Arc::clone(&escalation_log),
             &catalog,
         )
         .await?,
@@ -1527,7 +1564,7 @@ async fn run_mcp_server(
     );
 
     let audit_log = harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl"));
-    let gate = build_spawn_gate(&catalog, audit_log)?;
+    let gate = build_spawn_gate(&catalog, audit_log, spawn_escalation_hook(escalation_log))?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
@@ -1561,7 +1598,15 @@ async fn run_delegate(
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let task_manager = Arc::new(build_delegate_task_manager(provider.clone(), model));
-    let gate = build_spawn_gate(&load_identities(), harness::auditor::AuditLog::in_memory())?;
+    let queue_path = resolve_queue_path(None)?;
+    let escalation_log = Arc::new(harness::escalation::EscalationLog::open(
+        &resolve_escalation_path(&queue_path),
+    )?);
+    let gate = build_spawn_gate(
+        &load_identities(),
+        harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
+        spawn_escalation_hook(escalation_log),
+    )?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
         provider,
@@ -1620,7 +1665,7 @@ mod tests {
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
-            &dir.path().join("escalations.jsonl"),
+            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
             &IdentityCatalog::default(),
         )
         .await
@@ -1631,6 +1676,62 @@ mod tests {
             gate.log().path(),
             Some(dir.path().join("action_audit.jsonl").as_path())
         );
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_uses_the_escalation_log_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
+        let manager = build_mcp_task_manager(
+            offline_provider(),
+            "reviewer-model",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            std::sync::Arc::clone(&log),
+            &IdentityCatalog::default(),
+        )
+        .await
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&manager.escalations(), &log));
+    }
+
+    #[tokio::test]
+    async fn the_spawn_escalation_hook_records_an_escalate_verdict_in_the_log() {
+        fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/identities/global"),
+            dir.path(),
+        );
+        std::fs::remove_file(dir.path().join("incident-responder.toml")).unwrap();
+        let catalog = IdentityCatalog::load(dir.path()).unwrap();
+        let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
+        let gate = build_spawn_gate(
+            &catalog,
+            harness::auditor::AuditLog::in_memory(),
+            spawn_escalation_hook(std::sync::Arc::clone(&log)),
+        )
+        .unwrap();
+        let request = gate.request(
+            harness::auditor::TaskSummary::new("task-1", "d", "example/repo"),
+            "deployer",
+            "Deploy build 42 to the production environment.",
+        );
+        let refused = gate.check(request).await.unwrap_err();
+        assert!(matches!(refused, harness::auditor::Refused::Verdict { .. }));
+        assert_eq!(log.states().len(), 1);
     }
 
     #[test]

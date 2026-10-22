@@ -441,7 +441,15 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
     ) -> Result<Self, QueueStoreError> {
-        Self::build(max_concurrent_tasks, policy, store, leases, None)
+        Self::build(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            None,
+            Arc::new(EscalationLog::in_memory()),
+            None,
+        )
     }
 
     /// Build a manager over `store`, re-queue every entry the store still
@@ -481,7 +489,40 @@ impl TaskManager {
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
     ) -> Result<Self, QueueStoreError> {
-        let manager = Self::build(max_concurrent_tasks, policy, store, leases, Some(provider))?;
+        let gate_leases = Arc::clone(&leases);
+        Self::restore_with_escalations(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(gate_leases),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_with_escalations(
+        max_concurrent_tasks: usize,
+        policy: Box<dyn SchedulingPolicy>,
+        store: Box<dyn QueueStore>,
+        leases: Arc<dyn LeaseStore>,
+        provider: Arc<dyn ModelProvider>,
+        identities: &crate::identity::IdentityCatalog,
+        escalations: Arc<EscalationLog>,
+        action_gate: Arc<ActionGate>,
+    ) -> Result<Self, QueueStoreError> {
+        let manager = Self::build(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            Some(provider),
+            escalations,
+            Some(action_gate),
+        )?;
         manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
@@ -501,8 +542,10 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
+        escalations: Arc<EscalationLog>,
+        action_gate: Option<Arc<ActionGate>>,
     ) -> Result<Self, QueueStoreError> {
-        let action_gate = default_action_gate(Arc::clone(&leases));
+        let action_gate = action_gate.unwrap_or_else(|| default_action_gate(Arc::clone(&leases)));
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -515,7 +558,7 @@ impl TaskManager {
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::Mutex::new(Arc::new(NoopAuditHook)),
             bound: RwLock::new(HashMap::new()),
-            escalations: std::sync::RwLock::new(Arc::new(EscalationLog::in_memory())),
+            escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
         });
@@ -532,7 +575,8 @@ impl TaskManager {
 
     /// Use `escalations` (for example the persisted log under `mcp-serve`)
     /// instead of the in-memory default.
-    pub fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_escalations(self, escalations: Arc<EscalationLog>) -> Self {
         *self.runner.escalations.write().unwrap() = escalations;
         self
     }
@@ -565,8 +609,17 @@ impl TaskManager {
         model: Option<(Arc<dyn ModelProvider>, String)>,
         log: crate::action_auditor::ActionAuditLog,
     ) -> Self {
+        let gate = Self::action_policy_gate(self.leases(), windows, model, log);
+        self.with_action_gate(gate)
+    }
+
+    pub fn action_policy_gate(
+        leases: Arc<dyn LeaseStore>,
+        windows: crate::windows::WindowSet,
+        model: Option<(Arc<dyn ModelProvider>, String)>,
+        log: crate::action_auditor::ActionAuditLog,
+    ) -> Arc<ActionGate> {
         let windows = Arc::new(windows);
-        let leases = self.leases();
         let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
             Some((provider, name)) => Arc::new(crate::action_auditor::ModelActionAuditor::new(
                 provider,
@@ -581,7 +634,7 @@ impl TaskManager {
                 DEFAULT_ACTION_LEASE_TTL,
             )),
         };
-        self.with_action_gate(Arc::new(ActionGate::new(auditor, log)))
+        Arc::new(ActionGate::new(auditor, log))
     }
 
     /// The gate every dispatched task's effectful calls pass through.
@@ -592,7 +645,8 @@ impl TaskManager {
     /// Deliver action-auditor escalations through `escalator` and use its
     /// log as this manager's escalation log. Without one, an escalation is
     /// recorded in the escalation log only and no sink delivers it.
-    pub fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_escalator(self, escalator: Arc<crate::escalation::Escalator>) -> Self {
         *self.runner.escalations.write().unwrap() = Arc::clone(escalator.log());
         *self.runner.escalator.write().unwrap() = Some(escalator);
         self
@@ -718,7 +772,8 @@ impl TaskManager {
     /// [`crate::scope::ScopeDenial`]. To run effectful work, submit under a
     /// named, registered identity with [`TaskManager::submit_with_identity`]
     /// or a hinted [`TaskManager::submit_task`].
-    pub async fn submit(
+    #[cfg(test)]
+    pub(crate) async fn submit(
         &self,
         description: String,
         repo_path: PathBuf,
@@ -815,7 +870,7 @@ impl TaskManager {
     /// identity this is exactly [`TaskManager::submit`]: read-only and
     /// network-less.
     #[allow(clippy::too_many_arguments)]
-    pub async fn submit_with_identity(
+    pub(crate) async fn submit_with_identity(
         &self,
         description: String,
         repo_path: PathBuf,
@@ -844,7 +899,7 @@ impl TaskManager {
     /// The task is `Pending` until the scheduler starts it. If the queue
     /// store rejects the entry the task is recorded as `Failed` with error
     /// type `QueuePersistFailed` rather than dropped silently.
-    pub async fn submit_task(
+    pub(crate) async fn submit_task(
         &self,
         queued: QueuedTask,
         provider: Arc<dyn ModelProvider>,
@@ -1563,6 +1618,100 @@ mod tests {
         ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole, ModelInfo,
     };
     use std::sync::Mutex;
+
+    #[tokio::test]
+    #[ignore]
+    async fn task_manager_submit_with_dev_container() {
+        let repo_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests/integration/repo");
+        assert!(
+            repo_path.exists(),
+            "Example repo not found at {:?}",
+            repo_path
+        );
+
+        assert!(
+            crate::container::detect_runtime().is_available(),
+            "no container runtime available: podman or docker is required to run this ignored test"
+        );
+
+        assert!(
+            tokio::net::TcpStream::connect("127.0.0.1:11434")
+                .await
+                .is_ok(),
+            "Ollama not reachable on 127.0.0.1:11434: required to run this ignored test"
+        );
+
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+
+        let ollama_config = model::OllamaConfig::default();
+        let provider =
+            model::OllamaProvider::new(ollama_config).expect("failed to create provider");
+        let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+
+        let identity = crate::identity::AgentIdentity::from_toml_str(
+            r#"
+[identity]
+name = "dev-container-e2e"
+description = "Edits the example repository inside its dev container."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Edit the repository." }
+
+[scope]
+repos = ["DominicBurkart/nanna-coder"]
+paths = []
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "run_command"]
+
+[limits]
+max_iterations = 32
+max_wall_clock_secs = 600
+max_concurrent = 1
+"#,
+            "dev-container-e2e.toml",
+        )
+        .expect("e2e identity must parse");
+
+        let task_id = manager
+            .submit_with_identity(
+                "Add a simple function `add(a: i32, b: i32) -> i32` to src/lib.rs that returns a + b."
+                    .to_string(),
+                repo_path,
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                32,
+                provider,
+                Some(identity),
+            )
+            .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(700);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("Task did not complete within timeout");
+            }
+
+            let task = manager.poll(&task_id).await.expect("task not found");
+            match &task.status {
+                TaskStatus::Completed { result, .. } => {
+                    assert!(
+                        result.changes_patch.is_some(),
+                        "expected non-empty changes_patch"
+                    );
+                    return;
+                }
+                TaskStatus::Failed { error, .. } => {
+                    panic!("Task failed: {}", error);
+                }
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
 
     type ChatHook = Box<dyn Fn() + Send + Sync>;
 
@@ -3867,6 +4016,60 @@ mod identity_tests {
         assert_eq!(snapshot.tracked, 1);
         assert_eq!(snapshot.occurrences, 1);
         assert!(snapshot.holds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_task_escalates_into_the_supplied_log_through_the_supplied_gate() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let entry = QueuedTask::new(
+            "Check PR status",
+            repo_dir.path().to_path_buf(),
+            "HEAD",
+            "mock",
+            20,
+        )
+        .with_identity_hint(Some("pr-shepherd".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let log = Arc::new(EscalationLog::in_memory());
+        let leases: Arc<dyn LeaseStore> = Arc::new(InMemoryLeaseStore::default());
+        let manager = TaskManager::restore_with_escalations(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            leases,
+            provider,
+            &catalog,
+            Arc::clone(&log),
+            escalating_gate(),
+        )
+        .await
+        .unwrap();
+        wait_for(&manager, &entry.id, terminal).await;
+        assert!(Arc::ptr_eq(&manager.escalations(), &log));
+        let snapshot = log.snapshot(Utc::now());
+        assert_eq!(snapshot.tracked, 1);
+        assert_eq!(snapshot.occurrences, 1);
+        let default = TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            MockProvider::new(vec![]),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&default.escalations(), &log));
     }
 
     async fn run_github_status_task(manager: &TaskManager) -> TaskResult {
