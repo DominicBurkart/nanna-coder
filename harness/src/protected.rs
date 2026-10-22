@@ -22,6 +22,7 @@ use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// The fixed, repository-relative globs every agent is refused, matched
 /// with `*` never crossing `/` and `**` spanning directories. A glob
@@ -129,10 +130,19 @@ fn compile(glob: &str) -> Pattern {
     Pattern::new(glob).expect("protected glob is valid")
 }
 
+fn nfc(text: &str) -> String {
+    text.nfc().collect()
+}
+
+fn fold_path(path: &Path) -> PathBuf {
+    PathBuf::from(nfc(&path.to_string_lossy()))
+}
+
 impl Rule {
     fn new(glob: String) -> Self {
-        let pattern = compile(&glob);
-        let directory = glob.strip_suffix(RECURSIVE_SUFFIX).map(compile);
+        let folded = nfc(&glob);
+        let pattern = compile(&folded);
+        let directory = folded.strip_suffix(RECURSIVE_SUFFIX).map(compile);
         Self {
             glob,
             pattern,
@@ -189,11 +199,17 @@ pub struct ProtectedPaths {
 
 fn relative_config_dir(repo_root: &Path, config_dir: &Path) -> Option<PathBuf> {
     let canonical = repo_root.canonicalize().ok();
+    let folded = fold_path(config_dir);
     std::iter::once(repo_root)
         .chain(canonical.as_deref())
-        .find_map(|root| config_dir.strip_prefix(root).ok())
+        .find(|root| folded.starts_with(fold_path(root)))
+        .map(|root| {
+            config_dir
+                .components()
+                .skip(root.components().count())
+                .collect::<PathBuf>()
+        })
         .filter(|relative| !relative.as_os_str().is_empty())
-        .map(Path::to_path_buf)
 }
 
 impl ProtectedPaths {
@@ -230,7 +246,8 @@ impl ProtectedPaths {
 
     /// The rule protecting the repository-relative `path`, as an error.
     pub fn check(&self, path: &Path) -> Result<(), ProtectedPathViolation> {
-        match self.rules.iter().find(|rule| rule.matches(path)) {
+        let folded = fold_path(path);
+        match self.rules.iter().find(|rule| rule.matches(&folded)) {
             Some(rule) => Err(ProtectedPathViolation {
                 path: crate::scope::denial_path(path),
                 rule: rule.glob.clone(),
@@ -564,6 +581,137 @@ mod tests {
         ] {
             assert!(!protected.is_protected(Path::new(path)), "{path}");
             assert_eq!(protected.check(Path::new(path)), Ok(()));
+        }
+    }
+
+    mod unicode_folding {
+        use super::*;
+
+        const NFD: &str = "cafe\u{301}";
+        const PRECOMPOSED: &str = "caf\u{e9}";
+
+        fn with_config(config: &str) -> ProtectedPaths {
+            let root = Path::new("/repo");
+            ProtectedPaths::with_config_dir(root, Some(&root.join(config)))
+        }
+
+        #[test]
+        fn a_decomposed_spelling_matches_a_precomposed_configuration_directory() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            let candidate = format!("cfg/{NFD}/agents/x.toml");
+            let violation = protected.check(Path::new(&candidate)).unwrap_err();
+            assert_eq!(violation.path, candidate);
+            assert_eq!(violation.rule, format!("cfg/{PRECOMPOSED}/**"));
+        }
+
+        #[test]
+        fn a_precomposed_spelling_matches_a_decomposed_configuration_directory() {
+            let config = format!("cfg/{NFD}");
+            let protected = with_config(&config);
+            let candidate = format!("cfg/{PRECOMPOSED}/agents/x.toml");
+            let violation = protected.check(Path::new(&candidate)).unwrap_err();
+            assert_eq!(violation.rule, format!("{config}/**"));
+        }
+
+        #[test]
+        fn the_directory_itself_and_case_variants_match_in_either_spelling() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            assert!(protected.is_protected(Path::new(&format!("cfg/{NFD}"))));
+            assert!(protected.is_protected(Path::new(&format!("CFG/{NFD}/x"))));
+        }
+
+        #[test]
+        fn the_directory_itself_matches_when_the_configuration_directory_is_decomposed() {
+            let protected = with_config(&format!("cfg/{NFD}"));
+            assert!(protected.is_protected(Path::new(&format!("cfg/{PRECOMPOSED}"))));
+        }
+
+        #[test]
+        fn a_configuration_directory_equal_to_the_repository_root_adds_no_rule() {
+            let root = Path::new("/repo");
+            let protected = ProtectedPaths::with_config_dir(root, Some(root));
+            assert_eq!(protected.rules().len(), PROTECTED_PATTERNS.len());
+        }
+
+        #[test]
+        fn combining_marks_are_reordered_canonically() {
+            let protected = with_config("cfg/a\u{323}\u{301}");
+            assert!(protected.is_protected(Path::new("cfg/a\u{301}\u{323}/x")));
+            assert!(protected.is_protected(Path::new("cfg/\u{1ea1}\u{301}/x")));
+        }
+
+        #[test]
+        fn a_decomposed_configuration_directory_under_a_precomposed_root_is_a_rule() {
+            let root = PathBuf::from(format!("/home/{PRECOMPOSED}/repo"));
+            let config = PathBuf::from(format!("/home/{NFD}/repo/cfg"));
+            let protected = ProtectedPaths::with_config_dir(&root, Some(&config));
+            assert!(protected.is_protected(Path::new("cfg/agents/x.toml")));
+            assert_eq!(protected.config_dir(), Some(config.as_path()));
+        }
+
+        #[test]
+        fn a_precomposed_configuration_directory_under_a_decomposed_root_is_a_rule() {
+            let root = PathBuf::from(format!("/home/{NFD}/repo"));
+            let config = PathBuf::from(format!("/home/{PRECOMPOSED}/repo/cfg"));
+            let protected = ProtectedPaths::with_config_dir(&root, Some(&config));
+            assert!(protected.is_protected(Path::new("cfg/agents/x.toml")));
+        }
+
+        #[test]
+        fn rules_and_mount_roots_keep_the_configuration_directory_spelling() {
+            let config = format!("cfg/{NFD}");
+            let protected = with_config(&config);
+            assert!(protected.rules().contains(&format!("{config}/**").as_str()));
+            assert!(protected.mount_roots().contains(&PathBuf::from(&config)));
+        }
+
+        #[test]
+        fn compatibility_singletons_fold_onto_ascii_protected_names() {
+            let protected = protected();
+            for (path, rule) in [
+                ("fla\u{212A}e.nix", "flake.nix"),
+                ("flake.loc\u{212A}", "flake.lock"),
+                (".cargo-hus\u{212A}y/x", ".cargo-husky/**"),
+                ("crates/.nanna/\u{212B}", "**/.nanna/**"),
+            ] {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert_eq!(violation.rule, rule, "{path}");
+                assert_eq!(violation.path, path);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_path_that_is_not_valid_utf8_is_still_matched() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let protected = protected();
+            let inside = Path::new(OsStr::from_bytes(b".nanna/agents/\xff.toml"));
+            assert!(protected.is_protected(inside));
+            let outside = Path::new(OsStr::from_bytes(b"docs/\xff.md"));
+            assert!(!protected.is_protected(outside));
+        }
+
+        #[test]
+        fn compatibility_forms_that_no_file_system_folds_stay_unprotected() {
+            let protected = protected();
+            for path in ["\u{fb02}ake.nix", "\u{ff46}lake.nix", "codecov\u{ff0e}yml"] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn unrelated_non_ascii_names_stay_unprotected() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            for path in [
+                format!("cfg/{NFD}x/y"),
+                format!("other/{NFD}/y"),
+                format!("{NFD}/cfg/y"),
+                "docs/caf\u{e8}/y".to_string(),
+                "docs/\u{212A}elvin.md".to_string(),
+            ] {
+                assert!(!protected.is_protected(Path::new(&path)), "{path}");
+            }
         }
     }
 

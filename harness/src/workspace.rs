@@ -1882,6 +1882,18 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_changes_refuses_a_unicode_equivalent_spelling_of_a_protected_file() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nfc"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join("fla\u{212A}e.nix"), "evil").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, "flake.nix");
+        assert_eq!(violation.path, "fla\u{212A}e.nix");
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
     fn test_unprotected_changes_still_produce_patches_and_call_no_hook() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());

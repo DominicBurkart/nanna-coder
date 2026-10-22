@@ -1383,6 +1383,16 @@ mod tests {
     }
 
     #[test]
+    fn a_unicode_equivalent_spelling_of_a_protected_file_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let violation = protected_error(guarded(None, PathAccess::Write, "fla\u{212A}e.nix", root));
+        assert_eq!(violation.rule, "flake.nix");
+        assert_eq!(violation.path, "fla\u{212A}e.nix");
+        assert!(!root.join("fla\u{212A}e.nix").exists());
+    }
+
+    #[test]
     fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
         let ws = workspace();
         let root = ws.path();
