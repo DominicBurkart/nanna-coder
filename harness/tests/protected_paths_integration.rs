@@ -15,6 +15,8 @@
 //! It skips (loudly) when no container runtime is available and fails when
 //! the runtime cannot start the image.
 
+mod support;
+
 use harness::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
     ReadOnlyMount,
@@ -94,7 +96,11 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
     assert!(mounts.iter().all(|m| !m.host.starts_with(&config_dir)));
 
     let handle = start(&workspace, mounts).await;
-    let registry = create_container_tool_registry(&workspace, handle, CONTAINER_WORKSPACE_DIR);
+    let registry = support::allow_gated(create_container_tool_registry(
+        &workspace,
+        handle,
+        CONTAINER_WORKSPACE_DIR,
+    ));
 
     let config_path = config_dir.display().to_string();
     let visible = run(&registry, &format!("test -e '{config_path}'")).await;
@@ -184,7 +190,11 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let shielded = protected_mounts(&protected, &workspace).unwrap();
 
     let handle = start(&workspace, shielded.mounts).await;
-    let registry = create_container_tool_registry(&workspace, handle, CONTAINER_WORKSPACE_DIR);
+    let registry = support::allow_gated(create_container_tool_registry(
+        &workspace,
+        handle,
+        CONTAINER_WORKSPACE_DIR,
+    ));
 
     assert_refused(&registry, "mkdir -p /workspace/.nanna/agents").await;
     assert_refused(&registry, "echo x > /workspace/.nanna/new.toml").await;

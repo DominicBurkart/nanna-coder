@@ -118,8 +118,8 @@ impl RuleActionAuditor {
         }
     }
 
-    /// Replace the `run_command` content inspector, which by default is the
-    /// explicit not-implemented stub in `commands`.
+    /// Replace the `run_command` content inspector, which by default is
+    /// `commands::inspect`.
     pub fn with_inspector(mut self, inspector: Inspector) -> Self {
         self.inspector = inspector;
         self
