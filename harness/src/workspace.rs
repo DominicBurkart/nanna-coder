@@ -1881,6 +1881,29 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    fn assert_alias_refused(name: &str, rule: &str) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-alias"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join(name), "evil").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, rule, "{name}");
+        assert_eq!(violation.path, name);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_refuses_a_short_name_of_a_protected_file() {
+        assert_alias_refused("CODECO~1.YML", "codecov.yml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_trailing_dot_and_space_aliases() {
+        assert_alias_refused("flake.nix.", "flake.nix");
+        assert_alias_refused("codecov.yml ", "codecov.yml");
+    }
+
     #[test]
     fn test_unprotected_changes_still_produce_patches_and_call_no_hook() {
         let source = TempDir::new().unwrap();
