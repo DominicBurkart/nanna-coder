@@ -8,7 +8,7 @@ This project uses **Cachix exclusively** for binary caching, providing unlimited
 
 ### Previous Approaches
 
-1. **Magic Nix Cache** (deprecated Feb 2025)
+1. **Magic Nix Cache** (deprecated 2025-02)
    - Automatic caching by DeterminateSystems
    - Deprecated and removed
 
@@ -31,14 +31,14 @@ This project uses **Cachix exclusively** for binary caching, providing unlimited
 ┌─────────────────────────────────────────┐
 │         GitHub Actions CI               │
 │                                         │
-│  ┌─────────────────────────────────┐   │
+│  ┌───────────────────────────────┐   │
 │  │  cachix-action@v15              │   │
 │  │  - Pull: Always (public cache)  │   │
 │  │  - Push: Main branch + PRs      │   │
 │  │  - Skip: Fork PRs               │   │
-│  └─────────────────────────────────┘   │
+│  └───────────────────────────────┘   │
 │              ↓↑                         │
-└──────────────┼─────────────────────────┘
+└──────────────┼───────────────────────┘
                │
                ↓↑
     ┌──────────────────────┐
@@ -49,7 +49,7 @@ This project uses **Cachix exclusively** for binary caching, providing unlimited
     │  - Authenticated push│
     └──────────────────────┘
                ↓↑
-┌──────────────┼─────────────────────────┐
+┌──────────────┼───────────────────────┐
 │    Developer Workstations              │
 │                                         │
 │  nix run .#setup-cache                 │

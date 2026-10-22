@@ -317,7 +317,7 @@ cargo run --bin evaluate-agent -- \
 
 ## Related Documentation
 
-- [AGENTS.md](../AGENTS.md) - Agent control flow architecture
-- [ARCHITECTURE.md](../ARCHITECTURE.md) - System architecture overview
-- [TESTING.md](../TESTING.md) - General testing strategy
-- [harness/src/agent/eval.rs](../harness/src/agent/eval.rs) - Implementation
+- [AGENTS.md](../AGENTS.md) — agent control flow
+- [ARCHITECTURE.md](../ARCHITECTURE.md) — system architecture
+- [TESTING.md](../TESTING.md) — testing strategy
+- [harness/src/agent/eval.rs](../harness/src/agent/eval.rs) — implementation
