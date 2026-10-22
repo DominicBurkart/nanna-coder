@@ -4338,6 +4338,65 @@ mod identity_tests {
     }
 
     #[tokio::test]
+    async fn test_a_parked_hostile_store_entry_is_refused_on_restore() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let parked = stored_entry(repo.path(), Some("rust-implementer"), HOSTILE)
+            .with_not_before(Some(Utc::now() + chrono::Duration::hours(1)));
+        let gate = crate::auditor::test_support::fixture_gate();
+        let (manager, store) =
+            restore_audited(&[&parked], &fixture_catalog(), &gate, untouched_provider()).await;
+        let task = manager.poll(&parked.id).await.unwrap();
+        assert_eq!(failed_with(&task.status).0, "RestoreRefused");
+        assert!(store.load().unwrap().is_empty());
+        assert!(!manager.dispatcher.is_queued(&parked.id).await);
+        assert_eq!(gate.log().entries().unwrap().len(), 1);
+    }
+
+    struct StuckRemovalStore(InMemoryQueueStore);
+
+    impl QueueStore for StuckRemovalStore {
+        fn load(&self) -> Result<Vec<QueuedTask>, QueueStoreError> {
+            self.0.load()
+        }
+        fn insert(&self, task: &QueuedTask) -> Result<(), QueueStoreError> {
+            self.0.insert(task)
+        }
+        fn remove(&self, _id: &TaskId) -> Result<(), QueueStoreError> {
+            Err(QueueStoreError::Rejected("read-only".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_fails_and_dispatches_nothing_when_a_refused_entry_cannot_be_removed() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let hostile = stored_entry(repo.path(), Some("rust-implementer"), HOSTILE);
+        let benign = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let inner = InMemoryQueueStore::default();
+        inner.insert(&hostile).unwrap();
+        inner.insert(&benign).unwrap();
+        let provider = untouched_provider();
+        let before = provider.remaining();
+        let gate = crate::auditor::test_support::fixture_gate();
+        let result = TaskManager::restore_with_escalations(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(StuckRemovalStore(inner.clone())),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider.clone() as Arc<dyn ModelProvider>,
+            &fixture_catalog(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &gate,
+        )
+        .await;
+        assert!(matches!(result, Err(QueueStoreError::Rejected(_))));
+        let kept: Vec<_> = inner.load().unwrap().into_iter().map(|e| e.id).collect();
+        assert!(kept.contains(&hostile.id) && kept.contains(&benign.id));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(provider.remaining(), before);
+    }
+
+    #[tokio::test]
     async fn test_a_store_entry_whose_audit_fails_is_not_dispatched_on_restore() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");

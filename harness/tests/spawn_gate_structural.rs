@@ -444,6 +444,7 @@ fn restore_audits_every_persisted_entry_before_the_dispatcher_starts() {
     let admit = calls_in("TaskManager::admit_restored", "task.rs");
     assert!(admit.iter().any(|(name, _)| name == "audit_restored"));
     assert!(admit.iter().any(|(name, _)| name == "cancel"));
+    assert!(admit.iter().all(|(name, _)| name != "dispatch"));
     let audit = calls_in("audit_restored", "task.rs");
     assert!(dominates(&audit, "request", "check"));
 }
