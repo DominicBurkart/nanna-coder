@@ -223,14 +223,8 @@ fn respond(
     let foreign_pr_path = format!("/repos/example/repo/pulls/{FOREIGN_PR_NUMBER}");
     match (method, path) {
         ("POST", "/repos/example/repo/pulls") => {
-            pr.body = body
-                .and_then(|b| b.get("body"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            pr.draft = body
-                .and_then(|b| b.get("draft"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            pr.body = body.and_then(|b| b["body"].as_str()).map(str::to_string);
+            pr.draft = body.is_some_and(|b| b["draft"] == json!(true));
             (201, pr_json(PR_NUMBER, pr, pr.body.as_deref()).to_string())
         }
         ("GET", p) if p == own_pr_path => ok(pr_json(PR_NUMBER, pr, pr.body.as_deref())),
