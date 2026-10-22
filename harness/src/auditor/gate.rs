@@ -392,11 +392,12 @@ impl SpawnGate {
 
     pub(crate) fn for_repo(
         &self,
-        repo_root: impl AsRef<std::path::Path>,
+        repo_root: &std::path::Path,
     ) -> Result<RepoSpawnGate<'_>, crate::identity::IdentityError> {
+        let context = self.context.with_repo_overrides(repo_root)?;
         Ok(RepoSpawnGate {
             gate: self,
-            context: self.context.with_repo_overrides(repo_root)?,
+            context,
         })
     }
 }
