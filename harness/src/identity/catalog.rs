@@ -271,16 +271,12 @@ fn check_untrusted(path: &Path) -> Result<(), IdentityError> {
         file: path.to_path_buf(),
         message,
     };
-    let meta = fs::symlink_metadata(path).map_err(|source| IdentityError::Io {
-        file: path.to_path_buf(),
-        source,
-    })?;
-    if meta.file_type().is_symlink() {
+    if path.is_symlink() {
         return Err(refuse(
             "repo-local identity files may not be symlinks".to_string(),
         ));
     }
-    if meta.len() > REPO_OVERRIDE_MAX_BYTES {
+    if fs::metadata(path).is_ok_and(|meta| meta.len() > REPO_OVERRIDE_MAX_BYTES) {
         return Err(refuse(format!(
             "repo-local identity file exceeds {REPO_OVERRIDE_MAX_BYTES} bytes"
         )));
