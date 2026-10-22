@@ -5405,6 +5405,37 @@ mod repo_override_tests {
     }
 
     #[tokio::test]
+    async fn test_a_restore_binds_the_audited_layered_identity_and_ignores_later_edits() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let entry = QueuedTask::new("Add a test.", repo.path().to_path_buf(), "HEAD", "mock", 20)
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let manager = TaskManager::restore_with_escalations(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            writes(&[]),
+            &IdentityCatalog::load(GLOBAL).unwrap(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &crate::auditor::test_support::fixture_gate(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(repo.path().join(".nanna")).unwrap();
+        let resolved = manager
+            .runner
+            .resolve_identity(&entry.id, Some("rust-implementer"), repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.scope.paths, ["api/**"]);
+    }
+
+    #[tokio::test]
     async fn test_a_task_cannot_change_what_it_is_resolved_against() {
         let repo = repo_with_origin();
         install_override(repo.path(), "rust-implementer.toml", NARROWING);

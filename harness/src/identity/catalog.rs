@@ -21,6 +21,8 @@ pub const AUDITOR_IDENTITY: &str = "auditor";
 /// Repo-relative directory whose identities override the global catalog.
 pub const REPO_AGENTS_DIR: &str = ".nanna/agents";
 
+const REPO_OVERRIDE_MAX_BYTES: u64 = 64 * 1024;
+
 /// The host-controlled Nanna configuration directory: `$NANNA_CONFIG_DIR`,
 /// else `$XDG_CONFIG_HOME/nanna`, else `$HOME/.config/nanna`. `None` when
 /// none of those is set. Nothing under a target repository is consulted.
@@ -116,7 +118,7 @@ impl IdentityCatalog {
     /// [`IdentityError::DuplicateName`].
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, IdentityError> {
         let mut catalog = Self::default();
-        for identity in load_dir(dir.as_ref())? {
+        for identity in load_dir(dir.as_ref(), false)? {
             catalog.insert_unique(identity)?;
         }
         Ok(catalog)
@@ -134,7 +136,7 @@ impl IdentityCatalog {
             return Ok(self);
         }
         let mut overrides = Self::default();
-        for local in load_dir(&dir)? {
+        for local in load_dir(&dir, true)? {
             let name = local.name();
             if name == AUDITOR_IDENTITY {
                 return Err(protected(&local));
@@ -245,7 +247,7 @@ fn no_base(local: &AgentIdentity) -> IdentityError {
     }
 }
 
-fn load_dir(dir: &Path) -> Result<Vec<AgentIdentity>, IdentityError> {
+fn load_dir(dir: &Path, untrusted: bool) -> Result<Vec<AgentIdentity>, IdentityError> {
     let io = |source| IdentityError::Io {
         file: dir.to_path_buf(),
         source,
@@ -254,11 +256,36 @@ fn load_dir(dir: &Path) -> Result<Vec<AgentIdentity>, IdentityError> {
     for entry in fs::read_dir(dir).map_err(io)? {
         let path = entry.map_err(io)?.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "toml") {
+            if untrusted {
+                check_untrusted(&path)?;
+            }
             files.push(path);
         }
     }
     files.sort();
     files.iter().map(AgentIdentity::load).collect()
+}
+
+fn check_untrusted(path: &Path) -> Result<(), IdentityError> {
+    let refuse = |message: String| IdentityError::Parse {
+        file: path.to_path_buf(),
+        message,
+    };
+    let meta = fs::symlink_metadata(path).map_err(|source| IdentityError::Io {
+        file: path.to_path_buf(),
+        source,
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(refuse(
+            "repo-local identity files may not be symlinks".to_string(),
+        ));
+    }
+    if meta.len() > REPO_OVERRIDE_MAX_BYTES {
+        return Err(refuse(format!(
+            "repo-local identity file exceeds {REPO_OVERRIDE_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -437,6 +464,56 @@ mod tests {
             catalog.get("pr-shepherd").unwrap().source(),
             dir.path().join("pr-shepherd.toml")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_override_that_is_a_symlink_is_rejected_without_reading_its_target() {
+        let dir = global_catalog();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = write(
+            outside.path(),
+            "secret.toml",
+            "SECRET-FIRST-LINE = [broken\n",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let agents = repo.path().join(".nanna/agents");
+        fs::create_dir_all(&agents).unwrap();
+        std::os::unix::fs::symlink(&secret, agents.join("deployer.toml")).unwrap();
+        let err = IdentityCatalog::load(dir.path())
+            .unwrap()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn repo_override_above_the_size_cap_is_rejected() {
+        let dir = global_catalog();
+        let repo = tempfile::tempdir().unwrap();
+        let mut body = identity_toml("deployer", "outer", "sandbox", "\"read_file\"");
+        body.push_str(&"#".repeat(REPO_OVERRIDE_MAX_BYTES as usize));
+        write(repo.path(), ".nanna/agents/deployer.toml", &body);
+        let err = IdentityCatalog::load(dir.path())
+            .unwrap()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_global_identity_file_still_loads() {
+        let real = tempfile::tempdir().unwrap();
+        let target = write(
+            real.path(),
+            "deployer.toml",
+            &identity_toml("deployer", "outer", "sandbox", "\"read_file\""),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("deployer.toml")).unwrap();
+        assert_eq!(IdentityCatalog::load(dir.path()).unwrap().len(), 1);
     }
 
     #[test]
