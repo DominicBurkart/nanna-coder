@@ -438,6 +438,29 @@ fn the_backlog_sinks_verify_the_proof_on_every_path_to_dispatching() {
 }
 
 #[test]
+fn restore_audits_every_persisted_entry_before_the_dispatcher_starts() {
+    let calls = calls_in("TaskManager::restore_inner", "task.rs");
+    assert!(dominates(&calls, "admit_restored", "dispatch"));
+    let admit = calls_in("TaskManager::admit_restored", "task.rs");
+    assert!(admit.iter().any(|(name, _)| name == "audit_restored"));
+    assert!(admit.iter().any(|(name, _)| name == "cancel"));
+    let audit = calls_in("audit_restored", "task.rs");
+    assert!(dominates(&audit, "request", "check"));
+}
+
+#[test]
+fn only_the_gated_restore_is_a_production_entry_point() {
+    let functions = union(|scan| &scan.functions);
+    assert!(functions.contains("task.rs: TaskManager::restore_with_escalations"));
+    for name in ["restore", "restore_with_identities"] {
+        assert!(
+            !functions.contains(&format!("task.rs: TaskManager::{name}")),
+            "`{name}` restores without auditing and must stay test-only"
+        );
+    }
+}
+
+#[test]
 fn a_check_in_a_dead_branch_does_not_guard_a_dispatch() {
     let scan = scan_source(
         "x.rs",
