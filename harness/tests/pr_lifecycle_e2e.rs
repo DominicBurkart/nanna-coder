@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use harness::action_auditor::{
-    ActionAuditError, ActionAuditLog, ActionAuditor, ActionContext, ActionDenied, ActionGate,
-    ActionReview, ActionVerdict,
+    ActionAuditError, ActionAuditLog, ActionAuditor, ActionContext, ActionGate, ActionReview,
+    ActionVerdict,
 };
 use harness::backlog::{GithubClient, ReqwestGithubClient};
 use harness::effects::EffectClass;
@@ -40,11 +40,7 @@ const EIGHT_TOOLS: [&str; 8] = [
 ];
 
 fn identity_toml(max_effect: &str) -> String {
-    let tools = EIGHT_TOOLS
-        .iter()
-        .map(|t| format!("\"{t}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let tools = EIGHT_TOOLS.map(|t| format!("\"{t}\"")).join(", ");
     format!(
         r#"
 [identity]
@@ -117,18 +113,7 @@ impl FakeGithub {
         }));
         let routes = Arc::new((review, issue));
         let shared = Arc::clone(&state);
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let state = Arc::clone(&shared);
-                let routes = Arc::clone(&routes);
-                tokio::spawn(async move {
-                    let _ = serve(socket, state, routes).await;
-                });
-            }
-        });
+        let server = tokio::spawn(accept_loop(listener, shared, routes));
         Self {
             base,
             state,
@@ -156,6 +141,17 @@ impl FakeGithub {
     }
 }
 
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<Mutex<FakeState>>,
+    routes: Arc<(Vec<Value>, Vec<Value>)>,
+) {
+    while let Ok((socket, _)) = listener.accept().await {
+        let (state, routes) = (Arc::clone(&state), Arc::clone(&routes));
+        tokio::spawn(async move { serve(socket, state, routes).await });
+    }
+}
+
 async fn serve(
     mut socket: TcpStream,
     state: Arc<Mutex<FakeState>>,
@@ -165,9 +161,7 @@ async fn serve(
     let mut chunk = [0u8; 4096];
     let (head_end, content_length) = loop {
         let n = socket.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
-        }
+        assert_ne!(n, 0);
         raw.extend_from_slice(&chunk[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
@@ -179,13 +173,10 @@ async fn serve(
             break (pos + 4, length);
         }
     };
-    while raw.len() < head_end + content_length {
-        let n = socket.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&chunk[..n]);
-    }
+    let missing = (head_end + content_length).saturating_sub(raw.len());
+    let mut rest = vec![0u8; missing];
+    socket.read_exact(&mut rest).await?;
+    raw.extend_from_slice(&rest);
     let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
     let mut request_line = head.lines().next().unwrap_or("").split_whitespace();
     let method = request_line.next().unwrap_or("").to_string();
@@ -194,19 +185,9 @@ async fn serve(
     let body: Option<Value> = serde_json::from_slice(&raw[head_end..]).ok();
     let (status, payload) = {
         let mut guard = state.lock().unwrap();
-        guard.requests.push(Seen {
-            method: method.clone(),
-            path: path.clone(),
-            body: body.clone(),
-        });
-        respond(
-            &mut guard.pr,
-            &method,
-            &path,
-            &target,
-            body.as_ref(),
-            &routes,
-        )
+        let reply = respond(&mut guard.pr, &method, &path, body.as_ref(), &routes);
+        guard.requests.push(Seen { method, path, body });
+        reply
     };
     let response = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -231,17 +212,10 @@ fn respond(
     pr: &mut PrState,
     method: &str,
     path: &str,
-    target: &str,
     body: Option<&Value>,
     routes: &(Vec<Value>, Vec<Value>),
 ) -> (u16, String) {
-    let page = |items: &Vec<Value>| {
-        if target.contains("page=1") || !target.contains("page=") {
-            Value::Array(items.clone())
-        } else {
-            json!([])
-        }
-    };
+    let page = |items: &Vec<Value>| Value::Array(items.clone());
     let ok = |v: Value| (200, v.to_string());
     let comments_path = format!("/repos/example/repo/pulls/{PR_NUMBER}/comments");
     let issue_comments_path = format!("/repos/example/repo/issues/{PR_NUMBER}/comments");
@@ -285,8 +259,10 @@ fn respond(
             pr.state = "closed";
             ok(pr_json(PR_NUMBER, pr, pr.body.as_deref()))
         }
-        (_, p) if p.contains("merge") => ok(json!({ "merged": true })),
-        _ => (404, "{}".to_string()),
+        _ => {
+            let status = if path.contains("merge") { 200 } else { 404 };
+            (status, "{}".to_string())
+        }
     }
 }
 
@@ -300,18 +276,14 @@ fn comment(id: u64, login: &str, body: &str) -> Value {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let status = Command::new("git")
         .arg("-c")
         .arg("commit.gpgsign=false")
         .args(args)
         .current_dir(dir)
-        .output()
+        .status()
         .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(status.success(), "git {args:?} failed");
 }
 
 fn feature_repo() -> TempDir {
@@ -358,25 +330,6 @@ impl ActionAuditor for AllowAll {
     }
 }
 
-fn gate() -> (Arc<ActionGate>, ActionSubject) {
-    let gate = Arc::new(ActionGate::new(
-        Arc::new(AllowAll),
-        ActionAuditLog::in_memory(),
-    ));
-    let subject = ActionSubject {
-        task_id: TaskId("pr-lifecycle-e2e".to_string()),
-        max_effect: EffectClass::Repository,
-        window: None,
-        repo: "example/repo".to_string(),
-        branch: None,
-        pr: None,
-        environment: None,
-        paths: vec![],
-        description: String::new(),
-    };
-    (gate, subject)
-}
-
 fn wired_registry(root: &Path, fake: &FakeGithub, allowed_authors: &[&str]) -> ToolRegistry {
     let mut registry = create_tool_registry_for(root, &identity("repository")).unwrap();
     for name in EIGHT_TOOLS {
@@ -406,8 +359,15 @@ fn wired_registry(root: &Path, fake: &FakeGithub, allowed_authors: &[&str]) -> T
     registry
 }
 
+#[rustfmt::skip]
 fn gated(registry: ToolRegistry) -> ToolRegistry {
-    let (gate, subject) = gate();
+    let auditor = Arc::new(AllowAll);
+    let gate = Arc::new(ActionGate::new(auditor, ActionAuditLog::in_memory()));
+    let task_id = TaskId("pr-lifecycle-e2e".to_string());
+    let (repo, max_effect) = ("example/repo".to_string(), EffectClass::Repository);
+    let (window, branch, pr, environment) = (None, None, None, None);
+    let (paths, description) = (Vec::new(), String::new());
+    let subject = ActionSubject { task_id, max_effect, window, repo, branch, pr, environment, paths, description };
     registry.with_action_gate(gate, subject)
 }
 
@@ -456,12 +416,11 @@ fn fenced_fields(entries: &Value) -> Vec<String> {
 
 fn assert_never_merged(fake: &FakeGithub) {
     for seen in fake.requests() {
-        assert_ne!(seen.method, "PUT", "unexpected PUT {}", seen.path);
+        let merged = seen.method == "PUT" || seen.path.contains("merge");
         assert!(
-            !seen.path.contains("merge"),
+            !merged,
             "merge endpoint reached: {} {}",
-            seen.method,
-            seen.path
+            seen.method, seen.path
         );
     }
 }
@@ -528,10 +487,8 @@ async fn open_comments_promote_and_close_reach_the_server_through_the_gated_regi
     assert!(!inner.contains('<') && !inner.contains('>'), "{inner}");
     assert!(!inner.contains('[') && !inner.contains(']'), "{inner}");
     assert!(!inner.contains('\u{202e}'), "{inner}");
-    assert!(
-        inner.contains("&lt;&lt;&lt;UNTRUSTED_GITHUB_TEXT"),
-        "{inner}"
-    );
+    let forged_fence_escaped = inner.contains("&lt;&lt;&lt;UNTRUSTED_GITHUB_TEXT");
+    assert!(forged_fence_escaped, "{inner}");
     assert!(inner.contains("\\u{202e}"), "{inner}");
     assert!(comments["notice"].as_str().unwrap().len() > 10);
 
@@ -551,10 +508,8 @@ async fn open_comments_promote_and_close_reach_the_server_through_the_gated_regi
         )
         .await
         .unwrap_err();
-    assert!(
-        matches!(no_reference, ToolError::InvalidArguments { .. }),
-        "{no_reference:?}"
-    );
+    let invalid = matches!(no_reference, ToolError::InvalidArguments { .. });
+    assert!(invalid, "{no_reference:?}");
     assert!(no_reference.to_string().contains("reference an issue"));
     assert_eq!(fake.request_count(), before_refusals);
 
@@ -607,18 +562,9 @@ async fn the_same_calls_without_a_gate_are_denied_and_send_no_request() {
     let registry = wired_registry(repo.path(), &fake, &["alice"]);
     for (name, args) in lifecycle_calls() {
         let err = registry.execute(name, args).await.unwrap_err();
-        match err {
-            ToolError::ActionDenied(
-                ActionDenied::Block { reasons } | ActionDenied::Escalate { reasons },
-            ) => {
-                assert!(
-                    reasons[0].detail.contains("no action auditor configured"),
-                    "{name}: {}",
-                    reasons[0].detail
-                );
-            }
-            other => panic!("{name}: expected ActionDenied, got {other:?}"),
-        }
+        assert!(matches!(err, ToolError::ActionDenied(_)), "{name}: {err:?}");
+        let by_default = err.to_string().contains("no action auditor configured");
+        assert!(by_default, "{name}: {err}");
     }
     assert_eq!(fake.request_count(), 0, "{:?}", fake.requests());
 }
@@ -631,16 +577,15 @@ async fn an_unscoped_registry_denies_the_same_calls_and_sends_no_request() {
     let registry = gated(create_tool_registry(repo.path()).read_only_unscoped());
     for (name, args) in lifecycle_calls() {
         let err = registry.execute(name, args).await.unwrap_err();
-        match err {
-            ToolError::ScopeDenied(denial) => {
-                assert_eq!(denial.identity, harness::scope::UNSCOPED_IDENTITY);
-                assert_eq!(denial.tool, name);
-                assert_eq!(denial.reason, DenialReason::ToolNotInScope);
-            }
-            other => panic!("{name}: expected ScopeDenied, got {other:?}"),
-        }
+        assert!(matches!(err, ToolError::ScopeDenied(_)), "{name}: {err:?}");
     }
-    assert_eq!(registry.denial_count(), 4);
+    let denials = registry.denials();
+    assert_eq!(denials.len(), 4);
+    for (denial, (name, _)) in denials.iter().zip(lifecycle_calls()) {
+        assert_eq!(denial.identity, harness::scope::UNSCOPED_IDENTITY);
+        assert_eq!(denial.tool, name);
+        assert_eq!(denial.reason, DenialReason::ToolNotInScope);
+    }
     assert!(registry.action_reviews().is_empty());
     assert_eq!(fake.request_count(), 0);
 }
@@ -660,4 +605,22 @@ async fn an_identity_whose_ceiling_is_below_repository_gets_none_of_the_tools() 
     }
     assert_eq!(registry.denial_count(), 4);
     assert_eq!(fake.request_count(), 0);
+}
+
+#[test]
+fn the_test_auditor_names_itself() {
+    assert_eq!(AllowAll.name(), "allow-all");
+}
+
+#[tokio::test]
+#[should_panic(expected = "merge endpoint reached: PUT /repos/example/repo/pulls/7/merge")]
+async fn the_merge_detector_fires_when_the_merge_endpoint_is_called() {
+    let fake = FakeGithub::start(vec![], vec![]).await;
+    let client = reqwest::Client::new();
+    let merge = format!("{}/repos/example/repo/pulls/{PR_NUMBER}/merge", fake.base);
+    let merged = client.put(&merge).send().await.unwrap();
+    assert_eq!(merged.status().as_u16(), 200);
+    let unknown = client.get(format!("{}/nope", fake.base)).send().await;
+    assert_eq!(unknown.unwrap().status().as_u16(), 404);
+    assert_never_merged(&fake);
 }
