@@ -112,6 +112,7 @@ jobs:
             "auto-issue-pr.sh"
             "test-agentic-security.sh"
             "harness/src/pr_tools.rs"
+            "docs/pr-lifecycle-tools.md"
           )
           shopt -s nocasematch
           VIOLATIONS=()
