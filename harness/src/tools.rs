@@ -2926,7 +2926,7 @@ fn collect_pr_status(workspace_root: &Path) -> ToolResult<PrStatusData> {
 }
 
 /// Parse a GitHub remote URL into (owner, repo).
-fn parse_github_remote(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_remote(url: &str) -> Option<(String, String)> {
     // Handle SSH: git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
@@ -3271,7 +3271,7 @@ impl Tool for GitHubPrStatusTool {
 }
 
 pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    create_tool_registry_with_scope(workspace_root, None)
+    create_tool_registry_with_scope(workspace_root, None, None)
 }
 
 /// The default tools restricted to `identity`: file tools carry the
@@ -3282,12 +3282,16 @@ pub fn create_tool_registry_for(
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    Ok(create_tool_registry_with_scope(workspace_root, Some(scope)).scoped_for(identity))
+    Ok(
+        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity))
+            .scoped_for(identity),
+    )
 }
 
 fn create_tool_registry_with_scope(
     workspace_root: &std::path::Path,
     scope: Option<PathScope>,
+    pr_identity: Option<&AgentIdentity>,
 ) -> ToolRegistry {
     let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
@@ -3302,6 +3306,9 @@ fn create_tool_registry_with_scope(
     registry.register(Box::new(GitHubPrStatusTool::new(
         workspace_root.to_path_buf(),
     )));
+    if let Some(identity) = pr_identity {
+        crate::pr_tools::register(&mut registry, workspace_root, identity);
+    }
     registry
 }
 
@@ -3380,7 +3387,7 @@ pub fn create_container_tool_registry_for(
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope));
+    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity));
     let working_dir = Some(container_working_dir.to_string());
     registry.register(Box::new(RunCommandTool::new(container_handle, working_dir)));
     Ok(registry.scoped_for(identity))
@@ -4745,7 +4752,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 58] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 60] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4828,6 +4835,8 @@ mod tests {
         ("harness/src/leases/**", "harness/src/leases/store.rs"),
         ("auto-issue-pr.sh", "auto-issue-pr.sh"),
         ("test-agentic-security.sh", "test-agentic-security.sh"),
+        ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
+        ("docs/pr-lifecycle-tools.md", "docs/pr-lifecycle-tools.md"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {

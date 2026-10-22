@@ -215,6 +215,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     .await;
     assert_refused(&registry, "mkdir /workspace/harness/src/leases/sub").await;
     assert_refused(&registry, "echo x > /workspace/auto-issue-pr.sh").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/pr_tools.rs").await;
+    assert_refused(&registry, "echo x > /workspace/docs/pr-lifecycle-tools.md").await;
     assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
     assert_refused(
         &registry,
@@ -250,6 +252,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         ".envrc",
         "CLAUDE.md",
         "harness/src/tools.rs",
+        "harness/src/pr_tools.rs",
+        "docs/pr-lifecycle-tools.md",
     ] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
