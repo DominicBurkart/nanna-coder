@@ -310,16 +310,15 @@ impl ProtectedPaths {
                 Component::Normal(name) => self.component_options(name.to_string_lossy().as_ref()),
                 other => vec![other.as_os_str().to_os_string()],
             };
-            spellings = spellings
-                .iter()
-                .flat_map(|prefix| {
-                    options.iter().map(move |option| {
-                        let mut next = prefix.clone();
-                        next.push(option.clone());
-                        next
-                    })
-                })
-                .collect();
+            let mut next = Vec::with_capacity(spellings.len() * options.len());
+            for prefix in &spellings {
+                for option in &options {
+                    let mut spelling = prefix.clone();
+                    spelling.push(option.clone());
+                    next.push(spelling);
+                }
+            }
+            spellings = next;
             if spellings.len() > MAX_ALIAS_VARIANTS {
                 return None;
             }
