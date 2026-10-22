@@ -5306,6 +5306,33 @@ mod tests {
     }
 
     #[test]
+    fn removing_or_moving_an_ancestor_of_a_protected_path_is_refused() {
+        refuse_all(
+            &[
+                "rm -rf harness",
+                "rm -rf harness/src",
+                "rm -rf harness/src/rollout",
+                "rm -rf docs",
+                "rm -rf tests",
+                "rm -rf .github",
+                "mv harness x",
+                "mv harness/src x",
+                "chmod -R 000 harness",
+                "chmod -R 000 harness/src",
+            ],
+            "protected path",
+        );
+        allow_all(&[
+            "rm -rf target",
+            "rm target/debug/x",
+            "rm -rf build",
+            "rm -rf harness/tests",
+            "mv a b",
+            "chmod -R 755 src",
+        ]);
+    }
+
+    #[test]
     fn protected_paths_are_refused_for_every_write_form() {
         let protected = ProtectedPaths::with_config_dir(Path::new("."), None);
         for rule in protected.rules() {
