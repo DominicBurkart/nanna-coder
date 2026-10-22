@@ -351,6 +351,14 @@ impl SpawnGate {
     pub async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
         self.gate.check(request, &self.context).await
     }
+
+    pub(crate) async fn check_against(
+        &self,
+        request: SpawnRequest,
+        context: &AuditContext,
+    ) -> Result<Allowed, Refused> {
+        self.gate.check(request, context).await
+    }
 }
 
 fn reconcile_with_catalog(
