@@ -4,6 +4,7 @@ pub mod apprun;
 pub mod assets;
 pub mod auditor;
 pub mod backlog;
+pub mod budget;
 pub mod capabilities;
 pub mod container;
 pub mod deploy;

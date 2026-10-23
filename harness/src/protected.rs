@@ -84,6 +84,7 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "test-agentic-security.sh",
     "harness/src/pr_tools.rs",
     "docs/pr-lifecycle-tools.md",
+    "harness/src/budget.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -389,6 +390,7 @@ mod tests {
         ("test-agentic-security.sh", "test-agentic-security.sh"),
         ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
         ("docs/pr-lifecycle-tools.md", "docs/pr-lifecycle-tools.md"),
+        ("harness/src/budget.rs", "harness/src/budget.rs"),
     ];
 
     #[test]
@@ -468,6 +470,7 @@ mod tests {
             "auto-issue-pr.sh",
             "harness/src/pr_tools.rs",
             "docs/pr-lifecycle-tools.md",
+            "harness/src/budget.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -542,6 +545,11 @@ mod tests {
             "docs/pr-lifecycle-tools.md.bak",
             "docs/other/pr-lifecycle-tools.md",
             "docs/pr-lifecycle-tool.md",
+            "harness/src/budget.rs.bak",
+            "harness/src/budget",
+            "other/harness/src/budget.rs",
+            "harness/budget.rs",
+            "harness/src/budgets.rs",
             "harness/src/pr_tool.rs",
             "harness/src/pr_tools.rs.bak",
             "harness/src/pr_tools",
@@ -737,6 +745,7 @@ mod tests {
                 PathBuf::from("test-agentic-security.sh"),
                 PathBuf::from("harness/src/pr_tools.rs"),
                 PathBuf::from("docs/pr-lifecycle-tools.md"),
+                PathBuf::from("harness/src/budget.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -808,6 +817,7 @@ mod tests {
                 ("test-agentic-security.sh".to_string(), false),
                 ("harness/src/pr_tools.rs".to_string(), false),
                 ("docs/pr-lifecycle-tools.md".to_string(), false),
+                ("harness/src/budget.rs".to_string(), false),
             ]
         );
     }

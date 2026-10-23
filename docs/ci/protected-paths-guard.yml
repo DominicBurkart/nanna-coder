@@ -113,6 +113,7 @@ jobs:
             "test-agentic-security.sh"
             "harness/src/pr_tools.rs"
             "docs/pr-lifecycle-tools.md"
+            "harness/src/budget.rs"
           )
           shopt -s nocasematch
           VIOLATIONS=()
