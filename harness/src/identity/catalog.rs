@@ -271,17 +271,19 @@ fn check_untrusted(path: &Path) -> Result<(), IdentityError> {
         file: path.to_path_buf(),
         message,
     };
-    if path.is_symlink() {
-        return Err(refuse(
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(refuse(
             "repo-local identity files may not be symlinks".to_string(),
-        ));
-    }
-    if fs::metadata(path).is_ok_and(|meta| meta.len() > REPO_OVERRIDE_MAX_BYTES) {
-        return Err(refuse(format!(
+        )),
+        Ok(meta) if meta.len() > REPO_OVERRIDE_MAX_BYTES => Err(refuse(format!(
             "repo-local identity file exceeds {REPO_OVERRIDE_MAX_BYTES} bytes"
-        )));
+        ))),
+        Ok(_) => Ok(()),
+        Err(source) => Err(IdentityError::Io {
+            file: path.to_path_buf(),
+            source,
+        }),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -460,6 +462,21 @@ mod tests {
             catalog.get("pr-shepherd").unwrap().source(),
             dir.path().join("pr-shepherd.toml")
         );
+    }
+
+    #[test]
+    fn an_untrusted_file_that_cannot_be_statted_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let err = check_untrusted(&missing).unwrap_err();
+        assert!(
+            matches!(err, IdentityError::Io { ref file, .. } if *file == missing),
+            "{err}"
+        );
+        let file = write(dir.path(), "plain.toml", "x");
+        let beneath_a_file = file.join("child.toml");
+        let err = check_untrusted(&beneath_a_file).unwrap_err();
+        assert!(matches!(err, IdentityError::Io { .. }), "{err}");
     }
 
     #[cfg(unix)]
