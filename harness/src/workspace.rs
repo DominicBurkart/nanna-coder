@@ -1898,7 +1898,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 36] = [
+    const PLACEHOLDER_FILES: [&str; 40] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1935,6 +1935,10 @@ mod tests {
         "harness/src/pr_tools.rs",
         "docs/pr-lifecycle-tools.md",
         "harness/src/budget.rs",
+        "harness/src/ci_tools.rs",
+        "harness/src/ci_policy.rs",
+        "harness/src/ci_integrity.rs",
+        "harness/src/deploy/template.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1999,6 +2003,10 @@ mod tests {
             "harness/src/pr_tools.rs",
             "docs/pr-lifecycle-tools.md",
             "harness/src/budget.rs",
+            "harness/src/ci_tools.rs",
+            "harness/src/ci_policy.rs",
+            "harness/src/ci_integrity.rs",
+            "harness/src/deploy/template.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
