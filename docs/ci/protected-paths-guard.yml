@@ -114,6 +114,10 @@ jobs:
             "harness/src/pr_tools.rs"
             "docs/pr-lifecycle-tools.md"
             "harness/src/budget.rs"
+            "harness/src/ci_tools.rs"
+            "harness/src/ci_policy.rs"
+            "harness/src/ci_integrity.rs"
+            "harness/src/deploy/template.rs"
           )
           shopt -s nocasematch
           VIOLATIONS=()

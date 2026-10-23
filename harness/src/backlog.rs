@@ -15,7 +15,7 @@ use crate::auditor::{Allowed, SpawnGate, TaskSummary};
 use crate::scheduler::{QueueStore, QueueStoreError, QueuedTask, TaskOrigin, TaskQueue};
 use crate::task::TaskManager;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use model::provider::ModelProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -126,6 +126,8 @@ pub enum BacklogError {
     },
     #[error("invalid repository {repo:?}: expected owner/name")]
     InvalidRepo { repo: String },
+    #[error("invalid workflow {workflow:?}: expected a file name or numeric id")]
+    InvalidWorkflow { workflow: String },
     #[error("GitHub request to {url} timed out")]
     Timeout { url: String },
     #[error("GitHub GraphQL error for {url}: {message}")]
@@ -215,6 +217,106 @@ pub trait GithubClient: Send + Sync {
     ) -> Result<Vec<GithubComment>, BacklogError>;
 
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: u64,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub html_url: String,
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub run_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl WorkflowRun {
+    pub fn duration_minutes(&self) -> Option<f64> {
+        let started = self.run_started_at?;
+        let ended = self.updated_at?;
+        if self.status != "completed" || ended < started {
+            return None;
+        }
+        Some((ended - started).num_seconds() as f64 / 60.0)
+    }
+
+    pub fn is_rerunnable_failure_on(&self, branch: &str) -> bool {
+        self.head_branch.as_deref() == Some(branch)
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("failure") | Some("timed_out") | Some("cancelled")
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowJob {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowJob {
+    pub fn failed(&self) -> bool {
+        matches!(
+            self.conclusion.as_deref(),
+            Some("failure") | Some("timed_out") | Some("cancelled")
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub number: u64,
+}
+
+#[async_trait]
+pub trait GithubActionsClient: Send + Sync {
+    async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow: &str,
+        git_ref: &str,
+        inputs: serde_json::Value,
+    ) -> Result<(), BacklogError>;
+
+    async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError>;
+
+    async fn list_workflow_runs(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+        event: &str,
+    ) -> Result<Vec<WorkflowRun>, BacklogError>;
+
+    async fn get_workflow_run(&self, repo: &str, run_id: u64) -> Result<WorkflowRun, BacklogError>;
+
+    async fn list_workflow_jobs(
+        &self,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<WorkflowJob>, BacklogError>;
+
+    async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError>;
 }
 
 /// A repository whose backlog is ingested.
@@ -612,6 +714,8 @@ fn transport_error(error: reqwest::Error, url: &str) -> BacklogError {
     }
 }
 
+pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+
 const MAX_REPO_OWNER_LEN: usize = 39;
 const MAX_REPO_NAME_LEN: usize = 100;
 const MAX_REPO_ECHO_CHARS: usize = 64;
@@ -624,6 +728,25 @@ fn valid_repo_segment(segment: &str, max_len: usize) -> bool {
         && segment
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+pub fn valid_workflow_ref(workflow: &str) -> bool {
+    !workflow.is_empty()
+        && workflow != "."
+        && workflow != ".."
+        && workflow
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn validate_workflow_ref(workflow: &str) -> Result<(), BacklogError> {
+    if valid_workflow_ref(workflow) {
+        Ok(())
+    } else {
+        Err(BacklogError::InvalidWorkflow {
+            workflow: workflow.chars().take(MAX_REPO_ECHO_CHARS).collect(),
+        })
+    }
 }
 
 fn validate_repo(repo: &str) -> Result<(), BacklogError> {
@@ -886,13 +1009,13 @@ impl ReqwestGithubClient {
             .await
     }
 
-    async fn request_json(
+    async fn send_with_retry(
         &self,
         method: HttpMethod,
         path: &str,
         query: &[(&str, String)],
         payload: Option<&serde_json::Value>,
-    ) -> Result<serde_json::Value, BacklogError> {
+    ) -> Result<reqwest::Response, BacklogError> {
         let url = format!("{}{}", self.base_url, path);
         let mut attempt = 0u32;
         loop {
@@ -914,11 +1037,7 @@ impl ReqwestGithubClient {
             let response = request.send().await.map_err(|e| transport_error(e, &url))?;
             let status = response.status();
             if status.is_success() {
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|e| transport_error(e, &url))?;
-                return Ok(serde_json::from_str(&text)?);
+                return Ok(response);
             }
             let retry_after = retry_after_secs(response.headers());
             let rate_limited =
@@ -940,6 +1059,54 @@ impl ReqwestGithubClient {
                 retry_after_secs: retry_after,
             });
         }
+    }
+
+    async fn request_json(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, String)],
+        payload: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, BacklogError> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self.send_with_retry(method, path, query, payload).await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| transport_error(e, &url))?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    async fn request_no_content(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), BacklogError> {
+        self.send_with_retry(method, path, &[], payload).await?;
+        Ok(())
+    }
+
+    async fn request_log_tail(&self, path: &str) -> Result<String, BacklogError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut response = self
+            .send_with_retry(HttpMethod::Get, path, &[], None)
+            .await?;
+        let mut kept: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| transport_error(e, &url))?
+        {
+            kept.extend_from_slice(&chunk);
+            if kept.len() > 2 * MAX_LOG_BYTES {
+                kept.drain(..kept.len() - MAX_LOG_BYTES);
+            }
+        }
+        if kept.len() > MAX_LOG_BYTES {
+            kept.drain(..kept.len() - MAX_LOG_BYTES);
+        }
+        Ok(String::from_utf8_lossy(&kept).into_owned())
     }
 
     async fn paginate<T: for<'de> Deserialize<'de>>(
@@ -1133,6 +1300,83 @@ impl GithubClient for ReqwestGithubClient {
     }
 }
 
+#[async_trait]
+impl GithubActionsClient for ReqwestGithubClient {
+    async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow: &str,
+        git_ref: &str,
+        inputs: serde_json::Value,
+    ) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
+        validate_workflow_ref(workflow)?;
+        let payload = serde_json::json!({ "ref": git_ref, "inputs": inputs });
+        self.request_no_content(
+            HttpMethod::Post,
+            &format!("/repos/{repo}/actions/workflows/{workflow}/dispatches"),
+            Some(&payload),
+        )
+        .await
+    }
+
+    async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError> {
+        validate_repo(repo)?;
+        self.request_no_content(
+            HttpMethod::Post,
+            &format!("/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"),
+            None,
+        )
+        .await
+    }
+
+    async fn list_workflow_runs(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+        event: &str,
+    ) -> Result<Vec<WorkflowRun>, BacklogError> {
+        validate_repo(repo)?;
+        validate_workflow_ref(workflow)?;
+        let value = self
+            .get_json(
+                &format!("/repos/{repo}/actions/workflows/{workflow}/runs"),
+                &[("branch", branch.to_string()), ("event", event.to_string())],
+            )
+            .await?;
+        let runs = value.get("workflow_runs").cloned().unwrap_or(value);
+        Ok(serde_json::from_value(runs)?)
+    }
+
+    async fn get_workflow_run(&self, repo: &str, run_id: u64) -> Result<WorkflowRun, BacklogError> {
+        validate_repo(repo)?;
+        let value = self
+            .get_json(&format!("/repos/{repo}/actions/runs/{run_id}"), &[])
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    async fn list_workflow_jobs(
+        &self,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<WorkflowJob>, BacklogError> {
+        validate_repo(repo)?;
+        let value = self
+            .get_json(&format!("/repos/{repo}/actions/runs/{run_id}/jobs"), &[])
+            .await?;
+        let jobs = value.get("jobs").cloned().unwrap_or(value);
+        Ok(serde_json::from_value(jobs)?)
+    }
+
+    async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError> {
+        validate_repo(repo)?;
+        self.request_log_tail(&format!("/repos/{repo}/actions/jobs/{job_id}/logs"))
+            .await
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -1301,6 +1545,151 @@ pub(crate) mod test_support {
                 })
         }
     }
+
+    #[derive(Default)]
+    pub(crate) struct MockGithubActions {
+        pub runs: StdMutex<HashMap<u64, WorkflowRun>>,
+        pub jobs: HashMap<u64, Vec<WorkflowJob>>,
+        pub logs: HashMap<u64, String>,
+        pub list_result: Vec<WorkflowRun>,
+        pub list_result_before_dispatch: Option<Vec<WorkflowRun>>,
+        pub(crate) dispatched: StdMutex<bool>,
+        pub fail_dispatch_status: Option<u16>,
+        pub fail_status: Option<u16>,
+        pub fail_operation: Option<(&'static str, u16, usize)>,
+        pub(crate) calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockGithubActions {
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("mock call log poisoned").clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .expect("mock call log poisoned")
+                .push(call.into());
+        }
+
+        fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            if let Some((operation, status, nth)) = self.fail_operation {
+                let seen = self
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with(operation))
+                    .count();
+                if url.ends_with(operation) && seen == nth {
+                    return Err(BacklogError::Status {
+                        url: url.to_string(),
+                        status,
+                    });
+                }
+            }
+            match self.fail_status {
+                Some(status) => Err(BacklogError::Status {
+                    url: url.to_string(),
+                    status,
+                }),
+                None => Ok(()),
+            }
+        }
+
+        pub(crate) fn set_run(&self, run: WorkflowRun) {
+            self.runs
+                .lock()
+                .expect("mock run table poisoned")
+                .insert(run.id, run);
+        }
+    }
+
+    #[async_trait]
+    impl GithubActionsClient for MockGithubActions {
+        async fn dispatch_workflow(
+            &self,
+            repo: &str,
+            workflow: &str,
+            git_ref: &str,
+            inputs: serde_json::Value,
+        ) -> Result<(), BacklogError> {
+            self.record(format!(
+                "dispatch_workflow {repo} {workflow}@{git_ref} {inputs}"
+            ));
+            *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned") = true;
+            if let Some(status) = self.fail_dispatch_status {
+                return Err(BacklogError::Status {
+                    url: "mock:dispatch_workflow".to_string(),
+                    status,
+                });
+            }
+            self.maybe_fail("mock:dispatch_workflow")
+        }
+
+        async fn rerun_workflow(&self, repo: &str, run_id: u64) -> Result<(), BacklogError> {
+            self.record(format!("rerun_workflow {repo}#{run_id}"));
+            self.maybe_fail("mock:rerun_workflow")
+        }
+
+        async fn list_workflow_runs(
+            &self,
+            repo: &str,
+            workflow: &str,
+            branch: &str,
+            event: &str,
+        ) -> Result<Vec<WorkflowRun>, BacklogError> {
+            self.record(format!(
+                "list_workflow_runs {repo} {workflow} {branch} {event}"
+            ));
+            self.maybe_fail("mock:list_workflow_runs")?;
+            let dispatched = *self
+                .dispatched
+                .lock()
+                .expect("mock dispatched flag poisoned");
+            if !dispatched {
+                if let Some(before) = &self.list_result_before_dispatch {
+                    return Ok(before.clone());
+                }
+            }
+            Ok(self.list_result.clone())
+        }
+
+        async fn get_workflow_run(
+            &self,
+            repo: &str,
+            run_id: u64,
+        ) -> Result<WorkflowRun, BacklogError> {
+            self.record(format!("get_workflow_run {repo}#{run_id}"));
+            self.maybe_fail("mock:get_workflow_run")?;
+            self.runs
+                .lock()
+                .expect("mock run table poisoned")
+                .get(&run_id)
+                .cloned()
+                .ok_or_else(|| BacklogError::Status {
+                    url: format!("mock:runs/{run_id}"),
+                    status: 404,
+                })
+        }
+
+        async fn list_workflow_jobs(
+            &self,
+            repo: &str,
+            run_id: u64,
+        ) -> Result<Vec<WorkflowJob>, BacklogError> {
+            self.record(format!("list_workflow_jobs {repo}#{run_id}"));
+            self.maybe_fail("mock:list_workflow_jobs")?;
+            Ok(self.jobs.get(&run_id).cloned().unwrap_or_default())
+        }
+
+        async fn get_job_logs(&self, repo: &str, job_id: u64) -> Result<String, BacklogError> {
+            self.record(format!("get_job_logs {repo}#{job_id}"));
+            self.maybe_fail("mock:get_job_logs")?;
+            Ok(self.logs.get(&job_id).cloned().unwrap_or_default())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1310,6 +1699,7 @@ mod tests {
     use crate::auditor::test_support::{fixture_gate, gate_over};
     use crate::auditor::{SpawnEscalation, SpawnEscalationHook, VerdictKind};
     use crate::scheduler::InMemoryQueueStore;
+    use chrono::TimeZone;
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2856,6 +3246,345 @@ mod tests {
         let err = client.get_issue("o/n", 1).await.unwrap_err();
         assert!(matches!(err, BacklogError::Status { status: 403, .. }));
         assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    fn run(id: u64, status: &str, conclusion: Option<&str>) -> WorkflowRun {
+        WorkflowRun {
+            id,
+            name: Some("ci".to_string()),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            html_url: format!("https://example.invalid/runs/{id}"),
+            head_branch: None,
+            path: None,
+            head_sha: None,
+            run_started_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn is_rerunnable_failure_on_requires_a_matching_branch_and_a_failure_conclusion() {
+        let mut failed = run(1, "completed", Some("failure"));
+        failed.head_branch = Some("feat/x".to_string());
+        assert!(failed.is_rerunnable_failure_on("feat/x"));
+        assert!(!failed.is_rerunnable_failure_on("main"));
+
+        let mut succeeded = run(2, "completed", Some("success"));
+        succeeded.head_branch = Some("feat/x".to_string());
+        assert!(!succeeded.is_rerunnable_failure_on("feat/x"));
+
+        let mut timed_out = run(3, "completed", Some("timed_out"));
+        timed_out.head_branch = Some("feat/x".to_string());
+        assert!(timed_out.is_rerunnable_failure_on("feat/x"));
+
+        let no_branch = run(4, "completed", Some("failure"));
+        assert!(!no_branch.is_rerunnable_failure_on("feat/x"));
+
+        let mut cancelled = run(5, "completed", Some("cancelled"));
+        cancelled.head_branch = Some("feat/x".to_string());
+        assert!(cancelled.is_rerunnable_failure_on("feat/x"));
+
+        let mut running = run(6, "in_progress", None);
+        running.head_branch = Some("feat/x".to_string());
+        assert!(!running.is_rerunnable_failure_on("feat/x"));
+    }
+
+    #[test]
+    fn duration_minutes_is_none_unless_completed_with_both_timestamps_in_order() {
+        let started = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
+        let ended = started + chrono::Duration::minutes(9);
+        let mut completed = run(1, "completed", Some("success"));
+        completed.run_started_at = Some(started);
+        completed.updated_at = Some(ended);
+        assert_eq!(completed.duration_minutes(), Some(9.0));
+
+        let in_progress = WorkflowRun {
+            run_started_at: Some(started),
+            updated_at: Some(ended),
+            ..run(2, "in_progress", None)
+        };
+        assert_eq!(in_progress.duration_minutes(), None);
+
+        let missing_start = WorkflowRun {
+            updated_at: Some(ended),
+            ..run(3, "completed", Some("success"))
+        };
+        assert_eq!(missing_start.duration_minutes(), None);
+
+        let missing_end = WorkflowRun {
+            run_started_at: Some(started),
+            ..run(4, "completed", Some("success"))
+        };
+        assert_eq!(missing_end.duration_minutes(), None);
+
+        let backwards = WorkflowRun {
+            run_started_at: Some(ended),
+            updated_at: Some(started),
+            ..run(5, "completed", Some("success"))
+        };
+        assert_eq!(backwards.duration_minutes(), None);
+    }
+
+    #[test]
+    fn workflow_job_failed_covers_every_terminal_conclusion() {
+        let job = |conclusion: Option<&str>| WorkflowJob {
+            id: 1,
+            name: "build".to_string(),
+            status: "completed".to_string(),
+            conclusion: conclusion.map(str::to_string),
+            steps: vec![],
+        };
+        assert!(job(Some("failure")).failed());
+        assert!(job(Some("timed_out")).failed());
+        assert!(job(Some("cancelled")).failed());
+        assert!(!job(Some("success")).failed());
+        assert!(!job(None).failed());
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_dispatches_a_workflow_with_204_no_content() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/actions/workflows/ci.yml/dispatches",
+            204,
+            "",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client
+            .dispatch_workflow("o/n", "ci.yml", "feat/x", serde_json::json!({"k": "v"}))
+            .await
+            .unwrap();
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("POST /repos/o/n/actions/workflows/ci.yml/dispatches"));
+        assert!(sent[0].contains("\"ref\":\"feat/x\""));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_dispatch_workflow_surfaces_a_status_error() {
+        let (base, _requests, server) =
+            fake_github_ext(vec![MockRoute::new("POST", "/dispatches", 404, "{}")]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client
+            .dispatch_workflow("o/n", "ci.yml", "feat/x", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 404, .. }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_reruns_a_workflow_with_201_no_content() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "POST",
+            "/actions/runs/9/rerun-failed-jobs",
+            201,
+            "",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        client.rerun_workflow("o/n", 9).await.unwrap();
+        assert!(requests.lock().unwrap()[0].contains("runs/9/rerun-failed-jobs"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_workflow_runs_unwraps_the_envelope() {
+        let body = serde_json::json!({
+            "total_count": 1,
+            "workflow_runs": [
+                {"id": 42, "status": "queued", "html_url": "https://example.invalid/runs/42"},
+            ],
+        })
+        .to_string();
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/workflows/ci.yml/runs",
+            200,
+            &body,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let runs = client
+            .list_workflow_runs("o/n", "ci.yml", "feat/x", "workflow_dispatch")
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, 42);
+        assert_eq!(runs[0].status, "queued");
+        assert!(requests.lock().unwrap()[0].contains("branch=feat%2Fx"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_gets_a_workflow_run() {
+        let body = serde_json::json!({
+            "id": 42,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://example.invalid/runs/42",
+            "run_started_at": "2026-09-26T10:00:00Z",
+            "updated_at": "2026-09-26T10:09:00Z",
+        })
+        .to_string();
+        let (base, _requests, server) =
+            fake_github_ext(vec![MockRoute::new("GET", "/actions/runs/42", 200, &body)]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let run = client.get_workflow_run("o/n", 42).await.unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.conclusion.as_deref(), Some("success"));
+        assert_eq!(run.duration_minutes(), Some(9.0));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_workflow_jobs_unwraps_the_envelope() {
+        let body = serde_json::json!({
+            "jobs": [
+                {
+                    "id": 7,
+                    "name": "test",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {"name": "cargo test", "status": "completed", "conclusion": "failure", "number": 3},
+                    ],
+                },
+            ],
+        })
+        .to_string();
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/runs/42/jobs",
+            200,
+            &body,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let jobs = client.list_workflow_jobs("o/n", 42).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].failed());
+        assert_eq!(jobs[0].steps[0].name, "cargo test");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_fetches_job_logs_across_a_redirect() {
+        let (base, _requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "/actions/jobs/7/logs", 302, "")
+                .with_headers(vec![("Location", "/blob/7")]),
+            MockRoute::new("GET", "/blob/7", 200, "cargo test failed\nsee above\n"),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let logs = client.get_job_logs("o/n", 7).await.unwrap();
+        assert!(logs.contains("cargo test failed"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_job_logs_surfaces_a_status_error() {
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/jobs/7/logs",
+            410,
+            "{}",
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.get_job_logs("o/n", 7).await.unwrap_err();
+        assert!(matches!(err, BacklogError::Status { status: 410, .. }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_refuses_a_workflow_reference_that_could_alter_the_url() {
+        let (base, requests, server) = fake_github_ext(vec![]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        for workflow in [
+            "",
+            ".",
+            "..",
+            "../../other/repo/actions/workflows/ci.yml",
+            "ci.yml?x=1",
+            "a b.yml",
+            "ci.yml#frag",
+        ] {
+            let dispatch = client
+                .dispatch_workflow("o/n", workflow, "feat/x", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(dispatch, BacklogError::InvalidWorkflow { .. }),
+                "{workflow}"
+            );
+            let listing = client
+                .list_workflow_runs("o/n", workflow, "feat/x", "workflow_dispatch")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(listing, BacklogError::InvalidWorkflow { .. }),
+                "{workflow}"
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_refuses_an_invalid_repository_for_every_actions_call() {
+        let (base, requests, server) = fake_github_ext(vec![]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let bad = "o/n/../../x";
+        assert!(client.rerun_workflow(bad, 1).await.is_err());
+        assert!(client.get_workflow_run(bad, 1).await.is_err());
+        assert!(client.list_workflow_jobs(bad, 1).await.is_err());
+        assert!(client.get_job_logs(bad, 1).await.is_err());
+        assert!(client
+            .dispatch_workflow(bad, "ci.yml", "b", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(client
+            .list_workflow_runs(bad, "ci.yml", "b", "workflow_dispatch")
+            .await
+            .is_err());
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn valid_workflow_ref_accepts_file_names_and_ids_only() {
+        for ok in ["ci.yml", "build_and-test.yaml", "123456", "a.b.c"] {
+            assert!(valid_workflow_ref(ok), "{ok}");
+        }
+        for bad in ["", ".", "..", "a/b", "a\\b", "a b", "a?b", "a%2fb", "a\n"] {
+            assert!(!valid_workflow_ref(bad), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_keeps_only_the_tail_of_an_oversized_job_log() {
+        let big = format!(
+            "{}MID-MARKER{}END-MARKER",
+            "x".repeat(2 * MAX_LOG_BYTES - MAX_LOG_BYTES / 10),
+            "y".repeat(MAX_LOG_BYTES / 2)
+        );
+        let (base, _requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/actions/jobs/7/logs",
+            200,
+            &big,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let logs = client.get_job_logs("o/n", 7).await.unwrap();
+        assert!(logs.len() <= MAX_LOG_BYTES);
+        assert!(logs.ends_with("END-MARKER"));
+        assert!(logs.contains("MID-MARKER"));
         server.abort();
     }
 }

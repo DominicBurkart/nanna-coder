@@ -218,6 +218,14 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/harness/src/pr_tools.rs").await;
     assert_refused(&registry, "echo x > /workspace/docs/pr-lifecycle-tools.md").await;
     assert_refused(&registry, "echo x > /workspace/harness/src/budget.rs").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/ci_tools.rs").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/ci_policy.rs").await;
+    assert_refused(&registry, "echo x > /workspace/harness/src/ci_integrity.rs").await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/deploy/template.rs",
+    )
+    .await;
     assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
     assert_refused(
         &registry,
@@ -256,6 +264,10 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         "harness/src/pr_tools.rs",
         "docs/pr-lifecycle-tools.md",
         "harness/src/budget.rs",
+        "harness/src/ci_tools.rs",
+        "harness/src/ci_policy.rs",
+        "harness/src/ci_integrity.rs",
+        "harness/src/deploy/template.rs",
     ] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
