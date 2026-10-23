@@ -642,11 +642,10 @@ impl FileBudgetStore {
         let lock = Self::acquire_lock(&path)?;
         let ledger = match std::fs::read(&path) {
             Ok(bytes) => {
-                let snapshot: LedgerSnapshot =
-                    serde_json::from_slice(&bytes).map_err(|source| BudgetStoreError::Corrupt {
-                        path: path.clone(),
-                        source,
-                    })?;
+                let snapshot: LedgerSnapshot = match serde_json::from_slice(&bytes) {
+                    Ok(snapshot) => snapshot,
+                    Err(source) => return Err(BudgetStoreError::Corrupt { path, source }),
+                };
                 snapshot
                     .validate()
                     .map_err(|reason| BudgetStoreError::Invalid {

@@ -1556,6 +1556,7 @@ pub(crate) mod test_support {
         pub(crate) dispatched: StdMutex<bool>,
         pub fail_dispatch_status: Option<u16>,
         pub fail_status: Option<u16>,
+        pub fail_operation: Option<(&'static str, u16, usize)>,
         pub(crate) calls: StdMutex<Vec<String>>,
     }
 
@@ -1572,6 +1573,19 @@ pub(crate) mod test_support {
         }
 
         fn maybe_fail(&self, url: &str) -> Result<(), BacklogError> {
+            if let Some((operation, status, nth)) = self.fail_operation {
+                let seen = self
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with(operation))
+                    .count();
+                if url.ends_with(operation) && seen == nth {
+                    return Err(BacklogError::Status {
+                        url: url.to_string(),
+                        status,
+                    });
+                }
+            }
             match self.fail_status {
                 Some(status) => Err(BacklogError::Status {
                     url: url.to_string(),

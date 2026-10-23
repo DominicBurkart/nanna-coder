@@ -2416,4 +2416,232 @@ mod tests {
         assert!(!rerun.to_string().contains("abcdefghijkl"), "{rerun}");
         assert!(rerun["notice"].as_str().unwrap().contains("untrusted"));
     }
+
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: InMemoryBudgetStore,
+        fail_record: bool,
+        fail_claim: bool,
+        fail_note: bool,
+    }
+
+    fn flaky_fault() -> crate::budget::BudgetError {
+        crate::budget::BudgetError::Persist {
+            path: PathBuf::from("budget.json"),
+            message: "disk full".to_string(),
+        }
+    }
+
+    impl crate::budget::BudgetStore for FlakyStore {
+        fn task_usage(
+            &self,
+            identity: &str,
+            task_id: &str,
+            class: BudgetClass,
+        ) -> crate::budget::Usage {
+            self.inner.task_usage(identity, task_id, class)
+        }
+
+        fn day_usage(
+            &self,
+            identity: &str,
+            class: BudgetClass,
+            day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            self.inner.day_usage(identity, class, day)
+        }
+
+        fn repo_day_usage(
+            &self,
+            repo: &str,
+            class: BudgetClass,
+            day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            self.inner.repo_day_usage(repo, class, day)
+        }
+
+        fn record(
+            &self,
+            key: &crate::budget::ChargeKey<'_>,
+            delta: crate::budget::Usage,
+        ) -> Result<(), crate::budget::BudgetError> {
+            if self.fail_record {
+                return Err(flaky_fault());
+            }
+            self.inner.record(key, delta)
+        }
+
+        fn try_charge(
+            &self,
+            key: &crate::budget::ChargeKey<'_>,
+            limits: &BudgetLimits,
+        ) -> Result<(), crate::budget::BudgetError> {
+            self.inner.try_charge(key, limits)
+        }
+
+        fn note_run(&self, repo: &str, run_id: u64) -> Result<(), crate::budget::BudgetError> {
+            if self.fail_note {
+                return Err(flaky_fault());
+            }
+            self.inner.note_run(repo, run_id)
+        }
+
+        fn pending_runs(&self, repo: &str) -> Vec<u64> {
+            self.inner.pending_runs(repo)
+        }
+
+        fn claim_run(&self, repo: &str, run_id: u64) -> Result<bool, crate::budget::BudgetError> {
+            if self.fail_claim {
+                return Err(flaky_fault());
+            }
+            self.inner.claim_run(repo, run_id)
+        }
+    }
+
+    fn flaky_accountant(store: FlakyStore) -> Arc<CostAccountant> {
+        Arc::new(CostAccountant::new(
+            Arc::new(store),
+            BudgetConfig::UNLIMITED,
+        ))
+    }
+
+    fn finished_in(minutes: i64, id: u64) -> WorkflowRun {
+        let mut done = run(id, "completed", Some("success"));
+        done.run_started_at = Some(chrono::Utc::now());
+        done.updated_at = Some(chrono::Utc::now() + chrono::Duration::minutes(minutes));
+        done
+    }
+
+    #[tokio::test]
+    async fn a_status_poll_still_answers_when_settling_the_run_against_the_budget_fails() {
+        for (fail_claim, fail_record) in [(true, false), (false, true)] {
+            let dir = fixture();
+            let mock = Arc::new(MockGithubActions::default());
+            mock.set_run(finished_in(6, 9));
+            let accountant = flaky_accountant(FlakyStore {
+                fail_claim,
+                fail_record,
+                ..Default::default()
+            });
+            let tool = CiStatusTool::new(dir.path().to_path_buf(), mock).with_budget(
+                Arc::clone(&accountant),
+                "id",
+                "t1",
+            );
+            let result = tool.execute(json!({"run_id": 9})).await.unwrap();
+            assert_eq!(result["id"], 9);
+            assert_eq!(accountant.task_summary("id", "t1").ci.minutes, 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_still_succeeds_when_the_run_cannot_be_tracked_for_settlement() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        let accountant = flaky_accountant(FlakyStore {
+            fail_note: true,
+            ..Default::default()
+        });
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(Arc::clone(&accountant), "id", "t1");
+        let result = tool.execute(json!({"workflow": "ci.yml"})).await.unwrap();
+        assert_eq!(result["run_id"], 1);
+        assert!(accountant.pending_runs("o/n").is_empty());
+        assert_eq!(accountant.task_summary("id", "t1").ci.count, 1);
+    }
+
+    fn failing(operation: &'static str, nth: usize) -> Arc<MockGithubActions> {
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            jobs: HashMap::from([(9, vec![job(2, "test", Some("failure"))])]),
+            fail_operation: Some((operation, 503, nth)),
+            ..Default::default()
+        });
+        mock.set_run(run(9, "completed", Some("failure")));
+        mock
+    }
+
+    fn sent(mock: &MockGithubActions, operation: &str) -> usize {
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with(operation))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_failing_request_at_each_step_of_a_dispatch_or_rerun_is_reported_as_an_execution_failure(
+    ) {
+        for (operation, nth, args, dispatched, charged) in [
+            (
+                "list_workflow_runs",
+                1,
+                json!({"workflow": "ci.yml"}),
+                false,
+                0,
+            ),
+            (
+                "list_workflow_runs",
+                2,
+                json!({"workflow": "ci.yml"}),
+                true,
+                1,
+            ),
+            (
+                "dispatch_workflow",
+                1,
+                json!({"workflow": "ci.yml"}),
+                true,
+                1,
+            ),
+            ("get_workflow_run", 1, json!({"run_id": 9}), false, 0),
+            ("rerun_workflow", 1, json!({"run_id": 9}), true, 1),
+            ("get_workflow_run", 2, json!({"run_id": 9}), true, 1),
+        ] {
+            let dir = fixture();
+            let mock = failing(operation, nth);
+            let accountant = unlimited_accountant();
+            let tool = trigger_tool(
+                dir.path(),
+                Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+            )
+            .with_budget(Arc::clone(&accountant), "id", "t1");
+            let err = tool.execute(args).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ExecutionFailed { ref message } if message.contains("503")),
+                "{operation}#{nth}: {err:?}"
+            );
+            let reached = sent(&mock, "dispatch_workflow") + sent(&mock, "rerun_workflow");
+            assert_eq!(reached > 0, dispatched, "{operation}#{nth}");
+            assert_eq!(
+                accountant.task_summary("id", "t1").ci.count,
+                charged,
+                "{operation}#{nth}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_jobs_or_log_request_is_reported_as_an_execution_failure() {
+        for operation in ["list_workflow_jobs", "get_job_logs"] {
+            let dir = fixture();
+            let mock = failing(operation, 1);
+            let tool = CiLogsTool::new(
+                dir.path().to_path_buf(),
+                Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+            );
+            let err = tool.execute(json!({"run_id": 9})).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ExecutionFailed { ref message } if message.contains("503")),
+                "{operation}: {err:?}"
+            );
+        }
+    }
 }

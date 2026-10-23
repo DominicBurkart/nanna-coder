@@ -181,12 +181,6 @@ impl CiPolicy {
         Self::default()
     }
 
-    pub fn allowing(workflows: impl IntoIterator<Item = (String, WorkflowSpec)>) -> Self {
-        Self {
-            workflows: workflows.into_iter().collect(),
-        }
-    }
-
     pub fn permits(&self, workflow: &str) -> bool {
         self.workflows.contains_key(workflow)
     }
