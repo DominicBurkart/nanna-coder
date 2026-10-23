@@ -389,6 +389,49 @@ impl SpawnGate {
     pub async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
         self.gate.check(request, &self.context).await
     }
+
+    pub(crate) fn for_repo(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<RepoSpawnGate<'_>, crate::identity::IdentityError> {
+        let context = self.context.with_repo_overrides(repo_root)?;
+        Ok(RepoSpawnGate {
+            gate: self,
+            context,
+        })
+    }
+}
+
+pub(crate) struct RepoSpawnGate<'a> {
+    gate: &'a SpawnGate,
+    context: AuditContext,
+}
+
+impl RepoSpawnGate<'_> {
+    pub(crate) fn request(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
+    pub(crate) fn request_with_caller(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        effect: Option<EffectClass>,
+        dev_loop: Option<DevLoop>,
+    ) -> SpawnRequest {
+        let catalog = self.context.catalog();
+        SpawnRequest::derive_tightened(catalog, parent_task, identity, subtask, effect, dev_loop)
+    }
+
+    pub(crate) async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
+        self.gate.gate.check(request, &self.context).await
+    }
 }
 
 fn reconcile_with_catalog(
@@ -704,5 +747,28 @@ mod tests {
         let allowed = Allowed::new(fitting(), identity);
         assert_eq!(allowed.repo(), fitting().parent_task.repo);
         assert_eq!(allowed.model(), "gemma4:e4b");
+    }
+
+    #[test]
+    fn a_repo_gate_derives_requests_from_the_layered_identity() {
+        use crate::auditor::test_support::fixture_gate;
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let narrowed = include_str!(
+            "../../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml"
+        )
+        .replace(r#"loop = "inner""#, r#"loop = "middle""#);
+        std::fs::write(dir.join("rust-implementer.toml"), narrowed).unwrap();
+        let parent = || TaskSummary::new("t", "d", "github.com/example/repo");
+        let spawn_gate = fixture_gate();
+        let base = spawn_gate.request(parent(), "rust-implementer", "Add a test.");
+        assert_eq!(base.dev_loop, DevLoop::Inner);
+        let repo_gate = spawn_gate.for_repo(repo.path()).unwrap();
+        let plain = repo_gate.request(parent(), "rust-implementer", "Add a test.");
+        assert_eq!(plain.dev_loop, DevLoop::Middle);
+        let caller =
+            repo_gate.request_with_caller(parent(), "rust-implementer", "Add a test.", None, None);
+        assert_eq!(caller.dev_loop, DevLoop::Middle);
     }
 }
