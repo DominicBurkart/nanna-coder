@@ -108,9 +108,6 @@ pub struct ScopeSection {
     pub tools: Vec<ToolPattern>,
 }
 
-/// Per-identity ceilings on one budgeted effect class (`[limits.ci]`,
-/// `[limits.sandbox]`). An unset value defers to the host default; a set
-/// value may only lower it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetCeiling {
@@ -590,8 +587,6 @@ impl AgentIdentity {
         fs::read_to_string(&resolved).map_err(io(&resolved))
     }
 
-    /// The identity's own ceiling for `class`, still to be narrowed against
-    /// the host default by the accountant.
     #[doc = r#"```
 use harness::budget::BudgetClass;
 use harness::identity::AgentIdentity;
