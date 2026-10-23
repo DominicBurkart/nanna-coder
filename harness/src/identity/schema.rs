@@ -2,6 +2,7 @@
 //! system-prompt resolution.
 
 use super::{DevLoop, IdentityError, ToolPattern};
+use crate::budget::{BudgetClass, BudgetConfig, BudgetLimits};
 use crate::effects::EffectClass;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -107,8 +108,39 @@ pub struct ScopeSection {
     pub tools: Vec<ToolPattern>,
 }
 
+/// Per-identity ceilings on one budgeted effect class (`[limits.ci]`,
+/// `[limits.sandbox]`). An unset value defers to the host default; a set
+/// value may only lower it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetCeiling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count_per_task: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count_per_day: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes_per_task: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes_per_day: Option<u64>,
+}
+
+impl BudgetCeiling {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn to_limits(&self) -> BudgetLimits {
+        BudgetLimits {
+            max_count_per_task: self.max_count_per_task,
+            max_count_per_day: self.max_count_per_day,
+            max_minutes_per_task: self.max_minutes_per_task.map(|m| m as f64),
+            max_minutes_per_day: self.max_minutes_per_day.map(|m| m as f64),
+        }
+    }
+}
+
 /// The `[limits]` table: resource ceilings per spawned agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
     /// Maximum agent-loop iterations.
@@ -117,6 +149,10 @@ pub struct LimitsSection {
     pub max_wall_clock_secs: u64,
     /// Maximum concurrently running agents with this identity.
     pub max_concurrent: usize,
+    #[serde(default, skip_serializing_if = "BudgetCeiling::is_unset")]
+    pub ci: BudgetCeiling,
+    #[serde(default, skip_serializing_if = "BudgetCeiling::is_unset")]
+    pub sandbox: BudgetCeiling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +324,59 @@ impl Validator<'_> {
         }
     }
 
+    fn within_host(
+        &self,
+        table: &str,
+        ceiling: &BudgetCeiling,
+        host: &BudgetLimits,
+    ) -> Result<(), IdentityError> {
+        let counts = [
+            (
+                "max_count_per_task",
+                ceiling.max_count_per_task,
+                host.max_count_per_task,
+            ),
+            (
+                "max_count_per_day",
+                ceiling.max_count_per_day,
+                host.max_count_per_day,
+            ),
+        ];
+        for (key, own, host) in counts {
+            if let (Some(own), Some(host)) = (own, host) {
+                if own > host {
+                    return Err(self.invalid(
+                        format!("{table}.{key}"),
+                        format!("{own} exceeds the host ceiling of {host}"),
+                    ));
+                }
+            }
+        }
+        let minutes = [
+            (
+                "max_minutes_per_task",
+                ceiling.max_minutes_per_task,
+                host.max_minutes_per_task,
+            ),
+            (
+                "max_minutes_per_day",
+                ceiling.max_minutes_per_day,
+                host.max_minutes_per_day,
+            ),
+        ];
+        for (key, own, host) in minutes {
+            if let (Some(own), Some(host)) = (own, host) {
+                if own as f64 > host {
+                    return Err(self.invalid(
+                        format!("{table}.{key}"),
+                        format!("{own} exceeds the host ceiling of {host}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn positive(&self, field: &str, value: u64) -> Result<(), IdentityError> {
         if value == 0 {
             return Err(self.invalid(field, "must be greater than zero"));
@@ -322,6 +411,9 @@ impl Validator<'_> {
         self.positive("limits.max_iterations", raw.limits.max_iterations as u64)?;
         self.positive("limits.max_wall_clock_secs", raw.limits.max_wall_clock_secs)?;
         self.positive("limits.max_concurrent", raw.limits.max_concurrent as u64)?;
+        let host = BudgetConfig::default();
+        self.within_host("limits.ci", &raw.limits.ci, &host.ci)?;
+        self.within_host("limits.sandbox", &raw.limits.sandbox, &host.sandbox)?;
         let source = self.file.to_path_buf();
 
         Ok(AgentIdentity {
@@ -498,6 +590,25 @@ impl AgentIdentity {
         fs::read_to_string(&resolved).map_err(io(&resolved))
     }
 
+    /// The identity's own ceiling for `class`, still to be narrowed against
+    /// the host default by the accountant.
+    #[doc = r#"```
+use harness::budget::BudgetClass;
+use harness::identity::AgentIdentity;
+
+let src = "[identity]\nname = \"a\"\ndescription = \"d\"\nloop = \"middle\"\nmodel = \"m\"\nsystem_prompt = { inline = \"p\" }\n[scope]\nrepos = [\"github.com/o/n\"]\npaths = [\"**\"]\nmax_effect = \"ci\"\ntools = [\"ci_status\"]\n[limits]\nmax_iterations = 1\nmax_wall_clock_secs = 1\nmax_concurrent = 1\n[limits.ci]\nmax_count_per_task = 2\n";
+let identity = AgentIdentity::from_toml_str(src, "agents/a.toml").unwrap();
+assert_eq!(identity.budget_limits(BudgetClass::Ci).max_count_per_task, Some(2));
+assert_eq!(identity.budget_limits(BudgetClass::Sandbox).max_count_per_task, None);
+```
+"#]
+    pub fn budget_limits(&self, class: BudgetClass) -> BudgetLimits {
+        match class {
+            BudgetClass::Ci => self.limits.ci.to_limits(),
+            BudgetClass::Sandbox => self.limits.sandbox.to_limits(),
+        }
+    }
+
     /// Serialise back to TOML that [`AgentIdentity::from_toml_str`] accepts.
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
@@ -588,7 +699,8 @@ max_concurrent = 4
             LimitsSection {
                 max_iterations: 200,
                 max_wall_clock_secs: 3600,
-                max_concurrent: 4
+                max_concurrent: 4,
+                ..Default::default()
             }
         );
         assert_eq!(identity.source(), Path::new("agents/rust-implementer.toml"));
@@ -1044,6 +1156,7 @@ max_concurrent = 4
                 max_iterations,
                 max_wall_clock_secs,
                 max_concurrent,
+                ..Default::default()
             },
         );
         (identity, scope, limits).prop_map(|(identity, scope, limits)| {
@@ -1069,5 +1182,112 @@ max_concurrent = 4
             let expected = identity.scope.tools.iter().any(|p| p.matches(&tool));
             prop_assert_eq!(identity.allows_tool(&tool), expected);
         }
+    }
+
+    const LIMITS_TAIL: &str = "max_concurrent = 4\n";
+
+    fn with_budget(tables: &str) -> Result<AgentIdentity, IdentityError> {
+        with(LIMITS_TAIL, &format!("{LIMITS_TAIL}{tables}"))
+    }
+
+    #[test]
+    fn budget_ceilings_default_to_unset_and_parse_per_class() {
+        let plain = example();
+        assert_eq!(plain.limits.ci, BudgetCeiling::default());
+        assert_eq!(plain.limits.sandbox, BudgetCeiling::default());
+        assert_eq!(
+            plain.budget_limits(crate::budget::BudgetClass::Ci),
+            crate::budget::BudgetLimits::UNLIMITED
+        );
+        let tuned = with_budget(
+            "\n[limits.ci]\nmax_count_per_task = 3\nmax_minutes_per_day = 90\n\n[limits.sandbox]\nmax_count_per_day = 0\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.limits.ci.max_count_per_task, Some(3));
+        assert_eq!(tuned.limits.ci.max_minutes_per_day, Some(90));
+        assert_eq!(tuned.limits.ci.max_count_per_day, None);
+        assert_eq!(tuned.limits.sandbox.max_count_per_day, Some(0));
+        let ci = tuned.budget_limits(crate::budget::BudgetClass::Ci);
+        assert_eq!(ci.max_count_per_task, Some(3));
+        assert_eq!(ci.max_minutes_per_day, Some(90.0));
+        assert_eq!(ci.max_minutes_per_task, None);
+        let sandbox = tuned.budget_limits(crate::budget::BudgetClass::Sandbox);
+        assert_eq!(sandbox.max_count_per_day, Some(0));
+    }
+
+    #[test]
+    fn budget_ceilings_survive_a_toml_round_trip_and_unset_ones_are_not_written() {
+        let tuned = with_budget("\n[limits.ci]\nmax_count_per_task = 3\n").unwrap();
+        let text = tuned.to_toml_string().unwrap();
+        assert!(text.contains("[limits.ci]"), "{text}");
+        assert!(!text.contains("limits.sandbox"), "{text}");
+        let again = AgentIdentity::from_toml_str(&text, "agents/rust-implementer.toml").unwrap();
+        assert_eq!(again.limits, tuned.limits);
+        let plain = example().to_toml_string().unwrap();
+        assert!(!plain.contains("limits.ci") && !plain.contains("limits.sandbox"));
+    }
+
+    #[test]
+    fn a_budget_ceiling_above_the_host_default_is_refused_naming_the_field() {
+        let host = crate::budget::BudgetConfig::default();
+        let cases = [
+            (
+                "ci",
+                "max_count_per_task",
+                host.ci.max_count_per_task.unwrap() as u64 + 1,
+            ),
+            (
+                "ci",
+                "max_count_per_day",
+                host.ci.max_count_per_day.unwrap() as u64 + 1,
+            ),
+            (
+                "ci",
+                "max_minutes_per_task",
+                host.ci.max_minutes_per_task.unwrap() as u64 + 1,
+            ),
+            (
+                "ci",
+                "max_minutes_per_day",
+                host.ci.max_minutes_per_day.unwrap() as u64 + 1,
+            ),
+            (
+                "sandbox",
+                "max_count_per_task",
+                host.sandbox.max_count_per_task.unwrap() as u64 + 1,
+            ),
+            (
+                "sandbox",
+                "max_minutes_per_day",
+                host.sandbox.max_minutes_per_day.unwrap() as u64 + 1,
+            ),
+        ];
+        for (class, key, value) in cases {
+            let (field, reason) = invalid_field(with_budget(&format!(
+                "\n[limits.{class}]\n{key} = {value}\n"
+            )));
+            assert_eq!(field, format!("limits.{class}.{key}"));
+            assert!(reason.contains("host ceiling"), "{reason}");
+        }
+        let at_the_ceiling = host.ci.max_count_per_task.unwrap();
+        assert!(with_budget(&format!(
+            "\n[limits.ci]\nmax_count_per_task = {at_the_ceiling}\n"
+        ))
+        .is_ok());
+        let minutes_ceiling = host.ci.max_minutes_per_day.unwrap() as u64;
+        assert!(with_budget(&format!(
+            "\n[limits.ci]\nmax_minutes_per_day = {minutes_ceiling}\nmax_minutes_per_task = {}\nmax_count_per_day = {}\n",
+            host.ci.max_minutes_per_task.unwrap() as u64,
+            host.ci.max_count_per_day.unwrap()
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn an_unknown_budget_key_is_a_parse_error() {
+        let err = with_budget("\n[limits.ci]\nmax_everything = 1\n").unwrap_err();
+        assert!(matches!(err, IdentityError::Parse { .. }), "{err:?}");
+        let err = with_budget("\n[limits.deploy]\nmax_count_per_task = 1\n").unwrap_err();
+        assert!(matches!(err, IdentityError::Parse { .. }), "{err:?}");
     }
 }
