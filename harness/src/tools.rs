@@ -59,6 +59,9 @@ pub enum ToolError {
     /// before it reached the tool.
     #[error("{0}")]
     ActionDenied(ActionDenied),
+
+    #[error("Budget refused the action: {0}")]
+    Budget(#[from] crate::budget::BudgetError),
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -4841,7 +4844,10 @@ mod tests {
         ("harness/src/ci_tools.rs", "harness/src/ci_tools.rs"),
         ("harness/src/ci_policy.rs", "harness/src/ci_policy.rs"),
         ("harness/src/ci_integrity.rs", "harness/src/ci_integrity.rs"),
-        ("harness/src/deploy/template.rs", "harness/src/deploy/template.rs"),
+        (
+            "harness/src/deploy/template.rs",
+            "harness/src/deploy/template.rs",
+        ),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {

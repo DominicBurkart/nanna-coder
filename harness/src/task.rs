@@ -359,6 +359,7 @@ struct TaskRunner {
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
     escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
+    ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -693,6 +694,7 @@ impl TaskManager {
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
             cost_accountant: std::sync::RwLock::new(cost_accountant),
+            ci_client: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -800,6 +802,15 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
 ```"#]
     pub fn cost_accountant(&self) -> Arc<CostAccountant> {
         self.runner.cost_accountant()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ci_client(
+        self,
+        client: Arc<dyn crate::backlog::GithubActionsClient>,
+    ) -> Self {
+        *self.runner.ci_client.write().unwrap() = Some(client);
+        self
     }
 
     pub fn with_cost_accountant(self, accountant: Arc<CostAccountant>) -> Self {
@@ -1497,6 +1508,11 @@ impl TaskRunner {
                 return;
             }
         };
+
+        workspace.set_cost_accountant(self.cost_accountant());
+        if let Some(client) = self.ci_client.read().unwrap().clone() {
+            workspace.set_ci_client(client);
+        }
 
         let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
         let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
@@ -4091,6 +4107,198 @@ mod identity_tests {
         );
     }
 
+    fn ci_scoped_identity() -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Ci;
+        identity.scope.tools = vec!["ci_trigger".parse().unwrap()];
+        identity
+    }
+
+    #[tokio::test]
+    async fn test_ci_trigger_passes_the_action_gate_before_the_tool_or_the_budget_runs() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(AlwaysBlocksAction),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_action_gate(gate)
+            .with_cost_accountant(Arc::clone(&accountant));
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("ci_trigger", serde_json::json!({"workflow": "ci.yml"})),
+                stop_response("done"),
+            ]));
+        let task_id = manager
+            .submit_with_identity(
+                "Run CI".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(ci_scoped_identity()),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 1);
+        assert_eq!(result.action_audit[0].review.tool, "ci_trigger");
+        assert_eq!(result.action_audit[0].review.effect_class, EffectClass::Ci);
+        assert_eq!(
+            result.action_audit[0].verdict.kind(),
+            crate::auditor::VerdictKind::Block
+        );
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
+        assert!(result.denials.is_empty());
+    }
+
+    struct AlwaysAllowsAction;
+
+    #[async_trait::async_trait]
+    impl crate::action_auditor::ActionAuditor for AlwaysAllowsAction {
+        fn name(&self) -> &str {
+            "always-allows"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(crate::action_auditor::ActionVerdict::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_dispatched_task_settles_ci_minutes_against_the_manager_accountant_and_reports_them(
+    ) {
+        use crate::backlog::test_support::MockGithubActions;
+        let repo_dir = repo_with_origin("git@github.com:Example/Repo.git");
+        for args in [
+            vec!["branch", "feat/x"],
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(repo_dir.path())
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        }
+        let started = Utc::now();
+        let mock = Arc::new(MockGithubActions::default());
+        mock.set_run(crate::backlog::WorkflowRun {
+            id: 9,
+            name: Some("ci".to_string()),
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            html_url: "https://example.invalid/runs/9".to_string(),
+            head_branch: Some("feat/x".to_string()),
+            path: None,
+            head_sha: None,
+            run_started_at: Some(started),
+            updated_at: Some(started + chrono::Duration::minutes(7)),
+        });
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            BudgetConfig::UNLIMITED,
+        ));
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(AlwaysAllowsAction),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_action_gate(gate)
+            .with_cost_accountant(Arc::clone(&accountant))
+            .with_ci_client(Arc::clone(&mock) as Arc<dyn crate::backlog::GithubActionsClient>);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("ci_status", serde_json::json!({"run_id": 9})),
+                stop_response("done"),
+            ]));
+        let mut identity = ci_scoped_identity();
+        identity.scope.tools = vec!["ci_status".parse().unwrap()];
+        identity.scope.max_effect = EffectClass::Repository;
+        let name = identity.name().to_string();
+        let task_id = manager
+            .submit_with_identity(
+                "Poll CI".to_string(),
+                repo_dir.path().to_path_buf(),
+                "feat/x".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 1, "{:?}", result.denials);
+        assert_eq!(result.action_audit[0].review.tool, "ci_status");
+        assert!(result.action_audit[0].verdict.is_allow());
+        assert_eq!(accountant.task_summary(&name, &task_id.0).ci.minutes, 7.0);
+        assert_eq!(result.budget.ci.minutes, 7.0);
+        assert!(mock
+            .calls()
+            .iter()
+            .any(|call| call.contains("example/repo#9")));
+    }
+
+    #[tokio::test]
+    async fn test_an_identity_without_the_exact_ci_grant_gets_no_ci_tool_in_a_task() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("ci_trigger", serde_json::json!({"workflow": "ci.yml"})),
+                stop_response("done"),
+            ]));
+        let mut identity = ci_scoped_identity();
+        identity.scope.tools = vec!["ci_*".parse().unwrap()];
+        let task_id = manager
+            .submit_with_identity(
+                "Run CI".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert!(result.action_audit.is_empty());
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "ci_trigger");
+    }
+
     #[tokio::test]
     async fn test_default_rule_only_gate_blocks_a_repository_call_pending_a_model() {
         let repo_dir = repo_with_origin("git@github.com:example/repo.git");
@@ -4268,11 +4476,11 @@ mod identity_tests {
     impl crate::budget::BudgetStore for FixedTaskUsage {
         fn task_usage(
             &self,
-            _identity: &str,
+            identity: &str,
             task_id: &str,
             class: crate::budget::BudgetClass,
         ) -> crate::budget::Usage {
-            if Uuid::parse_str(task_id).is_err() {
+            if identity != crate::identity::example().name() || Uuid::parse_str(task_id).is_err() {
                 return crate::budget::Usage::default();
             }
             match class {
