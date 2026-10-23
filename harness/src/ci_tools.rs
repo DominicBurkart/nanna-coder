@@ -2059,10 +2059,10 @@ mod tests {
                 .to_lowercase();
             assert!(!definition.contains("merge"), "{name}");
         }
-        let source = include_str!("ci_tools.rs");
+        let source = include_str!("ci_tools.rs").replace("\r\n", "\n");
         let production = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(!production.to_lowercase().contains("merge"));
-        let client = include_str!("backlog.rs");
+        let client = include_str!("backlog.rs").replace("\r\n", "\n");
         let trait_start = client.find("pub trait GithubActionsClient").unwrap();
         let trait_end = trait_start + client[trait_start..].find("\n}\n").unwrap();
         assert!(!client[trait_start..trait_end]
