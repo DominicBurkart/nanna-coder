@@ -152,7 +152,7 @@ Based on community feedback:
 | cache-nix-action | Low | Good | Free |
 | FlakeHub Cache | Low | Excellent | Paid |
 | Cachix | Medium | Excellent | Paid |
-| Magic Nix Cache | None | Good | Free (until Feb 2025) |
+| Magic Nix Cache | None | Good | Free (until 2025-02) |
 
 ## Support
 
