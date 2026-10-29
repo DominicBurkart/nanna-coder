@@ -18,6 +18,7 @@
 
 pub(crate) mod context;
 pub mod eval;
+mod fail_closed;
 mod gate;
 mod llm;
 mod log;
@@ -27,6 +28,7 @@ pub(crate) mod rules;
 mod verdict;
 
 pub use context::AuditContext;
+pub use fail_closed::{FailClosedModelAuditor, MODEL_AUDIT_TIMEOUT};
 pub use gate::{
     Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook, SpawnGate,
 };
