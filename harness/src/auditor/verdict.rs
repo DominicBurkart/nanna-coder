@@ -37,11 +37,12 @@ pub enum ReasonCode {
     RepeatedDenials,
     /// Anything else, described in the reason detail.
     Other,
+    ModelFailure,
 }
 
 impl ReasonCode {
     /// Every code, in declaration order.
-    pub const ALL: [ReasonCode; 9] = [
+    pub const ALL: [ReasonCode; 10] = [
         ReasonCode::ScopeCreep,
         ReasonCode::LoopMismatch,
         ReasonCode::PromptInjection,
@@ -51,6 +52,7 @@ impl ReasonCode {
         ReasonCode::LeaseUnavailable,
         ReasonCode::RepeatedDenials,
         ReasonCode::Other,
+        ReasonCode::ModelFailure,
     ];
 
     /// Stable snake_case name, identical to the serde representation.
@@ -65,6 +67,7 @@ impl ReasonCode {
             ReasonCode::LeaseUnavailable => "lease_unavailable",
             ReasonCode::RepeatedDenials => "repeated_denials",
             ReasonCode::Other => "other",
+            ReasonCode::ModelFailure => "model_failure",
         }
     }
 }
