@@ -982,23 +982,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_or_broken_deploy_template_denies_every_workflow() {
-        let dir = fixture();
-        let mock: Arc<dyn GithubActionsClient> = Arc::new(MockGithubActions::default());
-        let tool = CiTriggerTool::from_repo_template(dir.path().to_path_buf(), Arc::clone(&mock))
-            .with_budget(unlimited_accountant(), "id", "t1");
-        assert!(tool.execute(json!({"workflow": "ci.yml"})).await.is_err());
-        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-        std::fs::write(dir.path().join(".nanna/deploy.toml"), "not toml [").unwrap();
-        let tool = CiTriggerTool::from_repo_template(dir.path().to_path_buf(), mock).with_budget(
-            unlimited_accountant(),
-            "id",
-            "t1",
-        );
-        assert!(tool.execute(json!({"workflow": "ci.yml"})).await.is_err());
-    }
-
-    #[tokio::test]
     async fn a_dispatched_run_is_remembered_as_pending_for_later_settlement() {
         let dir = fixture();
         let mock = Arc::new(MockGithubActions {
@@ -2948,5 +2931,112 @@ mod tests {
         assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err:?}");
         assert_eq!(accountant.task_summary("id", "t1").ci.count, 1);
         assert_eq!(accountant.task_summary("id", "t1").ci.minutes, 0.0);
+    }
+
+    async fn assert_refused_as_not_allowlisted(dir: &Path) {
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        mock.set_run(run(9, "completed", Some("failure")));
+        let tool = CiTriggerTool::from_repo_template(
+            dir.to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(unlimited_accountant(), "id", "t1")
+        .with_correlation_policy(Duration::from_millis(50), Duration::from_millis(5));
+        for args in [json!({"workflow": "ci.yml"}), json!({"run_id": 9})] {
+            match tool.execute(args.clone()).await.unwrap_err() {
+                ToolError::InvalidArguments { message } => {
+                    assert!(message.contains("not allowlisted"), "{args}: {message}")
+                }
+                other => panic!("{args}: {other:?}"),
+            }
+        }
+        let sent = mock.calls();
+        assert!(
+            !sent.iter().any(|call| call.starts_with("dispatch_workflow")
+                || call.starts_with("rerun_workflow")
+                || call.starts_with("list_workflow_runs")),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_base_revision_with_no_deploy_template_refuses_a_workflow_that_exists_there() {
+        let dir = fixture();
+        assert!(!dir.path().join(".nanna/deploy.toml").exists());
+        assert_refused_as_not_allowlisted(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_base_revision_whose_deploy_template_does_not_parse_refuses_a_workflow_that_exists_there(
+    ) {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(dir.path().join(".nanna/deploy.toml"), "not toml [").unwrap();
+        commit_all(dir.path(), "broken template");
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/feat/x", "HEAD"],
+        );
+        assert_refused_as_not_allowlisted(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_base_revision_whose_allowlist_can_reach_production_refuses_a_workflow_that_exists_there(
+    ) {
+        let dir = fixture();
+        write_template(
+            dir.path(),
+            "[ci.workflows.\"ci.yml\"]\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"production\"]\n",
+        );
+        assert_refused_as_not_allowlisted(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_checkout_with_no_resolvable_base_revision_refuses_a_workflow_that_exists_in_it() {
+        let dir = fixture();
+        write_template(dir.path(), "[ci.workflows.\"ci.yml\"]\n");
+        git(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/ghost",
+            ],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        assert_refused_as_not_allowlisted(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_at_base_is_honoured_by_the_same_helper_so_the_refusals_above_are_the_policys(
+    ) {
+        let dir = fixture();
+        write_template(dir.path(), "[ci.workflows.\"ci.yml\"]\n");
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![run(1, "queued", None)],
+            ..Default::default()
+        });
+        let tool = CiTriggerTool::from_repo_template(
+            dir.path().to_path_buf(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(unlimited_accountant(), "id", "t1")
+        .with_correlation_policy(Duration::from_millis(50), Duration::from_millis(5));
+        assert_eq!(
+            tool.execute(json!({"workflow": "ci.yml"})).await.unwrap()["run_id"],
+            1
+        );
     }
 }
