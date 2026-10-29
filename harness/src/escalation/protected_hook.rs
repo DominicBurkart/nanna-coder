@@ -19,6 +19,7 @@ fn untrusted_inline(text: &str) -> String {
         })
         .collect();
     let fenced = fenced_untrusted(&flat, FIELD_CAP, &mut Budget::new(FIELD_CAP)).replace('\n', " ");
+    let fenced = unlink(&fenced);
     let mut out = String::with_capacity(fenced.len());
     let mut previous = '\0';
     for c in fenced.chars() {
@@ -29,6 +30,28 @@ fn untrusted_inline(text: &str) -> String {
             c => out.push(c),
         }
         previous = c;
+    }
+    out
+}
+
+fn unlink(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let lower = text.to_ascii_lowercase();
+    let mut rest = 0;
+    while rest < text.len() {
+        let tail = &lower[rest..];
+        if tail.starts_with("://") {
+            out.push_str(":&#47;&#47;");
+            rest += 3;
+        } else if tail.starts_with("www.") {
+            out.push_str(&text[rest..rest + 3]);
+            out.push_str("&#46;");
+            rest += 4;
+        } else {
+            let ch = text[rest..].chars().next().expect("rest is within text");
+            out.push(ch);
+            rest += ch.len_utf8();
+        }
     }
     out
 }
@@ -121,34 +144,35 @@ mod tests {
             ".nanna/\u{1b}[31m\u{7}\u{202e}gpj\u{200b}.toml",
             "Closes #7 resolves #8 fixes owner/repo#9 @team/admins",
             ".nanna/a\t\r\n\r\n# heading\n```\nrm -rf\n```",
+            "https://evil.example/phish HTTP://EVIL.example www.evil.example WWW.Evil.example ftp://x",
         ] {
             let (body, title) = rendered(hostile, hostile);
             assert_eq!(body.lines().count(), benign.lines().count(), "{body}");
             assert_eq!(body.matches("## Suggested action").count(), 1, "{body}");
             for text in [&body, &title] {
-                assert!(
-                    !text.chars().any(|c| c.is_control() && c != '\n'),
-                    "{text:?}"
-                );
-                assert!(!text.contains('@'), "{text}");
-                assert!(!text.contains('`'), "{text}");
-                assert!(!text.contains("](http"), "{text}");
-                assert!(!text.contains("<img"), "{text}");
-                assert!(
-                    !text
-                        .chars()
-                        .any(|c| matches!(c, '\u{1b}' | '\u{7}' | '\u{202e}' | '\u{200b}')),
-                    "{text}"
-                );
+                let controls: Vec<char> = text
+                    .chars()
+                    .filter(|c| c.is_control() && *c != '\n')
+                    .collect();
+                assert_eq!(controls, Vec::<char>::new());
+                let hidden: Vec<char> = text
+                    .chars()
+                    .filter(|c| matches!(c, '\u{202e}' | '\u{200b}'))
+                    .collect();
+                assert_eq!(hidden, Vec::<char>::new());
+                let linkable = ["@", "`", "](http", "<img", "://"];
+                let found: Vec<&str> = linkable.into_iter().filter(|n| text.contains(n)).collect();
+                assert_eq!(found, Vec::<&str>::new());
+                assert!(!text.to_ascii_lowercase().contains("www."));
                 for line in text.lines().filter(|line| !line.starts_with("## ")) {
                     for (at, _) in line.match_indices('#') {
                         assert!(line[..at].ends_with('&'), "{line}");
                     }
                 }
             }
-            for keyword in ["Fixes #", "Closes #", "resolves #", "repo#", "cc @"] {
-                assert!(!body.contains(keyword), "{keyword}: {body}");
-            }
+            let keywords = ["Fixes #", "Closes #", "resolves #", "repo#", "cc @"];
+            let found: Vec<&str> = keywords.into_iter().filter(|k| body.contains(k)).collect();
+            assert_eq!(found, Vec::<&str>::new());
         }
     }
 
@@ -220,6 +244,7 @@ mod tests {
                 },
             );
         });
+        std::io::Write::flush(&mut captured.clone()).unwrap();
         let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(text.contains("WARN"), "{text}");
         assert_eq!(text.lines().count(), 1, "{text}");
@@ -248,6 +273,7 @@ mod tests {
         assert_eq!(log.states().len(), 1);
         hook.deliver_pending().await;
         assert_eq!(sink.escalations().len(), 1);
+        assert_eq!(log.states()[0].count, 1);
     }
 
     #[tokio::test]

@@ -5477,9 +5477,11 @@ mod identity_tests {
         let repo_dir = repo_with_origin("https://github.com/example/repo.git");
         let sink = crate::test_support::escalation::CapturingSink::new(false);
         let log = Arc::new(crate::escalation::EscalationLog::in_memory());
+        let slow = SlowSink(Arc::clone(&sink));
+        assert_eq!(crate::escalation::EscalationSink::name(&slow), "slow");
         let escalator = Arc::new(crate::escalation::Escalator::new(
             log,
-            Arc::new(SlowSink(Arc::clone(&sink))),
+            Arc::new(slow),
             Arc::new(crate::leases::SystemClock),
             chrono::Duration::minutes(10),
         ));
