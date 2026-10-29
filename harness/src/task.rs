@@ -1501,17 +1501,12 @@ impl TaskRunner {
                 .map_err(|e| e.to_string())
         };
 
-        let audit = self
-            .audit
-            .lock()
-            .expect("audit hook lock poisoned")
-            .clone()
-            .unwrap_or_else(|| {
-                Arc::new(crate::escalation::ProtectedPathEscalation::new(
-                    self.action_escalator(),
-                    action_repo_key(&queued.repo_path),
-                ))
-            });
+        let escalating = Arc::new(crate::escalation::ProtectedPathEscalation::new(
+            self.action_escalator(),
+            action_repo_key(&queued.repo_path),
+        ));
+        let explicit = self.audit.lock().expect("audit hook lock poisoned").clone();
+        let audit: Arc<dyn AuditHook> = explicit.unwrap_or_else(|| escalating.clone());
         let mut workspace = match workspace_result {
             Ok(workspace) => workspace.with_audit_hook(audit),
             Err(e) => {
@@ -1604,6 +1599,7 @@ impl TaskRunner {
             .task_summary(identity.as_ref().map_or("", |i| i.name()), &task_id.0);
 
         let _ = workspace.cleanup();
+        escalating.deliver_pending().await;
 
         self.progress.write().await.remove(&task_id);
 
@@ -5408,16 +5404,6 @@ mod identity_tests {
             .await
     }
 
-    async fn eventually<T>(mut probe: impl FnMut() -> Option<T>) -> T {
-        for _ in 0..200 {
-            if let Some(found) = probe() {
-                return found;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        panic!("condition not reached");
-    }
-
     #[tokio::test]
     async fn test_a_default_manager_escalates_a_protected_path_violation_to_the_configured_escalator(
     ) {
@@ -5433,8 +5419,7 @@ mod identity_tests {
             }
             other => panic!("expected a failure, got {other:?}"),
         }
-        let delivered =
-            eventually(|| Some(sink.escalations()).filter(|seen| !seen.is_empty())).await;
+        let delivered = sink.escalations();
         assert_eq!(delivered.len(), 1);
         let escalation = &delivered[0];
         assert_eq!(escalation.severity, crate::escalation::Severity::Blocked);
@@ -5444,12 +5429,13 @@ mod identity_tests {
         );
         assert_eq!(escalation.task_id.as_ref(), Some(&task_id));
         assert_eq!(escalation.repo, "example/repo");
-        assert!(escalation.summary.contains(".nanna/agents/x.toml"));
-        assert!(escalation.summary.contains(".nanna/**"));
-        assert!(escalation
-            .evidence
-            .iter()
-            .any(|line| line.contains(".nanna/agents/x.toml")));
+        assert_eq!(
+            escalation.summary,
+            "A task changed a protected path; the change was refused."
+        );
+        assert_eq!(escalation.evidence.len(), 2);
+        assert!(escalation.evidence[0].contains(".nanna/agents/x.toml"));
+        assert!(escalation.evidence[1].contains(".nanna/**"));
         assert_eq!(log.states().len(), 1);
     }
 
@@ -5463,11 +5449,38 @@ mod identity_tests {
             wait_for_terminal(&manager, &task_id).await,
             TaskStatus::Failed { .. }
         ));
-        let states =
-            eventually(|| Some(manager.escalations().states()).filter(|states| !states.is_empty()))
-                .await;
+        let states = manager.escalations().states();
         assert_eq!(states.len(), 1);
         assert!(states[0].key.starts_with("auditor:"));
+    }
+
+    #[tokio::test]
+    async fn test_a_run_that_errors_after_planting_a_protected_file_still_fails_and_escalates() {
+        let repo_dir = repo_with_origin("https://github.com/example/repo.git");
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _log) = crate::test_support::escalation::escalator(&sink);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_escalator(escalator);
+        let repo = repo_dir.path().to_path_buf();
+        let provider =
+            MockProvider::with_hook(vec![], Box::new(move || plant_protected_file(&repo)));
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(sink.escalations().len(), 1);
     }
 
     #[tokio::test]
@@ -5484,7 +5497,6 @@ mod identity_tests {
             TaskStatus::Failed { .. }
         ));
         assert_eq!(hook.seen.lock().unwrap().len(), 1);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(manager.escalations().states().is_empty());
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
@@ -27,17 +27,27 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 #[derive(Default)]
 struct Idents {
     file: String,
-    found: BTreeSet<String>,
+    found: BTreeMap<String, usize>,
+    renames: BTreeSet<String>,
+}
+
+fn plain(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
 }
 
 impl Idents {
+    fn note(&mut self, name: &str) {
+        *self
+            .found
+            .entry(format!("{}: {}", self.file, plain(name)))
+            .or_default() += 1;
+    }
+
     fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
         for token in tokens {
             match token {
                 proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
-                proc_macro2::TokenTree::Ident(ident) => {
-                    self.found.insert(format!("{}: {ident}", self.file));
-                }
+                proc_macro2::TokenTree::Ident(ident) => self.note(&ident.to_string()),
                 _ => {}
             }
         }
@@ -70,7 +80,18 @@ impl<'ast> Visit<'ast> for Idents {
     }
 
     fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
-        self.found.insert(format!("{}: {ident}", self.file));
+        self.note(&ident.to_string());
+    }
+
+    fn visit_use_tree(&mut self, node: &'ast syn::UseTree) {
+        if let syn::UseTree::Rename(rename) = node {
+            self.renames.insert(format!(
+                "{}: renames {}",
+                self.file,
+                plain(&rename.ident.to_string())
+            ));
+        }
+        syn::visit::visit_use_tree(self, node);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -78,100 +99,112 @@ impl<'ast> Visit<'ast> for Idents {
     }
 }
 
-fn idents_of(file: &str, source: &str) -> BTreeSet<String> {
+fn scan_source(file: &str, source: &str) -> Idents {
     let syntax = syn::parse_file(source).unwrap();
     let mut scan = Idents {
         file: file.to_string(),
         ..Idents::default()
     };
     scan.visit_file(&syntax);
-    scan.found
+    scan
 }
 
-fn production_idents() -> BTreeSet<String> {
+fn production() -> Vec<Idents> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&root, &mut files);
     files
         .into_iter()
-        .flat_map(|path| {
+        .map(|path| {
             let relative = path
                 .strip_prefix(&root)
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            idents_of(&relative, &fs::read_to_string(&path).unwrap())
+            scan_source(&relative, &fs::read_to_string(&path).unwrap())
         })
         .collect()
 }
 
-fn files_naming(name: &str) -> BTreeSet<String> {
+fn mentions(name: &str) -> BTreeMap<String, usize> {
     let suffix = format!(": {name}");
-    production_idents()
+    production()
         .into_iter()
-        .filter_map(|entry| entry.strip_suffix(&suffix).map(str::to_string))
+        .flat_map(|scan| scan.found)
+        .filter_map(|(entry, count)| {
+            entry
+                .strip_suffix(&suffix)
+                .map(|file| (file.to_string(), count))
+        })
         .collect()
 }
 
-fn expected(files: &[&str]) -> BTreeSet<String> {
-    files.iter().map(|file| file.to_string()).collect()
+fn pinned(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+    entries
+        .iter()
+        .map(|(file, count)| (file.to_string(), *count))
+        .collect()
 }
 
 #[test]
-fn the_noop_audit_hook_is_named_only_by_its_definition_and_the_bare_workspace_default() {
+fn the_noop_audit_hook_is_named_a_pinned_number_of_times_in_a_pinned_set_of_files() {
     assert_eq!(
-        files_naming("NoopAuditHook"),
-        expected(&["lib.rs", "protected.rs", "workspace.rs"]),
-        "a production path now names NoopAuditHook; the task manager must build workspaces with the escalating hook"
+        mentions("NoopAuditHook"),
+        pinned(&[("lib.rs", 1), ("protected.rs", 2), ("workspace.rs", 3)]),
+        "NoopAuditHook gained or lost a mention in production code: an alias, macro, re-export or new use could hand a task workspace the do-nothing hook"
     );
 }
 
 #[test]
-fn no_task_dispatching_file_names_the_noop_audit_hook() {
-    let naming = files_naming("NoopAuditHook");
-    for file in [
-        "task.rs",
-        "main.rs",
-        "backlog.rs",
-        "mcp/mod.rs",
-        "mcp/handlers.rs",
-        "mcp/client.rs",
-    ] {
-        assert!(!naming.contains(file), "{file} names NoopAuditHook");
-    }
+fn no_production_use_renames_anything_to_hide_a_noop_hook_or_a_workspace_constructor() {
+    let renames: BTreeSet<String> = production()
+        .into_iter()
+        .flat_map(|scan| scan.renames)
+        .filter(|rename| {
+            ["NoopAuditHook", "TaskWorkspace", "ProtectedPathEscalation"]
+                .iter()
+                .any(|name| rename.ends_with(&format!("renames {name}")))
+        })
+        .collect();
+    assert_eq!(renames, BTreeSet::new());
+}
+
+#[test]
+fn only_the_task_runner_constructs_task_workspaces_and_it_installs_a_hook_each_time() {
+    assert_eq!(
+        mentions("TaskWorkspace"),
+        pinned(&[("task.rs", 5), ("workspace.rs", 3)]),
+        "a new production path names TaskWorkspace; a workspace built without with_audit_hook silently gets NoopAuditHook"
+    );
+    assert_eq!(
+        mentions("with_audit_hook"),
+        pinned(&[("task.rs", 2), ("workspace.rs", 1)])
+    );
 }
 
 #[test]
 fn the_task_runner_installs_the_escalating_hook_by_default() {
     assert_eq!(
-        files_naming("ProtectedPathEscalation"),
-        expected(&[
-            "escalation/mod.rs",
-            "escalation/protected_hook.rs",
-            "task.rs"
+        mentions("ProtectedPathEscalation"),
+        pinned(&[
+            ("escalation/mod.rs", 1),
+            ("escalation/protected_hook.rs", 3),
+            ("task.rs", 1)
         ])
     );
 }
 
 #[test]
-fn only_the_task_manager_hands_a_hook_to_a_workspace_and_no_production_path_overrides_it() {
-    assert_eq!(
-        files_naming("with_audit_hook"),
-        expected(&["task.rs", "workspace.rs"])
-    );
-}
-
-#[test]
-fn the_scanner_sees_idents_in_production_code_and_macros_but_not_in_cfg_test_items() {
-    let seen = idents_of(
+fn the_scanner_sees_raw_identifiers_macros_aliases_and_renames_but_not_cfg_test_items() {
+    let seen = scan_source(
         "x.rs",
-        "fn f() { let _ = NoopAuditHook; } fn g() { m!(NoopAuditHook2); }",
+        "fn f() { let _ = r#NoopAuditHook; } fn g() { m!(NoopAuditHook); } pub type Sneak = protected::NoopAuditHook; macro_rules! n { () => { NoopAuditHook } } pub use p::NoopAuditHook as Other;",
     );
-    assert!(seen.contains("x.rs: NoopAuditHook"));
-    assert!(seen.contains("x.rs: NoopAuditHook2"));
-    let hidden = idents_of(
+    assert_eq!(seen.found["x.rs: NoopAuditHook"], 5);
+    assert!(seen.renames.contains("x.rs: renames NoopAuditHook"));
+    let hidden = scan_source(
         "x.rs",
         "#[cfg(test)] mod t { fn f() { let _ = NoopAuditHook; } } #[cfg(test)] fn h() { NoopAuditHook; } struct S; #[cfg(test)] impl S { fn k(&self) { NoopAuditHook; } }",
     );
-    assert!(!hidden.contains("x.rs: NoopAuditHook"));
+    assert!(!hidden.found.contains_key("x.rs: NoopAuditHook"));
 }

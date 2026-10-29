@@ -1609,12 +1609,12 @@ fn sanitize_git_output(raw: &str) -> String {
     }
 }
 
-struct Budget {
+pub(crate) struct Budget {
     remaining: usize,
 }
 
 impl Budget {
-    fn new(total: usize) -> Self {
+    pub(crate) fn new(total: usize) -> Self {
         Self { remaining: total }
     }
 }
@@ -1642,7 +1642,7 @@ fn render_escaped(chars: &[char]) -> String {
         .collect()
 }
 
-fn fenced_untrusted(text: &str, cap: usize, budget: &mut Budget) -> String {
+pub(crate) fn fenced_untrusted(text: &str, cap: usize, budget: &mut Budget) -> String {
     let allowed = cap.min(budget.remaining);
     let window: Vec<char> = text.chars().take(allowed.saturating_add(1)).collect();
     let mask = unprintable_mask(&window.iter().collect::<String>(), Shape::Block);
