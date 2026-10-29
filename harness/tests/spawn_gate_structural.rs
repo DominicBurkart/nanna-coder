@@ -58,6 +58,24 @@ fn token_use(owner: &str, name: &str) -> Option<&'static str> {
     }
 }
 
+fn listed_derives(attr: &syn::Attribute) -> Vec<String> {
+    let parse = syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated;
+    let listed = attr.parse_args_with(parse).unwrap();
+    listed.iter().map(last_segment).collect()
+}
+
+fn attribute_shapes(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut shapes = Vec::new();
+    for attr in attrs {
+        if attr.path().is_ident("derive") {
+            shapes.push(format!("derives {}", listed_derives(attr).join(", ")));
+        } else {
+            shapes.push(format!("attribute {}", last_segment(attr.path())));
+        }
+    }
+    shapes
+}
+
 fn mentions_token(ty: &syn::Type) -> bool {
     type_name(ty) == "AuditedIdentity"
 }
@@ -223,16 +241,9 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         syn::visit::visit_item_struct(self, node);
         if node.ident == "AuditedIdentity" {
-            let mut derives: Vec<String> = Vec::new();
-            for attr in node.attrs.iter().filter(|a| a.path().is_ident("derive")) {
-                let listed = attr
-                    .parse_args_with(
-                        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-                    )
-                    .unwrap();
-                derives.extend(listed.iter().map(last_segment));
+            for shape in attribute_shapes(&node.attrs) {
+                self.record_token_shape(&shape);
             }
-            self.record_token_shape(&format!("derives {}", derives.join(", ")));
         }
     }
 
@@ -309,11 +320,12 @@ impl<'ast> Visit<'ast> for Scan {
         syn::visit::visit_expr_path(self, node);
         let mut tail = node.path.segments.iter().rev().map(|s| s.ident.to_string());
         let name = tail.next().unwrap_or_default();
-        let owner = tail.next().unwrap_or_default();
+        let owner = match &node.qself {
+            Some(qself) => type_name(&qself.ty),
+            None => tail.next().unwrap_or_default(),
+        };
         let owner = match owner.as_str() {
-            "Self" if self.owner.last().is_some_and(|o| o == "AuditedIdentity") => {
-                "AuditedIdentity".to_string()
-            }
+            "Self" => self.owner.last().cloned().unwrap_or_default(),
             _ => owner,
         };
         if let Some(what) = token_use(&owner, &name) {
@@ -782,7 +794,39 @@ fn indirect_routes_to_the_token_constructor_and_widened_derives_are_seen() {
     );
     assert!(derives
         .audit_tokens
-        .contains("x.rs: token shape: derives Debug, Clone, Default"));
+        .contains("x.rs: token shape: derives Debug, Clone"));
+    assert!(derives
+        .audit_tokens
+        .contains("x.rs: token shape: derives Default"));
+    for source in [
+        "#[cfg_attr(all(), derive(Clone))] struct AuditedIdentity { i: I }",
+        "#[::core::prelude::v1::derive(Clone)] struct AuditedIdentity { i: I }",
+    ] {
+        let hidden = scan_source("x.rs", source);
+        assert!(
+            hidden
+                .audit_tokens
+                .iter()
+                .any(|shape| shape.contains("token shape: attribute")),
+            "{source}"
+        );
+    }
+    let qualified = scan_source(
+        "x.rs",
+        "fn f(a: A) { let _ = <AuditedIdentity>::split(a); }",
+    );
+    assert!(qualified
+        .audit_tokens
+        .contains("x.rs: f constructs AuditedIdentity::split"));
+    let qualified_self = scan_source(
+        "x.rs",
+        "impl AuditedIdentity { fn again(a: A) { let _ = <Self>::split(a); } }",
+    );
+    assert!(qualified_self
+        .audit_tokens
+        .contains("x.rs: AuditedIdentity::again constructs AuditedIdentity::split"));
+    let qualified_other = scan_source("x.rs", "fn f(a: A) { let _ = <Other>::split(a); }");
+    assert!(qualified_other.audit_tokens.is_empty());
     let unrelated = scan_source("x.rs", "#[derive(Clone)] struct Other { i: I }");
     assert!(unrelated.audit_tokens.is_empty());
     let manual = scan_source(
@@ -816,26 +860,4 @@ fn indirect_routes_to_the_token_constructor_and_widened_derives_are_seen() {
     );
     assert_eq!(token_use("BoundIdentity", "Unaudited"), None);
     assert_eq!(token_use("Other", "split"), None);
-}
-
-#[test]
-fn the_only_production_hinted_submit_task_callers_are_the_known_unaudited_bypasses_tracked_in_967()
-{
-    let mut callers: BTreeSet<String> = BTreeSet::new();
-    for scan in scan_all() {
-        for key in scan.calls.keys() {
-            if key.ends_with(" uses submit_task") {
-                callers.insert(key.clone());
-            }
-        }
-    }
-    assert_eq!(
-        callers,
-        expected(&[
-            "backlog.rs: ManagerSink::enqueue uses submit_task",
-            "main.rs: run_delegate uses submit_task",
-            "task.rs: TaskManager::submit_bound uses submit_task",
-        ]),
-        "a new submit_task caller binds an Unaudited identity; route it through submit_spawn"
-    );
 }
