@@ -2895,4 +2895,58 @@ mod tests {
         }
         let _ = dir;
     }
+
+    #[test]
+    fn with_no_resolvable_base_or_a_base_template_that_does_not_parse_the_policy_denies_everything()
+    {
+        let dir = fixture();
+        write_template(dir.path(), "[ci.workflows.\"ci.yml\"]\n");
+        let client: Arc<dyn GithubActionsClient> = Arc::new(MockGithubActions::default());
+        let tool = CiTriggerTool::from_repo_template(dir.path().to_path_buf(), Arc::clone(&client));
+        assert!(tool.effective_policy().permits("ci.yml"));
+
+        std::fs::write(dir.path().join(".nanna/deploy.toml"), "not toml [").unwrap();
+        commit_all(dir.path(), "break the template");
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        assert!(!tool.effective_policy().permits("ci.yml"));
+
+        git(
+            dir.path(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        assert!(!tool.effective_policy().permits("ci.yml"));
+    }
+
+    #[tokio::test]
+    async fn an_uncorrelated_dispatch_still_reports_the_dispatch_failure_when_settling_it_fails() {
+        let dir = fixture();
+        let mock = Arc::new(MockGithubActions {
+            list_result_before_dispatch: Some(vec![]),
+            list_result: vec![],
+            ..Default::default()
+        });
+        let accountant = flaky_accountant(FlakyStore {
+            fail_record: true,
+            ..Default::default()
+        });
+        let tool = trigger_tool(
+            dir.path(),
+            Arc::clone(&mock) as Arc<dyn GithubActionsClient>,
+        )
+        .with_budget(Arc::clone(&accountant), "id", "t1");
+        let err = tool
+            .execute(json!({"workflow": "ci.yml"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err:?}");
+        assert_eq!(accountant.task_summary("id", "t1").ci.count, 1);
+        assert_eq!(accountant.task_summary("id", "t1").ci.minutes, 0.0);
+    }
 }
