@@ -47,7 +47,9 @@ pub use pattern::{ToolPattern, ToolPatternError};
 mod narrowing;
 mod schema;
 
-pub use schema::{AgentIdentity, IdentitySection, LimitsSection, ScopeSection, SystemPrompt};
+pub use schema::{
+    AgentIdentity, BudgetCeiling, IdentitySection, LimitsSection, ScopeSection, SystemPrompt,
+};
 
 #[cfg(test)]
 pub(crate) use schema::tests::example;
