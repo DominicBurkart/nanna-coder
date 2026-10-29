@@ -75,6 +75,10 @@ impl From<DeployError> for SandboxError {
     }
 }
 
+fn io_deploy(e: std::io::Error) -> SandboxError {
+    SandboxError::Deploy(e.to_string())
+}
+
 fn fenced_text(text: &str, cap: usize) -> String {
     fenced_untrusted(
         &redact_resilient(&strip_unprintable(text)),
@@ -179,11 +183,8 @@ impl SandboxTarget for FakeSandboxTarget {
         if std::mem::take(&mut *self.fail_deploy.lock().expect("fail_deploy poisoned")) {
             return Err(SandboxError::Deploy("scripted failure".to_string()));
         }
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| SandboxError::Deploy(e.to_string()))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| SandboxError::Deploy(e.to_string()))?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(io_deploy)?;
+        let addr = listener.local_addr().map_err(io_deploy)?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || serve_ok_forever(listener, rx));
         let handle = SandboxHandle {
@@ -373,15 +374,21 @@ struct BudgetContext {
 }
 
 impl BudgetContext {
-    fn deny_all(task_id: &str) -> Self {
+    fn new(accountant: Arc<CostAccountant>, identity: String, task_id: String) -> Self {
+        let ceiling = BudgetLimits::UNLIMITED;
         Self {
-            accountant: Arc::new(CostAccountant::deny_all(Arc::new(
-                InMemoryBudgetStore::new(),
-            ))),
-            identity: String::new(),
-            task_id: task_id.to_string(),
-            ceiling: BudgetLimits::UNLIMITED,
+            accountant,
+            identity,
+            task_id,
+            ceiling,
         }
+    }
+
+    fn deny_all(task_id: &str) -> Self {
+        let denied = Arc::new(CostAccountant::deny_all(Arc::new(
+            InMemoryBudgetStore::new(),
+        )));
+        Self::new(denied, String::new(), task_id.to_string())
     }
 }
 
@@ -424,12 +431,7 @@ impl SandboxDeployTool {
         accountant: Arc<CostAccountant>,
         identity: impl Into<String>,
     ) -> Self {
-        self.budget = BudgetContext {
-            accountant,
-            identity: identity.into(),
-            task_id: self.task_id.clone(),
-            ceiling: BudgetLimits::UNLIMITED,
-        };
+        self.budget = BudgetContext::new(accountant, identity.into(), self.task_id.clone());
         self
     }
 
@@ -573,12 +575,7 @@ impl SandboxTeardownTool {
         accountant: Arc<CostAccountant>,
         identity: impl Into<String>,
     ) -> Self {
-        self.budget = BudgetContext {
-            accountant,
-            identity: identity.into(),
-            task_id: self.task_id.clone(),
-            ceiling: BudgetLimits::UNLIMITED,
-        };
+        self.budget = BudgetContext::new(accountant, identity.into(), self.task_id.clone());
         self
     }
 }
@@ -1788,5 +1785,160 @@ mod tests {
             .all(|e| matches!(e, ToolError::ExecutionFailed { message } if message.contains("already deployed"))));
         assert_eq!(target.deployed().len(), 1);
         assert_eq!(accountant.task_summary("id", "t1").sandbox.count, 1);
+    }
+
+    #[test]
+    fn an_io_failure_while_standing_up_the_fake_is_a_deploy_error() {
+        let error = io_deploy(std::io::Error::other("no port"));
+        assert!(matches!(error, SandboxError::Deploy(ref text) if text == "no port"));
+    }
+
+    struct PanickingTarget;
+
+    impl SandboxTarget for PanickingTarget {
+        fn deploy(
+            &self,
+            _repo: &str,
+            _pr: u64,
+            _image: &str,
+        ) -> Result<SandboxHandle, SandboxError> {
+            panic!("provider crashed");
+        }
+
+        fn teardown(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+            panic!("provider crashed");
+        }
+    }
+
+    struct PanickingProbe;
+
+    impl HttpProbe for PanickingProbe {
+        fn get(&self, _url: &str) -> Result<ProbeResponse, ProbeError> {
+            panic!("probe crashed");
+        }
+    }
+
+    fn failure_message(err: ToolError) -> String {
+        match err {
+            ToolError::ExecutionFailed { message } => message,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_or_probe_that_panics_is_reported_as_a_failure_not_a_crash() {
+        let dir = fixture();
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let crashing = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(PanickingTarget),
+            Arc::new(LoopbackProbe),
+            Arc::clone(&sandboxes),
+            "t1",
+            7,
+        )
+        .with_budget(unlimited(), "id");
+        let err = crashing
+            .execute(json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(failure_message(err).contains("deploy task failed"));
+        assert!(sandboxes.get("t1").is_none());
+
+        let blind = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(FakeSandboxTarget::new()),
+            Arc::new(PanickingProbe),
+            Arc::clone(&sandboxes),
+            "t1",
+            7,
+        )
+        .with_budget(unlimited(), "id");
+        let err = blind.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(failure_message(err).contains("QA task failed"));
+        assert!(sandboxes.get("t1").is_some());
+
+        let teardown =
+            SandboxTeardownTool::new(Arc::new(PanickingTarget), Arc::clone(&sandboxes), "t1");
+        let err = teardown.execute(json!({})).await.unwrap_err();
+        assert!(failure_message(err).contains("teardown task failed"));
+        assert!(sandboxes.get("t1").is_some());
+    }
+
+    struct RecordFails(InMemoryBudgetStore);
+
+    impl crate::budget::BudgetStore for RecordFails {
+        fn task_usage(
+            &self,
+            identity: &str,
+            task_id: &str,
+            class: BudgetClass,
+        ) -> crate::budget::Usage {
+            self.0.task_usage(identity, task_id, class)
+        }
+
+        fn day_usage(
+            &self,
+            identity: &str,
+            class: BudgetClass,
+            day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            self.0.day_usage(identity, class, day)
+        }
+
+        fn repo_day_usage(
+            &self,
+            repo: &str,
+            class: BudgetClass,
+            day: chrono::NaiveDate,
+        ) -> crate::budget::Usage {
+            self.0.repo_day_usage(repo, class, day)
+        }
+
+        fn record(
+            &self,
+            _key: &crate::budget::ChargeKey<'_>,
+            _delta: crate::budget::Usage,
+        ) -> Result<(), BudgetError> {
+            Err(BudgetError::Persist {
+                path: PathBuf::from("budget.json"),
+                message: "disk full".to_string(),
+            })
+        }
+
+        fn try_charge(
+            &self,
+            key: &crate::budget::ChargeKey<'_>,
+            limits: &BudgetLimits,
+        ) -> Result<(), BudgetError> {
+            self.0.try_charge(key, limits)
+        }
+
+        fn note_run(&self, repo: &str, run_id: u64) -> Result<(), BudgetError> {
+            self.0.note_run(repo, run_id)
+        }
+
+        fn pending_runs(&self, repo: &str) -> Vec<u64> {
+            self.0.pending_runs(repo)
+        }
+
+        fn claim_run(&self, repo: &str, run_id: u64) -> Result<bool, BudgetError> {
+            self.0.claim_run(repo, run_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_deploy_still_reports_the_deploy_error_when_settling_it_fails() {
+        let (dir, target, sandboxes, _) = setup();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(RecordFails(InMemoryBudgetStore::new())),
+            BudgetConfig::UNLIMITED,
+        ));
+        target.fail_next_deploy();
+        let tool = deploy_tool(dir.path(), &target, &sandboxes, &accountant);
+        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(failure_message(err).contains("scripted failure"));
+        assert_eq!(accountant.task_summary("id", "t1").sandbox.count, 1);
+        assert_eq!(accountant.task_summary("id", "t1").sandbox.minutes, 0.0);
     }
 }
