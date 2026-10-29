@@ -118,6 +118,7 @@ jobs:
             "harness/src/ci_policy.rs"
             "harness/src/ci_integrity.rs"
             "harness/src/deploy/template.rs"
+            "harness/src/sandbox_tools.rs"
           )
           shopt -s nocasematch
           VIOLATIONS=()
