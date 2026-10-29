@@ -82,6 +82,7 @@ struct Scan {
     field_writes: BTreeSet<String>,
     functions: BTreeSet<String>,
     sequences: BTreeMap<String, Calls>,
+    audit_tokens: BTreeSet<String>,
 }
 
 impl Scan {
@@ -114,14 +115,39 @@ impl Scan {
         }
     }
 
+    fn record_token_use(&mut self, what: &str) {
+        let function = self.function.last().cloned().unwrap_or_default();
+        self.audit_tokens
+            .insert(format!("{}: {function} constructs {what}", self.file));
+    }
+
     fn scan_tokens(&mut self, tokens: TokenStream) {
+        let mut previous = String::new();
+        let mut pending_type = false;
         for token in tokens {
             match token {
-                TokenTree::Group(group) => self.scan_tokens(group.stream()),
-                TokenTree::Ident(ident) => {
-                    self.record_call(&ident.to_string());
+                TokenTree::Group(group) => {
+                    if pending_type && group.delimiter() == proc_macro2::Delimiter::Brace {
+                        self.record_token_use("AuditedIdentity");
+                    }
+                    pending_type = false;
+                    self.scan_tokens(group.stream());
                 }
-                _ => {}
+                TokenTree::Ident(ident) => {
+                    let name = plain(&ident.to_string()).to_string();
+                    self.record_call(&name);
+                    if previous == "AuditedIdentity" && name == "split" {
+                        self.record_token_use("AuditedIdentity::split");
+                    }
+                    if previous == "BoundIdentity" && name == "Audited" {
+                        self.record_token_use("BoundIdentity::Audited");
+                    }
+                    pending_type = name == "AuditedIdentity"
+                        || (name == "Self"
+                            && self.owner.last().is_some_and(|o| o == "AuditedIdentity"));
+                    previous = name;
+                }
+                _ => pending_type = false,
             }
         }
     }
@@ -214,8 +240,31 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        syn::visit::visit_expr_struct(self, node);
+        let name = last_segment(&node.path);
+        let in_token = name == "AuditedIdentity"
+            || (name == "Self" && self.owner.last().is_some_and(|o| o == "AuditedIdentity"));
+        if in_token {
+            self.record_token_use("AuditedIdentity");
+        }
+    }
+
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         syn::visit::visit_expr_path(self, node);
+        let segments: Vec<String> = node
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if let [.., owner, name] = segments.as_slice() {
+            match (owner.as_str(), name.as_str()) {
+                ("AuditedIdentity", "split") => self.record_token_use("AuditedIdentity::split"),
+                ("BoundIdentity", "Audited") => self.record_token_use("BoundIdentity::Audited"),
+                _ => {}
+            }
+        }
         if let Some(segment) = node.path.segments.last() {
             self.record_call(&segment.ident.to_string());
         }
@@ -335,7 +384,7 @@ fn the_set_of_submit_and_enqueue_functions_is_pinned() {
             "scheduler/dispatch.rs: Dispatcher::enqueue (pub)",
             "task.rs: TaskManager::submit_spawn (pub)",
             "task.rs: TaskManager::submit_task (pub(restricted))",
-            "task.rs: TaskManager::submit_with_identity (pub(restricted))",
+            "task.rs: TaskManager::submit_bound (private)",
         ]),
         "a submit/enqueue function was added, removed or had its visibility changed; every such function must go through SpawnGate and be reviewed here"
     );
@@ -368,15 +417,9 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         ("backlog.rs: backlog_sync uses enqueue", 1),
         ("main.rs: run_delegate uses submit_task", 1),
         ("mcp/handlers.rs: handle_assign_task uses submit_spawn", 1),
-        (
-            "task.rs: TaskManager::submit_spawn uses submit_with_identity",
-            1,
-        ),
+        ("task.rs: TaskManager::submit_spawn uses submit_bound", 1),
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
-        (
-            "task.rs: TaskManager::submit_with_identity uses submit_task",
-            1,
-        ),
+        ("task.rs: TaskManager::submit_bound uses submit_task", 1),
     ]
     .into_iter()
     .map(|(key, count)| (key.to_string(), count))
@@ -480,14 +523,16 @@ fn a_check_in_a_dead_branch_does_not_guard_a_dispatch() {
 #[test]
 fn raw_task_manager_submission_methods_are_not_public() {
     let declared = union(|scan| &scan.declarations);
-    for name in ["submit_with_identity", "submit_task"] {
-        let restricted = format!("task.rs: TaskManager::{name} (pub(restricted))");
-        assert!(declared.contains(&restricted));
-        assert!(
-            !declared.contains(&format!("task.rs: TaskManager::{name} (pub)")),
-            "`{name}` must not be public"
-        );
-    }
+    assert!(declared.contains("task.rs: TaskManager::submit_bound (private)"));
+    assert!(
+        !union(|scan| &scan.functions).contains("task.rs: TaskManager::submit_with_identity"),
+        "`submit_with_identity` binds an unaudited identity and must stay test-only"
+    );
+    assert!(declared.contains("task.rs: TaskManager::submit_task (pub(restricted))"));
+    assert!(
+        !declared.contains("task.rs: TaskManager::submit_task (pub)"),
+        "`submit_task` must not be public"
+    );
 }
 
 #[test]
@@ -582,4 +627,65 @@ impl R for (A, B) { fn submit_j() {} }
             "x.rs: ::submit_j (private)",
         ])
     );
+}
+
+#[test]
+fn the_audit_token_is_minted_only_where_the_gate_proof_is_consumed() {
+    assert_eq!(
+        union(|scan| &scan.audit_tokens),
+        expected(&[
+            "task.rs: AuditedIdentity::split constructs AuditedIdentity",
+            "task.rs: TaskManager::admit_restored constructs BoundIdentity::Audited",
+            "task.rs: TaskManager::submit_spawn constructs AuditedIdentity::split",
+            "task.rs: TaskManager::submit_spawn constructs BoundIdentity::Audited",
+            "task.rs: audit_restored constructs AuditedIdentity::split",
+        ]),
+        "the audited-identity token may only be created from a gate proof in submit_spawn and audit_restored"
+    );
+}
+
+#[test]
+fn token_construction_is_seen_in_expressions_literals_and_macro_bodies() {
+    let split = scan_source("x.rs", "fn f(a: A) { let t = AuditedIdentity::split(a); }");
+    assert!(split
+        .audit_tokens
+        .contains("x.rs: f constructs AuditedIdentity::split"));
+    let literal = scan_source(
+        "x.rs",
+        "fn f(i: I) { let t = AuditedIdentity { identity: i }; }",
+    );
+    assert!(literal
+        .audit_tokens
+        .contains("x.rs: f constructs AuditedIdentity"));
+    let selfish = scan_source(
+        "x.rs",
+        "impl AuditedIdentity { fn forge(i: I) -> Self { Self { identity: i } } }",
+    );
+    assert!(selfish
+        .audit_tokens
+        .contains("x.rs: AuditedIdentity::forge constructs AuditedIdentity"));
+    let variant = scan_source("x.rs", "fn f(t: T) { let b = BoundIdentity::Audited(t); }");
+    assert!(variant
+        .audit_tokens
+        .contains("x.rs: f constructs BoundIdentity::Audited"));
+    let in_macro = scan_source(
+        "x.rs",
+        "fn f(i: I) { vec![AuditedIdentity { identity: i }]; }",
+    );
+    assert!(in_macro
+        .audit_tokens
+        .contains("x.rs: f constructs AuditedIdentity"));
+    let in_macro_call = scan_source("x.rs", "fn f(a: A) { vec![AuditedIdentity::split(a)]; }");
+    assert!(in_macro_call
+        .audit_tokens
+        .contains("x.rs: f constructs AuditedIdentity::split"));
+    let in_macro_variant = scan_source("x.rs", "fn f(t: T) { vec![BoundIdentity::Audited(t)]; }");
+    assert!(in_macro_variant
+        .audit_tokens
+        .contains("x.rs: f constructs BoundIdentity::Audited"));
+    let unrelated = scan_source(
+        "x.rs",
+        "fn f(b: B) { let _ = BoundIdentity::Unaudited(b); }",
+    );
+    assert!(unrelated.audit_tokens.is_empty());
 }

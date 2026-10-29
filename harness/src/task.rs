@@ -353,7 +353,7 @@ struct TaskRunner {
     audit: std::sync::Mutex<Arc<dyn AuditHook>>,
     /// Identities bound to one task at submission; they take precedence over
     /// the shared catalog and are consumed when the task starts.
-    bound: RwLock<HashMap<TaskId, AgentIdentity>>,
+    bound: RwLock<HashMap<TaskId, BoundIdentity>>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
@@ -459,10 +459,44 @@ impl RestoreRefused {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct AuditedIdentity {
+    identity: AgentIdentity,
+}
+
+impl AuditedIdentity {
+    fn split(allowed: Allowed) -> (crate::auditor::SpawnRequest, Self) {
+        let (request, identity) = allowed.into_parts();
+        (request, Self { identity })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BoundIdentity {
+    Audited(AuditedIdentity),
+    Unaudited(AgentIdentity),
+}
+
+impl BoundIdentity {
+    pub(crate) fn identity(&self) -> &AgentIdentity {
+        match self {
+            BoundIdentity::Audited(audited) => &audited.identity,
+            BoundIdentity::Unaudited(identity) => identity,
+        }
+    }
+
+    pub(crate) fn into_identity(self) -> AgentIdentity {
+        match self {
+            BoundIdentity::Audited(audited) => audited.identity,
+            BoundIdentity::Unaudited(identity) => identity,
+        }
+    }
+}
+
 async fn audit_restored(
     gate: &SpawnGate,
     queued: &QueuedTask,
-) -> Result<AgentIdentity, RestoreRefused> {
+) -> Result<AuditedIdentity, RestoreRefused> {
     let hint = queued
         .identity_hint
         .as_deref()
@@ -481,7 +515,7 @@ async fn audit_restored(
         hint,
         queued.description.clone(),
     );
-    Ok(gate.check(request).await?.into_parts().1)
+    Ok(AuditedIdentity::split(gate.check(request).await?).1)
 }
 
 enum RestoreAudit<'a> {
@@ -659,7 +693,11 @@ impl TaskManager {
         for queued in self.dispatcher.queued().await {
             match audit_restored(gate, &queued).await {
                 Ok(identity) => {
-                    self.runner.bound.write().await.insert(queued.id, identity);
+                    self.runner
+                        .bound
+                        .write()
+                        .await
+                        .insert(queued.id, BoundIdentity::Audited(identity));
                 }
                 Err(refused) => {
                     self.dispatcher.cancel(&queued.id).await?;
@@ -1022,16 +1060,16 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             });
         }
         crate::scope::check_repo(allowed.identity(), &repo_path)?;
-        let (request, identity) = allowed.into_parts();
+        let (request, identity) = AuditedIdentity::split(allowed);
         Ok(self
-            .submit_with_identity(
+            .submit_bound(
                 request.subtask,
                 repo_path,
                 branch,
                 model,
                 max_iterations,
                 provider,
-                Some(identity),
+                Some(BoundIdentity::Audited(identity)),
             )
             .await)
     }
@@ -1046,7 +1084,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// identity this is exactly [`TaskManager::submit`]: read-only and
     /// network-less.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn submit_with_identity(
+    async fn submit_bound(
         &self,
         description: String,
         repo_path: PathBuf,
@@ -1054,9 +1092,9 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         model: String,
         max_iterations: usize,
         provider: Arc<dyn ModelProvider>,
-        identity: Option<AgentIdentity>,
+        identity: Option<BoundIdentity>,
     ) -> TaskId {
-        let hint = identity.as_ref().map(|i| i.name().to_string());
+        let hint = identity.as_ref().map(|i| i.identity().name().to_string());
         let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
             .with_identity_hint(hint);
         if let Some(identity) = identity {
@@ -1067,6 +1105,30 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
                 .insert(queued.id.clone(), identity);
         }
         self.submit_task(queued, provider).await
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_with_identity(
+        &self,
+        description: String,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        provider: Arc<dyn ModelProvider>,
+        identity: Option<AgentIdentity>,
+    ) -> TaskId {
+        self.submit_bound(
+            description,
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+            provider,
+            identity.map(BoundIdentity::Unaudited),
+        )
+        .await
     }
 
     /// Submit a fully described queue entry, which may be parked with
@@ -1374,9 +1436,9 @@ impl TaskRunner {
         task_id: &TaskId,
         hint: Option<&str>,
         repo_path: &Path,
-    ) -> Result<Option<AgentIdentity>, String> {
-        if let Some(identity) = self.bound.write().await.remove(task_id) {
-            return Ok(Some(identity));
+    ) -> Result<Option<BoundIdentity>, String> {
+        if let Some(bound) = self.bound.write().await.remove(task_id) {
+            return Ok(Some(bound));
         }
         let Some(name) = hint else {
             return Ok(None);
@@ -1387,7 +1449,7 @@ impl TaskRunner {
                 .with_repo_overrides(repo_path)
                 .map_err(|e| format!("repo-local identity overrides rejected: {e}"))?;
         match layered.get(name) {
-            Some(identity) => Ok(Some(identity.clone())),
+            Some(identity) => Ok(Some(BoundIdentity::Unaudited(identity.clone()))),
             None => Err(format!("identity `{name}` is not registered")),
         }
     }
@@ -1413,7 +1475,7 @@ impl TaskRunner {
             .resolve_identity(&task_id, queued.identity_hint.as_deref(), &queued.repo_path)
             .await
         {
-            Ok(identity) => identity,
+            Ok(bound) => bound.map(BoundIdentity::into_identity),
             Err(e) => {
                 self.fail(&task_id, e, "IdentityUnavailable").await;
                 return;
@@ -5062,7 +5124,7 @@ mod identity_tests {
             assert_eq!(registered.get("rust-implementer"), Some(&catalog_entry));
         }
         let bound = manager.runner.bound.read().await;
-        assert_eq!(bound.get(&id), Some(&wider));
+        assert_eq!(bound.get(&id).map(BoundIdentity::identity), Some(&wider));
     }
 
     #[tokio::test]
@@ -5078,20 +5140,21 @@ mod identity_tests {
             .bound
             .write()
             .await
-            .insert(id.clone(), bound.clone());
+            .insert(id.clone(), BoundIdentity::Unaudited(bound.clone()));
         let resolved = runner_manager
             .runner
             .resolve_identity(&id, Some("rust-implementer"), Path::new("/nonexistent"))
             .await
             .unwrap();
-        assert_eq!(resolved, Some(bound));
+        assert_eq!(resolved.map(BoundIdentity::into_identity), Some(bound));
         let from_catalog = runner_manager
             .runner
             .resolve_identity(&id, Some("rust-implementer"), Path::new("/nonexistent"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(from_catalog.scope.max_effect, EffectClass::None);
+        assert!(matches!(from_catalog, BoundIdentity::Unaudited(_)));
+        assert_eq!(from_catalog.identity().scope.max_effect, EffectClass::None);
     }
 
     #[tokio::test]
@@ -5716,14 +5779,14 @@ mod repo_override_tests {
             .bound
             .write()
             .await
-            .insert(id.clone(), narrowed.clone());
+            .insert(id.clone(), BoundIdentity::Unaudited(narrowed.clone()));
         std::fs::remove_dir_all(repo.path().join(".nanna")).unwrap();
         let resolved = manager
             .runner
             .resolve_identity(&id, Some("rust-implementer"), repo.path())
             .await
             .unwrap();
-        assert_eq!(resolved, Some(narrowed));
+        assert_eq!(resolved.map(BoundIdentity::into_identity), Some(narrowed));
     }
 
     #[tokio::test]
@@ -5754,7 +5817,8 @@ mod repo_override_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.scope.paths, ["api/**"]);
+        assert!(matches!(resolved, BoundIdentity::Audited(_)));
+        assert_eq!(resolved.identity().scope.paths, ["api/**"]);
     }
 
     #[tokio::test]
@@ -5787,7 +5851,7 @@ mod repo_override_tests {
             .unwrap()
             .unwrap();
         workspace.cleanup().unwrap();
-        assert_eq!(resolved.scope.paths, ["api/**"]);
+        assert_eq!(resolved.identity().scope.paths, ["api/**"]);
     }
 }
 
@@ -5873,6 +5937,31 @@ mod spawn_tests {
         );
         assert!(refused.to_string().contains("github.com/example/repo"));
         assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_binds_the_audited_identity_to_its_task() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let audited = allowed.identity().clone();
+
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+
+        let bound = manager.runner.bound.read().await;
+        let held = bound.get(&id).unwrap();
+        assert!(matches!(held, BoundIdentity::Audited(_)));
+        assert_eq!(held.identity(), &audited);
     }
 
     #[tokio::test]

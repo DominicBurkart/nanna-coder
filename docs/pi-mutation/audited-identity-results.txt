@@ -1,0 +1,7 @@
+5 mutants, all applied, 0 left as compile errors:
+submit_spawn stores Unaudited: KILLED (test_submit_spawn_binds_the_audited_identity_to_its_task)
+admit_restored stores Unaudited: KILLED (test_a_restore_binds_the_audited_layered_identity_and_ignores_later_edits)
+catalog resolution mints Audited: KILLED (spawn_gate_structural)
+second AuditedIdentity constructor: KILLED (spawn_gate_structural)
+macro-hidden BoundIdentity::Audited: KILLED (spawn_gate_structural)
+The script's list was narrowed to two entries for the last re-run after correcting a test filter and a non-compiling mutation.
