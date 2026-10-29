@@ -1225,9 +1225,6 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         .await
     }
 
-    /// Submit a queue entry whose identity, subtask and repository the caller
-    /// has already checked against `allowed`, running it under exactly the
-    /// audited identity.
     pub(crate) async fn submit_audited(
         &self,
         queued: QueuedTask,

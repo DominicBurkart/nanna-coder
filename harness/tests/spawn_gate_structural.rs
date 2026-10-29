@@ -556,10 +556,12 @@ fn the_backlog_manager_sink_binds_the_audited_identity_and_never_calls_submit_ta
     let audited = calls_in("TaskManager::submit_audited", "task.rs");
     assert!(audited.iter().any(|(name, _)| name == "split"));
     assert!(audited.iter().any(|(name, _)| name == "submit_task"));
+    assert!(dominates(&audited, "split", "submit_task"));
+    assert!(dominates(&audited, "insert", "submit_task"));
 }
 
 #[test]
-fn the_remaining_direct_submit_task_callers_are_the_known_bypasses() {
+fn the_name_submit_task_is_called_only_by_the_audited_binders_and_the_gated_mcp_client_entry() {
     let mut callers: BTreeSet<String> = BTreeSet::new();
     for scan in scan_all() {
         for key in scan.calls.keys() {
@@ -575,7 +577,7 @@ fn the_remaining_direct_submit_task_callers_are_the_known_bypasses() {
             "task.rs: TaskManager::submit_audited uses submit_task",
             "task.rs: TaskManager::submit_bound uses submit_task",
         ]),
-        "a new direct submit_task caller bypasses the audited identity; run_delegate is the known remaining bypass"
+        "the only production callers of TaskManager::submit_task are submit_bound and submit_audited; run_delegate calls NannaMcpClient::submit_task, which reaches submit_spawn through the gated in-process server; the scan matches by method name only, so it cannot tell the two submit_task methods apart and any new caller of either must be reviewed here"
     );
 }
 
