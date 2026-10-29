@@ -4346,6 +4346,82 @@ mod tests {
         }
     }
 
+    fn commit_dot_git_entry_by_plumbing(dir: &Path, branch: &str) {
+        let blob = {
+            let mut child = StdCommand::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"x").unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let mktree = |input: String| -> String {
+            let mut child = StdCommand::new("git")
+                .arg("mktree")
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let sub = mktree(format!("100644 blob {blob}\tconfig\n"));
+        let head_tree = run_git(dir, &["ls-tree", "HEAD"]).unwrap();
+        let root = mktree(format!("{head_tree}\n040000 tree {sub}\t.git\n"));
+        let message = "dotgit\n\nNanna-Identity: sdlc-dev";
+        let commit = run_git(dir, &["commit-tree", &root, "-p", "HEAD", "-m", message]).unwrap();
+        let reference = format!("refs/heads/{branch}");
+        git(dir, &["update-ref", &reference, &commit]);
+        git(dir, &["symbolic-ref", "HEAD", &reference]);
+    }
+
+    #[tokio::test]
+    async fn push_refuses_a_commit_under_every_protected_pattern() {
+        let protected = ProtectedPaths::for_repo(Path::new("/nonexistent"));
+        for pattern in crate::protected::PROTECTED_PATTERNS {
+            let fixture = push_fixture();
+            let path = if *pattern == ".git/**" {
+                commit_dot_git_entry_by_plumbing(fixture.work.path(), "feature-pp");
+                ".git/config".to_string()
+            } else {
+                git(fixture.work.path(), &["checkout", "-q", "-b", "feature-pp"]);
+                let path = pattern_example_path(pattern);
+                commit_file(
+                    fixture.work.path(),
+                    &path,
+                    "x",
+                    "protected\n\nNanna-Identity: sdlc-dev",
+                );
+                path
+            };
+            assert!(
+                protected.is_protected(Path::new(&path)),
+                "{pattern}: {path}"
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ExecutionFailed { .. }),
+                "{pattern}: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("changes protected path '{path}'")),
+                "{pattern}: {err}"
+            );
+            assert!(!remote_has(fixture.work.path(), "feature-pp"), "{pattern}");
+        }
+    }
+
     #[tokio::test]
     async fn push_refuses_a_commit_that_deletes_or_renames_a_protected_path() {
         let fixture = push_fixture();
@@ -4622,6 +4698,122 @@ mod tests {
             .collect();
         skipped.sort();
         assert_eq!(skipped, vec![".github/workflows/x.yml", "codecov.yml"]);
+    }
+
+    fn pattern_example_path(pattern: &str) -> String {
+        if pattern == "**/.nanna/**" {
+            return "crates/api/.nanna/agents/x.toml".to_string();
+        }
+        match pattern.strip_suffix("/**") {
+            Some(prefix) => format!("{prefix}/sub/x.txt"),
+            None => pattern.to_string(),
+        }
+    }
+
+    fn commit_reachable_patterns() -> Vec<(&'static str, String)> {
+        let protected = ProtectedPaths::for_repo(Path::new("/nonexistent"));
+        crate::protected::PROTECTED_PATTERNS
+            .iter()
+            .filter(|pattern| **pattern != ".git/**")
+            .map(|pattern| {
+                let path = pattern_example_path(pattern);
+                assert!(
+                    protected.is_protected(Path::new(&path)),
+                    "{pattern}: {path}"
+                );
+                (*pattern, path)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn git_cannot_track_a_path_under_dot_git_so_only_that_pattern_is_unreachable_by_commit() {
+        let dir = github_repo_fixture();
+        let output = StdCommand::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,.git/config",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            commit_reachable_patterns().len() + 1,
+            crate::protected::PROTECTED_PATTERNS.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_a_tracked_change_under_every_protected_pattern() {
+        for (pattern, path) in commit_reachable_patterns() {
+            let dir = github_repo_fixture();
+            commit_file(dir.path(), &path, "a: 1\n", "base");
+            git(dir.path(), &["checkout", "-q", "-b", "feature-pp"]);
+            std::fs::write(dir.path().join(&path), "a: 2\n").unwrap();
+            std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+            let before = head_sha(dir.path());
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+            let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+            assert!(
+                matches!(err, ToolError::ExecutionFailed { .. }),
+                "{pattern}: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{path}' is a protected path")),
+                "{pattern}: {err}"
+            );
+            assert_eq!(head_sha(dir.path()), before, "{pattern}");
+            let staged = run_git(dir.path(), &["diff", "--cached", "--name-only"]).unwrap();
+            assert!(staged.is_empty(), "{pattern}: {staged}");
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_a_staged_new_file_under_every_protected_pattern() {
+        for (pattern, path) in commit_reachable_patterns() {
+            let dir = github_repo_fixture();
+            git(dir.path(), &["checkout", "-q", "-b", "feature-ps"]);
+            let full = dir.path().join(&path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "a: 1\n").unwrap();
+            git(dir.path(), &["add", "-f", "--", &path]);
+            let before = head_sha(dir.path());
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+            let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{path}' is a protected path")),
+                "{pattern}: {err}"
+            );
+            assert_eq!(head_sha(dir.path()), before, "{pattern}");
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_an_untracked_file_under_every_protected_pattern_out_of_the_commit() {
+        for (pattern, path) in commit_reachable_patterns() {
+            let dir = feature_repo();
+            let full = dir.path().join(&path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "a: 1\n").unwrap();
+            std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+            let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+            let committed =
+                run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+            assert_eq!(committed, "ok.txt", "{pattern}");
+            let skipped: Vec<&str> = result["skipped_protected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(skipped, vec![path.as_str()], "{pattern}");
+        }
     }
 
     #[tokio::test]
