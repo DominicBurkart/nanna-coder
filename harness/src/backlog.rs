@@ -235,12 +235,25 @@ pub struct WorkflowRun {
     #[serde(default)]
     pub head_sha: Option<String>,
     #[serde(default)]
+    pub head_repository: Option<RunRepository>,
+    #[serde(default)]
     pub run_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRepository {
+    pub full_name: String,
+}
+
 impl WorkflowRun {
+    pub fn is_from(&self, repo: &str) -> bool {
+        self.head_repository
+            .as_ref()
+            .is_some_and(|head| head.full_name.eq_ignore_ascii_case(repo))
+    }
+
     pub fn duration_minutes(&self) -> Option<f64> {
         let started = self.run_started_at?;
         let ended = self.updated_at?;
@@ -3259,6 +3272,7 @@ mod tests {
             head_branch: None,
             path: None,
             head_sha: None,
+            head_repository: None,
             run_started_at: None,
             updated_at: None,
         }
@@ -3429,6 +3443,7 @@ mod tests {
             "html_url": "https://example.invalid/runs/42",
             "run_started_at": "2026-09-26T10:00:00Z",
             "updated_at": "2026-09-26T10:09:00Z",
+            "head_repository": {"full_name": "Fork/Name", "private": false},
         })
         .to_string();
         let (base, _requests, server) =
@@ -3438,6 +3453,8 @@ mod tests {
         assert_eq!(run.status, "completed");
         assert_eq!(run.conclusion.as_deref(), Some("success"));
         assert_eq!(run.duration_minutes(), Some(9.0));
+        assert!(run.is_from("fork/name"));
+        assert!(!run.is_from("o/n"));
         server.abort();
     }
 

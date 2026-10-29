@@ -143,6 +143,14 @@ pub(crate) fn verify_ci_surface(
     Ok(())
 }
 
+pub(crate) fn policy_source_at_base(repo: &Path) -> Result<Option<String>, IntegrityError> {
+    let base = resolve_base(repo)?;
+    Ok(git_stdout(
+        repo,
+        &["show", &format!("{base}:{POLICY_FILE}")],
+    ))
+}
+
 pub(crate) fn workflow_file_of_run_path(path: &str) -> Option<&str> {
     let without_ref = path.split('@').next().unwrap_or(path);
     let name = without_ref.strip_prefix(WORKFLOWS_DIR)?;
