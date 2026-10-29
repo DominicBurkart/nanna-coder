@@ -984,7 +984,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// read-only (`EffectClass::None`) tools and a network-less container,
     /// and any call to an effectful tool is refused and recorded as a
     /// [`crate::scope::ScopeDenial`]. To run effectful work, submit under a
-    /// named, registered identity with [`TaskManager::submit_with_identity`]
+    /// named, registered identity with `submit_bound`
     /// or a hinted [`TaskManager::submit_task`].
     #[cfg(test)]
     pub(crate) async fn submit(
@@ -1036,7 +1036,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// `scope.repos` ([`SpawnRefused::OutsideScope`]), and `model` must be
     /// the identity's model ([`SpawnRefused::ModelMismatch`]). The subtask
     /// text becomes the task description and the task runs under the audited
-    /// identity exactly as [`TaskManager::submit_with_identity`] would run it.
+    /// identity exactly as `submit_bound` would run it.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_spawn(
         &self,

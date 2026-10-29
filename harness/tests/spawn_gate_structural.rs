@@ -50,6 +50,18 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+fn token_use(owner: &str, name: &str) -> Option<&'static str> {
+    match (owner, name) {
+        ("AuditedIdentity", "split") => Some("AuditedIdentity::split"),
+        ("BoundIdentity", "Audited") => Some("BoundIdentity::Audited"),
+        _ => None,
+    }
+}
+
+fn mentions_token(ty: &syn::Type) -> bool {
+    type_name(ty) == "AuditedIdentity"
+}
+
 fn plain(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
@@ -115,6 +127,11 @@ impl Scan {
         }
     }
 
+    fn record_token_shape(&mut self, what: &str) {
+        self.audit_tokens
+            .insert(format!("{}: token shape: {what}", self.file));
+    }
+
     fn record_token_use(&mut self, what: &str) {
         let function = self.function.last().cloned().unwrap_or_default();
         self.audit_tokens
@@ -136,11 +153,8 @@ impl Scan {
                 TokenTree::Ident(ident) => {
                     let name = plain(&ident.to_string()).to_string();
                     self.record_call(&name);
-                    if previous == "AuditedIdentity" && name == "split" {
-                        self.record_token_use("AuditedIdentity::split");
-                    }
-                    if previous == "BoundIdentity" && name == "Audited" {
-                        self.record_token_use("BoundIdentity::Audited");
+                    if let Some(what) = token_use(&previous, &name) {
+                        self.record_token_use(what);
                     }
                     pending_type = name == "AuditedIdentity"
                         || (name == "Self"
@@ -162,6 +176,9 @@ impl Scan {
         if dispatch_name(name) {
             self.declarations
                 .insert(format!("{}: {qualified} ({})", self.file, visibility(vis)));
+        }
+        if qualified == "AuditedIdentity::split" {
+            self.record_token_shape(&format!("split is {}", visibility(vis)));
         }
         self.function.push(qualified);
         true
@@ -186,8 +203,46 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        syn::visit::visit_item_type(self, node);
+        if mentions_token(&node.ty) {
+            self.record_token_shape(&format!("type alias {}", node.ident));
+        }
+    }
+
+    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+        syn::visit::visit_use_rename(self, node);
+        if matches!(
+            node.ident.to_string().as_str(),
+            "AuditedIdentity" | "BoundIdentity"
+        ) {
+            self.record_token_shape(&format!("use {} as {}", node.ident, node.rename));
+        }
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        syn::visit::visit_item_struct(self, node);
+        if node.ident == "AuditedIdentity" {
+            let mut derives: Vec<String> = Vec::new();
+            for attr in node.attrs.iter().filter(|a| a.path().is_ident("derive")) {
+                let listed = attr
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                    )
+                    .unwrap();
+                derives.extend(listed.iter().map(last_segment));
+            }
+            self.record_token_shape(&format!("derives {}", derives.join(", ")));
+        }
+    }
+
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if !is_cfg_test(&node.attrs) {
+            if mentions_token(&node.self_ty) {
+                if let Some((_, path, _)) = &node.trait_ {
+                    self.record_token_shape(&format!("impl {}", last_segment(path)));
+                }
+            }
             self.owner.push(type_name(&node.self_ty));
             syn::visit::visit_item_impl(self, node);
             self.owner.pop();
@@ -252,18 +307,17 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         syn::visit::visit_expr_path(self, node);
-        let segments: Vec<String> = node
-            .path
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect();
-        if let [.., owner, name] = segments.as_slice() {
-            match (owner.as_str(), name.as_str()) {
-                ("AuditedIdentity", "split") => self.record_token_use("AuditedIdentity::split"),
-                ("BoundIdentity", "Audited") => self.record_token_use("BoundIdentity::Audited"),
-                _ => {}
+        let mut tail = node.path.segments.iter().rev().map(|s| s.ident.to_string());
+        let name = tail.next().unwrap_or_default();
+        let owner = tail.next().unwrap_or_default();
+        let owner = match owner.as_str() {
+            "Self" if self.owner.last().is_some_and(|o| o == "AuditedIdentity") => {
+                "AuditedIdentity".to_string()
             }
+            _ => owner,
+        };
+        if let Some(what) = token_use(&owner, &name) {
+            self.record_token_use(what);
         }
         if let Some(segment) = node.path.segments.last() {
             self.record_call(&segment.ident.to_string());
@@ -639,6 +693,8 @@ fn the_audit_token_is_minted_only_where_the_gate_proof_is_consumed() {
             "task.rs: TaskManager::submit_spawn constructs AuditedIdentity::split",
             "task.rs: TaskManager::submit_spawn constructs BoundIdentity::Audited",
             "task.rs: audit_restored constructs AuditedIdentity::split",
+            "task.rs: token shape: derives Debug",
+            "task.rs: token shape: split is private",
         ]),
         "the audited-identity token may only be created from a gate proof in submit_spawn and audit_restored"
     );
@@ -688,4 +744,98 @@ fn token_construction_is_seen_in_expressions_literals_and_macro_bodies() {
         "fn f(b: B) { let _ = BoundIdentity::Unaudited(b); }",
     );
     assert!(unrelated.audit_tokens.is_empty());
+}
+
+#[test]
+fn indirect_routes_to_the_token_constructor_and_widened_derives_are_seen() {
+    let alias = scan_source("x.rs", "type Alias = AuditedIdentity;");
+    assert!(alias
+        .audit_tokens
+        .contains("x.rs: token shape: type alias Alias"));
+    let reference = scan_source("x.rs", "type Alias = &'static AuditedIdentity;");
+    assert!(reference
+        .audit_tokens
+        .contains("x.rs: token shape: type alias Alias"));
+    let renamed = scan_source("x.rs", "use self::AuditedIdentity as AI;");
+    assert!(renamed
+        .audit_tokens
+        .contains("x.rs: token shape: use AuditedIdentity as AI"));
+    let renamed_enum = scan_source("x.rs", "use crate::task::{BoundIdentity as B};");
+    assert!(renamed_enum
+        .audit_tokens
+        .contains("x.rs: token shape: use BoundIdentity as B"));
+    let selfish = scan_source(
+        "x.rs",
+        "impl AuditedIdentity { fn again(a: A) { let _ = Self::split(a); } }",
+    );
+    assert!(selfish
+        .audit_tokens
+        .contains("x.rs: AuditedIdentity::again constructs AuditedIdentity::split"));
+    let other_self = scan_source(
+        "x.rs",
+        "impl Other { fn again(a: A) { let _ = Self::split(a); } }",
+    );
+    assert!(other_self.audit_tokens.is_empty());
+    let derives = scan_source(
+        "x.rs",
+        "#[derive(Debug, Clone)] #[derive(Default)] struct AuditedIdentity { i: I }",
+    );
+    assert!(derives
+        .audit_tokens
+        .contains("x.rs: token shape: derives Debug, Clone, Default"));
+    let unrelated = scan_source("x.rs", "#[derive(Clone)] struct Other { i: I }");
+    assert!(unrelated.audit_tokens.is_empty());
+    let manual = scan_source(
+        "x.rs",
+        "impl Clone for AuditedIdentity { fn clone(&self) -> Self { todo!() } }",
+    );
+    assert!(manual
+        .audit_tokens
+        .contains("x.rs: token shape: impl Clone"));
+    let other_impl = scan_source(
+        "x.rs",
+        "impl Clone for Other { fn clone(&self) -> Self { todo!() } }",
+    );
+    assert!(other_impl.audit_tokens.is_empty());
+    let public = scan_source(
+        "x.rs",
+        "impl AuditedIdentity { pub(crate) fn split(a: A) {} }",
+    );
+    assert!(public
+        .audit_tokens
+        .contains("x.rs: token shape: split is pub(restricted)"));
+    let other_split = scan_source("x.rs", "impl Other { pub fn split(a: A) {} }");
+    assert!(other_split.audit_tokens.is_empty());
+    assert_eq!(
+        token_use("AuditedIdentity", "split"),
+        Some("AuditedIdentity::split")
+    );
+    assert_eq!(
+        token_use("BoundIdentity", "Audited"),
+        Some("BoundIdentity::Audited")
+    );
+    assert_eq!(token_use("BoundIdentity", "Unaudited"), None);
+    assert_eq!(token_use("Other", "split"), None);
+}
+
+#[test]
+fn the_only_production_hinted_submit_task_callers_are_the_known_unaudited_bypasses_tracked_in_967()
+{
+    let mut callers: BTreeSet<String> = BTreeSet::new();
+    for scan in scan_all() {
+        for key in scan.calls.keys() {
+            if key.ends_with(" uses submit_task") {
+                callers.insert(key.clone());
+            }
+        }
+    }
+    assert_eq!(
+        callers,
+        expected(&[
+            "backlog.rs: ManagerSink::enqueue uses submit_task",
+            "main.rs: run_delegate uses submit_task",
+            "task.rs: TaskManager::submit_bound uses submit_task",
+        ]),
+        "a new submit_task caller binds an Unaudited identity; route it through submit_spawn"
+    );
 }
