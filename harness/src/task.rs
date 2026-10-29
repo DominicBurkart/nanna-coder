@@ -5068,7 +5068,7 @@ mod identity_tests {
         assert!(!matches!(task.status, TaskStatus::Failed { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_the_deadline_bounds_the_whole_restore_not_each_entry() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let entries: Vec<_> = (0..5)
@@ -5138,6 +5138,60 @@ mod identity_tests {
             "{error}"
         );
         assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn capture_park_logs() -> (String, String) {
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let gate = model_backed(None);
+        let (_manager, _store) = restore_audited(
+            &[&entry],
+            &fixture_catalog(),
+            &gate,
+            untouched_provider() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, entry.id.0.clone())
+    }
+
+    #[tokio::test]
+    async fn test_parking_logs_a_warning_and_a_restore_summary() {
+        let (mut out, mut id) = capture_park_logs().await;
+        for _ in 0..50 {
+            if out.contains("Restore parked a queued entry")
+                && out.contains("Restore audit finished")
+            {
+                break;
+            }
+            (out, id) = capture_park_logs().await;
+        }
+        assert!(out.contains("Restore parked a queued entry"), "{out}");
+        assert!(out.contains(&id), "{out}");
+        assert!(out.contains("RestoreAuditFailed"), "{out}");
+        assert!(out.contains("Restore audit finished"), "{out}");
+        assert!(out.contains("parked=1"), "{out}");
     }
 
     #[tokio::test]

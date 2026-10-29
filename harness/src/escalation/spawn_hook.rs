@@ -1,5 +1,6 @@
+use super::Severity;
 use super::{CardRequest, Escalation, EscalationSource, Escalator};
-use crate::auditor::{SpawnEscalation, SpawnEscalationHook};
+use crate::auditor::{ReasonCode, SpawnEscalation, SpawnEscalationHook, MODEL_FAILURE_PREFIX};
 use crate::task::TaskId;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -13,7 +14,42 @@ impl EscalatorSpawnHook {
         Self { escalator }
     }
 
+    fn model_failed(escalation: &SpawnEscalation) -> bool {
+        escalation
+            .reasons
+            .iter()
+            .any(|r| r.code == ReasonCode::Other && r.detail.starts_with(MODEL_FAILURE_PREFIX))
+    }
+
+    fn model_failure(escalation: &SpawnEscalation) -> Escalation {
+        let request = &escalation.request;
+        let summary = format!(
+            "The auditor model could not review a spawn of `{}` (unavailable or unparsable reply); the spawn was refused.",
+            request.identity
+        );
+        let mut evidence: Vec<String> = escalation.reasons.iter().map(|r| r.to_string()).collect();
+        evidence.push(format!(
+            "auditor rationale: {}",
+            escalation.record.rationale
+        ));
+        Escalation::new(
+            Severity::Blocked,
+            EscalationSource::Auditor,
+            &request.parent_task.repo,
+            summary,
+        )
+        .with_suggested_action(
+            "Check the auditor model and its provider, then re-run the task. No identity change is implied.",
+        )
+        .with_task(TaskId(request.parent_task.id.clone()))
+        .with_identity(&request.identity)
+        .with_evidence(evidence)
+    }
+
     fn escalation(escalation: &SpawnEscalation) -> Escalation {
+        if Self::model_failed(escalation) {
+            return Self::model_failure(escalation);
+        }
         let request = &escalation.request;
         let suggestion = &escalation.suggested_identity_change;
         let summary = format!(
@@ -110,6 +146,47 @@ mod tests {
             .iter()
             .all(|line| !line.contains("SECRET-PAYLOAD")));
         assert_eq!(log.states().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_model_failure_escalation_says_so_and_asks_for_no_card() {
+        let (hook, sink, _log) = setup(false);
+        let context = crate::auditor::rules::tests::context(true);
+        let request = SpawnRequest::derive(
+            context.catalog(),
+            TaskSummary::new("task-9", "d", "example/repo"),
+            "deployer",
+            "Check the build.",
+        );
+        let suggestion = crate::auditor::CardSuggestion::widen(
+            context.catalog().get("deployer").unwrap(),
+            request.dev_loop,
+            request.requested_effect,
+            "the model auditor produced no verdict; confirm the card by hand",
+        );
+        let reasons = vec![crate::auditor::Reason::new(
+            crate::auditor::ReasonCode::Other,
+            format!("{MODEL_FAILURE_PREFIX}output could not be parsed (x); human review required"),
+        )];
+        let record = crate::auditor::AuditRecord {
+            model: "m".to_string(),
+            prompt_hash: "h".to_string(),
+            rationale: "r".to_string(),
+        };
+        let escalation = SpawnEscalation {
+            request,
+            reasons,
+            suggested_identity_change: suggestion,
+            record,
+        };
+        hook.on_escalate(&escalation).await;
+        let seen = sink.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].severity, Severity::Blocked);
+        assert!(seen[0].summary.contains("auditor model could not review"));
+        assert!(!seen[0].summary.contains("no identity in the catalog"));
+        assert!(seen[0].proposed_identity_toml.is_none());
+        assert!(seen[0].suggested_action.contains("No identity change"));
     }
 
     #[tokio::test]

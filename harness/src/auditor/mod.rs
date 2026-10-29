@@ -32,7 +32,10 @@ pub use fail_closed::{FailClosedModelAuditor, MODEL_AUDIT_TIMEOUT};
 pub use gate::{
     Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook, SpawnGate,
 };
-pub use llm::{ModelAuditor, AUDITOR_FRAMING, OUTPUT_CONTRACT, SUBTASK_CLOSE, SUBTASK_OPEN};
+pub use llm::{
+    ModelAuditor, AUDITOR_FRAMING, MODEL_FAILURE_PREFIX, OUTPUT_CONTRACT, SUBTASK_CLOSE,
+    SUBTASK_OPEN,
+};
 pub use log::{AuditLog, AuditLogEntry};
 pub use record::{content_hash, AuditOutcome, AuditRecord};
 pub use request::{SpawnRequest, TaskSummary};

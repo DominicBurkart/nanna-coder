@@ -196,6 +196,10 @@ impl SpawnEscalationHook for NoopEscalationHook {
     async fn on_escalate(&self, _escalation: &SpawnEscalation) {}
 }
 
+fn log_write_failed(error: &AuditError) {
+    tracing::error!(%error, "audit log write failed for an unavailable auditor");
+}
+
 /// Runs a [`SpawnRequest`] through an [`Auditor`], logs the outcome, and
 /// hands back proof of the result: [`Allowed`] on `Allow`, [`Refused`]
 /// otherwise. This is the only function in the crate that can produce an
@@ -285,9 +289,7 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
             Err(error) => {
                 if let AuditError::Unavailable { outcome, .. } = &error {
                     if let Err(log_error) = self.log.append(&request, outcome) {
-                        tracing::error!(
-                            "audit log write failed for an unavailable auditor: {log_error}"
-                        );
+                        log_write_failed(&log_error);
                     }
                     if outcome.verdict.kind() == VerdictKind::Escalate {
                         self.notify_escalation(&request, &outcome.verdict, &outcome.record)

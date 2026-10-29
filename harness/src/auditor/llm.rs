@@ -32,6 +32,7 @@ pub const MAX_SUBTASK_CHARS: usize = 32_000;
 const MAX_FIELD_CHARS: usize = 256;
 const MAX_DESCRIPTION_CHARS: usize = 4_000;
 pub(super) const MAX_TEXT_CHARS: usize = 1_000;
+pub const MODEL_FAILURE_PREFIX: &str = "auditor model ";
 const MAX_REASONS: usize = 16;
 const MAX_TOOLS: usize = 32;
 const TRUNCATED: &str = "[truncated]";
@@ -193,7 +194,7 @@ impl ModelAuditor {
     fn unparsable(problem: &str, request: &SpawnRequest, identity: &AgentIdentity) -> SpawnVerdict {
         let reason = Reason::new(
             ReasonCode::Other,
-            format!("auditor model output could not be parsed ({problem}); human review required"),
+            format!("{MODEL_FAILURE_PREFIX}output could not be parsed ({problem}); human review required"),
         );
         let suggestion = CardSuggestion::widen(
             identity,
@@ -240,12 +241,11 @@ fn sanitize_verdict(verdict: SpawnVerdict) -> SpawnVerdict {
             let mut suggestion = suggested_identity_change;
             suggestion.name = clip(&suggestion.name, MAX_FIELD_CHARS);
             suggestion.rationale = clip(&suggestion.rationale, MAX_TEXT_CHARS);
-            suggestion.tools = suggestion
-                .tools
-                .iter()
-                .take(MAX_TOOLS)
-                .map(|tool| clip(tool, MAX_FIELD_CHARS))
-                .collect();
+            let mut tools = Vec::new();
+            for tool in suggestion.tools.iter().take(MAX_TOOLS) {
+                tools.push(clip(tool, MAX_FIELD_CHARS));
+            }
+            suggestion.tools = tools;
             SpawnVerdict::escalate(sanitize_reasons(reasons), suggestion)
         }
     }
@@ -875,6 +875,15 @@ pub(crate) mod tests {
             assert!(!cut);
             assert_eq!(whole, unit.repeat(4));
         }
+    }
+
+    #[test]
+    fn the_untrusted_text_caps_are_pinned() {
+        assert_eq!(MAX_TEXT_CHARS, 1_000);
+        assert_eq!(MAX_SUBTASK_CHARS, 32_000);
+        assert_eq!(MAX_FIELD_CHARS, 256);
+        assert_eq!(MAX_REASONS, 16);
+        assert_eq!(MAX_TOOLS, 32);
     }
 
     #[test]

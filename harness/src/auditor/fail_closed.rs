@@ -1,4 +1,4 @@
-use super::llm::{clip, MAX_TEXT_CHARS};
+use super::llm::{clip, MAX_TEXT_CHARS, MODEL_FAILURE_PREFIX};
 use super::{
     content_hash, AuditContext, AuditError, AuditOutcome, AuditRecord, Auditor, ModelAuditor,
     Reason, ReasonCode, RuleAuditor, SpawnRequest, SpawnVerdict, VerdictKind,
@@ -66,7 +66,7 @@ impl FailClosedModelAuditor {
         let mut reasons = rule_verdict.reasons().to_vec();
         reasons.push(Reason::new(
             ReasonCode::Other,
-            format!("auditor model unavailable ({failure}); spawn refused"),
+            format!("{MODEL_FAILURE_PREFIX}unavailable ({failure}); spawn refused"),
         ));
         let verdict = match rule_verdict.suggestion() {
             Some(suggestion) if rule_verdict.kind() == VerdictKind::Escalate => {
