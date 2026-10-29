@@ -1677,7 +1677,7 @@ fn registry_for(
     }
 }
 
-pub(crate) struct ModelFacingLayers {
+pub struct ModelFacingLayers {
     pub(crate) escalation_log: Arc<EscalationLog>,
     pub(crate) action_gate: Arc<ActionGate>,
     pub(crate) action_escalator: Arc<crate::escalation::Escalator>,
