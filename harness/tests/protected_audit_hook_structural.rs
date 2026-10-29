@@ -85,11 +85,9 @@ impl<'ast> Visit<'ast> for Idents {
 
     fn visit_use_tree(&mut self, node: &'ast syn::UseTree) {
         if let syn::UseTree::Rename(rename) = node {
-            self.renames.insert(format!(
-                "{}: renames {}",
-                self.file,
-                plain(&rename.ident.to_string())
-            ));
+            let original = rename.ident.to_string();
+            let entry = format!("{}: renames {}", self.file, plain(&original));
+            self.renames.insert(entry);
         }
         syn::visit::visit_use_tree(self, node);
     }
