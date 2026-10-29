@@ -21,6 +21,7 @@ mod escalator;
 mod github;
 mod log;
 mod model;
+mod protected_hook;
 mod redact;
 mod sink;
 mod spawn_hook;
@@ -34,6 +35,7 @@ pub use log::{
     KeyState, Occurrence, ResolveGrant, AGENT_SESSION_ENV, ESCALATION_PATH_ENV,
 };
 pub use model::{Escalation, EscalationSource, Severity, UnknownName, HEADLINE_CHARS};
+pub use protected_hook::ProtectedPathEscalation;
 pub use redact::{marker, redact, redact_value};
 pub use sink::{
     DeliveryOutcome, DeliveryReceipt, EscalationError, EscalationSink, FanoutSink, SinkFailure,
