@@ -12,7 +12,7 @@ use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escal
 use crate::identity::AgentIdentity;
 use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, SystemClock};
-use crate::protected::{AuditHook, NoopAuditHook, ProtectedPathViolation};
+use crate::protected::{AuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
 use crate::scheduler::{
     BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
@@ -350,7 +350,7 @@ struct TaskRunner {
     /// Identities a task may be dispatched under, keyed by name. A task whose
     /// `identity_hint` names none of these fails closed.
     identities: RwLock<HashMap<String, AgentIdentity>>,
-    audit: std::sync::Mutex<Arc<dyn AuditHook>>,
+    audit: std::sync::Mutex<Option<Arc<dyn AuditHook>>>,
     /// Identities bound to one task at submission; they take precedence over
     /// the shared catalog and are consumed when the task starts.
     bound: RwLock<HashMap<TaskId, AgentIdentity>>,
@@ -687,7 +687,7 @@ impl TaskManager {
             default_provider,
             leases,
             identities: RwLock::new(HashMap::new()),
-            audit: std::sync::Mutex::new(Arc::new(NoopAuditHook)),
+            audit: std::sync::Mutex::new(None),
             bound: RwLock::new(HashMap::new()),
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
@@ -701,7 +701,7 @@ impl TaskManager {
 
     /// Deliver protected-path violations from every task's workspace to `hook`.
     pub fn with_audit_hook(self, hook: Arc<dyn AuditHook>) -> Self {
-        *self.runner.audit.lock().expect("audit hook lock poisoned") = hook;
+        *self.runner.audit.lock().expect("audit hook lock poisoned") = Some(hook);
         self
     }
 
@@ -1489,7 +1489,17 @@ impl TaskRunner {
                 .map_err(|e| e.to_string())
         };
 
-        let audit = Arc::clone(&self.audit.lock().expect("audit hook lock poisoned"));
+        let audit = self
+            .audit
+            .lock()
+            .expect("audit hook lock poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                Arc::new(crate::escalation::ProtectedPathEscalation::new(
+                    self.action_escalator(),
+                    action_repo_key(&queued.repo_path),
+                ))
+            });
         let mut workspace = match workspace_result {
             Ok(workspace) => workspace.with_audit_hook(audit),
             Err(e) => {
@@ -5370,6 +5380,100 @@ mod identity_tests {
             }
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    async fn submit_planting_task(manager: &TaskManager, repo_dir: &tempfile::TempDir) -> TaskId {
+        let provider = planting_provider(repo_dir.path().to_path_buf());
+        manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+            )
+            .await
+    }
+
+    async fn eventually<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..200 {
+            if let Some(found) = probe() {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    #[tokio::test]
+    async fn test_a_default_manager_escalates_a_protected_path_violation_to_the_configured_escalator(
+    ) {
+        let repo_dir = repo_with_origin("https://github.com/example/repo.git");
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, log) = crate::test_support::escalation::escalator(&sink);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_escalator(escalator);
+        let task_id = submit_planting_task(&manager, &repo_dir).await;
+
+        match wait_for_terminal(&manager, &task_id).await {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "ProtectedPathViolation");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        let delivered =
+            eventually(|| Some(sink.escalations()).filter(|seen| !seen.is_empty())).await;
+        assert_eq!(delivered.len(), 1);
+        let escalation = &delivered[0];
+        assert_eq!(escalation.severity, crate::escalation::Severity::Blocked);
+        assert_eq!(
+            escalation.source,
+            crate::escalation::EscalationSource::Auditor
+        );
+        assert_eq!(escalation.task_id.as_ref(), Some(&task_id));
+        assert_eq!(escalation.repo, "example/repo");
+        assert!(escalation.summary.contains(".nanna/agents/x.toml"));
+        assert!(escalation.summary.contains(".nanna/**"));
+        assert!(escalation
+            .evidence
+            .iter()
+            .any(|line| line.contains(".nanna/agents/x.toml")));
+        assert_eq!(log.states().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_default_manager_records_a_protected_path_violation_in_its_escalation_log() {
+        let repo_dir = git_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = submit_planting_task(&manager, &repo_dir).await;
+
+        assert!(matches!(
+            wait_for_terminal(&manager, &task_id).await,
+            TaskStatus::Failed { .. }
+        ));
+        let states =
+            eventually(|| Some(manager.escalations().states()).filter(|states| !states.is_empty()))
+                .await;
+        assert_eq!(states.len(), 1);
+        assert!(states[0].key.starts_with("auditor:"));
+    }
+
+    #[tokio::test]
+    async fn test_an_explicit_audit_hook_replaces_the_default_escalation() {
+        let repo_dir = git_repo();
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_audit_hook(hook.clone());
+        let task_id = submit_planting_task(&manager, &repo_dir).await;
+
+        assert!(matches!(
+            wait_for_terminal(&manager, &task_id).await,
+            TaskStatus::Failed { .. }
+        ));
+        assert_eq!(hook.seen.lock().unwrap().len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(manager.escalations().states().is_empty());
     }
 
     #[test]
