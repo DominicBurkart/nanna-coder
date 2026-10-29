@@ -18,6 +18,7 @@
 
 pub(crate) mod context;
 pub mod eval;
+mod fail_closed;
 mod gate;
 mod llm;
 mod log;
@@ -27,6 +28,7 @@ pub(crate) mod rules;
 mod verdict;
 
 pub use context::AuditContext;
+pub use fail_closed::{FailClosedModelAuditor, MODEL_AUDIT_TIMEOUT};
 pub use gate::{
     Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook, SpawnGate,
 };
@@ -139,6 +141,11 @@ pub enum AuditError {
     /// The model behind a [`ModelAuditor`] failed.
     #[error("auditor model call failed: {0}")]
     Model(#[from] ModelError),
+    #[error("auditor model unavailable: {detail}")]
+    Unavailable {
+        detail: String,
+        outcome: Box<AuditOutcome>,
+    },
     /// The audit log could not be written.
     #[error("audit log write failed: {0}")]
     Log(#[from] std::io::Error),
