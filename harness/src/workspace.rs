@@ -262,6 +262,16 @@ impl TaskWorkspace {
         self.sandbox_pr = Some(pr);
     }
 
+    pub fn bind_sandbox_pr(&mut self, subject: &crate::tools::ActionSubject) {
+        if let Some(pr) = subject.pr {
+            self.sandbox_pr = Some(pr);
+        }
+    }
+
+    pub fn sandbox_pr(&self) -> Option<u64> {
+        self.sandbox_pr
+    }
+
     pub fn sandboxes(&self) -> Arc<crate::sandbox_tools::SandboxRegistry> {
         Arc::clone(&self.sandboxes)
     }

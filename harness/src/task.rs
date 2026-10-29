@@ -1594,6 +1594,7 @@ impl TaskRunner {
         }
 
         let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
+        workspace.bind_sandbox_pr(&layers.subject);
         let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
             Ok(registry) => registry,
             Err(e) => {
@@ -4481,6 +4482,29 @@ mod identity_tests {
         assert_eq!(result.denials.len(), 1);
         assert_eq!(result.denials[0].tool, "sandbox_deploy");
         assert_eq!(result.budget, crate::budget::BudgetReport::default());
+    }
+
+    #[test]
+    fn test_the_sandbox_pr_is_taken_from_the_action_subject_the_lease_is_keyed_by_and_nowhere_else()
+    {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let mut workspace = TaskWorkspace::create(repo.path(), "t-bindpr", "HEAD").unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let queued = queued(repo.path());
+        let identity = ci_scoped_identity();
+        let layers = manager.runner.model_facing_layers(
+            &TaskId("t-bindpr".to_string()),
+            &queued,
+            Some(&identity),
+        );
+        assert_eq!(layers.subject.pr, None);
+        workspace.bind_sandbox_pr(&layers.subject);
+        assert_eq!(workspace.sandbox_pr(), None);
+        let mut subject = layers.subject;
+        subject.pr = Some(41);
+        workspace.bind_sandbox_pr(&subject);
+        assert_eq!(workspace.sandbox_pr(), Some(41));
+        workspace.cleanup().unwrap();
     }
 
     #[tokio::test]

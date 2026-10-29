@@ -393,6 +393,7 @@ pub struct SandboxDeployTool {
     task_id: String,
     pr: u64,
     budget: BudgetContext,
+    deploy_lock: tokio::sync::Mutex<()>,
 }
 
 impl SandboxDeployTool {
@@ -414,6 +415,7 @@ impl SandboxDeployTool {
             task_id,
             pr,
             budget,
+            deploy_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -497,6 +499,7 @@ impl Tool for SandboxDeployTool {
             })?
             .to_string();
         let repo = resolve_repo(&self.workspace_root)?.to_ascii_lowercase();
+        let _one_deploy_at_a_time = self.deploy_lock.lock().await;
         if self.sandboxes.get(&self.task_id).is_some() {
             return Err(map_sandbox_error(SandboxError::AlreadyDeployed));
         }
@@ -1763,5 +1766,27 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(accountant.task_summary("sb-agent", "t1").sandbox.count, 1);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_deploys_of_one_task_deploy_and_charge_exactly_once() {
+        let (dir, target, sandboxes, accountant) = setup();
+        let tool = Arc::new(deploy_tool(dir.path(), &target, &sandboxes, &accountant));
+        let (a, b) = tokio::join!(
+            tool.execute(json!({"image_tag": "v1"})),
+            tool.execute(json!({"image_tag": "v2"}))
+        );
+        let outcomes = [a, b];
+        assert_eq!(
+            outcomes.iter().filter(|o| o.is_ok()).count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert!(outcomes
+            .iter()
+            .filter_map(|o| o.as_ref().err())
+            .all(|e| matches!(e, ToolError::ExecutionFailed { message } if message.contains("already deployed"))));
+        assert_eq!(target.deployed().len(), 1);
+        assert_eq!(accountant.task_summary("id", "t1").sandbox.count, 1);
     }
 }
