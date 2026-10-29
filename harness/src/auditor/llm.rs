@@ -31,7 +31,7 @@ Use \"escalate\" only when no card in the catalog could run the subtask; use \"b
 pub const MAX_SUBTASK_CHARS: usize = 32_000;
 const MAX_FIELD_CHARS: usize = 256;
 const MAX_DESCRIPTION_CHARS: usize = 4_000;
-const MAX_TEXT_CHARS: usize = 1_000;
+pub(super) const MAX_TEXT_CHARS: usize = 1_000;
 const MAX_REASONS: usize = 16;
 const MAX_TOOLS: usize = 32;
 const TRUNCATED: &str = "[truncated]";
@@ -47,57 +47,6 @@ pub const SUBTASK_CLOSE: &str = "SUBTASK_DATA>>>";
 /// `Escalate` is only ever raised to `Block` by the model, never lowered
 /// to `Allow`. Output the model produces that is not a valid verdict
 /// becomes `Escalate` with [`ReasonCode::Other`], so a confused or
-fn clip(text: &str, cap: usize) -> String {
-    let clean = crate::pr_tools::strip_unprintable(text).replace(['\n', '\t'], " ");
-    match clean.char_indices().nth(cap) {
-        Some((end, _)) => format!("{}{TRUNCATED}", &clean[..end]),
-        None => clean,
-    }
-}
-
-fn clip_block(text: &str, cap: usize) -> (String, bool) {
-    let clean = crate::pr_tools::strip_unprintable(text);
-    match clean.char_indices().nth(cap) {
-        Some((end, _)) => (format!("{}\n{TRUNCATED}", &clean[..end]), true),
-        None => (clean, false),
-    }
-}
-
-fn sanitize_reasons(reasons: Vec<Reason>) -> Vec<Reason> {
-    reasons
-        .into_iter()
-        .take(MAX_REASONS)
-        .map(|reason| Reason::new(reason.code, clip(&reason.detail, MAX_TEXT_CHARS)))
-        .collect()
-}
-
-fn sanitize_verdict(verdict: SpawnVerdict) -> SpawnVerdict {
-    match verdict {
-        SpawnVerdict::Allow => SpawnVerdict::Allow,
-        SpawnVerdict::Block { reasons } => SpawnVerdict::block(sanitize_reasons(reasons)),
-        SpawnVerdict::Escalate {
-            reasons,
-            suggested_identity_change,
-        } => {
-            let mut suggestion = suggested_identity_change;
-            suggestion.name = clip(&suggestion.name, MAX_FIELD_CHARS);
-            suggestion.rationale = clip(&suggestion.rationale, MAX_TEXT_CHARS);
-            suggestion.tools = suggestion
-                .tools
-                .iter()
-                .take(MAX_TOOLS)
-                .map(|tool| clip(tool, MAX_FIELD_CHARS))
-                .collect();
-            SpawnVerdict::escalate(sanitize_reasons(reasons), suggestion)
-        }
-    }
-}
-
-fn fence_safe(text: &str) -> String {
-    text.replace(SUBTASK_CLOSE, "SUBTASK_DATA> >>")
-        .replace(SUBTASK_OPEN, "<< <SUBTASK_DATA")
-}
-
 /// manipulated model can never let a spawn through.
 pub struct ModelAuditor {
     provider: Arc<dyn ModelProvider>,
@@ -256,6 +205,57 @@ impl ModelAuditor {
     }
 }
 
+pub(super) fn clip(text: &str, cap: usize) -> String {
+    let clean = crate::pr_tools::strip_unprintable(text).replace(['\n', '\t'], " ");
+    match clean.char_indices().nth(cap) {
+        Some((end, _)) => format!("{}{TRUNCATED}", &clean[..end]),
+        None => clean,
+    }
+}
+
+fn clip_block(text: &str, cap: usize) -> (String, bool) {
+    let clean = crate::pr_tools::strip_unprintable(text);
+    match clean.char_indices().nth(cap) {
+        Some((end, _)) => (format!("{}\n{TRUNCATED}", &clean[..end]), true),
+        None => (clean, false),
+    }
+}
+
+fn sanitize_reasons(reasons: Vec<Reason>) -> Vec<Reason> {
+    reasons
+        .into_iter()
+        .take(MAX_REASONS)
+        .map(|reason| Reason::new(reason.code, clip(&reason.detail, MAX_TEXT_CHARS)))
+        .collect()
+}
+
+fn sanitize_verdict(verdict: SpawnVerdict) -> SpawnVerdict {
+    match verdict {
+        SpawnVerdict::Allow => SpawnVerdict::Allow,
+        SpawnVerdict::Block { reasons } => SpawnVerdict::block(sanitize_reasons(reasons)),
+        SpawnVerdict::Escalate {
+            reasons,
+            suggested_identity_change,
+        } => {
+            let mut suggestion = suggested_identity_change;
+            suggestion.name = clip(&suggestion.name, MAX_FIELD_CHARS);
+            suggestion.rationale = clip(&suggestion.rationale, MAX_TEXT_CHARS);
+            suggestion.tools = suggestion
+                .tools
+                .iter()
+                .take(MAX_TOOLS)
+                .map(|tool| clip(tool, MAX_FIELD_CHARS))
+                .collect();
+            SpawnVerdict::escalate(sanitize_reasons(reasons), suggestion)
+        }
+    }
+}
+
+fn fence_safe(text: &str) -> String {
+    text.replace(SUBTASK_CLOSE, "SUBTASK_DATA> >>")
+        .replace(SUBTASK_OPEN, "<< <SUBTASK_DATA")
+}
+
 fn describe_card(out: &mut String, card: &AgentIdentity) {
     let tools: Vec<String> = card.scope.tools.iter().map(ToString::to_string).collect();
     let _ = writeln!(
@@ -289,20 +289,36 @@ impl Auditor for ModelAuditor {
         request: &SpawnRequest,
         context: &AuditContext,
     ) -> Result<AuditOutcome, AuditError> {
+        Ok(self.audit_detailed(request, context).await?.0)
+    }
+}
+
+impl ModelAuditor {
+    pub(super) async fn audit_detailed(
+        &self,
+        request: &SpawnRequest,
+        context: &AuditContext,
+    ) -> Result<(AuditOutcome, bool), AuditError> {
         let rule_verdict = self.rules.evaluate(request, context);
         let Some(identity) = context.catalog().get(&request.identity) else {
             let record = AuditRecord::deterministic(self.rules.name(), request, &rule_verdict);
-            return Ok(AuditOutcome {
-                verdict: rule_verdict,
-                record,
-            });
+            return Ok((
+                AuditOutcome {
+                    verdict: rule_verdict,
+                    record,
+                },
+                false,
+            ));
         };
         if let SpawnVerdict::Block { .. } = rule_verdict {
             let record = AuditRecord::deterministic(self.rules.name(), request, &rule_verdict);
-            return Ok(AuditOutcome {
-                verdict: rule_verdict,
-                record,
-            });
+            return Ok((
+                AuditOutcome {
+                    verdict: rule_verdict,
+                    record,
+                },
+                false,
+            ));
         }
         let messages = Self::build_prompt(request, context);
         let prompt_hash = content_hash(&serde_json::to_string(&messages).unwrap_or_default());
@@ -313,9 +329,9 @@ impl Auditor for ModelAuditor {
             .first()
             .and_then(|choice| choice.message.content.clone())
             .unwrap_or_default();
-        let (model_verdict, rationale) = match Self::parse_reply(&text) {
-            Ok(parsed) => parsed,
-            Err(problem) => (Self::unparsable(&problem, request, identity), None),
+        let (model_verdict, rationale, garbled) = match Self::parse_reply(&text) {
+            Ok((verdict, rationale)) => (verdict, rationale, false),
+            Err(problem) => (Self::unparsable(&problem, request, identity), None, true),
         };
         let model_verdict = sanitize_verdict(model_verdict);
         let mut verdict = Self::merge(rule_verdict, model_verdict);
@@ -331,7 +347,7 @@ impl Auditor for ModelAuditor {
             prompt_hash,
             rationale,
         };
-        Ok(AuditOutcome { verdict, record })
+        Ok((AuditOutcome { verdict, record }, garbled))
     }
 }
 
@@ -822,6 +838,43 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.verdict, SpawnVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_subtask_of_exactly_the_cap_is_reviewed_whole_and_one_more_is_not() {
+        for (len, whole) in [(MAX_SUBTASK_CHARS, true), (MAX_SUBTASK_CHARS + 1, false)] {
+            let provider = MockProvider::replying(&[r#"{"verdict":"allow"}"#]);
+            let auditor = ModelAuditor::new(provider.clone(), MODEL);
+            let request = request(
+                "rust-implementer",
+                &"a".repeat(len),
+                DevLoop::Inner,
+                EffectClass::Workspace,
+            );
+            let outcome = auditor.audit_spawn(&request, &context(true)).await.unwrap();
+            let sent = provider.requests.lock().unwrap()[0].messages[1]
+                .content
+                .clone()
+                .unwrap();
+            assert_eq!(sent.contains(TRUNCATED), !whole, "{len}");
+            assert_eq!(outcome.verdict.is_allow(), whole, "{len}");
+        }
+    }
+
+    #[test]
+    fn clipping_cuts_on_character_boundaries() {
+        for unit in ["\u{e9}", "\u{1f600}", "\u{4e2d}"] {
+            let text = unit.repeat(10);
+            let clipped = clip(&text, 4);
+            assert_eq!(clipped, format!("{}{TRUNCATED}", unit.repeat(4)));
+            assert_eq!(clip(&unit.repeat(4), 4), unit.repeat(4));
+            let (block, cut) = clip_block(&text, 4);
+            assert!(cut);
+            assert_eq!(block, format!("{}\n{TRUNCATED}", unit.repeat(4)));
+            let (whole, cut) = clip_block(&unit.repeat(4), 4);
+            assert!(!cut);
+            assert_eq!(whole, unit.repeat(4));
+        }
     }
 
     #[test]

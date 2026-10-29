@@ -488,7 +488,7 @@ async fn audit_restored(
     Ok(gate.check(request).await?.into_parts().1)
 }
 
-pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 enum RestoreAudit<'a> {
     Gate(&'a SpawnGate, std::time::Duration),
@@ -691,12 +691,14 @@ impl TaskManager {
             RestoreAudit::Skip => return Ok(()),
         };
         let deadline_at = tokio::time::Instant::now() + *deadline;
+        let (mut parked, mut deferred) = (0usize, 0usize);
         for queued in self.dispatcher.queued().await {
             let audited = tokio::time::timeout_at(deadline_at, audit_restored(gate, &queued)).await;
             match audited {
                 Err(_) => {
+                    deferred += 1;
                     self.park(
-                        &queued.id,
+                        &queued,
                         "restore audit deadline exceeded; the entry stays queued for the next start"
                             .to_string(),
                         "RestoreAuditDeferred",
@@ -707,7 +709,8 @@ impl TaskManager {
                     self.runner.bound.write().await.insert(queued.id, identity);
                 }
                 Ok(Err(refused)) if refused.is_infrastructure() => {
-                    self.park(&queued.id, refused.to_string(), refused.error_type())
+                    parked += 1;
+                    self.park(&queued, refused.to_string(), refused.error_type())
                         .await;
                 }
                 Ok(Err(refused)) => {
@@ -718,12 +721,38 @@ impl TaskManager {
                 }
             }
         }
+        tracing::info!(parked, deferred, "Restore audit finished");
         Ok(())
     }
 
-    async fn park(&self, id: &TaskId, reason: String, error_type: &str) {
-        self.dispatcher.withhold(id).await;
-        self.runner.fail(id, reason, error_type).await;
+    async fn park(&self, queued: &QueuedTask, reason: String, error_type: &str) {
+        tracing::warn!(
+            task_id = %queued.id,
+            repo = %queued.repo_path.display(),
+            error_type,
+            %reason,
+            "Restore parked a queued entry; it stays in the store and is re-audited on the next start"
+        );
+        self.dispatcher.withhold(&queued.id).await;
+        self.runner
+            .fail(
+                &queued.id,
+                format!("parked for re-audit on next start: {reason}"),
+                error_type,
+            )
+            .await;
+    }
+
+    async fn is_parked(&self, id: &TaskId) -> bool {
+        match self.runner.tasks.read().await.get(id).map(|t| &t.status) {
+            Some(TaskStatus::Failed { diagnostics, .. }) => {
+                matches!(
+                    diagnostics.error_type.as_str(),
+                    "RestoreAuditFailed" | "RestoreAuditDeferred"
+                )
+            }
+            _ => false,
+        }
     }
 
     fn build(
@@ -1183,10 +1212,15 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// the store; a running one is aborted and its slot handed to the next
     /// entry.
     pub async fn cancel(&self, task_id: &TaskId) -> Result<Task, String> {
-        self.dispatcher
-            .cancel(task_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let parked = self.is_parked(task_id).await;
+        if parked {
+            self.dispatcher.forget(task_id).map_err(|e| e.to_string())?;
+        } else {
+            self.dispatcher
+                .cancel(task_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         let iterations_completed = {
             let mut progress = self.runner.progress.write().await;
@@ -1204,7 +1238,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
                 .get_mut(task_id)
                 .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
-            if task.status.is_terminal() {
+            if task.status.is_terminal() && !parked {
                 return Err(format!(
                     "Task {} cannot be cancelled: already finished",
                     task_id
@@ -5000,10 +5034,135 @@ mod identity_tests {
         assert_eq!(provider.remaining(), before);
     }
 
+    struct SlowAuditor(std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl crate::auditor::Auditor for SlowAuditor {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn review_spawn(
+            &self,
+            _request: &crate::auditor::SpawnRequest,
+            _context: &crate::auditor::AuditContext,
+        ) -> Result<crate::auditor::SpawnVerdict, crate::auditor::AuditError> {
+            tokio::time::sleep(self.0).await;
+            Ok(crate::auditor::SpawnVerdict::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_slightly_slow_model_still_decides_under_the_default_deadline() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let gate = model_gate(Box::new(SlowAuditor(std::time::Duration::from_millis(30))));
+        let (manager, _store) = restore_audited(
+            &[&entry],
+            &fixture_catalog(),
+            &gate,
+            untouched_provider() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        let task = manager.poll(&entry.id).await.unwrap();
+        assert!(!matches!(task.status, TaskStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_the_deadline_bounds_the_whole_restore_not_each_entry() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entries: Vec<_> = (0..5)
+            .map(|i| {
+                stored_entry(
+                    repo.path(),
+                    Some("pr-shepherd"),
+                    &format!("Check PR status {i}"),
+                )
+            })
+            .collect();
+        let store = InMemoryQueueStore::default();
+        for entry in &entries {
+            store.insert(entry).unwrap();
+        }
+        let gate = model_gate(Box::new(SlowAuditor(std::time::Duration::from_millis(60))));
+        let manager = TaskManager::restore_within(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
+            untouched_provider() as Arc<dyn ModelProvider>,
+            &fixture_catalog(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &gate,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .unwrap();
+        let mut deferred = 0;
+        let mut audited = 0;
+        for entry in &entries {
+            let task = manager.poll(&entry.id).await.unwrap();
+            match &task.status {
+                TaskStatus::Failed { diagnostics, .. }
+                    if diagnostics.error_type == "RestoreAuditDeferred" =>
+                {
+                    deferred += 1
+                }
+                _ => audited += 1,
+            }
+        }
+        assert!(deferred >= 1, "deferred {deferred}");
+        assert!(audited >= 1, "audited {audited}");
+        let kept = store.load().unwrap().len();
+        assert!(kept >= deferred);
+    }
+
+    #[tokio::test]
+    async fn test_a_garbled_model_reply_parks_the_store_entry() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let gate = model_backed(Some("looks fine to me"));
+        let (manager, store) = restore_audited(
+            &[&entry],
+            &fixture_catalog(),
+            &gate,
+            untouched_provider() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        let task = manager.poll(&entry.id).await.unwrap();
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "RestoreAuditFailed");
+        assert!(
+            error.starts_with("parked for re-audit on next start"),
+            "{error}"
+        );
+        assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_parked_entry_removes_it_from_the_store() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let gate = model_backed(None);
+        let (manager, store) = restore_audited(
+            &[&entry],
+            &fixture_catalog(),
+            &gate,
+            untouched_provider() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        assert_eq!(store.load().unwrap().len(), 1);
+        let cancelled = manager.cancel(&entry.id).await.unwrap();
+        assert!(matches!(cancelled.status, TaskStatus::Cancelled { .. }));
+        assert!(store.load().unwrap().is_empty());
+        assert!(manager.cancel(&entry.id).await.is_err());
+    }
+
     #[test]
     fn test_the_restore_audit_deadline_is_bounded() {
-        assert!(RESTORE_AUDIT_DEADLINE >= std::time::Duration::from_secs(1));
-        assert!(RESTORE_AUDIT_DEADLINE <= std::time::Duration::from_secs(600));
+        assert!(RESTORE_AUDIT_DEADLINE >= std::time::Duration::from_secs(5));
+        assert!(RESTORE_AUDIT_DEADLINE <= std::time::Duration::from_secs(30));
     }
 
     #[tokio::test]

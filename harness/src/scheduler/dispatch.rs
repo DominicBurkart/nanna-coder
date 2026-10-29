@@ -249,6 +249,10 @@ impl<L: Launcher> Dispatcher<L> {
         Some(slot)
     }
 
+    pub fn forget(&self, id: &TaskId) -> Result<(), QueueStoreError> {
+        self.store.remove(id)
+    }
+
     pub async fn withhold(&self, id: &TaskId) -> bool {
         self.state.lock().await.queue.remove(id).is_some()
     }

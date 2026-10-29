@@ -1839,6 +1839,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_escalated_store_entry_is_refused_on_mcp_restore_and_recorded_in_the_shared_log() {
+        escalated_entry_restore(RecordingProvider::replying(vec![Ok(ALLOW.to_string())])).await;
+    }
+
+    #[tokio::test]
+    async fn an_escalated_store_entry_is_still_escalated_and_removed_when_the_model_is_offline() {
+        escalated_entry_restore(RecordingProvider::replying(vec![])).await;
+    }
+
+    async fn escalated_entry_restore(provider: std::sync::Arc<RecordingProvider>) {
         let dir = tempfile::tempdir().unwrap();
         let cards = dir.path().join("cards");
         copy_dir(
@@ -1861,7 +1870,7 @@ mod tests {
         std::fs::write(&queue, format!("{line}\n")).unwrap();
         let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
         let manager = build_mcp_task_manager(
-            RecordingProvider::replying(vec![Ok(ALLOW.to_string())]),
+            provider,
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),

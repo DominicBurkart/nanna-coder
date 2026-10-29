@@ -289,6 +289,10 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
                             "audit log write failed for an unavailable auditor: {log_error}"
                         );
                     }
+                    if outcome.verdict.kind() == VerdictKind::Escalate {
+                        self.notify_escalation(&request, &outcome.verdict, &outcome.record)
+                            .await;
+                    }
                 }
                 return Err(Refused::AuditFailed(error));
             }
