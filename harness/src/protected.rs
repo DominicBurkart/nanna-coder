@@ -85,6 +85,10 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "harness/src/pr_tools.rs",
     "docs/pr-lifecycle-tools.md",
     "harness/src/budget.rs",
+    "harness/src/ci_tools.rs",
+    "harness/src/ci_policy.rs",
+    "harness/src/ci_integrity.rs",
+    "harness/src/deploy/template.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -391,6 +395,13 @@ mod tests {
         ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
         ("docs/pr-lifecycle-tools.md", "docs/pr-lifecycle-tools.md"),
         ("harness/src/budget.rs", "harness/src/budget.rs"),
+        ("harness/src/ci_tools.rs", "harness/src/ci_tools.rs"),
+        ("harness/src/ci_policy.rs", "harness/src/ci_policy.rs"),
+        ("harness/src/ci_integrity.rs", "harness/src/ci_integrity.rs"),
+        (
+            "harness/src/deploy/template.rs",
+            "harness/src/deploy/template.rs",
+        ),
     ];
 
     #[test]
@@ -471,6 +482,10 @@ mod tests {
             "harness/src/pr_tools.rs",
             "docs/pr-lifecycle-tools.md",
             "harness/src/budget.rs",
+            "harness/src/ci_tools.rs",
+            "harness/src/ci_policy.rs",
+            "harness/src/ci_integrity.rs",
+            "harness/src/deploy/template.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -550,6 +565,18 @@ mod tests {
             "other/harness/src/budget.rs",
             "harness/budget.rs",
             "harness/src/budgets.rs",
+            "harness/src/ci_tools.rs.bak",
+            "other/harness/src/ci_tools.rs",
+            "harness/src/ci_toolsx.rs",
+            "harness/src/ci_policy.rs.bak",
+            "other/harness/src/ci_policy.rs",
+            "harness/src/ci_policyx.rs",
+            "harness/src/ci_integrity.rs.bak",
+            "other/harness/src/ci_integrity.rs",
+            "harness/src/ci_integrityx.rs",
+            "harness/src/deploy/template.rs.bak",
+            "other/harness/src/deploy/template.rs",
+            "harness/src/deploy/templatex.rs",
             "harness/src/pr_tool.rs",
             "harness/src/pr_tools.rs.bak",
             "harness/src/pr_tools",
@@ -746,6 +773,10 @@ mod tests {
                 PathBuf::from("harness/src/pr_tools.rs"),
                 PathBuf::from("docs/pr-lifecycle-tools.md"),
                 PathBuf::from("harness/src/budget.rs"),
+                PathBuf::from("harness/src/ci_tools.rs"),
+                PathBuf::from("harness/src/ci_policy.rs"),
+                PathBuf::from("harness/src/ci_integrity.rs"),
+                PathBuf::from("harness/src/deploy/template.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -818,6 +849,10 @@ mod tests {
                 ("harness/src/pr_tools.rs".to_string(), false),
                 ("docs/pr-lifecycle-tools.md".to_string(), false),
                 ("harness/src/budget.rs".to_string(), false),
+                ("harness/src/ci_tools.rs".to_string(), false),
+                ("harness/src/ci_policy.rs".to_string(), false),
+                ("harness/src/ci_integrity.rs".to_string(), false),
+                ("harness/src/deploy/template.rs".to_string(), false),
             ]
         );
     }

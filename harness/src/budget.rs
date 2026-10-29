@@ -111,6 +111,33 @@ impl BudgetLimits {
         max_minutes_per_task: None,
         max_minutes_per_day: None,
     };
+
+    #[doc = r#"The stricter of each dimension of `self` and `other`; an unset side defers to the other.
+
+```
+use harness::budget::BudgetLimits;
+
+let host = BudgetLimits { max_count_per_task: Some(20), ..BudgetLimits::UNLIMITED };
+let identity = BudgetLimits { max_count_per_task: Some(3), ..BudgetLimits::UNLIMITED };
+assert_eq!(host.narrowed(&identity).max_count_per_task, Some(3));
+assert_eq!(identity.narrowed(&host).max_count_per_task, Some(3));
+```
+"#]
+    pub fn narrowed(&self, other: &BudgetLimits) -> BudgetLimits {
+        fn stricter<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(if b < a { b } else { a }),
+                (a, None) => a,
+                (None, b) => b,
+            }
+        }
+        BudgetLimits {
+            max_count_per_task: stricter(self.max_count_per_task, other.max_count_per_task),
+            max_count_per_day: stricter(self.max_count_per_day, other.max_count_per_day),
+            max_minutes_per_task: stricter(self.max_minutes_per_task, other.max_minutes_per_task),
+            max_minutes_per_day: stricter(self.max_minutes_per_day, other.max_minutes_per_day),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -293,6 +320,26 @@ struct LedgerSnapshot {
     repos: Vec<(String, BudgetClass, NaiveDate, Usage)>,
     charged_runs: Vec<(String, u64)>,
     pending_runs: Vec<(String, u64)>,
+}
+
+impl LedgerSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        let usages = self
+            .tasks
+            .iter()
+            .map(|(_, _, _, usage)| usage)
+            .chain(self.days.iter().map(|(_, _, _, usage)| usage))
+            .chain(self.repos.iter().map(|(_, _, _, usage)| usage));
+        for usage in usages {
+            if !usage.minutes.is_finite() || usage.minutes < 0.0 {
+                return Err(format!(
+                    "minutes must be finite and not negative, got {}",
+                    usage.minutes
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn add(usage: &mut Usage, delta: Usage) {
@@ -552,6 +599,8 @@ pub enum BudgetStoreError {
     },
     #[error("budget store {path} is in use by another process")]
     Locked { path: PathBuf },
+    #[error("budget store {path} holds an invalid value: {reason}")]
+    Invalid { path: PathBuf, reason: String },
     #[error("budget store {path} is corrupt: {source}")]
     Corrupt {
         path: PathBuf,
@@ -593,12 +642,17 @@ impl FileBudgetStore {
         let lock = Self::acquire_lock(&path)?;
         let ledger = match std::fs::read(&path) {
             Ok(bytes) => {
-                Ledger::from_snapshot(serde_json::from_slice(&bytes).map_err(|source| {
-                    BudgetStoreError::Corrupt {
+                let snapshot: LedgerSnapshot = match serde_json::from_slice(&bytes) {
+                    Ok(snapshot) => snapshot,
+                    Err(source) => return Err(BudgetStoreError::Corrupt { path, source }),
+                };
+                snapshot
+                    .validate()
+                    .map_err(|reason| BudgetStoreError::Invalid {
                         path: path.clone(),
-                        source,
-                    }
-                })?)
+                        reason,
+                    })?;
+                Ledger::from_snapshot(snapshot)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
             Err(source) => return Err(BudgetStoreError::Io { path, source }),
@@ -801,6 +855,27 @@ impl CostAccountant {
         class: BudgetClass,
         now: DateTime<Utc>,
     ) -> Result<BudgetReport, BudgetError> {
+        self.charge_count_within(
+            &BudgetLimits::UNLIMITED,
+            identity,
+            task_id,
+            repo,
+            class,
+            now,
+        )
+        .await
+    }
+
+    pub async fn charge_count_within(
+        &self,
+        ceiling: &BudgetLimits,
+        identity: &str,
+        task_id: &str,
+        repo: &str,
+        class: BudgetClass,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetReport, BudgetError> {
+        let limits = self.config.limits(class).narrowed(ceiling);
         let key = ChargeKey {
             identity,
             task_id,
@@ -808,7 +883,7 @@ impl CostAccountant {
             class,
             day: now.date_naive(),
         };
-        match self.store.try_charge(&key, &self.config.limits(class)) {
+        match self.store.try_charge(&key, &limits) {
             Ok(()) => Ok(self.task_summary(identity, task_id)),
             Err(BudgetError::Exceeded(exceeded)) => {
                 Err(BudgetError::Exceeded(self.deny(repo, exceeded).await))
@@ -2348,5 +2423,148 @@ mod tests {
                 last = now_used;
             }
         }
+    }
+
+    #[test]
+    fn narrowing_limits_takes_the_stricter_of_each_dimension_and_never_widens() {
+        let host = BudgetLimits {
+            max_count_per_task: Some(20),
+            max_count_per_day: Some(100),
+            max_minutes_per_task: Some(300.0),
+            max_minutes_per_day: None,
+        };
+        let identity = BudgetLimits {
+            max_count_per_task: Some(5),
+            max_count_per_day: Some(500),
+            max_minutes_per_task: None,
+            max_minutes_per_day: Some(60.0),
+        };
+        assert_eq!(
+            host.narrowed(&identity),
+            BudgetLimits {
+                max_count_per_task: Some(5),
+                max_count_per_day: Some(100),
+                max_minutes_per_task: Some(300.0),
+                max_minutes_per_day: Some(60.0),
+            }
+        );
+        assert_eq!(host.narrowed(&BudgetLimits::UNLIMITED), host);
+        assert_eq!(BudgetLimits::UNLIMITED.narrowed(&identity), identity);
+        assert_eq!(
+            host.narrowed(&BudgetLimits::DENY_ALL),
+            BudgetLimits::DENY_ALL
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_identity_ceiling_blocks_earlier_than_the_host_default() {
+        let accountant = accountant(BudgetConfig::UNLIMITED);
+        let tight = BudgetLimits {
+            max_count_per_task: Some(1),
+            ..BudgetLimits::UNLIMITED
+        };
+        accountant
+            .charge_count_within(&tight, "id", "t1", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap();
+        let err = accountant
+            .charge_count_within(&tight, "id", "t1", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap_err();
+        assert_eq!(err.exceeded().unwrap().scope, BudgetScope::Task);
+        accountant
+            .charge_count("id", "t2", "o/n", BudgetClass::Ci, now())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_per_identity_ceiling_cannot_widen_the_accountants_own_config() {
+        let config = BudgetConfig {
+            ci: BudgetLimits {
+                max_count_per_task: Some(1),
+                ..BudgetLimits::UNLIMITED
+            },
+            sandbox: BudgetLimits::UNLIMITED,
+        };
+        let accountant = accountant(config);
+        accountant
+            .charge_count_within(
+                &BudgetLimits::UNLIMITED,
+                "id",
+                "t1",
+                "o/n",
+                BudgetClass::Ci,
+                now(),
+            )
+            .await
+            .unwrap();
+        assert!(accountant
+            .charge_count_within(
+                &BudgetLimits::UNLIMITED,
+                "id",
+                "t1",
+                "o/n",
+                BudgetClass::Ci,
+                now()
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn a_ledger_file_with_negative_or_non_finite_minutes_is_refused_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, usage) in [
+            r#"{"count":1,"minutes":-5.0}"#,
+            r#"{"count":1,"minutes":1e999}"#,
+            r#"{"count":1,"minutes":null}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.path().join(format!("budget{index}.json"));
+            let body = format!(
+                r#"{{"tasks":[["id","t1","ci",{usage}]],"days":[],"repos":[],"charged_runs":[],"pending_runs":[]}}"#
+            );
+            std::fs::write(&path, body).unwrap();
+            assert!(
+                matches!(
+                    FileBudgetStore::open(&path),
+                    Err(BudgetStoreError::Invalid { .. } | BudgetStoreError::Corrupt { .. })
+                ),
+                "{usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_minutes_in_any_ledger_table_are_refused_on_load_as_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let negative = r#"{"count":0,"minutes":-0.5}"#;
+        let ok = r#"{"count":0,"minutes":0.5}"#;
+        for (task, day, repo) in [(negative, ok, ok), (ok, negative, ok), (ok, ok, negative)] {
+            let path = dir.path().join("budget.json");
+            let body = format!(
+                r#"{{"tasks":[["id","t1","ci",{task}]],"days":[["id","ci","2026-09-26",{day}]],"repos":[["o/n","ci","2026-09-26",{repo}]],"charged_runs":[],"pending_runs":[]}}"#
+            );
+            std::fs::write(&path, body).unwrap();
+            assert!(matches!(
+                FileBudgetStore::open(&path),
+                Err(BudgetStoreError::Invalid { .. })
+            ));
+        }
+        let path = dir.path().join("fine.json");
+        let body = format!(
+            r#"{{"tasks":[["id","t1","ci",{ok}]],"days":[["id","ci","2026-09-26",{ok}]],"repos":[["o/n","ci","2026-09-26",{ok}]],"charged_runs":[],"pending_runs":[]}}"#
+        );
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            FileBudgetStore::open(&path)
+                .unwrap()
+                .task_usage("id", "t1", BudgetClass::Ci)
+                .minutes,
+            0.5
+        );
     }
 }

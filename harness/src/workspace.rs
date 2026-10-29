@@ -2,6 +2,7 @@ use crate::apprun::{
     register_app_tools, stop_app, AppContext, AppSpec, Limits, PortAllocator, RunningApps,
     DEFAULT_POLL_INTERVAL,
 };
+use crate::budget::{CostAccountant, InMemoryBudgetStore};
 use crate::container::{
     cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
     ContainerHandle, NetworkPolicy, ReadOnlyMount,
@@ -199,6 +200,8 @@ pub struct TaskWorkspace {
     protected: ProtectedPaths,
     audit: Arc<dyn AuditHook>,
     placeholders: Vec<PathBuf>,
+    cost_accountant: Option<Arc<CostAccountant>>,
+    ci_client: Option<Arc<dyn crate::backlog::GithubActionsClient>>,
 }
 
 impl TaskWorkspace {
@@ -236,6 +239,24 @@ impl TaskWorkspace {
             protected,
             audit: Arc::new(NoopAuditHook),
             placeholders: Vec::new(),
+            cost_accountant: None,
+            ci_client: None,
+        })
+    }
+
+    pub fn set_cost_accountant(&mut self, accountant: Arc<CostAccountant>) {
+        self.cost_accountant = Some(accountant);
+    }
+
+    pub(crate) fn set_ci_client(&mut self, client: Arc<dyn crate::backlog::GithubActionsClient>) {
+        self.ci_client = Some(client);
+    }
+
+    pub(crate) fn budget_accountant(&self) -> Arc<CostAccountant> {
+        self.cost_accountant.clone().unwrap_or_else(|| {
+            Arc::new(CostAccountant::deny_all(Arc::new(
+                InMemoryBudgetStore::new(),
+            )))
         })
     }
 
@@ -424,6 +445,8 @@ impl TaskWorkspace {
             protected,
             audit: Arc::new(NoopAuditHook),
             placeholders,
+            cost_accountant: None,
+            ci_client: None,
         })
     }
 
@@ -669,13 +692,28 @@ impl TaskWorkspace {
         identity: &AgentIdentity,
     ) -> Result<ToolRegistry, ScopeError> {
         let root = &self.workspace_path;
-        match &self.container_handle {
+        let mut registry = match &self.container_handle {
             Some(handle) => {
                 let handle = Arc::clone(handle);
                 create_container_tool_registry_for(root, handle, CONTAINER_WORKSPACE_DIR, identity)
             }
             None => create_tool_registry_for(root, identity),
+        }?;
+        let context = crate::ci_tools::CiContext {
+            accountant: self.budget_accountant(),
+            task_id: self.task_id.clone(),
+        };
+        match &self.ci_client {
+            Some(client) => crate::ci_tools::register_with_client(
+                &mut registry,
+                root,
+                identity,
+                context,
+                Arc::clone(client),
+            ),
+            None => crate::ci_tools::register(&mut registry, root, identity, context),
         }
+        Ok(registry.scoped_for(identity))
     }
 
     /// Stage every change except the harness artefacts under
@@ -1051,6 +1089,85 @@ mod tests {
             },
             report_path,
         );
+    }
+
+    fn ci_identity(tools: &str, max_effect: &str) -> AgentIdentity {
+        let src = format!(
+            "[identity]\nname = \"ci-agent\"\ndescription = \"d\"\nloop = \"middle\"\nmodel = \"m\"\nsystem_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = [\"github.com/o/n\"]\npaths = [\"**\"]\nmax_effect = \"{max_effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 10\nmax_wall_clock_secs = 60\nmax_concurrent = 1\n"
+        );
+        AgentIdentity::from_toml_str(&src, "agents/ci-agent.toml").unwrap()
+    }
+
+    fn ci_tool_names(ws: &TaskWorkspace, identity: &AgentIdentity) -> Vec<String> {
+        let registry = ws.build_tool_registry_for(identity).unwrap();
+        let mut names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .filter(|name| name.starts_with("ci_"))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_identity_registry_carries_the_ci_tools_only_for_exact_grants_within_the_ceiling() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-ci"), "HEAD").unwrap();
+        ws.set_cost_accountant(Arc::new(CostAccountant::deny_all(Arc::new(
+            InMemoryBudgetStore::new(),
+        ))));
+        let all = "\"ci_trigger\", \"ci_status\", \"ci_logs\"";
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "ci")),
+            vec!["ci_logs", "ci_status", "ci_trigger"]
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "repository")),
+            vec!["ci_logs", "ci_status"]
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "workspace")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity("\"ci_*\"", "ci")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity("\"ci_status\"", "ci")),
+            vec!["ci_status"]
+        );
+        let registry = ws.build_tool_registry_for(&ci_identity(all, "ci")).unwrap();
+        assert_eq!(registry.identity(), Some("ci-agent"));
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_no_accountant_charges_a_deny_all_one_and_an_installed_one_is_used() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-ci-bare"), "HEAD").unwrap();
+        let denied = ws
+            .budget_accountant()
+            .charge_count(
+                "id",
+                "t1",
+                "o/n",
+                crate::budget::BudgetClass::Ci,
+                chrono::Utc::now(),
+            )
+            .await;
+        assert!(denied.is_err());
+        let open = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&open));
+        assert!(Arc::ptr_eq(&ws.budget_accountant(), &open));
+        ws.cleanup().unwrap();
     }
 
     #[test]
@@ -1898,7 +2015,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 36] = [
+    const PLACEHOLDER_FILES: [&str; 40] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -1935,6 +2052,10 @@ mod tests {
         "harness/src/pr_tools.rs",
         "docs/pr-lifecycle-tools.md",
         "harness/src/budget.rs",
+        "harness/src/ci_tools.rs",
+        "harness/src/ci_policy.rs",
+        "harness/src/ci_integrity.rs",
+        "harness/src/deploy/template.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -1999,6 +2120,10 @@ mod tests {
             "harness/src/pr_tools.rs",
             "docs/pr-lifecycle-tools.md",
             "harness/src/budget.rs",
+            "harness/src/ci_tools.rs",
+            "harness/src/ci_policy.rs",
+            "harness/src/ci_integrity.rs",
+            "harness/src/deploy/template.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
