@@ -4447,6 +4447,43 @@ mod identity_tests {
     }
 
     #[tokio::test]
+    async fn test_sandbox_tools_are_absent_from_a_dispatched_task_until_a_target_and_a_pr_are_bound(
+    ) {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("sandbox_deploy", serde_json::json!({"image_tag": "v1"})),
+                stop_response("done"),
+            ]));
+        let mut identity = ci_scoped_identity();
+        identity.scope.tools = vec!["sandbox_deploy".parse().unwrap()];
+        identity.scope.max_effect = EffectClass::Sandbox;
+        let task_id = manager
+            .submit_with_identity(
+                "Deploy".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert!(result.action_audit.is_empty());
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "sandbox_deploy");
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
+    }
+
+    #[tokio::test]
     async fn test_an_identity_without_the_exact_ci_grant_gets_no_ci_tool_in_a_task() {
         let repo_dir = repo_with_origin("git@github.com:example/repo.git");
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);

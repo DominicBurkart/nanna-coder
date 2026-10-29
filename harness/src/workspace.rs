@@ -202,6 +202,9 @@ pub struct TaskWorkspace {
     placeholders: Vec<PathBuf>,
     cost_accountant: Option<Arc<CostAccountant>>,
     ci_client: Option<Arc<dyn crate::backlog::GithubActionsClient>>,
+    sandboxes: Arc<crate::sandbox_tools::SandboxRegistry>,
+    sandbox_target: Option<Arc<dyn crate::sandbox_tools::SandboxTarget>>,
+    sandbox_pr: Option<u64>,
 }
 
 impl TaskWorkspace {
@@ -241,11 +244,26 @@ impl TaskWorkspace {
             placeholders: Vec::new(),
             cost_accountant: None,
             ci_client: None,
+            sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
         })
     }
 
     pub fn set_cost_accountant(&mut self, accountant: Arc<CostAccountant>) {
         self.cost_accountant = Some(accountant);
+    }
+
+    pub fn set_sandbox_target(&mut self, target: Arc<dyn crate::sandbox_tools::SandboxTarget>) {
+        self.sandbox_target = Some(target);
+    }
+
+    pub fn set_sandbox_pr(&mut self, pr: u64) {
+        self.sandbox_pr = Some(pr);
+    }
+
+    pub fn sandboxes(&self) -> Arc<crate::sandbox_tools::SandboxRegistry> {
+        Arc::clone(&self.sandboxes)
     }
 
     pub(crate) fn set_ci_client(&mut self, client: Arc<dyn crate::backlog::GithubActionsClient>) {
@@ -447,6 +465,9 @@ impl TaskWorkspace {
             placeholders,
             cost_accountant: None,
             ci_client: None,
+            sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
         })
     }
 
@@ -638,6 +659,15 @@ impl TaskWorkspace {
         if self.cleaned_up {
             return Ok(());
         }
+        if let Some(target) = &self.sandbox_target {
+            crate::sandbox_tools::teardown_forgotten(
+                target,
+                &self.sandboxes,
+                &self.budget_accountant(),
+                &self.task_id,
+                crate::scope::UNSCOPED_IDENTITY,
+            );
+        }
         if let Some(handle) = self.container_handle.take() {
             self.stop_forgotten_app(&handle);
             if handle.needs_cleanup {
@@ -712,6 +742,23 @@ impl TaskWorkspace {
                 Arc::clone(client),
             ),
             None => crate::ci_tools::register(&mut registry, root, identity, context),
+        }
+        if let (Some(target), Some(pr)) = (&self.sandbox_target, self.sandbox_pr) {
+            crate::sandbox_tools::register(
+                &mut registry,
+                root,
+                identity,
+                crate::sandbox_tools::SandboxContext {
+                    target: Arc::clone(target),
+                    probe: Arc::new(crate::sandbox_tools::HostHttpProbe::new(Arc::new(
+                        crate::sidecar::SystemRunner,
+                    ))),
+                    sandboxes: Arc::clone(&self.sandboxes),
+                    accountant: self.budget_accountant(),
+                    task_id: self.task_id.clone(),
+                    pr,
+                },
+            );
         }
         Ok(registry.scoped_for(identity))
     }
@@ -1142,6 +1189,154 @@ mod tests {
         let registry = ws.build_tool_registry_for(&ci_identity(all, "ci")).unwrap();
         assert_eq!(registry.identity(), Some("ci-agent"));
         ws.cleanup().unwrap();
+    }
+
+    fn sandbox_tool_names(ws: &TaskWorkspace, identity: &AgentIdentity) -> Vec<String> {
+        let registry = ws.build_tool_registry_for(identity).unwrap();
+        let mut names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .filter(|name| name.starts_with("sandbox_"))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_sandbox_tools_need_a_target_a_pull_request_an_exact_grant_and_a_reaching_ceiling() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let both = "\"sandbox_deploy\", \"sandbox_teardown\"";
+        let mut bare =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-bare"), "HEAD").unwrap();
+        assert!(sandbox_tool_names(&bare, &ci_identity(both, "sandbox")).is_empty());
+        bare.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        assert!(sandbox_tool_names(&bare, &ci_identity(both, "sandbox")).is_empty());
+        bare.cleanup().unwrap();
+
+        let mut pr_only =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-pr"), "HEAD").unwrap();
+        pr_only.set_sandbox_pr(7);
+        assert!(sandbox_tool_names(&pr_only, &ci_identity(both, "sandbox")).is_empty());
+        pr_only.cleanup().unwrap();
+
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sb"), "HEAD").unwrap();
+        ws.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        ws.set_sandbox_pr(7);
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity(both, "sandbox")),
+            vec!["sandbox_deploy", "sandbox_teardown"]
+        );
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity("\"sandbox_teardown\"", "sandbox")),
+            vec!["sandbox_teardown"]
+        );
+        assert!(
+            sandbox_tool_names(&ws, &ci_identity("\"sandbox_*\", \"*\"", "sandbox")).is_empty()
+        );
+        assert!(sandbox_tool_names(&ws, &ci_identity(both, "ci")).is_empty());
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity(both, "production")).len(),
+            2
+        );
+        assert!(sandbox_tool_names(&ws, &ci_identity(both, "repository")).is_empty());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cleanup_tears_down_a_forgotten_sandbox_and_records_its_lifetime_against_the_stamped_identity(
+    ) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-clean"), "HEAD").unwrap();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn crate::sandbox_tools::SandboxTarget>);
+        let task_id = ws.task_id.clone();
+        ws.sandboxes().insert(
+            &task_id,
+            crate::sandbox_tools::SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 7,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: chrono::Utc::now() - chrono::Duration::minutes(12),
+                identity: Some("stamped".to_string()),
+            },
+        );
+        ws.cleanup().unwrap();
+        assert_eq!(target.torn_down().len(), 1);
+        assert!(accountant.task_summary("stamped", &task_id).sandbox.minutes >= 12.0);
+    }
+
+    #[tokio::test]
+    async fn the_registered_sandbox_tools_share_the_workspace_registry_and_unstamped_handles_fall_back_to_the_unscoped_identity(
+    ) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-share"), "HEAD").unwrap();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn crate::sandbox_tools::SandboxTarget>);
+        ws.set_sandbox_pr(7);
+        let task_id = ws.task_id.clone();
+        let handle = || crate::sandbox_tools::SandboxHandle {
+            repo: "o/n".to_string(),
+            pr: 7,
+            url: "http://127.0.0.1:1".to_string(),
+            deployed_at: chrono::Utc::now() - chrono::Duration::minutes(3),
+            identity: None,
+        };
+        ws.sandboxes().insert(&task_id, handle());
+        let registry = ws
+            .build_tool_registry_for(&ci_identity("\"sandbox_teardown\"", "sandbox"))
+            .unwrap();
+        let tool = registry.get_tool("sandbox_teardown").unwrap();
+        let done = tool.execute(serde_json::json!({})).await.unwrap();
+        assert_eq!(done["torn_down"], true);
+        assert!(ws.sandboxes().get(&task_id).is_none());
+        assert_eq!(target.torn_down().len(), 1);
+
+        ws.sandboxes().insert(&task_id, handle());
+        ws.cleanup().unwrap();
+        assert!(
+            accountant
+                .task_summary(crate::scope::UNSCOPED_IDENTITY, &task_id)
+                .sandbox
+                .minutes
+                >= 3.0
+        );
+    }
+
+    #[test]
+    fn cleanup_without_a_sandbox_target_leaves_a_registered_handle_alone() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-none"), "HEAD").unwrap();
+        let task_id = ws.task_id.clone();
+        ws.sandboxes().insert(
+            &task_id,
+            crate::sandbox_tools::SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 7,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: chrono::Utc::now(),
+                identity: None,
+            },
+        );
+        ws.cleanup().unwrap();
+        assert!(ws.sandboxes().get(&task_id).is_some());
     }
 
     #[tokio::test]
