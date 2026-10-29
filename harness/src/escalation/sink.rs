@@ -14,6 +14,8 @@ pub enum DeliveryOutcome {
     Updated,
     /// A one-shot message was posted (webhook).
     Posted,
+    /// The escalation was appended to the local record.
+    Recorded,
     /// Every child sink of a [`FanoutSink`] delivered.
     Fanout { receipts: Vec<DeliveryReceipt> },
 }
@@ -50,12 +52,18 @@ pub enum EscalationError {
     Github(#[from] BacklogError),
     #[error("webhook request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("webhook {url} returned HTTP {status}")]
-    Status { url: String, status: u16 },
+    #[error("webhook {origin} returned HTTP {status}")]
+    Status { origin: String, status: u16 },
     #[error("escalation log I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("escalation log record is not valid JSON: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("no escalation sink is configured, so the escalation was not delivered")]
+    NoSink,
+    #[error("remote escalation delivery is capped at {max} per {window_secs}s per severity; this one was not sent")]
+    RateLimited { max: usize, window_secs: i64 },
+    #[error("the local escalation record is full ({limit_bytes} bytes); this one was not written")]
+    RecordFull { limit_bytes: u64 },
     #[error("no incident hold with id `{0}`")]
     UnknownHold(String),
     #[error("resolving an incident hold needs a human operator at a terminal: {0}")]

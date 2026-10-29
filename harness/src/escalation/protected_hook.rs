@@ -1,60 +1,10 @@
+use super::untrusted::untrusted_inline;
 use super::{Escalation, EscalationSource, Escalator, Severity};
-use crate::pr_tools::{fenced_untrusted, Budget};
 use crate::protected::{AuditHook, ProtectedPathViolation};
 use crate::task::TaskId;
 use std::sync::{Arc, Mutex};
 
-const FIELD_CAP: usize = 200;
 const SUMMARY: &str = "A task changed a protected path; the change was refused.";
-
-fn untrusted_inline(text: &str) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| {
-            if matches!(c, '\n' | '\r' | '\t') {
-                '\u{23ce}'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let fenced = fenced_untrusted(&flat, FIELD_CAP, &mut Budget::new(FIELD_CAP)).replace('\n', " ");
-    let fenced = unlink(&fenced);
-    let mut out = String::with_capacity(fenced.len());
-    let mut previous = '\0';
-    for c in fenced.chars() {
-        match c {
-            '@' => out.push_str("&#64;"),
-            '`' => out.push_str("&#96;"),
-            '#' if previous != '&' => out.push_str("&#35;"),
-            c => out.push(c),
-        }
-        previous = c;
-    }
-    out
-}
-
-fn unlink(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let lower = text.to_ascii_lowercase();
-    let mut rest = 0;
-    while rest < text.len() {
-        let tail = &lower[rest..];
-        if tail.starts_with("://") {
-            out.push_str(":&#47;&#47;");
-            rest += 3;
-        } else if tail.starts_with("www.") {
-            out.push_str(&text[rest..rest + 3]);
-            out.push_str("&#46;");
-            rest += 4;
-        } else {
-            let ch = text[rest..].chars().next().expect("rest is within text");
-            out.push(ch);
-            rest += ch.len_utf8();
-        }
-    }
-    out
-}
 
 pub struct ProtectedPathEscalation {
     escalator: Arc<Escalator>,

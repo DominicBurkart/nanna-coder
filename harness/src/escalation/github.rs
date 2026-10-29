@@ -13,11 +13,25 @@ pub const ESCALATION_LABEL: &str = "nanna-escalation";
 /// it with the occurrence number instead of opening a duplicate.
 pub struct GithubIssueSink {
     client: Arc<dyn GithubClient>,
+    pinned_repo: Option<String>,
 }
 
 impl GithubIssueSink {
     pub fn new(client: Arc<dyn GithubClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            pinned_repo: None,
+        }
+    }
+
+    /// A sink that files every issue and comment in `repo`, whatever
+    /// repository the escalation names: a task controls its own repository
+    /// string, and the token must not follow it to other repositories.
+    pub fn for_repo(client: Arc<dyn GithubClient>, repo: impl Into<String>) -> Self {
+        Self {
+            client,
+            pinned_repo: Some(repo.into()),
+        }
     }
 
     /// GitHub search query that finds the open issue for `title`, if any.
@@ -38,7 +52,7 @@ impl EscalationSink for GithubIssueSink {
     async fn deliver(&self, escalation: &Escalation) -> Result<DeliveryReceipt, EscalationError> {
         let title = escalation.title();
         let body = escalation.body();
-        let repo = &escalation.repo;
+        let repo = self.pinned_repo.as_ref().unwrap_or(&escalation.repo);
         let open = self
             .client
             .search_open_issues(repo, &Self::search_query(&title))
@@ -89,6 +103,7 @@ pub(super) mod tests {
         pub issues: Mutex<Vec<(GithubIssue, Vec<String>)>>,
         pub comments: Mutex<Vec<(u64, String)>>,
         pub queries: Mutex<Vec<String>>,
+        pub repos: Mutex<Vec<String>>,
         pub fail_create: bool,
     }
 
@@ -96,9 +111,10 @@ pub(super) mod tests {
     impl GithubClient for MockGithub {
         async fn search_open_issues(
             &self,
-            _repo: &str,
+            repo: &str,
             query: &str,
         ) -> Result<Vec<GithubIssue>, BacklogError> {
+            self.repos.lock().unwrap().push(repo.to_string());
             self.queries.lock().unwrap().push(query.to_string());
             Ok(self
                 .issues
@@ -123,6 +139,7 @@ pub(super) mod tests {
             body: &str,
             labels: &[String],
         ) -> Result<GithubIssue, BacklogError> {
+            self.repos.lock().unwrap().push(repo.to_string());
             if self.fail_create {
                 return Err(BacklogError::Status {
                     url: repo.to_string(),
@@ -143,10 +160,11 @@ pub(super) mod tests {
 
         async fn comment_on_issue(
             &self,
-            _repo: &str,
+            repo: &str,
             number: u64,
             body: &str,
         ) -> Result<(), BacklogError> {
+            self.repos.lock().unwrap().push(repo.to_string());
             self.comments
                 .lock()
                 .unwrap()
@@ -290,5 +308,43 @@ pub(super) mod tests {
         assert!(err
             .to_string()
             .starts_with("GitHub delivery failed: GitHub returned HTTP 403"));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_sink_files_and_comments_only_in_its_own_repository() {
+        let github = Arc::new(MockGithub::default());
+        let sink = GithubIssueSink::for_repo(github.clone(), "ops/escalations");
+        let hostile = Escalation::new(
+            Severity::Blocked,
+            EscalationSource::Auditor,
+            "victim/other-repo",
+            "pinned",
+        );
+        sink.deliver(&hostile).await.unwrap();
+        sink.deliver(&hostile.clone().with_occurrence(2))
+            .await
+            .unwrap();
+        let repos = github.repos.lock().unwrap().clone();
+        assert_eq!(repos.len(), 4, "{repos:?}");
+        assert!(repos.iter().all(|r| r == "ops/escalations"), "{repos:?}");
+        assert!(github.issues.lock().unwrap()[0]
+            .0
+            .html_url
+            .contains("ops/escalations"));
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_sink_still_follows_the_escalation_repository() {
+        let github = Arc::new(MockGithub::default());
+        GithubIssueSink::new(github.clone())
+            .deliver(&escalation("unpinned"))
+            .await
+            .unwrap();
+        assert!(github
+            .repos
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r == "example/repo"));
     }
 }

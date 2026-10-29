@@ -19,22 +19,32 @@
 mod card;
 mod escalator;
 mod github;
+mod limit;
+mod local;
 mod log;
 mod model;
+mod plane;
 mod protected_hook;
 mod redact;
 mod sink;
 mod spawn_hook;
+mod untrusted;
 mod webhook;
 
 pub use card::{CardRequest, PLACEHOLDER};
 pub use escalator::{default_window, EscalationOutcome, Escalator};
 pub use github::{GithubIssueSink, ESCALATION_LABEL};
+pub use limit::{RateLimitedSink, DEFAULT_REMOTE_CAP};
+pub use local::{LocalRecordSink, DEFAULT_RECORD_LIMIT_BYTES};
 pub use log::{
     default_escalation_path, escalation_path_from, EscalationLog, EscalationSnapshot, IncidentHold,
     KeyState, Occurrence, ResolveGrant, AGENT_SESSION_ENV, ESCALATION_PATH_ENV,
 };
 pub use model::{Escalation, EscalationSource, Severity, UnknownName, HEADLINE_CHARS};
+pub use plane::{
+    EscalationPlane, SinkConfigError, SinkSettings, UndeliveredSink, ESCALATION_GITHUB_TOKEN_ENV,
+    ESCALATION_REPO_ENV, ESCALATION_WEBHOOK_URL_ENV, GITHUB_TOKEN_ENV, RECORD_FILE_NAME,
+};
 pub use protected_hook::ProtectedPathEscalation;
 pub use redact::{marker, redact, redact_value};
 pub use sink::{
