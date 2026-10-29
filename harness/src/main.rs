@@ -2143,7 +2143,7 @@ mod tests {
                 assert_eq!(outcome.verdict.kind(), harness::auditor::VerdictKind::Block);
                 assert_eq!(
                     outcome.verdict.reasons().last().unwrap().code,
-                    harness::auditor::ReasonCode::Other
+                    harness::auditor::ReasonCode::ModelFailure
                 );
             }
             other => panic!("expected an unavailable auditor, got {other:?}"),

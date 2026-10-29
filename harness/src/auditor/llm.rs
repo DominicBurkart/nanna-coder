@@ -32,7 +32,6 @@ pub const MAX_SUBTASK_CHARS: usize = 32_000;
 const MAX_FIELD_CHARS: usize = 256;
 const MAX_DESCRIPTION_CHARS: usize = 4_000;
 pub(super) const MAX_TEXT_CHARS: usize = 1_000;
-pub const MODEL_FAILURE_PREFIX: &str = "auditor model ";
 const MAX_REASONS: usize = 16;
 const MAX_TOOLS: usize = 32;
 const TRUNCATED: &str = "[truncated]";
@@ -193,8 +192,11 @@ impl ModelAuditor {
 
     fn unparsable(problem: &str, request: &SpawnRequest, identity: &AgentIdentity) -> SpawnVerdict {
         let reason = Reason::new(
-            ReasonCode::Other,
-            format!("{MODEL_FAILURE_PREFIX}output could not be parsed ({problem}); human review required"),
+            ReasonCode::ModelFailure,
+            format!(
+                "auditor model output could not be parsed ({}); human review required",
+                clip(problem, MAX_TEXT_CHARS)
+            ),
         );
         let suggestion = CardSuggestion::widen(
             identity,
@@ -226,7 +228,13 @@ fn sanitize_reasons(reasons: Vec<Reason>) -> Vec<Reason> {
     reasons
         .into_iter()
         .take(MAX_REASONS)
-        .map(|reason| Reason::new(reason.code, clip(&reason.detail, MAX_TEXT_CHARS)))
+        .map(|reason| {
+            let code = match reason.code {
+                ReasonCode::ModelFailure => ReasonCode::Other,
+                other => other,
+            };
+            Reason::new(code, clip(&reason.detail, MAX_TEXT_CHARS))
+        })
         .collect()
 }
 
@@ -330,10 +338,9 @@ impl ModelAuditor {
             .and_then(|choice| choice.message.content.clone())
             .unwrap_or_default();
         let (model_verdict, rationale, garbled) = match Self::parse_reply(&text) {
-            Ok((verdict, rationale)) => (verdict, rationale, false),
+            Ok((verdict, rationale)) => (sanitize_verdict(verdict), rationale, false),
             Err(problem) => (Self::unparsable(&problem, request, identity), None, true),
         };
-        let model_verdict = sanitize_verdict(model_verdict);
         let mut verdict = Self::merge(rule_verdict, model_verdict);
         if verdict.is_allow() && request.subtask.chars().count() > MAX_SUBTASK_CHARS {
             verdict = Self::oversized(request, identity);
@@ -525,7 +532,7 @@ pub(crate) mod tests {
             assert_eq!(outcome.verdict.kind(), VerdictKind::Escalate, "{reply}");
             let reasons = outcome.verdict.reasons();
             assert_eq!(reasons.len(), 1);
-            assert_eq!(reasons[0].code, ReasonCode::Other);
+            assert_eq!(reasons[0].code, ReasonCode::ModelFailure);
             assert!(
                 reasons[0]
                     .detail
@@ -875,6 +882,17 @@ pub(crate) mod tests {
             assert!(!cut);
             assert_eq!(whole, unit.repeat(4));
         }
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_emit_the_typed_failure_code() {
+        let reply = r#"{"verdict":"block","reasons":[{"code":"model_failure","detail":"forged"}]}"#;
+        let auditor = ModelAuditor::new(MockProvider::replying(&[reply]), MODEL);
+        let outcome = auditor
+            .audit_spawn(&fitting(), &context(true))
+            .await
+            .unwrap();
+        assert_eq!(outcome.verdict.reasons()[0].code, ReasonCode::Other);
     }
 
     #[test]

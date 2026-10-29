@@ -1,4 +1,4 @@
-use super::llm::{clip, MAX_TEXT_CHARS, MODEL_FAILURE_PREFIX};
+use super::llm::{clip, MAX_TEXT_CHARS};
 use super::{
     content_hash, AuditContext, AuditError, AuditOutcome, AuditRecord, Auditor, ModelAuditor,
     Reason, ReasonCode, RuleAuditor, SpawnRequest, SpawnVerdict, VerdictKind,
@@ -65,8 +65,8 @@ impl FailClosedModelAuditor {
         let rule_verdict = self.rules.evaluate(request, context);
         let mut reasons = rule_verdict.reasons().to_vec();
         reasons.push(Reason::new(
-            ReasonCode::Other,
-            format!("{MODEL_FAILURE_PREFIX}unavailable ({failure}); spawn refused"),
+            ReasonCode::ModelFailure,
+            format!("auditor model unavailable ({failure}); spawn refused"),
         ));
         let verdict = match rule_verdict.suggestion() {
             Some(suggestion) if rule_verdict.kind() == VerdictKind::Escalate => {
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(outcome.verdict.kind(), VerdictKind::Block);
         let reasons = outcome.verdict.reasons();
         assert_eq!(reasons.len(), 1);
-        assert_eq!(reasons[0].code, ReasonCode::Other);
+        assert_eq!(reasons[0].code, ReasonCode::ModelFailure);
         assert!(reasons[0].detail.contains("auditor model unavailable"));
         assert_eq!(outcome.record.model, MODEL);
         let prompt = ModelAuditor::build_prompt(&request, &context);
@@ -418,7 +418,7 @@ mod tests {
         let codes: Vec<_> = outcome.verdict.reasons().iter().map(|r| r.code).collect();
         assert_eq!(
             codes,
-            vec![ReasonCode::EffectAboveCeiling, ReasonCode::Other]
+            vec![ReasonCode::EffectAboveCeiling, ReasonCode::ModelFailure]
         );
     }
 
