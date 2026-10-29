@@ -448,6 +448,7 @@ fn the_set_of_submit_and_enqueue_functions_is_pinned() {
             "backlog.rs: StoreSink::enqueue (private)",
             "mcp/client.rs: NannaMcpClient::submit_task (pub)",
             "scheduler/dispatch.rs: Dispatcher::enqueue (pub)",
+            "task.rs: TaskManager::submit_audited (pub(restricted))",
             "task.rs: TaskManager::submit_spawn (pub)",
             "task.rs: TaskManager::submit_task (pub(restricted))",
             "task.rs: TaskManager::submit_bound (private)",
@@ -479,10 +480,11 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         }
     }
     let expected: BTreeMap<String, usize> = [
-        ("backlog.rs: ManagerSink::enqueue uses submit_task", 1),
+        ("backlog.rs: ManagerSink::enqueue uses submit_audited", 1),
         ("backlog.rs: backlog_sync uses enqueue", 1),
         ("main.rs: run_delegate uses submit_task", 1),
         ("mcp/handlers.rs: handle_assign_task uses submit_spawn", 1),
+        ("task.rs: TaskManager::submit_audited uses submit_task", 1),
         ("task.rs: TaskManager::submit_spawn uses submit_bound", 1),
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
         ("task.rs: TaskManager::submit_bound uses submit_task", 1),
@@ -539,11 +541,42 @@ fn backlog_sync_checks_the_gate_on_every_path_to_its_enqueue() {
 fn the_backlog_sinks_verify_the_proof_on_every_path_to_dispatching() {
     for (function, dispatch) in [
         ("StoreSink::enqueue", "insert"),
-        ("ManagerSink::enqueue", "submit_task"),
+        ("ManagerSink::enqueue", "submit_audited"),
     ] {
         let calls = calls_in(function, "backlog.rs");
         assert!(dominates(&calls, "ensure_audited", dispatch), "{function}");
     }
+}
+
+#[test]
+fn the_backlog_manager_sink_binds_the_audited_identity_and_never_calls_submit_task() {
+    let calls = calls_in("ManagerSink::enqueue", "backlog.rs");
+    assert!(calls.iter().any(|(name, _)| name == "submit_audited"));
+    assert!(calls.iter().all(|(name, _)| name != "submit_task"));
+    let audited = calls_in("TaskManager::submit_audited", "task.rs");
+    assert!(audited.iter().any(|(name, _)| name == "split"));
+    assert!(audited.iter().any(|(name, _)| name == "submit_task"));
+}
+
+#[test]
+fn the_remaining_direct_submit_task_callers_are_the_known_bypasses() {
+    let mut callers: BTreeSet<String> = BTreeSet::new();
+    for scan in scan_all() {
+        for key in scan.calls.keys() {
+            if key.ends_with(" uses submit_task") {
+                callers.insert(key.clone());
+            }
+        }
+    }
+    assert_eq!(
+        callers,
+        expected(&[
+            "main.rs: run_delegate uses submit_task",
+            "task.rs: TaskManager::submit_audited uses submit_task",
+            "task.rs: TaskManager::submit_bound uses submit_task",
+        ]),
+        "a new direct submit_task caller bypasses the audited identity; run_delegate is the known remaining bypass"
+    );
 }
 
 #[test]
@@ -702,13 +735,15 @@ fn the_audit_token_is_minted_only_where_the_gate_proof_is_consumed() {
         expected(&[
             "task.rs: AuditedIdentity::split constructs AuditedIdentity",
             "task.rs: TaskManager::admit_restored constructs BoundIdentity::Audited",
+            "task.rs: TaskManager::submit_audited constructs AuditedIdentity::split",
+            "task.rs: TaskManager::submit_audited constructs BoundIdentity::Audited",
             "task.rs: TaskManager::submit_spawn constructs AuditedIdentity::split",
             "task.rs: TaskManager::submit_spawn constructs BoundIdentity::Audited",
             "task.rs: audit_restored constructs AuditedIdentity::split",
             "task.rs: token shape: derives Debug",
             "task.rs: token shape: split is private",
         ]),
-        "the audited-identity token may only be created from a gate proof in submit_spawn and audit_restored"
+        "the audited-identity token may only be created from a gate proof in submit_spawn, submit_audited and audit_restored"
     );
 }
 

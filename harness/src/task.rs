@@ -1225,6 +1225,34 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         .await
     }
 
+    /// Submit a queue entry whose identity, subtask and repository the caller
+    /// has already checked against `allowed`, running it under exactly the
+    /// audited identity.
+    pub(crate) async fn submit_audited(
+        &self,
+        queued: QueuedTask,
+        allowed: Allowed,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TaskId {
+        let (_, identity) = AuditedIdentity::split(allowed);
+        self.runner
+            .bound
+            .write()
+            .await
+            .insert(queued.id.clone(), BoundIdentity::Audited(identity));
+        self.submit_task(queued, provider).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn bound_identity_of(&self, id: &TaskId) -> Option<(bool, AgentIdentity)> {
+        self.runner.bound.read().await.get(id).map(|bound| {
+            (
+                matches!(bound, BoundIdentity::Audited(_)),
+                bound.identity().clone(),
+            )
+        })
+    }
+
     /// Submit a fully described queue entry, which may be parked with
     /// `not_before` or carry an identity hint and backlog origin.
     ///
