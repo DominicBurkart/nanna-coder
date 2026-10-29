@@ -26,7 +26,7 @@ use model::provider::ModelProvider;
 use model::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -442,6 +442,8 @@ pub enum SpawnRefused {
 enum RestoreRefused {
     #[error("queued entry names no identity, so it cannot be audited")]
     NoIdentity,
+    #[error("repo-local identity overrides rejected: {0}")]
+    Overrides(crate::identity::IdentityError),
     #[error(transparent)]
     Gate(#[from] Refused),
 }
@@ -450,6 +452,7 @@ impl RestoreRefused {
     fn error_type(&self) -> &'static str {
         match self {
             RestoreRefused::NoIdentity => "RestoreNoIdentity",
+            RestoreRefused::Overrides(_) => "RestoreOverridesInvalid",
             RestoreRefused::Gate(Refused::Verdict { .. }) => "RestoreRefused",
             RestoreRefused::Gate(Refused::AuditFailed(_)) => "RestoreAuditFailed",
         }
@@ -466,6 +469,9 @@ async fn audit_restored(
         .ok_or(RestoreRefused::NoIdentity)?;
     let repo = crate::scope::origin_slug(&queued.repo_path)
         .unwrap_or_else(|| queued.repo_path.display().to_string());
+    let gate = gate
+        .for_repo(&queued.repo_path)
+        .map_err(RestoreRefused::Overrides)?;
     let request = gate.request(
         TaskSummary::new(
             format!("restore-{}", queued.id.0),
@@ -1367,6 +1373,7 @@ impl TaskRunner {
         &self,
         task_id: &TaskId,
         hint: Option<&str>,
+        repo_path: &Path,
     ) -> Result<Option<AgentIdentity>, String> {
         if let Some(identity) = self.bound.write().await.remove(task_id) {
             return Ok(Some(identity));
@@ -1374,7 +1381,12 @@ impl TaskRunner {
         let Some(name) = hint else {
             return Ok(None);
         };
-        match self.identities.read().await.get(name) {
+        let registered = self.identities.read().await;
+        let layered =
+            crate::identity::IdentityCatalog::from_identities(registered.values().cloned())
+                .with_repo_overrides(repo_path)
+                .map_err(|e| format!("repo-local identity overrides rejected: {e}"))?;
+        match layered.get(name) {
             Some(identity) => Ok(Some(identity.clone())),
             None => Err(format!("identity `{name}` is not registered")),
         }
@@ -1398,7 +1410,7 @@ impl TaskRunner {
             return;
         };
         let identity = match self
-            .resolve_identity(&task_id, queued.identity_hint.as_deref())
+            .resolve_identity(&task_id, queued.identity_hint.as_deref(), &queued.repo_path)
             .await
         {
             Ok(identity) => identity,
@@ -5079,13 +5091,13 @@ mod identity_tests {
             .insert(id.clone(), bound.clone());
         let resolved = runner_manager
             .runner
-            .resolve_identity(&id, Some("rust-implementer"))
+            .resolve_identity(&id, Some("rust-implementer"), Path::new("/nonexistent"))
             .await
             .unwrap();
         assert_eq!(resolved, Some(bound));
         let from_catalog = runner_manager
             .runner
-            .resolve_identity(&id, Some("rust-implementer"))
+            .resolve_identity(&id, Some("rust-implementer"), Path::new("/nonexistent"))
             .await
             .unwrap()
             .unwrap();
@@ -5530,6 +5542,356 @@ mod identity_tests {
             }
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod repo_override_tests {
+    use super::identity_tests::tool_call_response;
+    use super::scheduler_tests::{git_repo, queued, wait_for};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::identity::IdentityCatalog;
+
+    const GLOBAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/identities/global"
+    );
+    const NARROWING: &str =
+        include_str!("../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml");
+
+    fn repo_with_origin() -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        repo
+    }
+
+    fn install_override(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    fn named(body: &str, name: &str) -> String {
+        body.replace("name = \"rust-implementer\"", &format!("name = \"{name}\""))
+    }
+
+    async fn manager() -> TaskManager {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        manager
+            .register_catalog(&IdentityCatalog::load(GLOBAL).unwrap())
+            .await;
+        manager
+    }
+
+    fn writes(paths: &[&str]) -> Arc<dyn ModelProvider> {
+        let mut calls: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": path, "content": "x"}),
+                )
+            })
+            .collect();
+        calls.push(stop_response("done"));
+        MockProvider::new(wrap_with_state_machine_responses(calls))
+    }
+
+    async fn submit_hinted(
+        manager: &TaskManager,
+        repo: &Path,
+        hint: Option<&str>,
+        paths: &[&str],
+    ) -> Task {
+        let hinted = queued(repo).with_identity_hint(hint.map(str::to_string));
+        let id = manager.submit_task(hinted, writes(paths)).await;
+        wait_for(manager, &id, |status| status.is_terminal()).await
+    }
+
+    #[tokio::test]
+    async fn test_a_hinted_task_resolves_to_the_catalog_card_narrowed_by_its_repo() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let manager = manager().await;
+        let task = submit_hinted(
+            &manager,
+            repo.path(),
+            Some("rust-implementer"),
+            &["api/a.rs", "shared/b.rs"],
+        )
+        .await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.files_modified, ["api/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_hinted_task_without_repo_overrides_keeps_the_global_card() {
+        let repo = repo_with_origin();
+        let manager = manager().await;
+        let task = submit_hinted(
+            &manager,
+            repo.path(),
+            Some("rust-implementer"),
+            &["api/a.rs", "shared/b.rs"],
+        )
+        .await;
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.denial_count(), 0);
+        assert_eq!(result.files_modified, ["api/a.rs", "shared/b.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_repo_overrides_fail_the_hinted_task_closed() {
+        let widening = NARROWING.replace(
+            r#"paths = ["api/**"]"#,
+            r#"paths = ["api/**", "shared/**", "ui/**"]"#,
+        );
+        let cases = [
+            ("rust-implementer.toml", widening, "widens"),
+            (
+                "ghost.toml",
+                named(NARROWING, "ghost"),
+                "no global identity",
+            ),
+            (
+                "rust-implementer.toml",
+                "not = [valid".to_string(),
+                "rust-implementer.toml",
+            ),
+            ("auditor.toml", named(NARROWING, "auditor"), "protected"),
+        ];
+        for (file, body, expect) in cases {
+            let repo = repo_with_origin();
+            install_override(repo.path(), file, &body);
+            let manager = manager().await;
+            let task = submit_hinted(
+                &manager,
+                repo.path(),
+                Some("rust-implementer"),
+                &["api/a.rs"],
+            )
+            .await;
+            let (error_type, error) = match &task.status {
+                TaskStatus::Failed {
+                    error, diagnostics, ..
+                } => (diagnostics.error_type.as_str(), error.as_str()),
+                other => panic!("{file}: expected a failed task, got {other:?}"),
+            };
+            assert_eq!(error_type, "IdentityUnavailable", "{file}");
+            assert!(
+                error.contains("repo-local identity overrides"),
+                "{file}: {error}"
+            );
+            assert!(error.contains(expect), "{file}: {error}");
+            assert!(manager.get_result(&task.id).await.is_none(), "{file}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_unscoped_task_ignores_repo_overrides() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", "not = [valid");
+        let manager = manager().await;
+        let task = submit_hinted(&manager, repo.path(), None, &["api/a.rs"]).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
+        assert!(result.files_modified.is_empty());
+    }
+
+    async fn restore_one(
+        repo: &Path,
+        provider: Arc<dyn ModelProvider>,
+    ) -> (TaskManager, QueuedTask) {
+        let entry = QueuedTask::new("Add a test.", repo.to_path_buf(), "HEAD", "mock", 20)
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let manager = TaskManager::restore_with_escalations(
+            2,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+            &IdentityCatalog::load(GLOBAL).unwrap(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &crate::auditor::test_support::fixture_gate(),
+        )
+        .await
+        .unwrap();
+        (manager, entry)
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_task_runs_under_the_card_narrowed_by_its_repo() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let (manager, entry) = restore_one(repo.path(), writes(&["api/a.rs", "shared/b.rs"])).await;
+        let task = wait_for(&manager, &entry.id, |status| status.is_terminal()).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&entry.id).await.unwrap();
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.files_modified, ["api/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_task_without_repo_overrides_keeps_the_global_card() {
+        let repo = repo_with_origin();
+        let (manager, entry) = restore_one(repo.path(), writes(&["api/a.rs", "shared/b.rs"])).await;
+        let task = wait_for(&manager, &entry.id, |status| status.is_terminal()).await;
+        assert!(matches!(task.status, TaskStatus::Completed { .. }));
+        let result = manager.get_result(&entry.id).await.unwrap();
+        assert_eq!(result.files_modified, ["api/a.rs", "shared/b.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_repo_overrides_fail_a_restored_task_closed() {
+        let widening = NARROWING.replace(
+            r#"paths = ["api/**"]"#,
+            r#"paths = ["api/**", "shared/**", "ui/**"]"#,
+        );
+        let cases = [
+            ("rust-implementer.toml", widening),
+            ("ghost.toml", named(NARROWING, "ghost")),
+            ("rust-implementer.toml", "not = [valid".to_string()),
+            ("auditor.toml", named(NARROWING, "auditor")),
+        ];
+        for (file, body) in cases {
+            let repo = repo_with_origin();
+            install_override(repo.path(), file, &body);
+            let (manager, entry) = restore_one(repo.path(), writes(&["api/a.rs"])).await;
+            let task = manager.poll(&entry.id).await.unwrap();
+            let (error_type, error) = match &task.status {
+                TaskStatus::Failed {
+                    error, diagnostics, ..
+                } => (diagnostics.error_type.as_str(), error.as_str()),
+                other => panic!("{file}: expected a failed task, got {other:?}"),
+            };
+            assert_eq!(error_type, "RestoreOverridesInvalid", "{file}");
+            assert!(
+                error.contains("repo-local identity overrides"),
+                "{file}: {error}"
+            );
+            assert!(manager.get_result(&entry.id).await.is_none(), "{file}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_bound_identity_is_fixed_at_audit_time_and_ignores_later_edits() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let manager = manager().await;
+        let narrowed = IdentityCatalog::load(GLOBAL)
+            .unwrap()
+            .with_repo_overrides(repo.path())
+            .unwrap()
+            .get("rust-implementer")
+            .unwrap()
+            .clone();
+        let id = TaskId::new();
+        manager
+            .runner
+            .bound
+            .write()
+            .await
+            .insert(id.clone(), narrowed.clone());
+        std::fs::remove_dir_all(repo.path().join(".nanna")).unwrap();
+        let resolved = manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"), repo.path())
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(narrowed));
+    }
+
+    #[tokio::test]
+    async fn test_a_restore_binds_the_audited_layered_identity_and_ignores_later_edits() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let entry = QueuedTask::new("Add a test.", repo.path().to_path_buf(), "HEAD", "mock", 20)
+            .with_identity_hint(Some("rust-implementer".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let manager = TaskManager::restore_with_escalations(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            writes(&[]),
+            &IdentityCatalog::load(GLOBAL).unwrap(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &crate::auditor::test_support::fixture_gate(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(repo.path().join(".nanna")).unwrap();
+        let resolved = manager
+            .runner
+            .resolve_identity(&entry.id, Some("rust-implementer"), repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.scope.paths, ["api/**"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_task_cannot_change_what_it_is_resolved_against() {
+        let repo = repo_with_origin();
+        install_override(repo.path(), "rust-implementer.toml", NARROWING);
+        let widened = NARROWING.replace(r#"paths = ["api/**"]"#, r#"paths = ["**"]"#);
+        let manager = manager().await;
+        let task = submit_hinted(
+            &manager,
+            repo.path(),
+            Some("rust-implementer"),
+            &[".nanna/agents/rust-implementer.toml", "shared/b.rs"],
+        )
+        .await;
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.denial_count(), 2);
+        assert!(result.files_modified.is_empty());
+        let on_host =
+            std::fs::read_to_string(repo.path().join(".nanna/agents/rust-implementer.toml"))
+                .unwrap();
+        assert_eq!(on_host, NARROWING);
+
+        let mut workspace = TaskWorkspace::create(repo.path(), "t-tamper", "HEAD").unwrap();
+        install_override(&workspace.workspace_path, "rust-implementer.toml", &widened);
+        let resolved = manager
+            .runner
+            .resolve_identity(&TaskId::new(), Some("rust-implementer"), repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        workspace.cleanup().unwrap();
+        assert_eq!(resolved.scope.paths, ["api/**"]);
     }
 }
 
