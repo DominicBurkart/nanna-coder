@@ -5454,6 +5454,45 @@ mod identity_tests {
         assert!(states[0].key.starts_with("auditor:"));
     }
 
+    struct SlowSink(Arc<crate::test_support::escalation::CapturingSink>);
+
+    #[async_trait::async_trait]
+    impl crate::escalation::EscalationSink for SlowSink {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn deliver(
+            &self,
+            escalation: &crate::escalation::Escalation,
+        ) -> Result<crate::escalation::DeliveryReceipt, crate::escalation::EscalationError>
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            crate::escalation::EscalationSink::deliver(&self.0, escalation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_escalation_is_delivered_before_the_failed_status_is_observable() {
+        let repo_dir = repo_with_origin("https://github.com/example/repo.git");
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let log = Arc::new(crate::escalation::EscalationLog::in_memory());
+        let escalator = Arc::new(crate::escalation::Escalator::new(
+            log,
+            Arc::new(SlowSink(Arc::clone(&sink))),
+            Arc::new(crate::leases::SystemClock),
+            chrono::Duration::minutes(10),
+        ));
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_escalator(escalator);
+        let task_id = submit_planting_task(&manager, &repo_dir).await;
+
+        assert!(matches!(
+            wait_for_terminal(&manager, &task_id).await,
+            TaskStatus::Failed { .. }
+        ));
+        assert_eq!(sink.escalations().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_a_run_that_errors_after_planting_a_protected_file_still_fails_and_escalates() {
         let repo_dir = repo_with_origin("https://github.com/example/repo.git");

@@ -120,12 +120,16 @@ mod tests {
             ".nanna/`](http://evil)<img src=x onerror=alert(1)>",
             ".nanna/\u{1b}[31m\u{7}\u{202e}gpj\u{200b}.toml",
             "Closes #7 resolves #8 fixes owner/repo#9 @team/admins",
-            ".nanna/a\r\n\r\n# heading\n```\nrm -rf\n```",
+            ".nanna/a\t\r\n\r\n# heading\n```\nrm -rf\n```",
         ] {
             let (body, title) = rendered(hostile, hostile);
             assert_eq!(body.lines().count(), benign.lines().count(), "{body}");
             assert_eq!(body.matches("## Suggested action").count(), 1, "{body}");
             for text in [&body, &title] {
+                assert!(
+                    !text.chars().any(|c| c.is_control() && c != '\n'),
+                    "{text:?}"
+                );
                 assert!(!text.contains('@'), "{text}");
                 assert!(!text.contains('`'), "{text}");
                 assert!(!text.contains("](http"), "{text}");
