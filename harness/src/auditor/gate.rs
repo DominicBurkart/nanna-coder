@@ -280,8 +280,19 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
         request: SpawnRequest,
         context: &AuditContext,
     ) -> Result<Allowed, Refused> {
-        let audited = self.auditor.audit_spawn(&request, context).await;
-        let outcome = audited.map_err(Refused::AuditFailed)?;
+        let outcome = match self.auditor.audit_spawn(&request, context).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let AuditError::Unavailable { outcome, .. } = &error {
+                    if let Err(log_error) = self.log.append(&request, outcome) {
+                        tracing::error!(
+                            "audit log write failed for an unavailable auditor: {log_error}"
+                        );
+                    }
+                }
+                return Err(Refused::AuditFailed(error));
+            }
+        };
         let outcome = reconcile_with_catalog(&request, context, outcome);
         self.log
             .append(&request, &outcome)

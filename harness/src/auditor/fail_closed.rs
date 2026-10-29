@@ -9,6 +9,26 @@ use std::time::Duration;
 
 pub const MODEL_AUDIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[doc = r#"A [`ModelAuditor`] that can never turn a model failure into an `Allow`.
+
+A model that errors or does not answer within the timeout makes `audit_spawn`
+return [`AuditError::Unavailable`], which [`Gate::check`](super::Gate::check)
+logs and refuses. Output the model produces that is not a verdict escalates.
+
+```
+use harness::auditor::{Auditor, FailClosedModelAuditor, MODEL_AUDIT_TIMEOUT};
+use model::prelude::*;
+use std::sync::Arc;
+use std::time::Duration;
+
+let provider = Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+let auditor = FailClosedModelAuditor::new(provider, "reviewer");
+assert_eq!(auditor.name(), "reviewer");
+assert_eq!(auditor.timeout(), MODEL_AUDIT_TIMEOUT);
+let quick = auditor.with_timeout(Duration::from_secs(5));
+assert_eq!(quick.timeout(), Duration::from_secs(5));
+```
+"#]
 #[derive(Debug)]
 pub struct FailClosedModelAuditor {
     inner: ModelAuditor,
@@ -34,12 +54,12 @@ impl FailClosedModelAuditor {
         self.timeout
     }
 
-    fn refuse(
+    fn unavailable(
         &self,
         request: &SpawnRequest,
         context: &AuditContext,
         failure: String,
-    ) -> AuditOutcome {
+    ) -> AuditError {
         let rule_verdict = self.rules.evaluate(request, context);
         let mut reasons = rule_verdict.reasons().to_vec();
         reasons.push(Reason::new(
@@ -58,7 +78,10 @@ impl FailClosedModelAuditor {
             prompt_hash: content_hash(&serde_json::to_string(&messages).unwrap_or_default()),
             rationale: verdict.rationale(),
         };
-        AuditOutcome { verdict, record }
+        AuditError::Unavailable {
+            detail: failure,
+            outcome: Box::new(AuditOutcome { verdict, record }),
+        }
     }
 }
 
@@ -82,12 +105,11 @@ impl Auditor for FailClosedModelAuditor {
         context: &AuditContext,
     ) -> Result<AuditOutcome, AuditError> {
         match tokio::time::timeout(self.timeout, self.inner.audit_spawn(request, context)).await {
-            Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(AuditError::Model(error))) => {
-                Ok(self.refuse(request, context, format!("model call failed: {error}")))
+                Err(self.unavailable(request, context, format!("model call failed: {error}")))
             }
-            Ok(Err(other)) => Err(other),
-            Err(_) => Ok(self.refuse(
+            Ok(other) => other,
+            Err(_) => Err(self.unavailable(
                 request,
                 context,
                 format!("no reply within {}s", self.timeout.as_secs()),
@@ -102,6 +124,7 @@ mod tests {
     use crate::auditor::llm::tests::MockProvider;
     use crate::auditor::request::tests::request;
     use crate::auditor::rules::tests::context;
+    use crate::auditor::{AuditLog, Gate, Refused};
     use crate::effects::EffectClass;
     use crate::identity::DevLoop;
     use model::types::{ChatRequest, ChatResponse, ModelInfo};
@@ -136,10 +159,36 @@ mod tests {
         }
     }
 
+    struct Delayed(Arc<MockProvider>);
+
+    #[async_trait]
+    impl ModelProvider for Delayed {
+        async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.0.chat(request).await
+        }
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "delayed"
+        }
+    }
+
+    fn unavailable_outcome(error: AuditError) -> AuditOutcome {
+        match error {
+            AuditError::Unavailable { outcome, .. } => *outcome,
+            other => panic!("expected an unavailable auditor, got {other}"),
+        }
+    }
+
     #[tokio::test]
-    async fn a_reachable_model_decides_like_the_model_auditor() {
+    async fn a_slow_but_reachable_model_still_decides_under_the_default_timeout() {
         let provider = MockProvider::replying(&[r#"{"verdict":"allow","rationale":"fits"}"#]);
-        let auditor = FailClosedModelAuditor::new(provider.clone(), MODEL);
+        let auditor = FailClosedModelAuditor::new(Arc::new(Delayed(provider.clone())), MODEL);
         assert_eq!(auditor.name(), MODEL);
         let outcome = auditor
             .audit_spawn(&fitting(), &context(true))
@@ -150,31 +199,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_erroring_model_blocks_with_a_typed_reason_and_a_full_record() {
-        let provider = MockProvider::replying(&[]);
-        let auditor = FailClosedModelAuditor::new(provider, MODEL);
-        let outcome = auditor
-            .audit_spawn(&fitting(), &context(true))
-            .await
-            .unwrap();
+    async fn an_erroring_model_is_unavailable_with_a_typed_reason_and_a_full_record() {
+        let auditor = FailClosedModelAuditor::new(MockProvider::replying(&[]), MODEL);
+        let request = fitting();
+        let context = context(true);
+        let error = auditor.audit_spawn(&request, &context).await.unwrap_err();
+        assert!(error.to_string().starts_with("auditor model unavailable"));
+        let outcome = unavailable_outcome(error);
         assert_eq!(outcome.verdict.kind(), VerdictKind::Block);
         let reasons = outcome.verdict.reasons();
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].code, ReasonCode::Other);
         assert!(reasons[0].detail.contains("auditor model unavailable"));
         assert_eq!(outcome.record.model, MODEL);
-        assert_eq!(outcome.record.prompt_hash.len(), 16);
+        let prompt = ModelAuditor::build_prompt(&request, &context);
+        assert_eq!(
+            outcome.record.prompt_hash,
+            content_hash(&serde_json::to_string(&prompt).unwrap())
+        );
+        assert_ne!(outcome.record.prompt_hash, content_hash(""));
         assert!(!outcome.record.rationale.is_empty());
     }
 
     #[tokio::test]
-    async fn review_spawn_of_an_erroring_model_is_a_block() {
+    async fn review_spawn_of_an_erroring_model_is_never_a_verdict() {
         let auditor = FailClosedModelAuditor::new(MockProvider::replying(&[]), MODEL);
-        let verdict = auditor
+        let error = auditor
             .review_spawn(&fitting(), &context(true))
             .await
-            .unwrap();
-        assert_eq!(verdict.kind(), VerdictKind::Block);
+            .unwrap_err();
+        assert!(matches!(error, AuditError::Unavailable { .. }));
     }
 
     #[tokio::test]
@@ -188,16 +242,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hung_model_is_blocked_after_the_timeout() {
+    async fn a_hung_model_is_unavailable_after_the_timeout() {
         let auditor = FailClosedModelAuditor::new(Arc::new(Hanging), MODEL)
             .with_timeout(Duration::from_millis(50));
         assert_eq!(auditor.timeout(), Duration::from_millis(50));
-        let started = std::time::Instant::now();
-        let outcome = auditor
-            .audit_spawn(&fitting(), &context(true))
-            .await
-            .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            auditor.audit_spawn(&fitting(), &context(true)),
+        )
+        .await
+        .expect("auditor returned");
+        let outcome = unavailable_outcome(result.unwrap_err());
         assert_eq!(outcome.verdict.kind(), VerdictKind::Block);
         assert!(outcome.verdict.reasons()[0]
             .detail
@@ -208,6 +263,8 @@ mod tests {
     fn the_default_timeout_is_bounded() {
         let auditor = FailClosedModelAuditor::new(MockProvider::replying(&[]), MODEL);
         assert_eq!(auditor.timeout(), MODEL_AUDIT_TIMEOUT);
+        assert!(MODEL_AUDIT_TIMEOUT >= Duration::from_secs(1));
+        assert!(MODEL_AUDIT_TIMEOUT <= Duration::from_secs(120));
     }
 
     #[tokio::test]
@@ -234,15 +291,49 @@ mod tests {
             DevLoop::Inner,
             EffectClass::Sandbox,
         );
-        let outcome = auditor
+        let error = auditor
             .audit_spawn(&escalating, &context(false))
             .await
-            .unwrap();
+            .unwrap_err();
+        let outcome = unavailable_outcome(error);
         assert_eq!(outcome.verdict.kind(), VerdictKind::Escalate);
         let codes: Vec<_> = outcome.verdict.reasons().iter().map(|r| r.code).collect();
         assert_eq!(
             codes,
             vec![ReasonCode::EffectAboveCeiling, ReasonCode::Other]
         );
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_log_still_refuses_an_unavailable_auditor() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let gate = Gate::new(
+            FailClosedModelAuditor::new(MockProvider::replying(&[]), MODEL),
+            AuditLog::file(blocker.join("audit.jsonl")),
+        );
+        let refused = gate.check(fitting(), &context(true)).await.unwrap_err();
+        assert!(matches!(
+            refused,
+            Refused::AuditFailed(AuditError::Unavailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_gate_logs_an_unavailable_auditor_and_refuses() {
+        let gate = Gate::new(
+            FailClosedModelAuditor::new(MockProvider::replying(&[]), MODEL),
+            AuditLog::in_memory(),
+        );
+        let refused = gate.check(fitting(), &context(true)).await.unwrap_err();
+        assert!(matches!(
+            refused,
+            Refused::AuditFailed(AuditError::Unavailable { .. })
+        ));
+        let entries = gate.log().entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record.model, MODEL);
+        assert_eq!(entries[0].record.prompt_hash.len(), 16);
     }
 }

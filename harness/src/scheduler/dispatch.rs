@@ -249,6 +249,10 @@ impl<L: Launcher> Dispatcher<L> {
         Some(slot)
     }
 
+    pub async fn withhold(&self, id: &TaskId) -> bool {
+        self.state.lock().await.queue.remove(id).is_some()
+    }
+
     /// Remove `id` from the queue, or abort it if running.
     pub async fn cancel(self: &Arc<Self>, id: &TaskId) -> Result<CancelOutcome, QueueStoreError> {
         let queued = self.state.lock().await.queue.remove(id);

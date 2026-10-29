@@ -1278,7 +1278,7 @@ fn unprintable_mask(text: &str, shape: Shape) -> Vec<bool> {
     bad
 }
 
-fn strip_unprintable(raw: &str) -> String {
+pub(crate) fn strip_unprintable(raw: &str) -> String {
     let current = raw.replace('\r', "");
     let mask = unprintable_mask(&current, Shape::Block);
     current

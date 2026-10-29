@@ -141,6 +141,11 @@ pub enum AuditError {
     /// The model behind a [`ModelAuditor`] failed.
     #[error("auditor model call failed: {0}")]
     Model(#[from] ModelError),
+    #[error("auditor model unavailable: {detail}")]
+    Unavailable {
+        detail: String,
+        outcome: Box<AuditOutcome>,
+    },
     /// The audit log could not be written.
     #[error("audit log write failed: {0}")]
     Log(#[from] std::io::Error),
