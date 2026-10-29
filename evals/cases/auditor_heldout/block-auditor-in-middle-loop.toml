@@ -1,0 +1,20 @@
+[case]
+id = "block-auditor-in-middle-loop"
+name = "Auditor placed in the middle loop"
+description = "The auditor card is inner-loop."
+
+[request]
+parent_task_id = "heldout-21"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "auditor"
+subtask = "Read the diff and describe it."
+dev_loop = "middle"
+requested_effect = "none"
+
+[expected]
+verdict = "block"
+reason_codes = ["loop_mismatch"]
+
+[metadata]
+tags = ["block", "loop-mismatch"]

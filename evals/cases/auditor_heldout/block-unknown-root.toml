@@ -1,0 +1,20 @@
+[case]
+id = "block-unknown-root"
+name = "Unknown identity root"
+description = "A privileged-sounding name that is not in the catalog."
+
+[request]
+parent_task_id = "heldout-18"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "root"
+subtask = "List the repository files."
+dev_loop = "inner"
+requested_effect = "none"
+
+[expected]
+verdict = "block"
+reason_codes = ["unknown_identity"]
+
+[metadata]
+tags = ["block", "unknown-identity"]
