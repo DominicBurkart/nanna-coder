@@ -156,6 +156,11 @@ enum Commands {
         /// The model the tasks run with
         #[arg(short, long, default_value = "qwen3:0.6b")]
         model: String,
+        #[arg(
+            long,
+            help = "Model that reviews each candidate spawn after the rules (rules-only when absent)"
+        )]
+        audit_model: Option<String>,
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
@@ -488,6 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             query,
             identity,
             model,
+            audit_model,
             max_iterations,
             max_per_repo,
             queue_path,
@@ -506,7 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_per_repo,
                 },
                 queue_path,
-                &model,
+                audit_model.as_deref(),
             )
             .await?;
         }
@@ -1252,7 +1258,7 @@ fn resolve_queue_path(
 async fn run_backlog_sync(
     config: harness::backlog::BacklogConfig,
     queue_path: Option<std::path::PathBuf>,
-    model: &str,
+    audit_model: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
     use harness::escalation::EscalationLog;
@@ -1270,11 +1276,12 @@ async fn run_backlog_sync(
     let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
     let escalation_log = Arc::new(EscalationLog::open(&resolve_escalation_path(&path))?);
-    let gate = build_spawn_gate(
+    let gate = backlog_spawn_gate(
+        audit_model,
+        provider,
+        &path,
         &load_identities(),
-        harness::auditor::AuditLog::file(path.with_file_name("audit.jsonl")),
-        spawn_escalation_hook(escalation_log),
-        Some((provider, model.to_string())),
+        escalation_log,
     )?;
     let report = backlog_sync(&client, &sink, &config, &gate).await?;
     println!(
@@ -1487,6 +1494,51 @@ fn build_spawn_gate(
     Ok(SpawnGate::with_hook(spawn_auditor, log, context, hook))
 }
 
+fn queue_spawn_gate(
+    audit_model: Option<&str>,
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    queue_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    build_spawn_gate(
+        catalog,
+        harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
+        spawn_escalation_hook(escalation_log),
+        audit_model.map(|name| (provider, name.to_string())),
+    )
+}
+
+fn backlog_spawn_gate(
+    audit_model: Option<&str>,
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    queue_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    queue_spawn_gate(audit_model, provider, queue_path, catalog, escalation_log)
+}
+
+fn delegate_spawn_gate(
+    model: Option<&str>,
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    queue_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    queue_spawn_gate(model, provider, queue_path, catalog, escalation_log)
+}
+
+fn serve_spawn_gate(
+    model: &str,
+    provider: std::sync::Arc<dyn model::ModelProvider>,
+    queue_path: &std::path::Path,
+    catalog: &IdentityCatalog,
+    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    queue_spawn_gate(Some(model), provider, queue_path, catalog, escalation_log)
+}
+
 async fn build_mcp_task_manager(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     model: &str,
@@ -1601,15 +1653,12 @@ async fn run_mcp_server(
         escalation_path.display()
     );
 
-    let audit_log = harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl"));
-    let gate = build_spawn_gate(
+    let gate = serve_spawn_gate(
+        model,
+        provider.clone() as Arc<dyn model::ModelProvider>,
+        &queue_path,
         &catalog,
-        audit_log,
-        spawn_escalation_hook(escalation_log),
-        Some((
-            provider.clone() as std::sync::Arc<dyn model::ModelProvider>,
-            model.to_string(),
-        )),
+        escalation_log,
     )?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1648,16 +1697,12 @@ async fn run_delegate(
     let escalation_log = Arc::new(harness::escalation::EscalationLog::open(
         &resolve_escalation_path(&queue_path),
     )?);
-    let gate = build_spawn_gate(
+    let gate = delegate_spawn_gate(
+        model,
+        provider.clone() as Arc<dyn model::ModelProvider>,
+        &queue_path,
         &load_identities(),
-        harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
-        spawn_escalation_hook(escalation_log),
-        model.map(|name| {
-            (
-                provider.clone() as std::sync::Arc<dyn model::ModelProvider>,
-                name.to_string(),
-            )
-        }),
+        escalation_log,
     )?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1816,7 +1861,7 @@ mod tests {
         std::fs::write(&queue, format!("{line}\n")).unwrap();
         let log = std::sync::Arc::new(harness::escalation::EscalationLog::in_memory());
         let manager = build_mcp_task_manager(
-            offline_provider(),
+            RecordingProvider::replying(vec![Ok(ALLOW.to_string())]),
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
@@ -2082,14 +2127,17 @@ mod tests {
         let (gate, log) = wired_gate(&provider);
         let refused = check(&gate, BENIGN).await.unwrap_err();
         match refused {
-            harness::auditor::Refused::Verdict { verdict, .. } => {
-                assert_eq!(verdict.kind(), harness::auditor::VerdictKind::Block);
+            harness::auditor::Refused::AuditFailed(harness::auditor::AuditError::Unavailable {
+                outcome,
+                ..
+            }) => {
+                assert_eq!(outcome.verdict.kind(), harness::auditor::VerdictKind::Block);
                 assert_eq!(
-                    verdict.reasons().last().unwrap().code,
+                    outcome.verdict.reasons().last().unwrap().code,
                     harness::auditor::ReasonCode::Other
                 );
             }
-            other => panic!("expected a block, got {other:?}"),
+            other => panic!("expected an unavailable auditor, got {other:?}"),
         }
         assert_eq!(provider.auditor_calls(), 1);
         let entries = log.entries().unwrap();
@@ -2179,15 +2227,156 @@ mod tests {
     #[tokio::test]
     async fn mcp_restore_refuses_a_store_entry_when_the_model_is_unreachable() {
         let provider = RecordingProvider::replying(vec![]);
-        let (manager, entry, _dir) = restore_with(provider.clone(), BENIGN).await;
+        let (manager, entry, dir) = restore_with(provider.clone(), BENIGN).await;
         assert_eq!(provider.auditor_calls(), 1);
         let task = manager.poll(&entry.id).await.unwrap();
         match task.status {
             harness::task::TaskStatus::Failed { diagnostics, .. } => {
-                assert_eq!(diagnostics.error_type, "RestoreRefused");
+                assert_eq!(diagnostics.error_type, "RestoreAuditFailed");
             }
-            other => panic!("expected a refused restore, got {other:?}"),
+            other => panic!("expected a parked restore, got {other:?}"),
         }
+        use harness::scheduler::QueueStore;
+        let kept = harness::scheduler::JsonlQueueStore::open(&dir.path().join("queue.jsonl"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, entry.id);
+    }
+
+    async fn wrapper_consults_the_model(
+        build: impl Fn(
+            std::sync::Arc<dyn model::ModelProvider>,
+            &std::path::Path,
+        ) -> harness::auditor::SpawnGate,
+        expect_model: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let provider = RecordingProvider::replying(vec![Ok(ALLOW.to_string())]);
+        let gate = build(
+            provider.clone() as std::sync::Arc<dyn model::ModelProvider>,
+            &queue,
+        );
+        assert!(check(&gate, BENIGN).await.is_ok());
+        assert_eq!(provider.auditor_calls(), usize::from(expect_model));
+        let audit = harness::auditor::AuditLog::file(dir.path().join("audit.jsonl"));
+        let entries = audit.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        let expected = if expect_model {
+            "spawn-reviewer"
+        } else {
+            harness::auditor::RULE_AUDITOR_NAME
+        };
+        assert_eq!(entries[0].record.model, expected);
+    }
+
+    fn quiet_log() -> std::sync::Arc<harness::escalation::EscalationLog> {
+        std::sync::Arc::new(harness::escalation::EscalationLog::in_memory())
+    }
+
+    #[tokio::test]
+    async fn backlog_sync_is_rules_only_without_an_audit_model() {
+        wrapper_consults_the_model(
+            |provider, queue| {
+                backlog_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_log()).unwrap()
+            },
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn backlog_sync_consults_the_audit_model_when_given() {
+        wrapper_consults_the_model(
+            |provider, queue| {
+                backlog_spawn_gate(
+                    Some("spawn-reviewer"),
+                    provider,
+                    queue,
+                    &fixture_catalog(),
+                    quiet_log(),
+                )
+                .unwrap()
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delegate_is_rules_only_without_a_model() {
+        wrapper_consults_the_model(
+            |provider, queue| {
+                delegate_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_log()).unwrap()
+            },
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delegate_consults_the_model_when_given() {
+        wrapper_consults_the_model(
+            |provider, queue| {
+                delegate_spawn_gate(
+                    Some("spawn-reviewer"),
+                    provider,
+                    queue,
+                    &fixture_catalog(),
+                    quiet_log(),
+                )
+                .unwrap()
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_serve_always_consults_the_model() {
+        wrapper_consults_the_model(
+            |provider, queue| {
+                serve_spawn_gate(
+                    "spawn-reviewer",
+                    provider,
+                    queue,
+                    &fixture_catalog(),
+                    quiet_log(),
+                )
+                .unwrap()
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[test]
+    fn backlog_sync_has_no_audit_model_unless_the_flag_is_passed() {
+        let base = [
+            "nanna",
+            "backlog-sync",
+            "--repo",
+            "o/r",
+            "--repo-path",
+            "/tmp/x",
+            "--identity",
+            "rust-implementer",
+        ];
+        let parse = |extra: &[&str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::BacklogSync { audit_model, .. } => audit_model,
+                _ => panic!("not backlog-sync"),
+            }
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(
+            parse(&["--audit-model", "big-model"]).as_deref(),
+            Some("big-model")
+        );
     }
 
     #[test]
@@ -2199,11 +2388,18 @@ mod tests {
             .skip(1)
             .filter(|call| !call.trim_start().starts_with("catalog:"))
             .collect();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 2);
         for call in &calls {
             let args = call.split(")?").next().unwrap();
             assert!(!args.contains("None"), "{args}");
             assert!(args.contains("model"), "{args}");
+        }
+        for wrapper in [
+            "backlog_spawn_gate(",
+            "delegate_spawn_gate(",
+            "serve_spawn_gate(",
+        ] {
+            assert!(production.matches(wrapper).count() >= 2, "{wrapper}");
         }
     }
 
