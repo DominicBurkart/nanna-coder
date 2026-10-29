@@ -2784,6 +2784,7 @@ mod tests {
         let used = accountant.task_summary("id", "t1");
         assert_eq!(used.ci.count, 1);
         assert_eq!(used.ci.minutes, UNCORRELATED_RUN_MINUTES);
+        assert_eq!(UNCORRELATED_RUN_MINUTES, 60.0);
     }
 
     #[tokio::test]

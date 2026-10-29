@@ -548,6 +548,71 @@ mod tests {
         );
     }
 
+    fn shepherd_with(limits: &str) -> String {
+        format!(
+            "{}\n{limits}",
+            identity_toml(
+                "pr-shepherd",
+                "middle",
+                "ci",
+                "\"read_file\", \"ci_status\""
+            )
+        )
+    }
+
+    fn layered(base_limits: &str, local_limits: &str) -> Result<IdentityCatalog, IdentityError> {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pr-shepherd.toml", &shepherd_with(base_limits));
+        let repo = tempfile::tempdir().unwrap();
+        write(
+            repo.path(),
+            ".nanna/agents/pr-shepherd.toml",
+            &shepherd_with(local_limits),
+        );
+        IdentityCatalog::load(dir.path())?.with_repo_overrides(repo.path())
+    }
+
+    #[test]
+    fn a_repo_override_may_lower_but_never_raise_or_drop_the_ci_and_sandbox_limits() {
+        let base = "[limits.ci]\nmax_count_per_task = 5\nmax_minutes_per_day = 100\n\n[limits.sandbox]\nmax_count_per_day = 4\n";
+        let lowered = layered(
+            base,
+            "[limits.ci]\nmax_count_per_task = 2\nmax_minutes_per_day = 100\n\n[limits.sandbox]\nmax_count_per_day = 1\n",
+        )
+        .unwrap();
+        let ci = lowered
+            .get("pr-shepherd")
+            .unwrap()
+            .budget_limits(crate::budget::BudgetClass::Ci);
+        assert_eq!(ci.max_count_per_task, Some(2));
+
+        for (local, field) in [
+            (
+                "[limits.ci]\nmax_count_per_task = 6\nmax_minutes_per_day = 100\n\n[limits.sandbox]\nmax_count_per_day = 4\n",
+                "limits.ci.max_count_per_task",
+            ),
+            (
+                "[limits.ci]\nmax_count_per_task = 5\nmax_minutes_per_day = 101\n\n[limits.sandbox]\nmax_count_per_day = 4\n",
+                "limits.ci.max_minutes_per_day",
+            ),
+            (
+                "[limits.ci]\nmax_count_per_task = 5\nmax_minutes_per_day = 100\n\n[limits.sandbox]\nmax_count_per_day = 5\n",
+                "limits.sandbox.max_count_per_day",
+            ),
+            (
+                "[limits.sandbox]\nmax_count_per_day = 4\n",
+                "limits.ci.max_count_per_task",
+            ),
+            ("", "limits.ci.max_count_per_task"),
+        ] {
+            let err = layered(base, local).unwrap_err();
+            assert!(
+                matches!(&err, IdentityError::WidensScope { name, field: widened, .. } if name == "pr-shepherd" && widened == field),
+                "{field}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn repo_override_of_the_auditor_is_rejected_even_when_it_narrows() {
         let dir = global_catalog();
