@@ -79,6 +79,9 @@ pub async fn handle_assign_task(
         .to_string();
 
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
+    let repo_gate = spawn_gate
+        .for_repo(&repo_path)
+        .map_err(|e| format!("repo-local identity overrides rejected: {e}"))?;
     let caller_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
         Some(value) => Some(value.parse::<DevLoop>().map_err(|e| e.to_string())?),
         None => None,
@@ -89,7 +92,7 @@ pub async fn handle_assign_task(
     };
     let repo =
         crate::scope::origin_slug(&repo_path).unwrap_or_else(|| repo_path.display().to_string());
-    let request = spawn_gate.request_with_caller(
+    let request = repo_gate.request_with_caller(
         TaskSummary::new(
             format!("mcp-{}", uuid::Uuid::new_v4()),
             description.clone(),
@@ -100,7 +103,7 @@ pub async fn handle_assign_task(
         caller_effect,
         caller_loop,
     );
-    let allowed = spawn_gate
+    let allowed = repo_gate
         .check(request)
         .await
         .map_err(|refused| refused.to_string())?;
@@ -800,6 +803,221 @@ mod tests {
         let log = gate.log().entries().unwrap();
         assert_eq!(log.len(), 1);
         assert!(log[0].verdict.is_allow());
+    }
+
+    fn write_call(path: &str) -> ChatResponse {
+        use model::types::{FunctionCall, ToolCall};
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function: FunctionCall {
+                            name: "write_file".to_string(),
+                            arguments: serde_json::json!({"path": path, "content": "x"}),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
+        }
+    }
+
+    fn writing_provider(paths: &[&str]) -> Arc<dyn ModelProvider> {
+        let mut responses = vec![stop_response("Plan: execute the task")];
+        responses.extend(paths.iter().map(|path| write_call(path)));
+        responses.push(stop_response("performed"));
+        responses.push(stop_response("COMPLETE - task done"));
+        MockProvider::new(responses)
+    }
+
+    fn install_override(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    fn fixture_override() -> &'static str {
+        include_str!("../../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml")
+    }
+
+    fn card_with(paths: &str, effect: &str) -> String {
+        format!(
+            r#"
+[identity]
+name = "rust-implementer"
+description = "Override."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = {{ inline = "Override." }}
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = [{paths}]
+max_effect = "{effect}"
+tools = ["read_file", "write_file"]
+
+[limits]
+max_iterations = 10
+max_wall_clock_secs = 60
+max_concurrent = 1
+"#
+        )
+    }
+
+    async fn run_writes(repo: &Path, paths: &[&str]) -> crate::task::TaskResult {
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(paths);
+        let gate = fixture_gate();
+        let mut request = params(repo, "rust-implementer", "Add a test.");
+        request["model"] = serde_json::json!("gemma4:e4b");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        manager.get_result(&id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_without_repo_overrides_runs_the_global_card() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let result = run_writes(repo.path(), &["api/a.rs", "shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 0);
+        assert_eq!(result.files_modified, ["api/a.rs", "shared/b.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_applies_the_repos_narrowing_override() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(repo.path(), "rust-implementer.toml", fixture_override());
+        let result = run_writes(repo.path(), &["api/a.rs", "shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(result.files_modified, ["api/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_defaults_come_from_the_narrowed_card() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**""#, "none"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let id = assign(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await
+        .unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        assert!(gate.log().entries().unwrap()[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_audits_a_request_above_the_narrowed_ceiling() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**""#, "none"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        let err = assign(&manager, &provider, &gate, request)
+            .await
+            .unwrap_err();
+        assert!(err.contains("spawn refused"), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_fails_closed_on_a_widening_override() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**", "shared/**", "ui/**""#, "repository"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let err = assign(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("repo-local identity overrides"), "{err}");
+        assert!(err.contains("widens"), "{err}");
+        assert!(manager.list().await.is_empty());
+        assert!(gate.log().entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_fails_closed_on_an_invalid_override_file() {
+        for (name, body, expect) in [
+            (
+                "ghost.toml",
+                card_with(r#""api/**""#, "none").replace("rust-implementer", "ghost"),
+                "no global identity",
+            ),
+            (
+                "rust-implementer.toml",
+                "not = [valid".to_string(),
+                "overrides",
+            ),
+            (
+                "auditor.toml",
+                card_with("", "none").replace("rust-implementer", "auditor"),
+                "protected",
+            ),
+        ] {
+            let repo = repo_with_origin("https://github.com/example/repo.git");
+            install_override(repo.path(), name, &body);
+            let manager = Arc::new(TaskManager::default());
+            let provider = writing_provider(&[]);
+            let gate = fixture_gate();
+            let err = assign(
+                &manager,
+                &provider,
+                &gate,
+                params(repo.path(), "rust-implementer", "Add a test."),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("repo-local identity overrides"),
+                "{name}: {err}"
+            );
+            assert!(err.contains(expect), "{name}: {err}");
+            assert!(manager.list().await.is_empty());
+            assert!(gate.log().entries().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_reads_overrides_from_the_tasks_repo_only() {
+        let narrowed = repo_with_origin("https://github.com/example/repo.git");
+        install_override(narrowed.path(), "rust-implementer.toml", fixture_override());
+        let plain = repo_with_origin("https://github.com/example/repo.git");
+        let result = run_writes(plain.path(), &["shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 0);
+        assert_eq!(result.files_modified, ["shared/b.rs"]);
     }
 
     #[tokio::test]
