@@ -2,23 +2,59 @@ use super::{DeliveryOutcome, DeliveryReceipt, Escalation, EscalationError, Escal
 use async_trait::async_trait;
 
 /// Posts [`Escalation::to_json`] to a configured URL for pager and chat
-/// integrations. Any 2xx response is a delivery.
-#[derive(Debug, Clone)]
+/// integrations. Any 2xx response is a delivery. The URL is a credential
+/// for most chat and pager hooks, so receipts, errors, logs and `Debug`
+/// carry only its scheme, host and port ([`origin`](Self::origin)); every
+/// request is bounded by a timeout.
+#[derive(Clone)]
 pub struct WebhookSink {
     http: reqwest::Client,
     url: String,
 }
 
+impl std::fmt::Debug for WebhookSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookSink")
+            .field("origin", &self.origin())
+            .finish_non_exhaustive()
+    }
+}
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn client(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+        .timeout(timeout)
+        .build()
+        .expect("a client with only timeouts configured always builds")
+}
+
 impl WebhookSink {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: client(REQUEST_TIMEOUT),
             url: url.into(),
         }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn origin(&self) -> String {
+        match reqwest::Url::parse(&self.url) {
+            Ok(url) if url.host_str().is_some() => {
+                let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+                if let Some(port) = url.port() {
+                    origin.push_str(&format!(":{port}"));
+                }
+                origin
+            }
+            _ => "<invalid-url>".to_string(),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = client(timeout);
+        self
     }
 }
 
@@ -36,18 +72,19 @@ impl EscalationSink for WebhookSink {
             .header(reqwest::header::USER_AGENT, "nanna-coder")
             .json(&payload)
             .send()
-            .await?;
+            .await
+            .map_err(|e| EscalationError::Http(e.without_url()))?;
         let status = response.status();
         if !status.is_success() {
             return Err(EscalationError::Status {
-                url: self.url.clone(),
+                origin: self.origin(),
                 status: status.as_u16(),
             });
         }
-        tracing::info!(url = %self.url, severity = %escalation.severity, "Escalation posted to webhook");
+        tracing::info!(origin = %self.origin(), severity = %escalation.severity, "Escalation posted to webhook");
         Ok(DeliveryReceipt {
             sink: self.name().to_string(),
-            reference: self.url.clone(),
+            reference: self.origin(),
             outcome: DeliveryOutcome::Posted,
         })
     }
@@ -136,13 +173,13 @@ mod tests {
     async fn posts_redacted_json_and_reports_non_success() {
         let (base, bodies, server) = capture_server().await;
         let sink = WebhookSink::new(format!("{base}/ok"));
-        assert_eq!(sink.url(), format!("{base}/ok"));
+        assert_eq!(sink.origin(), base);
         let receipt = sink.deliver(&escalation()).await.unwrap();
         assert_eq!(
             receipt,
             DeliveryReceipt {
                 sink: "webhook".into(),
-                reference: format!("{base}/ok"),
+                reference: base.clone(),
                 outcome: DeliveryOutcome::Posted
             }
         );
@@ -174,10 +211,7 @@ mod tests {
         let failing = WebhookSink::new(format!("{base}/boom"));
         let err = failing.deliver(&escalation()).await.unwrap_err();
         assert!(matches!(err, EscalationError::Status { status: 500, .. }));
-        assert_eq!(
-            err.to_string(),
-            format!("webhook {base}/boom returned HTTP 500")
-        );
+        assert_eq!(err.to_string(), format!("webhook {base} returned HTTP 500"));
         assert!(!bodies.lock().unwrap()[1].contains(TOKEN));
         server.abort();
 
@@ -185,5 +219,57 @@ mod tests {
         let err = unreachable.deliver(&escalation()).await.unwrap_err();
         assert!(matches!(err, EscalationError::Http(_)));
         assert!(err.to_string().starts_with("webhook request failed"));
+    }
+
+    const SECRET_PATH: &str = "T0P-S3CR3T-HOOK-PATH";
+
+    #[tokio::test]
+    async fn the_secret_webhook_url_never_reaches_a_receipt_error_or_debug_output() {
+        let (base, _bodies, server) = capture_server().await;
+
+        let ok = WebhookSink::new(format!("{base}/ok/{SECRET_PATH}"));
+        let receipt = ok.deliver(&escalation()).await.unwrap();
+        let rejected = WebhookSink::new(format!("{base}/boom/{SECRET_PATH}"));
+        let status = rejected.deliver(&escalation()).await.unwrap_err();
+        server.abort();
+        let unreachable = WebhookSink::new(format!("http://127.0.0.1:1/hook/{SECRET_PATH}"));
+        let transport = unreachable.deliver(&escalation()).await.unwrap_err();
+
+        let everything = format!(
+            "{receipt:?} {status} {status:?} {transport} {transport:?} {ok:?} {unreachable:?}"
+        );
+        assert!(!everything.contains(SECRET_PATH), "{everything}");
+        assert!(!everything.contains("/ok/"), "{everything}");
+        assert_eq!(receipt.reference, base);
+    }
+
+    #[tokio::test]
+    async fn a_hung_endpoint_is_cut_off_by_the_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ok", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let sink = WebhookSink::new(url).with_timeout(std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let err = sink.deliver(&escalation()).await.unwrap_err();
+        hold.abort();
+        assert!(matches!(err, EscalationError::Http(_)), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_unparsable_url_has_a_placeholder_origin() {
+        assert_eq!(WebhookSink::new("not a url").origin(), "<invalid-url>");
+        assert_eq!(
+            WebhookSink::new("https://hooks.example.com:8443/a/b?c=d").origin(),
+            "https://hooks.example.com:8443"
+        );
+        assert_eq!(
+            WebhookSink::new("https://hooks.example.com/a").origin(),
+            "https://hooks.example.com"
+        );
     }
 }

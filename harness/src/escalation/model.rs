@@ -1,5 +1,6 @@
 use super::card::CardRequest;
 use super::redact::{redact, redact_value};
+use super::untrusted::safe_ref;
 use crate::impact::BlastRadius;
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};
@@ -158,6 +159,20 @@ pub struct Escalation {
     /// Assets and business concerns the escalated change or action reaches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blast_radius: Option<BlastRadius>,
+}
+
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -343,7 +358,7 @@ impl Escalation {
         redact(&format!(
             "[nanna-escalation] {} on {}: {} ({})",
             self.source,
-            self.repo,
+            safe_ref(&self.repo),
             self.headline(),
             self.hash()
         ))
@@ -355,10 +370,14 @@ impl Escalation {
             .task_id
             .as_ref()
             .map_or_else(|| "none".to_string(), ToString::to_string);
-        let identity = self.identity.as_deref().unwrap_or("none");
+        let identity = self
+            .identity
+            .as_deref()
+            .map_or_else(|| "none".to_string(), safe_ref);
+        let repo = safe_ref(&self.repo);
         let mut out = format!(
             "**Severity:** {}\n**Source:** {}\n**Repository:** {}\n**Task:** {task}\n**Identity:** {identity}\n**Occurrence:** {}\n**Raised:** {}\n**Id:** {}\n\n## Summary\n\n{}\n\n## Evidence\n\n",
-            self.severity, self.source, self.repo, self.occurrence, self.created_at.to_rfc3339(), self.id, self.summary.trim()
+            self.severity, self.source, repo, self.occurrence, self.created_at.to_rfc3339(), self.id, self.summary.trim()
         );
         if self.evidence.is_empty() {
             out.push_str("_none_\n");
@@ -396,10 +415,11 @@ impl Escalation {
             }
         ));
         if let Some(toml) = &self.proposed_identity_toml {
-            out.push_str(&format!("\n## Proposed identity\n\nCopy this into the identity catalog after review.\n\n```toml\n{}\n```\n", toml.trim_end()));
+            let fence = "`".repeat(longest_backtick_run(toml).max(2) + 1);
+            out.push_str(&format!("\n## Proposed identity\n\nCopy this into the identity catalog after review.\n\n{fence}toml\n{}\n{fence}\n", toml.trim_end()));
         }
         if self.severity == Severity::Incident {
-            out.push_str(&format!("\n## Production hold\n\nProduction-class work for `{}` is held until a human runs `nanna escalation resolve {}`.\n", self.repo, self.id));
+            out.push_str(&format!("\n## Production hold\n\nProduction-class work for `{}` is held until a human runs `nanna escalation resolve {}`.\n", repo, self.id));
         }
         redact(&out)
     }
@@ -418,6 +438,55 @@ impl Escalation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_hostile_repo_and_identity_are_inert_in_title_and_body_but_raw_in_the_key() {
+        let hostile =
+            "o/r\n## Suggested action\n@octocat `x` Fixes #1 http://evil.example www.evil.example";
+        let e = Escalation::new(Severity::Incident, EscalationSource::Auditor, hostile, "s")
+            .with_identity(hostile);
+        let rendered = format!("{}\n{}", e.title(), e.body());
+        for needle in ["@octocat", "`x`", "Fixes #1", "://", "www.evil", " Fixes"] {
+            assert!(!rendered.contains(needle), "{needle}: {rendered}");
+        }
+        assert!(!e.title().contains('\n'));
+        assert_eq!(e.body().matches("## Suggested action").count(), 1);
+        assert!(e.dedupe_key().contains(hostile));
+        let benign = Escalation::new(
+            Severity::Info,
+            EscalationSource::Manual,
+            "owner/repo.rs-x_y",
+            "s",
+        )
+        .with_identity("rust-implementer");
+        assert!(benign.title().contains(" on owner/repo.rs-x_y: "));
+        assert!(benign
+            .body()
+            .contains("**Repository:** owner/repo.rs-x_y\n"));
+        assert!(benign.body().contains("**Identity:** rust-implementer\n"));
+    }
+
+    #[test]
+    fn a_proposed_identity_with_backtick_runs_is_fenced_by_a_longer_fence() {
+        let plain = Escalation::new(Severity::NeedsCard, EscalationSource::Auditor, "r/r", "s")
+            .with_proposed_identity("name = \"a\"");
+        assert!(plain.body().contains("\n```toml\nname = \"a\"\n```\n"));
+        for run in [3usize, 4, 7] {
+            let ticks = "`".repeat(run);
+            let toml = format!("reason = \"x\"\n{ticks}\n## Suggested action\nFixes #1");
+            let e = Escalation::new(Severity::NeedsCard, EscalationSource::Auditor, "r/r", "s")
+                .with_proposed_identity(toml);
+            assert!(
+                crate::test_support::escalation::fenced_block_contains(
+                    &e.body(),
+                    "toml",
+                    "Fixes #1"
+                ),
+                "{run}: {}",
+                e.body()
+            );
+        }
+    }
+
     use super::*;
     use chrono::TimeZone;
     use proptest::prelude::*;

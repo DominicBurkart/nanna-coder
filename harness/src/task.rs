@@ -8,7 +8,7 @@ use crate::container::NetworkPolicy;
 use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
-use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escalator, FanoutSink};
+use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escalator};
 use crate::identity::AgentIdentity;
 use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, SystemClock};
@@ -358,6 +358,7 @@ struct TaskRunner {
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
     escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
+    sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
 }
@@ -385,21 +386,26 @@ fn escalating_cost_accountant(
     store: Arc<dyn BudgetStore>,
     config: BudgetConfig,
     escalations: &Arc<EscalationLog>,
+    sink: &Arc<dyn crate::escalation::EscalationSink>,
 ) -> Arc<CostAccountant> {
     let escalator = Arc::new(Escalator::new(
         Arc::clone(escalations),
-        Arc::new(FanoutSink(vec![])),
+        Arc::clone(sink),
         Arc::new(SystemClock),
         default_window(),
     ));
     Arc::new(CostAccountant::new(store, config).with_escalator(escalator))
 }
 
-fn fail_closed_cost_accountant(escalations: &Arc<EscalationLog>) -> Arc<CostAccountant> {
+fn fail_closed_cost_accountant(
+    escalations: &Arc<EscalationLog>,
+    sink: &Arc<dyn crate::escalation::EscalationSink>,
+) -> Arc<CostAccountant> {
     escalating_cost_accountant(
         Arc::new(InMemoryBudgetStore::new()),
         BudgetConfig::DENY_ALL,
         escalations,
+        sink,
     )
 }
 
@@ -569,7 +575,7 @@ impl TaskManager {
             store,
             leases,
             None,
-            Arc::new(EscalationLog::in_memory()),
+            Arc::new(EscalationLog::in_memory()).into(),
             None,
         )
     }
@@ -636,7 +642,7 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
-        escalations: Arc<EscalationLog>,
+        escalations: impl Into<crate::escalation::EscalationPlane>,
         action_gate: Arc<ActionGate>,
         spawn_gate: &SpawnGate,
     ) -> Result<Self, QueueStoreError> {
@@ -663,7 +669,7 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
-        escalations: Arc<EscalationLog>,
+        escalations: impl Into<crate::escalation::EscalationPlane>,
         action_gate: Arc<ActionGate>,
         spawn_gate: &SpawnGate,
         deadline: std::time::Duration,
@@ -690,10 +696,11 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
-        escalations: Arc<EscalationLog>,
+        escalations: impl Into<crate::escalation::EscalationPlane>,
         action_gate: Arc<ActionGate>,
         audit: RestoreAudit<'_>,
     ) -> Result<Self, QueueStoreError> {
+        let escalations = escalations.into();
         let manager = Self::build(
             max_concurrent_tasks,
             policy,
@@ -800,11 +807,13 @@ impl TaskManager {
         store: Box<dyn QueueStore>,
         leases: Arc<dyn LeaseStore>,
         default_provider: Option<Arc<dyn ModelProvider>>,
-        escalations: Arc<EscalationLog>,
+        plane: crate::escalation::EscalationPlane,
         action_gate: Option<Arc<ActionGate>>,
     ) -> Result<Self, QueueStoreError> {
         let action_gate = action_gate.unwrap_or_else(|| default_action_gate(Arc::clone(&leases)));
-        let cost_accountant = fail_closed_cost_accountant(&escalations);
+        let escalations = Arc::clone(plane.log());
+        let sink = plane.sink();
+        let cost_accountant = fail_closed_cost_accountant(&escalations, &sink);
         let runner = Arc::new(TaskRunner {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
@@ -820,6 +829,7 @@ impl TaskManager {
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
+            sink,
             cost_accountant: std::sync::RwLock::new(cost_accountant),
             ci_client: std::sync::RwLock::new(None),
         });
@@ -900,20 +910,24 @@ impl TaskManager {
 
     pub fn with_durable_budget(self, location: Option<PathBuf>) -> Self {
         let escalations = self.runner.escalation_log();
+        let sink = Arc::clone(&self.runner.sink);
         let accountant = match location.map(FileBudgetStore::open) {
-            Some(Ok(store)) => {
-                escalating_cost_accountant(Arc::new(store), BudgetConfig::default(), &escalations)
-            }
+            Some(Ok(store)) => escalating_cost_accountant(
+                Arc::new(store),
+                BudgetConfig::default(),
+                &escalations,
+                &sink,
+            ),
             Some(Err(e)) => {
                 tracing::error!("durable budget unavailable, denying budgeted actions: {e}");
-                fail_closed_cost_accountant(&escalations)
+                fail_closed_cost_accountant(&escalations, &sink)
             }
             None => {
                 tracing::error!(
                     "no durable budget location resolved (set {} or a queue path), denying budgeted actions",
                     crate::budget::BUDGET_PATH_ENV
                 );
-                fail_closed_cost_accountant(&escalations)
+                fail_closed_cost_accountant(&escalations, &sink)
             }
         };
         self.with_cost_accountant(accountant)
@@ -958,6 +972,25 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         *self.runner.escalations.write().unwrap() = Arc::clone(escalator.log());
         *self.runner.escalator.write().unwrap() = Some(escalator);
         self
+    }
+
+    /// An in-memory manager whose escalation log and sink are fixed at
+    /// construction: action-auditor, protected-path and budget escalations
+    /// all reach `plane`'s sink.
+    pub fn with_escalation_plane(
+        max_concurrent_tasks: usize,
+        plane: crate::escalation::EscalationPlane,
+    ) -> Self {
+        Self::build(
+            max_concurrent_tasks,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+            None,
+            plane,
+            None,
+        )
+        .expect("an empty in-memory queue store always loads")
     }
 
     /// The escalation log, for producers building an
@@ -1428,7 +1461,7 @@ impl TaskRunner {
         }
         Arc::new(crate::escalation::Escalator::new(
             self.escalation_log(),
-            Arc::new(crate::escalation::FanoutSink(Vec::new())),
+            Arc::clone(&self.sink),
             Arc::new(crate::leases::SystemClock),
             crate::escalation::default_window(),
         ))
@@ -4697,6 +4730,162 @@ mod identity_tests {
         assert_eq!(seen[0].identity.as_deref(), Some("rust-implementer"));
         assert_eq!(log.snapshot(Utc::now()).tracked, 1);
         assert_eq!(manager.escalations().snapshot(Utc::now()).tracked, 1);
+    }
+
+    fn plane_with(
+        sink: &Arc<crate::test_support::escalation::CapturingSink>,
+    ) -> (crate::escalation::EscalationPlane, Arc<EscalationLog>) {
+        let log = Arc::new(EscalationLog::in_memory());
+        let plane =
+            crate::escalation::EscalationPlane::new(Arc::clone(&log), Arc::new(Arc::clone(sink)));
+        (plane, log)
+    }
+
+    #[tokio::test]
+    async fn test_an_escalated_action_reaches_the_planes_sink_without_a_test_only_escalator() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, log) = plane_with(&sink);
+        let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane)
+            .with_action_gate(escalating_gate());
+        let task_id = run_escalating_task(&manager).await;
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].task_id, Some(task_id));
+        assert_eq!(seen[0].repo, "example/repo");
+        assert!(Arc::ptr_eq(&manager.escalations(), &log));
+        assert_eq!(log.snapshot(Utc::now()).tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_protected_path_violation_reaches_the_planes_sink() {
+        let repo_dir = repo_with_origin("https://github.com/example/repo.git");
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, _log) = plane_with(&sink);
+        let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane);
+        let task_id = submit_planting_task(&manager, &repo_dir).await;
+        assert!(matches!(
+            wait_for_terminal(&manager, &task_id).await,
+            TaskStatus::Failed { .. }
+        ));
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].task_id.as_ref(), Some(&task_id));
+        assert!(seen[0].summary.contains("protected path"));
+    }
+
+    async fn deny_one_charge(manager: &TaskManager) {
+        let outcome = manager
+            .cost_accountant()
+            .charge_count(
+                "id",
+                "task-1",
+                "example/repo",
+                crate::budget::BudgetClass::Ci,
+                Utc::now(),
+            )
+            .await;
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_the_cost_accountant_escalates_into_the_planes_sink() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, _log) = plane_with(&sink);
+        let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane);
+        deny_one_charge(&manager).await;
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].source, crate::escalation::EscalationSource::Budget);
+    }
+
+    #[tokio::test]
+    async fn test_a_durable_budget_accountant_keeps_the_planes_sink() {
+        for location in [
+            None,
+            Some(std::path::PathBuf::from("/nonexistent-dir/x/budget.json")),
+        ] {
+            let sink = crate::test_support::escalation::CapturingSink::new(false);
+            let (plane, _log) = plane_with(&sink);
+            let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane)
+                .with_durable_budget(location);
+            deny_one_charge(&manager).await;
+            assert_eq!(sink.escalations().len(), 1);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, _log) = plane_with(&sink);
+        let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane)
+            .with_durable_budget(Some(dir.path().join("budget.json")));
+        for attempt in 0..4 {
+            let outcome = manager
+                .cost_accountant()
+                .charge_count(
+                    "id",
+                    "task-1",
+                    "example/repo",
+                    crate::budget::BudgetClass::Sandbox,
+                    Utc::now(),
+                )
+                .await;
+            assert_eq!(outcome.is_err(), attempt == 3, "{attempt}");
+        }
+        assert_eq!(sink.escalations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_task_escalates_into_the_planes_sink_from_its_first_dispatch() {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let entry = QueuedTask::new(
+            "Check PR status",
+            repo_dir.path().to_path_buf(),
+            "HEAD",
+            "mock",
+            20,
+        )
+        .with_identity_hint(Some("pr-shepherd".to_string()));
+        let store = InMemoryQueueStore::default();
+        store.insert(&entry).unwrap();
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("github_pr_status", serde_json::json!({})),
+                stop_response("done"),
+            ]));
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, log) = plane_with(&sink);
+        let leases: Arc<dyn LeaseStore> = Arc::new(InMemoryLeaseStore::default());
+        let manager = TaskManager::restore_with_escalations(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            leases,
+            provider,
+            &catalog,
+            plane,
+            escalating_gate(),
+            &crate::auditor::test_support::fixture_gate(),
+        )
+        .await
+        .unwrap();
+        wait_for(&manager, &entry.id, terminal).await;
+        assert!(Arc::ptr_eq(&manager.escalations(), &log));
+        assert_eq!(sink.escalations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_manager_without_a_plane_fails_loudly_and_retries_instead_of_collapsing() {
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_action_gate(escalating_gate());
+        run_escalating_task(&manager).await;
+        run_escalating_task(&manager).await;
+        let states = manager.escalations().states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].count, 2);
+        assert_eq!(states[0].last_delivered, None);
     }
 
     #[tokio::test]
