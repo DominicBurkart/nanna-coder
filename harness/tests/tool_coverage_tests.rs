@@ -19,7 +19,7 @@ use harness::tools::{
     sqlx_migrate_args, trunk_build_args, CalculatorTool, ReadFileTool, SqlxMigrateTool, Tool,
     ToolError, ToolRegistry, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -592,6 +592,7 @@ async fn cargo_deny_execute_no_check_arg_error_path() {
     assert!(matches!(err, ToolError::ExecutionFailed { .. }));
 }
 
+#[cfg(unix)]
 const FAKE_PODMAN_SCRIPT: &str = "#!/bin/sh\n\
 case \"$*\" in\n\
   *boom*) echo \"FAKE_PODMAN_FAILED $*\" >&2; exit 3 ;;\n\
@@ -600,6 +601,7 @@ echo \"FAKE_PODMAN $*\"\n\
 echo \"FAKE_PODMAN_STDERR\" >&2\n\
 exit 0\n";
 
+#[cfg(unix)]
 fn fake_podman_handle() -> Arc<ContainerHandle> {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
@@ -625,7 +627,8 @@ fn fake_podman_handle() -> Arc<ContainerHandle> {
     })
 }
 
-fn assert_fake_exec_output(result: &Value, argv: &str, command: &str) {
+#[cfg(unix)]
+fn assert_fake_exec_output(result: &serde_json::Value, argv: &str, command: &str) {
     assert_eq!(result["command"].as_str().unwrap(), command);
     assert_eq!(result["success"], json!(true));
     let stdout = result["stdout"].as_str().unwrap();
@@ -641,6 +644,7 @@ fn assert_fake_exec_output(result: &Value, argv: &str, command: &str) {
         .contains("FAKE_PODMAN_STDERR"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_build_execute_success_path_covered() {
     use harness::tools::CargoBuildTool;
@@ -656,6 +660,7 @@ async fn cargo_build_execute_success_path_covered() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_test_execute_success_path_covered() {
     use harness::tools::CargoTestTool;
@@ -667,6 +672,7 @@ async fn cargo_test_execute_success_path_covered() {
     assert_fake_exec_output(&result, "cargo test my_test", "cargo test my_test");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_check_execute_success_path_covered() {
     use harness::tools::CargoCheckTool;
@@ -678,6 +684,7 @@ async fn cargo_check_execute_success_path_covered() {
     assert_fake_exec_output(&result, "cargo check", "cargo check");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_bench_execute_success_path_covered() {
     use harness::tools::CargoBenchTool;
@@ -689,6 +696,7 @@ async fn cargo_bench_execute_success_path_covered() {
     assert_fake_exec_output(&result, "cargo bench bench_foo", "cargo bench bench_foo");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_run_execute_success_path_covered() {
     use harness::tools::CargoRunTool;
@@ -704,6 +712,7 @@ async fn cargo_run_execute_success_path_covered() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_deny_execute_success_path_covered() {
     use harness::tools::CargoDenyTool;
@@ -719,6 +728,7 @@ async fn cargo_deny_execute_success_path_covered() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_audit_execute_success_path_covered() {
     use harness::tools::CargoAuditTool;
@@ -730,6 +740,7 @@ async fn cargo_audit_execute_success_path_covered() {
     assert_fake_exec_output(&result, "cargo audit", "cargo audit");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_build_nonzero_exit_reports_failure_not_success() {
     use harness::tools::CargoBuildTool;
@@ -746,6 +757,7 @@ async fn cargo_build_nonzero_exit_reports_failure_not_success() {
         .contains("FAKE_PODMAN_FAILED"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_build_rejects_option_like_package() {
     use harness::tools::CargoBuildTool;
@@ -757,6 +769,7 @@ async fn cargo_build_rejects_option_like_package() {
     assert!(matches!(err, ToolError::InvalidArguments { .. }));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cargo_test_rejects_option_like_filter() {
     use harness::tools::CargoTestTool;
