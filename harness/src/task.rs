@@ -1707,6 +1707,7 @@ impl TaskRunner {
         }
 
         let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
+        workspace.bind_sandbox_pr(&layers.subject);
         let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
             Ok(registry) => registry,
             Err(e) => {
@@ -4557,6 +4558,66 @@ mod identity_tests {
             .any(|call| call.starts_with("rerun_workflow")));
         assert_eq!(result.budget, crate::budget::BudgetReport::default());
         assert_eq!(manager.escalation_snapshot().tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_tools_are_absent_from_a_dispatched_task_until_a_target_and_a_pr_are_bound(
+    ) {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("sandbox_deploy", serde_json::json!({"image_tag": "v1"})),
+                stop_response("done"),
+            ]));
+        let mut identity = ci_scoped_identity();
+        identity.scope.tools = vec!["sandbox_deploy".parse().unwrap()];
+        identity.scope.max_effect = EffectClass::Sandbox;
+        let task_id = manager
+            .submit_with_identity(
+                "Deploy".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert!(result.action_audit.is_empty());
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "sandbox_deploy");
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
+    }
+
+    #[test]
+    fn test_the_sandbox_pr_is_taken_from_the_action_subject_the_lease_is_keyed_by_and_nowhere_else()
+    {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let mut workspace = TaskWorkspace::create(repo.path(), "t-bindpr", "HEAD").unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let queued = queued(repo.path());
+        let identity = ci_scoped_identity();
+        let layers = manager.runner.model_facing_layers(
+            &TaskId("t-bindpr".to_string()),
+            &queued,
+            Some(&identity),
+        );
+        assert_eq!(layers.subject.pr, None);
+        workspace.bind_sandbox_pr(&layers.subject);
+        assert_eq!(workspace.sandbox_pr(), None);
+        let mut subject = layers.subject;
+        subject.pr = Some(41);
+        workspace.bind_sandbox_pr(&subject);
+        assert_eq!(workspace.sandbox_pr(), Some(41));
+        workspace.cleanup().unwrap();
     }
 
     #[tokio::test]
