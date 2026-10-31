@@ -33,6 +33,13 @@ const MAX_CAPABILITY_NAME: usize = 64;
 
 /// Translates a [`ResolvedAgent`] into a pi RPC launch plan.
 #[derive(Debug, Clone, Default)]
+/// ```
+/// use harness::harness_adapter::{HarnessAdapter, LaunchPlan, PiAdapter, ResolvedAgent, Unsupported};
+///
+/// fn plan(agent: &ResolvedAgent) -> Result<LaunchPlan, Unsupported> {
+///     PiAdapter.plan(agent)
+/// }
+/// ```
 pub struct PiAdapter;
 
 fn name_is_representable(name: &str) -> Result<(), String> {
@@ -97,6 +104,8 @@ impl HarnessAdapter for PiAdapter {
         .to_string();
 
         Ok(LaunchPlan {
+            agent: agent.name().to_string(),
+            model: agent.model().to_string(),
             image: agent.image().to_string(),
             files: vec![
                 file("models.json", models_json(agent)),

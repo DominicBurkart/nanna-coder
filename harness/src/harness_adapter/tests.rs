@@ -1,8 +1,13 @@
-use super::testing::{allowed_for, allowed_from_dir, scoped};
+use super::testing::{
+    allowed_for, allowed_for_repo, allowed_for_subtask, allowed_from_dir,
+    allowed_from_dir_for_repo, base_registry, calls, fail_with, ok_with, scoped, Behavior,
+    Counters, FixedVerdict,
+};
 use super::*;
 use crate::identity::AgentIdentity;
 use proptest::prelude::*;
 use std::path::Path;
+use std::sync::Arc;
 
 const SOCKET: &str = "/run/nanna/broker.sock";
 
@@ -13,6 +18,9 @@ struct Card<'a> {
     read_paths: &'a str,
     effect: &'a str,
     tools: &'a str,
+    iterations: &'a str,
+    repos: &'a str,
+    prompt: &'a str,
 }
 
 impl<'a> Card<'a> {
@@ -24,6 +32,9 @@ impl<'a> Card<'a> {
             read_paths: "",
             effect,
             tools,
+            iterations: "7",
+            repos: "[\"r\"]",
+            prompt: "Be careful.",
         }
     }
 
@@ -35,19 +46,27 @@ name = "{}"
 description = "d"
 loop = "inner"
 model = "{}"
-system_prompt = {{ inline = "Be careful." }}
+system_prompt = {{ inline = "{}" }}
 [scope]
-repos = ["r"]
+repos = {}
 paths = {}
 {}
 max_effect = "{}"
 tools = [{}]
 [limits]
-max_iterations = 7
+max_iterations = {}
 max_wall_clock_secs = 9
 max_concurrent = 2
 "#,
-            self.name, self.model, self.paths, self.read_paths, self.effect, self.tools
+            self.name,
+            self.model,
+            self.prompt,
+            self.repos,
+            self.paths,
+            self.read_paths,
+            self.effect,
+            self.tools,
+            self.iterations
         );
         AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
     }
@@ -1115,4 +1134,1583 @@ fn capability_names_may_not_contain_uppercase_after_the_first_character() {
         let err = PiAdapter.plan(&a).unwrap_err();
         assert!(matches!(err, Unsupported::CapabilityName { .. }), "{name}");
     }
+}
+
+fn specs_of(tools: &[(&str, EffectClass, Behavior)]) -> Vec<CapabilitySpec> {
+    tools
+        .iter()
+        .map(|(n, e, _)| {
+            CapabilitySpec::new(
+                *n,
+                format!("{n} tool"),
+                serde_json::json!({"type": "object"}),
+                *e,
+            )
+        })
+        .collect()
+}
+
+struct Parts {
+    allowed: crate::auditor::Allowed,
+    agent: ResolvedAgent,
+    plan: CheckedPlan,
+    counters: Counters,
+    sink: Arc<RingAuditSink>,
+}
+
+impl Parts {
+    fn reported(&self) -> Vec<String> {
+        self.plan.exposed_capabilities.clone()
+    }
+}
+
+fn build_with(
+    card: &Card,
+    tools: Vec<(&str, EffectClass, Behavior)>,
+    policy: BrokerPolicy,
+) -> (Broker, Parts) {
+    let identity = card.identity();
+    let allowed = allowed_for(&identity);
+    let grant = scoped(allowed.identity(), &specs_of(&tools));
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let plan = launch_plan(&PiAdapter, &agent).unwrap();
+    let (registry, counters) = base_registry(tools);
+    let bound = BoundWorkspace::for_test(registry.scoped_for(allowed.identity()), &allowed, &agent);
+    let sink = Arc::new(RingAuditSink::default());
+    let broker = Broker::for_agent(&allowed, &agent, bound, policy, sink.clone()).unwrap();
+    (
+        broker,
+        Parts {
+            allowed,
+            agent,
+            plan,
+            counters,
+            sink,
+        },
+    )
+}
+
+fn armed_with(
+    card: &Card,
+    tools: Vec<(&str, EffectClass, Behavior)>,
+    policy: BrokerPolicy,
+) -> (ArmedBroker, Parts) {
+    let (broker, parts) = build_with(card, tools, policy);
+    let armed = broker.arm(&parts.plan, &parts.reported()).unwrap();
+    (armed, parts)
+}
+
+fn armed(tools: Vec<(&str, EffectClass, Behavior)>) -> (ArmedBroker, Parts) {
+    armed_with(
+        &Card::new("\"*\"", "workspace"),
+        tools,
+        BrokerPolicy::default(),
+    )
+}
+
+fn req(tool: &str) -> BrokerRequest {
+    BrokerRequest {
+        tool: tool.to_string(),
+        args: serde_json::json!({"k": 1}),
+    }
+}
+
+fn kind_of(outcome: &BrokerOutcome) -> Option<ToolErrorKind> {
+    match outcome {
+        BrokerOutcome::ToolError { kind, .. } => Some(*kind),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_documented_limits_are_pinned() {
+    assert_eq!(MAX_OUTPUT_BYTES, 1_000_000);
+    assert_eq!(MAX_REQUEST_BYTES, 1_048_576);
+    assert_eq!(BrokerPolicy::default().max_effect(), EffectClass::Workspace);
+}
+
+#[test]
+fn arming_requires_the_runtime_to_report_exactly_the_planned_tools() {
+    let tools = vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(1)),
+        ),
+        ("search", EffectClass::None, ok_with(serde_json::json!(2))),
+    ];
+    let extra = vec![
+        "read_file".to_string(),
+        "search".to_string(),
+        "bash".to_string(),
+    ];
+    let (broker, parts) = build_with(
+        &Card::new("\"*\"", "workspace"),
+        tools,
+        BrokerPolicy::default(),
+    );
+    let err = broker.arm(&parts.plan, &extra).err().unwrap();
+    assert!(matches!(err, ArmError::Handshake(_)));
+    assert!(err.to_string().contains("bash"));
+    let tools = vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(1)),
+        ),
+        ("search", EffectClass::None, ok_with(serde_json::json!(2))),
+    ];
+    let (broker, parts) = build_with(
+        &Card::new("\"*\"", "workspace"),
+        tools,
+        BrokerPolicy::default(),
+    );
+    let missing = vec!["read_file".to_string()];
+    assert!(matches!(
+        broker.arm(&parts.plan, &missing),
+        Err(ArmError::Handshake(_))
+    ));
+}
+
+#[test]
+fn arming_refuses_a_plan_built_for_another_agent_or_task() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(1)),
+            ),
+            ("search", EffectClass::None, ok_with(serde_json::json!(2))),
+        ]
+    };
+    let base = Card::new("\"*\"", "workspace");
+    let plan_for = |card: &Card,
+                    repo: &str,
+                    socket: &str,
+                    image: &str,
+                    tools: Vec<(&str, EffectClass, Behavior)>| {
+        let identity = card.identity();
+        let allowed = allowed_for_repo(&identity, repo);
+        let grant = scoped(allowed.identity(), &specs_of(&tools));
+        let agent =
+            ResolvedAgent::resolve(&allowed, &grant, gateway(), image, socket.into()).unwrap();
+        launch_plan(&PiAdapter, &agent).unwrap()
+    };
+    let repo = "github.com/example/repo";
+    let other_agent = Card {
+        name: "other",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let other_limits = Card {
+        iterations: "8",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let other_model = Card {
+        model: "other-model",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let other_scope = Card {
+        paths: "[\"api/**\"]",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let cases: Vec<(&str, CheckedPlan)> = vec![
+        (
+            "agent",
+            plan_for(&other_agent, repo, SOCKET, "nanna-agent:pi", tools()),
+        ),
+        (
+            "audited repository",
+            plan_for(
+                &base,
+                "github.com/example/other",
+                SOCKET,
+                "nanna-agent:pi",
+                tools(),
+            ),
+        ),
+        (
+            "model",
+            plan_for(&other_model, repo, SOCKET, "nanna-agent:pi", tools()),
+        ),
+        (
+            "image",
+            plan_for(&base, repo, SOCKET, "nanna-agent:other", tools()),
+        ),
+        (
+            "limits",
+            plan_for(&other_limits, repo, SOCKET, "nanna-agent:pi", tools()),
+        ),
+        (
+            "scope",
+            plan_for(&other_scope, repo, SOCKET, "nanna-agent:pi", tools()),
+        ),
+        (
+            "broker socket",
+            plan_for(
+                &base,
+                repo,
+                "/run/nanna/other.sock",
+                "nanna-agent:pi",
+                tools(),
+            ),
+        ),
+        (
+            "capabilities",
+            plan_for(
+                &base,
+                repo,
+                SOCKET,
+                "nanna-agent:pi",
+                tools().into_iter().take(1).collect(),
+            ),
+        ),
+    ];
+    for (field, plan) in cases {
+        let (broker, parts) = build_with(&base, tools(), BrokerPolicy::default());
+        let err = broker.arm(&plan, &parts.reported()).err().unwrap();
+        assert!(
+            matches!(err, ArmError::PlanMismatch { field: f } if f == field),
+            "{field}: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("plan does not belong to this broker: {field} differs")
+        );
+    }
+    let (broker, parts) = build_with(&base, tools(), BrokerPolicy::default());
+    assert!(broker.arm(&parts.plan, &parts.reported()).is_ok());
+}
+
+#[test]
+fn a_plan_exposing_capabilities_above_the_policy_cannot_arm() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(0)),
+            ),
+            (
+                "git_push",
+                EffectClass::Repository,
+                ok_with(serde_json::json!(1)),
+            ),
+            ("trigger_ci", EffectClass::Ci, ok_with(serde_json::json!(2))),
+            (
+                "deploy_prod",
+                EffectClass::Production,
+                ok_with(serde_json::json!(3)),
+            ),
+        ]
+    };
+    for (ceiling, unserved) in [
+        ("repository", vec!["git_push"]),
+        ("ci", vec!["git_push", "trigger_ci"]),
+        ("production", vec!["deploy_prod", "git_push", "trigger_ci"]),
+    ] {
+        let (broker, parts) = build_with(
+            &Card::new("\"*\"", ceiling),
+            tools(),
+            BrokerPolicy::default(),
+        );
+        assert_eq!(broker.served(), vec!["read_file"], "{ceiling}");
+        match broker.arm(&parts.plan, &parts.reported()).err().unwrap() {
+            ArmError::ExposedNotServed { names } => assert_eq!(names, unserved, "{ceiling}"),
+            other => panic!("{ceiling}: {other:?}"),
+        }
+        assert_eq!(calls(&parts.counters, "git_push"), 0);
+    }
+    let (broker, parts) = build_with(
+        &Card::new("\"*\"", "ci"),
+        tools(),
+        BrokerPolicy::new(EffectClass::Ci),
+    );
+    assert!(BrokerPolicy::new(EffectClass::Ci).admits(EffectClass::Ci));
+    assert!(!BrokerPolicy::new(EffectClass::Ci).admits(EffectClass::Sandbox));
+    assert_eq!(broker.served(), vec!["git_push", "read_file", "trigger_ci"]);
+    assert!(broker.arm(&parts.plan, &parts.reported()).is_ok());
+}
+
+#[tokio::test]
+async fn granted_calls_run_and_ungranted_calls_never_reach_the_tool() {
+    let (broker, parts) = armed(vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!("body")),
+        ),
+        (
+            "write_file",
+            EffectClass::Workspace,
+            ok_with(serde_json::json!("w")),
+        ),
+    ]);
+    assert_eq!(
+        broker.handle(req("read_file")).await,
+        BrokerOutcome::Output(serde_json::json!("body"))
+    );
+    assert_eq!(calls(&parts.counters, "read_file"), 1);
+    let unknown = broker.handle(req("bash")).await;
+    assert_eq!(kind_of(&unknown), Some(ToolErrorKind::NotGranted));
+    for name in [
+        "READ_FILE",
+        "read_file ",
+        "read_file\0",
+        "",
+        "a/../read_file",
+    ] {
+        let outcome = broker.handle(req(name)).await;
+        assert_eq!(
+            kind_of(&outcome),
+            Some(ToolErrorKind::NotGranted),
+            "{name:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_narrower_identity_is_not_served_what_only_the_global_one_holds() {
+    let tools = vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!("body")),
+        ),
+        (
+            "write_file",
+            EffectClass::Workspace,
+            ok_with(serde_json::json!("w")),
+        ),
+    ];
+    let (broker, parts) = armed_with(
+        &Card::new("\"read_file\"", "workspace"),
+        tools,
+        BrokerPolicy::default(),
+    );
+    assert_eq!(parts.plan.exposed_capabilities, vec!["read_file"]);
+    let outcome = broker.handle(req("write_file")).await;
+    assert_eq!(kind_of(&outcome), Some(ToolErrorKind::NotGranted));
+    assert_eq!(calls(&parts.counters, "write_file"), 0);
+}
+
+#[tokio::test]
+async fn tool_errors_map_to_kinds_and_the_production_hold_halts_the_task() {
+    use crate::protected::ProtectedPathViolation;
+    use crate::scope::{DenialReason, ScopeDenial};
+    use crate::tools::ToolError;
+    let tools = vec![
+        (
+            "t_args",
+            EffectClass::None,
+            fail_with(|| ToolError::InvalidArguments {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_exec",
+            EffectClass::None,
+            fail_with(|| ToolError::ExecutionFailed {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_nf",
+            EffectClass::None,
+            fail_with(|| ToolError::NotFound { name: "n".into() }),
+        ),
+        (
+            "t_ser",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::Serialization(
+                    serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                )
+            }),
+        ),
+        (
+            "t_path",
+            EffectClass::None,
+            fail_with(|| ToolError::PathSecurityViolation {
+                message: "m".into(),
+            }),
+        ),
+        (
+            "t_scope",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ScopeDenied(ScopeDenial {
+                    identity: "a".into(),
+                    tool: "t_scope".into(),
+                    reason: DenialReason::ToolNotInScope,
+                })
+            }),
+        ),
+        (
+            "t_prot",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ProtectedPath(ProtectedPathViolation {
+                    path: ".nanna/x".into(),
+                    rule: "r".into(),
+                })
+            }),
+        ),
+        (
+            "t_io",
+            EffectClass::None,
+            fail_with(|| ToolError::Io(std::io::Error::other("io"))),
+        ),
+        (
+            "t_held",
+            EffectClass::None,
+            fail_with(|| ToolError::ProductionHeld {
+                repo: "r".into(),
+                escalation_id: "e1".into(),
+                summary: "down".into(),
+            }),
+        ),
+        (
+            "t_ok",
+            EffectClass::None,
+            ok_with(serde_json::json!("fine")),
+        ),
+    ];
+    let (broker, parts) = armed(tools);
+    let expect = [
+        ("t_args", ToolErrorKind::InvalidArguments),
+        ("t_exec", ToolErrorKind::ExecutionFailed),
+        ("t_nf", ToolErrorKind::NotFound),
+        ("t_ser", ToolErrorKind::ExecutionFailed),
+        ("t_path", ToolErrorKind::PathSecurity),
+        ("t_scope", ToolErrorKind::ScopeDenied),
+        ("t_prot", ToolErrorKind::ProtectedPath),
+        ("t_io", ToolErrorKind::ExecutionFailed),
+    ];
+    for (tool, kind) in expect {
+        match broker.handle(req(tool)).await {
+            BrokerOutcome::ToolError { kind: got, message } => {
+                assert_eq!(got, kind, "{tool}");
+                assert!(!message.is_empty());
+            }
+            other => panic!("{tool}: {other:?}"),
+        }
+    }
+    assert!(!broker.is_halted());
+    let held = broker.handle(req("t_held")).await;
+    assert_eq!(
+        held,
+        BrokerOutcome::Halt(HaltReason::ProductionHeld {
+            repo: "r".into(),
+            escalation_id: "e1".into(),
+            summary: "down".into()
+        })
+    );
+    assert!(broker.is_halted());
+    assert_eq!(
+        parts.sink.entries().pop().unwrap().outcome,
+        AuditOutcome::Halt
+    );
+    let reply = held.to_response();
+    assert!(reply.halt && !reply.ok && reply.kind.is_none());
+    let text = reply.output.as_str().unwrap();
+    assert_eq!(text, "the task was halted by the host");
+    for secret in ["incident", "e1", "down", "r"] {
+        if secret.len() > 1 {
+            assert!(!text.contains(secret), "{secret}");
+        }
+    }
+    let after = broker.handle(req("t_ok")).await;
+    assert_eq!(kind_of(&after), Some(ToolErrorKind::TaskHalted));
+    assert_eq!(calls(&parts.counters, "t_ok"), 0);
+}
+
+#[tokio::test]
+async fn output_over_the_cap_is_replaced_by_an_error_measured_in_bytes() {
+    let at_cap = "a".repeat(MAX_OUTPUT_BYTES - 2);
+    let over_cap = "a".repeat(MAX_OUTPUT_BYTES - 1);
+    let multibyte = "é".repeat(MAX_OUTPUT_BYTES / 2);
+    assert!(multibyte.chars().count() < MAX_OUTPUT_BYTES);
+    let (broker, parts) = armed(vec![
+        (
+            "at_cap",
+            EffectClass::None,
+            ok_with(serde_json::json!(at_cap)),
+        ),
+        (
+            "over_cap",
+            EffectClass::None,
+            ok_with(serde_json::json!(over_cap)),
+        ),
+        (
+            "multibyte",
+            EffectClass::None,
+            ok_with(serde_json::json!(multibyte)),
+        ),
+    ]);
+    assert!(matches!(
+        broker.handle(req("at_cap")).await,
+        BrokerOutcome::Output(_)
+    ));
+    let over = broker.handle(req("over_cap")).await;
+    assert_eq!(kind_of(&over), Some(ToolErrorKind::ReplyTooLarge));
+    let wide = broker.handle(req("multibyte")).await;
+    assert_eq!(kind_of(&wide), Some(ToolErrorKind::ReplyTooLarge));
+    assert_eq!(calls(&parts.counters, "over_cap"), 1);
+    assert_eq!(
+        parts.sink.entries()[1].outcome,
+        AuditOutcome::Error(ToolErrorKind::ReplyTooLarge)
+    );
+}
+
+#[tokio::test]
+async fn wire_lines_round_trip_and_bad_or_oversized_requests_are_not_logged() {
+    let (broker, parts) = armed(vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!({"n": 1})),
+    )]);
+    let ok: serde_json::Value = serde_json::from_str(
+        &broker
+            .handle_line(r#"{"tool":"read_file","args":{}}"#)
+            .await,
+    )
+    .unwrap();
+    assert_eq!(
+        ok,
+        serde_json::json!({"ok": true, "output": {"n": 1}, "halt": false})
+    );
+    let no_args: serde_json::Value =
+        serde_json::from_str(&broker.handle_line(r#"{"tool":"read_file"}"#).await).unwrap();
+    assert_eq!(no_args["ok"], true);
+    for bad in ["not json", r#"{"args":{}}"#, ""] {
+        let reply: serde_json::Value =
+            serde_json::from_str(&broker.handle_line(bad).await).unwrap();
+        assert_eq!(reply["ok"], false, "{bad}");
+        assert_eq!(reply["kind"], "bad_request", "{bad}");
+        assert_eq!(reply["halt"], false);
+    }
+    let prefix = r#"{"tool":"read_file","args":""#;
+    let suffix = r#""}"#;
+    let pad = |total: usize| "a".repeat(total - prefix.len() - suffix.len());
+    let at_cap = format!("{prefix}{}{suffix}", pad(MAX_REQUEST_BYTES));
+    assert_eq!(at_cap.len(), MAX_REQUEST_BYTES);
+    let accepted: serde_json::Value =
+        serde_json::from_str(&broker.handle_line(&at_cap).await).unwrap();
+    assert_eq!(accepted["ok"], true);
+    let over = format!("{prefix}{}{suffix}", pad(MAX_REQUEST_BYTES + 1));
+    let rejected: serde_json::Value =
+        serde_json::from_str(&broker.handle_line(&over).await).unwrap();
+    assert_eq!(rejected["kind"], "bad_request");
+    assert_eq!(rejected["output"], "request too large");
+    assert_eq!(parts.sink.entries().len(), 3);
+    let refused: serde_json::Value =
+        serde_json::from_str(&broker.handle_line(r#"{"tool":"bash"}"#).await).unwrap();
+    assert_eq!(refused["kind"], "not_granted");
+}
+
+#[tokio::test]
+async fn audit_records_hold_sizes_and_fingerprints_not_content_and_are_bounded() {
+    let (broker, parts) = armed(vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!("body")),
+    )]);
+    let secret = "hunter2-SECRET-TOKEN";
+    let args = serde_json::json!({"path": secret});
+    let call = |tool: &str, args: &serde_json::Value| BrokerRequest {
+        tool: tool.to_string(),
+        args: args.clone(),
+    };
+    broker.handle(call("read_file", &args)).await;
+    broker.handle(call("evil\nname\u{1b}[31m", &args)).await;
+    let long = "x".repeat(500);
+    broker.handle(call(&long, &args)).await;
+    let records = parts.sink.entries();
+    assert_eq!(records.len(), 3);
+    let text = format!("{records:?}");
+    assert!(!text.contains(secret));
+    let text_args = args.to_string();
+    assert_eq!(records[0].args_bytes, text_args.len());
+    assert_eq!(
+        records[0].args_fingerprint,
+        crate::auditor::content_hash(&text_args)
+    );
+    assert_eq!(records[0].effect, Some(EffectClass::None));
+    assert_eq!(records[0].outcome, AuditOutcome::Ok);
+    assert_eq!(records[1].tool, "evil\\nname\\u{1b}[31m");
+    assert_eq!(records[1].effect, None);
+    assert_eq!(records[2].tool.len(), 128);
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.started, i as u64);
+        assert_eq!(record.completed, i as u64);
+    }
+}
+
+#[test]
+fn the_ring_sink_drops_the_oldest_and_counts_drops() {
+    let record = |n: u64| CallRecord {
+        started: n,
+        completed: n,
+        tool: format!("t{n}"),
+        args_bytes: 0,
+        args_fingerprint: String::new(),
+        effect: None,
+        outcome: AuditOutcome::Ok,
+    };
+    let sink = RingAuditSink::new(2);
+    for n in 0..5 {
+        sink.record(record(n));
+    }
+    let kept: Vec<u64> = sink.entries().iter().map(|r| r.started).collect();
+    assert_eq!(kept, vec![3, 4]);
+    assert_eq!(sink.dropped(), 3);
+    let tiny = RingAuditSink::new(0);
+    tiny.record(record(1));
+    assert_eq!(tiny.dropped(), 0);
+    tiny.record(record(2));
+    assert_eq!(tiny.entries().len(), 1);
+    assert_eq!(tiny.dropped(), 1);
+    let default = RingAuditSink::default();
+    for n in 0..10_001 {
+        default.record(record(n));
+    }
+    assert_eq!(default.entries().len(), 10_000);
+    assert_eq!(default.dropped(), 1);
+}
+
+#[test]
+fn building_refuses_an_agent_that_differs_from_the_audit() {
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        )]
+    };
+    let (_, parts) = build_with(
+        &Card::new("\"*\"", "workspace"),
+        tools(),
+        BrokerPolicy::default(),
+    );
+    let attempts: Vec<(&str, Card, &str)> = vec![
+        (
+            "name",
+            Card {
+                name: "other",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "scope",
+            Card {
+                paths: "[\"api/**\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "read paths",
+            Card {
+                read_paths: "read_paths = [\"**\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "repos",
+            Card {
+                repos: "[\"r\", \"s\"]",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "github.com/example/repo",
+        ),
+        (
+            "ceiling",
+            Card::new("\"*\"", "none"),
+            "github.com/example/repo",
+        ),
+        (
+            "repo",
+            Card::new("\"*\"", "workspace"),
+            "github.com/example/other",
+        ),
+    ];
+    for (label, card, repo) in attempts {
+        let other_allowed = allowed_for_repo(&card.identity(), repo);
+        let (registry, _) = base_registry(tools());
+        let bound = BoundWorkspace::for_test(
+            registry.scoped_for(other_allowed.identity()),
+            &other_allowed,
+            &parts.agent,
+        );
+        let result = Broker::for_agent(
+            &other_allowed,
+            &parts.agent,
+            bound,
+            BrokerPolicy::default(),
+            Arc::new(RingAuditSink::default()),
+        );
+        let err = result.err().unwrap_or_else(|| panic!("{label} accepted"));
+        assert!(
+            matches!(err, BrokerError::IdentityMismatch { .. }),
+            "{label}"
+        );
+        assert!(err
+            .to_string()
+            .contains("does not match the resolved agent"));
+    }
+    let _ = &parts.allowed;
+}
+
+#[test]
+fn a_registry_must_offer_exactly_the_agents_capabilities_and_effects() {
+    use super::bind::registry_matches;
+    let card = Card::new("\"*\"", "workspace");
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(0)),
+            ),
+            (
+                "write_file",
+                EffectClass::Workspace,
+                ok_with(serde_json::json!(0)),
+            ),
+        ]
+    };
+    let (_, parts) = build_with(&card, tools(), BrokerPolicy::default());
+    let build = |tools: Vec<(&str, EffectClass, Behavior)>| base_registry(tools).0;
+    assert!(registry_matches(&parts.agent, &build(tools())).is_ok());
+    let extra = vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        ),
+        (
+            "write_file",
+            EffectClass::Workspace,
+            ok_with(serde_json::json!(0)),
+        ),
+        ("bash", EffectClass::None, ok_with(serde_json::json!(0))),
+    ];
+    let err = registry_matches(&parts.agent, &build(extra)).unwrap_err();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "bash"));
+    let missing = vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!(0)),
+    )];
+    let err = registry_matches(&parts.agent, &build(missing)).unwrap_err();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "write_file"));
+    let effect = vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        ),
+        (
+            "write_file",
+            EffectClass::Production,
+            ok_with(serde_json::json!(0)),
+        ),
+    ];
+    let err = registry_matches(&parts.agent, &build(effect)).unwrap_err();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "write_file"));
+    assert_eq!(
+        err.to_string(),
+        "workspace registry differs from the agent's capabilities at `write_file`"
+    );
+}
+
+fn layers_with(
+    verdict: crate::action_auditor::ActionVerdict,
+) -> (
+    crate::task::ModelFacingLayers,
+    Arc<crate::escalation::EscalationLog>,
+) {
+    let log = Arc::new(crate::escalation::EscalationLog::in_memory());
+    let layers = crate::task::ModelFacingLayers {
+        escalation_log: Arc::clone(&log),
+        action_gate: Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(FixedVerdict(verdict)),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        )),
+        action_escalator: Arc::new(crate::escalation::Escalator::new(
+            Arc::clone(&log),
+            Arc::new(crate::escalation::FanoutSink(Vec::new())),
+            Arc::new(crate::leases::SystemClock),
+            crate::escalation::default_window(),
+        )),
+        subject: crate::tools::ActionSubject {
+            task_id: crate::task::TaskId("t-broker".to_string()),
+            max_effect: EffectClass::Workspace,
+            window: None,
+            repo: "example/repo".to_string(),
+            branch: None,
+            pr: None,
+            environment: None,
+            paths: vec![],
+            description: "d".to_string(),
+        },
+    };
+    (layers, log)
+}
+
+fn layers_allowing() -> crate::task::ModelFacingLayers {
+    layers_with(crate::action_auditor::ActionVerdict::Allow).0
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+fn repo_with_origin(url: &str) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(dir.path().join("api")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("README.md"), "# r").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "init"]);
+    git(dir.path(), &["remote", "add", "origin", url]);
+    dir
+}
+
+#[tokio::test]
+async fn bound_to_a_real_workspace_an_out_of_path_write_is_refused_end_to_end() {
+    use crate::workspace::TaskWorkspace;
+    let _path = crate::test_support::hold_path_async().await;
+    let repo = repo_with_origin("https://github.com/example/repo.git");
+    let mut workspace = TaskWorkspace::create(repo.path(), "t-e2e", "HEAD").unwrap();
+
+    let local = Card {
+        paths: "[\"api/**\"]",
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"write_file\"", "workspace")
+    };
+    let identity = local.identity();
+    let allowed = allowed_for(&identity);
+    let grant = ScopedCapabilities::scope(
+        workspace
+            .build_tool_registry_for(allowed.identity())
+            .unwrap(),
+        allowed.identity(),
+    );
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    assert_eq!(agent.capability_names(), vec!["write_file"]);
+
+    let global = Card {
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"*\"", "workspace")
+    };
+    let global_allowed = allowed_for(&global.identity());
+    let err = agent
+        .bind_workspace(&global_allowed, &workspace, layers_allowing())
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::AgentMismatch));
+
+    let empty = scoped(allowed.identity(), &[]);
+    let hollow =
+        ResolvedAgent::resolve(&allowed, &empty, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let err = hollow
+        .bind_workspace(&allowed, &workspace, layers_allowing())
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "write_file"));
+
+    let bound = agent
+        .bind_workspace(&allowed, &workspace, layers_allowing())
+        .unwrap();
+    let sink = Arc::new(RingAuditSink::default());
+    let broker = Broker::for_agent(&allowed, &agent, bound, BrokerPolicy::default(), sink).unwrap();
+    let plan = launch_plan(&PiAdapter, &agent).unwrap();
+    let armed = broker
+        .arm(&plan, &plan.exposed_capabilities.clone())
+        .unwrap();
+
+    let denied = armed
+        .handle(BrokerRequest {
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "src/x.rs", "content": "x"}),
+        })
+        .await;
+    assert_eq!(kind_of(&denied), Some(ToolErrorKind::ScopeDenied));
+    assert!(!workspace.workspace_path.join("src/x.rs").exists());
+    let written = armed
+        .handle(BrokerRequest {
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "api/x.rs", "content": "x"}),
+        })
+        .await;
+    assert!(matches!(written, BrokerOutcome::Output(_)));
+    assert!(workspace.workspace_path.join("api/x.rs").exists());
+
+    let other = repo_with_origin("https://github.com/example/other.git");
+    let other_workspace = TaskWorkspace::create(other.path(), "t-other", "HEAD").unwrap();
+    let err = agent
+        .bind_workspace(&allowed, &other_workspace, layers_allowing())
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::RepoMismatch { .. }));
+    assert!(err.to_string().contains("is not the audited repository"));
+
+    let outside = Card::new("\"write_file\"", "workspace");
+    let outside_allowed = allowed_for(&outside.identity());
+    let outside_grant = ScopedCapabilities::scope(
+        workspace
+            .build_tool_registry_for(outside_allowed.identity())
+            .unwrap(),
+        outside_allowed.identity(),
+    );
+    let outside_agent = ResolvedAgent::resolve(
+        &outside_allowed,
+        &outside_grant,
+        gateway(),
+        "nanna-agent:pi",
+        SOCKET.into(),
+    )
+    .unwrap();
+    let err = outside_agent
+        .bind_workspace(&outside_allowed, &workspace, layers_allowing())
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::Scope(_)), "{err}");
+
+    let mut other_workspace = other_workspace;
+    other_workspace.cleanup().unwrap();
+    workspace.cleanup().unwrap();
+}
+
+#[test]
+fn a_plan_naming_another_agent_or_model_is_rejected_by_the_policy() {
+    let (a, base) = checked_plan();
+    let mut plan = base.clone();
+    plan.agent = "someone-else".into();
+    assert_eq!(
+        first_violation(&plan, &a),
+        Some(IsolationViolation::AgentChanged {
+            plan: "someone-else".into(),
+            agent: "a".into()
+        })
+    );
+    assert_eq!(
+        IsolationViolation::AgentChanged {
+            plan: "x".into(),
+            agent: "y".into()
+        }
+        .to_string(),
+        "plan agent `x` differs from the agent `y`"
+    );
+    let mut plan = base;
+    plan.model = "other".into();
+    assert_eq!(
+        first_violation(&plan, &a),
+        Some(IsolationViolation::ModelChanged {
+            plan: "other".into(),
+            agent: "gemma4:e4b".into()
+        })
+    );
+    assert_eq!(
+        IsolationViolation::ModelChanged {
+            plan: "x".into(),
+            agent: "y".into()
+        }
+        .to_string(),
+        "plan model `x` differs from the agent model `y`"
+    );
+}
+
+#[tokio::test]
+async fn action_denials_map_to_a_typed_error_or_a_halt() {
+    use crate::action_auditor::ActionDenied;
+    use crate::auditor::{Reason, ReasonCode};
+    use crate::tools::ToolError;
+    let reason = || Reason::new(ReasonCode::Other, "needs a human");
+    let tools = vec![
+        (
+            "t_block",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ActionDenied(ActionDenied::Block {
+                    reasons: vec![Reason::new(ReasonCode::Other, "needs a human")],
+                })
+            }),
+        ),
+        (
+            "t_escalate",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ActionDenied(ActionDenied::Escalate {
+                    reasons: vec![Reason::new(ReasonCode::Other, "needs a human")],
+                })
+            }),
+        ),
+        (
+            "t_ok",
+            EffectClass::None,
+            ok_with(serde_json::json!("fine")),
+        ),
+    ];
+    let (broker, parts) = armed(tools);
+    let blocked = broker.handle(req("t_block")).await;
+    assert_eq!(kind_of(&blocked), Some(ToolErrorKind::ActionBlocked));
+    assert!(!broker.is_halted());
+    assert_eq!(
+        serde_json::to_value(ToolErrorKind::ActionBlocked).unwrap(),
+        "action_blocked"
+    );
+    let escalated = broker.handle(req("t_escalate")).await;
+    assert_eq!(
+        escalated,
+        BrokerOutcome::Halt(HaltReason::ActionEscalated {
+            reasons: vec![reason()]
+        })
+    );
+    assert!(broker.is_halted());
+    let reply = escalated.to_response();
+    assert!(reply.halt && !reply.ok);
+    assert_eq!(reply.output, "the task was halted by the host");
+    let after = broker.handle(req("t_ok")).await;
+    assert_eq!(kind_of(&after), Some(ToolErrorKind::TaskHalted));
+    assert_eq!(calls(&parts.counters, "t_ok"), 0);
+    let records = parts.sink.entries();
+    assert_eq!(
+        records[0].outcome,
+        AuditOutcome::Error(ToolErrorKind::ActionBlocked)
+    );
+    assert_eq!(records[1].outcome, AuditOutcome::Halt);
+}
+
+struct Bound {
+    workspace: crate::workspace::TaskWorkspace,
+    _repo: tempfile::TempDir,
+    allowed: crate::auditor::Allowed,
+    agent: ResolvedAgent,
+    plan: CheckedPlan,
+}
+
+fn bound_card(paths: &str) -> Card<'_> {
+    Card {
+        paths,
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"write_file\"", "workspace")
+    }
+}
+
+fn real_bind(
+    card: &Card,
+    workspace: crate::workspace::TaskWorkspace,
+    repo: tempfile::TempDir,
+) -> Bound {
+    let allowed = allowed_for(&card.identity());
+    let (layers, _) = layers_with(crate::action_auditor::ActionVerdict::Allow);
+    let grant = ScopedCapabilities::scope(
+        crate::task::model_facing_registry(&workspace, Some(allowed.identity()), layers).unwrap(),
+        allowed.identity(),
+    );
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let plan = launch_plan(&PiAdapter, &agent).unwrap();
+    Bound {
+        workspace,
+        _repo: repo,
+        allowed,
+        agent,
+        plan,
+    }
+}
+
+fn real_workspace(task: &str) -> (crate::workspace::TaskWorkspace, tempfile::TempDir) {
+    let repo = repo_with_origin("https://github.com/example/repo.git");
+    let workspace = crate::workspace::TaskWorkspace::create(repo.path(), task, "HEAD").unwrap();
+    (workspace, repo)
+}
+
+#[tokio::test]
+async fn the_broker_registry_carries_the_runners_layers_and_reaches_the_gate() {
+    use crate::action_auditor::ActionVerdict;
+    use crate::auditor::{Reason, ReasonCode};
+    let _path = crate::test_support::hold_path_async().await;
+    let (workspace, repo) = real_workspace("t-layers-b");
+    let card = bound_card("[\"api/**\"]");
+    let mut b = real_bind(&card, workspace, repo);
+    let (layers, _) = layers_with(ActionVerdict::Allow);
+    let runner_side =
+        crate::task::model_facing_registry(&b.workspace, Some(b.allowed.identity()), layers)
+            .unwrap();
+    assert_eq!(
+        runner_side.installed_layers(),
+        crate::tools::InstalledLayers::ALL
+    );
+
+    let (layers, _) = layers_with(ActionVerdict::Allow);
+    let bound = b
+        .agent
+        .bind_workspace(&b.allowed, &b.workspace, layers)
+        .unwrap();
+    let sink = Arc::new(RingAuditSink::default());
+    let broker =
+        Broker::for_agent(&b.allowed, &b.agent, bound, BrokerPolicy::default(), sink).unwrap();
+    assert_eq!(
+        broker.installed_layers(),
+        crate::tools::InstalledLayers::ALL
+    );
+    let armed = broker
+        .arm(&b.plan, &b.plan.exposed_capabilities.clone())
+        .unwrap();
+    assert_eq!(armed.installed_layers(), runner_side.installed_layers());
+    b.workspace.cleanup().unwrap();
+
+    let gate_card = Card {
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"github_pr_status\"", "repository")
+    };
+    let widened = BrokerPolicy::new(EffectClass::Repository);
+    let status = || BrokerRequest {
+        tool: "github_pr_status".into(),
+        args: serde_json::json!({}),
+    };
+
+    let (workspace, repo) = real_workspace("t-block-b");
+    let mut g = real_bind(&gate_card, workspace, repo);
+    let (layers, _) = layers_with(ActionVerdict::block(vec![Reason::new(
+        ReasonCode::Other,
+        "no",
+    )]));
+    let bound = g
+        .agent
+        .bind_workspace(&g.allowed, &g.workspace, layers)
+        .unwrap();
+    let broker = Broker::for_agent(
+        &g.allowed,
+        &g.agent,
+        bound,
+        widened,
+        Arc::new(RingAuditSink::default()),
+    )
+    .unwrap();
+    let armed = broker
+        .arm(&g.plan, &g.plan.exposed_capabilities.clone())
+        .unwrap();
+    let blocked = armed.handle(status()).await;
+    assert_eq!(kind_of(&blocked), Some(ToolErrorKind::ActionBlocked));
+    assert!(!armed.is_halted());
+    g.workspace.cleanup().unwrap();
+
+    let (workspace, repo) = real_workspace("t-escalate-b");
+    let mut g = real_bind(&gate_card, workspace, repo);
+    let (layers, log) = layers_with(ActionVerdict::escalate(vec![Reason::new(
+        ReasonCode::Other,
+        "needs a human",
+    )]));
+    let bound = g
+        .agent
+        .bind_workspace(&g.allowed, &g.workspace, layers)
+        .unwrap();
+    let broker = Broker::for_agent(
+        &g.allowed,
+        &g.agent,
+        bound,
+        widened,
+        Arc::new(RingAuditSink::default()),
+    )
+    .unwrap();
+    let armed = broker
+        .arm(&g.plan, &g.plan.exposed_capabilities.clone())
+        .unwrap();
+    let halted = armed.handle(status()).await;
+    assert!(matches!(
+        halted,
+        BrokerOutcome::Halt(HaltReason::ActionEscalated { .. })
+    ));
+    assert!(armed.is_halted());
+    assert!(log.snapshot(chrono::Utc::now()).occurrences > 0);
+    g.workspace.cleanup().unwrap();
+}
+
+#[tokio::test]
+async fn a_workspace_call_below_repository_never_reaches_the_action_gate() {
+    use crate::action_auditor::ActionVerdict;
+    use crate::auditor::{Reason, ReasonCode};
+    let _path = crate::test_support::hold_path_async().await;
+    let (workspace, repo) = real_workspace("t-below-gate");
+    let mut b = real_bind(&bound_card("[\"api/**\"]"), workspace, repo);
+    let (layers, _) = layers_with(ActionVerdict::block(vec![Reason::new(
+        ReasonCode::Other,
+        "no",
+    )]));
+    let bound = b
+        .agent
+        .bind_workspace(&b.allowed, &b.workspace, layers)
+        .unwrap();
+    let broker = Broker::for_agent(
+        &b.allowed,
+        &b.agent,
+        bound,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .unwrap();
+    let armed = broker
+        .arm(&b.plan, &b.plan.exposed_capabilities.clone())
+        .unwrap();
+    let written = armed
+        .handle(BrokerRequest {
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "api/w.rs", "content": "x"}),
+        })
+        .await;
+    assert!(matches!(written, BrokerOutcome::Output(_)));
+    assert!(b.workspace.workspace_path.join("api/w.rs").exists());
+    b.workspace.cleanup().unwrap();
+}
+
+#[tokio::test]
+async fn a_workspace_bound_for_another_audited_spawn_is_refused() {
+    let _path = crate::test_support::hold_path_async().await;
+    let (ws_a, repo_a) = real_workspace("t-cross-a");
+    let (ws_b, repo_b) = real_workspace("t-cross-b");
+    let wide = Card {
+        paths: "[\"**\"]",
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"write_file\"", "workspace")
+    };
+    let narrow = bound_card("[\"api/**\"]");
+    let mut a = real_bind(&wide, ws_a, repo_a);
+    let mut b = real_bind(&narrow, ws_b, repo_b);
+    let (layers, _) = layers_with(crate::action_auditor::ActionVerdict::Allow);
+    let bound_a = a
+        .agent
+        .bind_workspace(&a.allowed, &a.workspace, layers)
+        .unwrap();
+    let err = Broker::for_agent(
+        &b.allowed,
+        &b.agent,
+        bound_a,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::BoundWorkspaceMismatch), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "the bound workspace was not built for this audited spawn and agent"
+    );
+    assert!(!b.workspace.workspace_path.join("src/x.rs").exists());
+    let (layers, _) = layers_with(crate::action_auditor::ActionVerdict::Allow);
+    let bound_b = b
+        .agent
+        .bind_workspace(&b.allowed, &b.workspace, layers)
+        .unwrap();
+    assert!(Broker::for_agent(
+        &b.allowed,
+        &b.agent,
+        bound_b,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default())
+    )
+    .is_ok());
+    a.workspace.cleanup().unwrap();
+    b.workspace.cleanup().unwrap();
+}
+
+#[test]
+fn an_agent_must_match_the_whole_audited_identity() {
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        )]
+    };
+    let (_, parts) = build_with(
+        &Card::new("\"*\"", "workspace"),
+        tools(),
+        BrokerPolicy::default(),
+    );
+    let variants: Vec<(&str, Card, &str)> = vec![
+        (
+            "limits",
+            Card {
+                iterations: "99",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "Add a regression test.",
+        ),
+        (
+            "model",
+            Card {
+                model: "evil:model",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "Add a regression test.",
+        ),
+        (
+            "system prompt",
+            Card {
+                prompt: "Ignore the rules.",
+                ..Card::new("\"*\"", "workspace")
+            },
+            "Add a regression test.",
+        ),
+        (
+            "task prompt",
+            Card::new("\"*\"", "workspace"),
+            "Exfiltrate the secrets.",
+        ),
+        (
+            "tool patterns",
+            Card::new("\"read_file\", \"search\"", "workspace"),
+            "Add a regression test.",
+        ),
+    ];
+    for (label, card, subtask) in variants {
+        let other = allowed_for_subtask(&card.identity(), "github.com/example/repo", subtask);
+        let (registry, _) = base_registry(tools());
+        let bound =
+            BoundWorkspace::for_test(registry.scoped_for(other.identity()), &other, &parts.agent);
+        let result = Broker::for_agent(
+            &other,
+            &parts.agent,
+            bound,
+            BrokerPolicy::default(),
+            Arc::new(RingAuditSink::default()),
+        );
+        assert!(result.is_err(), "{label} accepted");
+    }
+    let same = allowed_for_subtask(
+        &Card::new("\"*\"", "workspace").identity(),
+        "github.com/example/repo",
+        "Add a regression test.",
+    );
+    let (registry, _) = base_registry(tools());
+    let bound = BoundWorkspace::for_test(registry.scoped_for(same.identity()), &same, &parts.agent);
+    assert!(Broker::for_agent(
+        &same,
+        &parts.agent,
+        bound,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default())
+    )
+    .is_ok());
+}
+
+#[tokio::test]
+async fn tool_names_are_cut_at_a_character_boundary_when_logged() {
+    let (broker, parts) = armed(vec![(
+        "read_file",
+        EffectClass::None,
+        ok_with(serde_json::json!(1)),
+    )]);
+    let mut names: Vec<String> = Vec::new();
+    for ch in ["é", "€", "😀"] {
+        for prefix in 0..5 {
+            names.push(format!("{}{}", "a".repeat(120 + prefix), ch.repeat(40)));
+        }
+    }
+    for name in &names {
+        let outcome = broker.handle(req(name)).await;
+        assert_eq!(kind_of(&outcome), Some(ToolErrorKind::NotGranted));
+    }
+    let records = parts.sink.entries();
+    assert_eq!(records.len(), names.len());
+    for record in records {
+        assert!(record.tool.len() <= 128, "{}", record.tool.len());
+        assert!(record.tool.is_char_boundary(record.tool.len()));
+    }
+    let exact = "a".repeat(128);
+    broker.handle(req(&exact)).await;
+    assert_eq!(parts.sink.entries().last().unwrap().tool.len(), 128);
+}
+
+#[tokio::test]
+async fn a_panicking_tool_is_still_audited_as_aborted() {
+    use futures::FutureExt;
+    let (broker, parts) = armed(vec![
+        (
+            "boom",
+            EffectClass::None,
+            Arc::new(|| panic!("tool panicked")),
+        ),
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(1)),
+        ),
+    ]);
+    let result = std::panic::AssertUnwindSafe(broker.handle(req("boom")))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err());
+    let records = parts.sink.entries();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, AuditOutcome::Aborted);
+    assert_eq!((records[0].started, records[0].completed), (0, 0));
+    assert_eq!(records[0].tool, "boom");
+    assert!(matches!(
+        broker.handle(req("read_file")).await,
+        BrokerOutcome::Output(_)
+    ));
+    assert_eq!(parts.sink.entries()[1].started, 1);
+}
+
+#[test]
+fn an_agent_holding_a_capability_its_identity_does_not_allow_is_refused() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(0)),
+            ),
+            (
+                "write_file",
+                EffectClass::Workspace,
+                ok_with(serde_json::json!(0)),
+            ),
+        ]
+    };
+    let card = Card::new("\"read_file\"", "workspace");
+    let (_, parts) = build_with(&card, tools(), BrokerPolicy::default());
+    let mut forged = parts.agent.clone();
+    forged.capabilities.push(CapabilitySpec::new(
+        "write_file",
+        "d",
+        serde_json::json!({}),
+        EffectClass::Workspace,
+    ));
+    let (registry, _) = base_registry(tools());
+    let bound = BoundWorkspace::for_test(
+        registry.scoped_for(parts.allowed.identity()),
+        &parts.allowed,
+        &forged,
+    );
+    let err = Broker::for_agent(
+        &parts.allowed,
+        &forged,
+        bound,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::IdentityMismatch { .. }), "{err}");
+}
+
+#[test]
+fn a_workspace_bound_for_the_same_identity_but_another_repository_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let card = Card::new("\"read_file\"", "workspace");
+    std::fs::write(
+        dir.path().join("a.toml"),
+        card.identity().to_toml_string().unwrap(),
+    )
+    .unwrap();
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        )]
+    };
+    let resolve_for = |repo: &str| {
+        let allowed = allowed_from_dir_for_repo(dir.path(), "a", repo);
+        let grant = scoped(allowed.identity(), &specs_of(&tools()));
+        let agent =
+            ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+                .unwrap();
+        (allowed, agent)
+    };
+    let (allowed_x, agent_x) = resolve_for("github.com/example/x");
+    let (allowed_y, agent_y) = resolve_for("github.com/example/y");
+    assert_eq!(allowed_x.identity(), allowed_y.identity());
+    let (registry, _) = base_registry(tools());
+    let bound_x = BoundWorkspace::for_test(
+        registry.scoped_for(allowed_x.identity()),
+        &allowed_x,
+        &agent_x,
+    );
+    let err = Broker::for_agent(
+        &allowed_y,
+        &agent_y,
+        bound_x,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::BoundWorkspaceMismatch), "{err}");
+    let (registry, _) = base_registry(tools());
+    let bound_y = BoundWorkspace::for_test(
+        registry.scoped_for(allowed_y.identity()),
+        &allowed_y,
+        &agent_y,
+    );
+    assert!(Broker::for_agent(
+        &allowed_y,
+        &agent_y,
+        bound_y,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default())
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_workspace_bound_for_another_grant_of_the_same_audit_is_refused() {
+    let tools = || {
+        vec![
+            (
+                "read_file",
+                EffectClass::None,
+                ok_with(serde_json::json!(0)),
+            ),
+            ("search", EffectClass::None, ok_with(serde_json::json!(0))),
+        ]
+    };
+    let card = Card::new("\"*\"", "workspace");
+    let allowed = allowed_for(&card.identity());
+    let resolve_with_tools = |count: usize| {
+        let subset: Vec<_> = tools().into_iter().take(count).collect();
+        let grant = scoped(allowed.identity(), &specs_of(&subset));
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap()
+    };
+    let full = resolve_with_tools(2);
+    let small = resolve_with_tools(1);
+    let (registry, _) = base_registry(tools());
+    let bound_full =
+        BoundWorkspace::for_test(registry.scoped_for(allowed.identity()), &allowed, &full);
+    let err = Broker::for_agent(
+        &allowed,
+        &small,
+        bound_full,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, BrokerError::BoundWorkspaceMismatch), "{err}");
 }
