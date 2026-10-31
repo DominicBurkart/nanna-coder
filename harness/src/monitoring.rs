@@ -1242,4 +1242,160 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    // ── HealthStatus predicates ──────────────────────────────────────────────
+
+    #[test]
+    fn health_status_is_healthy_only_for_healthy_variant() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn health_status_requires_attention_for_warning_degraded_unhealthy() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    // ── MonitoringSystem start/stop ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monitoring_system_start_and_stop() {
+        let mut system = MonitoringSystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+        // A second stop is a no-op and must not panic
+        system.stop_monitoring().await;
+    }
+
+    // ── DefaultAlertManager history and threshold configuration ─────────────
+
+    #[tokio::test]
+    async fn alert_manager_get_alert_history_returns_limited_results() {
+        let manager = DefaultAlertManager::new();
+        manager
+            .send_alert("First", "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Second", "desc", AlertSeverity::Warning)
+            .await
+            .unwrap();
+
+        let all = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let one = manager.get_alert_history(1).await.unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn alert_manager_configure_thresholds_succeeds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            ..AlertThresholds::default()
+        };
+        manager.configure_thresholds(thresholds).await.unwrap();
+    }
+
+    // ── DefaultMetricsCollector extended coverage ────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_collector_record_error_and_model_inference() {
+        use chrono::Utc;
+
+        let mut collector = DefaultMetricsCollector::new();
+
+        let error_event = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "TestError".to_string(),
+            message: "something went wrong".to_string(),
+            component: "test-component".to_string(),
+            severity: ErrorSeverity::Warning,
+        };
+        collector.record_error(error_event).await;
+
+        let model_metrics = ModelMetrics {
+            model_name: "test-model".to_string(),
+            inference_count: 5,
+            avg_inference_time_ms: 120.0,
+            tokens_per_second: 15.0,
+            success_rate: 0.98,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.88,
+                accuracy_rate: 0.92,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("test-model", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.model_metrics.contains_key("test-model"));
+    }
+
+    #[tokio::test]
+    async fn metrics_collector_reset_clears_all_data() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector.record_cache_hit("key").await;
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert!(metrics.request_latencies.is_empty());
+    }
+
+    // ── DefaultHealthMonitor extended coverage ───────────────────────────────
+
+    #[tokio::test]
+    async fn health_monitor_check_model_health_returns_healthy() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let result = monitor.check_model_health("qwen3:0.6b").await.unwrap();
+        assert_eq!(result.status, HealthStatus::Healthy);
+        assert!(result.details.contains_key("model"));
+    }
+
+    #[tokio::test]
+    async fn health_monitor_comprehensive_check_returns_multiple_results() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let results = monitor.comprehensive_health_check().await.unwrap();
+        // At minimum the system health check should be present
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn health_monitor_set_check_interval_does_not_panic() {
+        let mut monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        monitor.set_check_interval(Duration::from_secs(60));
+    }
+
+    // ── MetricsFormat::Custom error case ────────────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_export_custom_format_returns_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("myformat".to_string()))
+            .await;
+        assert!(result.is_err());
+    }
 }
