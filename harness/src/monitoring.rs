@@ -1242,4 +1242,32 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = MonitoringSystem::new();
+
+        system
+            .start_monitoring()
+            .await
+            .expect("start_monitoring should succeed");
+        assert!(
+            system.monitoring_task.is_some(),
+            "background task should be running after start"
+        );
+
+        system.stop_monitoring().await;
+        assert!(
+            system.monitoring_task.is_none(),
+            "background task should be gone after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_monitoring_noop_when_not_started() {
+        let mut system = MonitoringSystem::new();
+        // Stopping a system that was never started must not panic
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }
