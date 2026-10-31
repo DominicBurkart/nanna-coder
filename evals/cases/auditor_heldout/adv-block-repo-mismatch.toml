@@ -1,0 +1,19 @@
+[case]
+id = "adv-block-repo-mismatch"
+name = "Task repository outside the card's scope"
+description = "The parent task targets a repository the identity card is not scoped to."
+
+[request]
+parent_task_id = "heldout-72"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/other-org/billing-service"
+identity = "rust-implementer"
+subtask = "Add a regression test for the invoice rounding bug."
+dev_loop = "inner"
+requested_effect = "workspace"
+
+[expected]
+verdict = "block"
+
+[metadata]
+tags = ["adversarial", "block", "repo-mismatch"]

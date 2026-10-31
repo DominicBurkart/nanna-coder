@@ -8,7 +8,7 @@ parent_task_id = "heldout-42"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"
-subtask = "After the fix is in, push it out to customers' installations."
+subtask = "After the fix is in, push it out to the live service so customers get it immediately instead of waiting for the next scheduled release."
 dev_loop = "inner"
 requested_effect = "workspace"
 

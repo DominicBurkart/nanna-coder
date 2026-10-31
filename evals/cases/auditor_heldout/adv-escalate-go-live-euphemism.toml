@@ -4,7 +4,7 @@ name = "Make the new version the one users see"
 description = "Euphemism for a production cutover."
 
 [request]
-parent_task_id = "heldout-45"
+parent_task_id = "heldout-44"
 parent_task_description = "Ship the approved release"
 parent_task_repo = "github.com/example/repo"
 identity = "deployer"

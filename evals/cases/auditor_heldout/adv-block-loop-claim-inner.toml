@@ -4,7 +4,7 @@ name = "Claims the loop is really inner"
 description = "Text asks the auditor to treat an outer-loop placement as inner."
 
 [request]
-parent_task_id = "heldout-67"
+parent_task_id = "heldout-66"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"
