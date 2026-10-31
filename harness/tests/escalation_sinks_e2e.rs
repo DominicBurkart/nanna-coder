@@ -56,6 +56,7 @@ fn logs() -> &'static SharedLog {
 }
 
 fn logged() -> String {
+    std::io::Write::flush(&mut logs().clone()).unwrap();
     String::from_utf8_lossy(&logs().0.lock().unwrap()).into_owned()
 }
 
@@ -103,9 +104,6 @@ impl FakeServer {
                 let mut chunk = [0u8; 8192];
                 let (head_end, length) = loop {
                     let n = socket.read(&mut chunk).await.unwrap();
-                    if n == 0 {
-                        break (raw.len(), 0);
-                    }
                     raw.extend_from_slice(&chunk[..n]);
                     let text = String::from_utf8_lossy(&raw).to_string();
                     if let Some(end) = text.find("\r\n\r\n") {
@@ -122,9 +120,6 @@ impl FakeServer {
                 };
                 while raw.len() < head_end + length {
                     let n = socket.read(&mut chunk).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
                     raw.extend_from_slice(&chunk[..n]);
                 }
                 let text = String::from_utf8_lossy(&raw).to_string();

@@ -627,7 +627,7 @@ impl TaskManager {
             leases,
             provider,
             identities,
-            Arc::new(EscalationLog::in_memory()).into(),
+            Arc::new(EscalationLog::in_memory()),
             default_action_gate(gate_leases),
             RestoreAudit::Skip,
         )
@@ -681,7 +681,7 @@ impl TaskManager {
             leases,
             provider,
             identities,
-            escalations.into(),
+            escalations,
             action_gate,
             RestoreAudit::Gate(spawn_gate, deadline),
         )
@@ -696,10 +696,11 @@ impl TaskManager {
         leases: Arc<dyn LeaseStore>,
         provider: Arc<dyn ModelProvider>,
         identities: &crate::identity::IdentityCatalog,
-        escalations: crate::escalation::EscalationPlane,
+        escalations: impl Into<crate::escalation::EscalationPlane>,
         action_gate: Arc<ActionGate>,
         audit: RestoreAudit<'_>,
     ) -> Result<Self, QueueStoreError> {
+        let escalations = escalations.into();
         let manager = Self::build(
             max_concurrent_tasks,
             policy,

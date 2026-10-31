@@ -140,10 +140,9 @@ impl SinkSettings {
         github_api_url: &str,
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn EscalationSink> {
-        let local: Box<dyn EscalationSink> = Box::new(LocalRecordSink::new(
-            record_path,
-            DEFAULT_RECORD_LIMIT_BYTES,
-        ));
+        let limit = DEFAULT_RECORD_LIMIT_BYTES;
+        let local = LocalRecordSink::new(record_path, limit);
+        let local: Box<dyn EscalationSink> = Box::new(local);
         let mut remote: Vec<Box<dyn EscalationSink>> = Vec::new();
         if let (Some(repo), Some(token)) = (&self.repo, &self.token) {
             let client = ReqwestGithubClient::new(github_api_url, Some(token.clone()));
@@ -156,12 +155,9 @@ impl SinkSettings {
             tracing::warn!("no human-facing escalation sink is configured (set {ESCALATION_REPO_ENV} and a token, or {ESCALATION_WEBHOOK_URL_ENV}); escalations are only written to the local record");
             return Arc::new(FanoutSink(vec![local]));
         }
-        let capped = RateLimitedSink::new(
-            Arc::new(FanoutSink(remote)),
-            clock,
-            DEFAULT_REMOTE_CAP,
-            default_window(),
-        );
+        let inner = Arc::new(FanoutSink(remote));
+        let (cap, window) = (DEFAULT_REMOTE_CAP, default_window());
+        let capped = RateLimitedSink::new(inner, clock, cap, window);
         Arc::new(FanoutSink(vec![local, Box::new(capped)]))
     }
 }

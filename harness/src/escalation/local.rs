@@ -85,6 +85,8 @@ mod tests {
             "example/repo",
             summary,
         )
+        .with_id("fixed-id")
+        .at(chrono::DateTime::UNIX_EPOCH)
         .with_evidence(vec![format!("Authorization: Bearer {TOKEN}")])
     }
 
