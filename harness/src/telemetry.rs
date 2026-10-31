@@ -1044,4 +1044,146 @@ mod tests {
             Some(&"Something went wrong".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn test_trace_context_with_attribute() {
+        let trace = TraceContext::new("operation")
+            .with_attribute("key1", "val1")
+            .with_attribute("key2", "val2");
+
+        assert_eq!(trace.attributes.get("key1"), Some(&"val1".to_string()));
+        assert_eq!(trace.attributes.get("key2"), Some(&"val2".to_string()));
+        assert_eq!(trace.status, SpanStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn test_trace_context_set_status() {
+        let mut trace = TraceContext::new("operation");
+
+        trace.set_status(SpanStatus::Timeout);
+        assert_eq!(trace.status, SpanStatus::Timeout);
+
+        trace.set_status(SpanStatus::Cancelled);
+        assert_eq!(trace.status, SpanStatus::Cancelled);
+
+        trace.set_status(SpanStatus::Ok);
+        assert_eq!(trace.status, SpanStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_with_global_attribute() {
+        let telemetry = TelemetrySystem::new()
+            .with_global_attribute("env", "testing")
+            .with_global_attribute("region", "us-east-1");
+
+        assert_eq!(
+            telemetry.config.global_attributes.get("env"),
+            Some(&"testing".to_string())
+        );
+        assert_eq!(
+            telemetry.config.global_attributes.get("region"),
+            Some(&"us-east-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_with_config() {
+        let mut config = TelemetryConfig::default();
+        config.service.name = "custom-service".to_string();
+        config.log_level = "debug".to_string();
+
+        let telemetry = TelemetrySystem::new().with_config(config);
+
+        assert_eq!(telemetry.config.service.name, "custom-service");
+        assert_eq!(telemetry.config.log_level, "debug");
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_add_exporter() {
+        let exporter = PrometheusExporter::new(None);
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(exporter));
+
+        assert_eq!(telemetry.exporters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_initialize_idempotent() {
+        let mut telemetry = TelemetrySystem::new();
+        telemetry.initialized = true;
+
+        let result = telemetry.initialize().await;
+        assert!(result.is_ok());
+        assert!(telemetry.initialized);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_uptime() {
+        let telemetry = TelemetrySystem::new();
+        let uptime = telemetry.get_uptime();
+        assert!(uptime.as_secs() < 60);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_get_prometheus_exporter_none() {
+        let telemetry = TelemetrySystem::new();
+        assert!(telemetry.get_prometheus_exporter().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_export_all_clears_buffers() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.record_gauge("g", 2.0, vec![]);
+        assert_eq!(telemetry.get_buffered_metrics_count(), 2);
+
+        let result = telemetry.export_all().await;
+        assert!(result.is_ok());
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_new_and_trace() {
+        let telemetry = TelemetrySystem::new();
+        let span = telemetry.start_trace("guarded_op");
+        let guard = TraceGuard::new(&telemetry, span);
+
+        assert!(guard.trace().is_some());
+        assert_eq!(guard.trace().unwrap().operation_name, "guarded_op");
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_record_error() {
+        let telemetry = TelemetrySystem::new();
+        let span = telemetry.start_trace("error_op");
+        let mut guard = TraceGuard::new(&telemetry, span);
+
+        guard.record_error("something failed");
+
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Error);
+        assert_eq!(
+            guard.trace().unwrap().attributes.get("error"),
+            Some(&"something failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_set_status() {
+        let telemetry = TelemetrySystem::new();
+        let span = telemetry.start_trace("status_op");
+        let mut guard = TraceGuard::new(&telemetry, span);
+
+        guard.set_status(SpanStatus::Cancelled);
+        assert_eq!(guard.trace().unwrap().status, SpanStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_trace_guard_drop_finishes_trace() {
+        let telemetry = TelemetrySystem::new();
+        {
+            let span = telemetry.start_trace("drop_op");
+            let _guard = TraceGuard::new(&telemetry, span);
+            assert_eq!(telemetry.get_active_trace_count(), 1);
+        }
+        assert_eq!(telemetry.get_active_trace_count(), 0);
+    }
 }
