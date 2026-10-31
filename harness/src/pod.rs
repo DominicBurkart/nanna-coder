@@ -128,12 +128,31 @@ async fn probe_ollama(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
+#[cfg(test)]
+const SERIAL_ENV_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
+
+#[cfg(test)]
+fn require_serial_env_locks(is_locked: impl Fn(&str) -> bool) {
+    for key in SERIAL_ENV_KEYS {
+        if !is_locked(key) {
+            panic!(
+                "test thread {:?} reached the bring-up path without serial lock `{}`: it must hold #[serial_test::serial({})]",
+                std::thread::current().name().unwrap_or("<unnamed>"),
+                key,
+                SERIAL_ENV_KEYS.join(", ")
+            );
+        }
+    }
+}
+
 /// Choose a bring-up command. Prefer `nix run .#start-pod` *only when a
 /// `flake.nix` is reachable from `flake_lookup_dir`* (`nix run .#start-pod`
 /// resolves the flake from CWD; a `nanna agent --work-dir <arbitrary>` run
 /// would otherwise fail with "flake not found"). Fall back to
 /// `podman play kube ${NANNA_POD_CONFIG}` when the env var is set.
 fn bring_up_command(flake_lookup_dir: &Path) -> Option<(String, Vec<String>)> {
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     // Test seam: `NANNA_TEST_BRING_UP_CMD=<path>` overrides every other
     // selection. Lets tests drive the full ensure_running success path
     // against `/usr/bin/true` + a local stub HTTP server.
@@ -213,6 +232,8 @@ async fn ensure_running_inner(
         debug!("pod ensure: skipped ({:?})", reason);
         return Ok(EnsureOutcome::Skipped(reason));
     }
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     if probe_ollama(&cfg.probe_url).await {
         debug!("pod ensure: ollama already reachable at {}", cfg.probe_url);
         return Ok(EnsureOutcome::AlreadyUp);
@@ -703,6 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     async fn ensure_running_returns_already_up_when_probe_succeeds() {
         let url = start_ok_http_server().await;
         let cfg = EnsureConfig {
@@ -909,5 +931,34 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn require_serial_env_locks_passes_when_every_key_is_held() {
+        require_serial_env_locks(|_| true);
+    }
+
+    #[test]
+    #[should_panic(expected = "nanna_pod_config_env")]
+    fn require_serial_env_locks_panics_naming_the_missing_key() {
+        require_serial_env_locks(|k| k != "nanna_pod_config_env");
+    }
+
+    #[test]
+    #[should_panic(expected = "require_serial_env_locks_panics_naming_the_thread")]
+    fn require_serial_env_locks_panics_naming_the_thread() {
+        require_serial_env_locks(|_| false);
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    fn require_serial_env_locks_accepts_the_real_serial_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
+    }
+
+    #[test]
+    #[should_panic(expected = "must hold #[serial_test::serial")]
+    fn require_serial_env_locks_rejects_an_unserialised_test_with_the_real_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
     }
 }
