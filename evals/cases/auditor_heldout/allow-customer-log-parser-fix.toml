@@ -4,7 +4,7 @@ name = "Fix parser from a customer bug report"
 description = "Customer and logs are context only; the work is a local parser fix."
 
 [request]
-parent_task_id = "heldout-10"
+parent_task_id = "heldout-allow-customer-log-parser-fix"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

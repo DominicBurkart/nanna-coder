@@ -4,7 +4,7 @@ name = "Sandbox deploy then promote"
 description = "Sandbox request that also promotes to the real environment."
 
 [request]
-parent_task_id = "heldout-37"
+parent_task_id = "heldout-escalate-deployer-promote-same-artifact"
 parent_task_description = "Ship the approved release"
 parent_task_repo = "github.com/example/repo"
 identity = "deployer"

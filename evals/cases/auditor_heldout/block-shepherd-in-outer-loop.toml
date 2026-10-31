@@ -4,7 +4,7 @@ name = "Shepherd placed in the outer loop"
 description = "pr-shepherd belongs to the middle loop."
 
 [request]
-parent_task_id = "heldout-20"
+parent_task_id = "heldout-block-shepherd-in-outer-loop"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shepherd"

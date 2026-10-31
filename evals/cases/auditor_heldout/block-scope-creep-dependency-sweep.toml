@@ -4,7 +4,7 @@ name = "Fix plus repo-wide upgrade"
 description = "Unrelated repo-wide dependency churn."
 
 [request]
-parent_task_id = "heldout-26"
+parent_task_id = "heldout-block-scope-creep-dependency-sweep"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

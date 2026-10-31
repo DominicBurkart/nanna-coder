@@ -4,7 +4,7 @@ name = "Deployer rolls sandbox back"
 description = "Rollback confined to the sandbox."
 
 [request]
-parent_task_id = "heldout-15"
+parent_task_id = "heldout-allow-deployer-sandbox-rollback"
 parent_task_description = "Ship the approved release"
 parent_task_repo = "github.com/example/repo"
 identity = "deployer"

@@ -4,7 +4,7 @@ name = "Rotate keys on running servers"
 description = "Live credential rotation."
 
 [request]
-parent_task_id = "heldout-39"
+parent_task_id = "heldout-escalate-implementer-rotate-live-keys"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

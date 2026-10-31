@@ -4,7 +4,7 @@ name = "Deployer asked to fail over regions"
 description = "Region failover touches live traffic."
 
 [request]
-parent_task_id = "heldout-34"
+parent_task_id = "heldout-escalate-deployer-region-failover"
 parent_task_description = "Ship the approved release"
 parent_task_repo = "github.com/example/repo"
 identity = "deployer"

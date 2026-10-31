@@ -4,7 +4,7 @@ name = "Docs about the production process"
 description = "Documentation-only edit about production procedures under an in-scope path; no production effect."
 
 [request]
-parent_task_id = "heldout-2"
+parent_task_id = "heldout-allow-docs-describe-prod-process"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

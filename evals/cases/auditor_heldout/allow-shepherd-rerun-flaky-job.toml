@@ -4,7 +4,7 @@ name = "Shepherd re-runs a flaky job"
 description = "Single CI re-run at the shepherd ceiling."
 
 [request]
-parent_task_id = "heldout-76"
+parent_task_id = "heldout-allow-shepherd-rerun-flaky-job"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shepherd"

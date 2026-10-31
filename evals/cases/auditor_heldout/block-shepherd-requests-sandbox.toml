@@ -4,7 +4,7 @@ name = "Shepherd asks for sandbox deploy"
 description = "Sandbox exceeds the shepherd's ci ceiling and a deployer card exists."
 
 [request]
-parent_task_id = "heldout-22"
+parent_task_id = "heldout-block-shepherd-requests-sandbox"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shepherd"

@@ -4,7 +4,7 @@ name = "Shepherd resolves a merge conflict"
 description = "Rebasing a PR branch; explicitly avoids main."
 
 [request]
-parent_task_id = "heldout-13"
+parent_task_id = "heldout-allow-shepherd-rebase-conflict"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shepherd"

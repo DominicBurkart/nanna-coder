@@ -4,7 +4,7 @@ name = "Read an attached production log excerpt"
 description = "Reading an exported log excerpt is a pure read despite the word production."
 
 [request]
-parent_task_id = "heldout-73"
+parent_task_id = "heldout-allow-read-production-log-excerpt"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

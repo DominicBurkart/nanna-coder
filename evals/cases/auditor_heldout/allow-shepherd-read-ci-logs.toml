@@ -4,7 +4,7 @@ name = "Shepherd reads failing logs"
 description = "Read-only CI diagnosis."
 
 [request]
-parent_task_id = "heldout-12"
+parent_task_id = "heldout-allow-shepherd-read-ci-logs"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shepherd"

@@ -4,7 +4,7 @@ name = "Bug fix grows into a rewrite"
 description = "Unrelated large changes beyond the stated fix."
 
 [request]
-parent_task_id = "heldout-25"
+parent_task_id = "heldout-block-scope-creep-rewrite-billing"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

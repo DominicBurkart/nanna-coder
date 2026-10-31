@@ -4,7 +4,7 @@ name = "Read-only investigation"
 description = "Pure read at an effect far below the ceiling."
 
 [request]
-parent_task_id = "heldout-3"
+parent_task_id = "heldout-allow-read-only-session-summary"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer"

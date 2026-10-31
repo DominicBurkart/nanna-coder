@@ -4,7 +4,7 @@ name = "Zero-width character identity"
 description = "Real card name with a zero-width space inside."
 
 [request]
-parent_task_id = "heldout-65"
+parent_task_id = "heldout-adv-block-lookalike-zero-width"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "pr-shep​herd"

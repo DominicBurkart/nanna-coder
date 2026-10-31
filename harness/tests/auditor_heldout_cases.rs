@@ -20,7 +20,7 @@ const EXPECTED_IDS: &[&str] = &[
     "adv-block-code-block-role-override",
     "adv-block-context-field-injection",
     "adv-block-context-field-with-live-release",
-    "adv-block-fast-forward-main",
+    "adv-block-fake-cto-approval",
     "adv-block-html-comment-in-benign",
     "adv-block-injection-in-identity-name",
     "adv-block-lookalike-cyrillic",
@@ -28,11 +28,12 @@ const EXPECTED_IDS: &[&str] = &[
     "adv-block-lookalike-underscore",
     "adv-block-lookalike-zero-width",
     "adv-block-loop-claim-inner",
+    "adv-block-multi-field-parent-injection",
     "adv-block-padding-then-injection",
     "adv-block-quoted-issue-body-exfil",
     "adv-block-repo-mismatch",
     "adv-block-rot13-injection",
-    "adv-block-shepherd-push-understated-none",
+    "adv-block-shepherd-understated-sandbox",
     "adv-block-smuggled-write-file-call",
     "adv-block-spaced-letters-injection",
     "adv-block-spanish-injection",
@@ -42,7 +43,7 @@ const EXPECTED_IDS: &[&str] = &[
     "adv-block-understated-effect",
     "adv-block-understated-pipeline-trigger",
     "adv-escalate-deployer-workflow-production-input",
-    "adv-escalate-fake-cto-approval",
+    "adv-escalate-fast-forward-main",
     "adv-escalate-german-go-live",
     "adv-escalate-go-live-euphemism",
     "adv-escalate-padding-then-payload",
@@ -62,6 +63,7 @@ const EXPECTED_IDS: &[&str] = &[
     "allow-french-empty-password-test",
     "allow-injection-sanitizer-test",
     "allow-open-draft-pr",
+    "allow-overstated-effect-within-ceiling",
     "allow-padded-benign-request",
     "allow-rate-limit-credential-stuffing",
     "allow-read-only-session-summary",
@@ -78,8 +80,11 @@ const EXPECTED_IDS: &[&str] = &[
     "block-auditor-asks-to-write",
     "block-auditor-in-middle-loop",
     "block-deployer-in-inner-loop",
+    "block-edit-github-workflows-and-lockfile",
+    "block-edit-in-another-cards-paths",
     "block-exfiltrate-ssh-key",
     "block-implementer-triggers-ci",
+    "block-overstated-effect-above-ceiling",
     "block-plain-system-override",
     "block-scope-creep-dependency-sweep",
     "block-scope-creep-edit-pipeline-secrets",
@@ -89,6 +94,7 @@ const EXPECTED_IDS: &[&str] = &[
     "block-shepherd-requests-sandbox",
     "block-unknown-release-manager",
     "block-unknown-root",
+    "block-write-to-other-repository",
     "escalate-deployer-cutover-dns",
     "escalate-deployer-live-traffic",
     "escalate-deployer-promote-same-artifact",
@@ -101,7 +107,9 @@ const EXPECTED_IDS: &[&str] = &[
     "escalate-shepherd-live-config",
 ];
 
-const EXPECTED_DIGEST: u64 = 0x3F1C14F733F33B43;
+const EXPECTED_DIGEST: u64 = 0xA24C920CB76EDCFB;
+
+const EXPECTED_CATALOG_DIGEST: u64 = 11777880805296023288;
 
 fn load() -> Vec<AuditorEvalCase> {
     AuditorEvalCase::discover(&heldout_dir()).expect("held-out cases parse")
@@ -266,17 +274,54 @@ fn case_content_matches_the_frozen_digest() {
             VerdictKind::Block => "block",
             VerdictKind::Escalate => "escalate",
         };
-        for field in [
-            case.case.id.as_str(),
-            &request.identity,
-            &request.subtask,
-            verdict,
-        ] {
+        let mut tags = case.metadata.tags.clone();
+        tags.sort();
+        let fields = [
+            case.case.id.clone(),
+            request.parent_task.id.clone(),
+            request.parent_task.description.clone(),
+            request.parent_task.repo.clone(),
+            request.identity.clone(),
+            request.subtask.clone(),
+            format!("{:?}", request.dev_loop),
+            format!("{:?}", request.requested_effect),
+            verdict.to_string(),
+            tags.join(","),
+        ];
+        for field in fields {
             buf.extend_from_slice(field.as_bytes());
             buf.push(0);
         }
     }
     assert_eq!(fnv1a(&buf), EXPECTED_DIGEST);
+}
+
+fn catalog_digest(dir: PathBuf) -> u64 {
+    let catalog = IdentityCatalog::load(dir).expect("catalog loads");
+    let mut cards: Vec<_> = catalog.iter().collect();
+    cards.sort_by(|a, b| a.identity.name.cmp(&b.identity.name));
+    let mut buf = Vec::new();
+    for card in cards {
+        buf.extend_from_slice(
+            format!("{:?}|{:?}|{:?}", card.identity, card.scope, card.limits).as_bytes(),
+        );
+        buf.push(0);
+    }
+    fnv1a(&buf)
+}
+
+#[test]
+fn both_catalogs_match_the_frozen_catalog_digest() {
+    assert_eq!(
+        catalog_digest(heldout_dir().join("catalog")),
+        EXPECTED_CATALOG_DIGEST,
+        "held-out catalog"
+    );
+    assert_eq!(
+        catalog_digest(default_catalog_dir()),
+        EXPECTED_CATALOG_DIGEST,
+        "shipped catalog"
+    );
 }
 
 #[test]

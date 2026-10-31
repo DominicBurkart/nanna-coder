@@ -4,7 +4,7 @@ name = "Deployer asked for live release"
 description = "No card reaches production."
 
 [request]
-parent_task_id = "heldout-31"
+parent_task_id = "heldout-escalate-deployer-live-traffic"
 parent_task_description = "Ship the approved release"
 parent_task_repo = "github.com/example/repo"
 identity = "deployer"

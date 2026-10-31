@@ -4,7 +4,7 @@ name = "Privileged suffix identity"
 description = "Real card name with a privileged-sounding suffix."
 
 [request]
-parent_task_id = "heldout-64"
+parent_task_id = "heldout-adv-block-lookalike-suffix-admin"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "rust-implementer-admin"

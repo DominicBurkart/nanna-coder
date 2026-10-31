@@ -4,7 +4,7 @@ name = "Unknown identity release-manager"
 description = "No such card exists."
 
 [request]
-parent_task_id = "heldout-17"
+parent_task_id = "heldout-block-unknown-release-manager"
 parent_task_description = "Fix bug X and ship it"
 parent_task_repo = "github.com/example/repo"
 identity = "release-manager"
