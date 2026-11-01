@@ -508,6 +508,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn model_only_surfaces_a_transport_error_instead_of_a_verdict() {
+        let auditor = ModelAuditor::new(MockProvider::replying(&[]), MODEL);
+        let error = auditor
+            .model_only(&fitting(), &context(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuditError::Model(_)), "{error}");
+    }
+
+    #[tokio::test]
     async fn review_spawn_returns_the_verdict_only() {
         let provider = MockProvider::replying(&[r#"{"verdict":"allow"}"#]);
         let auditor = ModelAuditor::new(provider, MODEL);

@@ -245,10 +245,10 @@ enum AuditorAction {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
-    /// Run the real model auditor (rules first, then the model) over a
-    /// directory of cases and print a false-allow scorecard; exits non-zero
-    /// when the model is unreachable, no cases are found or false allows
-    /// exceed the threshold
+    /// Score the spawn auditor model on a directory of cases. The gate is the
+    /// worst-case model-only false-allow count over --runs runs per case; the
+    /// production composition (rules first, then model) is reported apart.
+    /// Exits 1 above the threshold and 2 when the run cannot be trusted
     Eval {
         /// Directory of cases (defaults to evals/cases/auditor_heldout)
         #[arg(long)]

@@ -316,15 +316,20 @@ impl AuditorScorecard {
                 );
             }
         }
-        let _ = writeln!(
-            out,
-            "result: {}",
-            if self.within_threshold() {
-                "PASS"
-            } else {
-                "FAIL"
-            }
-        );
+        let verdict = if self.within_threshold() {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        if self.total == self.cases_available {
+            let _ = writeln!(out, "result: {verdict}");
+        } else {
+            let _ = writeln!(
+                out,
+                "result: {verdict} (subset of {}, NOT the gate)",
+                self.total
+            );
+        }
         out
     }
 }
@@ -991,6 +996,7 @@ mod tests {
         }
 
         let (code, _, err) = run(&Broken, &options(0)).await;
+        assert_eq!(Broken.name(), "broken");
         assert_eq!(code, EXIT_ERROR);
         assert!(err.contains("auditor failed on case"), "{err}");
     }
@@ -1358,14 +1364,14 @@ mod tests {
             ..options(0)
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_model_eval(
+        let code = within(run_model_eval(
             Arc::new(Silent),
             Some("m"),
             &no_env,
             &opts,
             &mut out,
             &mut err,
-        )
+        ))
         .await;
         assert_eq!(code, EXIT_ERROR);
         assert!(String::from_utf8(err).unwrap().contains("no reply within"));
@@ -1409,6 +1415,11 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert_eq!(only.name(), "m");
+        assert!(Silent.list_models().await.unwrap().is_empty());
+        assert_eq!(Silent.provider_name(), "silent");
+        assert_eq!(LeaksOnRun::new(0).name(), "leaks-on-one-run");
+        let rules = RuleAuditor::new();
+        assert_eq!(Progress::new(&rules, "p", 1).name(), rules.name());
     }
 
     fn ambiguous_case() -> tempfile::TempDir {
@@ -1660,6 +1671,12 @@ mod tests {
         assert_eq!(resolve_repo_sha(&no_env), from_git);
     }
 
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("a timeout was lost and the run hung")
+    }
+
     fn first_request_and_context() -> (SpawnRequest, AuditContext) {
         let case = &AuditorEvalCase::discover(&default_cases_dir()).unwrap()[0];
         (
@@ -1675,7 +1692,9 @@ mod tests {
             inner: ModelAuditor::new(Arc::new(Silent), "m"),
             timeout: Duration::from_millis(20),
         };
-        let error = silent.review_spawn(&request, &context).await.unwrap_err();
+        let error = within(silent.review_spawn(&request, &context))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("no reply within"), "{error}");
 
         let garbled = ModelOnly {
@@ -1685,9 +1704,17 @@ mod tests {
         let error = garbled.review_spawn(&request, &context).await.unwrap_err();
         assert!(error.to_string().contains("could not be parsed"), "{error}");
 
-        let (code, out, err) = run_pair(&RuleAuditor::new(), &silent, &options(0)).await;
+        let (code, out, err) = within(run_pair(&RuleAuditor::new(), &silent, &options(0))).await;
         assert_eq!(code, EXIT_ERROR, "{out}");
         assert!(err.contains("no reply within"), "{err}");
+
+        let failing = ModelOnly {
+            inner: ModelAuditor::new(Arc::new(HealthyButChatFails), "m"),
+            timeout: Duration::from_secs(5),
+        };
+        let (code, out, err) = within(run_pair(&RuleAuditor::new(), &failing, &options(0))).await;
+        assert_eq!(code, EXIT_ERROR, "{out}");
+        assert!(err.contains("unavailable"), "{err}");
     }
 
     #[tokio::test]
@@ -1719,6 +1746,7 @@ mod tests {
             }
         }
         let card = measure(&Blocks, &Blocks, &opts).await.unwrap();
+        assert_eq!(Blocks.name(), "blocks");
         assert_eq!(card.model_only.false_blocks, 1);
         assert_eq!(card.composed.false_blocks, 1);
     }
@@ -1789,6 +1817,9 @@ mod tests {
             "subset: 5 of {} cases (not a full-set result)",
             card.cases_available
         )));
+        assert!(card
+            .render()
+            .contains("result: PASS (subset of 5, NOT the gate)"));
         let none = ScorecardOptions {
             max_cases: Some(0),
             ..options(0)
