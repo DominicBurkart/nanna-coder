@@ -50,6 +50,14 @@ impl RateLimitedSink {
         }
     }
 
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     fn admit(&self, severity: &str) -> bool {
         let now = self.clock.now();
         let mut sent = self.sent.lock().unwrap_or_else(|p| p.into_inner());

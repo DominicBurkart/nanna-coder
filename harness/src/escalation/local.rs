@@ -8,8 +8,9 @@ pub const DEFAULT_RECORD_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Appends [`Escalation::to_json`] (redacted) as one JSON line per delivery,
 /// so every escalation leaves content a human can read even when no remote
-/// sink is configured. Writes stop with [`EscalationError::RecordFull`] once
-/// the file would exceed `limit_bytes`, which bounds its growth.
+/// sink is configured. When the file would exceed `limit_bytes` it is moved
+/// to `<path>.1`, replacing the previous rotation, which bounds the record to
+/// twice the limit however many escalations arrive.
 ///
 /// ```
 /// use harness::escalation::{Escalation, EscalationSink, EscalationSource, LocalRecordSink, Severity};
@@ -53,10 +54,11 @@ impl EscalationSink for LocalRecordSink {
         line.push('\n');
         let _guard = self.write.lock().unwrap_or_else(|p| p.into_inner());
         let used = std::fs::metadata(&self.path).map_or(0, |m| m.len());
-        if used.saturating_add(line.len() as u64) > self.limit_bytes {
-            return Err(EscalationError::RecordFull {
-                limit_bytes: self.limit_bytes,
-            });
+        if used > 0 && used.saturating_add(line.len() as u64) > self.limit_bytes {
+            let mut rotated = self.path.clone().into_os_string();
+            rotated.push(".1");
+            let _ = std::fs::remove_file(&rotated);
+            std::fs::rename(&self.path, &rotated)?;
         }
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
@@ -134,24 +136,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_record_refuses_the_write_and_stays_unchanged() {
+    async fn a_full_record_rotates_so_the_total_stays_bounded_and_the_newest_survives() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("records.jsonl");
-        let one = LocalRecordSink::new(&path, 1 << 20);
-        one.deliver(&escalation("a")).await.unwrap();
+        let rotated = dir.path().join("records.jsonl.1");
+        LocalRecordSink::new(&path, 1 << 20)
+            .deliver(&escalation("a"))
+            .await
+            .unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).unwrap();
 
-        let exact = LocalRecordSink::new(&path, size * 2);
-        exact.deliver(&escalation("b")).await.unwrap();
+        let sink = LocalRecordSink::new(&path, size * 2);
+        for name in ["a", "b"] {
+            sink.deliver(&escalation(name)).await.unwrap();
+        }
+        assert!(!rotated.exists());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), size * 2);
 
-        let tight = LocalRecordSink::new(&path, size * 2);
-        let err = tight.deliver(&escalation("c")).await.unwrap_err();
-        assert!(
-            matches!(err, EscalationError::RecordFull { limit_bytes } if limit_bytes == size * 2),
-            "{err}"
-        );
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), size * 2);
+        sink.deliver(&escalation("c")).await.unwrap();
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        assert!(old.contains("\"a\"") && old.contains("\"b\""), "{old}");
+        let new = std::fs::read_to_string(&path).unwrap();
+        assert!(new.contains("\"c\"") && !new.contains("\"b\""), "{new}");
+
+        for i in 0..50 {
+            sink.deliver(&escalation(&format!("n{i}"))).await.unwrap();
+            assert!(std::fs::metadata(&path).unwrap().len() <= size * 2);
+            assert!(std::fs::metadata(&rotated).unwrap().len() <= size * 2);
+        }
+        assert!(std::fs::read_to_string(&path).unwrap().contains("n49"));
+    }
+
+    #[tokio::test]
+    async fn a_rotation_that_cannot_happen_is_an_error_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.jsonl");
+        std::fs::create_dir(dir.path().join("records.jsonl.1")).unwrap();
+        let sink = LocalRecordSink::new(&path, 1);
+        sink.deliver(&escalation("first")).await.unwrap();
+        let err = sink.deliver(&escalation("second")).await.unwrap_err();
+        assert!(matches!(err, EscalationError::Io(_)), "{err}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("first"));
     }
 
     #[tokio::test]

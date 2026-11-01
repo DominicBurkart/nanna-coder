@@ -1,6 +1,6 @@
 use super::card::CardRequest;
 use super::redact::{redact, redact_value};
-use super::untrusted::safe_ref;
+use super::untrusted::{evidence_line, safe_ref};
 use crate::impact::BlastRadius;
 use crate::task::TaskId;
 use chrono::{DateTime, Utc};
@@ -383,7 +383,7 @@ impl Escalation {
             out.push_str("_none_\n");
         }
         for line in &self.evidence {
-            out.push_str(&format!("- {}\n", line.trim()));
+            out.push_str(&format!("- {}\n", evidence_line(line.trim())));
         }
         if let Some(radius) = &self.blast_radius {
             let list = |items: &[String]| {

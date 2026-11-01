@@ -48,7 +48,8 @@ pub use plane::{
 pub use protected_hook::ProtectedPathEscalation;
 pub use redact::{marker, redact, redact_value};
 pub use sink::{
-    DeliveryOutcome, DeliveryReceipt, EscalationError, EscalationSink, FanoutSink, SinkFailure,
+    BestEffortSink, DeliveryOutcome, DeliveryReceipt, EscalationError, EscalationSink, FanoutSink,
+    SinkFailure,
 };
 pub use spawn_hook::EscalatorSpawnHook;
 pub use webhook::WebhookSink;

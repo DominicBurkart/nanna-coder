@@ -1,6 +1,6 @@
 use super::{
-    default_window, EscalationError, EscalationLog, EscalationSink, Escalator, EscalatorSpawnHook,
-    FanoutSink, GithubIssueSink, LocalRecordSink, RateLimitedSink, WebhookSink,
+    default_window, BestEffortSink, EscalationError, EscalationLog, EscalationSink, Escalator,
+    EscalatorSpawnHook, FanoutSink, GithubIssueSink, LocalRecordSink, RateLimitedSink, WebhookSink,
     DEFAULT_RECORD_LIMIT_BYTES, DEFAULT_REMOTE_CAP,
 };
 use crate::backlog::{ReqwestGithubClient, GITHUB_API_URL};
@@ -155,11 +155,17 @@ impl SinkSettings {
             tracing::warn!("no human-facing escalation sink is configured (set {ESCALATION_REPO_ENV} and a token, or {ESCALATION_WEBHOOK_URL_ENV}); escalations are only written to the local record");
             return Arc::new(FanoutSink(vec![local]));
         }
-        let inner = Arc::new(FanoutSink(remote));
-        let (cap, window) = (DEFAULT_REMOTE_CAP, default_window());
-        let capped = RateLimitedSink::new(inner, clock, cap, window);
+        let capped = remote_limiter(Arc::new(FanoutSink(remote)), clock);
+        let local: Box<dyn EscalationSink> = Box::new(BestEffortSink::new(local));
         Arc::new(FanoutSink(vec![local, Box::new(capped)]))
     }
+}
+
+pub(crate) fn remote_limiter(
+    inner: Arc<dyn EscalationSink>,
+    clock: Arc<dyn Clock>,
+) -> RateLimitedSink {
+    RateLimitedSink::new(inner, clock, DEFAULT_REMOTE_CAP, default_window())
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -277,6 +283,13 @@ mod tests {
             "example/repo",
             summary,
         )
+    }
+
+    #[test]
+    fn the_production_remote_limiter_allows_ten_per_hour() {
+        let limiter = remote_limiter(Arc::new(UndeliveredSink), Arc::new(SystemClock));
+        assert_eq!(limiter.max(), 10);
+        assert_eq!(limiter.window(), chrono::Duration::hours(1));
     }
 
     #[test]

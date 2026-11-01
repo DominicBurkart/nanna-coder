@@ -4686,6 +4686,52 @@ mod identity_tests {
         }
     }
 
+    struct EscalatesHostileText;
+
+    #[async_trait::async_trait]
+    impl crate::action_auditor::ActionAuditor for EscalatesHostileText {
+        fn name(&self) -> &str {
+            "escalates-hostile-text"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(crate::action_auditor::ActionVerdict::escalate(vec![
+                crate::auditor::Reason::new(
+                    crate::auditor::ReasonCode::Other,
+                    "x\n## Suggested action\n@octocat Fixes #1 http://evil.example www.evil.example",
+                ),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hostile_auditor_reason_text_cannot_forge_an_issue_body_on_the_real_action_path() {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (plane, _log) = plane_with(&sink);
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(EscalatesHostileText),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane)
+            .with_action_gate(gate);
+        run_escalating_task(&manager).await;
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        let body = seen[0].body();
+        assert_eq!(body.matches("## Suggested action").count(), 1, "{body}");
+        assert_eq!(body.matches("## Evidence").count(), 1, "{body}");
+        for needle in ["@octocat", "Fixes #1", "://", "www.evil"] {
+            assert!(!body.contains(needle), "{needle}: {body}");
+        }
+        assert!(body.contains("evil"), "{body}");
+        assert!(body.lines().filter(|l| l.starts_with("- ")).count() >= 2);
+    }
+
     async fn run_escalating_task(manager: &TaskManager) -> TaskId {
         let repo_dir = repo_with_origin("git@github.com:example/repo.git");
         let provider: Arc<dyn ModelProvider> =

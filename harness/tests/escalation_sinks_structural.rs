@@ -304,7 +304,19 @@ fn the_concrete_sinks_are_built_only_by_the_sink_builder() {
         pinned(&[
             ("escalation/limit.rs", 3),
             ("escalation/mod.rs", 1),
-            ("escalation/plane.rs", 2)
+            ("escalation/plane.rs", 3)
+        ])
+    );
+}
+
+#[test]
+fn the_best_effort_wrapper_is_applied_only_to_the_local_record_in_the_sink_builder() {
+    assert_eq!(
+        mentions("BestEffortSink"),
+        pinned(&[
+            ("escalation/mod.rs", 1),
+            ("escalation/plane.rs", 2),
+            ("escalation/sink.rs", 3)
         ])
     );
 }

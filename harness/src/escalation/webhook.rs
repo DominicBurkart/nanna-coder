@@ -5,11 +5,13 @@ use async_trait::async_trait;
 /// integrations. Any 2xx response is a delivery. The URL is a credential
 /// for most chat and pager hooks, so receipts, errors, logs and `Debug`
 /// carry only its scheme, host and port ([`origin`](Self::origin)); every
-/// request is bounded by a timeout.
+/// request is bounded by a timeout and redirects are never followed, so a
+/// 3xx answer is a failure rather than a re-POST of the escalation elsewhere.
 #[derive(Clone)]
 pub struct WebhookSink {
     http: reqwest::Client,
     url: String,
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for WebhookSink {
@@ -27,15 +29,21 @@ fn client(timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("a client with only timeouts configured always builds")
 }
 
 impl WebhookSink {
     pub fn new(url: impl Into<String>) -> Self {
+        Self::bounded(url.into(), REQUEST_TIMEOUT)
+    }
+
+    fn bounded(url: String, timeout: std::time::Duration) -> Self {
         Self {
-            http: client(REQUEST_TIMEOUT),
-            url: url.into(),
+            http: client(timeout),
+            url,
+            timeout,
         }
     }
 
@@ -52,9 +60,12 @@ impl WebhookSink {
         }
     }
 
-    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.http = client(timeout);
-        self
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+
+    pub fn with_timeout(self, timeout: std::time::Duration) -> Self {
+        Self::bounded(self.url, timeout)
     }
 }
 
@@ -271,5 +282,44 @@ mod tests {
             WebhookSink::new("https://hooks.example.com/a").origin(),
             "https://hooks.example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn the_production_constructor_uses_the_documented_timeout() {
+        let sink = WebhookSink::new("https://hooks.example.com/x");
+        assert_eq!(sink.timeout(), std::time::Duration::from_secs(15));
+        let shorter = sink.with_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(shorter.timeout(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_a_failure_and_the_escalation_is_not_resent_elsewhere() {
+        let (target, bodies, target_server) = capture_server().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hop = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("{target}/ok/elsewhere");
+        let redirector = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut chunk = [0u8; 8192];
+                let _ = socket.read(&mut chunk).await.unwrap();
+                let reply = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let err = WebhookSink::new(format!("{hop}/hook"))
+            .deliver(&escalation())
+            .await
+            .unwrap_err();
+        redirector.abort();
+        target_server.abort();
+        assert!(
+            matches!(err, EscalationError::Status { status: 307, .. }),
+            "{err}"
+        );
+        assert!(bodies.lock().unwrap().is_empty());
     }
 }

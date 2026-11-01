@@ -453,3 +453,56 @@ async fn with_nothing_configured_only_the_local_record_is_written_and_the_operat
     assert_eq!(records(dir.path()).len(), 1);
     assert!(logged().contains("no human-facing escalation sink is configured"));
 }
+
+#[tokio::test]
+async fn a_broken_local_record_does_not_turn_remote_success_into_a_failed_delivery() {
+    logs();
+    let server = FakeServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "x").unwrap();
+    let lookup = env(&[
+        (ESCALATION_REPO_ENV, PINNED.to_string()),
+        (ESCALATION_GITHUB_TOKEN_ENV, TOKEN.to_string()),
+        (
+            ESCALATION_WEBHOOK_URL_ENV,
+            format!("{}/ok/hook", server.base),
+        ),
+    ]);
+    let settings = SinkSettings::from_lookup(&lookup).unwrap();
+    let sink = settings.build(
+        blocker.join("records.jsonl"),
+        &server.base,
+        Arc::new(SystemClock),
+    );
+    let log = Arc::new(EscalationLog::in_memory());
+    let escalator = EscalationPlane::new(Arc::clone(&log), sink).escalator();
+    let escalation = || {
+        Escalation::new(
+            Severity::Blocked,
+            EscalationSource::Auditor,
+            "example/repo",
+            "same problem",
+        )
+    };
+
+    let first = escalator.escalate(escalation()).await.unwrap();
+    assert!(matches!(
+        first,
+        EscalationOutcome::Delivered { occurrence: 1, .. }
+    ));
+    assert!(log.states()[0].last_delivered.is_some());
+    let second = escalator.escalate(escalation()).await.unwrap();
+    assert!(matches!(
+        second,
+        EscalationOutcome::Collapsed { occurrence: 2 }
+    ));
+    assert_eq!(
+        server
+            .requests("POST", &format!("/repos/{PINNED}/issues"))
+            .len(),
+        1
+    );
+    assert_eq!(server.requests("POST", "/ok/hook").len(), 1);
+    assert!(logged().contains("best-effort escalation sink failed"));
+}

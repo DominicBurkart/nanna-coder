@@ -16,6 +16,8 @@ pub enum DeliveryOutcome {
     Posted,
     /// The escalation was appended to the local record.
     Recorded,
+    /// A best-effort sink failed; the failure was logged and not propagated.
+    Degraded,
     /// Every child sink of a [`FanoutSink`] delivered.
     Fanout { receipts: Vec<DeliveryReceipt> },
 }
@@ -62,8 +64,6 @@ pub enum EscalationError {
     NoSink,
     #[error("remote escalation delivery is capped at {max} per {window_secs}s per severity; this one was not sent")]
     RateLimited { max: usize, window_secs: i64 },
-    #[error("the local escalation record is full ({limit_bytes} bytes); this one was not written")]
-    RecordFull { limit_bytes: u64 },
     #[error("no incident hold with id `{0}`")]
     UnknownHold(String),
     #[error("resolving an incident hold needs a human operator at a terminal: {0}")]
@@ -113,6 +113,49 @@ pub trait EscalationSink: Send + Sync {
 
     /// Deliver `escalation` and say where it landed.
     async fn deliver(&self, escalation: &Escalation) -> Result<DeliveryReceipt, EscalationError>;
+}
+
+/// Wraps a sink whose failure must not turn the other sinks' success into a
+/// failure: an error is logged and reported as [`DeliveryOutcome::Degraded`].
+///
+/// ```
+/// use harness::escalation::{BestEffortSink, DeliveryOutcome, Escalation, EscalationSink, EscalationSource, LocalRecordSink, Severity};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let dir = tempfile::tempdir().unwrap();
+/// let broken = LocalRecordSink::new(dir.path().join("missing").join("r.jsonl"), 1024);
+/// let sink = BestEffortSink::new(Box::new(broken));
+/// let escalation = Escalation::new(Severity::Info, EscalationSource::Manual, "example/repo", "x");
+/// assert_eq!(sink.deliver(&escalation).await.unwrap().outcome, DeliveryOutcome::Degraded);
+/// # });
+/// ```
+pub struct BestEffortSink(Box<dyn EscalationSink>);
+
+impl BestEffortSink {
+    pub fn new(inner: Box<dyn EscalationSink>) -> Self {
+        Self(inner)
+    }
+}
+
+#[async_trait]
+impl EscalationSink for BestEffortSink {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    async fn deliver(&self, escalation: &Escalation) -> Result<DeliveryReceipt, EscalationError> {
+        match self.0.deliver(escalation).await {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                tracing::error!(sink = self.0.name(), %error, "best-effort escalation sink failed; the other sinks still decide delivery");
+                Ok(DeliveryReceipt {
+                    sink: self.0.name().to_string(),
+                    reference: "degraded".to_string(),
+                    outcome: DeliveryOutcome::Degraded,
+                })
+            }
+        }
+    }
 }
 
 /// Deliver to several sinks at once. Every sink is attempted even after one
@@ -226,6 +269,35 @@ pub(super) mod tests {
             vec!["a", "b"]
         );
         assert!(FanoutSink(vec![]).deliver(&escalation()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failing_best_effort_sink_does_not_fail_the_fanout_and_a_working_one_passes_through()
+    {
+        let fanout = FanoutSink(vec![
+            Box::new(BestEffortSink::new(Box::new(RecordingSink::new(
+                "local", true,
+            )))),
+            Box::new(RecordingSink::new("remote", false)),
+        ]);
+        let receipt = fanout.deliver(&escalation()).await.unwrap();
+        let DeliveryOutcome::Fanout { receipts } = receipt.outcome else {
+            panic!("expected fanout")
+        };
+        assert_eq!(receipts[0].outcome, DeliveryOutcome::Degraded);
+        assert_eq!(receipts[0].sink, "local");
+        assert_eq!(receipts[1].sink, "remote");
+        let ok = BestEffortSink::new(Box::new(RecordingSink::new("fine", false)));
+        assert_eq!(ok.name(), "fine");
+        assert_eq!(
+            ok.deliver(&escalation()).await.unwrap().outcome,
+            DeliveryOutcome::Posted
+        );
+        let strict = FanoutSink(vec![
+            Box::new(RecordingSink::new("local", true)),
+            Box::new(RecordingSink::new("remote", false)),
+        ]);
+        assert!(strict.deliver(&escalation()).await.is_err());
     }
 
     #[tokio::test]

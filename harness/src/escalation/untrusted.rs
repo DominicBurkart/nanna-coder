@@ -51,6 +51,33 @@ fn unlink(text: &str) -> String {
     out
 }
 
+const EVIDENCE_CAP: usize = 600;
+
+pub(crate) fn evidence_line(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .take(EVIDENCE_CAP)
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => None,
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let linked = unlink(&flat);
+    let mut out = String::with_capacity(linked.len());
+    let mut previous = '\0';
+    for c in linked.chars() {
+        match c {
+            '@' => out.push_str("&#64;"),
+            '#' if previous != '&' => out.push_str("&#35;"),
+            c => out.push(c),
+        }
+        previous = c;
+    }
+    out
+}
+
 const REF_CAP: usize = 160;
 
 pub(crate) fn safe_ref(text: &str) -> String {
@@ -84,6 +111,23 @@ mod tests {
         assert_eq!(safe_ref("a b\n#c@d`e:f"), "a_b__c_d_e_f");
         assert_eq!(safe_ref("www.evil.example"), "www&#46;evil.example");
         assert_eq!(safe_ref("WWW.evil.example"), "WWW&#46;evil.example");
+    }
+
+    #[test]
+    fn evidence_lines_are_flat_unlinked_and_mention_free_but_keep_ordinary_text() {
+        let shown = evidence_line(
+            "tool `x` refused\n## Suggested action\r@octocat Fixes #1 http://e www.e\u{202e}\u{1b}",
+        );
+        assert_eq!(
+            shown,
+            "tool `x` refused &#35;&#35; Suggested action &#64;octocat Fixes &#35;1 http:&#47;&#47;e www&#46;e"
+        );
+        assert_eq!(evidence_line("a: b (c) 1.5"), "a: b (c) 1.5");
+        assert_eq!(
+            evidence_line(&evidence_line("@x #1")),
+            evidence_line("@x #1")
+        );
+        assert_eq!(evidence_line(&"a".repeat(2000)).len(), 600);
     }
 
     #[test]
