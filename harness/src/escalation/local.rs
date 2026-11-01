@@ -38,6 +38,10 @@ impl LocalRecordSink {
         }
     }
 
+    pub fn limit_bytes(&self) -> u64 {
+        self.limit_bytes
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }

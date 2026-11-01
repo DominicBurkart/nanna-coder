@@ -296,7 +296,7 @@ fn the_concrete_sinks_are_built_only_by_the_sink_builder() {
         pinned(&[
             ("escalation/local.rs", 3),
             ("escalation/mod.rs", 1),
-            ("escalation/plane.rs", 2)
+            ("escalation/plane.rs", 3)
         ])
     );
     assert_eq!(

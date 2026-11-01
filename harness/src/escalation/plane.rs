@@ -140,9 +140,7 @@ impl SinkSettings {
         github_api_url: &str,
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn EscalationSink> {
-        let limit = DEFAULT_RECORD_LIMIT_BYTES;
-        let local = LocalRecordSink::new(record_path, limit);
-        let local: Box<dyn EscalationSink> = Box::new(local);
+        let local: Box<dyn EscalationSink> = Box::new(local_record(record_path.into()));
         let mut remote: Vec<Box<dyn EscalationSink>> = Vec::new();
         if let (Some(repo), Some(token)) = (&self.repo, &self.token) {
             let client = ReqwestGithubClient::new(github_api_url, Some(token.clone()));
@@ -159,6 +157,10 @@ impl SinkSettings {
         let local: Box<dyn EscalationSink> = Box::new(BestEffortSink::new(local));
         Arc::new(FanoutSink(vec![local, Box::new(capped)]))
     }
+}
+
+pub(crate) fn local_record(path: PathBuf) -> LocalRecordSink {
+    LocalRecordSink::new(path, DEFAULT_RECORD_LIMIT_BYTES)
 }
 
 pub(crate) fn remote_limiter(
@@ -283,6 +285,34 @@ mod tests {
             "example/repo",
             summary,
         )
+    }
+
+    #[test]
+    fn the_production_local_record_rotates_at_eight_mebibytes() {
+        assert_eq!(DEFAULT_RECORD_LIMIT_BYTES, 8 * 1024 * 1024);
+        let sink = local_record(PathBuf::from("records.jsonl"));
+        assert_eq!(sink.limit_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn with_no_remote_sink_a_broken_local_record_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let sink = SinkSettings::default().build(
+            blocker.join("records.jsonl"),
+            "http://127.0.0.1:1",
+            Arc::new(SystemClock),
+        );
+        let err = sink.deliver(&escalation("nowhere")).await.unwrap_err();
+        assert!(
+            matches!(&err, EscalationError::Partial { failed, .. } if failed[0].sink == "local-record"),
+            "{err}"
+        );
+        let log = Arc::new(EscalationLog::in_memory());
+        let escalator = EscalationPlane::new(Arc::clone(&log), sink).escalator();
+        assert!(escalator.escalate(escalation("again")).await.is_err());
+        assert_eq!(log.states()[0].last_delivered, None);
     }
 
     #[test]

@@ -131,7 +131,7 @@ mod tests {
         let (body, title) = rendered(&format!(".nanna/{}", "a".repeat(4000)), ".nanna/**");
         assert!(body.len() < 2000, "{}", body.len());
         assert!(title.len() < 300);
-        assert!(body.contains("[truncated]"));
+        assert!(body.contains("&#91;truncated&#93;"));
     }
 
     #[test]

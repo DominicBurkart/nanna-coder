@@ -59,17 +59,28 @@ pub(crate) fn evidence_line(text: &str) -> String {
         .take(EVIDENCE_CAP)
         .filter_map(|c| match c {
             '\n' | '\r' | '\t' => Some(' '),
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => None,
+            '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{e0000}'..='\u{e007f}' => None,
             c if c.is_control() => None,
             c => Some(c),
         })
         .collect();
-    let linked = unlink(&flat);
+    let linked = unlink(&flat).replace("//", "&#47;&#47;");
     let mut out = String::with_capacity(linked.len());
     let mut previous = '\0';
     for c in linked.chars() {
         match c {
             '@' => out.push_str("&#64;"),
+            '<' => out.push_str("&lt;"),
+            '[' => out.push_str("&#91;"),
+            ']' => out.push_str("&#93;"),
+            '!' => out.push_str("&#33;"),
             '#' if previous != '&' => out.push_str("&#35;"),
             c => out.push(c),
         }
@@ -128,6 +139,37 @@ mod tests {
             evidence_line("@x #1")
         );
         assert_eq!(evidence_line(&"a".repeat(2000)).len(), 600);
+    }
+
+    #[test]
+    fn evidence_lines_cannot_carry_html_images_links_or_invisible_characters() {
+        let payloads = [
+            "<img src=//evil/x.png>",
+            "<a href=//evil>click</a>",
+            "[click](//evil.com)",
+            "![x](//evil/p.png)",
+            "see //evil.example/track.gif now",
+            "ab\u{feff}cd\u{2060}ef\u{ad}gh\u{61c}ij\u{e0041}\u{e007f}kl\u{180e}mn\u{2064}op",
+        ];
+        for payload in payloads {
+            let shown = evidence_line(payload);
+            for needle in ["<", "[", "]", "!", "//"] {
+                assert!(!shown.contains(needle), "{needle}: {payload} -> {shown}");
+            }
+            for c in shown.chars() {
+                assert!(
+                    !matches!(c, '\u{feff}' | '\u{2060}'..='\u{2064}' | '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{e0000}'..='\u{e007f}'),
+                    "{payload} -> {shown:?}"
+                );
+            }
+            assert_eq!(evidence_line(&shown), shown, "{payload}");
+        }
+        assert_eq!(evidence_line("abcdefghijklmnopq"), "abcdefghijklmnopq");
+        assert_eq!(
+            evidence_line("ab\u{feff}cd\u{2060}ef\u{ad}gh\u{61c}ij\u{e0041}kl\u{180e}mn\u{2064}op"),
+            "abcdefghijklmnop"
+        );
+        assert_eq!(evidence_line("<b>"), "&lt;b>");
     }
 
     #[test]
