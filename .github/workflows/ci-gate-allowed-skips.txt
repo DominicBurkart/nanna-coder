@@ -1,0 +1,6 @@
+security-scan pull_request *
+cache-maintenance pull_request *
+release pull_request *
+cache-maintenance release *
+release push *
+cache-maintenance push refs/heads/develop
