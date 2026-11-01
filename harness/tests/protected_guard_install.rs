@@ -4,8 +4,8 @@ fn repo_file(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    std::fs::read_to_string(path)
+        .expect("repository file readable")
         .replace("\r\n", "\n")
 }
 
