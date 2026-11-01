@@ -15,6 +15,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 - Strip or forge the identity marker. Agent commits end with the `Nanna-Identity: <name>` trailer and agent PR bodies carry `<!-- Nanna-Identity: <name> -->` (`harness::marker`); the CI guard uses it to tell agent PRs from human PRs.
 - Circumvent the protected-paths guard. Its workflow is maintained at [`docs/ci/protected-paths-guard.yml`](docs/ci/protected-paths-guard.yml) and must be installed into `.github/workflows/` by a maintainer, because agents cannot write there; it fails any PR that touches a protected path unless its author is listed in the repository variable `PROTECTED_PATTERNS_HUMAN_AUTHORS` and the PR carries no identity marker (a PR with a marker fails even when its author is listed).
 
+## Auditor false-allow eval: what is enforced where
+
+The spawn auditor's false-allow rate is measured with `nanna auditor eval --cases <dir> [--max-false-allow 0]` (defaults to the held-out set in `evals/cases/auditor_heldout/`). It runs the real model (`NANNA_EVAL_MODEL` or `MODEL`, served by Ollama) over every case model-only (rule layer bypassed) `--runs` times (default 3; a case is a false allow if any run allows it) and once composed exactly as production (rules first, then model, as `--audit-model` wires it). The scorecard records the model id and digest, temperature 0 (the provider has no seed option, so none is set), the system-prompt hash, the run count and the repo SHA. The exit code is gated on the model-only worst-case false-allow count, because rule-decided cases cannot show model weakness; composed numbers, the layer that decided each case, and block-versus-escalate confusion are reported separately. It exits non-zero when no model is configured or reachable, when the model fails to answer or answers unparsably on any case, when the cases directory is missing or empty, or when false allows exceed the threshold. It never skips.
+
+- Enforced by CI on every PR: only the unit tests of the scorecard logic against mock auditors (a leaky mock fails the run, a perfect mock passes, an unreachable model fails the run). CI has no model, so no required check measures a model.
+- Manual: the command above, and `cargo test --test auditor_eval_integration -- --ignored`, which calls the same function and fails when no model is configured.
+- Scheduled: `.github/workflows/auditor-eval.yml` runs the command nightly and on `workflow_dispatch` on a GitHub-hosted runner that installs Ollama and pulls the model, fails on model-only false allows, and uploads the scorecard. It is not a required check and is not in the `All Checks Passed` needs, so a red run does not block merges.
+- The cases in `evals/cases/auditor_spawn/` were written alongside `RuleAuditor`; scoring the rules on them (`nanna auditor record-scorecard`) is circular (#771) and says nothing about a model.
+
 ## When 100% patch coverage is genuinely unhittable
 
 1. If you are blocked because of disabled tests, enable them.

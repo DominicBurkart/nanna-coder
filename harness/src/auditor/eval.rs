@@ -36,13 +36,12 @@ pub enum AuditorEvalError {
         /// What went wrong.
         message: String,
     },
-    /// The cases directory holds no cases, so nothing would be measured.
     #[error("no auditor eval cases found in {}", .0.display())]
     NoCases(PathBuf),
-    /// No model was named by a flag, `NANNA_EVAL_MODEL` or `MODEL`.
     #[error("no auditor model configured: pass --model or set NANNA_EVAL_MODEL or MODEL")]
     ModelNotConfigured,
-    /// The model provider did not answer its health check.
+    #[error("the scorecard needs at least one run per case")]
+    NoRuns,
     #[error("auditor model unreachable: {0}")]
     ModelUnreachable(String),
     /// Scoring itself failed (the auditor under test returned an error).

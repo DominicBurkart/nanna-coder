@@ -1,0 +1,97 @@
+name: Auditor Eval (model-measured false-allow)
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ollama model the spawn auditor runs on"
+        required: false
+        default: "gemma4:e4b"
+      cases:
+        description: "Cases directory"
+        required: false
+        default: "evals/cases/auditor_heldout"
+      max_false_allow:
+        description: "Largest model-only false-allow count that passes"
+        required: false
+        default: "0"
+      runs:
+        description: "Model-only runs per case"
+        required: false
+        default: "3"
+
+jobs:
+  auditor-eval:
+    name: Model-only false-allow scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      MODEL: ${{ inputs.model || 'gemma4:e4b' }}
+      CASES: ${{ inputs.cases || 'evals/cases/auditor_heldout' }}
+      MAX_FALSE_ALLOW: ${{ inputs.max_false_allow || '0' }}
+      RUNS: ${{ inputs.runs || '3' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: nanna-coder
+          authToken: ${{ secrets.CACHIX_AUTH }}
+          pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+
+      - name: Build nanna
+        run: nix develop --command cargo build --release --bin nanna
+
+      - name: Start Ollama and pull model
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for i in $(seq 1 60); do
+            ollama list > /dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama list > /dev/null 2>&1 || { echo "Ollama did not become ready within 60s"; exit 1; }
+          for attempt in 1 2 3; do
+            timeout 1200 ollama pull "$MODEL" && break
+            [ "$attempt" = "3" ] && { echo "Failed to pull $MODEL"; exit 1; }
+            sleep $((attempt * 10))
+          done
+
+      - name: Run auditor scorecard
+        shell: bash
+        env:
+          NANNA_EVAL_MODEL: ${{ env.MODEL }}
+        run: |
+          set -o pipefail
+          ./target/release/nanna auditor eval \
+            --cases "$CASES" \
+            --max-false-allow "$MAX_FALSE_ALLOW" \
+            --runs "$RUNS" \
+            2>&1 | tee auditor-scorecard.txt
+
+      - name: Write scorecard summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '```'
+            cat auditor-scorecard.txt 2>/dev/null || echo "no scorecard produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditor-scorecard
+          path: auditor-scorecard.txt
+          if-no-files-found: warn
