@@ -59,15 +59,40 @@ impl OllamaProvider {
         })
     }
 
+    fn has_explicit_port(base_url: &str) -> bool {
+        let rest = base_url
+            .split_once("://")
+            .map_or(base_url, |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, tail)| tail);
+        match host_port.strip_prefix('[') {
+            Some(bracketed) => bracketed
+                .split_once(']')
+                .is_some_and(|(_, after)| after.starts_with(':')),
+            None => host_port.contains(':'),
+        }
+    }
+
     fn endpoint(base_url: &str) -> ModelResult<reqwest::Url> {
-        let mut url = reqwest::Url::parse(base_url).map_err(|e| ModelError::InvalidConfig {
-            message: format!("Invalid base URL `{base_url}`: {e}"),
-        })?;
-        if url.port().is_none() {
-            url.set_port(Some(11434))
-                .map_err(|_| ModelError::InvalidConfig {
-                    message: format!("Base URL `{base_url}` cannot carry a port"),
-                })?;
+        let invalid = |reason: String| ModelError::InvalidConfig {
+            message: format!("Invalid base URL `{base_url}`: {reason}"),
+        };
+        let mut url = reqwest::Url::parse(base_url).map_err(|e| invalid(e.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(invalid(
+                "expected an http or https URL with a host".to_string(),
+            ));
+        }
+        if url.scheme() == "http" && !Self::has_explicit_port(base_url) {
+            let _ = url.set_port(Some(11434));
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
         }
         Ok(url)
     }
@@ -1003,13 +1028,104 @@ mod tests {
         provider.health_check().await.unwrap();
     }
 
+    fn endpoint_of(base_url: &str) -> reqwest::Url {
+        OllamaProvider::endpoint(base_url).unwrap()
+    }
+
     #[test]
-    fn the_endpoint_keeps_an_explicit_port_and_defaults_a_missing_one() {
-        let kept = OllamaProvider::endpoint("http://127.0.0.1:4242").unwrap();
+    fn an_explicit_port_is_kept() {
+        assert_eq!(endpoint_of("http://127.0.0.1:4242").port(), Some(4242));
+        assert_eq!(endpoint_of("https://h.example:8443").port(), Some(8443));
+        assert_eq!(endpoint_of("http://h:11434").port(), Some(11434));
+    }
+
+    #[test]
+    fn an_explicit_default_port_is_kept_not_replaced_with_the_ollama_port() {
+        assert_eq!(endpoint_of("http://h:80").port_or_known_default(), Some(80));
+        assert_eq!(
+            endpoint_of("https://h:443").port_or_known_default(),
+            Some(443)
+        );
+    }
+
+    #[test]
+    fn a_missing_http_port_defaults_to_the_ollama_port() {
+        assert_eq!(endpoint_of("http://127.0.0.1").port(), Some(11434));
+        assert_eq!(endpoint_of("http://localhost/").port(), Some(11434));
+    }
+
+    #[test]
+    fn a_missing_https_port_is_443_because_a_tls_front_end_is_not_on_the_ollama_port() {
+        let url = endpoint_of("https://ollama.example.com");
+        assert_eq!(url.port_or_known_default(), Some(443));
+        assert_eq!(url.as_str(), "https://ollama.example.com/");
+    }
+
+    #[test]
+    fn ipv6_hosts_keep_their_port_and_default_a_missing_one() {
+        let kept = endpoint_of("http://[::1]:4242");
+        assert_eq!(kept.host_str(), Some("[::1]"));
         assert_eq!(kept.port(), Some(4242));
-        let defaulted = OllamaProvider::endpoint("http://127.0.0.1").unwrap();
-        assert_eq!(defaulted.port(), Some(11434));
-        assert!(OllamaProvider::endpoint("mailto:someone@example.com").is_err());
+        assert_eq!(endpoint_of("http://[::1]:11434").port(), Some(11434));
+        assert_eq!(endpoint_of("http://[::1]").port(), Some(11434));
+        assert_eq!(
+            endpoint_of("http://[::1]:80").port_or_known_default(),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_change_the_endpoint() {
+        assert_eq!(
+            endpoint_of("http://h:5/").as_str(),
+            endpoint_of("http://h:5").as_str()
+        );
+        assert_eq!(endpoint_of("http://h:5").as_str(), "http://h:5/");
+    }
+
+    #[test]
+    fn userinfo_is_kept_and_does_not_hide_a_missing_port() {
+        let with_port = endpoint_of("http://user:secret@h:5");
+        assert_eq!(with_port.username(), "user");
+        assert_eq!(with_port.port(), Some(5));
+        let without = endpoint_of("http://user:secret@h");
+        assert_eq!(without.username(), "user");
+        assert_eq!(without.port(), Some(11434));
+    }
+
+    #[test]
+    fn a_path_prefix_is_kept_with_a_trailing_slash_and_query_and_fragment_are_dropped() {
+        assert_eq!(
+            endpoint_of("http://h:5/ollama").as_str(),
+            "http://h:5/ollama/"
+        );
+        assert_eq!(
+            endpoint_of("http://h:5/ollama/?x=1#frag").as_str(),
+            "http://h:5/ollama/"
+        );
+        assert_eq!(
+            endpoint_of("http://h/ollama").as_str(),
+            "http://h:11434/ollama/"
+        );
+    }
+
+    #[test]
+    fn an_unusable_base_url_is_a_config_error() {
+        for bad in [
+            "",
+            "not a url",
+            "mailto:someone@example.com",
+            "ftp://h:21",
+            "http://",
+        ] {
+            assert!(
+                matches!(
+                    OllamaProvider::endpoint(bad),
+                    Err(ModelError::InvalidConfig { .. })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
