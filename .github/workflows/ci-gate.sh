@@ -21,11 +21,12 @@ if ! printf '%s' "$NEEDS_JSON" | jq -e '
   exit 1
 fi
 
+missing_jobs=$(printf '%s' "$NEEDS_JSON" | jq -r --argjson req "$required_jobs" '$req - keys | .[]')
+
 while IFS= read -r job; do
-  if ! printf '%s' "$NEEDS_JSON" | jq -e --arg j "$job" 'has($j)' >/dev/null; then
-    add_failure "required job '$job' is absent from the needs context"
-  fi
-done < <(printf '%s' "$required_jobs" | jq -r '.[]')
+  [ -n "$job" ] || continue
+  add_failure "required job '$job' is absent from the needs context"
+done <<< "$missing_jobs"
 
 skip_allowed() {
   local job="$1" event ref
