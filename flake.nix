@@ -261,7 +261,7 @@
 
           workspace-coverage = pkgs.runCommand "cargo-tarpaulin-coverage" {
             buildInputs = [ pkgs.cargo-tarpaulin rustToolchain ] ++ packages.commonBuildInputs;
-            nativeBuildInputs = packages.commonNativeBuildInputs;
+            nativeBuildInputs = packages.commonNativeBuildInputs ++ [ pkgs.jq ];
           } ''
             cd ${src}
             export CARGO_HOME=$(mktemp -d)
