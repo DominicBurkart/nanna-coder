@@ -22,6 +22,7 @@ let
   commonNativeBuildInputs = with pkgs; [
     pkg-config
     stdenv.cc
+    jq
   ];
 
   # Build dependencies first for better caching

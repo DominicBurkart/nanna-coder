@@ -119,6 +119,9 @@
             (pkgs.lib.hasSuffix "\.lock" path) ||
             (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
             (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci.yml" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
             (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
             (pkgs.lib.hasInfix "/docs/" path) ||
             (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
@@ -300,7 +303,7 @@
           nix2containerPkgs = nix2container.packages.${system};
 
           commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git ];
+          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git jq ];
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -310,6 +313,9 @@
               (pkgs.lib.hasSuffix "\.lock" path) ||
               (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
               (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci.yml" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
               (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
               (pkgs.lib.hasInfix "/docs/" path) ||
               (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
