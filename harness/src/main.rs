@@ -263,8 +263,14 @@ enum AuditorAction {
         #[arg(long, default_value_t = 0)]
         max_false_allow: usize,
         /// Seconds to wait for the model on each case
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
+        /// Ollama base URL (defaults to the local instance)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Score only the first N cases (a partial, non-authoritative run)
+        #[arg(long)]
+        max_cases: Option<usize>,
         /// Model-only runs per case; a case is a false allow if any run allows it
         #[arg(long, default_value_t = harness::auditor::model_eval::DEFAULT_RUNS)]
         runs: usize,
@@ -578,12 +584,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     model,
                     max_false_allow,
                     timeout_secs,
+                    base_url,
+                    max_cases,
                     runs,
                 },
         } => {
+            let mut ollama = OllamaConfig::default();
+            if let Some(url) = base_url {
+                ollama = ollama.with_base_url(url);
+            }
             let provider: std::sync::Arc<dyn model::ModelProvider> =
-                std::sync::Arc::new(OllamaProvider::new(OllamaConfig::default())?);
+                std::sync::Arc::new(OllamaProvider::new(ollama.clone())?);
             let options = harness::auditor::model_eval::ScorecardOptions {
+                max_cases,
                 cases_dir: cases
                     .unwrap_or_else(harness::auditor::model_eval::default_heldout_cases_dir),
                 catalog_dir: catalog,
@@ -595,11 +608,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &|key| std::env::var(key).ok(),
                 ) {
                     Ok(name) => {
-                        harness::auditor::model_eval::fetch_ollama_digest(
-                            &OllamaConfig::default().base_url,
-                            &name,
-                        )
-                        .await
+                        harness::auditor::model_eval::fetch_ollama_digest(&ollama.base_url, &name)
+                            .await
                     }
                     Err(_) => None,
                 },

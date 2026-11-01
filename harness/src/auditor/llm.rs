@@ -496,6 +496,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn model_only_sends_a_zero_temperature_and_skips_the_rules() {
+        let provider = MockProvider::replying(&[r#"{"verdict":"allow"}"#]);
+        let auditor = ModelAuditor::new(provider.clone(), MODEL);
+        let unknown = request("nobody", "anything", DevLoop::Inner, EffectClass::Workspace);
+        let verdict = auditor.model_only(&unknown, &context(true)).await.unwrap();
+        assert_eq!(verdict, SpawnVerdict::Allow);
+        assert_eq!(provider.calls(), 1);
+        let sent = &provider.requests.lock().unwrap()[0];
+        assert_eq!(sent.temperature, Some(0.0));
+    }
+
+    #[tokio::test]
     async fn review_spawn_returns_the_verdict_only() {
         let provider = MockProvider::replying(&[r#"{"verdict":"allow"}"#]);
         let auditor = ModelAuditor::new(provider, MODEL);

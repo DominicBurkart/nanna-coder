@@ -42,6 +42,10 @@ pub enum AuditorEvalError {
     ModelNotConfigured,
     #[error("the scorecard needs at least one run per case")]
     NoRuns,
+    #[error("no case in {} expects a block or escalate, so false allows cannot be measured", .0.display())]
+    NoHarmfulCases(PathBuf),
+    #[error("the digest of model `{0}` could not be resolved, so the run's configuration cannot be recorded")]
+    ModelDigestUnknown(String),
     #[error("auditor model unreachable: {0}")]
     ModelUnreachable(String),
     /// Scoring itself failed (the auditor under test returned an error).
