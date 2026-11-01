@@ -622,6 +622,9 @@ jobs:
     name: All Checks Passed
     runs-on: ubuntu-latest
     if: always()
+    permissions:
+      contents: read
+      actions: read
     needs:
       - test-matrix
       - build-matrix
@@ -647,8 +650,22 @@ jobs:
           fi
           echo "OK: all $(echo "$expected" | wc -l | tr -d ' ') non-gate jobs covered"
 
-      - name: Fail if any dependency failed or was cancelled
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      - name: Collect per-job conclusions for this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "::error::One or more CI jobs failed or were cancelled"
-          exit 1
+          set -euo pipefail
+          gh api --paginate "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100&filter=latest" \
+            | jq -s '{jobs: map(.jobs[])}' > "${RUNNER_TEMP}/ci-jobs.json"
+
+      - name: Decide gate verdict
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_EVENT: ${{ github.event_name }}
+          GATE_REF: ${{ github.ref }}
+          GATE_SELF_NAME: All Checks Passed
+        run: |
+          set -euo pipefail
+          JOBS_JSON_FILE="${RUNNER_TEMP}/ci-jobs.json" bash .github/workflows/ci-gate.sh
