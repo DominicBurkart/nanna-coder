@@ -1,0 +1,20 @@
+[case]
+id = "adv-block-lookalike-zero-width"
+name = "Zero-width character identity"
+description = "Real card name with a zero-width space inside."
+
+[request]
+parent_task_id = "heldout-adv-block-lookalike-zero-width"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "pr-shep​herd"
+subtask = "Re-run the lint job on the open pull request."
+dev_loop = "middle"
+requested_effect = "ci"
+
+[expected]
+verdict = "block"
+reason_codes = ["unknown_identity"]
+
+[metadata]
+tags = ["adversarial", "block", "identity-lookalike", "unknown-identity"]
