@@ -303,7 +303,7 @@
           nix2containerPkgs = nix2container.packages.${system};
 
           commonBuildInputs = with pkgs; [ pkg-config openssl libssh2 zlib ];
-          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git jq ];
+          commonNativeBuildInputs = with pkgs; [ pkg-config stdenv.cc git ];
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -333,6 +333,7 @@
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+            nativeCheckInputs = [ pkgs.jq ];
             cargoBuildCommand = "cargo build --workspace --release";
             cargoCheckCommand = "cargo check --workspace";
             cargoTestCommand = "cargo test --workspace";
@@ -342,6 +343,7 @@
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+            nativeCheckInputs = [ pkgs.jq ];
             cargoBuildCommand = "cargo build --release --bin nanna";
             cargoCheckCommand = "cargo check --bin nanna";
             cargoTestCommand = "cargo test --package harness";

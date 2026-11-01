@@ -22,7 +22,6 @@ let
   commonNativeBuildInputs = with pkgs; [
     pkg-config
     stdenv.cc
-    jq
   ];
 
   # Build dependencies first for better caching
@@ -37,6 +36,7 @@ let
     inherit src cargoArtifacts;
     buildInputs = commonBuildInputs;
     nativeBuildInputs = commonNativeBuildInputs;
+    nativeCheckInputs = [ pkgs.jq ];
 
     # Ensure all workspace members are built
     cargoBuildCommand = "cargo build --workspace --release";
@@ -59,6 +59,7 @@ let
     inherit src cargoArtifacts;
     buildInputs = commonBuildInputs;
     nativeBuildInputs = commonNativeBuildInputs;
+    nativeCheckInputs = [ pkgs.jq ];
 
     cargoBuildCommand = "cargo build --release --bin nanna";
     cargoCheckCommand = "cargo check --bin nanna";

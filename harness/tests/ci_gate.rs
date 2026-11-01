@@ -182,6 +182,9 @@ fn malformed_needs_fails() {
         "{\"test-matrix\": {}}",
         "{\"test-matrix\": {\"result\": null}}",
         "{\"test-matrix\": {\"result\": 1}}",
+        "{\"test-matrix\": {\"result\": {\"a\": 1}}}",
+        "{\"test-matrix\": {\"result\": [\"success\"]}}",
+        "{\"test-matrix\": {\"result\": true}}",
     ] {
         let v = run_gate(bad, "pull_request", "refs/pull/1/merge", None);
         assert!(!v.ok, "needs {bad:?} passed: {}", v.output);
@@ -379,4 +382,105 @@ fn gate_job_never_interpolates_expressions_into_shell() {
 fn gate_job_can_read_actions() {
     let job = gate_job_text();
     assert!(job.contains("\n      actions: read\n"), "{job}");
+}
+
+#[test]
+fn non_string_result_among_otherwise_successful_jobs_fails() {
+    for bad in [
+        json!({"a": 1}),
+        json!(["success"]),
+        json!(true),
+        json!(1),
+        Value::Null,
+    ] {
+        let mut n = pr_needs();
+        n["test-matrix"]["result"] = bad.clone();
+        let v = pr(n);
+        assert!(!v.ok, "result {bad} passed: {}", v.output);
+        assert!(v.output.contains("malformed"), "{}", v.output);
+    }
+}
+
+#[test]
+fn empty_needs_is_reported_as_empty_or_malformed() {
+    let v = run_gate("{}", "pull_request", "refs/pull/1/merge", None);
+    assert!(!v.ok);
+    assert!(v.output.contains("empty or malformed"), "{}", v.output);
+}
+
+#[test]
+fn per_leg_incomplete_job_fails_even_with_a_success_conclusion() {
+    for (status, concl) in [
+        ("in_progress", "success"),
+        ("queued", "skipped"),
+        ("waiting", "success"),
+    ] {
+        let v = run_with_jobs(jobs_with(&[
+            ("unit (ubuntu-latest)", status, concl),
+            ("All Checks Passed", "in_progress", ""),
+        ]));
+        assert!(!v.ok, "{status}/{concl} passed: {}", v.output);
+        assert!(v.output.contains("not completed"), "{}", v.output);
+    }
+}
+
+fn develop_push_needs() -> String {
+    let mut n = pr_needs();
+    n["security-scan"]["result"] = json!("success");
+    n.to_string()
+}
+
+#[test]
+fn ref_rule_is_an_exact_match_not_a_prefix() {
+    for r in [
+        "refs/heads/developer",
+        "refs/heads/develop;x",
+        "refs/heads/develop/x",
+        "refs/heads/devel",
+        "refs/heads/Develop",
+        "refs/heads/develop ",
+        "",
+    ] {
+        let v = run_gate(&develop_push_needs(), "push", r, None);
+        assert!(!v.ok, "ref {r:?} passed: {}", v.output);
+    }
+    let ok = run_gate(&develop_push_needs(), "push", "refs/heads/develop", None);
+    assert!(ok.ok, "{}", ok.output);
+}
+
+#[test]
+fn missing_allow_list_file_fails_closed() {
+    require_jq();
+    let out = Command::new("bash")
+        .arg(script())
+        .env("NEEDS_JSON", pr_needs().to_string())
+        .env("GATE_EVENT", "pull_request")
+        .env("GATE_REF", "refs/pull/1/merge")
+        .env(
+            "ALLOWED_SKIPS_FILE",
+            "/var/tmp/m1-849-tmp/no-such-allow-list.txt",
+        )
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("security-scan"), "{text}");
+}
+
+#[test]
+fn comment_style_line_in_allow_list_grants_nothing() {
+    require_jq();
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("allow.txt");
+    std::fs::write(&f, "#security-scan pull_request *\n").unwrap();
+    let out = Command::new("bash")
+        .arg(script())
+        .env("NEEDS_JSON", pr_needs().to_string())
+        .env("GATE_EVENT", "pull_request")
+        .env("GATE_REF", "refs/pull/1/merge")
+        .env("ALLOWED_SKIPS_FILE", &f)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }

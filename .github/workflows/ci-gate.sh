@@ -41,6 +41,8 @@ skip_allowed() {
   return 1
 }
 
+needs_rows=$(printf '%s' "$NEEDS_JSON" | jq -r 'to_entries[] | [.key, .value.result] | @tsv')
+
 while IFS=$'\t' read -r job result; do
   case "$result" in
     success) ;;
@@ -53,7 +55,7 @@ while IFS=$'\t' read -r job result; do
       add_failure "job '$job' ended with result '$result'"
       ;;
   esac
-done < <(printf '%s' "$NEEDS_JSON" | jq -r 'to_entries[] | [.key, .value.result] | @tsv')
+done <<< "$needs_rows"
 
 if [ -n "${JOBS_JSON_FILE:-}" ]; then
   self="${GATE_SELF_NAME:-All Checks Passed}"
