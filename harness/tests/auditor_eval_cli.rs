@@ -259,3 +259,22 @@ fn neither_output_stream_carries_prompt_or_task_text() {
         assert!(!streams.contains(secret), "{secret} leaked:\n{streams}");
     }
 }
+
+#[test]
+fn a_subset_that_leaks_still_exits_one_and_says_it_is_not_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    leaking_cases(dir.path());
+    other_case(dir.path());
+    let base = serve(r#"{"verdict":"allow"}"#);
+    let output = nanna(
+        dir.path(),
+        &["--base-url", &base, "--max-cases", "1"],
+        Some("stub:1"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stdout.contains("result: FAIL (subset of 1, NOT the gate)"),
+        "{stdout}"
+    );
+}
