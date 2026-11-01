@@ -1,0 +1,153 @@
+name: protected-paths-guard
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect the Nanna-Identity marker
+        id: identity
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null || ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::base or head commit not resolvable; fail-closed per policy"
+            exit 1
+          fi
+          NAME_RE='[A-Za-z0-9][A-Za-z0-9._-]*'
+          COMMITS="$(git log --format=%B "$BASE_SHA..$HEAD_SHA")"
+          MARKER="$(printf '%s\n%s\n' "$PR_BODY" "$COMMITS" | tr -d '\r' \
+            | grep -oE "(^Nanna-Identity:[[:blank:]]*${NAME_RE}[[:blank:]]*$)|(<!--[[:space:]]*Nanna-Identity:[[:space:]]*${NAME_RE}[[:space:]]*-->)" \
+            | head -n 1 || true)"
+          IDENTITY="$(printf '%s' "$MARKER" | sed -E "s/.*Nanna-Identity:[[:space:]]*(${NAME_RE}).*/\1/")"
+          echo "name=$IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse protected paths unless a listed human authored the PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IDENTITY: ${{ steps.identity.outputs.name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PROTECTED_PATTERNS_HUMAN_AUTHORS: ${{ vars.PROTECTED_PATTERNS_HUMAN_AUTHORS }}
+        run: |
+          set -euo pipefail
+          PROTECTED_PATTERNS=(
+            ".nanna/**"
+            "**/.nanna/**"
+            ".git/**"
+            ".github/workflows/**"
+            ".github/CODEOWNERS"
+            "codecov.yml"
+            "windows.toml"
+            "tarpaulin.toml"
+            "deny.toml"
+            "flake.nix"
+            "flake.lock"
+            ".github/rulesets/**"
+            ".githooks/**"
+            ".cargo/**"
+            ".devcontainer/**"
+            "AGENTS.md"
+            "evals/cases/**"
+            "harness/src/protected.rs"
+            ".gitattributes"
+            ".gitmodules"
+            "harness/src/scope.rs"
+            "CODEOWNERS"
+            "docs/CODEOWNERS"
+            "harness/src/auditor/**"
+            ".github/**"
+            ".cargo-husky/**"
+            ".envrc"
+            ".config/**"
+            ".claude/**"
+            "nix/**"
+            "CLAUDE.md"
+            "docs/ci/protected-paths-guard.yml"
+            "harness/src/workspace.rs"
+            "harness/src/tools.rs"
+            "harness/src/marker.rs"
+            "harness/src/identity/**"
+            "harness/src/action_auditor/**"
+            "harness/src/windows.rs"
+            "harness/src/capabilities.rs"
+            "harness/src/container.rs"
+            "harness/src/harness_adapter/isolation.rs"
+            "harness/src/harness_adapter/checked.rs"
+            "scripts/**"
+            "tests/security/**"
+            "tests/lib/**"
+            "tests/run-all-tests.sh"
+            "harness/dev-container.toml"
+            "harness/src/rollout/executor.rs"
+            "harness/src/rollout/hooks.rs"
+            "harness/src/rollout/serverless.rs"
+            "harness/src/rollout/state.rs"
+            "harness/src/effects.rs"
+            "harness/src/leases/**"
+            "auto-issue-pr.sh"
+            "test-agentic-security.sh"
+            "harness/src/pr_tools.rs"
+            "docs/pr-lifecycle-tools.md"
+            "harness/src/budget.rs"
+            "harness/src/ci_tools.rs"
+            "harness/src/ci_policy.rs"
+            "harness/src/ci_integrity.rs"
+            "harness/src/deploy/template.rs"
+          )
+          shopt -s nocasematch
+          VIOLATIONS=()
+          while IFS= read -r -d '' path; do
+            [ -z "$path" ] && continue
+            for pattern in "${PROTECTED_PATTERNS[@]}"; do
+              shell_glob="${pattern//\*\*/*}"
+              directory="${shell_glob%/\*}"
+              case "$path" in
+                $shell_glob|$directory)
+                  VIOLATIONS+=("$path (rule: $pattern)")
+                  break
+                  ;;
+              esac
+            done
+          done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
+
+          if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
+            echo "no protected path touched"
+            exit 0
+          fi
+
+          if [ -z "$IDENTITY" ]; then
+            IFS=',' read -r -a HUMANS <<< "$PROTECTED_PATTERNS_HUMAN_AUTHORS"
+            for human in "${HUMANS[@]}"; do
+              human="${human//[[:space:]]/}"
+              if [ -n "$human" ] && [ "${human,,}" = "${PR_AUTHOR,,}" ]; then
+                echo "protected paths touched by listed human author '$PR_AUTHOR'"
+                exit 0
+              fi
+            done
+          fi
+
+          {
+            echo "::error::PR (identity marker: '${IDENTITY:-none}', author: '$PR_AUTHOR') touches protected paths:"
+            for v in "${VIOLATIONS[@]}"; do echo "  - $v"; done
+            echo ""
+            echo "Nanna may not modify its own configuration (identities, RBAC policy,"
+            echo "deployment templates, availability windows, the CI that guards them)."
+            echo "A maintainer must make this change in a human-authored PR."
+          } >&2
+          exit 1
