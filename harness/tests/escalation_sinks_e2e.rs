@@ -118,10 +118,9 @@ impl FakeServer {
                         break (end + 4, length);
                     }
                 };
-                while raw.len() < head_end + length {
-                    let n = socket.read(&mut chunk).await.unwrap();
-                    raw.extend_from_slice(&chunk[..n]);
-                }
+                let mut rest = vec![0u8; (head_end + length).saturating_sub(raw.len())];
+                socket.read_exact(&mut rest).await.unwrap();
+                raw.extend_from_slice(&rest);
                 let text = String::from_utf8_lossy(&raw).to_string();
                 let head = &text[..head_end.min(text.len())];
                 let mut first = head.lines().next().unwrap_or("").split_whitespace();

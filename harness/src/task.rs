@@ -4800,10 +4800,8 @@ mod identity_tests {
 
     #[tokio::test]
     async fn test_a_durable_budget_accountant_keeps_the_planes_sink() {
-        for location in [
-            None,
-            Some(std::path::PathBuf::from("/nonexistent-dir/x/budget.json")),
-        ] {
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        for location in [None, Some(blocker.path().join("budget.json"))] {
             let sink = crate::test_support::escalation::CapturingSink::new(false);
             let (plane, _log) = plane_with(&sink);
             let manager = TaskManager::with_escalation_plane(DEFAULT_MAX_CONCURRENT_TASKS, plane)
