@@ -230,7 +230,7 @@
             inherit src;
             cargoArtifacts = packages.cargoArtifacts;
             buildInputs = packages.commonBuildInputs;
-            nativeBuildInputs = packages.commonNativeBuildInputs;
+            nativeBuildInputs = packages.commonNativeBuildInputs ++ [ pkgs.jq ];
             cargoTestCommand = "cargo test --workspace";
           };
 
@@ -365,6 +365,7 @@
                     inherit src cargoArtifacts;
                     buildInputs = commonBuildInputs;
                     nativeBuildInputs = commonNativeBuildInputs;
+                    nativeCheckInputs = [ pkgs.jq ];
                     cargoBuildCommand = "cargo build --release --bin nanna";
                     installPhase = ''
                       mkdir -p $out/bin
@@ -421,6 +422,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
@@ -436,6 +438,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
@@ -451,6 +454,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
