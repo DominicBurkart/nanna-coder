@@ -2,7 +2,7 @@ name: Auditor Eval (model-measured false-allow)
 
 on:
   schedule:
-    - cron: "0 5 * * *"
+    - cron: "0 5 * * 1"
   workflow_dispatch:
     inputs:
       model:
@@ -13,8 +13,12 @@ on:
         description: "Cases directory"
         required: false
         default: "evals/cases/auditor_heldout"
+      max_cases:
+        description: "Score only the first N cases (timing run; informational, non-gating)"
+        required: false
+        default: ""
       max_false_allow:
-        description: "Largest model-only false-allow count that passes"
+        description: "Threshold override; any value other than 0 makes the run informational and non-gating"
         required: false
         default: "0"
       runs:
@@ -26,26 +30,27 @@ jobs:
   auditor-eval:
     name: Model-only false-allow scorecard
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     permissions:
       contents: read
     env:
       MODEL: ${{ inputs.model || 'gemma4:e4b' }}
       CASES: ${{ inputs.cases || 'evals/cases/auditor_heldout' }}
+      MAX_CASES: ${{ inputs.max_cases }}
       MAX_FALSE_ALLOW: ${{ inputs.max_false_allow || '0' }}
       RUNS: ${{ inputs.runs || '3' }}
+      INFORMATIONAL: ${{ (inputs.max_cases != '' && inputs.max_cases != null) || (inputs.max_false_allow != '' && inputs.max_false_allow != null && inputs.max_false_allow != '0') }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Configure Cachix
+      - name: Configure Cachix (read-only)
         uses: cachix/cachix-action@v15
         with:
           name: nanna-coder
-          authToken: ${{ secrets.CACHIX_AUTH }}
-          pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
+          skipPush: true
 
       - name: Build nanna
         run: nix develop --command cargo build --release --bin nanna
@@ -66,7 +71,8 @@ jobs:
             sleep $((attempt * 10))
           done
 
-      - name: Run auditor scorecard
+      - name: Run auditor scorecard (gating)
+        if: env.INFORMATIONAL != 'true'
         shell: bash
         env:
           NANNA_EVAL_MODEL: ${{ env.MODEL }}
@@ -74,15 +80,32 @@ jobs:
           set -o pipefail
           ./target/release/nanna auditor eval \
             --cases "$CASES" \
-            --max-false-allow "$MAX_FALSE_ALLOW" \
+            --max-false-allow 0 \
             --runs "$RUNS" \
             2>&1 | tee auditor-scorecard.txt
+
+      - name: Run auditor scorecard (informational, non-gating)
+        if: env.INFORMATIONAL == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          NANNA_EVAL_MODEL: ${{ env.MODEL }}
+        run: |
+          set -o pipefail
+          echo "INFORMATIONAL RUN: threshold or case subset overridden; this is not the gating result" | tee auditor-scorecard.txt
+          ./target/release/nanna auditor eval \
+            --cases "$CASES" \
+            --max-false-allow "$MAX_FALSE_ALLOW" \
+            --runs "$RUNS" \
+            ${MAX_CASES:+--max-cases "$MAX_CASES"} \
+            2>&1 | tee -a auditor-scorecard.txt
 
       - name: Write scorecard summary
         if: always()
         shell: bash
         run: |
           {
+            if [ "$INFORMATIONAL" = "true" ]; then echo "**Informational run: not the gating result.**"; fi
             echo '```'
             cat auditor-scorecard.txt 2>/dev/null || echo "no scorecard produced"
             echo '```'
