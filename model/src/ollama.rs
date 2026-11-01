@@ -70,20 +70,33 @@ impl OllamaProvider {
         match host_port.strip_prefix('[') {
             Some(bracketed) => bracketed
                 .split_once(']')
-                .is_some_and(|(_, after)| after.starts_with(':')),
-            None => host_port.contains(':'),
+                .is_some_and(|(_, after)| after.strip_prefix(':').is_some_and(|p| !p.is_empty())),
+            None => host_port
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| !port.is_empty()),
         }
     }
 
     fn endpoint(base_url: &str) -> ModelResult<reqwest::Url> {
         let invalid = |reason: String| ModelError::InvalidConfig {
-            message: format!("Invalid base URL `{base_url}`: {reason}"),
+            message: format!("Invalid base URL: {reason}"),
         };
+        if base_url
+            .chars()
+            .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                "backslashes, whitespace and control characters are not allowed".to_string(),
+            ));
+        }
         let mut url = reqwest::Url::parse(base_url).map_err(|e| invalid(e.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
             return Err(invalid(
                 "expected an http or https URL with a host".to_string(),
             ));
+        }
+        if url.port() == Some(0) {
+            return Err(invalid("port 0 is not usable".to_string()));
         }
         if url.scheme() == "http" && !Self::has_explicit_port(base_url) {
             let _ = url.set_port(Some(11434));
@@ -1320,5 +1333,72 @@ mod tests {
         let config = OllamaConfig::default().with_base_url("http://localhost:11434/v1");
         let provider = OllamaProvider::new(config).unwrap();
         assert_eq!(provider.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn an_empty_port_is_not_explicit_and_gets_the_default() {
+        assert_eq!(endpoint_of("http://h:").port(), Some(11434));
+        assert_eq!(endpoint_of("http://h:/x").port(), Some(11434));
+        assert_eq!(endpoint_of("http://[::1]:/x").port(), Some(11434));
+        assert_eq!(endpoint_of("http://u:p@h:/x").port(), Some(11434));
+        assert_eq!(
+            endpoint_of("https://h:/x").port_or_known_default(),
+            Some(443)
+        );
+    }
+
+    #[test]
+    fn port_zero_backslashes_and_whitespace_are_config_errors() {
+        for bad in [
+            "http://h:0",
+            "https://h:0/x",
+            "http://h\\x:1",
+            "http://h:1\\x",
+            "http://h :1",
+            " http://h:1",
+            "http://h:1 ",
+            "http://h\t:1",
+            "http://h:1\n",
+        ] {
+            assert!(
+                matches!(
+                    OllamaProvider::endpoint(bad),
+                    Err(ModelError::InvalidConfig { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colon_in_the_path_query_or_fragment_is_not_a_port() {
+        assert_eq!(endpoint_of("http://h/a:b").port(), Some(11434));
+        assert_eq!(endpoint_of("http://h?x=a:b").port(), Some(11434));
+        assert_eq!(endpoint_of("http://h#a:b").port(), Some(11434));
+        assert_eq!(endpoint_of("http://h/a:b").path(), "/a:b/");
+        assert_eq!(endpoint_of("http://h:7/a:b").port(), Some(7));
+    }
+
+    #[test]
+    fn config_errors_never_echo_credentials_from_the_base_url() {
+        for bad in [
+            "http://alice:hunter2@h:99999",
+            "http://alice:hunter2@",
+            "http://alice:hunter2@h:0",
+            "http://alice:hunter2@h\\x",
+            "ftp://alice:hunter2@h",
+            "http://alice:hunter2@h:1 ",
+        ] {
+            let direct = OllamaProvider::endpoint(bad).unwrap_err();
+            let built = OllamaProvider::new(OllamaConfig::default().with_base_url(bad))
+                .err()
+                .unwrap();
+            for error in [direct, built] {
+                let shown = format!("{error} {error:?}");
+                assert!(!shown.contains("hunter2"), "{bad}: {shown}");
+                assert!(!shown.contains("alice"), "{bad}: {shown}");
+                assert!(matches!(error, ModelError::InvalidConfig { .. }), "{bad}");
+            }
+        }
     }
 }
