@@ -41,7 +41,7 @@ impl OllamaProvider {
             base_url.clone()
         };
 
-        let client = Ollama::new(ollama_host, 11434);
+        let client = Ollama::from_url(Self::endpoint(&ollama_host)?);
 
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
@@ -57,6 +57,19 @@ impl OllamaProvider {
             http_client,
             base_url,
         })
+    }
+
+    fn endpoint(base_url: &str) -> ModelResult<reqwest::Url> {
+        let mut url = reqwest::Url::parse(base_url).map_err(|e| ModelError::InvalidConfig {
+            message: format!("Invalid base URL `{base_url}`: {e}"),
+        })?;
+        if url.port().is_none() {
+            url.set_port(Some(11434))
+                .map_err(|_| ModelError::InvalidConfig {
+                    message: format!("Base URL `{base_url}` cannot carry a port"),
+                })?;
+        }
+        Ok(url)
     }
 
     pub fn with_default_config() -> ModelResult<Self> {
@@ -959,6 +972,52 @@ fn calculate_variance(values: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn serve_tags_once(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn model_listing_and_health_use_the_configured_port() {
+        let base = serve_tags_once(
+            r#"{"models":[{"name":"only-on-the-stub:1","modified_at":"2024-01-01T00:00:00Z","size":1}]}"#,
+        );
+        let provider = OllamaProvider::new(OllamaConfig::default().with_base_url(base)).unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "only-on-the-stub:1");
+        provider.health_check().await.unwrap();
+    }
+
+    #[test]
+    fn the_endpoint_keeps_an_explicit_port_and_defaults_a_missing_one() {
+        let kept = OllamaProvider::endpoint("http://127.0.0.1:4242").unwrap();
+        assert_eq!(kept.port(), Some(4242));
+        let defaulted = OllamaProvider::endpoint("http://127.0.0.1").unwrap();
+        assert_eq!(defaulted.port(), Some(11434));
+        assert!(OllamaProvider::endpoint("mailto:someone@example.com").is_err());
+    }
+
+    #[test]
+    fn an_unparsable_base_url_is_a_config_error_not_a_panic() {
+        let result = OllamaProvider::new(OllamaConfig::default().with_base_url("not a url"));
+        assert!(matches!(result, Err(ModelError::InvalidConfig { .. })));
+    }
+
     use crate::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType};
     use std::collections::HashMap;
 
