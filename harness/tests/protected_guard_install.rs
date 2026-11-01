@@ -118,3 +118,231 @@ fn untrusted_event_fields_reach_the_scripts_only_through_env() {
     }
     assert!(!guard.contains("pull_request.title"));
 }
+
+#[test]
+fn the_installed_guard_reruns_on_edits_and_retargeting() {
+    assert!(installed()
+        .contains("on:\n  pull_request:\n    types: [opened, synchronize, reopened, edited]\n"));
+}
+
+#[test]
+fn both_steps_run_with_strict_shell_options_and_full_history() {
+    let guard = installed();
+    for block in run_blocks(&guard) {
+        assert!(
+            block.starts_with("          set -euo pipefail\n"),
+            "{block}"
+        );
+    }
+    assert!(guard.contains("          fetch-depth: 0\n"));
+}
+
+#[cfg(unix)]
+mod executed {
+    use super::{installed, run_blocks};
+    use std::path::Path;
+    use std::process::{Command, Output};
+
+    const ENFORCE: usize = 1;
+    const DETECT: usize = 0;
+
+    fn script(index: usize) -> String {
+        run_blocks(&installed())[index]
+            .lines()
+            .map(|line| line.strip_prefix("          ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn write(dir: &Path, path: &str, content: &str) {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
+    }
+
+    fn init(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        write(dir.path(), "README.md", "base");
+        for file in files {
+            write(dir.path(), file, "base");
+        }
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "base"]);
+        dir
+    }
+
+    fn commit(dir: &Path, message: &str) -> String {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn enforce(dir: &Path, base: &str, head: &str, author: &str, humans: &str) -> Output {
+        Command::new("bash")
+            .current_dir(dir)
+            .arg("-c")
+            .arg(script(ENFORCE))
+            .env("BASE_SHA", base)
+            .env("HEAD_SHA", head)
+            .env("IDENTITY", "")
+            .env("PR_AUTHOR", author)
+            .env("PROTECTED_PATTERNS_HUMAN_AUTHORS", humans)
+            .output()
+            .unwrap()
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn renaming_a_protected_file_out_of_its_path_is_a_violation() {
+        let dir = init(&["flake.nix"]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        git(dir.path(), &["mv", "flake.nix", "moved.txt"]);
+        let head = commit(dir.path(), "rename out");
+        let output = enforce(dir.path(), &base, &head, "stranger", "owner");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("  - flake.nix (rule: flake.nix)"));
+    }
+
+    #[test]
+    fn deleting_a_protected_file_is_a_violation() {
+        let dir = init(&["flake.nix"]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        git(dir.path(), &["rm", "-q", "flake.nix"]);
+        let head = commit(dir.path(), "delete");
+        let output = enforce(dir.path(), &base, &head, "stranger", "owner");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("  - flake.nix (rule: flake.nix)"));
+    }
+
+    #[test]
+    fn a_protected_directory_replaced_by_a_file_or_symlink_is_a_violation() {
+        for replacement in ["file", "symlink"] {
+            let dir = init(&[]);
+            let base = git(dir.path(), &["rev-parse", "HEAD"]);
+            if replacement == "file" {
+                write(dir.path(), ".github", "not a directory");
+            } else {
+                std::os::unix::fs::symlink("docs", dir.path().join(".github")).unwrap();
+            }
+            let head = commit(dir.path(), replacement);
+            let output = enforce(dir.path(), &base, &head, "stranger", "owner");
+            assert_eq!(output.status.code(), Some(1), "{replacement}: {output:?}");
+            assert!(
+                stderr(&output).contains("  - .github (rule: .github/**)"),
+                "{replacement}: {}",
+                stderr(&output)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_allow_list_entries_never_match_an_empty_author() {
+        let dir = init(&[]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        write(dir.path(), "flake.nix", "changed");
+        let head = commit(dir.path(), "work");
+        for humans in [",,", " , ", ",owner,"] {
+            let output = enforce(dir.path(), &base, &head, "", humans);
+            assert_eq!(output.status.code(), Some(1), "{humans:?}: {output:?}");
+        }
+    }
+
+    #[test]
+    fn unresolvable_commits_reaching_the_enforcing_step_fail_closed() {
+        let dir = init(&[]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        write(dir.path(), "flake.nix", "changed");
+        let head = commit(dir.path(), "work");
+        let zeros = "0000000000000000000000000000000000000000";
+        for (b, h) in [(base.as_str(), zeros), (zeros, head.as_str())] {
+            let output = enforce(dir.path(), b, h, "owner", "owner");
+            assert_ne!(output.status.code(), Some(0), "{output:?}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("no protected path touched"));
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("listed human"));
+        }
+    }
+
+    #[test]
+    fn a_shallow_clone_without_the_base_commit_fails_closed_in_both_steps() {
+        let origin = init(&[]);
+        let base = git(origin.path(), &["rev-parse", "HEAD"]);
+        write(origin.path(), "flake.nix", "changed");
+        let head = commit(origin.path(), "work");
+        let clone = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", origin.path().display());
+        git(
+            clone.path(),
+            &["clone", "-q", "--depth", "1", &url, "checkout"],
+        );
+        let work = clone.path().join("checkout");
+        let output = enforce(&work, &base, &head, "owner", "owner");
+        assert_ne!(output.status.code(), Some(0), "{output:?}");
+        let detect = Command::new("bash")
+            .current_dir(&work)
+            .arg("-c")
+            .arg(script(DETECT))
+            .env("BASE_SHA", &base)
+            .env("HEAD_SHA", &head)
+            .env("PR_BODY", "")
+            .env("GITHUB_OUTPUT", clone.path().join("out"))
+            .output()
+            .unwrap();
+        assert_ne!(detect.status.code(), Some(0), "{detect:?}");
+    }
+
+    #[test]
+    fn a_base_that_moved_ahead_is_diffed_two_dot_so_its_protected_changes_count() {
+        let dir = init(&["flake.nix"]);
+        let fork_point = git(dir.path(), &["rev-parse", "HEAD"]);
+        write(dir.path(), "flake.nix", "changed on base");
+        let base = commit(dir.path(), "base moved");
+        git(dir.path(), &["checkout", "-q", "-b", "pr", &fork_point]);
+        write(dir.path(), "docs/notes.md", "pr work");
+        let head = commit(dir.path(), "pr");
+        let output = enforce(dir.path(), &base, &head, "stranger", "owner");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stderr(&output).contains("  - flake.nix (rule: flake.nix)"));
+    }
+
+    #[test]
+    fn a_path_matching_several_rules_is_reported_once_under_its_first_rule() {
+        let dir = init(&[]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        write(dir.path(), ".github/workflows/x.yml", "changed");
+        let head = commit(dir.path(), "work");
+        let output = enforce(dir.path(), &base, &head, "stranger", "owner");
+        let stderr = stderr(&output);
+        assert_eq!(
+            stderr.matches("  - .github/workflows/x.yml").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(stderr.contains("(rule: .github/workflows/**)"));
+    }
+
+    #[test]
+    fn a_listed_human_without_a_marker_passes_case_insensitively_in_a_list() {
+        let dir = init(&[]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        write(dir.path(), "flake.nix", "changed");
+        let head = commit(dir.path(), "work");
+        let output = enforce(dir.path(), &base, &head, "Owner", "other,owner");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+}

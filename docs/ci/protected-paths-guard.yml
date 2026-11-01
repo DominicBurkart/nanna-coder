@@ -11,6 +11,7 @@ name: protected-paths-guard
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -121,6 +122,8 @@ jobs:
           )
           shopt -s nocasematch
           VIOLATIONS=()
+          DIFF_FILE="$(mktemp)"
+          git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA" > "$DIFF_FILE"
           while IFS= read -r -d '' path; do
             [ -z "$path" ] && continue
             for pattern in "${PROTECTED_PATTERNS[@]}"; do
@@ -133,7 +136,7 @@ jobs:
                   ;;
               esac
             done
-          done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
+          done < "$DIFF_FILE"
 
           if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
             echo "no protected path touched"
