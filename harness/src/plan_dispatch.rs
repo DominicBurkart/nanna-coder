@@ -589,6 +589,7 @@ mod tests {
         fake.set("rust-implementer", failed());
         run.advance(&fake).await;
         assert_eq!(kind_of(&run, "fix"), "failed");
+        assert_eq!(blocker(&run, "fix"), None);
         assert_eq!(blocker(&run, "shepherd"), Some("fix".to_string()));
         assert_eq!(blocker(&run, "ship"), Some("shepherd".to_string()));
         assert_eq!(fake.identities(), ["rust-implementer"]);
