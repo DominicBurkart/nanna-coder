@@ -2373,6 +2373,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err:?}");
+        assert!(failure_message(err).contains("path must start with"));
         assert_eq!(chain.target.deployed().len(), 1);
         let urls = |handles: Vec<SandboxHandle>| -> Vec<String> {
             handles.into_iter().map(|handle| handle.url).collect()
@@ -2423,6 +2424,14 @@ mod tests {
         assert!(failure_message(err).contains("stays registered for cleanup"));
         assert!(chain.sandboxes.get("t1").is_some());
         assert!(chain.target.torn_down().is_empty());
+        assert_eq!(
+            chain
+                .accountant
+                .task_summary("sb-agent", "t1")
+                .sandbox
+                .minutes,
+            0.0
+        );
     }
 
     struct AgedTarget(FakeSandboxTarget);
@@ -2439,22 +2448,111 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_sandbox_torn_down_after_failed_qa_has_its_lifetime_recorded() {
-        let (dir, _, sandboxes, accountant) = setup();
-        std::fs::write(dir.path().join(CHECKS_FILE), "GET\0 not a manifest line").unwrap();
-        let tool = SandboxDeployTool::new(
-            dir.path().to_path_buf(),
-            Arc::new(AgedTarget(FakeSandboxTarget::new())),
+    fn ledger_minutes(store: &InMemoryBudgetStore, repo: &str) -> f64 {
+        crate::budget::BudgetStore::repo_day_usage(
+            store,
+            repo,
+            BudgetClass::Sandbox,
+            Utc::now().date_naive(),
+        )
+        .minutes
+    }
+
+    fn aged_deploy_tool(
+        dir: &Path,
+        aged: &Arc<AgedTarget>,
+        sandboxes: &Arc<SandboxRegistry>,
+        accountant: &Arc<CostAccountant>,
+    ) -> SandboxDeployTool {
+        std::fs::write(dir.join(CHECKS_FILE), "GET\0 not a manifest line").unwrap();
+        SandboxDeployTool::new(
+            dir.to_path_buf(),
+            Arc::clone(aged) as Arc<dyn SandboxTarget>,
             Arc::new(LoopbackProbe),
-            Arc::clone(&sandboxes),
+            Arc::clone(sandboxes),
             "t1",
             7,
         )
-        .with_budget(Arc::clone(&accountant), "id");
+        .with_budget(Arc::clone(accountant), "id")
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_torn_down_after_failed_qa_has_its_lifetime_recorded_once_against_its_repository(
+    ) {
+        let store = Arc::new(InMemoryBudgetStore::new());
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::clone(&store) as Arc<dyn crate::budget::BudgetStore>,
+            BudgetConfig::UNLIMITED,
+        ));
+        let (dir, _, sandboxes, _) = setup();
+        let aged = Arc::new(AgedTarget(FakeSandboxTarget::new()));
+        let tool = aged_deploy_tool(dir.path(), &aged, &sandboxes, &accountant);
         tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
         assert!(sandboxes.get("t1").is_none());
-        assert!(accountant.task_summary("id", "t1").sandbox.minutes >= 12.0);
+        let summary = accountant.task_summary("id", "t1").sandbox;
+        assert_eq!(summary.count, 1);
+        assert!(
+            (12.0..13.0).contains(&summary.minutes),
+            "{}",
+            summary.minutes
+        );
+        assert!((12.0..13.0).contains(&ledger_minutes(&store, "o/n")));
+        assert_eq!(ledger_minutes(&store, "other/repo"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_teardown_after_failed_qa_records_no_minutes() {
+        let store = Arc::new(InMemoryBudgetStore::new());
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::clone(&store) as Arc<dyn crate::budget::BudgetStore>,
+            BudgetConfig::UNLIMITED,
+        ));
+        let (dir, _, sandboxes, _) = setup();
+        let aged = Arc::new(AgedTarget(FakeSandboxTarget::new()));
+        aged.0.fail_next_teardown();
+        let tool = aged_deploy_tool(dir.path(), &aged, &sandboxes, &accountant);
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(sandboxes.get("t1").is_some());
+        assert_eq!(accountant.task_summary("id", "t1").sandbox.minutes, 0.0);
+        assert_eq!(ledger_minutes(&store, "o/n"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_torn_down_after_failed_qa_is_not_torn_down_or_recorded_again_by_later_cleanup(
+    ) {
+        let store = Arc::new(InMemoryBudgetStore::new());
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::clone(&store) as Arc<dyn crate::budget::BudgetStore>,
+            BudgetConfig::UNLIMITED,
+        ));
+        let (dir, _, sandboxes, _) = setup();
+        let aged = Arc::new(AgedTarget(FakeSandboxTarget::new()));
+        let tool = aged_deploy_tool(dir.path(), &aged, &sandboxes, &accountant);
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        let as_target = Arc::clone(&aged) as Arc<dyn SandboxTarget>;
+        teardown_forgotten(&as_target, &sandboxes, &accountant, "t1", "id");
+        let teardown =
+            SandboxTeardownTool::new(Arc::clone(&as_target), Arc::clone(&sandboxes), "t1")
+                .with_budget(Arc::clone(&accountant), "id");
+        assert_eq!(
+            teardown.execute(json!({})).await.unwrap(),
+            json!({"torn_down": false})
+        );
+        assert_eq!(aged.0.torn_down().len(), 1);
+        let minutes = ledger_minutes(&store, "o/n");
+        assert!((12.0..13.0).contains(&minutes), "{minutes}");
+        let task = accountant.task_summary("id", "t1").sandbox.minutes;
+        assert!((12.0..13.0).contains(&task), "{task}");
+    }
+
+    #[tokio::test]
+    async fn one_check_over_the_cap_is_omitted_and_the_run_is_not_all_passed() {
+        let probe = Arc::new(CountingProbe(Mutex::new(Vec::new())));
+        let over: String = (0..=MAX_CHECKS).map(|i| format!("/p{i}\n")).collect();
+        let result = deploy_with_checks(&over, Arc::clone(&probe) as Arc<dyn HttpProbe>).await;
+        assert_eq!(probe.0.lock().unwrap().len(), MAX_CHECKS);
+        assert_eq!(result["omitted_checks"], 1);
+        assert_eq!(result["all_passed"], false);
     }
 
     struct CountingProbe(Mutex<Vec<String>>);
