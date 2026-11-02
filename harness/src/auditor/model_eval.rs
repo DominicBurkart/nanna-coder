@@ -2,7 +2,7 @@ use super::eval::{default_catalog_dir, score, AuditorEvalCase, AuditorEvalError,
 use super::llm::AUDIT_TEMPERATURE;
 use super::{
     content_hash, AuditContext, AuditError, AuditOutcome, Auditor, FailClosedModelAuditor,
-    ModelAuditor, ReasonCode, RuleAuditor, SpawnRequest, SpawnVerdict, VerdictKind,
+    ModelAuditor, Reason, ReasonCode, RuleAuditor, SpawnRequest, SpawnVerdict, VerdictKind,
     MODEL_AUDIT_TIMEOUT,
 };
 use crate::identity::IdentityCatalog;
@@ -408,6 +408,14 @@ fn build_scorecard(
     }
 }
 
+fn is_kind_ambiguous(case: &AuditorEvalCase) -> bool {
+    case.metadata.tags.iter().any(|t| t == KIND_AMBIGUOUS_TAG)
+}
+
+fn over_threshold(found: usize, max: usize) -> String {
+    format!("error: {found} model-only false allow(s) exceed the maximum of {max}")
+}
+
 fn load_context(catalog_dir: &Path) -> Result<AuditContext, AuditorEvalError> {
     let catalog_error = |message: String| AuditorEvalError::Catalog {
         dir: catalog_dir.to_path_buf(),
@@ -457,15 +465,7 @@ pub async fn measure<C: Auditor + ?Sized, M: Auditor + ?Sized>(
         return Err(AuditorEvalError::NoHarmfulCases(options.cases_dir.clone()));
     }
     let context = load_context(&options.resolved_catalog_dir())?;
-    let ambiguous: Vec<bool> = cases
-        .iter()
-        .map(|case| {
-            case.metadata
-                .tags
-                .iter()
-                .any(|tag| tag == KIND_AMBIGUOUS_TAG)
-        })
-        .collect();
+    let ambiguous: Vec<bool> = cases.iter().map(is_kind_ambiguous).collect();
     if options.runs == 0 {
         return Err(AuditorEvalError::NoRuns);
     }
@@ -480,12 +480,9 @@ pub async fn measure<C: Auditor + ?Sized, M: Auditor + ?Sized>(
         .map(|index| runs.iter().filter(|run| run[index].is_false_allow).count())
         .collect();
     let model_only_outcomes = worst_case(&runs);
-    let prompt_hash = content_hash(
-        &serde_json::to_string(
-            &ModelAuditor::build_prompt(&cases[0].request.to_request(), &context)[0],
-        )
-        .unwrap_or_default(),
-    );
+    let first = cases[0].request.to_request();
+    let system = &ModelAuditor::build_prompt(&first, &context)[0];
+    let prompt_hash = content_hash(&format!("{system:?}"));
     let (composed_outcomes, _) = score(&composed_progress, &context, &cases).await?;
     Ok(build_scorecard(
         composed.name(),
@@ -513,11 +510,8 @@ pub async fn run_auditor_eval<C: Auditor + ?Sized, M: Auditor + ?Sized>(
         Ok(card) => {
             let _ = out.write_all(card.render().as_bytes());
             if !card.within_threshold() {
-                let _ = writeln!(
-                    err,
-                    "error: {} model-only false allow(s) exceed the maximum of {}",
-                    card.model_only.false_allows, card.max_false_allow
-                );
+                let found = card.model_only.false_allows;
+                let _ = writeln!(err, "{}", over_threshold(found, card.max_false_allow));
             }
             card.exit_code()
         }
@@ -580,20 +574,19 @@ pub async fn fetch_ollama_digest(base_url: &str, model: &str) -> Option<String> 
     digest_from_tags(&body, model)
 }
 
+fn git_head() -> Option<String> {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let output = std::process::Command::new("git")
+        .args(["-C", manifest, "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !sha.is_empty()).then_some(sha)
+}
+
 pub fn resolve_repo_sha(env: &dyn Fn(&str) -> Option<String>) -> String {
-    env("GITHUB_SHA")
-        .filter(|sha| !sha.trim().is_empty())
-        .or_else(|| {
-            let output = std::process::Command::new("git")
-                .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
-                .output()
-                .ok()?;
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        })
-        .unwrap_or_else(|| UNKNOWN.to_string())
+    let from_env = env("GITHUB_SHA").filter(|sha| !sha.trim().is_empty());
+    from_env.or_else(git_head).unwrap_or(UNKNOWN.to_string())
 }
 
 struct Progress<'a, A: ?Sized> {
@@ -632,25 +625,23 @@ impl<A: Auditor + ?Sized> Auditor for Progress<'_, A> {
             Ok(verdict) => verdict.kind().to_string(),
             Err(_) => "error".to_string(),
         };
-        eprintln!(
-            "[{}] {call}/{} {outcome} ({:.1}s)",
-            self.label,
-            self.total,
-            started.elapsed().as_secs_f64()
-        );
+        let secs = started.elapsed().as_secs_f64();
+        let (label, total) = (self.label, self.total);
+        eprintln!("[{label}] {call}/{total} {outcome} ({secs:.1}s)");
         result
     }
 }
 
 struct ModelMustDecide<A>(A);
 
+fn is_model_failure(reason: &Reason) -> bool {
+    reason.code == ReasonCode::ModelFailure
+}
+
 impl<A> ModelMustDecide<A> {
     fn check(verdict: &SpawnVerdict) -> Result<(), AuditError> {
-        match verdict
-            .reasons()
-            .iter()
-            .find(|reason| reason.code == ReasonCode::ModelFailure)
-        {
+        let failure = verdict.reasons().iter().find(|r| is_model_failure(r));
+        match failure {
             Some(reason) => Err(AuditError::Model(model::ModelError::ServiceUnavailable {
                 message: format!("the model did not decide: {}", reason.detail),
             })),
