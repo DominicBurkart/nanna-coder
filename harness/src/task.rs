@@ -4024,15 +4024,46 @@ mod identity_tests {
         workspace.cleanup().unwrap();
     }
 
+    fn literal_id_workspace_calls(source: &str) -> Vec<String> {
+        let call = [
+            "TaskWorkspace::create",
+            r"\w*\(",
+            r#"\s*(?:[^,()]|\([^()]*\))*,\s*""#,
+        ]
+        .concat();
+        regex::Regex::new(&call)
+            .unwrap()
+            .find_iter(source)
+            .map(|m| m.as_str().to_string())
+            .collect()
+    }
+
     #[test]
     fn test_no_task_workspace_in_this_module_is_created_under_a_literal_task_id() {
-        let source = include_str!("task.rs");
-        let needle = ["TaskWorkspace::create(", "repo.path(), \""].concat();
-        let literal_calls: Vec<&str> = source
-            .lines()
-            .filter(|line| line.contains(&needle))
-            .collect();
-        assert!(literal_calls.is_empty(), "{literal_calls:#?}");
+        let found = literal_id_workspace_calls(include_str!("task.rs"));
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn test_the_literal_id_scan_sees_every_call_shape_and_ignores_variable_ids() {
+        let shapes = [
+            "TaskWorkspace::create(repo.path(), \"x\", \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    \"x\",\n    \"HEAD\",\n)",
+            "TaskWorkspace::create(&repo, \"x\", \"HEAD\")",
+            "TaskWorkspace::create(Path::new(\"r\"), \"x\", \"HEAD\")",
+            "TaskWorkspace::create_with_container(repo.path(), \"x\", \"HEAD\", c)",
+            "TaskWorkspace::create_with_container_and_sidecars(repo.path(), \"x\", \"HEAD\", c, s)",
+        ];
+        for shape in shapes {
+            assert_eq!(literal_id_workspace_calls(shape).len(), 1, "{shape}");
+        }
+        for clean in [
+            "TaskWorkspace::create(repo.path(), &task_id.0, \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    &id,\n    \"HEAD\",\n)",
+            "TaskWorkspace::create_with_container(&repo, id, \"HEAD\", c)",
+        ] {
+            assert!(literal_id_workspace_calls(clean).is_empty(), "{clean}");
+        }
     }
 
     struct ProductionStub;
