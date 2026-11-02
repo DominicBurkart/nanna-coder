@@ -116,6 +116,8 @@ struct Scan {
     bound_mentions: BTreeMap<String, usize>,
     bound_ops: BTreeMap<String, usize>,
     bound_guarded: BTreeMap<String, usize>,
+    cond_guard: Vec<usize>,
+    guards: BTreeMap<String, BTreeMap<usize, usize>>,
 }
 
 impl Scan {
@@ -136,10 +138,15 @@ impl Scan {
             return;
         };
         let branch = self.branch.clone();
-        self.sequences
-            .entry(function.clone())
-            .or_default()
-            .push((name.to_string(), branch));
+        let sequence = self.sequences.entry(function.clone()).or_default();
+        sequence.push((name.to_string(), branch));
+        let index = sequence.len() - 1;
+        if let Some(guard) = self.cond_guard.last().copied() {
+            self.guards
+                .entry(function.clone())
+                .or_default()
+                .insert(index, guard);
+        }
         if dispatch_name(name) {
             *self
                 .calls
@@ -338,6 +345,13 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        syn::visit::visit_field_pat(self, node);
+        if names_bound(&node.member) {
+            self.record_bound_mention();
+        }
+    }
+
     fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
         syn::visit::visit_expr_field(self, node);
         if names_bound(&node.member) {
@@ -376,8 +390,14 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.branches += 1;
+        let then_id = self.branches;
+        self.cond_guard.push(then_id);
         self.visit_expr(&node.cond);
-        self.conditional(|scan| scan.visit_block(&node.then_branch));
+        self.cond_guard.pop();
+        self.branch.push(then_id);
+        self.visit_block(&node.then_branch);
+        self.branch.pop();
         if let Some((_, otherwise)) = &node.else_branch {
             self.conditional(|scan| scan.visit_expr(otherwise));
         }
@@ -560,6 +580,24 @@ fn calls_in(function: &str, file: &str) -> Calls {
         .filter_map(|mut scan| scan.sequences.remove(function))
         .flatten()
         .collect()
+}
+
+fn guarded_by_condition(function: &str, file: &str, first: &str, then: &str) -> bool {
+    let scan = scan_all()
+        .into_iter()
+        .find(|scan| scan.file == file && scan.sequences.contains_key(function))
+        .unwrap_or_else(|| {
+            panic!("{file}: {function} is no longer scanned; update the pairing pin")
+        });
+    let calls = &scan.sequences[function];
+    let Some(index) = calls.iter().position(|(name, _)| name == first) else {
+        return false;
+    };
+    let Some(guard) = scan.guards.get(function).and_then(|g| g.get(&index)) else {
+        return false;
+    };
+    let dependents: Vec<_> = calls.iter().filter(|(name, _)| name == then).collect();
+    !dependents.is_empty() && dependents.iter().all(|(_, path)| path.contains(guard))
 }
 
 fn dominates(calls: &Calls, first: &str, then: &str) -> bool {
@@ -1024,7 +1062,8 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
             "task.rs: TaskManager::admit_restored",
             "task.rs: TaskManager::submit_audited",
             "task.rs: TaskManager::submit_bound",
-        ])
+        ]),
+        "an insert into `runner.bound` was added or moved: give the new site a remove path (terminal status, cancel, or consumption by resolve_identity) and update this list in the same change"
     );
     assert_eq!(
         sites("remove"),
@@ -1032,10 +1071,13 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
             "task.rs: TaskManager::cancel",
             "task.rs: TaskRunner::resolve_identity",
             "task.rs: TaskRunner::set_status",
-        ])
+        ]),
+        "a removal from `runner.bound` was added, deleted or moved: every insert site needs a remove reachable for it; update this list only after checking that"
     );
-    let status = calls_in("TaskRunner::set_status", "task.rs");
-    assert!(dominates(&status, "is_terminal", "remove"));
+    assert!(
+        guarded_by_condition("TaskRunner::set_status", "task.rs", "is_terminal", "remove"),
+        "set_status must remove the bound identity inside the `if status.is_terminal()` branch"
+    );
     let guarded_removes: BTreeMap<String, usize> = union_counts(|scan| &scan.bound_guarded)
         .into_iter()
         .filter(|(key, _)| key.ends_with(" bound.remove"))
@@ -1045,12 +1087,18 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
         counts(&[
             ("task.rs: TaskManager::cancel bound.remove", 1),
             ("task.rs: TaskRunner::set_status bound.remove", 1),
-        ])
+        ]),
+        "cancel and set_status must remove the bound identity only on a conditional branch (cancel: when the task was dequeued; set_status: when the status is terminal)"
     );
-    let submit = calls_in("TaskManager::submit_task", "task.rs");
-    assert!(dominates(&submit, "enqueue", "fail"));
+    assert!(
+        guarded_by_condition("TaskManager::submit_task", "task.rs", "enqueue", "fail"),
+        "submit_task must call fail inside the branch taken when enqueue errors, so a failed submit reaches the terminal remove in set_status"
+    );
     let fail = calls_in("TaskRunner::fail", "task.rs");
-    assert!(fail.iter().any(|(name, _)| name == "set_status"));
+    assert!(
+        fail.iter().any(|(name, _)| name == "set_status"),
+        "TaskRunner::fail must reach set_status, where the terminal remove lives"
+    );
 }
 
 #[test]
@@ -1069,4 +1117,129 @@ fn the_bound_scanner_sees_raw_identifiers_aliases_macros_and_ignores_cfg_test_it
     assert_eq!(scan.bound_mentions["x.rs: h"], 1);
     assert!(!scan.bound_mentions.contains_key("x.rs: t"));
     assert!(!scan.bound_ops.contains_key("x.rs: h bound.insert"));
+}
+
+struct FieldTypes {
+    idents: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for FieldTypes {
+    fn visit_path_segment(&mut self, node: &'ast syn::PathSegment) {
+        self.idents.insert(node.ident.to_string());
+        syn::visit::visit_path_segment(self, node);
+    }
+}
+
+fn task_runner_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let syntax = syn::parse_file(source).unwrap();
+    let mut fields = BTreeMap::new();
+    for item in &syntax.items {
+        let syn::Item::Struct(item) = item else {
+            continue;
+        };
+        if item.ident != "TaskRunner" {
+            continue;
+        }
+        for field in &item.fields {
+            let mut types = FieldTypes {
+                idents: BTreeSet::new(),
+            };
+            types.visit_type(&field.ty);
+            let name = field
+                .ident
+                .as_ref()
+                .map(|i| plain(&i.to_string()).to_string());
+            fields.insert(name.unwrap_or_default(), types.idents);
+        }
+    }
+    fields
+}
+
+fn task_source() -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/task.rs")).unwrap()
+}
+
+#[test]
+fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
+    let fields = task_runner_fields(&task_source());
+    let holders: BTreeSet<String> = fields
+        .iter()
+        .filter(|(_, types)| {
+            ["BoundIdentity", "AuditedIdentity", "Allowed"]
+                .iter()
+                .any(|token| types.contains(*token))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(
+        holders,
+        expected(&["bound"]),
+        "a second TaskRunner field holds bound or audited identities; the pairing pin is keyed on the field name `bound` and does not see it: extend the scanner to the new field and give it a remove path"
+    );
+    assert_eq!(
+        fields.keys().cloned().collect::<BTreeSet<_>>(),
+        expected(&[
+            "action_gate",
+            "audit",
+            "bound",
+            "build_locks",
+            "ci_client",
+            "cost_accountant",
+            "default_provider",
+            "escalations",
+            "escalator",
+            "identities",
+            "image_cache",
+            "leases",
+            "progress",
+            "providers",
+            "sink",
+            "status_senders",
+            "tasks",
+        ]),
+        "TaskRunner gained or lost a field: if it keeps per-task state, check that it is cleaned up on terminal status, then update this list"
+    );
+}
+
+#[test]
+fn the_field_list_scanner_reads_struct_fields_and_their_type_names() {
+    let fields = task_runner_fields(
+        "struct TaskRunner { bound: RwLock<HashMap<TaskId, BoundIdentity>>, r#other: Arc<X> } struct Other { z: u8 }",
+    );
+    assert_eq!(fields.len(), 2);
+    assert!(fields["bound"].contains("BoundIdentity"));
+    assert!(fields["other"].contains("X"));
+}
+
+#[test]
+fn the_bound_scanner_sees_struct_pattern_destructuring_of_the_field() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(s: S) { let TaskRunner { bound, .. } = &*s.runner; } \
+         fn g(r: &TaskRunner) { let TaskRunner { bound: m, .. } = r; } \
+         fn h(r: &TaskRunner) { let TaskRunner { r#bound: m, .. } = r; }",
+    );
+    assert_eq!(scan.bound_mentions["x.rs: f"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: g"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: h"], 1);
+}
+
+#[test]
+fn a_condition_guards_only_the_branch_it_selects() {
+    let guarded = |source: &str| {
+        let scan = scan_source("x.rs", source);
+        let calls = &scan.sequences["f"];
+        let index = calls.iter().position(|(name, _)| name == "cond").unwrap();
+        let guard = scan.guards["f"][&index];
+        calls
+            .iter()
+            .filter(|(name, _)| name == "act")
+            .all(|(_, path)| path.contains(&guard))
+    };
+    assert!(guarded("fn f(s: S) { if s.cond() { s.act(); } }"));
+    assert!(!guarded("fn f(s: S) { if s.cond() { } s.act(); }"));
+    assert!(!guarded(
+        "fn f(s: S) { if s.cond() { } if s.other() { s.act(); } }"
+    ));
+    assert!(!guarded("fn f(s: S) { if s.cond() { } else { s.act(); } }"));
 }
