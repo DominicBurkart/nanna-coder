@@ -123,6 +123,7 @@
             (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
             (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
             (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/auditor-eval.yml" path) ||
             (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
             (pkgs.lib.hasInfix "/docs/" path) ||
             (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
@@ -318,6 +319,7 @@
               (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
               (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
               (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/auditor-eval.yml" path) ||
               (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
               (pkgs.lib.hasInfix "/docs/" path) ||
               (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
