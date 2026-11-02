@@ -53,10 +53,24 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 impl Idents {
+    fn alias(&mut self, name: &syn::Ident, ty: &syn::Type) {
+        let mut mentioned = Idents::default();
+        mentioned.visit_type(ty);
+        if mentioned.sequence.iter().any(|ident| watched(ident)) {
+            self.aliases
+                .push(format!("aliases a watched type as {name}"));
+        }
+    }
+
     fn tokens(&mut self, stream: TokenStream) {
         for token in stream {
             match token {
-                TokenTree::Ident(ident) => self.sequence.push(ident.to_string()),
+                TokenTree::Ident(ident) => {
+                    if ident == "SpawnGate" {
+                        self.aliases.push("passes SpawnGate to a macro".to_string());
+                    }
+                    self.sequence.push(ident.to_string());
+                }
                 TokenTree::Group(group) => self.tokens(group.stream()),
                 _ => {}
             }
@@ -79,13 +93,20 @@ impl<'ast> Visit<'ast> for Idents {
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        let mut mentioned = Idents::default();
-        mentioned.visit_type(&node.ty);
-        if mentioned.sequence.iter().any(|name| watched(name)) {
-            self.aliases
-                .push(format!("aliases a watched type as {}", node.ident));
-        }
+        self.alias(&node.ident, &node.ty);
         syn::visit::visit_item_type(self, node);
+    }
+
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        self.alias(&node.ident, &node.ty);
+        syn::visit::visit_impl_item_type(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if node.mac.path.is_ident("macro_rules") {
+            self.aliases.push("defines a macro_rules macro".to_string());
+        }
+        syn::visit::visit_item_macro(self, node);
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
@@ -218,6 +239,28 @@ fn the_checker_sees_forbidden_constructs_in_code_and_macro_bodies_but_not_in_tes
     assert!(!found
         .iter()
         .any(|f| f.contains("as D") || f.contains("Fine")));
+}
+
+#[test]
+fn the_checker_sees_macro_pasted_types_and_associated_type_aliases() {
+    let source = r#"
+        macro_rules! mk { ($t:ty) => { $t::new() }; }
+        fn m() { mk!(SpawnGate); }
+        trait Tr { type A; }
+        struct S;
+        impl Tr for S { type A = SpawnGate; }
+        impl Tr for T { type A = Vec<u8>; }
+        fn n() { let _ = <S as Tr>::A::new(a, b, c); }
+    "#;
+    let found = forbidden_constructs(source);
+    for expected in [
+        "defines a macro_rules macro",
+        "passes SpawnGate to a macro",
+        "aliases a watched type as A",
+    ] {
+        assert!(found.iter().any(|f| f == expected), "{expected}: {found:?}");
+    }
+    assert_eq!(found.iter().filter(|f| f.contains("as A")).count(), 1);
 }
 
 #[test]
