@@ -4755,7 +4755,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 65] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 66] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4847,6 +4847,10 @@ mod tests {
         (
             "harness/src/deploy/template.rs",
             "harness/src/deploy/template.rs",
+        ),
+        (
+            "harness/src/sandbox_tools.rs",
+            "harness/src/sandbox_tools.rs",
         ),
     ];
 

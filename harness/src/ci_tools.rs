@@ -2818,7 +2818,10 @@ mod tests {
         for (path, text) in found {
             let identity = AgentIdentity::from_toml_str(&text, &path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            for tool in TOOL_NAMES {
+            for tool in TOOL_NAMES
+                .iter()
+                .chain(crate::sandbox_tools::TOOL_NAMES.iter())
+            {
                 assert!(
                     !identity.allows_tool(tool),
                     "{} grants {tool}",

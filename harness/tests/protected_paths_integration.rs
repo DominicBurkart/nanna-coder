@@ -226,6 +226,11 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         "echo x > /workspace/harness/src/deploy/template.rs",
     )
     .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/src/sandbox_tools.rs",
+    )
+    .await;
     assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
     assert_refused(
         &registry,
@@ -268,6 +273,7 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         "harness/src/ci_policy.rs",
         "harness/src/ci_integrity.rs",
         "harness/src/deploy/template.rs",
+        "harness/src/sandbox_tools.rs",
     ] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
