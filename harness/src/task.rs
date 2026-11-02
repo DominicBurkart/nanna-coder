@@ -1344,13 +1344,16 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// entry.
     pub async fn cancel(&self, task_id: &TaskId) -> Result<Task, String> {
         let parked = self.is_parked(task_id).await;
+        let mut dequeued = false;
         if parked {
             self.dispatcher.forget(task_id).map_err(|e| e.to_string())?;
         } else {
-            self.dispatcher
+            let outcome = self
+                .dispatcher
                 .cancel(task_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            dequeued = matches!(outcome, crate::scheduler::CancelOutcome::Queued(_));
         }
 
         let iterations_completed = {
@@ -1385,7 +1388,9 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             task.clone()
         };
         self.runner.release_leases(task_id);
-        self.runner.bound.write().await.remove(task_id);
+        if dequeued {
+            self.runner.bound.write().await.remove(task_id);
+        }
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -3431,8 +3436,8 @@ mod scheduler_tests {
     use model::types::{ChatRequest, ChatResponse, ModelInfo};
     use std::path::Path;
 
-    struct GatedProvider {
-        gate: watch::Receiver<bool>,
+    pub(super) struct GatedProvider {
+        pub(super) gate: watch::Receiver<bool>,
     }
 
     #[async_trait]
@@ -7130,7 +7135,7 @@ mod repo_override_tests {
 
 #[cfg(test)]
 mod spawn_tests {
-    use super::scheduler_tests::{git_repo, wait_for, RejectingStore};
+    use super::scheduler_tests::{git_repo, wait_for, GatedProvider, RejectingStore};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
@@ -7336,10 +7341,95 @@ mod spawn_tests {
         assert!(manager.runner.bound.read().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_a_cancel_that_is_refused_keeps_the_bound_entry_of_a_live_task() {
+    async fn occupied_manager() -> (TaskManager, tokio::sync::watch::Sender<bool>, TaskId) {
+        let repo = repo_with_origin("https://github.com/example/occupier.git");
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let occupier: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let manager = TaskManager::new(1);
+        let occupying = manager
+            .submit(
+                "Hold the only slot.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                occupier,
+            )
+            .await;
+        wait_for(&manager, &occupying, |status| {
+            matches!(status, TaskStatus::Running { .. })
+        })
+        .await;
+        std::mem::forget(repo);
+        (manager, open, occupying)
+    }
+
+    async fn queue_two_audited(manager: &TaskManager) -> (TaskId, TaskId) {
         let repo = repo_with_origin("https://github.com/example/repo.git");
-        let manager = TaskManager::new(0);
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let allowed = allowed_for("github.com/example/repo").await;
+            ids.push(
+                manager
+                    .submit_spawn(
+                        allowed,
+                        repo.path().to_path_buf(),
+                        "HEAD".to_string(),
+                        "gemma4:e4b".to_string(),
+                        20,
+                        provider(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        std::mem::forget(repo);
+        (ids.remove(0), ids.remove(0))
+    }
+
+    async fn assert_still_audited_and_runs_audited(
+        manager: &TaskManager,
+        open: &tokio::sync::watch::Sender<bool>,
+        survivor: &TaskId,
+    ) {
+        let (audited, _) = manager.bound_identity_of(survivor).await.unwrap();
+        assert!(audited);
+        open.send(true).unwrap();
+        let done = wait_for(manager, survivor, |status| status.is_terminal()).await;
+        assert!(
+            matches!(done.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            done.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_one_queued_audited_task_leaves_the_other_bound_and_audited() {
+        let (manager, open, _occupying) = occupied_manager().await;
+        let (doomed, survivor) = queue_two_audited(&manager).await;
+        manager.cancel(&doomed).await.unwrap();
+        assert!(manager.bound_identity_of(&doomed).await.is_none());
+        assert_eq!(manager.runner.bound.read().await.len(), 1);
+        assert_still_audited_and_runs_audited(&manager, &open, &survivor).await;
+    }
+
+    #[tokio::test]
+    async fn test_failing_one_queued_audited_task_leaves_the_other_bound_and_audited() {
+        let (manager, open, _occupying) = occupied_manager().await;
+        let (doomed, survivor) = queue_two_audited(&manager).await;
+        manager
+            .runner
+            .fail(&doomed, "scripted".to_string(), "Scripted")
+            .await;
+        assert!(manager.bound_identity_of(&doomed).await.is_none());
+        assert_eq!(manager.runner.bound.read().await.len(), 1);
+        assert_still_audited_and_runs_audited(&manager, &open, &survivor).await;
+    }
+
+    #[tokio::test]
+    async fn test_a_cancel_of_a_dispatched_task_leaves_its_entry_for_the_run_to_resolve() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(1);
         let allowed = allowed_for("github.com/example/repo").await;
         let id = manager
             .submit_spawn(
@@ -7352,9 +7442,16 @@ mod spawn_tests {
             )
             .await
             .unwrap();
-        let unknown = TaskId("never-submitted".to_string());
-        assert!(manager.cancel(&unknown).await.is_err());
+        assert!(manager.dispatcher.is_running(&id).await);
         assert!(manager.bound_identity_of(&id).await.is_some());
+        manager.cancel(&id).await.unwrap();
+        let resolved = manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"), repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(resolved, BoundIdentity::Audited(_)));
     }
 
     #[tokio::test]
