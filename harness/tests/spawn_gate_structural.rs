@@ -559,6 +559,7 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         ("backlog.rs: backlog_sync uses enqueue", 1),
         ("main.rs: run_delegate uses submit_task", 1),
         ("mcp/handlers.rs: handle_assign_task uses submit_spawn", 1),
+        ("plan_dispatch.rs: TaskManager::start uses submit_spawn", 1),
         ("task.rs: TaskManager::submit_audited uses submit_task", 1),
         ("task.rs: TaskManager::submit_spawn uses submit_bound", 1),
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
@@ -569,7 +570,7 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
     .collect();
     assert_eq!(
         counts, expected,
-        "a use of a submit/enqueue function appeared, vanished, was duplicated, or moved to another function"
+        "a use of a submit/enqueue function appeared, vanished, was duplicated, or moved to another function (plan_dispatch.rs is the single place a plan node reaches submit_spawn)"
     );
 }
 
