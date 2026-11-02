@@ -1941,4 +1941,399 @@ mod tests {
         assert_eq!(accountant.task_summary("id", "t1").sandbox.count, 1);
         assert_eq!(accountant.task_summary("id", "t1").sandbox.minutes, 0.0);
     }
+
+    const ALWAYS_OPEN: &str = "[[window]]\nname = \"early\"\ntimezone = \"UTC\"\ndays = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\nstart = \"00:00\"\nend = \"23:59\"\napplies_to = [\"sandbox\"]\n\n[[window]]\nname = \"late\"\ntimezone = \"Pacific/Kiritimati\"\ndays = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\nstart = \"00:00\"\nend = \"23:59\"\napplies_to = [\"sandbox\"]\n";
+
+    struct ScriptedModel {
+        reply: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedModel {
+        fn replying(reply: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: reply.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl model::ModelProvider for ScriptedModel {
+        async fn chat(
+            &self,
+            _request: model::types::ChatRequest,
+        ) -> model::ModelResult<model::types::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(model::types::ChatResponse {
+                choices: vec![model::types::Choice {
+                    message: model::types::ChatMessage {
+                        role: model::types::MessageRole::Assistant,
+                        content: Some(self.reply.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some(model::types::FinishReason::Stop),
+                }],
+                usage: None,
+            })
+        }
+
+        async fn list_models(&self) -> model::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> model::ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+    }
+
+    struct FixedAuditor(crate::action_auditor::ActionVerdict);
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for FixedAuditor {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &crate::action_auditor::ActionReview,
+            _context: &crate::action_auditor::ActionContext<'_>,
+        ) -> Result<crate::action_auditor::ActionVerdict, crate::action_auditor::ActionAuditError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct Chain {
+        dir: TempDir,
+        target: Arc<FakeSandboxTarget>,
+        sandboxes: Arc<SandboxRegistry>,
+        accountant: Arc<CostAccountant>,
+        leases: Arc<crate::leases::InMemoryLeaseStore>,
+    }
+
+    impl Chain {
+        fn new() -> Self {
+            Self {
+                dir: fixture(),
+                target: Arc::new(FakeSandboxTarget::new()),
+                sandboxes: Arc::new(SandboxRegistry::new()),
+                accountant: unlimited(),
+                leases: Arc::new(crate::leases::InMemoryLeaseStore::default()),
+            }
+        }
+
+        fn registry(
+            &self,
+            task_id: &str,
+            gate: Arc<crate::action_auditor::ActionGate>,
+            subject: crate::tools::ActionSubject,
+        ) -> ToolRegistry {
+            let identity = identity_with("\"sandbox_deploy\", \"sandbox_teardown\"", "sandbox", "");
+            let mut registry = ToolRegistry::new();
+            register(
+                &mut registry,
+                self.dir.path(),
+                &identity,
+                SandboxContext {
+                    target: Arc::clone(&self.target) as Arc<dyn SandboxTarget>,
+                    probe: Arc::new(LoopbackProbe),
+                    sandboxes: Arc::clone(&self.sandboxes),
+                    accountant: Arc::clone(&self.accountant),
+                    task_id: task_id.to_string(),
+                    pr: 7,
+                },
+            );
+            registry
+                .scoped_for(&identity)
+                .with_action_gate(gate, subject)
+        }
+
+        fn modelled_gate(
+            &self,
+            windows: &str,
+            reply: &str,
+        ) -> (Arc<crate::action_auditor::ActionGate>, Arc<ScriptedModel>) {
+            let provider = ScriptedModel::replying(reply);
+            let auditor = crate::action_auditor::ModelActionAuditor::new(
+                Arc::clone(&provider) as Arc<dyn model::ModelProvider>,
+                "scripted",
+                Arc::new(crate::windows::WindowSet::parse(windows).unwrap()),
+                Arc::clone(&self.leases) as Arc<dyn crate::leases::LeaseStore>,
+                chrono::Duration::minutes(10),
+            );
+            let gate = Arc::new(crate::action_auditor::ActionGate::new(
+                Arc::new(auditor),
+                crate::action_auditor::ActionAuditLog::in_memory(),
+            ));
+            (gate, provider)
+        }
+
+        fn nothing_happened(&self) {
+            assert!(self.target.deployed().is_empty());
+            assert!(self.target.images().is_empty());
+            assert!(self.target.torn_down().is_empty());
+            assert_eq!(
+                self.accountant.task_summary("sb-agent", "t1").sandbox.count,
+                0
+            );
+            assert_eq!(
+                self.accountant
+                    .task_summary("sb-agent", "t1")
+                    .sandbox
+                    .minutes,
+                0.0
+            );
+        }
+    }
+
+    fn denied_reasons(err: ToolError) -> Vec<crate::auditor::ReasonCode> {
+        match err {
+            ToolError::ActionDenied(denied) => {
+                denied.reasons().iter().map(|reason| reason.code).collect()
+            }
+            other => panic!("expected an action denial, got {other:?}"),
+        }
+    }
+
+    const ALLOW: &str = r#"{"verdict":"allow"}"#;
+
+    #[tokio::test]
+    async fn a_rule_pass_and_a_model_allow_run_the_deploy_once_take_the_sandbox_lease_and_charge_the_identity(
+    ) {
+        let chain = Chain::new();
+        let (gate, model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry("t1", gate, subject(Some(7)));
+        let report = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap();
+        assert_eq!(report["all_passed"], true);
+        assert_eq!(model.calls(), 1);
+        assert_eq!(chain.target.deployed().len(), 1);
+        let summary = chain.accountant.task_summary("sb-agent", "t1");
+        assert_eq!(summary.sandbox.count, 1);
+        let held: Vec<(String, String)> =
+            crate::leases::LeaseStore::snapshot(chain.leases.as_ref())
+                .unwrap()
+                .into_iter()
+                .map(|lease| (lease.name.to_string(), lease.holder))
+                .collect();
+        assert_eq!(held, vec![("sandbox:o/n:7".to_string(), "t1".to_string())]);
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].review.identity, "sb-agent");
+        assert_eq!(reviews[0].review.effect_class, EffectClass::Sandbox);
+        assert!(reviews[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_never_runs_either_tool_body_even_when_the_model_would_allow() {
+        for window in [Some("no-such-window"), None] {
+            let chain = Chain::new();
+            let windows = if window.is_some() { ALWAYS_OPEN } else { "" };
+            let (gate, model) = chain.modelled_gate(windows, ALLOW);
+            let mut closed = subject(Some(7));
+            closed.window = window.map(str::to_string);
+            let registry = chain.registry("t1", gate, closed);
+            chain.sandboxes.insert(
+                "t1",
+                SandboxHandle {
+                    repo: "o/n".to_string(),
+                    pr: 7,
+                    url: "http://127.0.0.1:1".to_string(),
+                    deployed_at: Utc::now(),
+                    identity: None,
+                },
+            );
+            for (tool, args) in [
+                ("sandbox_deploy", json!({"image_tag": "v1"})),
+                ("sandbox_teardown", json!({})),
+            ] {
+                let err = registry.execute(tool, args).await.unwrap_err();
+                assert_eq!(
+                    denied_reasons(err),
+                    vec![crate::auditor::ReasonCode::WindowClosed],
+                    "{window:?} {tool}"
+                );
+            }
+            assert_eq!(model.calls(), 0, "{window:?}");
+            chain.nothing_happened();
+            assert!(chain.sandboxes.get("t1").is_some());
+            assert!(crate::leases::LeaseStore::snapshot(chain.leases.as_ref())
+                .unwrap()
+                .is_empty());
+            let reviews = registry.action_reviews();
+            assert_eq!(reviews.len(), 2);
+            assert!(reviews
+                .iter()
+                .all(|entry| entry.verdict.kind() == crate::auditor::VerdictKind::Block));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_that_is_not_bound_is_refused_by_the_lease_rule_with_the_window_open() {
+        let chain = Chain::new();
+        let (gate, model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry("t1", gate, subject(None));
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied_reasons(err),
+            vec![crate::auditor::ReasonCode::LeaseUnavailable]
+        );
+        assert_eq!(model.calls(), 0);
+        chain.nothing_happened();
+    }
+
+    #[tokio::test]
+    async fn a_second_task_for_a_pull_request_that_holds_the_sandbox_lease_deploys_nothing() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let first = chain.registry("t1", Arc::clone(&gate), subject(Some(7)));
+        first
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap();
+        let mut rival = subject(Some(7));
+        rival.task_id = crate::task::TaskId("t2".to_string());
+        let second = chain.registry("t2", gate, rival);
+        let err = second
+            .execute("sandbox_deploy", json!({"image_tag": "v2"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied_reasons(err),
+            vec![crate::auditor::ReasonCode::LeaseUnavailable]
+        );
+        assert_eq!(chain.target.deployed().len(), 1);
+        assert_eq!(
+            chain
+                .accountant
+                .task_summary("sb-agent", "t2")
+                .sandbox
+                .count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_ceiling_below_sandbox_blocks_the_call_before_the_window_the_model_or_the_tool(
+    ) {
+        let chain = Chain::new();
+        let (gate, model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let mut capped = subject(Some(7));
+        capped.max_effect = EffectClass::Repository;
+        let registry = chain.registry("t1", gate, capped);
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied_reasons(err),
+            vec![crate::auditor::ReasonCode::EffectAboveCeiling]
+        );
+        assert_eq!(model.calls(), 0);
+        chain.nothing_happened();
+    }
+
+    #[tokio::test]
+    async fn a_model_block_stops_the_deploy_and_releases_the_lease() {
+        let chain = Chain::new();
+        let (gate, model) = chain.modelled_gate(
+            ALWAYS_OPEN,
+            r#"{"verdict":"block","reasons":[{"code":"scope_creep","detail":"not this task"}]}"#,
+        );
+        let registry = chain.registry("t1", gate, subject(Some(7)));
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied_reasons(err),
+            vec![crate::auditor::ReasonCode::ScopeCreep]
+        );
+        assert_eq!(model.calls(), 1);
+        chain.nothing_happened();
+        assert!(crate::leases::LeaseStore::snapshot(chain.leases.as_ref())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_escalate_verdict_stops_the_deploy_and_reaches_the_escalation_plane_with_the_task() {
+        let chain = Chain::new();
+        let gate = Arc::new(crate::action_auditor::ActionGate::new(
+            Arc::new(FixedAuditor(
+                crate::action_auditor::ActionVerdict::escalate(vec![crate::auditor::Reason::new(
+                    crate::auditor::ReasonCode::Other,
+                    "needs a human",
+                )]),
+            )),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _log) = crate::test_support::escalation::escalator(&sink);
+        let registry = chain
+            .registry("t1", gate, subject(Some(7)))
+            .with_action_escalator(escalator);
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ActionDenied(crate::action_auditor::ActionDenied::Escalate { .. })
+        ));
+        chain.nothing_happened();
+        let seen = sink.escalations();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].repo, "o/n");
+        assert_eq!(seen[0].task_id, Some(crate::task::TaskId("t1".to_string())));
+        assert!(seen[0].summary.contains("sandbox_deploy"));
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_sandbox_budget_stops_a_deploy_the_gate_allowed() {
+        let chain = Chain::new();
+        let (gate, model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let identity = identity_with("\"sandbox_deploy\"", "sandbox", "");
+        let mut registry = ToolRegistry::new();
+        register(
+            &mut registry,
+            chain.dir.path(),
+            &identity,
+            SandboxContext {
+                target: Arc::clone(&chain.target) as Arc<dyn SandboxTarget>,
+                probe: Arc::new(LoopbackProbe),
+                sandboxes: Arc::clone(&chain.sandboxes),
+                accountant: Arc::new(CostAccountant::deny_all(Arc::new(
+                    InMemoryBudgetStore::new(),
+                ))),
+                task_id: "t1".to_string(),
+                pr: 7,
+            },
+        );
+        let registry = registry.with_action_gate(gate, subject(Some(7)));
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Budget(_)), "{err:?}");
+        assert_eq!(model.calls(), 1);
+        assert!(chain.target.deployed().is_empty());
+        assert!(chain.target.images().is_empty());
+    }
 }
