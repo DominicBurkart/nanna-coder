@@ -120,6 +120,13 @@ jobs:
             "harness/src/ci_integrity.rs"
             "harness/src/deploy/template.rs"
             "harness/src/sandbox_tools.rs"
+            "harness/tests/spawn_gate_structural.rs"
+            "harness/tests/protected_audit_hook_structural.rs"
+            "harness/tests/escalation_sinks_structural.rs"
+            "harness/tests/fixtures/identities/global/auditor.toml"
+            "harness/tests/fixtures/identities/global/prompts/auditor.md"
+            "harness/tests/fixtures/one_track/catalog/auditor.toml"
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md"
           )
           shopt -s nocasematch
           VIOLATIONS=()
