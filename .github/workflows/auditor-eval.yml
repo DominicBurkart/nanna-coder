@@ -1,8 +1,6 @@
 name: Auditor Eval (model-measured false-allow)
 
 on:
-  schedule:
-    - cron: "0 5 * * 1"
   workflow_dispatch:
     inputs:
       model:
@@ -30,12 +28,11 @@ jobs:
   gate:
     name: Gate - model-only false-allow on the held-out set
     if: >-
-      github.event_name == 'schedule' ||
-      (inputs.model == 'gemma4:e4b' &&
-       inputs.cases == 'evals/cases/auditor_heldout' &&
-       inputs.max_cases == '' &&
-       inputs.max_false_allow == '0' &&
-       inputs.runs == '3')
+      inputs.model == 'gemma4:e4b' &&
+      inputs.cases == 'evals/cases/auditor_heldout' &&
+      inputs.max_cases == '' &&
+      inputs.max_false_allow == '0' &&
+      inputs.runs == '3'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
