@@ -604,7 +604,7 @@ mod tests {
                 file.strip_prefix(dir.path())
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect();
         found.sort();
