@@ -11,13 +11,9 @@ use shared::Greeting;
 pub const GREETING_ID: &str = "greeting";
 /// Text shown while the request is in flight.
 pub const LOADING_TEXT: &str = "loading";
-/// DOM id of the button that increments the click counter.
 pub const BUMP_ID: &str = "bump";
-/// DOM id of the element that shows the click count.
 pub const CLICKS_ID: &str = "clicks";
-/// DOM id of the text input.
 pub const NAME_ID: &str = "name";
-/// DOM id of the element that echoes the input value.
 pub const ECHO_ID: &str = "echo";
 /// Path the page fetches; relative so the api can serve the page.
 pub const GREETING_PATH: &str = "/api/v1/greeting";
@@ -68,7 +64,7 @@ fn App() -> Element {
             p { id: GREETING_ID, "{text}" }
             button { id: BUMP_ID, onclick: move |_| count += 1, "bump" }
             p { id: CLICKS_ID, "{clicks}" }
-            input { id: NAME_ID, oninput: move |event| name.set(event.value()) }
+            textarea { id: NAME_ID, oninput: move |event| name.set(event.value()) }
             p { id: ECHO_ID, "{echo}" }
         }
     }

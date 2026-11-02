@@ -18,7 +18,7 @@ root workspace.
 | `GET /` | the built `ui/dist` (rendered greeting inside `#greeting`) |
 
 The page also has a `#bump` button that increments the count shown in
-`#clicks` (`clicks: N`) and a `#name` input whose value is echoed in `#echo`
+`#clicks` (`clicks: N`) and a `#name` textarea whose value is echoed in `#echo`
 (`typed: [value]`), so a browser test can observe that `click` and `type` ran
 the page's own handlers.
 

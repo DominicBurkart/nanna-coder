@@ -2,12 +2,6 @@
 //! full-stack fixture. All tests are `#[ignore]` and skip when no runtime is
 //! available; run them with
 //! `cargo test -p harness --test qa_integration -- --ignored --test-threads=1`.
-//! With `NANNA_REQUIRE_RUNTIME=1` the browser interaction test panics instead
-//! of skipping when no container runtime is available.
-//!
-//! `container_browser_click_and_type_*` is layer C (container, real
-//! Chromium): it drives `Step::Click` and `Step::Type` against the fixture's
-//! interactive page and asserts the page's own state changed.
 //!
 //! The dev image is the [`apprun_integration`] stand-in plus headless
 //! Chromium (the package the generated flake adds for this profile).
@@ -268,12 +262,14 @@ async fn container_browser_click_and_type_change_the_fixture_page_state() {
         { "step": "expect_text", "selector": "#clicks", "text": "clicks: 2" },
         { "step": "type", "selector": "#name", "text": "nanna-typed" },
         { "step": "expect_text", "selector": "#echo", "text": "typed: [nanna-typed]" },
+        { "step": "type", "selector": "#name", "text": "a\"b'c\n日本" },
+        { "step": "expect_text", "selector": "#echo", "text": "typed: [a\"b'c\n日本]" },
         { "step": "screenshot", "name": "interacted" }
     ] });
     let browser = tool(&registry, QA_BROWSER_TOOL, json!({ "scenario": scenario })).await;
     assert_eq!(browser["passed"], true, "{browser}");
     let steps = browser["steps"].as_array().unwrap();
-    assert_eq!(steps.len(), 9, "{browser}");
+    assert_eq!(steps.len(), 11, "{browser}");
     assert!(steps.iter().all(|s| s["passed"] == true), "{browser}");
 
     let wrong = json!({ "steps": [
@@ -287,7 +283,7 @@ async fn container_browser_click_and_type_change_the_fixture_page_state() {
     let summary = ws.qa_summary();
     assert_eq!(summary.browser_runs, 2);
     assert_eq!(summary.browser_steps_failed, 1, "{summary:?}");
-    assert_eq!(summary.browser_steps_passed, 11, "{summary:?}");
+    assert_eq!(summary.browser_steps_passed, 13, "{summary:?}");
 
     ws.cleanup().expect("cleanup must succeed");
 }
