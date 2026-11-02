@@ -12,12 +12,7 @@ struct Facts {
 impl<'ast> Visit<'ast> for Facts {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = &*call.func {
-            let segments: Vec<String> = path
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
+            let segments = segment_names(&path.path);
             let last = segments.last().cloned().unwrap_or_default();
             if matches!(last.as_str(), "set_var" | "remove_var") && first_arg_is_path(call) {
                 self.mutates_path = true;
@@ -35,6 +30,10 @@ impl<'ast> Visit<'ast> for Facts {
         self.methods.insert(call.method.to_string());
         syn::visit::visit_expr_method_call(self, call);
     }
+}
+
+fn segment_names(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
 }
 
 fn first_arg_is_path(call: &syn::ExprCall) -> bool {
@@ -105,17 +104,16 @@ fn closure(
         .filter(|(_, f)| seed(f))
         .map(|(n, _)| n.clone())
         .collect();
-    loop {
-        let before = set.len();
+    let mut size = 0;
+    while set.len() != size {
+        size = set.len();
         for (name, f) in functions {
             if f.facts.calls.iter().any(|c| set.contains(c)) {
                 set.insert(name.clone());
             }
         }
-        if set.len() == before {
-            return set;
-        }
     }
+    set
 }
 
 pub fn violations(source: &str) -> Vec<String> {
