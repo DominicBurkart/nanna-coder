@@ -158,6 +158,7 @@ fn build_dev_image(
 
 #[tokio::test]
 #[ignore]
+#[serial_test::parallel(env_path)]
 async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
     let runtime = detect_runtime();
     if !runtime.is_available() {
@@ -238,6 +239,7 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
 
 #[tokio::test]
 #[ignore]
+#[serial_test::parallel(env_path)]
 async fn container_browser_click_and_type_change_the_fixture_page_state() {
     let runtime = detect_runtime();
     if !require_runtime_or_skip(&runtime) {
@@ -320,12 +322,14 @@ fn require_runtime_or_skip_accepts_an_available_runtime_whatever_the_environment
 
 #[test]
 #[should_panic(expected = "NANNA_REQUIRE_RUNTIME=1 requires one")]
+#[serial_test::parallel(env_path)]
 fn enforce_runtime_panics_when_required_and_absent() {
     enforce_runtime(&ContainerRuntime::None, Some("1"));
 }
 
 #[tokio::test]
 #[ignore]
+#[serial_test::parallel(env_path)]
 async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
     let runtime = detect_runtime();
     if !runtime.is_available() {
@@ -377,6 +381,7 @@ fn fixture_root_is_the_fullstack_fixture() {
 }
 
 #[test]
+#[serial_test::parallel(env_path)]
 fn init_repo_commits_every_file() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "a").unwrap();
@@ -401,6 +406,7 @@ fn init_repo_commits_every_file() {
 
 #[test]
 #[should_panic(expected = "failed")]
+#[serial_test::parallel(env_path)]
 fn git_helper_panics_on_a_failing_command() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["rev-parse", "HEAD"]);
@@ -565,6 +571,7 @@ fn build_dev_image_surfaces_a_failed_build() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn start_workspace_applies_the_cold_build_limit_and_app_env() {
     use std::os::unix::fs::PermissionsExt;
 
