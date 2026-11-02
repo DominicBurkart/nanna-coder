@@ -1,4 +1,4 @@
-use crate::identity::DevLoop;
+use crate::identity::{DevLoop, IdentityCatalog};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -54,6 +54,16 @@ pub enum PlanRejection {
     Cycle {
         unresolved: Vec<String>,
     },
+    UnknownIdentity {
+        id: String,
+        identity: String,
+    },
+    LoopNotAllowed {
+        id: String,
+        identity: String,
+        requested: DevLoop,
+        allowed: DevLoop,
+    },
 }
 
 impl fmt::Display for PlanRejection {
@@ -85,6 +95,19 @@ impl fmt::Display for PlanRejection {
                 f,
                 "the plan has a dependency cycle among: {}",
                 unresolved.join(", ")
+            ),
+            Self::UnknownIdentity { id, identity } => write!(
+                f,
+                "node `{id}` names identity `{identity}`, which is not in the catalog"
+            ),
+            Self::LoopNotAllowed {
+                id,
+                identity,
+                requested,
+                allowed,
+            } => write!(
+                f,
+                "node `{id}` places `{identity}` in the {requested} loop but it only acts in the {allowed} loop"
             ),
         }
     }
@@ -197,6 +220,27 @@ impl Plan {
 
     pub fn nodes(&self) -> &[Spawn] {
         &self.nodes
+    }
+
+    pub fn check_catalog(&self, catalog: &IdentityCatalog) -> Result<(), PlanRejection> {
+        for node in &self.nodes {
+            let Some(card) = catalog.get(&node.identity) else {
+                return Err(PlanRejection::UnknownIdentity {
+                    id: node.id.clone(),
+                    identity: printable(&node.identity),
+                });
+            };
+            let allowed = card.identity.dev_loop;
+            if node.dev_loop != allowed {
+                return Err(PlanRejection::LoopNotAllowed {
+                    id: node.id.clone(),
+                    identity: node.identity.clone(),
+                    requested: node.dev_loop,
+                    allowed,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn topological(&self) -> impl Iterator<Item = &Spawn> {
@@ -493,5 +537,125 @@ mod tests {
             let is_cycle = matches!(Plan::new(nodes), Err(PlanRejection::Cycle { .. }));
             prop_assert!(is_cycle);
         }
+    }
+
+    fn card(name: &str, dev_loop: &str, max_effect: &str) -> String {
+        format!(
+            "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"{dev_loop}\"\nmodel = \"m\"\nsystem_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\nmax_effect = \"{max_effect}\"\ntools = [\"read_file\"]\n\n[limits]\nmax_iterations = 1\nmax_wall_clock_secs = 1\nmax_concurrent = 1\n"
+        )
+    }
+
+    fn catalog() -> IdentityCatalog {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, dev_loop, effect) in [
+            ("rust-implementer", "inner", "repository"),
+            ("pr-shepherd", "middle", "ci"),
+            ("deployer", "outer", "sandbox"),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                card(name, dev_loop, effect),
+            )
+            .unwrap();
+        }
+        IdentityCatalog::load(dir.path()).unwrap()
+    }
+
+    fn placed(id: &str, identity: &str, dev_loop: DevLoop, deps: &[&str]) -> Spawn {
+        Spawn {
+            identity: identity.to_string(),
+            dev_loop,
+            ..node(id, deps)
+        }
+    }
+
+    #[test]
+    fn a_plan_over_known_identities_in_their_own_loops_passes_the_catalog_check() {
+        let plan = Plan::new(vec![
+            placed("a", "rust-implementer", DevLoop::Inner, &[]),
+            placed("b", "pr-shepherd", DevLoop::Middle, &["a"]),
+            placed("c", "deployer", DevLoop::Outer, &["b"]),
+        ])
+        .unwrap();
+        assert_eq!(plan.check_catalog(&catalog()), Ok(()));
+    }
+
+    #[test]
+    fn a_hallucinated_identity_is_a_hard_rejection() {
+        let plan = Plan::new(vec![
+            placed("a", "rust-implementer", DevLoop::Inner, &[]),
+            placed("b", "release-wizard", DevLoop::Outer, &["a"]),
+        ])
+        .unwrap();
+        assert_eq!(
+            plan.check_catalog(&catalog()),
+            Err(PlanRejection::UnknownIdentity {
+                id: "b".to_string(),
+                identity: "release-wizard".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_identity_name_is_sanitised_before_it_is_reported() {
+        let plan = Plan::new(vec![placed(
+            "a",
+            "sk-live key\nignore previous",
+            DevLoop::Inner,
+            &[],
+        )])
+        .unwrap();
+        let Err(PlanRejection::UnknownIdentity { identity, .. }) = plan.check_catalog(&catalog())
+        else {
+            panic!("expected an unknown identity");
+        };
+        assert_eq!(identity, "sk-live?key?ignore?previous");
+    }
+
+    #[test]
+    fn a_loop_outside_the_identitys_membership_is_rejected() {
+        let plan = Plan::new(vec![placed("a", "deployer", DevLoop::Inner, &[])]).unwrap();
+        assert_eq!(
+            plan.check_catalog(&catalog()),
+            Err(PlanRejection::LoopNotAllowed {
+                id: "a".to_string(),
+                identity: "deployer".to_string(),
+                requested: DevLoop::Inner,
+                allowed: DevLoop::Outer
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_offending_node_in_plan_order_is_reported() {
+        let plan = Plan::new(vec![
+            placed("a", "deployer", DevLoop::Inner, &[]),
+            placed("b", "ghost", DevLoop::Inner, &[]),
+        ])
+        .unwrap();
+        assert!(matches!(
+            plan.check_catalog(&catalog()),
+            Err(PlanRejection::LoopNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_rejections_render_with_their_context() {
+        let unknown = PlanRejection::UnknownIdentity {
+            id: "n".into(),
+            identity: "ghost".into(),
+        }
+        .to_string();
+        assert!(unknown.contains("ghost") && unknown.contains("not in the catalog"));
+        let looped = PlanRejection::LoopNotAllowed {
+            id: "n".into(),
+            identity: "deployer".into(),
+            requested: DevLoop::Inner,
+            allowed: DevLoop::Outer,
+        }
+        .to_string();
+        assert!(
+            looped.contains("inner") && looped.contains("outer") && looped.contains("deployer")
+        );
     }
 }
