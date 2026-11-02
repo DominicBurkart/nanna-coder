@@ -7,7 +7,7 @@ use super::{
 use crate::identity::AgentIdentity;
 use async_trait::async_trait;
 use model::types::{ChatMessage, ChatRequest};
-use model::ModelProvider;
+use model::{ModelError, ModelProvider};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -62,6 +62,8 @@ impl std::fmt::Debug for ModelAuditor {
             .finish()
     }
 }
+
+pub(super) const AUDIT_TEMPERATURE: f32 = 0.0;
 
 impl ModelAuditor {
     /// An auditor that asks `model` through `provider`.
@@ -302,6 +304,28 @@ impl Auditor for ModelAuditor {
 }
 
 impl ModelAuditor {
+    pub(super) async fn model_only(
+        &self,
+        request: &SpawnRequest,
+        context: &AuditContext,
+    ) -> Result<SpawnVerdict, AuditError> {
+        let messages = Self::build_prompt(request, context);
+        let chat =
+            ChatRequest::new(self.model.clone(), messages).with_temperature(AUDIT_TEMPERATURE);
+        let response = self.provider.chat(chat).await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+        match Self::parse_reply(&text) {
+            Ok((verdict, _)) => Ok(sanitize_verdict(verdict)),
+            Err(problem) => Err(AuditError::Model(ModelError::ServiceUnavailable {
+                message: format!("model output could not be parsed: {problem}"),
+            })),
+        }
+    }
+
     pub(super) async fn audit_detailed(
         &self,
         request: &SpawnRequest,
@@ -330,7 +354,8 @@ impl ModelAuditor {
         }
         let messages = Self::build_prompt(request, context);
         let prompt_hash = content_hash(&serde_json::to_string(&messages).unwrap_or_default());
-        let chat = ChatRequest::new(self.model.clone(), messages).with_temperature(0.0);
+        let chat =
+            ChatRequest::new(self.model.clone(), messages).with_temperature(AUDIT_TEMPERATURE);
         let response = self.provider.chat(chat).await?;
         let text = response
             .choices
@@ -468,6 +493,28 @@ pub(crate) mod tests {
         let sent = &provider.requests.lock().unwrap()[0];
         assert_eq!(sent.model, MODEL);
         assert_eq!(sent.temperature, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn model_only_sends_a_zero_temperature_and_skips_the_rules() {
+        let provider = MockProvider::replying(&[r#"{"verdict":"allow"}"#]);
+        let auditor = ModelAuditor::new(provider.clone(), MODEL);
+        let unknown = request("nobody", "anything", DevLoop::Inner, EffectClass::Workspace);
+        let verdict = auditor.model_only(&unknown, &context(true)).await.unwrap();
+        assert_eq!(verdict, SpawnVerdict::Allow);
+        assert_eq!(provider.calls(), 1);
+        let sent = &provider.requests.lock().unwrap()[0];
+        assert_eq!(sent.temperature, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn model_only_surfaces_a_transport_error_instead_of_a_verdict() {
+        let auditor = ModelAuditor::new(MockProvider::replying(&[]), MODEL);
+        let error = auditor
+            .model_only(&fitting(), &context(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuditError::Model(_)), "{error}");
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+pub mod model_eval;
 mod record;
 mod request;
 pub(crate) mod rules;

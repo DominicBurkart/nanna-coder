@@ -245,6 +245,36 @@ enum AuditorAction {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Score the spawn auditor model on a directory of cases. The gate is the
+    /// worst-case model-only false-allow count over --runs runs per case; the
+    /// production composition (rules first, then model) is reported apart.
+    /// Exits 1 above the threshold and 2 when the run cannot be trusted
+    Eval {
+        /// Directory of cases (defaults to evals/cases/auditor_heldout)
+        #[arg(long)]
+        cases: Option<std::path::PathBuf>,
+        /// Identity catalog (defaults to <cases>/catalog, else the shipped one)
+        #[arg(long)]
+        catalog: Option<std::path::PathBuf>,
+        /// Model to evaluate (defaults to NANNA_EVAL_MODEL, then MODEL)
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Largest number of false allows that still passes
+        #[arg(long, default_value_t = 0)]
+        max_false_allow: usize,
+        /// Seconds to wait for the model on each case
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
+        /// Ollama base URL (defaults to the local instance)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Score only the first N cases (a partial, non-authoritative run)
+        #[arg(long)]
+        max_cases: Option<usize>,
+        /// Model-only runs per case; a case is a false allow if any run allows it
+        #[arg(long, default_value_t = harness::auditor::model_eval::DEFAULT_RUNS)]
+        runs: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -545,6 +575,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Auditor {
+            action:
+                AuditorAction::Eval {
+                    cases,
+                    catalog,
+                    model,
+                    max_false_allow,
+                    timeout_secs,
+                    base_url,
+                    max_cases,
+                    runs,
+                },
+        } => {
+            let mut ollama = OllamaConfig::default();
+            if let Some(url) = base_url {
+                ollama = ollama.with_base_url(url);
+            }
+            let provider: std::sync::Arc<dyn model::ModelProvider> =
+                std::sync::Arc::new(OllamaProvider::new(ollama.clone())?);
+            let options = harness::auditor::model_eval::ScorecardOptions {
+                max_cases,
+                cases_dir: cases
+                    .unwrap_or_else(harness::auditor::model_eval::default_heldout_cases_dir),
+                catalog_dir: catalog,
+                max_false_allow,
+                model_timeout: std::time::Duration::from_secs(timeout_secs),
+                runs,
+                model_digest: match harness::auditor::model_eval::resolve_eval_model(
+                    model.as_deref(),
+                    &|key| std::env::var(key).ok(),
+                ) {
+                    Ok(name) => {
+                        harness::auditor::model_eval::fetch_ollama_digest(&ollama.base_url, &name)
+                            .await
+                    }
+                    Err(_) => None,
+                },
+                repo_sha: harness::auditor::model_eval::resolve_repo_sha(&|key| {
+                    std::env::var(key).ok()
+                }),
+            };
+            let code = harness::auditor::model_eval::run_model_eval(
+                provider,
+                model.as_deref(),
+                &|key| std::env::var(key).ok(),
+                &options,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await;
+            std::process::exit(code);
         }
         Commands::Deploy { command } => run_deploy(command).await?,
         Commands::Effects { command } => {
