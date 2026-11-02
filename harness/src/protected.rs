@@ -97,6 +97,7 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "harness/tests/fixtures/identities/global/prompts/auditor.md",
     "harness/tests/fixtures/one_track/catalog/auditor.toml",
     "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+    "harness/tests/planner_structural.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -442,6 +443,10 @@ mod tests {
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
         ),
+        (
+            "harness/tests/planner_structural.rs",
+            "harness/tests/planner_structural.rs",
+        ),
     ];
 
     #[test]
@@ -534,6 +539,7 @@ mod tests {
             "harness/tests/fixtures/identities/global/prompts/auditor.md",
             "harness/tests/fixtures/one_track/catalog/auditor.toml",
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -804,6 +810,8 @@ mod tests {
             "other/harness/tests/fixtures/one_track/catalog/auditor.toml",
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md.bak",
             "other/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs.bak",
+            "other/harness/tests/planner_structural.rs",
             "harness/src/pr_tool.rs",
             "harness/src/pr_tools.rs.bak",
             "harness/src/pr_tools",
@@ -1012,6 +1020,7 @@ mod tests {
                 PathBuf::from("harness/tests/fixtures/identities/global/prompts/auditor.md"),
                 PathBuf::from("harness/tests/fixtures/one_track/catalog/auditor.toml"),
                 PathBuf::from("harness/tests/fixtures/one_track/catalog/prompts/auditor.md"),
+                PathBuf::from("harness/tests/planner_structural.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -1114,6 +1123,7 @@ mod tests {
                     "harness/tests/fixtures/one_track/catalog/prompts/auditor.md".to_string(),
                     false
                 ),
+                ("harness/tests/planner_structural.rs".to_string(), false),
             ]
         );
     }
