@@ -17,7 +17,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 
 ## Auditor false-allow eval: what is enforced where
 
-`nanna auditor eval` measures the spawn auditor's model-only false-allow count on the held-out cases and exits non-zero above the threshold (default 0) or when the run cannot be trusted. It is manual today. CI checks only its logic against mocks; no required check measures a real model. A `workflow_dispatch`-only job (`.github/workflows/auditor-eval.yml`) is not a required check and is dispatch-only until the gate can complete on the runner (see #1000); the first measurement is pending, and no held-out false-allow number exists yet. Full description: [docs/agent-evaluation-patterns.md](docs/agent-evaluation-patterns.md#auditor-false-allow-eval-what-is-enforced-where).
+`nanna auditor eval` measures the spawn auditor's model-only false-allow count on the held-out cases and exits non-zero above the threshold (default 0) or when the run cannot be trusted. It is manual today. CI checks only its logic against mocks; no required check measures a real model. A `workflow_dispatch`-only workflow (`.github/workflows/auditor-eval.yml`) shards the calls (`--shard i/k`) and merges them (`--merge <dir>`) with the same gate and exit codes; it is not a required check, it is dispatch-only until a sharded run has completed (see #1000), the first measurement is pending, and no held-out false-allow number exists yet. Full description: [docs/agent-evaluation-patterns.md](docs/agent-evaluation-patterns.md#auditor-false-allow-eval-what-is-enforced-where).
 
 ## When 100% patch coverage is genuinely unhittable
 

@@ -23,20 +23,70 @@ on:
         description: "Model-only runs per case (anything but 3 makes the run informational)"
         required: false
         default: "3"
+      shards:
+        description: "Number of parallel shards (1 to 64); does not change the result"
+        required: false
+        default: "8"
 
 jobs:
-  gate:
-    name: Gate - model-only false-allow on the held-out set
-    if: >-
-      inputs.model == 'gemma4:e4b' &&
-      inputs.cases == 'evals/cases/auditor_heldout' &&
-      inputs.max_cases == '' &&
-      inputs.max_false_allow == '0' &&
-      inputs.runs == '3'
+  plan:
+    name: Plan the shards and decide gate or informational
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      gate: ${{ steps.plan.outputs.gate }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      model: ${{ steps.plan.outputs.model }}
+      cases: ${{ steps.plan.outputs.cases }}
+      runs: ${{ steps.plan.outputs.runs }}
+      max_cases: ${{ steps.plan.outputs.max_cases }}
+      max_false_allow: ${{ steps.plan.outputs.max_false_allow }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          IN_MODEL: ${{ inputs.model }}
+          IN_CASES: ${{ inputs.cases }}
+          IN_MAX_CASES: ${{ inputs.max_cases }}
+          IN_MAX_FALSE_ALLOW: ${{ inputs.max_false_allow }}
+          IN_RUNS: ${{ inputs.runs }}
+          IN_SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          case "$IN_SHARDS" in ''|*[!0-9]*) echo "shards must be a number"; exit 1;; esac
+          if [ "$IN_SHARDS" -lt 1 ] || [ "$IN_SHARDS" -gt 64 ]; then echo "shards must be 1 to 64"; exit 1; fi
+          gate=false
+          if [ "$IN_MODEL" = "gemma4:e4b" ] && [ "$IN_CASES" = "evals/cases/auditor_heldout" ] && [ -z "$IN_MAX_CASES" ] && [ "$IN_MAX_FALSE_ALLOW" = "0" ] && [ "$IN_RUNS" = "3" ]; then
+            gate=true
+            model="gemma4:e4b"; cases="evals/cases/auditor_heldout"; max_cases=""; max_false_allow="0"; runs="3"
+          else
+            model="$IN_MODEL"; cases="$IN_CASES"; max_cases="$IN_MAX_CASES"; max_false_allow="$IN_MAX_FALSE_ALLOW"; runs="$IN_RUNS"
+          fi
+          {
+            echo "gate=$gate"
+            echo "matrix=$(seq 1 "$IN_SHARDS" | jq -cs .)"
+            echo "count=$IN_SHARDS"
+            echo "model=$model"
+            echo "cases=$cases"
+            echo "runs=$runs"
+            echo "max_cases=$max_cases"
+            echo "max_false_allow=$max_false_allow"
+          } >> "$GITHUB_OUTPUT"
+
+  shard:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +105,7 @@ jobs:
       - name: Start Ollama and pull model
         shell: bash
         env:
-          MODEL: gemma4:e4b
+          MODEL: ${{ needs.plan.outputs.model }}
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama serve &
@@ -70,16 +120,74 @@ jobs:
             sleep $((attempt * 10))
           done
 
-      - name: Run auditor scorecard (gating)
+      - name: Run this shard of the auditor scorecard
         shell: bash
         env:
-          NANNA_EVAL_MODEL: gemma4:e4b
+          NANNA_EVAL_MODEL: ${{ needs.plan.outputs.model }}
+          CASES: ${{ needs.plan.outputs.cases }}
+          RUNS: ${{ needs.plan.outputs.runs }}
+          MAX_CASES: ${{ needs.plan.outputs.max_cases }}
+          SPEC: ${{ matrix.shard }}/${{ needs.plan.outputs.count }}
+          SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
+          mkdir -p shard-results
           ./target/release/nanna auditor eval \
+            --cases "$CASES" \
+            --runs "$RUNS" \
+            ${MAX_CASES:+--max-cases "$MAX_CASES"} \
+            --shard "$SPEC" \
+            --out shard-results \
+            2>&1 | tee "shard-results/shard-$SHARD.log"
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditor-shard-${{ matrix.shard }}
+          path: shard-results
+          if-no-files-found: warn
+
+  gate:
+    name: Gate - merge shards, model-only false-allow on the held-out set
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.gate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Cachix (read-only)
+        uses: cachix/cachix-action@v15
+        with:
+          name: nanna-coder
+          skipPush: true
+
+      - name: Build nanna
+        run: nix develop --command cargo build --release --bin nanna
+
+      - name: Download shard evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: auditor-shard-*
+          merge-multiple: true
+          path: shard-results
+
+      - name: Merge shards (gating)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p shard-results
+          ./target/release/nanna auditor eval \
+            --merge shard-results \
             --cases evals/cases/auditor_heldout \
             --max-false-allow 0 \
-            --runs 3 \
             2>&1 | tee auditor-scorecard.txt
 
       - name: Write scorecard summary
@@ -103,15 +211,10 @@ jobs:
 
   informational:
     name: Informational - non-gating, overridden inputs
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      (inputs.model != 'gemma4:e4b' ||
-       inputs.cases != 'evals/cases/auditor_heldout' ||
-       inputs.max_cases != '' ||
-       inputs.max_false_allow != '0' ||
-       inputs.runs != '3')
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.gate != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -129,41 +232,28 @@ jobs:
       - name: Build nanna
         run: nix develop --command cargo build --release --bin nanna
 
-      - name: Start Ollama and pull model
-        shell: bash
-        env:
-          MODEL: ${{ inputs.model }}
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama serve &
-          for i in $(seq 1 60); do
-            ollama list > /dev/null 2>&1 && break
-            sleep 1
-          done
-          ollama list > /dev/null 2>&1 || { echo "Ollama did not become ready within 60s"; exit 1; }
-          for attempt in 1 2 3; do
-            timeout 1200 ollama pull "$MODEL" && break
-            [ "$attempt" = "3" ] && { echo "Failed to pull $MODEL"; exit 1; }
-            sleep $((attempt * 10))
-          done
+      - name: Download shard evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: auditor-shard-*
+          merge-multiple: true
+          path: shard-results
 
-      - name: Run auditor scorecard (informational, non-gating)
+      - name: Merge shards (informational, non-gating)
         continue-on-error: true
         shell: bash
         env:
-          NANNA_EVAL_MODEL: ${{ inputs.model }}
-          CASES: ${{ inputs.cases }}
-          MAX_CASES: ${{ inputs.max_cases }}
-          MAX_FALSE_ALLOW: ${{ inputs.max_false_allow }}
-          RUNS: ${{ inputs.runs }}
+          CASES: ${{ needs.plan.outputs.cases }}
+          MAX_FALSE_ALLOW: ${{ needs.plan.outputs.max_false_allow }}
         run: |
           set -o pipefail
+          mkdir -p shard-results
           echo "INFORMATIONAL RUN: inputs overridden; this is not the gating result" | tee auditor-scorecard.txt
           ./target/release/nanna auditor eval \
+            --merge shard-results \
             --cases "$CASES" \
             --max-false-allow "$MAX_FALSE_ALLOW" \
-            --runs "$RUNS" \
-            ${MAX_CASES:+--max-cases "$MAX_CASES"} \
             2>&1 | tee -a auditor-scorecard.txt
 
       - name: Write scorecard summary
