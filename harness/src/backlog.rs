@@ -762,6 +762,10 @@ fn validate_workflow_ref(workflow: &str) -> Result<(), BacklogError> {
     }
 }
 
+pub(crate) fn is_valid_repo(repo: &str) -> bool {
+    validate_repo(repo).is_ok()
+}
+
 fn validate_repo(repo: &str) -> Result<(), BacklogError> {
     let valid = match repo.split_once('/') {
         Some((owner, name)) => {
