@@ -90,6 +90,14 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "harness/src/ci_integrity.rs",
     "harness/src/deploy/template.rs",
     "harness/src/sandbox_tools.rs",
+    "harness/tests/spawn_gate_structural.rs",
+    "harness/tests/protected_audit_hook_structural.rs",
+    "harness/tests/escalation_sinks_structural.rs",
+    "harness/tests/fixtures/identities/global/auditor.toml",
+    "harness/tests/fixtures/identities/global/prompts/auditor.md",
+    "harness/tests/fixtures/one_track/catalog/auditor.toml",
+    "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+    "harness/tests/planner_structural.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -407,6 +415,38 @@ mod tests {
             "harness/src/sandbox_tools.rs",
             "harness/src/sandbox_tools.rs",
         ),
+        (
+            "harness/tests/spawn_gate_structural.rs",
+            "harness/tests/spawn_gate_structural.rs",
+        ),
+        (
+            "harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs",
+        ),
+        (
+            "harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs",
+        ),
+        (
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+        ),
+        (
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        ),
+        (
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        ),
+        (
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        ),
+        (
+            "harness/tests/planner_structural.rs",
+            "harness/tests/planner_structural.rs",
+        ),
     ];
 
     #[test]
@@ -492,6 +532,14 @@ mod tests {
             "harness/src/ci_integrity.rs",
             "harness/src/deploy/template.rs",
             "harness/src/sandbox_tools.rs",
+            "harness/tests/spawn_gate_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -513,6 +561,168 @@ mod tests {
                 line.contains(&format!("`{pattern}`")),
                 "{pattern} missing from AGENTS.md"
             );
+        }
+    }
+
+    fn files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let skipped = dir == root
+                    && [".git", "target", ".claude"]
+                        .contains(&entry.file_name().to_str().unwrap_or(""));
+                if !skipped {
+                    files_under(root, &path, out);
+                }
+            } else if kind.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn the_auditor_card_walk_skips_build_and_vcs_directories_only_at_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for relative in [
+            "target/a.toml",
+            ".git/b.toml",
+            ".claude/c.toml",
+            "x/target/d.toml",
+            "x/.git/e.toml",
+            "x/.claude/f.toml",
+            "g.toml",
+        ] {
+            let file = dir.path().join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "").unwrap();
+        }
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        let mut found: Vec<String> = found
+            .iter()
+            .map(|file| {
+                file.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "g.toml",
+                "x/.claude/f.toml",
+                "x/.git/e.toml",
+                "x/target/d.toml"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_auditor_card_walk_follows_no_symlinks_and_survives_unreadable_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("o.toml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("o.toml"), dir.path().join("l.toml"))
+            .unwrap();
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        assert!(found.is_empty(), "{found:?}");
+        files_under(dir.path(), &dir.path().join("missing"), &mut found);
+        assert!(found.is_empty());
+    }
+
+    fn auditor_identity_files() -> Vec<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        files_under(&root, &root, &mut files);
+        let mut found = Vec::new();
+        for file in files {
+            if file.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+            let Ok(card) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(value) = card.parse::<toml::Table>() else {
+                continue;
+            };
+            let named_auditor = value
+                .get("identity")
+                .and_then(|identity| identity.get("name"))
+                .and_then(toml::Value::as_str)
+                == Some(crate::identity::AUDITOR_IDENTITY);
+            if !named_auditor {
+                continue;
+            }
+            let relative = |path: &Path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
+            found.push(relative(&file));
+            let prompt = value
+                .get("identity")
+                .and_then(|identity| identity.get("system_prompt"))
+                .and_then(toml::Value::as_str);
+            if let Some(prompt) = prompt {
+                found.push(relative(&file.parent().unwrap().join(prompt)));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn every_auditor_identity_card_and_prompt_in_the_repository_is_protected() {
+        let protected = protected();
+        let found = auditor_identity_files();
+        for expected in [
+            "evals/cases/auditor_heldout/catalog/auditor.toml",
+            "evals/cases/auditor_spawn/catalog/auditor.toml",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        ] {
+            assert!(found.iter().any(|file| file == expected), "{expected}");
+        }
+        for file in &found {
+            assert!(
+                protected.is_protected(Path::new(file)),
+                "{file} defines the auditor identity but is not protected"
+            );
+        }
+    }
+
+    #[test]
+    fn every_auditor_identity_card_in_the_repository_has_no_effect_ceiling_above_none() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let cards: Vec<String> = auditor_identity_files()
+            .into_iter()
+            .filter(|file| file.ends_with(".toml"))
+            .collect();
+        assert!(!cards.is_empty());
+        for card in cards {
+            let value = std::fs::read_to_string(root.join(&card))
+                .unwrap()
+                .parse::<toml::Table>()
+                .unwrap();
+            let max_effect = value
+                .get("scope")
+                .and_then(|scope| scope.get("max_effect"))
+                .and_then(toml::Value::as_str);
+            assert_eq!(max_effect, Some("none"), "{card}");
         }
     }
 
@@ -586,6 +796,22 @@ mod tests {
             "harness/src/sandbox_tools.rs.bak",
             "other/harness/src/sandbox_tools.rs",
             "harness/src/sandbox_toolsx.rs",
+            "harness/tests/spawn_gate_structural.rs.bak",
+            "other/harness/tests/spawn_gate_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs.bak",
+            "other/harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs.bak",
+            "other/harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/fixtures/identities/global/auditor.toml.bak",
+            "other/harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md.bak",
+            "other/harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml.bak",
+            "other/harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md.bak",
+            "other/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs.bak",
+            "other/harness/tests/planner_structural.rs",
             "harness/src/pr_tool.rs",
             "harness/src/pr_tools.rs.bak",
             "harness/src/pr_tools",
@@ -787,6 +1013,14 @@ mod tests {
                 PathBuf::from("harness/src/ci_integrity.rs"),
                 PathBuf::from("harness/src/deploy/template.rs"),
                 PathBuf::from("harness/src/sandbox_tools.rs"),
+                PathBuf::from("harness/tests/spawn_gate_structural.rs"),
+                PathBuf::from("harness/tests/protected_audit_hook_structural.rs"),
+                PathBuf::from("harness/tests/escalation_sinks_structural.rs"),
+                PathBuf::from("harness/tests/fixtures/identities/global/auditor.toml"),
+                PathBuf::from("harness/tests/fixtures/identities/global/prompts/auditor.md"),
+                PathBuf::from("harness/tests/fixtures/one_track/catalog/auditor.toml"),
+                PathBuf::from("harness/tests/fixtures/one_track/catalog/prompts/auditor.md"),
+                PathBuf::from("harness/tests/planner_structural.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -864,6 +1098,32 @@ mod tests {
                 ("harness/src/ci_integrity.rs".to_string(), false),
                 ("harness/src/deploy/template.rs".to_string(), false),
                 ("harness/src/sandbox_tools.rs".to_string(), false),
+                ("harness/tests/spawn_gate_structural.rs".to_string(), false),
+                (
+                    "harness/tests/protected_audit_hook_structural.rs".to_string(),
+                    false
+                ),
+                (
+                    "harness/tests/escalation_sinks_structural.rs".to_string(),
+                    false
+                ),
+                (
+                    "harness/tests/fixtures/identities/global/auditor.toml".to_string(),
+                    false
+                ),
+                (
+                    "harness/tests/fixtures/identities/global/prompts/auditor.md".to_string(),
+                    false
+                ),
+                (
+                    "harness/tests/fixtures/one_track/catalog/auditor.toml".to_string(),
+                    false
+                ),
+                (
+                    "harness/tests/fixtures/one_track/catalog/prompts/auditor.md".to_string(),
+                    false
+                ),
+                ("harness/tests/planner_structural.rs".to_string(), false),
             ]
         );
     }

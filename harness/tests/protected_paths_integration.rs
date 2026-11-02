@@ -231,6 +231,46 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         "echo x > /workspace/harness/src/sandbox_tools.rs",
     )
     .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/spawn_gate_structural.rs",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/protected_audit_hook_structural.rs",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/escalation_sinks_structural.rs",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/fixtures/identities/global/auditor.toml",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/fixtures/identities/global/prompts/auditor.md",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/auditor.toml",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+    )
+    .await;
+    assert_refused(
+        &registry,
+        "echo x > /workspace/harness/tests/planner_structural.rs",
+    )
+    .await;
     assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
     assert_refused(
         &registry,
@@ -274,6 +314,14 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         "harness/src/ci_integrity.rs",
         "harness/src/deploy/template.rs",
         "harness/src/sandbox_tools.rs",
+        "harness/tests/spawn_gate_structural.rs",
+        "harness/tests/protected_audit_hook_structural.rs",
+        "harness/tests/escalation_sinks_structural.rs",
+        "harness/tests/fixtures/identities/global/auditor.toml",
+        "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/planner_structural.rs",
     ] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))

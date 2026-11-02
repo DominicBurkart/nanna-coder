@@ -2220,7 +2220,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 41] = [
+    const PLACEHOLDER_FILES: [&str; 49] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -2262,6 +2262,14 @@ mod tests {
         "harness/src/ci_integrity.rs",
         "harness/src/deploy/template.rs",
         "harness/src/sandbox_tools.rs",
+        "harness/tests/spawn_gate_structural.rs",
+        "harness/tests/protected_audit_hook_structural.rs",
+        "harness/tests/escalation_sinks_structural.rs",
+        "harness/tests/fixtures/identities/global/auditor.toml",
+        "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/planner_structural.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -2331,6 +2339,14 @@ mod tests {
             "harness/src/ci_integrity.rs",
             "harness/src/deploy/template.rs",
             "harness/src/sandbox_tools.rs",
+            "harness/tests/spawn_gate_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
