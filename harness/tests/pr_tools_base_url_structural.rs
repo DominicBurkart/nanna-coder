@@ -421,10 +421,7 @@ fn real_source() -> String {
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries {
+    for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
             rust_files(&path, out);
@@ -569,6 +566,25 @@ fn the_seam_cannot_be_widened_or_renamed_around() {
 }
 
 #[test]
+fn a_misplaced_call_or_second_definition_is_rejected() {
+    must_fail(
+        mutate(&[(
+            "    register_granted_at(\n        registry,",
+            "    self::register_granted_at(\n        registry,",
+        )]),
+        "called from `register_granted` via",
+    );
+    must_fail(
+        append("fn register_granted_at() {}"),
+        "must be defined exactly once",
+    );
+    must_fail(
+        mutate(&[("::new(base_url, token)", "{}")]),
+        "needs exactly one construction, found 0",
+    );
+}
+
+#[test]
 fn another_client_or_environment_read_is_rejected() {
     must_fail(
         append(
@@ -606,6 +622,47 @@ fn another_client_or_environment_read_is_rejected() {
         append("fn sneak(s: std::net::TcpStream) {}"),
         "names `TcpStream`",
     );
+}
+
+#[test]
+fn parameter_shapes_name_the_pattern_and_the_reference_target() {
+    let shapes = |source: &str| -> Vec<String> {
+        let function: syn::ItemFn = syn::parse_str(source).unwrap();
+        function.sig.inputs.iter().map(param_shape).collect()
+    };
+    assert_eq!(
+        shapes("fn f(self, (a, b): &str, c: &mut Y, d: Box<Z>, e: &[u8], g: &r#str) {}"),
+        [
+            "self",
+            "<pattern>: &str",
+            "c: <type>",
+            "d: <type>",
+            "e: &<type>",
+            "g: &str"
+        ]
+    );
+}
+
+#[test]
+fn cfg_gates_are_evaluated_for_every_item_kind() {
+    let gated = [
+        "extern crate core;",
+        "extern \"C\" {}",
+        "static S: u8 = 0;",
+        "trait T {}",
+        "trait A = Send;",
+        "type Alias = u8;",
+        "union U { a: u8 }",
+        "macro dm() {}",
+    ];
+    for item in gated {
+        let kept = append(&format!("#[cfg(feature = \"x\")]\n{item}"));
+        assert!(kept.is_empty(), "{item}: {kept:?}");
+    }
+    let skipped = "#[cfg(all(unix, test))]\nfn register_granted_at() {}";
+    assert!(append(skipped).is_empty());
+    let kept = "#[cfg(all(unix, not(test)))]\nfn register_granted_at() {}";
+    must_fail(append(kept), "must be defined exactly once");
 }
 
 #[test]
