@@ -973,10 +973,8 @@ mod tests {
         )])
         .unwrap();
         let rendered = plan.check_catalog(&catalog()).unwrap_err().to_string();
-        assert!(
-            rendered.contains("`sk-live?key?ignore?previous`"),
-            "{rendered}"
-        );
+        let expected = "`sk-live?key?ignore?previous`";
+        assert!(rendered.contains(expected), "{rendered}");
     }
 
     #[test]
@@ -1021,9 +1019,8 @@ mod tests {
             allowed: DevLoop::Outer,
         }
         .to_string();
-        assert!(
-            looped.contains("inner") && looped.contains("outer") && looped.contains("deployer")
-        );
+        assert!(looped.contains("inner") && looped.contains("outer"));
+        assert!(looped.contains("deployer"));
     }
 
     struct MockProvider {
