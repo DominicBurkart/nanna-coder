@@ -15,6 +15,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the harness control flow diagram.
 - Strip or forge the identity marker. Agent commits end with the `Nanna-Identity: <name>` trailer and agent PR bodies carry `<!-- Nanna-Identity: <name> -->` (`harness::marker`); the CI guard uses it to tell agent PRs from human PRs.
 - Circumvent the protected-paths guard. Its workflow is installed at `.github/workflows/protected-paths-guard.yml` and maintained as [`docs/ci/protected-paths-guard.yml`](docs/ci/protected-paths-guard.yml); the installed copy is the template without its leading comment header (`harness/tests/protected_guard_install.rs` keeps them identical), agents cannot write either file, and it runs on `pull_request` with a read-only token, no secrets and no PR code executed. It fails any PR that touches a protected path unless its author is listed in the repository variable `PROTECTED_PATTERNS_HUMAN_AUTHORS` and the PR carries no identity marker (a PR with a marker fails even when its author is listed).
 
+## Auditor false-allow eval: what is enforced where
+
+`nanna auditor eval` measures the spawn auditor's model-only false-allow count on the held-out cases and exits non-zero above the threshold (default 0) or when the run cannot be trusted. It is manual today. CI checks only its logic against mocks; no required check measures a real model. A weekly and `workflow_dispatch` job (`.github/workflows/auditor-eval.yml`) is not a required check and has not yet had a timed run, and no held-out false-allow number exists yet. Full description: [docs/agent-evaluation-patterns.md](docs/agent-evaluation-patterns.md#auditor-false-allow-eval-what-is-enforced-where).
+
 ## When 100% patch coverage is genuinely unhittable
 
 1. If you are blocked because of disabled tests, enable them.
