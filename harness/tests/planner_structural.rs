@@ -170,7 +170,7 @@ fn gate_order_problem(source: &str) -> Option<String> {
         .iter()
         .filter(|ident| *ident == "check")
         .count();
-    let body = function_idents(source, "audit_plan");
+    let body = function_idents(source, "audit_plan_within");
     let position = |name: &str| body.iter().position(|ident| ident == name);
     let inside = body.iter().filter(|ident| *ident == "check").count();
     if total != 1 || inside != 1 {
@@ -266,15 +266,15 @@ fn the_checker_sees_macro_pasted_types_and_associated_type_aliases() {
 #[test]
 fn the_checker_flags_a_missing_extra_or_misordered_gate_call() {
     let ordered =
-        "async fn audit_plan() { let r = gate.request_with_caller(); gate.check(r).await; }";
+        "async fn audit_plan_within() { let r = gate.request_with_caller(); gate.check(r).await; }";
     assert_eq!(gate_order_problem(ordered), None);
-    let none = "async fn audit_plan() { let r = gate.request_with_caller(); }";
+    let none = "async fn audit_plan_within() { let r = gate.request_with_caller(); }";
     assert!(gate_order_problem(none).unwrap().contains("0 times"));
-    let twice = "async fn audit_plan() { gate.check(a); gate.check(b); }";
+    let twice = "async fn audit_plan_within() { gate.check(a); gate.check(b); }";
     assert!(gate_order_problem(twice).unwrap().contains("2 times"));
-    let outside = "fn helper() { g.check(a); } async fn audit_plan() { gate.check(r); }";
+    let outside = "fn helper() { g.check(a); } async fn audit_plan_within() { gate.check(r); }";
     assert!(gate_order_problem(outside).unwrap().contains("2 times"));
-    let reversed = "async fn audit_plan() { gate.check(r); gate.request_with_caller(); }";
+    let reversed = "async fn audit_plan_within() { gate.check(r); gate.request_with_caller(); }";
     assert!(gate_order_problem(reversed)
         .unwrap()
         .contains("before checking"));
