@@ -29,6 +29,7 @@ pub mod pr_tools;
 pub mod protected;
 pub mod qa;
 pub mod rollout;
+pub mod sandbox_tools;
 pub mod scheduler;
 pub mod scope;
 pub mod sidecar;
@@ -70,6 +71,7 @@ pub use pr_tools::{
 pub use protected::{
     AuditHook, NoopAuditHook, ProtectedPathViolation, ProtectedPaths, PROTECTED_PATTERNS,
 };
+pub use sandbox_tools::{SandboxDeployTool, SandboxTeardownTool};
 pub use scope::{DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError};
 pub use sidecar::{
     build_image_from_containerfile, container_exists, network_exists, task_leftovers,

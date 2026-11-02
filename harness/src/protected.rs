@@ -89,6 +89,7 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     "harness/src/ci_policy.rs",
     "harness/src/ci_integrity.rs",
     "harness/src/deploy/template.rs",
+    "harness/src/sandbox_tools.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -402,6 +403,10 @@ mod tests {
             "harness/src/deploy/template.rs",
             "harness/src/deploy/template.rs",
         ),
+        (
+            "harness/src/sandbox_tools.rs",
+            "harness/src/sandbox_tools.rs",
+        ),
     ];
 
     #[test]
@@ -486,6 +491,7 @@ mod tests {
             "harness/src/ci_policy.rs",
             "harness/src/ci_integrity.rs",
             "harness/src/deploy/template.rs",
+            "harness/src/sandbox_tools.rs",
         ] {
             assert!(protected.is_protected(Path::new(path)), "{path}");
         }
@@ -577,6 +583,9 @@ mod tests {
             "harness/src/deploy/template.rs.bak",
             "other/harness/src/deploy/template.rs",
             "harness/src/deploy/templatex.rs",
+            "harness/src/sandbox_tools.rs.bak",
+            "other/harness/src/sandbox_tools.rs",
+            "harness/src/sandbox_toolsx.rs",
             "harness/src/pr_tool.rs",
             "harness/src/pr_tools.rs.bak",
             "harness/src/pr_tools",
@@ -777,6 +786,7 @@ mod tests {
                 PathBuf::from("harness/src/ci_policy.rs"),
                 PathBuf::from("harness/src/ci_integrity.rs"),
                 PathBuf::from("harness/src/deploy/template.rs"),
+                PathBuf::from("harness/src/sandbox_tools.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -853,6 +863,7 @@ mod tests {
                 ("harness/src/ci_policy.rs".to_string(), false),
                 ("harness/src/ci_integrity.rs".to_string(), false),
                 ("harness/src/deploy/template.rs".to_string(), false),
+                ("harness/src/sandbox_tools.rs".to_string(), false),
             ]
         );
     }
