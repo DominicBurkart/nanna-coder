@@ -262,8 +262,8 @@ enum AuditorAction {
         /// Largest number of false allows that still passes
         #[arg(long, default_value_t = 0)]
         max_false_allow: usize,
-        /// Seconds to wait for the model on each case
-        #[arg(long, default_value_t = 120)]
+        /// Seconds to wait for the model on each call (recorded in the run config)
+        #[arg(long, default_value_t = harness::auditor::model_eval::DEFAULT_EVAL_TIMEOUT_SECS)]
         timeout_secs: u64,
         /// Ollama base URL (defaults to the local instance)
         #[arg(long)]
@@ -274,6 +274,17 @@ enum AuditorAction {
         /// Model-only runs per case; a case is a false allow if any run allows it
         #[arg(long, default_value_t = harness::auditor::model_eval::DEFAULT_RUNS)]
         runs: usize,
+        /// Run only slice i of k of the (case, run) calls and write a partial
+        /// result into --out; merge the slices with --merge
+        #[arg(long, value_name = "I/K", requires = "out", conflicts_with = "merge")]
+        shard: Option<harness::auditor::shard::ShardSpec>,
+        /// Directory the shard result is written to
+        #[arg(long, requires = "shard")]
+        out: Option<std::path::PathBuf>,
+        /// Merge the shard results in this directory into the scorecard
+        /// (worst case over runs per case, same gate and exit codes)
+        #[arg(long, value_name = "DIR")]
+        merge: Option<std::path::PathBuf>,
     },
 }
 
@@ -587,8 +598,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     base_url,
                     max_cases,
                     runs,
+                    shard,
+                    out,
+                    merge,
                 },
         } => {
+            if let Some(dir) = merge {
+                let options = harness::auditor::model_eval::ScorecardOptions {
+                    catalog_dir: catalog,
+                    ..harness::auditor::model_eval::ScorecardOptions::new(
+                        cases.unwrap_or_else(
+                            harness::auditor::model_eval::default_heldout_cases_dir,
+                        ),
+                        max_false_allow,
+                    )
+                };
+                let code = harness::auditor::model_eval::run_merge(
+                    &options,
+                    &dir,
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
+                .await;
+                std::process::exit(code);
+            }
             let mut ollama = OllamaConfig::default();
             if let Some(url) = base_url {
                 ollama = ollama.with_base_url(url);
@@ -617,6 +650,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::env::var(key).ok()
                 }),
             };
+            if let (Some(spec), Some(out_dir)) = (shard, out) {
+                let code = harness::auditor::model_eval::run_model_shard(
+                    provider,
+                    model.as_deref(),
+                    &|key| std::env::var(key).ok(),
+                    &options,
+                    spec,
+                    &out_dir,
+                    &mut std::io::stderr(),
+                )
+                .await;
+                std::process::exit(code);
+            }
             let code = harness::auditor::model_eval::run_model_eval(
                 provider,
                 model.as_deref(),
