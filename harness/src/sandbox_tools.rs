@@ -2194,19 +2194,35 @@ mod tests {
         }
     }
 
+    fn shut_all_week() -> String {
+        let today = Utc::now().date_naive();
+        let holidays: Vec<String> = (-1..=1)
+            .map(|offset| (today + chrono::Duration::days(offset)).to_string())
+            .collect();
+        format!(
+            "[[window]]\nname = \"shut\"\ntimezone = \"UTC\"\ndays = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\nstart = \"00:00\"\nend = \"23:59\"\napplies_to = [\"sandbox\"]\nholidays = {holidays:?}\n"
+        )
+    }
+
     #[tokio::test]
     async fn a_closed_window_records_each_blocked_sandbox_call_in_the_action_audit_with_the_window_reason(
     ) {
         for (window, windows, detail) in [
             (
                 Some("no-such-window"),
-                ALWAYS_OPEN,
+                ALWAYS_OPEN.to_string(),
                 "window `no-such-window`: unknown window `no-such-window`",
             ),
-            (None, "", "no availability window configured for `{tool}`"),
+            (
+                None,
+                String::new(),
+                "no availability window configured for `{tool}`",
+            ),
+            (Some("shut"), shut_all_week(), "window `shut` is not open"),
+            (None, shut_all_week(), "no `sandbox` window is open"),
         ] {
             let chain = Chain::new();
-            let (gate, _model) = chain.modelled_gate(windows, ALLOW);
+            let (gate, _model) = chain.modelled_gate(&windows, ALLOW);
             let mut closed = subject(Some(7));
             closed.window = window.map(str::to_string);
             let registry = chain.registry("t1", Arc::clone(&gate), closed);
