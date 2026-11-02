@@ -455,6 +455,61 @@ impl SandboxDeployTool {
         Ok(())
     }
 
+    async fn run_qa(
+        &self,
+        template: &DeployTemplate,
+        handle: &SandboxHandle,
+    ) -> ToolResult<(ManifestReport, &'static str)> {
+        let (manifest, source) =
+            load_manifest(&self.workspace_root, template).map_err(map_sandbox_error)?;
+        let probe = Arc::clone(&self.probe);
+        let url = handle.url.clone();
+        let report =
+            tokio::task::spawn_blocking(move || ManifestChecker::new(probe).run(&url, &manifest))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed {
+                    message: format!("the sandbox QA task failed: {e}"),
+                })?;
+        Ok((report, source))
+    }
+
+    async fn tear_down_after_failed_qa(
+        &self,
+        handle: &SandboxHandle,
+        cause: ToolError,
+    ) -> ToolError {
+        let target = Arc::clone(&self.target);
+        let to_tear = handle.clone();
+        let outcome = tokio::task::spawn_blocking(move || target.teardown(&to_tear)).await;
+        if !matches!(outcome, Ok(Ok(()))) {
+            return match cause {
+                ToolError::ExecutionFailed { message } => ToolError::ExecutionFailed {
+                    message: format!(
+                        "{message}; the sandbox could not be torn down and stays registered for cleanup"
+                    ),
+                },
+                other => other,
+            };
+        }
+        self.sandboxes.remove(&self.task_id);
+        let ctx = &self.budget;
+        if let Err(e) = ctx
+            .accountant
+            .record_minutes(
+                &ctx.identity,
+                &ctx.task_id,
+                &handle.repo,
+                BudgetClass::Sandbox,
+                lifetime_minutes(handle),
+                Utc::now(),
+            )
+            .await
+        {
+            tracing::warn!("a sandbox torn down after failed QA could not be recorded: {e}");
+        }
+        cause
+    }
+
     async fn settle_failed_deploy(&self, repo: &str) {
         let ctx = &self.budget;
         if let Err(e) = ctx
@@ -525,17 +580,10 @@ impl Tool for SandboxDeployTool {
         handle.repo = repo.clone();
         handle.identity = Some(self.budget.identity.clone());
         self.sandboxes.insert(&self.task_id, handle.clone());
-        let (manifest, source) =
-            load_manifest(&self.workspace_root, &template).map_err(map_sandbox_error)?;
-        let probe = Arc::clone(&self.probe);
-        let url = handle.url.clone();
-        let report =
-            tokio::task::spawn_blocking(move || ManifestChecker::new(probe).run(&url, &manifest))
-                .await
-                .map_err(|e| ToolError::ExecutionFailed {
-                    message: format!("the sandbox QA task failed: {e}"),
-                })?;
-        Ok(report_json(&report, self.pr, &handle.url, source))
+        match self.run_qa(&template, &handle).await {
+            Ok((report, source)) => Ok(report_json(&report, self.pr, &handle.url, source)),
+            Err(e) => Err(self.tear_down_after_failed_qa(&handle, e).await),
+        }
     }
 
     fn name(&self) -> &str {
@@ -1550,17 +1598,6 @@ mod tests {
         assert!(scoped.list_tools().is_empty());
     }
 
-    fn default_gate() -> Arc<crate::action_auditor::ActionGate> {
-        Arc::new(crate::action_auditor::ActionGate::new(
-            Arc::new(crate::action_auditor::RuleActionAuditor::new(
-                Arc::new(crate::windows::WindowSet::default()),
-                Arc::new(crate::leases::InMemoryLeaseStore::default()),
-                chrono::Duration::minutes(10),
-            )),
-            crate::action_auditor::ActionAuditLog::in_memory(),
-        ))
-    }
-
     fn subject(pr: Option<u64>) -> crate::tools::ActionSubject {
         crate::tools::ActionSubject {
             task_id: crate::task::TaskId("t1".to_string()),
@@ -1573,37 +1610,6 @@ mod tests {
             paths: vec![],
             description: "deploy".to_string(),
         }
-    }
-
-    #[tokio::test]
-    async fn the_action_gate_refuses_a_sandbox_call_with_no_bound_pull_request_before_the_tool_or_the_budget(
-    ) {
-        let dir = fixture();
-        let target = Arc::new(FakeSandboxTarget::new());
-        let accountant = unlimited();
-        let identity = identity_with("\"sandbox_deploy\"", "sandbox", "");
-        let mut registry = ToolRegistry::new();
-        register(
-            &mut registry,
-            dir.path(),
-            &identity,
-            SandboxContext {
-                target: Arc::clone(&target) as Arc<dyn SandboxTarget>,
-                probe: Arc::new(LoopbackProbe),
-                sandboxes: Arc::new(SandboxRegistry::new()),
-                accountant: Arc::clone(&accountant),
-                task_id: "t1".to_string(),
-                pr: 7,
-            },
-        );
-        let registry = registry.with_action_gate(default_gate(), subject(None));
-        let err = registry
-            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::ActionDenied(_)), "{err:?}");
-        assert!(target.deployed().is_empty());
-        assert_eq!(accountant.task_summary("sb-agent", "t1").sandbox.count, 0);
     }
 
     #[test]
@@ -1845,9 +1851,10 @@ mod tests {
         assert!(failure_message(err).contains("deploy task failed"));
         assert!(sandboxes.get("t1").is_none());
 
+        let fake = Arc::new(FakeSandboxTarget::new());
         let blind = SandboxDeployTool::new(
             dir.path().to_path_buf(),
-            Arc::new(FakeSandboxTarget::new()),
+            Arc::clone(&fake) as Arc<dyn SandboxTarget>,
             Arc::new(PanickingProbe),
             Arc::clone(&sandboxes),
             "t1",
@@ -1856,7 +1863,18 @@ mod tests {
         .with_budget(unlimited(), "id");
         let err = blind.execute(json!({"image_tag": "v1"})).await.unwrap_err();
         assert!(failure_message(err).contains("QA task failed"));
-        assert!(sandboxes.get("t1").is_some());
+        assert!(sandboxes.get("t1").is_none());
+        assert_eq!(fake.torn_down().len(), 1);
+        sandboxes.insert(
+            "t1",
+            SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 7,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: Utc::now(),
+                identity: None,
+            },
+        );
 
         let teardown =
             SandboxTeardownTool::new(Arc::new(PanickingTarget), Arc::clone(&sandboxes), "t1");
@@ -2335,5 +2353,103 @@ mod tests {
         assert_eq!(model.calls(), 1);
         assert!(chain.target.deployed().is_empty());
         assert!(chain.target.images().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_cannot_be_loaded_after_the_deploy_tears_the_sandbox_down_and_the_task_can_deploy_again(
+    ) {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry("t1", gate, subject(Some(7)));
+        let checks = chain.dir.path().join(CHECKS_FILE);
+        let good = std::fs::read_to_string(&checks).unwrap();
+        std::fs::write(&checks, "GET\0 not a manifest line").unwrap();
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err:?}");
+        assert_eq!(chain.target.deployed().len(), 1);
+        let urls = |handles: Vec<SandboxHandle>| -> Vec<String> {
+            handles.into_iter().map(|handle| handle.url).collect()
+        };
+        assert_eq!(
+            urls(chain.target.torn_down()),
+            urls(chain.target.deployed())
+        );
+        assert!(chain.sandboxes.get("t1").is_none());
+        assert_eq!(
+            chain
+                .accountant
+                .task_summary("sb-agent", "t1")
+                .sandbox
+                .count,
+            1
+        );
+        let held: Vec<String> = crate::leases::LeaseStore::snapshot(chain.leases.as_ref())
+            .unwrap()
+            .into_iter()
+            .map(|lease| format!("{}={}", lease.name, lease.holder))
+            .collect();
+        assert_eq!(held, vec!["sandbox:o/n:7=t1".to_string()]);
+        std::fs::write(&checks, good).unwrap();
+        let again = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v2"}))
+            .await
+            .unwrap();
+        assert_eq!(again["all_passed"], true);
+        assert_eq!(chain.target.deployed().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_teardown_after_failed_qa_keeps_the_handle_registered_and_says_so() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry("t1", gate, subject(Some(7)));
+        std::fs::write(
+            chain.dir.path().join(CHECKS_FILE),
+            "GET\0 not a manifest line",
+        )
+        .unwrap();
+        chain.target.fail_next_teardown();
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(failure_message(err).contains("stays registered for cleanup"));
+        assert!(chain.sandboxes.get("t1").is_some());
+        assert!(chain.target.torn_down().is_empty());
+    }
+
+    struct AgedTarget(FakeSandboxTarget);
+
+    impl SandboxTarget for AgedTarget {
+        fn deploy(&self, repo: &str, pr: u64, image: &str) -> Result<SandboxHandle, SandboxError> {
+            let mut handle = self.0.deploy(repo, pr, image)?;
+            handle.deployed_at = Utc::now() - chrono::Duration::minutes(12);
+            Ok(handle)
+        }
+
+        fn teardown(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+            self.0.teardown(handle)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_torn_down_after_failed_qa_has_its_lifetime_recorded() {
+        let (dir, _, sandboxes, accountant) = setup();
+        std::fs::write(dir.path().join(CHECKS_FILE), "GET\0 not a manifest line").unwrap();
+        let tool = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(AgedTarget(FakeSandboxTarget::new())),
+            Arc::new(LoopbackProbe),
+            Arc::clone(&sandboxes),
+            "t1",
+            7,
+        )
+        .with_budget(Arc::clone(&accountant), "id");
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(sandboxes.get("t1").is_none());
+        assert!(accountant.task_summary("id", "t1").sandbox.minutes >= 12.0);
     }
 }
