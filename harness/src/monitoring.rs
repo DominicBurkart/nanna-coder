@@ -1242,4 +1242,45 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_default() {
+        let system = MonitoringSystem::default();
+        let status = system.get_system_status().await.unwrap();
+        assert!(!status.health_checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_start_stop() {
+        let mut system = MonitoringSystem::new();
+        system.start_monitoring().await.unwrap();
+        // Give the background task a moment to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_stop_when_not_started() {
+        // stop_monitoring on a system that was never started should be a no-op
+        let mut system = MonitoringSystem::new();
+        system.stop_monitoring().await;
+    }
 }
