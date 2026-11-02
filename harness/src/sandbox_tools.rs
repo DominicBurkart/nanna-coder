@@ -244,7 +244,8 @@ impl HostHttpProbe {
 
 impl HttpProbe for HostHttpProbe {
     fn get(&self, url: &str) -> Result<crate::qa::manifest::ProbeResponse, ProbeError> {
-        let argv = ContainerProbe::argv(url, self.timeout_secs);
+        let mut argv = ContainerProbe::argv(url, self.timeout_secs);
+        argv.insert(1, "-g".to_string());
         let program = argv[0].clone();
         let args = argv[1..].to_vec();
         let output = self
@@ -336,12 +337,11 @@ fn load_manifest(
     Ok((Manifest::derived(health_path, &[]), MANIFEST_SOURCE_DERIVED))
 }
 
-fn report_json(report: &ManifestReport, pr: u64, url: &str, source: &str) -> Value {
+fn report_json(report: &ManifestReport, omitted: usize, pr: u64, url: &str, source: &str) -> Value {
     let mut budget = Budget::new(TOTAL_CAP);
     let checks: Vec<Value> = report
         .checks
         .iter()
-        .take(MAX_CHECKS)
         .map(|check| {
             json!({
                 "path": fenced_untrusted(&redact_resilient(&strip_unprintable(&check.path)), PATH_CAP, &mut budget),
@@ -358,10 +358,10 @@ fn report_json(report: &ManifestReport, pr: u64, url: &str, source: &str) -> Val
         "url": fenced_untrusted(url, URL_CAP, &mut budget),
         "manifest": source,
         "checks": checks,
-        "omitted_checks": report.checks.len().saturating_sub(MAX_CHECKS),
+        "omitted_checks": omitted,
         "passed": report.passed,
         "failed": report.failed,
-        "all_passed": report.all_passed(),
+        "all_passed": omitted == 0 && report.all_passed(),
         "text": fenced_untrusted(&redact_resilient(&strip_unprintable(&report.render_text())), TEXT_CAP, &mut budget),
     })
 }
@@ -459,9 +459,11 @@ impl SandboxDeployTool {
         &self,
         template: &DeployTemplate,
         handle: &SandboxHandle,
-    ) -> ToolResult<(ManifestReport, &'static str)> {
-        let (manifest, source) =
+    ) -> ToolResult<(ManifestReport, usize, &'static str)> {
+        let (mut manifest, source) =
             load_manifest(&self.workspace_root, template).map_err(map_sandbox_error)?;
+        let omitted = manifest.checks.len().saturating_sub(MAX_CHECKS);
+        manifest.checks.truncate(MAX_CHECKS);
         let probe = Arc::clone(&self.probe);
         let url = handle.url.clone();
         let report =
@@ -470,7 +472,7 @@ impl SandboxDeployTool {
                 .map_err(|e| ToolError::ExecutionFailed {
                     message: format!("the sandbox QA task failed: {e}"),
                 })?;
-        Ok((report, source))
+        Ok((report, omitted, source))
     }
 
     async fn tear_down_after_failed_qa(
@@ -581,7 +583,9 @@ impl Tool for SandboxDeployTool {
         handle.identity = Some(self.budget.identity.clone());
         self.sandboxes.insert(&self.task_id, handle.clone());
         match self.run_qa(&template, &handle).await {
-            Ok((report, source)) => Ok(report_json(&report, self.pr, &handle.url, source)),
+            Ok((report, omitted, source)) => {
+                Ok(report_json(&report, omitted, self.pr, &handle.url, source))
+            }
             Err(e) => Err(self.tear_down_after_failed_qa(&handle, e).await),
         }
     }
@@ -2451,5 +2455,115 @@ mod tests {
         tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
         assert!(sandboxes.get("t1").is_none());
         assert!(accountant.task_summary("id", "t1").sandbox.minutes >= 12.0);
+    }
+
+    struct CountingProbe(Mutex<Vec<String>>);
+
+    impl HttpProbe for CountingProbe {
+        fn get(&self, url: &str) -> Result<ProbeResponse, ProbeError> {
+            self.0.lock().unwrap().push(url.to_string());
+            Ok(ProbeResponse {
+                status: 200,
+                body: String::new(),
+            })
+        }
+    }
+
+    struct RecordingRunner(Mutex<Vec<Vec<String>>>);
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, program: &str, args: &[String]) -> std::io::Result<RunOutput> {
+            let mut argv = vec![program.to_string()];
+            argv.extend(args.iter().cloned());
+            self.0.lock().unwrap().push(argv);
+            Ok(RunOutput {
+                success: true,
+                stdout: "\n200".to_string(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    async fn deploy_with_checks(checks: &str, probe: Arc<dyn HttpProbe>) -> Value {
+        let dir = repo_with(Some(DEPLOY_TOML), false, "git@github.com:o/n.git");
+        std::fs::write(dir.path().join(CHECKS_FILE), checks).unwrap();
+        let tool = SandboxDeployTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(FakeSandboxTarget::new()),
+            probe,
+            Arc::new(SandboxRegistry::new()),
+            "t1",
+            7,
+        )
+        .with_budget(unlimited(), "id");
+        tool.execute(json!({"image_tag": "v1"})).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_more_than_the_cap_of_probes_run_and_a_truncated_manifest_is_never_all_passed() {
+        let probe = Arc::new(CountingProbe(Mutex::new(Vec::new())));
+        let many: String = (0..60).map(|i| format!("/p{i}\n")).collect();
+        let result = deploy_with_checks(&many, Arc::clone(&probe) as Arc<dyn HttpProbe>).await;
+        assert_eq!(probe.0.lock().unwrap().len(), MAX_CHECKS);
+        assert_eq!(result["omitted_checks"], 10);
+        assert_eq!(result["all_passed"], false);
+        assert_eq!(result["failed"], 0);
+
+        let exact = Arc::new(CountingProbe(Mutex::new(Vec::new())));
+        let fits: String = (0..MAX_CHECKS).map(|i| format!("/p{i}\n")).collect();
+        let result = deploy_with_checks(&fits, Arc::clone(&exact) as Arc<dyn HttpProbe>).await;
+        assert_eq!(exact.0.lock().unwrap().len(), MAX_CHECKS);
+        assert_eq!(result["omitted_checks"], 0);
+        assert_eq!(result["all_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn a_range_expression_in_a_check_line_is_one_probe_and_curl_is_told_not_to_expand_it() {
+        let probe = Arc::new(CountingProbe(Mutex::new(Vec::new())));
+        deploy_with_checks("/[1-100000]\n", Arc::clone(&probe) as Arc<dyn HttpProbe>).await;
+        let urls = probe.0.lock().unwrap().clone();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].ends_with("/[1-100000]"), "{urls:?}");
+
+        let runner = Arc::new(RecordingRunner(Mutex::new(Vec::new())));
+        let host = HostHttpProbe::new(Arc::clone(&runner) as Arc<dyn CommandRunner>);
+        host.get("http://127.0.0.1:1/[1-100000]").unwrap();
+        let calls = runner.0.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "curl");
+        assert!(calls[0].iter().any(|arg| arg == "-g"), "{calls:?}");
+        assert_eq!(calls[0].last().unwrap(), "http://127.0.0.1:1/[1-100000]");
+    }
+
+    #[tokio::test]
+    async fn a_teardown_tool_built_by_register_records_the_lifetime_against_the_identity() {
+        let dir = fixture();
+        let target = Arc::new(FakeSandboxTarget::new());
+        let sandboxes = Arc::new(SandboxRegistry::new());
+        let accountant = unlimited();
+        let identity = identity_with("\"sandbox_teardown\"", "sandbox", "");
+        let mut registry = ToolRegistry::new();
+        register(
+            &mut registry,
+            dir.path(),
+            &identity,
+            SandboxContext {
+                target: Arc::clone(&target) as Arc<dyn SandboxTarget>,
+                probe: Arc::new(LoopbackProbe),
+                sandboxes: Arc::clone(&sandboxes),
+                accountant: Arc::clone(&accountant),
+                task_id: "t1".to_string(),
+                pr: 7,
+            },
+        );
+        backdated(&sandboxes, 12, None);
+        let done = registry
+            .get_tool("sandbox_teardown")
+            .unwrap()
+            .execute(json!({}))
+            .await
+            .unwrap();
+        assert_eq!(done["torn_down"], true);
+        assert!(accountant.task_summary("sb-agent", "t1").sandbox.minutes >= 12.0);
     }
 }
