@@ -160,6 +160,7 @@ fn the_checker_sees_forbidden_constructs_in_code_and_macro_bodies_but_not_in_tes
         fn c() { gate.submit_spawn(allowed); }
         fn d() { enqueue_all(); Allowed::new(r, i); }
         fn f() { tokio::spawn(work()); }
+        mod inner { fn g() { let _ = AuditedIdentity::split(proof); } }
         #[cfg(test)]
         mod tests { fn e() { SpawnGate::new(x, y, z); AuditLog::in_memory(); } }
     "#;
@@ -171,6 +172,7 @@ fn the_checker_sees_forbidden_constructs_in_code_and_macro_bodies_but_not_in_tes
         "names dispatch function enqueue_all",
         "calls Allowed::new",
         "calls tokio::spawn",
+        "uses AuditedIdentity",
     ] {
         assert!(found.iter().any(|f| f == expected), "{expected}: {found:?}");
     }

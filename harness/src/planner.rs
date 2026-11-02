@@ -1,10 +1,11 @@
 use crate::auditor::{Allowed, Refused, SpawnGate, TaskSummary};
-use crate::identity::{AgentIdentity, DevLoop, IdentityCatalog};
+use crate::identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError};
 use model::types::{ChatMessage, ChatRequest};
 use model::{ModelError, ModelProvider};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -228,6 +229,36 @@ impl Plan {
         &self.nodes
     }
 
+    /// ```
+    /// # use harness::identity::{DevLoop, IdentityCatalog};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let card = |name: &str, dev_loop: &str, effect: &str, tools: &str| format!(
+    /// #     "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"{dev_loop}\"\nmodel = \"m\"\n\
+    /// #      system_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\n\
+    /// #      max_effect = \"{effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 1\n\
+    /// #      max_wall_clock_secs = 1\nmax_concurrent = 1\n"
+    /// # );
+    /// # std::fs::write(dir.path().join("rust-implementer.toml"), card("rust-implementer", "inner", "repository", "\"read_file\"")).unwrap();
+    /// # std::fs::write(dir.path().join("deployer.toml"), card("deployer", "outer", "sandbox", "\"read_file\"")).unwrap();
+    /// # let catalog = IdentityCatalog::load(dir.path()).unwrap();
+    /// use harness::planner::{Plan, PlanRejection, Spawn};
+    ///
+    /// let spawn = |identity: &str, dev_loop: DevLoop| Spawn {
+    ///     id: "a".to_string(),
+    ///     identity: identity.to_string(),
+    ///     subtask: "work".to_string(),
+    ///     dev_loop,
+    ///     depends_on: vec![],
+    /// };
+    /// let fine = Plan::new(vec![spawn("deployer", DevLoop::Outer)]).unwrap();
+    /// assert_eq!(fine.check_catalog(&catalog), Ok(()));
+    ///
+    /// let invented = Plan::new(vec![spawn("release-wizard", DevLoop::Outer)]).unwrap();
+    /// assert!(matches!(invented.check_catalog(&catalog), Err(PlanRejection::UnknownIdentity { .. })));
+    ///
+    /// let misplaced = Plan::new(vec![spawn("deployer", DevLoop::Inner)]).unwrap();
+    /// assert!(matches!(misplaced.check_catalog(&catalog), Err(PlanRejection::LoopNotAllowed { .. })));
+    /// ```
     pub fn check_catalog(&self, catalog: &IdentityCatalog) -> Result<(), PlanRejection> {
         for node in &self.nodes {
             let Some(card) = catalog.get(&node.identity) else {
@@ -417,6 +448,34 @@ impl Planner {
         vec![ChatMessage::system(system), ChatMessage::user(user)]
     }
 
+    /// ```
+    /// # use harness::identity::{DevLoop, IdentityCatalog};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let card = |name: &str, dev_loop: &str, effect: &str, tools: &str| format!(
+    /// #     "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"{dev_loop}\"\nmodel = \"m\"\n\
+    /// #      system_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\n\
+    /// #      max_effect = \"{effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 1\n\
+    /// #      max_wall_clock_secs = 1\nmax_concurrent = 1\n"
+    /// # );
+    /// # std::fs::write(dir.path().join("rust-implementer.toml"), card("rust-implementer", "inner", "repository", "\"read_file\"")).unwrap();
+    /// # std::fs::write(dir.path().join("deployer.toml"), card("deployer", "outer", "sandbox", "\"read_file\"")).unwrap();
+    /// # let catalog = IdentityCatalog::load(dir.path()).unwrap();
+    /// use harness::planner::{PlanError, PlanRejection, Planner};
+    ///
+    /// let reply = r#"{"nodes":[{"id":"fix","identity":"rust-implementer","subtask":"Fix it.","loop":"inner"}]}"#;
+    /// let plan = Planner::parse_reply(reply, &catalog).unwrap();
+    /// assert_eq!(plan.nodes()[0].identity, "rust-implementer");
+    ///
+    /// let invented = reply.replace("rust-implementer", "release-wizard");
+    /// assert!(matches!(
+    ///     Planner::parse_reply(&invented, &catalog),
+    ///     Err(PlanError::Rejected(PlanRejection::UnknownIdentity { .. }))
+    /// ));
+    ///
+    /// let fence = "`".repeat(3);
+    /// let fenced = format!("{fence}json\n{reply}\n{fence}");
+    /// assert!(matches!(Planner::parse_reply(&fenced, &catalog), Err(PlanError::Malformed { .. })));
+    /// ```
     pub fn parse_reply(text: &str, catalog: &IdentityCatalog) -> Result<Plan, PlanError> {
         if text.len() > MAX_REPLY_BYTES {
             return Err(PlanError::ReplyTooLarge {
@@ -502,7 +561,57 @@ impl PlanAudit {
     }
 }
 
-pub async fn audit_plan(plan: &Plan, parent: &TaskSummary, gate: &SpawnGate) -> PlanAudit {
+/// ```
+/// # #[tokio::main]
+/// # async fn main() {
+/// use harness::auditor::{AuditContext, AuditLog, RuleAuditor, SpawnGate, TaskSummary};
+/// use harness::identity::{DevLoop, IdentityCatalog};
+/// use harness::planner::{audit_plan, NodeStatus, Plan, Spawn};
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let card = |name: &str, effect: &str, tools: &str| format!(
+///     "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"inner\"\nmodel = \"m\"\n\
+///      system_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\n\
+///      max_effect = \"{effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 1\n\
+///      max_wall_clock_secs = 1\nmax_concurrent = 1\n"
+/// );
+/// std::fs::write(dir.path().join("rust-implementer.toml"), card("rust-implementer", "repository", "\"read_file\"")).unwrap();
+/// std::fs::write(dir.path().join("auditor.toml"), card("auditor", "none", "")).unwrap();
+/// let catalog = IdentityCatalog::load(dir.path()).unwrap();
+/// let context = AuditContext::new(catalog.clone(), catalog.get("auditor").unwrap().clone()).unwrap();
+/// let gate = SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context);
+///
+/// let spawn = |id: &str, subtask: &str, deps: &[&str]| Spawn {
+///     id: id.to_string(),
+///     identity: "rust-implementer".to_string(),
+///     subtask: subtask.to_string(),
+///     dev_loop: DevLoop::Inner,
+///     depends_on: deps.iter().map(|d| d.to_string()).collect(),
+/// };
+/// let plan = Plan::new(vec![
+///     spawn("fix", "Add a regression test.", &[]),
+///     spawn("push", "Deploy build 42 to production.", &["fix"]),
+///     spawn("after", "Add another test.", &["push"]),
+/// ])
+/// .unwrap();
+/// let parent = TaskSummary::new("task-1", "Fix the bug", "github.com/example/repo");
+/// let repo = tempfile::tempdir().unwrap();
+/// let audit = audit_plan(&plan, &parent, &gate, repo.path()).await.unwrap();
+///
+/// assert!(!audit.is_approved());
+/// assert!(matches!(audit.nodes()[0].status, NodeStatus::Allowed(_)));
+/// assert!(matches!(audit.nodes()[1].status, NodeStatus::Refused(_)));
+/// assert!(matches!(audit.nodes()[2].status, NodeStatus::Skipped { .. }));
+/// assert_eq!(gate.log().entries().unwrap().len(), 2);
+/// # }
+/// ```
+pub async fn audit_plan(
+    plan: &Plan,
+    parent: &TaskSummary,
+    gate: &SpawnGate,
+    repo_root: &Path,
+) -> Result<PlanAudit, IdentityError> {
+    let gate = gate.for_repo(repo_root)?;
     let mut nodes: Vec<NodeAudit> = Vec::with_capacity(plan.nodes().len());
     let mut failed: BTreeSet<&str> = BTreeSet::new();
     for spawn in plan.topological() {
@@ -536,7 +645,7 @@ pub async fn audit_plan(plan: &Plan, parent: &TaskSummary, gate: &SpawnGate) -> 
             status,
         });
     }
-    PlanAudit { nodes }
+    Ok(PlanAudit { nodes })
 }
 
 #[cfg(test)]
@@ -683,13 +792,11 @@ mod tests {
             })
         );
         let hostile = format!("sk-secret token\n{}", "z".repeat(200));
-        let Err(PlanRejection::DanglingDependency { missing, .. }) =
-            Plan::new(vec![node("a", &[&hostile])])
-        else {
-            panic!("expected a dangling dependency");
-        };
-        assert!(!missing.contains(' ') && !missing.contains('\n'));
-        assert_eq!(missing.chars().count(), MAX_ID_CHARS);
+        let rendered = Plan::new(vec![node("a", &[&hostile])])
+            .unwrap_err()
+            .to_string();
+        let expected = format!("`sk-secret?token?{}`", "z".repeat(MAX_ID_CHARS - 16));
+        assert!(rendered.contains(&expected), "{rendered}");
     }
 
     #[test]
@@ -865,11 +972,11 @@ mod tests {
             &[],
         )])
         .unwrap();
-        let Err(PlanRejection::UnknownIdentity { identity, .. }) = plan.check_catalog(&catalog())
-        else {
-            panic!("expected an unknown identity");
-        };
-        assert_eq!(identity, "sk-live?key?ignore?previous");
+        let rendered = plan.check_catalog(&catalog()).unwrap_err().to_string();
+        assert!(
+            rendered.contains("`sk-live?key?ignore?previous`"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1312,6 +1419,34 @@ mod tests {
             .collect()
     }
 
+    async fn run(plan: &Plan, gate: &SpawnGate) -> PlanAudit {
+        let repo = tempfile::tempdir().unwrap();
+        audit_plan(plan, &parent(), gate, repo.path())
+            .await
+            .unwrap()
+    }
+
+    fn proof_of(node: &NodeAudit) -> Option<&Allowed> {
+        match &node.status {
+            NodeStatus::Allowed(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn verdict_of(node: &NodeAudit) -> Option<&crate::auditor::SpawnVerdict> {
+        match &node.status {
+            NodeStatus::Refused(Refused::Verdict { verdict, .. }) => Some(verdict),
+            _ => None,
+        }
+    }
+
+    fn blocker_of(node: &NodeAudit) -> Option<&str> {
+        match &node.status {
+            NodeStatus::Skipped { blocked_by } => Some(blocked_by),
+            _ => None,
+        }
+    }
+
     fn logged(gate: &SpawnGate) -> Vec<String> {
         gate.log()
             .entries()
@@ -1351,7 +1486,7 @@ mod tests {
     #[tokio::test]
     async fn every_node_of_a_fitting_plan_is_allowed_in_dependency_order() {
         let gate = gate();
-        let audit = audit_plan(&ship_plan(), &parent(), &gate).await;
+        let audit = run(&ship_plan(), &gate).await;
         assert!(audit.is_approved());
         assert_eq!(
             statuses(&audit),
@@ -1363,9 +1498,9 @@ mod tests {
         );
         assert_eq!(logged(&gate).len(), 3);
         assert!(logged(&gate)[0].starts_with("Fix bug X"));
-        let NodeStatus::Allowed(proof) = &audit.nodes()[2].status else {
-            panic!("ship was not allowed");
-        };
+        assert!(verdict_of(&audit.nodes()[2]).is_none());
+        assert!(blocker_of(&audit.nodes()[2]).is_none());
+        let proof = proof_of(&audit.nodes()[2]).expect("ship was allowed");
         assert_eq!(proof.identity().name(), "deployer");
         assert_eq!(proof.request().dev_loop, DevLoop::Outer);
         assert_eq!(proof.request().parent_task, parent());
@@ -1412,7 +1547,7 @@ mod tests {
             ),
         ])
         .unwrap();
-        let audit = audit_plan(&plan, &parent(), &gate).await;
+        let audit = run(&plan, &gate).await;
         assert!(!audit.is_approved());
         assert_eq!(
             statuses(&audit),
@@ -1424,19 +1559,12 @@ mod tests {
                 ("lint", "allowed"),
             ]
         );
-        let NodeStatus::Refused(Refused::Verdict { verdict, .. }) = &audit.nodes()[1].status else {
-            panic!("push was not refused with a verdict");
-        };
+        assert!(proof_of(&audit.nodes()[1]).is_none());
+        let verdict = verdict_of(&audit.nodes()[1]).expect("push was refused");
         assert_eq!(verdict.kind(), VerdictKind::Block);
         assert!(!verdict.reasons().is_empty());
-        let NodeStatus::Skipped { blocked_by } = &audit.nodes()[2].status else {
-            panic!("shepherd was not skipped");
-        };
-        assert_eq!(blocked_by, "push");
-        let NodeStatus::Skipped { blocked_by } = &audit.nodes()[3].status else {
-            panic!("ship was not skipped");
-        };
-        assert_eq!(blocked_by, "shepherd");
+        assert_eq!(blocker_of(&audit.nodes()[2]), Some("push"));
+        assert_eq!(blocker_of(&audit.nodes()[3]), Some("shepherd"));
         assert_eq!(logged(&gate).len(), 3);
     }
 
@@ -1451,10 +1579,8 @@ mod tests {
             &[],
         )])
         .unwrap();
-        let audit = audit_plan(&plan, &parent(), &gate).await;
-        let NodeStatus::Refused(Refused::Verdict { verdict, .. }) = &audit.nodes()[0].status else {
-            panic!("the mismatch was not refused");
-        };
+        let audit = run(&plan, &gate).await;
+        let verdict = verdict_of(&audit.nodes()[0]).expect("the mismatch was refused");
         assert!(verdict
             .reasons()
             .iter()
@@ -1479,9 +1605,46 @@ mod tests {
             ),
         ])
         .unwrap();
-        let audit = audit_plan(&plan, &parent(), &gate).await;
+        let audit = run(&plan, &gate).await;
         assert_eq!(statuses(&audit), [("a", "refused"), ("b", "skipped")]);
         assert_eq!(audit.into_nodes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repo_local_overrides_narrow_the_audit_exactly_as_production_does() {
+        let gate = gate();
+        let plan = Plan::new(vec![work(
+            "pr",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Open a pull request for the fix.",
+            &[],
+        )])
+        .unwrap();
+        assert!(run(&plan, &gate).await.is_approved());
+        let repo = tempfile::tempdir().unwrap();
+        let agents = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let narrowed = card("rust-implementer", "inner", "workspace");
+        std::fs::write(agents.join("rust-implementer.toml"), narrowed).unwrap();
+        let audit = audit_plan(&plan, &parent(), &gate, repo.path())
+            .await
+            .unwrap();
+        assert!(!audit.is_approved());
+        assert!(verdict_of(&audit.nodes()[0]).is_some());
+    }
+
+    #[tokio::test]
+    async fn unreadable_repo_overrides_fail_the_whole_audit() {
+        let gate = gate();
+        let repo = tempfile::tempdir().unwrap();
+        let agents = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("ghost.toml"), card("ghost", "inner", "none")).unwrap();
+        let plan = Plan::new(vec![node("a", &[])]).unwrap();
+        let result = audit_plan(&plan, &parent(), &gate, repo.path()).await;
+        assert!(result.is_err());
+        assert_eq!(gate.log().entries().unwrap().len(), 0);
     }
 
     fn eval_catalog() -> IdentityCatalog {
@@ -1557,7 +1720,7 @@ mod tests {
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
         let gate = SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context);
-        let audit = audit_plan(&plan, &parent(), &gate).await;
+        let audit = run(&plan, &gate).await;
         assert!(audit.is_approved());
         assert_eq!(gate.log().entries().unwrap().len(), 3);
     }
