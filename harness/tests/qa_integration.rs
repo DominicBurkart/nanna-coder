@@ -2,6 +2,12 @@
 //! full-stack fixture. All tests are `#[ignore]` and skip when no runtime is
 //! available; run them with
 //! `cargo test -p harness --test qa_integration -- --ignored --test-threads=1`.
+//! With `NANNA_REQUIRE_RUNTIME=1` the browser interaction test panics instead
+//! of skipping when no container runtime is available.
+//!
+//! `container_browser_click_and_type_*` is layer C (container, real
+//! Chromium): it drives `Step::Click` and `Step::Type` against the fixture's
+//! interactive page and asserts the page's own state changed.
 //!
 //! The dev image is the [`apprun_integration`] stand-in plus headless
 //! Chromium (the package the generated flake adds for this profile).
@@ -40,6 +46,30 @@ const DEV_CONTAINERFILE: &str = "FROM docker.io/library/rust:1-bookworm\n\
 const COLD_BUILD_LIMIT: Limits = Limits {
     max_wall_clock_secs: 1800,
 };
+
+const REQUIRE_RUNTIME_ENV: &str = "NANNA_REQUIRE_RUNTIME";
+
+fn runtime_gate(available: bool, require: Option<&str>) -> Result<(), String> {
+    if available {
+        return Ok(());
+    }
+    if require == Some("1") {
+        return Err(format!(
+            "no container runtime available but {REQUIRE_RUNTIME_ENV}=1 requires one"
+        ));
+    }
+    Ok(())
+}
+
+fn require_runtime_or_skip(runtime: &ContainerRuntime) -> bool {
+    if let Err(message) = runtime_gate(
+        runtime.is_available(),
+        std::env::var(REQUIRE_RUNTIME_ENV).ok().as_deref(),
+    ) {
+        panic!("{message}");
+    }
+    runtime.is_available()
+}
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -209,6 +239,83 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
     assert!(!summary.artifacts.is_empty());
 
     ws.cleanup().expect("cleanup must succeed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn container_browser_click_and_type_change_the_fixture_page_state() {
+    let runtime = detect_runtime();
+    if !require_runtime_or_skip(&runtime) {
+        eprintln!("SKIPPED: no container runtime available");
+        return;
+    }
+    build_dev_image(&SystemRunner, &runtime).unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixture_root(), source.path());
+    init_repo(source.path());
+    let mut ws = start_workspace(source.path(), "qa-interact", vec![]).await;
+    let registry = ws.build_tool_registry();
+    tool(&registry, APP_START_TOOL, Value::Null).await;
+
+    let scenario = json!({ "steps": [
+        { "step": "goto", "path": "/" },
+        { "step": "expect_text", "selector": "#clicks", "text": "clicks: 0" },
+        { "step": "expect_text", "selector": "#echo", "text": "typed: []" },
+        { "step": "click", "selector": "#bump" },
+        { "step": "click", "selector": "#bump" },
+        { "step": "expect_text", "selector": "#clicks", "text": "clicks: 2" },
+        { "step": "type", "selector": "#name", "text": "nanna-typed" },
+        { "step": "expect_text", "selector": "#echo", "text": "typed: [nanna-typed]" },
+        { "step": "screenshot", "name": "interacted" }
+    ] });
+    let browser = tool(&registry, QA_BROWSER_TOOL, json!({ "scenario": scenario })).await;
+    assert_eq!(browser["passed"], true, "{browser}");
+    let steps = browser["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 9, "{browser}");
+    assert!(steps.iter().all(|s| s["passed"] == true), "{browser}");
+
+    let wrong = json!({ "steps": [
+        { "step": "goto", "path": "/" },
+        { "step": "click", "selector": "#bump" },
+        { "step": "expect_text", "selector": "#clicks", "text": "clicks: 5" }
+    ] });
+    let failing = tool(&registry, QA_BROWSER_TOOL, json!({ "scenario": wrong })).await;
+    assert_eq!(failing["passed"], false, "{failing}");
+
+    let summary = ws.qa_summary();
+    assert_eq!(summary.browser_runs, 2);
+    assert_eq!(summary.browser_steps_failed, 1, "{summary:?}");
+    assert_eq!(summary.browser_steps_passed, 11, "{summary:?}");
+
+    ws.cleanup().expect("cleanup must succeed");
+}
+
+#[test]
+fn runtime_gate_passes_when_a_runtime_is_available() {
+    assert_eq!(runtime_gate(true, Some("1")), Ok(()));
+    assert_eq!(runtime_gate(true, None), Ok(()));
+}
+
+#[test]
+fn runtime_gate_skips_when_absent_and_not_required() {
+    assert_eq!(runtime_gate(false, None), Ok(()));
+    assert_eq!(runtime_gate(false, Some("0")), Ok(()));
+    assert_eq!(runtime_gate(false, Some("")), Ok(()));
+}
+
+#[test]
+fn runtime_gate_fails_loudly_when_absent_and_required() {
+    let err = runtime_gate(false, Some("1")).unwrap_err();
+    assert!(err.contains("NANNA_REQUIRE_RUNTIME=1"), "{err}");
+}
+
+#[test]
+fn require_runtime_or_skip_reports_availability_when_not_required() {
+    if std::env::var(REQUIRE_RUNTIME_ENV).as_deref() == Ok("1") {
+        return;
+    }
+    assert!(!require_runtime_or_skip(&ContainerRuntime::None));
 }
 
 #[tokio::test]

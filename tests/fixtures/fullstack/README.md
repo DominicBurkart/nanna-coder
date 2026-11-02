@@ -17,6 +17,11 @@ root workspace.
 | `GET /api/v1/greeting` | `{"message":"Hello from the full-stack fixture"}` |
 | `GET /` | the built `ui/dist` (rendered greeting inside `#greeting`) |
 
+The page also has a `#bump` button that increments the count shown in
+`#clicks` (`clicks: N`) and a `#name` input whose value is echoed in `#echo`
+(`typed: [value]`), so a browser test can observe that `click` and `type` ran
+the page's own handlers.
+
 `CHECKS` lists these paths one per line for smoke tests.
 
 `index.html` mounts the app into `<div id="main">`, dioxus 0.7's default
