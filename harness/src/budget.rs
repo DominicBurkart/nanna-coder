@@ -999,7 +999,7 @@ mod tests {
             _escalation: &Escalation,
         ) -> Result<DeliveryReceipt, EscalationError> {
             Err(EscalationError::Status {
-                url: "https://example.invalid".to_string(),
+                origin: "https://example.invalid".to_string(),
                 status: 500,
             })
         }

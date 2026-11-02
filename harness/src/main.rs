@@ -1261,7 +1261,6 @@ async fn run_backlog_sync(
     audit_model: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::backlog::{backlog_sync, ReqwestGithubClient, StoreSink};
-    use harness::escalation::EscalationLog;
     use harness::scheduler::JsonlQueueStore;
     use std::sync::Arc;
 
@@ -1275,14 +1274,8 @@ async fn run_backlog_sync(
         .collect::<Vec<_>>();
     let sink = StoreSink::open(Box::new(store), identities)?;
     let client = ReqwestGithubClient::github(std::env::var("GITHUB_TOKEN").ok());
-    let escalation_log = Arc::new(EscalationLog::open(&resolve_escalation_path(&path))?);
-    let gate = backlog_spawn_gate(
-        audit_model,
-        provider,
-        &path,
-        &load_identities(),
-        escalation_log,
-    )?;
+    let plane = resolve_escalation_plane(&path)?;
+    let gate = backlog_spawn_gate(audit_model, provider, &path, &load_identities(), plane)?;
     let report = backlog_sync(&client, &sink, &config, &gate).await?;
     println!(
         "Backlog sync into {}: enqueued {}, duplicates {}, claimed by open PRs {}, capped {}, refused by the auditor {}",
@@ -1459,19 +1452,36 @@ fn load_identities() -> IdentityCatalog {
 }
 
 fn spawn_escalation_hook(
-    log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: &harness::escalation::EscalationPlane,
 ) -> Box<dyn harness::auditor::SpawnEscalationHook> {
-    use harness::escalation::{default_window, Escalator, EscalatorSpawnHook, FanoutSink};
-    use harness::leases::SystemClock;
-    use std::sync::Arc;
+    Box::new(plane.spawn_hook())
+}
 
-    let escalator = Escalator::new(
-        log,
-        Arc::new(FanoutSink(vec![])),
-        Arc::new(SystemClock),
-        default_window(),
+/// Escalation log and sinks for the queue at `queue_path`: the log next to
+/// the queue, the sinks from the `NANNA_ESCALATION_*` environment.
+fn resolve_escalation_plane(
+    queue_path: &std::path::Path,
+) -> Result<harness::escalation::EscalationPlane, Box<dyn std::error::Error>> {
+    resolve_escalation_plane_with(queue_path, &|key| std::env::var_os(key))
+}
+
+fn resolve_escalation_plane_with(
+    queue_path: &std::path::Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<harness::escalation::EscalationPlane, Box<dyn std::error::Error>> {
+    let path = harness::escalation::escalation_path_from(
+        lookup(harness::escalation::ESCALATION_PATH_ENV),
+        Some(queue_path.to_path_buf()),
+    )
+    .expect("a queue path always yields an escalation path");
+    let log = std::sync::Arc::new(harness::escalation::EscalationLog::open(&path)?);
+    let directory = path.parent().map_or_else(
+        || std::path::PathBuf::from("."),
+        std::path::Path::to_path_buf,
     );
-    Box::new(EscalatorSpawnHook::new(Arc::new(escalator)))
+    Ok(harness::escalation::EscalationPlane::from_lookup(
+        log, &directory, lookup,
+    )?)
 }
 
 fn build_spawn_gate(
@@ -1499,12 +1509,12 @@ fn queue_spawn_gate(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     queue_path: &std::path::Path,
     catalog: &IdentityCatalog,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
     build_spawn_gate(
         catalog,
         harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
-        spawn_escalation_hook(escalation_log),
+        spawn_escalation_hook(&plane),
         audit_model.map(|name| (provider, name.to_string())),
     )
 }
@@ -1514,9 +1524,9 @@ fn backlog_spawn_gate(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     queue_path: &std::path::Path,
     catalog: &IdentityCatalog,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
-    queue_spawn_gate(audit_model, provider, queue_path, catalog, escalation_log)
+    queue_spawn_gate(audit_model, provider, queue_path, catalog, plane)
 }
 
 fn delegate_spawn_gate(
@@ -1524,9 +1534,9 @@ fn delegate_spawn_gate(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     queue_path: &std::path::Path,
     catalog: &IdentityCatalog,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
-    queue_spawn_gate(model, provider, queue_path, catalog, escalation_log)
+    queue_spawn_gate(model, provider, queue_path, catalog, plane)
 }
 
 fn serve_spawn_gate(
@@ -1534,9 +1544,9 @@ fn serve_spawn_gate(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     queue_path: &std::path::Path,
     catalog: &IdentityCatalog,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
-    queue_spawn_gate(Some(model), provider, queue_path, catalog, escalation_log)
+    queue_spawn_gate(Some(model), provider, queue_path, catalog, plane)
 }
 
 async fn build_mcp_task_manager(
@@ -1544,7 +1554,7 @@ async fn build_mcp_task_manager(
     model: &str,
     queue_path: &std::path::Path,
     lease_path: &std::path::Path,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
     catalog: &IdentityCatalog,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
     let budget_path = harness::budget::budget_path_from(
@@ -1556,7 +1566,7 @@ async fn build_mcp_task_manager(
         model,
         queue_path,
         lease_path,
-        escalation_log,
+        plane,
         budget_path,
         catalog,
     )
@@ -1568,7 +1578,7 @@ async fn build_mcp_task_manager_with_budget(
     model: &str,
     queue_path: &std::path::Path,
     lease_path: &std::path::Path,
-    escalation_log: std::sync::Arc<harness::escalation::EscalationLog>,
+    plane: harness::escalation::EscalationPlane,
     budget_path: Option<std::path::PathBuf>,
     catalog: &IdentityCatalog,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
@@ -1581,7 +1591,7 @@ async fn build_mcp_task_manager_with_budget(
     let spawn_gate = build_spawn_gate(
         catalog,
         harness::auditor::AuditLog::file(queue_path.with_file_name("audit.jsonl")),
-        spawn_escalation_hook(Arc::clone(&escalation_log)),
+        spawn_escalation_hook(&plane),
         Some((provider.clone(), model.to_string())),
     )?;
     let action_gate = TaskManager::action_policy_gate(
@@ -1599,7 +1609,7 @@ async fn build_mcp_task_manager_with_budget(
         leases,
         provider,
         catalog,
-        escalation_log,
+        plane,
         action_gate,
         &spawn_gate,
     )
@@ -1610,8 +1620,13 @@ async fn build_mcp_task_manager_with_budget(
 fn build_delegate_task_manager(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     model: Option<&str>,
+    plane: harness::escalation::EscalationPlane,
 ) -> harness::task::TaskManager {
-    harness::task::TaskManager::default().with_action_policy(
+    harness::task::TaskManager::with_escalation_plane(
+        harness::task::DEFAULT_MAX_CONCURRENT_TASKS,
+        plane,
+    )
+    .with_action_policy(
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
         model.map(|name| (provider, name.to_string())),
         harness::action_auditor::ActionAuditLog::in_memory(),
@@ -1631,14 +1646,14 @@ async fn run_mcp_server(
     let lease_path = resolve_lease_path(&queue_path);
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
-    let escalation_log = Arc::new(harness::escalation::EscalationLog::open(&escalation_path)?);
+    let plane = resolve_escalation_plane(&queue_path)?;
     let task_manager = Arc::new(
         build_mcp_task_manager(
             provider.clone(),
             model,
             &queue_path,
             &lease_path,
-            Arc::clone(&escalation_log),
+            plane.clone(),
             &catalog,
         )
         .await?,
@@ -1658,7 +1673,7 @@ async fn run_mcp_server(
         provider.clone() as Arc<dyn model::ModelProvider>,
         &queue_path,
         &catalog,
-        escalation_log,
+        plane,
     )?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1692,17 +1707,19 @@ async fn run_delegate(
 
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
-    let task_manager = Arc::new(build_delegate_task_manager(provider.clone(), model));
     let queue_path = resolve_queue_path(None)?;
-    let escalation_log = Arc::new(harness::escalation::EscalationLog::open(
-        &resolve_escalation_path(&queue_path),
-    )?);
+    let plane = resolve_escalation_plane(&queue_path)?;
+    let task_manager = Arc::new(build_delegate_task_manager(
+        provider.clone(),
+        model,
+        plane.clone(),
+    ));
     let gate = delegate_spawn_gate(
         model,
         provider.clone() as Arc<dyn model::ModelProvider>,
         &queue_path,
         &load_identities(),
-        escalation_log,
+        plane,
     )?;
     let server = Arc::new(NannaMcpServer::new(
         task_manager,
@@ -1783,7 +1800,9 @@ mod tests {
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                harness::escalation::EscalationLog::in_memory(),
+            )),
             &fixture_catalog(),
         )
         .await
@@ -1815,7 +1834,9 @@ mod tests {
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                harness::escalation::EscalationLog::in_memory(),
+            )),
             &fixture_catalog(),
         )
         .await
@@ -1874,7 +1895,7 @@ mod tests {
             "reviewer-model",
             &queue,
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::clone(&log),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::clone(&log)),
             &catalog,
         )
         .await
@@ -1905,7 +1926,7 @@ mod tests {
             "reviewer-model",
             &dir.path().join("queue.jsonl"),
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::clone(&log),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::clone(&log)),
             &fixture_catalog(),
         )
         .await
@@ -1937,7 +1958,9 @@ mod tests {
             "reviewer-model",
             &dir.join("queue.jsonl"),
             &dir.join("leases.jsonl"),
-            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                harness::escalation::EscalationLog::in_memory(),
+            )),
             budget,
             &fixture_catalog(),
         )
@@ -1973,7 +1996,9 @@ mod tests {
             "reviewer-model",
             &dir.path().join("queue.jsonl"),
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                harness::escalation::EscalationLog::in_memory(),
+            )),
             &fixture_catalog(),
         )
         .await
@@ -1996,7 +2021,9 @@ mod tests {
         let gate = build_spawn_gate(
             &catalog,
             harness::auditor::AuditLog::in_memory(),
-            spawn_escalation_hook(std::sync::Arc::clone(&log)),
+            spawn_escalation_hook(&harness::escalation::EscalationPlane::from(
+                std::sync::Arc::clone(&log),
+            )),
             None,
         )
         .unwrap();
@@ -2093,9 +2120,7 @@ mod tests {
         let gate = build_spawn_gate(
             &fixture_catalog(),
             log.clone(),
-            spawn_escalation_hook(std::sync::Arc::new(
-                harness::escalation::EscalationLog::in_memory(),
-            )),
+            spawn_escalation_hook(&quiet_plane()),
             Some((
                 provider.clone() as std::sync::Arc<dyn model::ModelProvider>,
                 "spawn-reviewer".to_string(),
@@ -2179,9 +2204,7 @@ mod tests {
         let gate = build_spawn_gate(
             &fixture_catalog(),
             log.clone(),
-            spawn_escalation_hook(std::sync::Arc::new(
-                harness::escalation::EscalationLog::in_memory(),
-            )),
+            spawn_escalation_hook(&quiet_plane()),
             None,
         )
         .unwrap();
@@ -2214,7 +2237,9 @@ mod tests {
             "spawn-reviewer",
             &queue,
             &dir.path().join("leases.jsonl"),
-            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                harness::escalation::EscalationLog::in_memory(),
+            )),
             &fixture_catalog(),
         )
         .await
@@ -2281,15 +2306,202 @@ mod tests {
         assert_eq!(entries[0].record.model, expected);
     }
 
-    fn quiet_log() -> std::sync::Arc<harness::escalation::EscalationLog> {
-        std::sync::Arc::new(harness::escalation::EscalationLog::in_memory())
+    fn quiet_plane() -> harness::escalation::EscalationPlane {
+        harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+            harness::escalation::EscalationLog::in_memory(),
+        ))
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureSink(std::sync::Arc<std::sync::Mutex<Vec<harness::escalation::Escalation>>>);
+
+    impl CaptureSink {
+        fn seen(&self) -> Vec<harness::escalation::Escalation> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl harness::escalation::EscalationSink for CaptureSink {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        async fn deliver(
+            &self,
+            escalation: &harness::escalation::Escalation,
+        ) -> Result<harness::escalation::DeliveryReceipt, harness::escalation::EscalationError>
+        {
+            self.0.lock().unwrap().push(escalation.clone());
+            Ok(harness::escalation::DeliveryReceipt {
+                sink: "capture".to_string(),
+                reference: escalation.title(),
+                outcome: harness::escalation::DeliveryOutcome::Posted,
+            })
+        }
+    }
+
+    fn capture_plane() -> (harness::escalation::EscalationPlane, CaptureSink) {
+        let sink = CaptureSink::default();
+        let plane = harness::escalation::EscalationPlane::new(
+            std::sync::Arc::new(harness::escalation::EscalationLog::in_memory()),
+            std::sync::Arc::new(sink.clone()),
+        );
+        (plane, sink)
+    }
+
+    fn escalating_catalog(dir: &std::path::Path) -> IdentityCatalog {
+        let cards = dir.join("cards");
+        copy_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/identities/global"),
+            &cards,
+        );
+        std::fs::remove_file(cards.join("incident-responder.toml")).unwrap();
+        IdentityCatalog::load(&cards).unwrap()
+    }
+
+    async fn escalating_check(gate: &harness::auditor::SpawnGate) {
+        let request = gate.request(
+            harness::auditor::TaskSummary::new("task-1", "d", "example/repo"),
+            "deployer",
+            "Deploy build 42 to the production environment.",
+        );
+        assert!(gate.check(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn every_spawn_gate_builder_delivers_its_escalations_to_the_planes_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let catalog = escalating_catalog(dir.path());
+        let provider =
+            || RecordingProvider::replying(vec![]) as std::sync::Arc<dyn model::ModelProvider>;
+        type Builder =
+            Box<dyn Fn(harness::escalation::EscalationPlane) -> harness::auditor::SpawnGate>;
+        let builders: Vec<(&str, Builder)> = vec![
+            ("backlog", {
+                let (queue, catalog) = (queue.clone(), catalog.clone());
+                Box::new(move |plane| {
+                    backlog_spawn_gate(None, provider(), &queue, &catalog, plane).unwrap()
+                })
+            }),
+            ("backlog+model", {
+                let (queue, catalog) = (queue.clone(), catalog.clone());
+                Box::new(move |plane| {
+                    backlog_spawn_gate(Some("m"), provider(), &queue, &catalog, plane).unwrap()
+                })
+            }),
+            ("delegate", {
+                let (queue, catalog) = (queue.clone(), catalog.clone());
+                Box::new(move |plane| {
+                    delegate_spawn_gate(None, provider(), &queue, &catalog, plane).unwrap()
+                })
+            }),
+            ("delegate+model", {
+                let (queue, catalog) = (queue.clone(), catalog.clone());
+                Box::new(move |plane| {
+                    delegate_spawn_gate(Some("m"), provider(), &queue, &catalog, plane).unwrap()
+                })
+            }),
+            ("serve", {
+                let (queue, catalog) = (queue.clone(), catalog.clone());
+                Box::new(move |plane| {
+                    serve_spawn_gate("m", provider(), &queue, &catalog, plane).unwrap()
+                })
+            }),
+        ];
+        for (name, build) in builders {
+            let (plane, sink) = capture_plane();
+            let gate = build(plane);
+            escalating_check(&gate).await;
+            assert_eq!(sink.seen().len(), 1, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mcp_task_manager_escalates_budget_denials_into_the_planes_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plane, sink) = capture_plane();
+        let manager = build_mcp_task_manager(
+            RecordingProvider::replying(vec![]) as std::sync::Arc<dyn model::ModelProvider>,
+            "m",
+            &dir.path().join("queue.jsonl"),
+            &dir.path().join("leases.jsonl"),
+            plane,
+            &fixture_catalog(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..4 {
+            let _ = manager
+                .cost_accountant()
+                .charge_count(
+                    "id",
+                    "task-1",
+                    "example/repo",
+                    harness::budget::BudgetClass::Sandbox,
+                    chrono::Utc::now(),
+                )
+                .await;
+        }
+        assert_eq!(sink.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_delegate_task_manager_escalates_budget_denials_into_the_planes_sink() {
+        let (plane, sink) = capture_plane();
+        let manager = build_delegate_task_manager(offline_provider(), None, plane);
+        let denied = manager
+            .cost_accountant()
+            .charge_count(
+                "id",
+                "task-1",
+                "example/repo",
+                harness::budget::BudgetClass::Ci,
+                chrono::Utc::now(),
+            )
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(sink.seen().len(), 1);
+    }
+
+    #[test]
+    fn the_production_plane_records_next_to_the_escalation_log_and_rejects_bad_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let none = |_: &str| None;
+        let plane = resolve_escalation_plane_with(&queue, &none).unwrap();
+        let escalation = harness::escalation::Escalation::new(
+            harness::escalation::Severity::Info,
+            harness::escalation::EscalationSource::Manual,
+            "example/repo",
+            "recorded",
+        );
+        let delivered = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(plane.sink().deliver(&escalation));
+        assert!(delivered.is_ok());
+        let record =
+            std::fs::read_to_string(dir.path().join(harness::escalation::RECORD_FILE_NAME))
+                .unwrap();
+        assert!(record.contains("recorded"));
+
+        let bad = |key: &str| {
+            (key == harness::escalation::ESCALATION_WEBHOOK_URL_ENV)
+                .then(|| std::ffi::OsString::from("ftp://x/y"))
+        };
+        let err = resolve_escalation_plane_with(&queue, &bad).err().unwrap();
+        assert!(err.to_string().contains("NANNA_ESCALATION_WEBHOOK_URL"));
     }
 
     #[tokio::test]
     async fn backlog_sync_is_rules_only_without_an_audit_model() {
         wrapper_consults_the_model(
             |provider, queue| {
-                backlog_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_log()).unwrap()
+                backlog_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_plane())
+                    .unwrap()
             },
             false,
         )
@@ -2305,7 +2517,7 @@ mod tests {
                     provider,
                     queue,
                     &fixture_catalog(),
-                    quiet_log(),
+                    quiet_plane(),
                 )
                 .unwrap()
             },
@@ -2318,7 +2530,8 @@ mod tests {
     async fn delegate_is_rules_only_without_a_model() {
         wrapper_consults_the_model(
             |provider, queue| {
-                delegate_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_log()).unwrap()
+                delegate_spawn_gate(None, provider, queue, &fixture_catalog(), quiet_plane())
+                    .unwrap()
             },
             false,
         )
@@ -2334,7 +2547,7 @@ mod tests {
                     provider,
                     queue,
                     &fixture_catalog(),
-                    quiet_log(),
+                    quiet_plane(),
                 )
                 .unwrap()
             },
@@ -2352,7 +2565,7 @@ mod tests {
                     provider,
                     queue,
                     &fixture_catalog(),
-                    quiet_log(),
+                    quiet_plane(),
                 )
                 .unwrap()
             },
@@ -2414,9 +2627,10 @@ mod tests {
 
     #[test]
     fn the_delegate_task_manager_attaches_the_model_only_when_one_is_given() {
-        let with_model = build_delegate_task_manager(offline_provider(), Some("delegate-model"));
+        let with_model =
+            build_delegate_task_manager(offline_provider(), Some("delegate-model"), quiet_plane());
         assert_eq!(with_model.action_gate().auditor_name(), "delegate-model");
-        let without = build_delegate_task_manager(offline_provider(), None);
+        let without = build_delegate_task_manager(offline_provider(), None, quiet_plane());
         assert_eq!(
             without.action_gate().auditor_name(),
             RULE_ACTION_AUDITOR_NAME
