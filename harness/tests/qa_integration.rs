@@ -318,6 +318,11 @@ fn enforce_runtime_reports_availability_when_not_required() {
 }
 
 #[test]
+fn require_runtime_or_skip_accepts_an_available_runtime_whatever_the_environment() {
+    assert!(require_runtime_or_skip(&ContainerRuntime::Podman));
+}
+
+#[test]
 #[should_panic(expected = "NANNA_REQUIRE_RUNTIME=1 requires one")]
 fn enforce_runtime_panics_when_required_and_absent() {
     enforce_runtime(&ContainerRuntime::None, Some("1"));
