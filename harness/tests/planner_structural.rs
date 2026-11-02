@@ -39,6 +39,11 @@ const FORBIDDEN_PAIRS: &[(&str, &str)] = &[
 #[derive(Default)]
 struct Idents {
     sequence: Vec<String>,
+    aliases: Vec<String>,
+}
+
+fn watched(name: &str) -> bool {
+    FORBIDDEN.contains(&name) || matches!(name, "SpawnGate" | "Allowed")
 }
 
 fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
@@ -66,6 +71,23 @@ impl<'ast> Visit<'ast> for Idents {
         }
     }
 
+    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+        if watched(&node.ident.to_string()) {
+            self.aliases
+                .push(format!("renames {} as {}", node.ident, node.rename));
+        }
+    }
+
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        let mut mentioned = Idents::default();
+        mentioned.visit_type(&node.ty);
+        if mentioned.sequence.iter().any(|name| watched(name)) {
+            self.aliases
+                .push(format!("aliases a watched type as {}", node.ident));
+        }
+        syn::visit::visit_item_type(self, node);
+    }
+
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
         self.sequence.push(ident.to_string());
     }
@@ -75,11 +97,15 @@ impl<'ast> Visit<'ast> for Idents {
     }
 }
 
-fn production_idents(source: &str) -> Vec<String> {
+fn scan(source: &str) -> Idents {
     let file = syn::parse_file(source).unwrap();
     let mut idents = Idents::default();
     idents.visit_file(&file);
-    idents.sequence
+    idents
+}
+
+fn production_idents(source: &str) -> Vec<String> {
+    scan(source).sequence
 }
 
 fn function_idents(source: &str, name: &str) -> Vec<String> {
@@ -96,12 +122,15 @@ fn function_idents(source: &str, name: &str) -> Vec<String> {
 }
 
 fn forbidden_constructs(source: &str) -> Vec<String> {
-    let idents = production_idents(source);
-    let mut found: Vec<String> = idents
-        .iter()
-        .filter(|ident| FORBIDDEN.contains(&ident.as_str()))
-        .map(|ident| format!("uses {ident}"))
-        .collect();
+    let scanned = scan(source);
+    let idents = scanned.sequence;
+    let mut found: Vec<String> = scanned.aliases;
+    found.extend(
+        idents
+            .iter()
+            .filter(|ident| FORBIDDEN.contains(&ident.as_str()))
+            .map(|ident| format!("uses {ident}")),
+    );
     for pair in idents.windows(2) {
         if FORBIDDEN_PAIRS.contains(&(pair[0].as_str(), pair[1].as_str())) {
             found.push(format!("calls {}::{}", pair[0], pair[1]));
@@ -161,8 +190,14 @@ fn the_checker_sees_forbidden_constructs_in_code_and_macro_bodies_but_not_in_tes
         fn d() { enqueue_all(); Allowed::new(r, i); }
         fn f() { tokio::spawn(work()); }
         mod inner { fn g() { let _ = AuditedIdentity::split(proof); } }
+        use crate::auditor::SpawnGate as Gx;
+        type Gy = SpawnGate;
+        use crate::auditor::AuditLog as L;
+        use std::fmt::Debug as D;
+        type Fine = Vec<u8>;
+        fn h() { let _ = Gx::new(a, b, c); let _ = Gy::new(a, b, c); }
         #[cfg(test)]
-        mod tests { fn e() { SpawnGate::new(x, y, z); AuditLog::in_memory(); } }
+        mod tests { fn e() { SpawnGate::new(x, y, z); RuleAuditor::new(); } }
     "#;
     let found = forbidden_constructs(source);
     for expected in [
@@ -173,10 +208,16 @@ fn the_checker_sees_forbidden_constructs_in_code_and_macro_bodies_but_not_in_tes
         "calls Allowed::new",
         "calls tokio::spawn",
         "uses AuditedIdentity",
+        "renames SpawnGate as Gx",
+        "aliases a watched type as Gy",
+        "renames AuditLog as L",
     ] {
         assert!(found.iter().any(|f| f == expected), "{expected}: {found:?}");
     }
-    assert!(!found.iter().any(|f| f.contains("AuditLog")));
+    assert!(!found.iter().any(|f| f.contains("RuleAuditor")));
+    assert!(!found
+        .iter()
+        .any(|f| f.contains("as D") || f.contains("Fine")));
 }
 
 #[test]
