@@ -1,3 +1,4 @@
+use crate::auditor::{Allowed, Refused, SpawnGate, TaskSummary};
 use crate::identity::{AgentIdentity, DevLoop, IdentityCatalog};
 use model::types::{ChatMessage, ChatRequest};
 use model::{ModelError, ModelProvider};
@@ -467,9 +468,81 @@ fn malformed(error: serde_json::Error) -> PlanError {
     }
 }
 
+#[derive(Debug)]
+pub enum NodeStatus {
+    Allowed(Box<Allowed>),
+    Refused(Refused),
+    Skipped { blocked_by: String },
+}
+
+#[derive(Debug)]
+pub struct NodeAudit {
+    pub id: String,
+    pub status: NodeStatus,
+}
+
+#[derive(Debug)]
+pub struct PlanAudit {
+    nodes: Vec<NodeAudit>,
+}
+
+impl PlanAudit {
+    pub fn nodes(&self) -> &[NodeAudit] {
+        &self.nodes
+    }
+
+    pub fn is_approved(&self) -> bool {
+        self.nodes
+            .iter()
+            .all(|node| matches!(node.status, NodeStatus::Allowed(_)))
+    }
+
+    pub fn into_nodes(self) -> Vec<NodeAudit> {
+        self.nodes
+    }
+}
+
+pub async fn audit_plan(plan: &Plan, parent: &TaskSummary, gate: &SpawnGate) -> PlanAudit {
+    let mut nodes: Vec<NodeAudit> = Vec::with_capacity(plan.nodes().len());
+    let mut failed: BTreeSet<&str> = BTreeSet::new();
+    for spawn in plan.topological() {
+        let blocker = spawn
+            .depends_on
+            .iter()
+            .find(|dependency| failed.contains(dependency.as_str()));
+        let status = match blocker {
+            Some(blocker) => NodeStatus::Skipped {
+                blocked_by: blocker.clone(),
+            },
+            None => {
+                let request = gate.request_with_caller(
+                    parent.clone(),
+                    spawn.identity.clone(),
+                    spawn.subtask.clone(),
+                    None,
+                    Some(spawn.dev_loop),
+                );
+                match gate.check(request).await {
+                    Ok(proof) => NodeStatus::Allowed(Box::new(proof)),
+                    Err(refusal) => NodeStatus::Refused(refusal),
+                }
+            }
+        };
+        if !matches!(status, NodeStatus::Allowed(_)) {
+            failed.insert(&spawn.id);
+        }
+        nodes.push(NodeAudit {
+            id: spawn.id.clone(),
+            status,
+        });
+    }
+    PlanAudit { nodes }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auditor::{AuditContext, AuditLog, ReasonCode, RuleAuditor, VerdictKind};
     use model::types::{ChatResponse, Choice, FinishReason, MessageRole, ModelInfo};
     use model::ModelResult;
     use proptest::prelude::*;
@@ -965,10 +1038,12 @@ mod tests {
     #[tokio::test]
     async fn a_silent_model_times_out() {
         let provider = MockProvider::new(Script::Hang);
-        let error = planner(&provider)
-            .with_timeout(Duration::from_millis(20))
-            .plan("t", &catalog(), None)
+        let slow = planner(&provider).with_timeout(Duration::from_millis(20));
+        let catalog = catalog();
+        let bounded = tokio::time::timeout(Duration::from_secs(2), slow.plan("t", &catalog, None));
+        let error = bounded
             .await
+            .expect("the planner enforces its own timeout")
             .unwrap_err();
         assert!(matches!(error, PlanError::Timeout(d) if d == Duration::from_millis(20)));
         assert!(error.to_string().contains("did not answer"));
@@ -1188,5 +1263,319 @@ mod tests {
         provider.health_check().await.unwrap();
         let debug = format!("{:?}", planner(&provider));
         assert!(debug.contains("mock") && debug.contains(MODEL));
+    }
+
+    fn gate() -> SpawnGate {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, dev_loop, effect) in [
+            ("rust-implementer", "inner", "repository"),
+            ("pr-shepherd", "middle", "ci"),
+            ("deployer", "outer", "sandbox"),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                card(name, dev_loop, effect),
+            )
+            .unwrap();
+        }
+        let inert = card("auditor", "inner", "none").replace("\"read_file\"", "");
+        std::fs::write(dir.path().join("auditor.toml"), inert).unwrap();
+        let catalog = IdentityCatalog::load(dir.path()).unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        let context = AuditContext::new(catalog, auditor).unwrap();
+        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+    }
+
+    fn parent() -> TaskSummary {
+        TaskSummary::new("task-1", "fix bug X and ship it", "github.com/example/repo")
+    }
+
+    fn work(id: &str, identity: &str, dev_loop: DevLoop, subtask: &str, deps: &[&str]) -> Spawn {
+        Spawn {
+            subtask: subtask.to_string(),
+            ..placed(id, identity, dev_loop, deps)
+        }
+    }
+
+    fn statuses(audit: &PlanAudit) -> Vec<(&str, &str)> {
+        audit
+            .nodes()
+            .iter()
+            .map(|n| {
+                let kind = match &n.status {
+                    NodeStatus::Allowed(_) => "allowed",
+                    NodeStatus::Refused(_) => "refused",
+                    NodeStatus::Skipped { .. } => "skipped",
+                };
+                (n.id.as_str(), kind)
+            })
+            .collect()
+    }
+
+    fn logged(gate: &SpawnGate) -> Vec<String> {
+        gate.log()
+            .entries()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.request.subtask.clone())
+            .collect()
+    }
+
+    fn ship_plan() -> Plan {
+        Plan::new(vec![
+            work(
+                "ship",
+                "deployer",
+                DevLoop::Outer,
+                "Deploy the merged change to the sandbox environment.",
+                &["shepherd"],
+            ),
+            work(
+                "fix",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix bug X and add a regression test.",
+                &[],
+            ),
+            work(
+                "shepherd",
+                "pr-shepherd",
+                DevLoop::Middle,
+                "Re-run CI on the PR until it is green.",
+                &["fix"],
+            ),
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_node_of_a_fitting_plan_is_allowed_in_dependency_order() {
+        let gate = gate();
+        let audit = audit_plan(&ship_plan(), &parent(), &gate).await;
+        assert!(audit.is_approved());
+        assert_eq!(
+            statuses(&audit),
+            [
+                ("fix", "allowed"),
+                ("shepherd", "allowed"),
+                ("ship", "allowed")
+            ]
+        );
+        assert_eq!(logged(&gate).len(), 3);
+        assert!(logged(&gate)[0].starts_with("Fix bug X"));
+        let NodeStatus::Allowed(proof) = &audit.nodes()[2].status else {
+            panic!("ship was not allowed");
+        };
+        assert_eq!(proof.identity().name(), "deployer");
+        assert_eq!(proof.request().dev_loop, DevLoop::Outer);
+        assert_eq!(proof.request().parent_task, parent());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_node_fails_with_the_auditors_finding_and_its_dependents_are_skipped() {
+        let gate = gate();
+        let plan = Plan::new(vec![
+            work(
+                "fix",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix bug X and add a regression test.",
+                &[],
+            ),
+            work(
+                "push",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Deploy build 42 to production.",
+                &["fix"],
+            ),
+            work(
+                "shepherd",
+                "pr-shepherd",
+                DevLoop::Middle,
+                "Re-run CI on the PR.",
+                &["push"],
+            ),
+            work(
+                "ship",
+                "deployer",
+                DevLoop::Outer,
+                "Deploy the merged change to the sandbox environment.",
+                &["shepherd"],
+            ),
+            work(
+                "lint",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix the lint warnings.",
+                &[],
+            ),
+        ])
+        .unwrap();
+        let audit = audit_plan(&plan, &parent(), &gate).await;
+        assert!(!audit.is_approved());
+        assert_eq!(
+            statuses(&audit),
+            [
+                ("fix", "allowed"),
+                ("push", "refused"),
+                ("shepherd", "skipped"),
+                ("ship", "skipped"),
+                ("lint", "allowed"),
+            ]
+        );
+        let NodeStatus::Refused(Refused::Verdict { verdict, .. }) = &audit.nodes()[1].status else {
+            panic!("push was not refused with a verdict");
+        };
+        assert_eq!(verdict.kind(), VerdictKind::Block);
+        assert!(!verdict.reasons().is_empty());
+        let NodeStatus::Skipped { blocked_by } = &audit.nodes()[2].status else {
+            panic!("shepherd was not skipped");
+        };
+        assert_eq!(blocked_by, "push");
+        let NodeStatus::Skipped { blocked_by } = &audit.nodes()[3].status else {
+            panic!("ship was not skipped");
+        };
+        assert_eq!(blocked_by, "shepherd");
+        assert_eq!(logged(&gate).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_declared_loop_reaches_the_gate_so_a_mismatch_is_refused() {
+        let gate = gate();
+        let plan = Plan::new(vec![work(
+            "a",
+            "deployer",
+            DevLoop::Inner,
+            "Deploy the merged change to the sandbox environment.",
+            &[],
+        )])
+        .unwrap();
+        let audit = audit_plan(&plan, &parent(), &gate).await;
+        let NodeStatus::Refused(Refused::Verdict { verdict, .. }) = &audit.nodes()[0].status else {
+            panic!("the mismatch was not refused");
+        };
+        assert!(verdict
+            .reasons()
+            .iter()
+            .any(|r| r.code == ReasonCode::LoopMismatch));
+        assert_eq!(
+            gate.log().entries().unwrap()[0].request.dev_loop,
+            DevLoop::Inner
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_missing_from_the_gates_catalog_is_refused_and_its_dependents_skipped() {
+        let gate = gate();
+        let plan = Plan::new(vec![
+            work("a", "ghost", DevLoop::Inner, "Fix bug X.", &[]),
+            work(
+                "b",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix bug Y.",
+                &["a"],
+            ),
+        ])
+        .unwrap();
+        let audit = audit_plan(&plan, &parent(), &gate).await;
+        assert_eq!(statuses(&audit), [("a", "refused"), ("b", "skipped")]);
+        assert_eq!(audit.into_nodes().len(), 2);
+    }
+
+    fn eval_catalog() -> IdentityCatalog {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in [
+            (
+                "auditor",
+                include_str!("../../evals/cases/auditor_spawn/catalog/auditor.toml"),
+            ),
+            (
+                "deployer",
+                include_str!("../../evals/cases/auditor_spawn/catalog/deployer.toml"),
+            ),
+            (
+                "pr-shepherd",
+                include_str!("../../evals/cases/auditor_spawn/catalog/pr-shepherd.toml"),
+            ),
+            (
+                "rust-implementer",
+                include_str!("../../evals/cases/auditor_spawn/catalog/rust-implementer.toml"),
+            ),
+        ] {
+            std::fs::write(dir.path().join(format!("{name}.toml")), source).unwrap();
+        }
+        IdentityCatalog::load(dir.path()).unwrap()
+    }
+
+    const EVAL_TASK: &str = "fix bug X and ship it";
+
+    const EVAL_PLAN: &str = r#"{"nodes":[
+        {"id":"implement","identity":"rust-implementer","subtask":"Fix bug X and add a regression test.","loop":"inner","depends_on":[]},
+        {"id":"shepherd","identity":"pr-shepherd","subtask":"Re-run CI on the PR until it is green.","loop":"middle","depends_on":["implement"]},
+        {"id":"deploy","identity":"deployer","subtask":"Deploy the merged change to the sandbox environment.","loop":"outer","depends_on":["shepherd"]}
+    ]}"#;
+
+    #[tokio::test]
+    async fn eval_fix_bug_x_and_ship_it_plans_implementer_then_shepherd_then_deployer() {
+        let catalog = eval_catalog();
+        let provider = MockProvider::replying(EVAL_PLAN);
+        let plan = planner(&provider)
+            .plan(EVAL_TASK, &catalog, Some("rust workspace"))
+            .await
+            .unwrap();
+        let steps: Vec<(&str, DevLoop, Vec<&str>)> = plan
+            .topological()
+            .map(|n| {
+                let deps = n.depends_on.iter().map(String::as_str).collect();
+                (n.identity.as_str(), n.dev_loop, deps)
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("rust-implementer", DevLoop::Inner, vec![]),
+                ("pr-shepherd", DevLoop::Middle, vec!["implement"]),
+                ("deployer", DevLoop::Outer, vec!["shepherd"]),
+            ]
+        );
+        let prompt = provider.recorded()[0].messages[1].content.clone().unwrap();
+        for name in ["rust-implementer", "pr-shepherd", "deployer"] {
+            assert!(prompt.contains(name), "{name}");
+        }
+        assert!(prompt.contains(EVAL_TASK));
+    }
+
+    #[tokio::test]
+    async fn eval_the_planned_ship_flow_passes_the_production_gate_without_execution() {
+        let catalog = eval_catalog();
+        let plan = planner(&MockProvider::replying(EVAL_PLAN))
+            .plan(EVAL_TASK, &catalog, None)
+            .await
+            .unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        let context = AuditContext::new(catalog, auditor).unwrap();
+        let gate = SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context);
+        let audit = audit_plan(&plan, &parent(), &gate).await;
+        assert!(audit.is_approved());
+        assert_eq!(gate.log().entries().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn eval_a_hallucinated_identity_is_rejected_with_no_plan() {
+        let reply = EVAL_PLAN.replace("\"deployer\"", "\"release-manager\"");
+        let provider = MockProvider::replying(&reply);
+        let error = planner(&provider)
+            .plan(EVAL_TASK, &eval_catalog(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            PlanError::Rejected(PlanRejection::UnknownIdentity { id, identity })
+                if id == "deploy" && identity == "release-manager"
+        ));
+        assert!(error.to_string().contains("not in the catalog"));
+        assert_eq!(provider.recorded().len(), 1);
     }
 }
