@@ -459,9 +459,9 @@ impl SandboxDeployTool {
         &self,
         template: &DeployTemplate,
         handle: &SandboxHandle,
-    ) -> ToolResult<(ManifestReport, usize, &'static str)> {
-        let (mut manifest, source) =
-            load_manifest(&self.workspace_root, template).map_err(map_sandbox_error)?;
+    ) -> Result<(ManifestReport, usize, &'static str), String> {
+        let (mut manifest, source) = load_manifest(&self.workspace_root, template)
+            .map_err(|e| fenced_text(&e.to_string(), ERROR_CAP))?;
         let omitted = manifest.checks.len().saturating_sub(MAX_CHECKS);
         manifest.checks.truncate(MAX_CHECKS);
         let probe = Arc::clone(&self.probe);
@@ -469,28 +469,19 @@ impl SandboxDeployTool {
         let report =
             tokio::task::spawn_blocking(move || ManifestChecker::new(probe).run(&url, &manifest))
                 .await
-                .map_err(|e| ToolError::ExecutionFailed {
-                    message: format!("the sandbox QA task failed: {e}"),
-                })?;
+                .map_err(|e| format!("the sandbox QA task failed: {e}"))?;
         Ok((report, omitted, source))
     }
 
-    async fn tear_down_after_failed_qa(
-        &self,
-        handle: &SandboxHandle,
-        cause: ToolError,
-    ) -> ToolError {
+    async fn tear_down_after_failed_qa(&self, handle: &SandboxHandle, cause: String) -> ToolError {
         let target = Arc::clone(&self.target);
         let to_tear = handle.clone();
         let outcome = tokio::task::spawn_blocking(move || target.teardown(&to_tear)).await;
         if !matches!(outcome, Ok(Ok(()))) {
-            return match cause {
-                ToolError::ExecutionFailed { message } => ToolError::ExecutionFailed {
-                    message: format!(
-                        "{message}; the sandbox could not be torn down and stays registered for cleanup"
-                    ),
-                },
-                other => other,
+            return ToolError::ExecutionFailed {
+                message: format!(
+                    "{cause}; the sandbox could not be torn down and stays registered for cleanup"
+                ),
             };
         }
         self.sandboxes.remove(&self.task_id);
@@ -509,7 +500,7 @@ impl SandboxDeployTool {
         {
             tracing::warn!("a sandbox torn down after failed QA could not be recorded: {e}");
         }
-        cause
+        ToolError::ExecutionFailed { message: cause }
     }
 
     async fn settle_failed_deploy(&self, repo: &str) {
@@ -2663,5 +2654,20 @@ mod tests {
             .unwrap();
         assert_eq!(done["torn_down"], true);
         assert!(accountant.task_summary("sb-agent", "t1").sandbox.minutes >= 12.0);
+    }
+
+    #[tokio::test]
+    async fn a_ledger_that_cannot_record_the_lifetime_does_not_change_the_failed_qa_error() {
+        let (dir, _, sandboxes, _) = setup();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(RecordFails(InMemoryBudgetStore::new())),
+            BudgetConfig::UNLIMITED,
+        ));
+        let aged = Arc::new(AgedTarget(FakeSandboxTarget::new()));
+        let tool = aged_deploy_tool(dir.path(), &aged, &sandboxes, &accountant);
+        let err = tool.execute(json!({"image_tag": "v1"})).await.unwrap_err();
+        assert!(failure_message(err).contains("path must start with"));
+        assert!(sandboxes.get("t1").is_none());
+        assert_eq!(aged.0.torn_down().len(), 1);
     }
 }
