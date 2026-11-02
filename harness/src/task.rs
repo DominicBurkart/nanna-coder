@@ -7427,6 +7427,28 @@ mod spawn_tests {
     }
 
     #[tokio::test]
+    async fn test_cancelling_a_queued_unaudited_task_drops_its_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let id = manager
+            .submit_with_identity(
+                "Add a regression test.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+                Some(crate::identity::example()),
+            )
+            .await;
+        let (audited, _) = manager.bound_identity_of(&id).await.unwrap();
+        assert!(!audited);
+        manager.cancel(&id).await.unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_a_cancel_of_a_dispatched_task_leaves_its_entry_for_the_run_to_resolve() {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = TaskManager::new(1);
