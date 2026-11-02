@@ -61,14 +61,15 @@ fn runtime_gate(available: bool, require: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn require_runtime_or_skip(runtime: &ContainerRuntime) -> bool {
-    if let Err(message) = runtime_gate(
-        runtime.is_available(),
-        std::env::var(REQUIRE_RUNTIME_ENV).ok().as_deref(),
-    ) {
+fn enforce_runtime(runtime: &ContainerRuntime, require: Option<&str>) -> bool {
+    if let Err(message) = runtime_gate(runtime.is_available(), require) {
         panic!("{message}");
     }
     runtime.is_available()
+}
+
+fn require_runtime_or_skip(runtime: &ContainerRuntime) -> bool {
+    enforce_runtime(runtime, std::env::var(REQUIRE_RUNTIME_ENV).ok().as_deref())
 }
 
 fn fixture_root() -> PathBuf {
@@ -311,11 +312,15 @@ fn runtime_gate_fails_loudly_when_absent_and_required() {
 }
 
 #[test]
-fn require_runtime_or_skip_reports_availability_when_not_required() {
-    if std::env::var(REQUIRE_RUNTIME_ENV).as_deref() == Ok("1") {
-        return;
-    }
-    assert!(!require_runtime_or_skip(&ContainerRuntime::None));
+fn enforce_runtime_reports_availability_when_not_required() {
+    assert!(!enforce_runtime(&ContainerRuntime::None, None));
+    assert!(enforce_runtime(&ContainerRuntime::Podman, Some("1")));
+}
+
+#[test]
+#[should_panic(expected = "NANNA_REQUIRE_RUNTIME=1 requires one")]
+fn enforce_runtime_panics_when_required_and_absent() {
+    enforce_runtime(&ContainerRuntime::None, Some("1"));
 }
 
 #[tokio::test]
