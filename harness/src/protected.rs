@@ -558,24 +558,87 @@ mod tests {
         }
     }
 
-    fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                if ![".git", "target", ".claude"].contains(&name.as_str()) {
-                    files_under(&path, out);
+    fn files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let skipped = dir == root
+                    && [".git", "target", ".claude"]
+                        .contains(&entry.file_name().to_str().unwrap_or(""));
+                if !skipped {
+                    files_under(root, &path, out);
                 }
-            } else {
+            } else if kind.is_file() {
                 out.push(path);
             }
         }
     }
 
+    #[test]
+    fn the_auditor_card_walk_skips_build_and_vcs_directories_only_at_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for relative in [
+            "target/a.toml",
+            ".git/b.toml",
+            ".claude/c.toml",
+            "x/target/d.toml",
+            "x/.git/e.toml",
+            "x/.claude/f.toml",
+            "g.toml",
+        ] {
+            let file = dir.path().join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "").unwrap();
+        }
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        let mut found: Vec<String> = found
+            .iter()
+            .map(|file| {
+                file.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "g.toml",
+                "x/.claude/f.toml",
+                "x/.git/e.toml",
+                "x/target/d.toml"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_auditor_card_walk_follows_no_symlinks_and_survives_unreadable_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("o.toml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("o.toml"), dir.path().join("l.toml"))
+            .unwrap();
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        assert!(found.is_empty(), "{found:?}");
+        files_under(dir.path(), &dir.path().join("missing"), &mut found);
+        assert!(found.is_empty());
+    }
+
     fn auditor_identity_files() -> Vec<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut files = Vec::new();
-        files_under(&root, &mut files);
+        files_under(&root, &root, &mut files);
         let mut found = Vec::new();
         for file in files {
             if file.extension().is_none_or(|ext| ext != "toml") {
