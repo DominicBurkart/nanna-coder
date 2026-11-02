@@ -1385,6 +1385,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             task.clone()
         };
         self.runner.release_leases(task_id);
+        self.runner.bound.write().await.remove(task_id);
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -1534,6 +1535,7 @@ impl TaskRunner {
         }
         if status.is_terminal() {
             self.release_leases(task_id);
+            self.bound.write().await.remove(task_id);
         }
         let senders = self.status_senders.read().await;
         if let Some((tx, _keepalive)) = senders.get(task_id) {
@@ -3458,7 +3460,7 @@ mod scheduler_tests {
         }
     }
 
-    struct RejectingStore;
+    pub(super) struct RejectingStore;
 
     impl QueueStore for RejectingStore {
         fn load(&self) -> Result<Vec<QueuedTask>, QueueStoreError> {
@@ -5372,6 +5374,33 @@ mod identity_tests {
     }
 
     #[tokio::test]
+    async fn test_cancelling_a_restored_queued_entry_drops_its_audited_bound_entry() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let benign = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let store = InMemoryQueueStore::default();
+        store.insert(&benign).unwrap();
+        let gate = crate::auditor::test_support::fixture_gate();
+        let manager = TaskManager::restore_with_escalations(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            untouched_provider() as Arc<dyn ModelProvider>,
+            &fixture_catalog(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &gate,
+        )
+        .await
+        .unwrap();
+        let (audited, _) = manager.bound_identity_of(&benign.id).await.unwrap();
+        assert!(audited);
+        manager.cancel(&benign.id).await.unwrap();
+        assert!(manager.bound_identity_of(&benign.id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_restore_dispatches_the_audited_entries_and_refuses_only_the_hostile_one() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let hostile = stored_entry(repo.path(), Some("pr-shepherd"), HOSTILE);
@@ -7101,7 +7130,7 @@ mod repo_override_tests {
 
 #[cfg(test)]
 mod spawn_tests {
-    use super::scheduler_tests::git_repo;
+    use super::scheduler_tests::{git_repo, wait_for, RejectingStore};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
@@ -7206,6 +7235,172 @@ mod spawn_tests {
         let held = bound.get(&id).unwrap();
         assert!(matches!(held, BoundIdentity::Audited(_)));
         assert_eq!(held.identity(), &audited);
+    }
+
+    async fn rejecting_manager() -> TaskManager {
+        TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(RejectingStore),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn assert_persist_failed_and_unbound(manager: &TaskManager, id: &TaskId) {
+        let task = manager.poll(id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "QueuePersistFailed");
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.bound_identity_of(id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_audited_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let allowed = allowed_for("github.com/example/repo").await;
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        );
+        let id = manager.submit_audited(queued, allowed, provider()).await;
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let id = manager
+            .submit_with_identity(
+                "Add a regression test.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+                Some(crate::identity::example()),
+            )
+            .await;
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_queued_audited_task_drops_its_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_some());
+        manager.cancel(&id).await.unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_cancel_that_is_refused_keeps_the_bound_entry_of_a_live_task() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        let unknown = TaskId("never-submitted".to_string());
+        assert!(manager.cancel(&unknown).await.is_err());
+        assert!(manager.bound_identity_of(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_a_completed_audited_task_leaves_no_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        let done = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        assert!(done.status.is_terminal());
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_task_failed_before_it_resolves_its_identity_leaves_no_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_some());
+        manager
+            .runner
+            .fail(&id, "no model provider".to_string(), "NoProvider")
+            .await;
+        assert!(manager.bound_identity_of(&id).await.is_none());
     }
 
     #[tokio::test]
