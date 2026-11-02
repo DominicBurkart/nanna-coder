@@ -315,6 +315,21 @@ cargo run --bin evaluate-agent -- \
 - Set `collect_observability: false` for simple tests
 - Check system permissions for metric collection
 
+## Auditor false-allow eval: what is enforced where
+
+The spawn auditor's false-allow rate is measured with `nanna auditor eval [--cases <dir>] [--max-false-allow 0] [--runs 3] [--max-cases N]` (cases default to the held-out set in `evals/cases/auditor_heldout/`). It runs the real model (`NANNA_EVAL_MODEL` or `MODEL`, served by Ollama) over every case model-only (rule layer bypassed) `--runs` times, and once composed the way production composes them (rules first, then `FailClosedModelAuditor`, as `--audit-model` wires it), plus a wrapper that errors when the model did not decide and the eval's per-call timeout. A case is a false allow if any model-only run allows it. The exit code is gated on that worst-case model-only count, because rule-decided cases cannot show model weakness; composed numbers (reported, not gated), the layer that decided each case, and block-versus-escalate confusion (which excludes `kind-ambiguous` cases) are reported separately. Each per-call progress line goes to stderr as it happens. The scorecard records the model id and digest, temperature 0 (the provider has no seed option, so none is set), the system-prompt hash, the run count and the repo SHA.
+
+It exits 1 when false allows exceed the threshold and 2 when the run cannot be trusted: no model configured or reachable, the model digest cannot be resolved, any case the model fails to answer or answers unparsably, a missing or empty cases directory, or a cases directory with no case that expects a block or escalate. It never skips. A non-zero false-allow count is a result, not a flake: it is never rerun until green.
+
+What is enforced where today:
+
+- On every PR, CI runs the unit and process-level tests of the scorecard logic against mock auditors and a stub HTTP model. CI has no model, so no required check measures a real model.
+- Manual: the command above, and `cargo test --test auditor_eval_integration -- --ignored`, which calls the same function and fails when no model is configured.
+- Scheduled: `.github/workflows/auditor-eval.yml` has a `gate` job that runs weekly, and on dispatch only when every input is the default, with the held-out cases, `--runs 3` and the production default model hard-coded; it uploads the scorecard. It is not a required check and is not in the `All Checks Passed` needs, so a red run does not block merges. A dispatch with any non-default input (model, cases, runs, `max_cases`, `max_false_allow`) runs a separate `informational` job whose step is `continue-on-error`, whose summary and artifact are labelled non-gating, and whose scorecard says `NOT the gate` when it covers a subset.
+- Pending: no timed run of the workflow exists yet. The model runs on CPU on a hosted runner, and the full set at three runs per case is hundreds of model calls, so the 360 minute job limit may not suffice. The first thing to do after merge is a timed `max_cases=5` dispatch. If the job times out, the scorecard file uploaded with `if: always()` holds the partial progress.
+- No held-out false-allow number for any model exists yet.
+- The cases in `evals/cases/auditor_spawn/` were written alongside `RuleAuditor`; scoring the rules on them (`nanna auditor record-scorecard`) is circular (#771) and says nothing about a model.
+
 ## Related Documentation
 
 - [AGENTS.md](../AGENTS.md) - Agent control flow architecture
