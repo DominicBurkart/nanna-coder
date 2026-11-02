@@ -113,6 +113,9 @@ struct Scan {
     functions: BTreeSet<String>,
     sequences: BTreeMap<String, Calls>,
     audit_tokens: BTreeSet<String>,
+    bound_mentions: BTreeMap<String, usize>,
+    bound_ops: BTreeMap<String, usize>,
+    bound_guarded: BTreeMap<String, usize>,
 }
 
 impl Scan {
@@ -145,6 +148,23 @@ impl Scan {
         }
     }
 
+    fn record_bound_mention(&mut self) {
+        let function = self.function.last().cloned().unwrap_or_default();
+        *self
+            .bound_mentions
+            .entry(format!("{}: {function}", self.file))
+            .or_default() += 1;
+    }
+
+    fn record_bound_op(&mut self, method: &str) {
+        let function = self.function.last().cloned().unwrap_or_default();
+        let key = format!("{}: {function} bound.{}", self.file, plain(method));
+        if !self.branch.is_empty() {
+            *self.bound_guarded.entry(key.clone()).or_default() += 1;
+        }
+        *self.bound_ops.entry(key).or_default() += 1;
+    }
+
     fn record_token_shape(&mut self, what: &str) {
         self.audit_tokens
             .insert(format!("{}: token shape: {what}", self.file));
@@ -159,8 +179,15 @@ impl Scan {
     fn scan_tokens(&mut self, tokens: TokenStream) {
         let mut previous = String::new();
         let mut pending_type = false;
+        let mut after_dot = false;
         for token in tokens {
+            let was_dot = std::mem::take(&mut after_dot);
             match token {
+                TokenTree::Punct(punct) => {
+                    after_dot = punct.as_char() == '.';
+                    pending_type = false;
+                }
+                TokenTree::Literal(_) => pending_type = false,
                 TokenTree::Group(group) => {
                     if pending_type && group.delimiter() == proc_macro2::Delimiter::Brace {
                         self.record_token_use("AuditedIdentity");
@@ -170,6 +197,9 @@ impl Scan {
                 }
                 TokenTree::Ident(ident) => {
                     let name = plain(&ident.to_string()).to_string();
+                    if was_dot && name == "bound" {
+                        self.record_bound_mention();
+                    }
                     self.record_call(&name);
                     if let Some(what) = token_use(&previous, &name) {
                         self.record_token_use(what);
@@ -179,7 +209,6 @@ impl Scan {
                             && self.owner.last().is_some_and(|o| o == "AuditedIdentity"));
                     previous = name;
                 }
-                _ => pending_type = false,
             }
         }
     }
@@ -293,6 +322,9 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         syn::visit::visit_expr_method_call(self, node);
         self.record_call(&node.method.to_string());
+        if rooted_at_bound(&node.receiver) {
+            self.record_bound_op(&node.method.to_string());
+        }
         if node.method == "write" {
             if let syn::Expr::Field(field) = &*node.receiver {
                 if let syn::Member::Named(member) = &field.member {
@@ -303,6 +335,13 @@ impl<'ast> Visit<'ast> for Scan {
                     }
                 }
             }
+        }
+    }
+
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        syn::visit::visit_expr_field(self, node);
+        if names_bound(&node.member) {
+            self.record_bound_mention();
         }
     }
 
@@ -380,6 +419,22 @@ impl<'ast> Visit<'ast> for Scan {
                 .insert(format!("{}: include! macro", self.file));
         }
         self.scan_tokens(node.tokens.clone());
+    }
+}
+
+fn names_bound(member: &syn::Member) -> bool {
+    matches!(member, syn::Member::Named(name) if plain(&name.to_string()) == "bound")
+}
+
+fn rooted_at_bound(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Field(field) => names_bound(&field.member),
+        syn::Expr::MethodCall(call) => rooted_at_bound(&call.receiver),
+        syn::Expr::Await(awaited) => rooted_at_bound(&awaited.base),
+        syn::Expr::Paren(paren) => rooted_at_bound(&paren.expr),
+        syn::Expr::Reference(reference) => rooted_at_bound(&reference.expr),
+        syn::Expr::Unary(unary) => rooted_at_bound(&unary.expr),
+        _ => false,
     }
 }
 
@@ -897,4 +952,121 @@ fn indirect_routes_to_the_token_constructor_and_widened_derives_are_seen() {
     );
     assert_eq!(token_use("BoundIdentity", "Unaudited"), None);
     assert_eq!(token_use("Other", "split"), None);
+}
+
+fn union_counts(select: impl Fn(&Scan) -> &BTreeMap<String, usize>) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for scan in scan_all() {
+        for (key, count) in select(&scan) {
+            *counts.entry(key.clone()).or_default() += count;
+        }
+    }
+    counts
+}
+
+fn counts(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+    entries
+        .iter()
+        .map(|(key, count)| (key.to_string(), *count))
+        .collect()
+}
+
+#[test]
+fn every_production_mention_of_the_bound_identity_map_is_counted_per_function() {
+    assert_eq!(
+        union_counts(|scan| &scan.bound_mentions),
+        counts(&[
+            ("task.rs: TaskManager::admit_restored", 1),
+            ("task.rs: TaskManager::cancel", 1),
+            ("task.rs: TaskManager::submit_audited", 1),
+            ("task.rs: TaskManager::submit_bound", 1),
+            ("task.rs: TaskRunner::resolve_identity", 1),
+            ("task.rs: TaskRunner::set_status", 1),
+        ]),
+        "a production function started or stopped touching `runner.bound`, or reaches it through an alias, helper or macro; review that every insert still has a remove"
+    );
+}
+
+#[test]
+fn every_production_operation_on_the_bound_identity_map_is_counted_per_function() {
+    assert_eq!(
+        union_counts(|scan| &scan.bound_ops),
+        counts(&[
+            ("task.rs: TaskManager::admit_restored bound.insert", 1),
+            ("task.rs: TaskManager::admit_restored bound.write", 1),
+            ("task.rs: TaskManager::cancel bound.remove", 1),
+            ("task.rs: TaskManager::cancel bound.write", 1),
+            ("task.rs: TaskManager::submit_audited bound.insert", 1),
+            ("task.rs: TaskManager::submit_audited bound.write", 1),
+            ("task.rs: TaskManager::submit_bound bound.insert", 1),
+            ("task.rs: TaskManager::submit_bound bound.write", 1),
+            ("task.rs: TaskRunner::resolve_identity bound.remove", 1),
+            ("task.rs: TaskRunner::resolve_identity bound.write", 1),
+            ("task.rs: TaskRunner::set_status bound.remove", 1),
+            ("task.rs: TaskRunner::set_status bound.write", 1),
+        ]),
+        "an insert into or removal from `runner.bound` was added, removed or moved to another function; every insert site needs a matching remove path"
+    );
+}
+
+#[test]
+fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_status() {
+    let ops = union_counts(|scan| &scan.bound_ops);
+    let sites = |method: &str| -> BTreeSet<String> {
+        ops.keys()
+            .filter_map(|key| key.strip_suffix(&format!(" bound.{method}")))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        sites("insert"),
+        expected(&[
+            "task.rs: TaskManager::admit_restored",
+            "task.rs: TaskManager::submit_audited",
+            "task.rs: TaskManager::submit_bound",
+        ])
+    );
+    assert_eq!(
+        sites("remove"),
+        expected(&[
+            "task.rs: TaskManager::cancel",
+            "task.rs: TaskRunner::resolve_identity",
+            "task.rs: TaskRunner::set_status",
+        ])
+    );
+    let status = calls_in("TaskRunner::set_status", "task.rs");
+    assert!(dominates(&status, "is_terminal", "remove"));
+    let guarded_removes: BTreeMap<String, usize> = union_counts(|scan| &scan.bound_guarded)
+        .into_iter()
+        .filter(|(key, _)| key.ends_with(" bound.remove"))
+        .collect();
+    assert_eq!(
+        guarded_removes,
+        counts(&[
+            ("task.rs: TaskManager::cancel bound.remove", 1),
+            ("task.rs: TaskRunner::set_status bound.remove", 1),
+        ])
+    );
+    let submit = calls_in("TaskManager::submit_task", "task.rs");
+    assert!(dominates(&submit, "enqueue", "fail"));
+    let fail = calls_in("TaskRunner::fail", "task.rs");
+    assert!(fail.iter().any(|(name, _)| name == "set_status"));
+}
+
+#[test]
+fn the_bound_scanner_sees_raw_identifiers_aliases_macros_and_ignores_cfg_test_items() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(r: R) { r.r#bound.write().await.r#insert(1, 2); } \
+         fn g(r: R) { let b = &r.bound; } \
+         fn h(r: R) { m!(r.bound.write().await.insert(1, 2)); } \
+         #[cfg(test)] fn t(r: R) { r.bound.write().await.insert(1, 2); }",
+    );
+    assert_eq!(scan.bound_ops["x.rs: f bound.insert"], 1);
+    assert_eq!(scan.bound_ops["x.rs: f bound.write"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: f"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: g"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: h"], 1);
+    assert!(!scan.bound_mentions.contains_key("x.rs: t"));
+    assert!(!scan.bound_ops.contains_key("x.rs: h bound.insert"));
 }
