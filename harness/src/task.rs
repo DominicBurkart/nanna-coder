@@ -4006,15 +4006,13 @@ mod identity_tests {
     async fn test_the_shared_constructor_installs_every_layer_for_scoped_and_unscoped_tasks() {
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-layers", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
         for id in [Some(&identity), None] {
-            let layers =
-                manager
-                    .runner
-                    .model_facing_layers(&TaskId("t-layers".to_string()), &queued, id);
+            let layers = manager.runner.model_facing_layers(&task_id, &queued, id);
             let registry = model_facing_registry(&workspace, id, layers).unwrap();
             assert_eq!(
                 registry.installed_layers(),
@@ -4024,6 +4022,17 @@ mod identity_tests {
         let bare = workspace.build_tool_registry_for(&identity).unwrap();
         assert_ne!(bare.installed_layers(), crate::tools::InstalledLayers::ALL);
         workspace.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_no_task_workspace_in_this_module_is_created_under_a_literal_task_id() {
+        let source = include_str!("task.rs");
+        let needle = ["TaskWorkspace::create(", "repo.path(), \""].concat();
+        let literal_calls: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .collect();
+        assert!(literal_calls.is_empty(), "{literal_calls:#?}");
     }
 
     struct ProductionStub;
@@ -4065,11 +4074,11 @@ mod identity_tests {
         use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-hold", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
-        let task_id = TaskId("t-hold".to_string());
         let build = |log: Arc<EscalationLog>| {
             let mut layers = manager
                 .runner
@@ -4634,15 +4643,14 @@ mod identity_tests {
     fn test_the_sandbox_pr_is_taken_from_the_action_subject_the_lease_is_keyed_by_and_nowhere_else()
     {
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-bindpr", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = ci_scoped_identity();
-        let layers = manager.runner.model_facing_layers(
-            &TaskId("t-bindpr".to_string()),
-            &queued,
-            Some(&identity),
-        );
+        let layers = manager
+            .runner
+            .model_facing_layers(&task_id, &queued, Some(&identity));
         assert_eq!(layers.subject.pr, None);
         workspace.bind_sandbox_pr(&layers.subject);
         assert_eq!(workspace.sandbox_pr(), None);
@@ -7086,7 +7094,7 @@ mod repo_override_tests {
                 .unwrap();
         assert_eq!(on_host, NARROWING);
 
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-tamper", "HEAD").unwrap();
+        let mut workspace = TaskWorkspace::create(repo.path(), &TaskId::new().0, "HEAD").unwrap();
         install_override(&workspace.workspace_path, "rust-implementer.toml", &widened);
         let resolved = manager
             .runner
