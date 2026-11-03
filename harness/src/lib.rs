@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod monitoring;
 pub mod observability;
 pub mod onboarding;
+pub mod plan_dispatch;
 pub mod planner;
 pub mod pod;
 pub mod pr_tools;
