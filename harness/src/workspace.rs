@@ -2220,7 +2220,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 48] = [
+    const PLACEHOLDER_FILES: [&str; 49] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -2269,6 +2269,7 @@ mod tests {
         "harness/tests/fixtures/identities/global/prompts/auditor.md",
         "harness/tests/fixtures/one_track/catalog/auditor.toml",
         "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/planner_structural.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -2345,6 +2346,7 @@ mod tests {
             "harness/tests/fixtures/identities/global/prompts/auditor.md",
             "harness/tests/fixtures/one_track/catalog/auditor.toml",
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))

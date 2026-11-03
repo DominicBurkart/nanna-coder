@@ -4755,7 +4755,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 73] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 74] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4879,6 +4879,10 @@ mod tests {
         (
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
             "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        ),
+        (
+            "harness/tests/planner_structural.rs",
+            "harness/tests/planner_structural.rs",
         ),
     ];
 

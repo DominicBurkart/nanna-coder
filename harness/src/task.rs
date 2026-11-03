@@ -4013,15 +4013,13 @@ mod identity_tests {
     async fn test_the_shared_constructor_installs_every_layer_for_scoped_and_unscoped_tasks() {
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-layers", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
         for id in [Some(&identity), None] {
-            let layers =
-                manager
-                    .runner
-                    .model_facing_layers(&TaskId("t-layers".to_string()), &queued, id);
+            let layers = manager.runner.model_facing_layers(&task_id, &queued, id);
             let registry = model_facing_registry(&workspace, id, layers).unwrap();
             assert_eq!(
                 registry.installed_layers(),
@@ -4031,6 +4029,48 @@ mod identity_tests {
         let bare = workspace.build_tool_registry_for(&identity).unwrap();
         assert_ne!(bare.installed_layers(), crate::tools::InstalledLayers::ALL);
         workspace.cleanup().unwrap();
+    }
+
+    fn literal_id_workspace_calls(source: &str) -> Vec<String> {
+        let call = [
+            "TaskWorkspace::create",
+            r"\w*\(",
+            r#"\s*(?:[^,()]|\([^()]*\))*,\s*""#,
+        ]
+        .concat();
+        regex::Regex::new(&call)
+            .unwrap()
+            .find_iter(source)
+            .map(|m| m.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_no_task_workspace_in_this_module_is_created_under_a_literal_task_id() {
+        let found = literal_id_workspace_calls(include_str!("task.rs"));
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn test_the_literal_id_scan_sees_every_call_shape_and_ignores_variable_ids() {
+        let shapes = [
+            "TaskWorkspace::create(repo.path(), \"x\", \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    \"x\",\n    \"HEAD\",\n)",
+            "TaskWorkspace::create(&repo, \"x\", \"HEAD\")",
+            "TaskWorkspace::create(Path::new(\"r\"), \"x\", \"HEAD\")",
+            "TaskWorkspace::create_with_container(repo.path(), \"x\", \"HEAD\", c)",
+            "TaskWorkspace::create_with_container_and_sidecars(repo.path(), \"x\", \"HEAD\", c, s)",
+        ];
+        for shape in shapes {
+            assert_eq!(literal_id_workspace_calls(shape).len(), 1, "{shape}");
+        }
+        for clean in [
+            "TaskWorkspace::create(repo.path(), &task_id.0, \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    &id,\n    \"HEAD\",\n)",
+            "TaskWorkspace::create_with_container(&repo, id, \"HEAD\", c)",
+        ] {
+            assert!(literal_id_workspace_calls(clean).is_empty(), "{clean}");
+        }
     }
 
     struct ProductionStub;
@@ -4072,11 +4112,11 @@ mod identity_tests {
         use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-hold", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
-        let task_id = TaskId("t-hold".to_string());
         let build = |log: Arc<EscalationLog>| {
             let mut layers = manager
                 .runner
@@ -4641,15 +4681,14 @@ mod identity_tests {
     fn test_the_sandbox_pr_is_taken_from_the_action_subject_the_lease_is_keyed_by_and_nowhere_else()
     {
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-bindpr", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = ci_scoped_identity();
-        let layers = manager.runner.model_facing_layers(
-            &TaskId("t-bindpr".to_string()),
-            &queued,
-            Some(&identity),
-        );
+        let layers = manager
+            .runner
+            .model_facing_layers(&task_id, &queued, Some(&identity));
         assert_eq!(layers.subject.pr, None);
         workspace.bind_sandbox_pr(&layers.subject);
         assert_eq!(workspace.sandbox_pr(), None);
@@ -7120,7 +7159,7 @@ mod repo_override_tests {
                 .unwrap();
         assert_eq!(on_host, NARROWING);
 
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-tamper", "HEAD").unwrap();
+        let mut workspace = TaskWorkspace::create(repo.path(), &TaskId::new().0, "HEAD").unwrap();
         install_override(&workspace.workspace_path, "rust-implementer.toml", &widened);
         let resolved = manager
             .runner
