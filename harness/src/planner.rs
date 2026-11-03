@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 
 pub const MAX_NODES: usize = 32;
 pub const MAX_SUBTASK_CHARS: usize = 4_000;
@@ -527,11 +528,22 @@ fn malformed(error: serde_json::Error) -> PlanError {
     }
 }
 
+pub const PLAN_AUDIT_DEADLINE: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Error)]
+pub enum PlanAuditError {
+    #[error("repo-local identity overrides rejected: {0}")]
+    Identity(#[from] IdentityError),
+    #[error("the plan does not fit the gate's catalog: {0}")]
+    Rejected(#[from] PlanRejection),
+}
+
 #[derive(Debug)]
 enum NodeStatus {
     Allowed(Box<Allowed>),
     Refused(Refused),
     Skipped { blocked_by: String },
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -539,6 +551,7 @@ pub enum NodeOutcome<'a> {
     Allowed,
     Refused(&'a Refused),
     Skipped { blocked_by: &'a str },
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -557,6 +570,7 @@ impl NodeAudit {
             NodeStatus::Allowed(_) => NodeOutcome::Allowed,
             NodeStatus::Refused(refusal) => NodeOutcome::Refused(refusal),
             NodeStatus::Skipped { blocked_by } => NodeOutcome::Skipped { blocked_by },
+            NodeStatus::TimedOut => NodeOutcome::TimedOut,
         }
     }
 }
@@ -565,6 +579,7 @@ impl NodeAudit {
 pub enum NodeFailure {
     Refused { id: String, refusal: Refused },
     Skipped { id: String, blocked_by: String },
+    TimedOut { id: String },
 }
 
 #[derive(Debug)]
@@ -642,6 +657,7 @@ impl PlanAudit {
                     id: node.spawn.id,
                     blocked_by,
                 }),
+                NodeStatus::TimedOut => failures.push(NodeFailure::TimedOut { id: node.spawn.id }),
             }
         }
         if failures.is_empty() {
@@ -701,8 +717,20 @@ pub async fn audit_plan(
     parent: &TaskSummary,
     gate: &SpawnGate,
     repo_root: &Path,
-) -> Result<PlanAudit, IdentityError> {
+) -> Result<PlanAudit, PlanAuditError> {
+    audit_plan_within(plan, parent, gate, repo_root, PLAN_AUDIT_DEADLINE).await
+}
+
+pub(crate) async fn audit_plan_within(
+    plan: &Plan,
+    parent: &TaskSummary,
+    gate: &SpawnGate,
+    repo_root: &Path,
+    budget: Duration,
+) -> Result<PlanAudit, PlanAuditError> {
+    plan.check_catalog(gate.context().catalog())?;
     let gate = gate.for_repo(repo_root)?;
+    let deadline = Instant::now() + budget;
     let mut nodes: Vec<NodeAudit> = Vec::with_capacity(plan.nodes().len());
     let mut failed: BTreeSet<&str> = BTreeSet::new();
     for spawn in plan.topological() {
@@ -714,6 +742,7 @@ pub async fn audit_plan(
             Some(blocker) => NodeStatus::Skipped {
                 blocked_by: blocker.clone(),
             },
+            None if Instant::now() >= deadline => NodeStatus::TimedOut,
             None => {
                 let request = gate.request_with_caller(
                     parent.clone(),
@@ -723,6 +752,7 @@ pub async fn audit_plan(
                     Some(spawn.dev_loop),
                 );
                 match gate.check(request).await {
+                    Ok(_) if Instant::now() >= deadline => NodeStatus::TimedOut,
                     Ok(proof) => NodeStatus::Allowed(Box::new(proof)),
                     Err(refusal) => NodeStatus::Refused(refusal),
                 }
@@ -742,7 +772,10 @@ pub async fn audit_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auditor::{AuditContext, AuditLog, ReasonCode, RuleAuditor, VerdictKind};
+    use crate::auditor::{
+        AuditContext, AuditError, AuditLog, Auditor, NoopEscalationHook, RuleAuditor,
+        SpawnEscalation, SpawnEscalationHook, SpawnRequest, SpawnVerdict, VerdictKind,
+    };
     use model::types::{ChatResponse, Choice, FinishReason, MessageRole, ModelInfo};
     use model::ModelResult;
     use proptest::prelude::*;
@@ -1475,6 +1508,14 @@ mod tests {
     }
 
     fn gate() -> SpawnGate {
+        gate_with(Box::new(RuleAuditor::new()))
+    }
+
+    fn gate_with(judge: Box<dyn Auditor>) -> SpawnGate {
+        gate_with_hook(judge, Box::new(NoopEscalationHook))
+    }
+
+    fn gate_with_hook(judge: Box<dyn Auditor>, hook: Box<dyn SpawnEscalationHook>) -> SpawnGate {
         let dir = tempfile::tempdir().unwrap();
         for (name, dev_loop, effect) in [
             ("rust-implementer", "inner", "repository"),
@@ -1492,7 +1533,7 @@ mod tests {
         let catalog = IdentityCatalog::load(dir.path()).unwrap();
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
-        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+        SpawnGate::with_hook(judge, AuditLog::in_memory(), context, hook)
     }
 
     fn parent() -> TaskSummary {
@@ -1515,6 +1556,7 @@ mod tests {
                     NodeOutcome::Allowed => "allowed",
                     NodeOutcome::Refused(_) => "refused",
                     NodeOutcome::Skipped { .. } => "skipped",
+                    NodeOutcome::TimedOut => "timed_out",
                 };
                 (n.id(), kind)
             })
@@ -1670,8 +1712,15 @@ mod tests {
         assert_eq!(logged(&gate).len(), 3);
     }
 
+    async fn audit_error(plan: &Plan, gate: &SpawnGate) -> PlanAuditError {
+        let repo = tempfile::tempdir().unwrap();
+        audit_plan(plan, &parent(), gate, repo.path())
+            .await
+            .unwrap_err()
+    }
+
     #[tokio::test]
-    async fn the_declared_loop_reaches_the_gate_so_a_mismatch_is_refused() {
+    async fn a_loop_outside_the_cards_membership_fails_the_audit_before_any_auditor_call() {
         let gate = gate();
         let plan = Plan::new(vec![work(
             "a",
@@ -1681,20 +1730,16 @@ mod tests {
             &[],
         )])
         .unwrap();
-        let audit = run(&plan, &gate).await;
-        let verdict = verdict_of(&audit.nodes()[0]).expect("the mismatch was refused");
-        assert!(verdict
-            .reasons()
-            .iter()
-            .any(|r| r.code == ReasonCode::LoopMismatch));
-        assert_eq!(
-            gate.log().entries().unwrap()[0].request.dev_loop,
-            DevLoop::Inner
-        );
+        let error = audit_error(&plan, &gate).await;
+        assert!(matches!(
+            error,
+            PlanAuditError::Rejected(PlanRejection::LoopNotAllowed { .. })
+        ));
+        assert_eq!(gate.log().entries().unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn an_identity_missing_from_the_gates_catalog_is_refused_and_its_dependents_skipped() {
+    async fn an_identity_outside_the_gates_catalog_fails_the_audit_before_any_auditor_call() {
         let gate = gate();
         let plan = Plan::new(vec![
             work("a", "ghost", DevLoop::Inner, "Fix bug X.", &[]),
@@ -1707,9 +1752,229 @@ mod tests {
             ),
         ])
         .unwrap();
-        let audit = run(&plan, &gate).await;
-        assert_eq!(statuses(&audit), [("a", "refused"), ("b", "skipped")]);
-        assert_eq!(audit.nodes().len(), 2);
+        let error = audit_error(&plan, &gate).await;
+        assert!(matches!(
+            error,
+            PlanAuditError::Rejected(PlanRejection::UnknownIdentity { .. })
+        ));
+        assert_eq!(gate.log().entries().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_identity_text_never_reaches_the_auditor_or_the_error() {
+        let gate = gate();
+        let raw = "@admin\u{7}evil";
+        let plan = Plan::new(vec![work("a", raw, DevLoop::Inner, "Fix bug X.", &[])]).unwrap();
+        let rendered = audit_error(&plan, &gate).await.to_string();
+        assert!(rendered.contains("`?admin?evil`"), "{rendered}");
+        assert!(!rendered.contains('@') && !rendered.contains('\u{7}'));
+        assert_eq!(gate.log().entries().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_refused_node_with_no_dependents_yields_no_proofs() {
+        let gate = gate();
+        let plan = Plan::new(vec![work(
+            "push",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Deploy build 42 to production.",
+            &[],
+        )])
+        .unwrap();
+        let refusal = run(&plan, &gate).await.into_approved().unwrap_err();
+        assert_eq!(refusal.failures.len(), 1);
+        assert!(matches!(&refusal.failures[0], NodeFailure::Refused { id, .. } if id == "push"));
+    }
+
+    struct SlowAuditor {
+        delay: Duration,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Auditor for SlowAuditor {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn review_spawn(
+            &self,
+            _request: &SpawnRequest,
+            _context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(SpawnVerdict::Allow)
+        }
+    }
+
+    fn slow_gate(delay: Duration) -> (SpawnGate, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let auditor = SlowAuditor {
+            delay,
+            calls: calls.clone(),
+        };
+        (gate_with(Box::new(auditor)), calls)
+    }
+
+    async fn run_within(plan: &Plan, gate: &SpawnGate, budget: Duration) -> PlanAudit {
+        let repo = tempfile::tempdir().unwrap();
+        audit_plan_within(plan, &parent(), gate, repo.path(), budget)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_spans_the_whole_plan_and_unfinished_nodes_get_no_proof() {
+        let (gate, calls) = slow_gate(Duration::from_secs(3));
+        let plan = Plan::new(vec![
+            work("a", "rust-implementer", DevLoop::Inner, "Fix bug A.", &[]),
+            work("b", "rust-implementer", DevLoop::Inner, "Fix bug B.", &[]),
+            work(
+                "c",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix bug C.",
+                &["b"],
+            ),
+            work("d", "rust-implementer", DevLoop::Inner, "Fix bug D.", &[]),
+        ])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert!(!audit.is_approved());
+        assert_eq!(
+            statuses(&audit),
+            [
+                ("a", "allowed"),
+                ("b", "timed_out"),
+                ("c", "skipped"),
+                ("d", "timed_out"),
+            ]
+        );
+        assert_eq!(blocker_of(&audit.nodes()[2]), Some("b"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let refusal = audit.into_approved().unwrap_err();
+        assert_eq!(refusal.failures.len(), 3);
+        assert!(matches!(&refusal.failures[0], NodeFailure::TimedOut { id } if id == "b"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_allow_completing_exactly_at_the_deadline_is_timed_out_and_one_tick_earlier_is_approved(
+    ) {
+        let plan = Plan::new(vec![work(
+            "a",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug A.",
+            &[],
+        )])
+        .unwrap();
+        let (gate, _) = slow_gate(Duration::from_secs(5));
+        let at_deadline = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert_eq!(statuses(&at_deadline), [("a", "timed_out")]);
+        assert!(at_deadline.into_approved().is_err());
+        let (gate, _) = slow_gate(Duration::from_millis(4_999));
+        let before = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert_eq!(before.into_approved().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_that_finishes_inside_the_deadline_is_approved() {
+        let (gate, calls) = slow_gate(Duration::from_secs(3));
+        let plan = Plan::new(vec![
+            work("a", "rust-implementer", DevLoop::Inner, "Fix bug A.", &[]),
+            work(
+                "b",
+                "rust-implementer",
+                DevLoop::Inner,
+                "Fix bug B.",
+                &["a"],
+            ),
+        ])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::from_secs(7)).await;
+        assert_eq!(audit.into_approved().unwrap().len(), 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    struct SlowHook {
+        delay: Duration,
+        delivered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnEscalationHook for SlowHook {
+        async fn on_escalate(&self, _escalation: &SpawnEscalation) {
+            tokio::time::sleep(self.delay).await;
+            self.delivered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_never_cuts_an_escalation_delivery_short() {
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = SlowHook {
+            delay: Duration::from_secs(10),
+            delivered: delivered.clone(),
+        };
+        let gate = gate_with_hook(Box::new(RuleAuditor::new()), Box::new(hook));
+        let plan = Plan::new(vec![work(
+            "ship",
+            "deployer",
+            DevLoop::Outer,
+            "Deploy build 42 to production.",
+            &[],
+        )])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert!(delivered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!audit.is_approved());
+        assert_eq!(statuses(&audit), [("ship", "refused")]);
+        let entries = gate.log().entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verdict.kind(), VerdictKind::Escalate);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_whose_only_nodes_timed_out_is_not_approved() {
+        let (gate, calls) = slow_gate(Duration::from_secs(1));
+        let plan = Plan::new(vec![work(
+            "a",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug A.",
+            &[],
+        )])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::ZERO).await;
+        assert_eq!(statuses(&audit), [("a", "timed_out")]);
+        assert!(!audit.is_approved());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_documented_deadline_is_two_minutes() {
+        assert_eq!(PLAN_AUDIT_DEADLINE, Duration::from_secs(120));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_public_entry_point_applies_the_documented_deadline() {
+        let (gate, _) = slow_gate(PLAN_AUDIT_DEADLINE * 2);
+        let plan = Plan::new(vec![work(
+            "a",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug A.",
+            &[],
+        )])
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let audit = audit_plan(&plan, &parent(), &gate, repo.path())
+            .await
+            .unwrap();
+        assert_eq!(statuses(&audit), [("a", "timed_out")]);
     }
 
     #[tokio::test]
@@ -1790,7 +2055,9 @@ mod tests {
         std::fs::write(agents.join("ghost.toml"), card("ghost", "inner", "none")).unwrap();
         let plan = Plan::new(vec![node("a", &[])]).unwrap();
         let result = audit_plan(&plan, &parent(), &gate, repo.path()).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(PlanAuditError::Identity(_))));
+        let rendered = result.unwrap_err().to_string();
+        assert!(rendered.contains("overrides rejected"));
         assert_eq!(gate.log().entries().unwrap().len(), 0);
     }
 
