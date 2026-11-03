@@ -26,6 +26,7 @@ pub mod model_eval;
 mod record;
 mod request;
 pub(crate) mod rules;
+pub mod shard;
 mod verdict;
 
 pub use context::AuditContext;
