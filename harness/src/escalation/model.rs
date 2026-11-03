@@ -720,13 +720,13 @@ mod tests {
     }
 
     #[test]
-    fn needs_card_body_carries_a_parseable_identity_skeleton() {
+    fn needs_card_body_carries_a_skeleton_the_identity_loader_accepts_once_filled() {
         let request = CardRequest {
             name: "sandbox-qa".to_string(),
             dev_loop: "middle".to_string(),
             max_effect: "sandbox".to_string(),
             tools: vec!["cargo_test".to_string(), "deploy_sandbox".to_string()],
-            reason: "the task needs a sandbox deploy and no card allows it".to_string(),
+            reason: "quote \" and newline\nsurvive".to_string(),
         };
         let e = Escalation::needs_card(
             EscalationSource::Auditor,
@@ -744,11 +744,22 @@ mod tests {
             .split("\n```")
             .next()
             .unwrap();
-        let table: toml::Table = toml::from_str(block).unwrap();
-        assert_eq!(table["identity"]["name"].as_str(), Some("sandbox-qa"));
-        assert_eq!(table["scope"]["max_effect"].as_str(), Some("sandbox"));
-        assert_eq!(table["scope"]["tools"].as_array().unwrap().len(), 2);
-        assert_eq!(table["identity"]["loop"].as_str(), Some("middle"));
+        let filled = block
+            .replacen("model = \"\"", "model = \"gemma4:e4b\"", 1)
+            .replacen("inline = \"\"", "inline = \"You run sandbox QA.\"", 1)
+            .replacen("repos = [\"\"]", "repos = [\"github.com/example/repo\"]", 1)
+            .replacen("paths = [\"\"]", "paths = [\"src/**\"]", 1);
+        assert_ne!(filled, block);
+        let catalog = load_through_catalog(&filled).unwrap();
+        let identity = catalog.get("sandbox-qa").unwrap();
+        assert_eq!(identity.identity.name, "sandbox-qa");
+        assert_eq!(identity.identity.description, request.reason);
+        assert_eq!(identity.identity.dev_loop.as_str(), "middle");
+        assert_eq!(identity.scope.max_effect.as_str(), "sandbox");
+        assert_eq!(identity.scope.tools.len(), 2);
+        assert!(identity.allows_tool("cargo_test"));
+        assert!(identity.allows_tool("deploy_sandbox"));
+        assert!(load_through_catalog(block).is_err());
     }
 
     fn needs_card_skeleton(request: &CardRequest) -> String {

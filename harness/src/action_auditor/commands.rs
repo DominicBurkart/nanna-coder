@@ -5312,6 +5312,8 @@ mod tests {
                 "rm -rf harness",
                 "rm -rf harness/src",
                 "rm -rf harness/src/rollout",
+                "rm -rf harness/tests",
+                "rm -rf harness/tests/fixtures",
                 "rm -rf docs",
                 "rm -rf tests",
                 "rm -rf .github",
@@ -5326,7 +5328,6 @@ mod tests {
             "rm -rf target",
             "rm target/debug/x",
             "rm -rf build",
-            "rm -rf harness/tests",
             "mv a b",
             "chmod -R 755 src",
         ]);

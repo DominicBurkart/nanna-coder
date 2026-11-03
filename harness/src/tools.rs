@@ -4755,7 +4755,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 65] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 74] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4847,6 +4847,42 @@ mod tests {
         (
             "harness/src/deploy/template.rs",
             "harness/src/deploy/template.rs",
+        ),
+        (
+            "harness/src/sandbox_tools.rs",
+            "harness/src/sandbox_tools.rs",
+        ),
+        (
+            "harness/tests/spawn_gate_structural.rs",
+            "harness/tests/spawn_gate_structural.rs",
+        ),
+        (
+            "harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs",
+        ),
+        (
+            "harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs",
+        ),
+        (
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+        ),
+        (
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        ),
+        (
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        ),
+        (
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        ),
+        (
+            "harness/tests/planner_structural.rs",
+            "harness/tests/planner_structural.rs",
         ),
     ];
 

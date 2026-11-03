@@ -1344,13 +1344,16 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     /// entry.
     pub async fn cancel(&self, task_id: &TaskId) -> Result<Task, String> {
         let parked = self.is_parked(task_id).await;
+        let mut dequeued = false;
         if parked {
             self.dispatcher.forget(task_id).map_err(|e| e.to_string())?;
         } else {
-            self.dispatcher
+            let outcome = self
+                .dispatcher
                 .cancel(task_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            dequeued = matches!(outcome, crate::scheduler::CancelOutcome::Queued(_));
         }
 
         let iterations_completed = {
@@ -1385,6 +1388,9 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             task.clone()
         };
         self.runner.release_leases(task_id);
+        if dequeued {
+            self.runner.bound.write().await.remove(task_id);
+        }
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -1534,6 +1540,7 @@ impl TaskRunner {
         }
         if status.is_terminal() {
             self.release_leases(task_id);
+            self.bound.write().await.remove(task_id);
         }
         let senders = self.status_senders.read().await;
         if let Some((tx, _keepalive)) = senders.get(task_id) {
@@ -1740,6 +1747,7 @@ impl TaskRunner {
         }
 
         let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
+        workspace.bind_sandbox_pr(&layers.subject);
         let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
             Ok(registry) => registry,
             Err(e) => {
@@ -3428,8 +3436,8 @@ mod scheduler_tests {
     use model::types::{ChatRequest, ChatResponse, ModelInfo};
     use std::path::Path;
 
-    struct GatedProvider {
-        gate: watch::Receiver<bool>,
+    pub(super) struct GatedProvider {
+        pub(super) gate: watch::Receiver<bool>,
     }
 
     #[async_trait]
@@ -3457,7 +3465,7 @@ mod scheduler_tests {
         }
     }
 
-    struct RejectingStore;
+    pub(super) struct RejectingStore;
 
     impl QueueStore for RejectingStore {
         fn load(&self) -> Result<Vec<QueuedTask>, QueueStoreError> {
@@ -4005,15 +4013,13 @@ mod identity_tests {
     async fn test_the_shared_constructor_installs_every_layer_for_scoped_and_unscoped_tasks() {
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-layers", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
         for id in [Some(&identity), None] {
-            let layers =
-                manager
-                    .runner
-                    .model_facing_layers(&TaskId("t-layers".to_string()), &queued, id);
+            let layers = manager.runner.model_facing_layers(&task_id, &queued, id);
             let registry = model_facing_registry(&workspace, id, layers).unwrap();
             assert_eq!(
                 registry.installed_layers(),
@@ -4023,6 +4029,48 @@ mod identity_tests {
         let bare = workspace.build_tool_registry_for(&identity).unwrap();
         assert_ne!(bare.installed_layers(), crate::tools::InstalledLayers::ALL);
         workspace.cleanup().unwrap();
+    }
+
+    fn literal_id_workspace_calls(source: &str) -> Vec<String> {
+        let call = [
+            "TaskWorkspace::create",
+            r"\w*\(",
+            r#"\s*(?:[^,()]|\([^()]*\))*,\s*""#,
+        ]
+        .concat();
+        regex::Regex::new(&call)
+            .unwrap()
+            .find_iter(source)
+            .map(|m| m.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_no_task_workspace_in_this_module_is_created_under_a_literal_task_id() {
+        let found = literal_id_workspace_calls(include_str!("task.rs"));
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn test_the_literal_id_scan_sees_every_call_shape_and_ignores_variable_ids() {
+        let shapes = [
+            "TaskWorkspace::create(repo.path(), \"x\", \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    \"x\",\n    \"HEAD\",\n)",
+            "TaskWorkspace::create(&repo, \"x\", \"HEAD\")",
+            "TaskWorkspace::create(Path::new(\"r\"), \"x\", \"HEAD\")",
+            "TaskWorkspace::create_with_container(repo.path(), \"x\", \"HEAD\", c)",
+            "TaskWorkspace::create_with_container_and_sidecars(repo.path(), \"x\", \"HEAD\", c, s)",
+        ];
+        for shape in shapes {
+            assert_eq!(literal_id_workspace_calls(shape).len(), 1, "{shape}");
+        }
+        for clean in [
+            "TaskWorkspace::create(repo.path(), &task_id.0, \"HEAD\")",
+            "TaskWorkspace::create(\n    repo.path(),\n    &id,\n    \"HEAD\",\n)",
+            "TaskWorkspace::create_with_container(&repo, id, \"HEAD\", c)",
+        ] {
+            assert!(literal_id_workspace_calls(clean).is_empty(), "{clean}");
+        }
     }
 
     struct ProductionStub;
@@ -4064,11 +4112,11 @@ mod identity_tests {
         use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
         let _path = crate::test_support::hold_path_async().await;
         let repo = repo_with_origin("git@github.com:example/repo.git");
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-hold", "HEAD").unwrap();
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let queued = queued(repo.path());
         let identity = scoped_identity();
-        let task_id = TaskId("t-hold".to_string());
         let build = |log: Arc<EscalationLog>| {
             let mut layers = manager
                 .runner
@@ -4590,6 +4638,65 @@ mod identity_tests {
             .any(|call| call.starts_with("rerun_workflow")));
         assert_eq!(result.budget, crate::budget::BudgetReport::default());
         assert_eq!(manager.escalation_snapshot().tracked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_tools_are_absent_from_a_dispatched_task_until_a_target_and_a_pr_are_bound(
+    ) {
+        let repo_dir = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![
+                tool_call_response("sandbox_deploy", serde_json::json!({"image_tag": "v1"})),
+                stop_response("done"),
+            ]));
+        let mut identity = ci_scoped_identity();
+        identity.scope.tools = vec!["sandbox_deploy".parse().unwrap()];
+        identity.scope.max_effect = EffectClass::Sandbox;
+        let task_id = manager
+            .submit_with_identity(
+                "Deploy".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        let task = wait_for(&manager, &task_id, terminal).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task_id).await.unwrap();
+        assert!(result.action_audit.is_empty());
+        assert_eq!(result.denials.len(), 1);
+        assert_eq!(result.denials[0].tool, "sandbox_deploy");
+        assert_eq!(result.budget, crate::budget::BudgetReport::default());
+    }
+
+    #[test]
+    fn test_the_sandbox_pr_is_taken_from_the_action_subject_the_lease_is_keyed_by_and_nowhere_else()
+    {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let queued = queued(repo.path());
+        let identity = ci_scoped_identity();
+        let layers = manager
+            .runner
+            .model_facing_layers(&task_id, &queued, Some(&identity));
+        assert_eq!(layers.subject.pr, None);
+        workspace.bind_sandbox_pr(&layers.subject);
+        assert_eq!(workspace.sandbox_pr(), None);
+        let mut subject = layers.subject;
+        subject.pr = Some(41);
+        workspace.bind_sandbox_pr(&subject);
+        assert_eq!(workspace.sandbox_pr(), Some(41));
+        workspace.cleanup().unwrap();
     }
 
     #[tokio::test]
@@ -5308,6 +5415,33 @@ mod identity_tests {
         assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Block);
         assert_eq!(log[0].request.subtask, HOSTILE);
         assert_eq!(log[0].request.identity, "rust-implementer");
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_restored_queued_entry_drops_its_audited_bound_entry() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let benign = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let store = InMemoryQueueStore::default();
+        store.insert(&benign).unwrap();
+        let gate = crate::auditor::test_support::fixture_gate();
+        let manager = TaskManager::restore_with_escalations(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store),
+            Arc::new(InMemoryLeaseStore::default()),
+            untouched_provider() as Arc<dyn ModelProvider>,
+            &fixture_catalog(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            &gate,
+        )
+        .await
+        .unwrap();
+        let (audited, _) = manager.bound_identity_of(&benign.id).await.unwrap();
+        assert!(audited);
+        manager.cancel(&benign.id).await.unwrap();
+        assert!(manager.bound_identity_of(&benign.id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -7025,7 +7159,7 @@ mod repo_override_tests {
                 .unwrap();
         assert_eq!(on_host, NARROWING);
 
-        let mut workspace = TaskWorkspace::create(repo.path(), "t-tamper", "HEAD").unwrap();
+        let mut workspace = TaskWorkspace::create(repo.path(), &TaskId::new().0, "HEAD").unwrap();
         install_override(&workspace.workspace_path, "rust-implementer.toml", &widened);
         let resolved = manager
             .runner
@@ -7040,7 +7174,7 @@ mod repo_override_tests {
 
 #[cfg(test)]
 mod spawn_tests {
-    use super::scheduler_tests::git_repo;
+    use super::scheduler_tests::{git_repo, wait_for, GatedProvider, RejectingStore};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
@@ -7145,6 +7279,286 @@ mod spawn_tests {
         let held = bound.get(&id).unwrap();
         assert!(matches!(held, BoundIdentity::Audited(_)));
         assert_eq!(held.identity(), &audited);
+    }
+
+    async fn rejecting_manager() -> TaskManager {
+        TaskManager::restore(
+            1,
+            Box::new(HybridPolicy::default()),
+            Box::new(RejectingStore),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn assert_persist_failed_and_unbound(manager: &TaskManager, id: &TaskId) {
+        let task = manager.poll(id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "QueuePersistFailed");
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.bound_identity_of(id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_audited_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let allowed = allowed_for("github.com/example/repo").await;
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        );
+        let id = manager.submit_audited(queued, allowed, provider()).await;
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_with_identity_leaves_no_bound_entry_when_the_queue_rejects_it() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = rejecting_manager().await;
+        let id = manager
+            .submit_with_identity(
+                "Add a regression test.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+                Some(crate::identity::example()),
+            )
+            .await;
+        assert_persist_failed_and_unbound(&manager, &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_queued_audited_task_drops_its_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_some());
+        manager.cancel(&id).await.unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    async fn occupied_manager() -> (TaskManager, tokio::sync::watch::Sender<bool>, TaskId) {
+        let repo = repo_with_origin("https://github.com/example/occupier.git");
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let occupier: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let manager = TaskManager::new(1);
+        let occupying = manager
+            .submit(
+                "Hold the only slot.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                occupier,
+            )
+            .await;
+        wait_for(&manager, &occupying, |status| {
+            matches!(status, TaskStatus::Running { .. })
+        })
+        .await;
+        std::mem::forget(repo);
+        (manager, open, occupying)
+    }
+
+    async fn queue_two_audited(manager: &TaskManager) -> (TaskId, TaskId) {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let allowed = allowed_for("github.com/example/repo").await;
+            ids.push(
+                manager
+                    .submit_spawn(
+                        allowed,
+                        repo.path().to_path_buf(),
+                        "HEAD".to_string(),
+                        "gemma4:e4b".to_string(),
+                        20,
+                        provider(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        std::mem::forget(repo);
+        (ids.remove(0), ids.remove(0))
+    }
+
+    async fn assert_still_audited_and_runs_audited(
+        manager: &TaskManager,
+        open: &tokio::sync::watch::Sender<bool>,
+        survivor: &TaskId,
+    ) {
+        let (audited, _) = manager.bound_identity_of(survivor).await.unwrap();
+        assert!(audited);
+        open.send(true).unwrap();
+        let done = wait_for(manager, survivor, |status| status.is_terminal()).await;
+        assert!(
+            matches!(done.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            done.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_one_queued_audited_task_leaves_the_other_bound_and_audited() {
+        let (manager, open, _occupying) = occupied_manager().await;
+        let (doomed, survivor) = queue_two_audited(&manager).await;
+        manager.cancel(&doomed).await.unwrap();
+        assert!(manager.bound_identity_of(&doomed).await.is_none());
+        assert_eq!(manager.runner.bound.read().await.len(), 1);
+        assert_still_audited_and_runs_audited(&manager, &open, &survivor).await;
+    }
+
+    #[tokio::test]
+    async fn test_failing_one_queued_audited_task_leaves_the_other_bound_and_audited() {
+        let (manager, open, _occupying) = occupied_manager().await;
+        let (doomed, survivor) = queue_two_audited(&manager).await;
+        manager
+            .runner
+            .fail(&doomed, "scripted".to_string(), "Scripted")
+            .await;
+        assert!(manager.bound_identity_of(&doomed).await.is_none());
+        assert_eq!(manager.runner.bound.read().await.len(), 1);
+        assert_still_audited_and_runs_audited(&manager, &open, &survivor).await;
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_a_queued_unaudited_task_drops_its_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let id = manager
+            .submit_with_identity(
+                "Add a regression test.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+                Some(crate::identity::example()),
+            )
+            .await;
+        let (audited, _) = manager.bound_identity_of(&id).await.unwrap();
+        assert!(!audited);
+        manager.cancel(&id).await.unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_cancel_of_a_dispatched_task_leaves_its_entry_for_the_run_to_resolve() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(1);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert!(manager.dispatcher.is_running(&id).await);
+        assert!(manager.bound_identity_of(&id).await.is_some());
+        manager.cancel(&id).await.unwrap();
+        let resolved = manager
+            .runner
+            .resolve_identity(&id, Some("rust-implementer"), repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(resolved, BoundIdentity::Audited(_)));
+    }
+
+    #[tokio::test]
+    async fn test_a_completed_audited_task_leaves_no_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        let done = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        assert!(done.status.is_terminal());
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(manager.runner.bound.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_task_failed_before_it_resolves_its_identity_leaves_no_bound_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_for("github.com/example/repo").await;
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        assert!(manager.bound_identity_of(&id).await.is_some());
+        manager
+            .runner
+            .fail(&id, "no model provider".to_string(), "NoProvider")
+            .await;
+        assert!(manager.bound_identity_of(&id).await.is_none());
     }
 
     #[tokio::test]
