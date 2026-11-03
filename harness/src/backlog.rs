@@ -30,6 +30,7 @@ pub const IDENTITY_MARKER: &str = "Nanna-Identity:";
 
 /// Page size used for GitHub list and search requests.
 pub const GITHUB_PAGE_SIZE: usize = 100;
+pub const MAX_REVIEW_PAGES: usize = 10;
 
 /// Default GitHub REST endpoint.
 pub const GITHUB_API_URL: &str = "https://api.github.com";
@@ -74,6 +75,15 @@ pub struct GithubPullRequestDetail {
 pub struct GithubComment {
     pub id: u64,
     pub author: String,
+    pub body: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubReview {
+    pub id: u64,
+    pub author: String,
+    pub state: String,
     pub body: String,
     pub html_url: String,
 }
@@ -215,6 +225,12 @@ pub trait GithubClient: Send + Sync {
         repo: &str,
         number: u64,
     ) -> Result<Vec<GithubComment>, BacklogError>;
+
+    async fn list_pull_request_reviews(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubReview>, BacklogError>;
 
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError>;
 }
@@ -430,7 +446,7 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 /// use harness::backlog::{
 ///     backlog_sync, BacklogConfig, BacklogError, BacklogSource, GithubClient, GithubComment,
 ///     GithubIssue, GithubIssueDetail, GithubPullRequest, GithubPullRequestCreated,
-///     GithubPullRequestDetail, StoreSink,
+///     GithubPullRequestDetail, GithubReview, StoreSink,
 /// };
 /// use harness::auditor::{AuditContext, AuditLog, RuleAuditor, SpawnGate};
 /// use harness::identity::IdentityCatalog;
@@ -472,6 +488,9 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn list_issue_comments(&self, _: &str, _: u64) -> Result<Vec<GithubComment>, BacklogError> {
 ///         unreachable!("ingestion never reads issue comments")
+///     }
+///     async fn list_pull_request_reviews(&self, _: &str, _: u64) -> Result<Vec<GithubReview>, BacklogError> {
+///         unreachable!("ingestion never reads reviews")
 ///     }
 ///     async fn get_issue(&self, _: &str, _: u64) -> Result<GithubIssueDetail, BacklogError> {
 ///         unreachable!("ingestion never reads issue detail")
@@ -865,6 +884,30 @@ impl From<RawComment> for GithubComment {
 }
 
 #[derive(Deserialize)]
+struct RawReview {
+    id: u64,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    html_url: String,
+}
+
+impl From<RawReview> for GithubReview {
+    fn from(raw: RawReview) -> Self {
+        Self {
+            id: raw.id,
+            author: raw.user.map(|user| user.login).unwrap_or_default(),
+            state: raw.state,
+            body: raw.body.unwrap_or_default(),
+            html_url: raw.html_url,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct RawLabel {
     name: String,
 }
@@ -1132,10 +1175,20 @@ impl ReqwestGithubClient {
         query: &[(&str, String)],
         items: fn(serde_json::Value) -> serde_json::Value,
     ) -> Result<Vec<T>, BacklogError> {
+        self.paginate_up_to(path, query, items, usize::MAX).await
+    }
+
+    async fn paginate_up_to<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        items: fn(serde_json::Value) -> serde_json::Value,
+        max_pages: usize,
+    ) -> Result<Vec<T>, BacklogError> {
         let mut all = Vec::new();
         let mut page = 1;
         let mut last_page = false;
-        while !last_page {
+        while !last_page && page <= max_pages {
             let mut params = query.to_vec();
             params.push(("per_page", GITHUB_PAGE_SIZE.to_string()));
             params.push(("page", page.to_string()));
@@ -1307,6 +1360,23 @@ impl GithubClient for ReqwestGithubClient {
         Ok(raw.into_iter().map(GithubComment::from).collect())
     }
 
+    async fn list_pull_request_reviews(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GithubReview>, BacklogError> {
+        validate_repo(repo)?;
+        let raw: Vec<RawReview> = self
+            .paginate_up_to(
+                &format!("/repos/{repo}/pulls/{number}/reviews"),
+                &[],
+                |v| v,
+                MAX_REVIEW_PAGES,
+            )
+            .await?;
+        Ok(raw.into_iter().map(GithubReview::from).collect())
+    }
+
     async fn get_issue(&self, repo: &str, number: u64) -> Result<GithubIssueDetail, BacklogError> {
         validate_repo(repo)?;
         let value = self
@@ -1407,6 +1477,7 @@ pub(crate) mod test_support {
         pub issue_details: HashMap<(String, u64), GithubIssueDetail>,
         pub review_comments: HashMap<(String, u64), Vec<GithubComment>>,
         pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
+        pub reviews: HashMap<(String, u64), Vec<GithubReview>>,
         pub created_pr: Option<GithubPullRequestCreated>,
         pub fail_status: Option<u16>,
         pub fail_only: Option<&'static str>,
@@ -1543,6 +1614,19 @@ pub(crate) mod test_support {
             self.maybe_fail("mock:list_issue_comments")?;
             Ok(self
                 .issue_comments
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn list_pull_request_reviews(
+            &self,
+            repo: &str,
+            number: u64,
+        ) -> Result<Vec<GithubReview>, BacklogError> {
+            self.maybe_fail("mock:list_pull_request_reviews")?;
+            Ok(self
+                .reviews
                 .get(&(repo.to_string(), number))
                 .cloned()
                 .unwrap_or_default())
@@ -2851,6 +2935,84 @@ mod tests {
             }]
         );
         server.abort();
+    }
+
+    fn reviews_page(first: u64, count: u64) -> String {
+        let items: Vec<serde_json::Value> = (first..first + count)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "user": {"login": "alice"},
+                    "state": "COMMENTED",
+                    "body": "b",
+                    "html_url": "u"
+                })
+            })
+            .collect();
+        serde_json::Value::Array(items).to_string()
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_lists_pull_request_reviews_with_state() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/pulls/3/reviews?per_page=100&page=1",
+            200,
+            r#"[
+                {"id": 11, "user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "please fix", "html_url": "u11", "submitted_at": "2026-01-01T00:00:00Z"},
+                {"id": 12, "user": null, "state": "APPROVED", "body": null, "html_url": "u12"}
+            ]"#,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let reviews = client.list_pull_request_reviews("o/n", 3).await.unwrap();
+        assert_eq!(
+            reviews,
+            vec![
+                GithubReview {
+                    id: 11,
+                    author: "alice".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "please fix".to_string(),
+                    html_url: "u11".to_string()
+                },
+                GithubReview {
+                    id: 12,
+                    author: String::new(),
+                    state: "APPROVED".to_string(),
+                    body: String::new(),
+                    html_url: "u12".to_string()
+                },
+            ]
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_bounds_review_pagination() {
+        let routes = (1..=MAX_REVIEW_PAGES + 3)
+            .map(|page| {
+                MockRoute::new(
+                    "GET",
+                    Box::leak(format!("/reviews?per_page=100&page={page}").into_boxed_str()),
+                    200,
+                    &reviews_page(page as u64 * 1000, GITHUB_PAGE_SIZE as u64),
+                )
+            })
+            .collect();
+        let (base, requests, server) = fake_github_ext(routes).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let reviews = client.list_pull_request_reviews("o/n", 3).await.unwrap();
+        assert_eq!(reviews.len(), MAX_REVIEW_PAGES * GITHUB_PAGE_SIZE);
+        assert_eq!(requests.lock().unwrap().len(), MAX_REVIEW_PAGES);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_rejects_malformed_repo_for_reviews() {
+        let client = ReqwestGithubClient::new("http://127.0.0.1:1", None);
+        assert!(client.list_pull_request_reviews("../x", 1).await.is_err());
     }
 
     #[tokio::test]
