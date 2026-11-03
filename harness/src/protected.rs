@@ -152,13 +152,25 @@ impl ProtectedExtras {
             |e: &dyn std::fmt::Display| ProtectedConfigError::Unreadable(e.to_string());
         let path = base.join(EXTRAS_FILE);
         match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::absent(base).map_err(|e| unreadable(&e))
+            }
             Err(e) => return Err(unreadable(&e)),
             Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
             Ok(_) => {}
         }
         let text = std::fs::read_to_string(&path).map_err(|e| unreadable(&e))?;
         Self::parse(&text)
+    }
+
+    fn absent(base: &Path) -> Result<Self, &'static str> {
+        if !base.is_dir() {
+            return Err("the base checkout is not a directory");
+        }
+        match std::fs::symlink_metadata(base.join(".nanna")) {
+            Ok(meta) if !meta.is_dir() => Err("`.nanna` is not a directory"),
+            _ => Ok(Self::default()),
+        }
     }
 
     pub fn globs(&self) -> &[String] {
@@ -1419,6 +1431,25 @@ mod tests {
             std::fs::write(&file, "x").unwrap();
             assert!(matches!(
                 ProtectedExtras::load(&file),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn an_absent_declaration_under_a_base_that_is_not_a_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("plain");
+            std::fs::write(&file, "x").unwrap();
+            assert!(ProtectedExtras::absent(&file).is_err());
+            assert!(ProtectedExtras::absent(dir.path()).is_ok());
+        }
+
+        #[test]
+        fn a_file_in_place_of_the_config_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".nanna"), "x").unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
                 Err(ProtectedConfigError::Unreadable(_))
             ));
         }
