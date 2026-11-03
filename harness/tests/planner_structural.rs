@@ -42,6 +42,14 @@ struct Idents {
     aliases: Vec<String>,
 }
 
+fn plain(name: &str) -> String {
+    name.strip_prefix("r#").unwrap_or(name).to_string()
+}
+
+fn gate_type(name: &str) -> bool {
+    matches!(name, "SpawnGate" | "Allowed")
+}
+
 fn watched(name: &str) -> bool {
     FORBIDDEN.contains(&name) || matches!(name, "SpawnGate" | "Allowed")
 }
@@ -66,10 +74,11 @@ impl Idents {
         for token in stream {
             match token {
                 TokenTree::Ident(ident) => {
-                    if ident == "SpawnGate" {
+                    let name = plain(&ident.to_string());
+                    if name == "SpawnGate" {
                         self.aliases.push("passes SpawnGate to a macro".to_string());
                     }
-                    self.sequence.push(ident.to_string());
+                    self.sequence.push(name);
                 }
                 TokenTree::Group(group) => self.tokens(group.stream()),
                 _ => {}
@@ -86,7 +95,7 @@ impl<'ast> Visit<'ast> for Idents {
     }
 
     fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
-        if watched(&node.ident.to_string()) {
+        if watched(&plain(&node.ident.to_string())) {
             self.aliases
                 .push(format!("renames {} as {}", node.ident, node.rename));
         }
@@ -110,7 +119,27 @@ impl<'ast> Visit<'ast> for Idents {
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        self.sequence.push(ident.to_string());
+        self.sequence.push(plain(&ident.to_string()));
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let mut mentioned = Idents::default();
+        mentioned.visit_type(&node.self_ty);
+        for ident in mentioned.sequence.iter().filter(|i| gate_type(i)) {
+            self.aliases.push(format!("implements on {ident}"));
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if let Some(qself) = &node.qself {
+            let mut mentioned = Idents::default();
+            mentioned.visit_type(&qself.ty);
+            for ident in mentioned.sequence.iter().filter(|i| gate_type(i)) {
+                self.aliases.push(format!("qualified path through {ident}"));
+            }
+        }
+        syn::visit::visit_expr_path(self, node);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -175,7 +204,7 @@ fn gate_order_problem(source: &str) -> Option<String> {
     let inside = body.iter().filter(|ident| *ident == "check").count();
     if total != 1 || inside != 1 {
         return Some(format!(
-            "the gate is called {total} times, {inside} inside audit_plan"
+            "the gate is called {total} times, {inside} inside audit_plan_within"
         ));
     }
     match (position("request_with_caller"), position("check")) {
@@ -261,6 +290,31 @@ fn the_checker_sees_macro_pasted_types_and_associated_type_aliases() {
         assert!(found.iter().any(|f| f == expected), "{expected}: {found:?}");
     }
     assert_eq!(found.iter().filter(|f| f.contains("as A")).count(), 1);
+}
+
+#[test]
+fn the_checker_sees_raw_identifiers_inherent_impls_and_qualified_paths() {
+    let source = r#"
+        fn a() { SpawnGate::r#new(x); }
+        fn b() { r#SpawnGate::new(x); }
+        fn c() { SpawnGate::r#with_hook(x); }
+        impl SpawnGate { fn d() {} }
+        impl Allowed { fn e() {} }
+        impl Display for Plan { fn f() {} }
+        fn g() { <SpawnGate>::new(x); <Allowed as Default>::default(); <u8 as Default>::default(); }
+    "#;
+    let found = forbidden_constructs(source);
+    for expected in [
+        "calls SpawnGate::new",
+        "calls SpawnGate::with_hook",
+        "implements on SpawnGate",
+        "implements on Allowed",
+        "qualified path through SpawnGate",
+        "qualified path through Allowed",
+    ] {
+        assert!(found.iter().any(|f| f == expected), "{expected}: {found:?}");
+    }
+    assert!(!found.iter().any(|f| f.contains("Plan") || f.contains("u8")));
 }
 
 #[test]

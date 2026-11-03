@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::Instant;
 
 pub const MAX_NODES: usize = 32;
 pub const MAX_SUBTASK_CHARS: usize = 4_000;
@@ -751,10 +751,10 @@ pub(crate) async fn audit_plan_within(
                     None,
                     Some(spawn.dev_loop),
                 );
-                match timeout_at(deadline, gate.check(request)).await {
-                    Ok(Ok(proof)) => NodeStatus::Allowed(Box::new(proof)),
-                    Ok(Err(refusal)) => NodeStatus::Refused(refusal),
-                    Err(_) => NodeStatus::TimedOut,
+                match gate.check(request).await {
+                    Ok(_) if Instant::now() >= deadline => NodeStatus::TimedOut,
+                    Ok(proof) => NodeStatus::Allowed(Box::new(proof)),
+                    Err(refusal) => NodeStatus::Refused(refusal),
                 }
             }
         };
@@ -773,8 +773,8 @@ pub(crate) async fn audit_plan_within(
 mod tests {
     use super::*;
     use crate::auditor::{
-        AuditContext, AuditError, AuditLog, Auditor, RuleAuditor, SpawnRequest, SpawnVerdict,
-        VerdictKind,
+        AuditContext, AuditError, AuditLog, Auditor, NoopEscalationHook, RuleAuditor,
+        SpawnEscalation, SpawnEscalationHook, SpawnRequest, SpawnVerdict, VerdictKind,
     };
     use model::types::{ChatResponse, Choice, FinishReason, MessageRole, ModelInfo};
     use model::ModelResult;
@@ -1512,6 +1512,10 @@ mod tests {
     }
 
     fn gate_with(judge: Box<dyn Auditor>) -> SpawnGate {
+        gate_with_hook(judge, Box::new(NoopEscalationHook))
+    }
+
+    fn gate_with_hook(judge: Box<dyn Auditor>, hook: Box<dyn SpawnEscalationHook>) -> SpawnGate {
         let dir = tempfile::tempdir().unwrap();
         for (name, dev_loop, effect) in [
             ("rust-implementer", "inner", "repository"),
@@ -1529,7 +1533,7 @@ mod tests {
         let catalog = IdentityCatalog::load(dir.path()).unwrap();
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
-        SpawnGate::new(judge, AuditLog::in_memory(), context)
+        SpawnGate::with_hook(judge, AuditLog::in_memory(), context, hook)
     }
 
     fn parent() -> TaskSummary {
@@ -1872,6 +1876,67 @@ mod tests {
         let audit = run_within(&plan, &gate, Duration::from_secs(7)).await;
         assert_eq!(audit.into_approved().unwrap().len(), 2);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    struct SlowHook {
+        delay: Duration,
+        delivered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnEscalationHook for SlowHook {
+        async fn on_escalate(&self, _escalation: &SpawnEscalation) {
+            tokio::time::sleep(self.delay).await;
+            self.delivered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_never_cuts_an_escalation_delivery_short() {
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = SlowHook {
+            delay: Duration::from_secs(10),
+            delivered: delivered.clone(),
+        };
+        let gate = gate_with_hook(Box::new(RuleAuditor::new()), Box::new(hook));
+        let plan = Plan::new(vec![work(
+            "ship",
+            "deployer",
+            DevLoop::Outer,
+            "Deploy build 42 to production.",
+            &[],
+        )])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert!(delivered.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!audit.is_approved());
+        assert_eq!(statuses(&audit), [("ship", "refused")]);
+        let entries = gate.log().entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verdict.kind(), VerdictKind::Escalate);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_whose_only_nodes_timed_out_is_not_approved() {
+        let (gate, calls) = slow_gate(Duration::from_secs(1));
+        let plan = Plan::new(vec![work(
+            "a",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug A.",
+            &[],
+        )])
+        .unwrap();
+        let audit = run_within(&plan, &gate, Duration::ZERO).await;
+        assert_eq!(statuses(&audit), [("a", "timed_out")]);
+        assert!(!audit.is_approved());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_documented_deadline_is_two_minutes() {
+        assert_eq!(PLAN_AUDIT_DEADLINE, Duration::from_secs(120));
     }
 
     #[tokio::test(start_paused = true)]
