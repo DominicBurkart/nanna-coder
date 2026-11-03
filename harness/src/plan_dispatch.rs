@@ -91,6 +91,7 @@ impl ChildRunner for TaskManager {
 enum ChildState {
     Waiting,
     Starting,
+    Abandoned,
     Running(TaskId),
     Completed {
         task: TaskId,
@@ -120,6 +121,7 @@ enum ChildState {
 pub enum ChildOutcome<'a> {
     Waiting,
     Starting,
+    Abandoned,
     Running(&'a TaskId),
     Completed {
         task: &'a TaskId,
@@ -159,6 +161,7 @@ impl Child {
         match &self.state {
             ChildState::Waiting => ChildOutcome::Waiting,
             ChildState::Starting => ChildOutcome::Starting,
+            ChildState::Abandoned => ChildOutcome::Abandoned,
             ChildState::Running(task) => ChildOutcome::Running(task),
             ChildState::Completed { task, result } => ChildOutcome::Completed { task, result },
             ChildState::Failed { task, error, .. } => ChildOutcome::Failed { task, error },
@@ -386,6 +389,9 @@ impl PlanRun {
                 runner.cancel(&task).await;
                 child.state = settle(runner.status(&task).await, task);
             }
+            if matches!(child.state, ChildState::Starting) {
+                child.state = ChildState::Abandoned;
+            }
             if matches!(child.state, ChildState::Waiting) {
                 child.state = ChildState::Skipped {
                     blocked_by: BUDGET.to_string(),
@@ -441,7 +447,7 @@ impl PlanRun {
                         calls.len(),
                     );
                 }
-                ChildState::Cancelled(_) | ChildState::Lost(_) => {
+                ChildState::Cancelled(_) | ChildState::Lost(_) | ChildState::Abandoned => {
                     summary.failed += 1;
                     summary.effects_may_be_understated = true;
                 }
@@ -768,6 +774,7 @@ mod tests {
                 let kind = match outcome {
                     ChildOutcome::Waiting => "waiting",
                     ChildOutcome::Starting => "starting",
+                    ChildOutcome::Abandoned => "abandoned",
                     ChildOutcome::Running(_) => "running",
                     ChildOutcome::Completed { .. } => "completed",
                     ChildOutcome::Failed { .. } => "failed",
@@ -882,7 +889,9 @@ mod tests {
         assert_eq!(kind_of(&run, "ship"), "skipped");
         assert!(run.child_ids().iter().all(|(id, _)| *id == "fix"));
         assert!(run.is_finished());
-        assert!(!run.summary().succeeded);
+        let summary = run.summary();
+        assert!(!summary.succeeded);
+        assert_eq!((summary.failed, summary.skipped), (1, 1));
     }
 
     #[tokio::test]
@@ -979,12 +988,55 @@ mod tests {
         let cut = tokio::time::timeout(Duration::from_secs(1), run.advance(&fake)).await;
         assert!(cut.is_err());
         assert_eq!(kind_of(&run, "fix"), "starting");
+        assert_eq!(kind_of(&run, "shepherd"), "waiting");
         assert!(!run.is_finished());
         assert!(run.child_ids().is_empty());
         assert!(run.summary().effects_may_be_understated);
         run.advance(&fake).await;
         assert_eq!(kind_of(&run, "fix"), "starting");
+        assert_eq!(kind_of(&run, "shepherd"), "waiting");
         assert_eq!(fake.identities(), ["rust-implementer"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_single_node_dropped_mid_start_is_not_finished() {
+        let mut fake = Fake::new();
+        fake.start_delay = Duration::from_secs(10);
+        let nodes = vec![node(
+            "fix",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug X.",
+            &[],
+        )];
+        let pairs = approved(nodes).await;
+        let mut run = PlanRun::new(pairs, target(std::path::Path::new("/nonexistent"))).unwrap();
+        let cut = tokio::time::timeout(Duration::from_secs(1), run.advance(&fake)).await;
+        assert!(cut.is_err());
+        assert_eq!(kind_of(&run, "fix"), "starting");
+        assert!(!run.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_settles_a_node_left_starting_as_abandoned_and_skips_its_dependents() {
+        let mut fake = Fake::new();
+        fake.start_delay = Duration::from_secs(10);
+        let mut run = ship_run().await;
+        let cut = tokio::time::timeout(Duration::from_secs(1), run.advance(&fake)).await;
+        assert!(cut.is_err());
+        let (poll, budget) = (Duration::from_millis(10), Duration::from_millis(100));
+        assert!(!run.run(&fake, poll, budget).await);
+        assert!(run.is_finished());
+        assert_eq!(kind_of(&run, "fix"), "abandoned");
+        assert_eq!(blocker(&run, "shepherd"), Some("budget".to_string()));
+        assert_eq!(blocker(&run, "ship"), Some("budget".to_string()));
+        assert_eq!(fake.identities(), ["rust-implementer"]);
+        let summary = run.summary();
+        assert!(summary.effects_may_be_understated && !summary.succeeded);
+        assert_eq!(
+            (summary.failed, summary.skipped, summary.unfinished),
+            (1, 2, 0)
+        );
     }
 
     #[tokio::test(start_paused = true)]
