@@ -1,6 +1,7 @@
 pub mod client;
 pub mod handlers;
 pub mod jsonrpc;
+pub mod plan;
 
 use crate::auditor::SpawnGate;
 use crate::task::{TaskId, TaskManager};
@@ -15,6 +16,8 @@ pub struct NannaMcpServer {
     provider: Arc<dyn ModelProvider>,
     spawn_gate: SpawnGate,
     default_max_iterations: usize,
+    planner_model: Option<String>,
+    plans: Arc<plan::PlanRegistry>,
 }
 
 impl NannaMcpServer {
@@ -32,7 +35,24 @@ impl NannaMcpServer {
             provider,
             spawn_gate,
             default_max_iterations,
+            planner_model: None,
+            plans: Arc::new(plan::PlanRegistry::default()),
         }
+    }
+
+    /// ```
+    /// use harness::mcp::NannaMcpServer;
+    /// # use harness::task::TaskManager;
+    /// # use std::sync::Arc;
+    /// # fn build(provider: Arc<dyn model::ModelProvider>, gate: harness::auditor::SpawnGate) {
+    /// let server = NannaMcpServer::new(Arc::new(TaskManager::default()), provider, gate, 10)
+    ///     .with_planner("planner-model");
+    /// # let _ = server;
+    /// # }
+    /// ```
+    pub fn with_planner(mut self, model: impl Into<String>) -> Self {
+        self.planner_model = Some(model.into());
+        self
     }
 
     /// Serve the MCP protocol over a reader/writer pair.
@@ -155,6 +175,14 @@ impl NannaMcpServer {
     }
 
     fn tool_list(&self) -> Value {
+        let mut tools = self.base_tool_list();
+        if let (Some(_), Some(list)) = (&self.planner_model, tools.as_array_mut()) {
+            list.push(plan::tool_definition());
+        }
+        tools
+    }
+
+    fn base_tool_list(&self) -> Value {
         serde_json::json!([
             {
                 "name": "assign_task",
@@ -264,6 +292,38 @@ impl NannaMcpServer {
                     Err(msg) => JsonRpcResponse::error(id, -32602, msg),
                 }
             }
+            "plan_task" => {
+                let Some(planner_model) = self.planner_model.as_deref() else {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "Tool 'plan_task' is not enabled on this server".to_string(),
+                    );
+                };
+                if task_field.is_none() {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "Tool 'plan_task' requires task augmentation (include a `task` field). \
+                         Retrieve results via tasks/result."
+                            .to_string(),
+                    );
+                }
+                let env = plan::PlanTaskEnv {
+                    task_manager: &self.task_manager,
+                    provider: &self.provider,
+                    spawn_gate: &self.spawn_gate,
+                    registry: &self.plans,
+                    planner_model,
+                    default_max_iterations: self.default_max_iterations,
+                };
+                match plan::handle_plan_task(&tool_params, &env).await {
+                    Ok(task_wire) => {
+                        JsonRpcResponse::success(id, serde_json::json!({ "task": task_wire }))
+                    }
+                    Err(error) => JsonRpcResponse::error(id, error.code(), error.to_string()),
+                }
+            }
             // `onboard_repo` does not support task augmentation
             // (taskSupport defaults to "forbidden").
             "onboard_repo" => {
@@ -310,6 +370,12 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            return match self.plans.view(&task_id.0) {
+                Ok(view) => JsonRpcResponse::success(id, plan::view_to_wire(&task_id.0, &view)),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         match self.task_manager.poll(&task_id).await {
             Some(task) => JsonRpcResponse::success(id, handlers::task_to_wire(&task)),
             None => JsonRpcResponse::error(
@@ -327,6 +393,15 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            return match self.plans.wait_finished(&task_id.0).await {
+                Ok((status, result)) => JsonRpcResponse::success(
+                    id,
+                    plan::result_to_call_tool_result(&task_id.0, status, &result),
+                ),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         // wait_terminal returns the terminal status directly (or None for an
         // unknown task id), so no second lookup is needed.
         match self.task_manager.wait_terminal(&task_id).await {
@@ -350,7 +425,10 @@ impl NannaMcpServer {
     /// as `_meta.leases.error` rather than hidden.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
-        let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
+        let mut wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
+        for (plan_id, view) in self.plans.views() {
+            wire.push(plan::view_to_wire(&plan_id, &view));
+        }
         let queue = self.task_manager.queue_metrics().await.to_json();
         let leases = match self.task_manager.lease_snapshot() {
             Ok(snapshot) => snapshot.to_json(),
@@ -372,6 +450,16 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            let cancelled = self
+                .plans
+                .cancel(&task_id.0)
+                .and_then(|()| self.plans.view(&task_id.0));
+            return match cancelled {
+                Ok(view) => JsonRpcResponse::success(id, plan::view_to_wire(&task_id.0, &view)),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         // Distinguish "not found" from "already terminal": both surface as
         // -32602 per the spec, but with different messages.
         match self.task_manager.cancel(&task_id).await {
