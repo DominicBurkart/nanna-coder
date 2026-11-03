@@ -10,9 +10,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 const BUDGET: &str = "budget";
+const CANCELLED: &str = "cancelled";
+
+/// ```
+/// use harness::plan_dispatch::RunEnd;
+///
+/// assert_ne!(RunEnd::Finished, RunEnd::Cancelled);
+/// assert!(matches!(RunEnd::BudgetExhausted, RunEnd::BudgetExhausted));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnd {
+    Finished,
+    BudgetExhausted,
+    Cancelled,
+}
 
 /// ```
 /// use harness::plan_dispatch::DispatchTarget;
@@ -379,7 +394,7 @@ impl PlanRun {
         }
     }
 
-    async fn give_up(&mut self, runner: &dyn ChildRunner) {
+    async fn give_up(&mut self, runner: &dyn ChildRunner, reason: &str) {
         for child in &mut self.children {
             let running = match &child.state {
                 ChildState::Running(task) => Some(task.clone()),
@@ -394,7 +409,7 @@ impl PlanRun {
             }
             if matches!(child.state, ChildState::Waiting) {
                 child.state = ChildState::Skipped {
-                    blocked_by: BUDGET.to_string(),
+                    blocked_by: reason.to_string(),
                 };
             }
         }
@@ -406,18 +421,42 @@ impl PlanRun {
         poll_every: Duration,
         budget: Duration,
     ) -> bool {
+        let (_keep, never) = watch::channel(false);
+        let end = self
+            .run_with_cancel(runner, poll_every, budget, never)
+            .await;
+        end == RunEnd::Finished
+    }
+
+    pub async fn run_with_cancel(
+        &mut self,
+        runner: &dyn ChildRunner,
+        poll_every: Duration,
+        budget: Duration,
+        mut cancel: watch::Receiver<bool>,
+    ) -> RunEnd {
         let deadline = Instant::now() + budget;
         loop {
+            if *cancel.borrow() {
+                self.give_up(runner, CANCELLED).await;
+                return RunEnd::Cancelled;
+            }
             self.advance(runner).await;
             if self.is_finished() {
-                return true;
+                return RunEnd::Finished;
             }
             if Instant::now() >= deadline {
-                self.give_up(runner).await;
-                return false;
+                self.give_up(runner, BUDGET).await;
+                return RunEnd::BudgetExhausted;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            tokio::time::sleep(poll_every.min(remaining)).await;
+            let pause = poll_every.min(deadline.saturating_duration_since(Instant::now()));
+            let woke = tokio::select! {
+                _ = tokio::time::sleep(pause) => true,
+                changed = cancel.changed() => changed.is_ok(),
+            };
+            if !woke {
+                tokio::time::sleep(pause).await;
+            }
         }
     }
 
@@ -966,6 +1005,83 @@ mod tests {
         assert_eq!(fake.identities(), ["rust-implementer"]);
         let summary = run.summary();
         assert!(summary.effects_may_be_understated && !summary.succeeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_running_plan_cancels_its_children_and_skips_the_rest() {
+        let (mut run, fake) = (ship_run().await, Fake::new());
+        let (tx, rx) = watch::channel(false);
+        let (poll, budget) = (Duration::from_millis(10), Duration::from_secs(60));
+        let canceller = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(true).unwrap();
+        };
+        let (end, ()) = tokio::join!(run.run_with_cancel(&fake, poll, budget, rx), canceller);
+        assert_eq!(end, RunEnd::Cancelled);
+        assert!(run.is_finished());
+        assert_eq!(kind_of(&run, "fix"), "cancelled");
+        assert_eq!(blocker(&run, "shepherd"), Some("cancelled".to_string()));
+        assert_eq!(
+            *fake.cancelled.lock().unwrap(),
+            [fake.id_of("rust-implementer")]
+        );
+        assert_eq!(fake.identities(), ["rust-implementer"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_during_a_slow_start_cancels_the_child_once_it_exists() {
+        let mut fake = Fake::new();
+        fake.start_delay = Duration::from_secs(10);
+        let mut run = ship_run().await;
+        let (tx, rx) = watch::channel(false);
+        let (poll, budget) = (Duration::from_millis(100), Duration::from_secs(60));
+        let canceller = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            tx.send(true).unwrap();
+        };
+        let (end, ()) = tokio::join!(run.run_with_cancel(&fake, poll, budget, rx), canceller);
+        assert_eq!(end, RunEnd::Cancelled);
+        assert_eq!(kind_of(&run, "fix"), "cancelled");
+        assert_eq!(run.child_ids().len(), 1);
+        assert_eq!(fake.cancelled.lock().unwrap().len(), 1);
+        assert_eq!(fake.identities(), ["rust-implementer"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_requested_before_the_run_starts_nothing() {
+        let (mut run, fake) = (ship_run().await, Fake::new());
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        let (poll, budget) = (Duration::from_millis(10), Duration::from_secs(60));
+        let end = run.run_with_cancel(&fake, poll, budget, rx).await;
+        assert_eq!(end, RunEnd::Cancelled);
+        assert!(fake.identities().is_empty());
+        assert_eq!(blocker(&run, "fix"), Some("cancelled".to_string()));
+        assert!(run.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_means_never_cancelled() {
+        let mut fake = Fake::new();
+        fake.auto_complete = true;
+        let mut run = ship_run().await;
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        let (poll, budget) = (Duration::from_millis(10), Duration::from_secs(5));
+        let end = run.run_with_cancel(&fake, poll, budget, rx).await;
+        assert_eq!(end, RunEnd::Finished);
+        assert!(run.summary().succeeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_does_not_make_the_wait_spin() {
+        let (mut run, fake) = (ship_run().await, Fake::new());
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        let (poll, budget) = (Duration::from_millis(100), Duration::from_secs(1));
+        let end = run.run_with_cancel(&fake, poll, budget, rx).await;
+        assert_eq!(end, RunEnd::BudgetExhausted);
+        assert_eq!(blocker(&run, "shepherd"), Some("budget".to_string()));
     }
 
     #[tokio::test(start_paused = true)]
