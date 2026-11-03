@@ -113,6 +113,11 @@ struct Scan {
     functions: BTreeSet<String>,
     sequences: BTreeMap<String, Calls>,
     audit_tokens: BTreeSet<String>,
+    bound_mentions: BTreeMap<String, usize>,
+    bound_ops: BTreeMap<String, usize>,
+    bound_guarded: BTreeMap<String, usize>,
+    cond_guard: Vec<usize>,
+    guards: BTreeMap<String, BTreeMap<usize, usize>>,
 }
 
 impl Scan {
@@ -133,16 +138,38 @@ impl Scan {
             return;
         };
         let branch = self.branch.clone();
-        self.sequences
-            .entry(function.clone())
-            .or_default()
-            .push((name.to_string(), branch));
+        let sequence = self.sequences.entry(function.clone()).or_default();
+        sequence.push((name.to_string(), branch));
+        let index = sequence.len() - 1;
+        if let Some(guard) = self.cond_guard.last().copied() {
+            self.guards
+                .entry(function.clone())
+                .or_default()
+                .insert(index, guard);
+        }
         if dispatch_name(name) {
             *self
                 .calls
                 .entry(format!("{}: {function} uses {name}", self.file))
                 .or_default() += 1;
         }
+    }
+
+    fn record_bound_mention(&mut self) {
+        let function = self.function.last().cloned().unwrap_or_default();
+        *self
+            .bound_mentions
+            .entry(format!("{}: {function}", self.file))
+            .or_default() += 1;
+    }
+
+    fn record_bound_op(&mut self, method: &str) {
+        let function = self.function.last().cloned().unwrap_or_default();
+        let key = format!("{}: {function} bound.{}", self.file, plain(method));
+        if !self.branch.is_empty() {
+            *self.bound_guarded.entry(key.clone()).or_default() += 1;
+        }
+        *self.bound_ops.entry(key).or_default() += 1;
     }
 
     fn record_token_shape(&mut self, what: &str) {
@@ -159,8 +186,15 @@ impl Scan {
     fn scan_tokens(&mut self, tokens: TokenStream) {
         let mut previous = String::new();
         let mut pending_type = false;
+        let mut after_dot = false;
         for token in tokens {
+            let was_dot = std::mem::take(&mut after_dot);
             match token {
+                TokenTree::Punct(punct) => {
+                    after_dot = punct.as_char() == '.';
+                    pending_type = false;
+                }
+                TokenTree::Literal(_) => pending_type = false,
                 TokenTree::Group(group) => {
                     if pending_type && group.delimiter() == proc_macro2::Delimiter::Brace {
                         self.record_token_use("AuditedIdentity");
@@ -170,6 +204,9 @@ impl Scan {
                 }
                 TokenTree::Ident(ident) => {
                     let name = plain(&ident.to_string()).to_string();
+                    if was_dot && name == "bound" {
+                        self.record_bound_mention();
+                    }
                     self.record_call(&name);
                     if let Some(what) = token_use(&previous, &name) {
                         self.record_token_use(what);
@@ -179,7 +216,6 @@ impl Scan {
                             && self.owner.last().is_some_and(|o| o == "AuditedIdentity"));
                     previous = name;
                 }
-                _ => pending_type = false,
             }
         }
     }
@@ -293,6 +329,9 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         syn::visit::visit_expr_method_call(self, node);
         self.record_call(&node.method.to_string());
+        if rooted_at_bound(&node.receiver) {
+            self.record_bound_op(&node.method.to_string());
+        }
         if node.method == "write" {
             if let syn::Expr::Field(field) = &*node.receiver {
                 if let syn::Member::Named(member) = &field.member {
@@ -303,6 +342,20 @@ impl<'ast> Visit<'ast> for Scan {
                     }
                 }
             }
+        }
+    }
+
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        syn::visit::visit_field_pat(self, node);
+        if names_bound(&node.member) {
+            self.record_bound_mention();
+        }
+    }
+
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        syn::visit::visit_expr_field(self, node);
+        if names_bound(&node.member) {
+            self.record_bound_mention();
         }
     }
 
@@ -337,8 +390,14 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.branches += 1;
+        let then_id = self.branches;
+        self.cond_guard.push(then_id);
         self.visit_expr(&node.cond);
-        self.conditional(|scan| scan.visit_block(&node.then_branch));
+        self.cond_guard.pop();
+        self.branch.push(then_id);
+        self.visit_block(&node.then_branch);
+        self.branch.pop();
         if let Some((_, otherwise)) = &node.else_branch {
             self.conditional(|scan| scan.visit_expr(otherwise));
         }
@@ -380,6 +439,22 @@ impl<'ast> Visit<'ast> for Scan {
                 .insert(format!("{}: include! macro", self.file));
         }
         self.scan_tokens(node.tokens.clone());
+    }
+}
+
+fn names_bound(member: &syn::Member) -> bool {
+    matches!(member, syn::Member::Named(name) if plain(&name.to_string()) == "bound")
+}
+
+fn rooted_at_bound(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Field(field) => names_bound(&field.member),
+        syn::Expr::MethodCall(call) => rooted_at_bound(&call.receiver),
+        syn::Expr::Await(awaited) => rooted_at_bound(&awaited.base),
+        syn::Expr::Paren(paren) => rooted_at_bound(&paren.expr),
+        syn::Expr::Reference(reference) => rooted_at_bound(&reference.expr),
+        syn::Expr::Unary(unary) => rooted_at_bound(&unary.expr),
+        _ => false,
     }
 }
 
@@ -505,6 +580,28 @@ fn calls_in(function: &str, file: &str) -> Calls {
         .filter_map(|mut scan| scan.sequences.remove(function))
         .flatten()
         .collect()
+}
+
+fn guarded_in(scan: &Scan, function: &str, first: &str, then: &str) -> bool {
+    let calls = &scan.sequences[function];
+    let Some(index) = calls.iter().position(|(name, _)| name == first) else {
+        return false;
+    };
+    let Some(guard) = scan.guards.get(function).and_then(|g| g.get(&index)) else {
+        return false;
+    };
+    let dependents: Vec<_> = calls.iter().filter(|(name, _)| name == then).collect();
+    !dependents.is_empty() && dependents.iter().all(|(_, path)| path.contains(guard))
+}
+
+fn guarded_by_condition(function: &str, file: &str, first: &str, then: &str) -> bool {
+    let scan = scan_all()
+        .into_iter()
+        .find(|scan| scan.file == file && scan.sequences.contains_key(function))
+        .unwrap_or_else(|| {
+            panic!("{file}: {function} is no longer scanned; update the pairing pin")
+        });
+    guarded_in(&scan, function, first, then)
 }
 
 fn dominates(calls: &Calls, first: &str, then: &str) -> bool {
@@ -897,4 +994,287 @@ fn indirect_routes_to_the_token_constructor_and_widened_derives_are_seen() {
     );
     assert_eq!(token_use("BoundIdentity", "Unaudited"), None);
     assert_eq!(token_use("Other", "split"), None);
+}
+
+fn union_counts(select: impl Fn(&Scan) -> &BTreeMap<String, usize>) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for scan in scan_all() {
+        for (key, count) in select(&scan) {
+            *counts.entry(key.clone()).or_default() += count;
+        }
+    }
+    counts
+}
+
+fn counts(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+    entries
+        .iter()
+        .map(|(key, count)| (key.to_string(), *count))
+        .collect()
+}
+
+#[test]
+fn every_production_mention_of_the_bound_identity_map_is_counted_per_function() {
+    assert_eq!(
+        union_counts(|scan| &scan.bound_mentions),
+        counts(&[
+            ("task.rs: TaskManager::admit_restored", 1),
+            ("task.rs: TaskManager::cancel", 1),
+            ("task.rs: TaskManager::submit_audited", 1),
+            ("task.rs: TaskManager::submit_bound", 1),
+            ("task.rs: TaskRunner::resolve_identity", 1),
+            ("task.rs: TaskRunner::set_status", 1),
+        ]),
+        "a production function started or stopped touching `runner.bound`, or reaches it through an alias, helper or macro; review that every insert still has a remove"
+    );
+}
+
+#[test]
+fn every_production_operation_on_the_bound_identity_map_is_counted_per_function() {
+    assert_eq!(
+        union_counts(|scan| &scan.bound_ops),
+        counts(&[
+            ("task.rs: TaskManager::admit_restored bound.insert", 1),
+            ("task.rs: TaskManager::admit_restored bound.write", 1),
+            ("task.rs: TaskManager::cancel bound.remove", 1),
+            ("task.rs: TaskManager::cancel bound.write", 1),
+            ("task.rs: TaskManager::submit_audited bound.insert", 1),
+            ("task.rs: TaskManager::submit_audited bound.write", 1),
+            ("task.rs: TaskManager::submit_bound bound.insert", 1),
+            ("task.rs: TaskManager::submit_bound bound.write", 1),
+            ("task.rs: TaskRunner::resolve_identity bound.remove", 1),
+            ("task.rs: TaskRunner::resolve_identity bound.write", 1),
+            ("task.rs: TaskRunner::set_status bound.remove", 1),
+            ("task.rs: TaskRunner::set_status bound.write", 1),
+        ]),
+        "an insert into or removal from `runner.bound` was added, removed or moved to another function; every insert site needs a matching remove path"
+    );
+}
+
+#[test]
+fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_status() {
+    let ops = union_counts(|scan| &scan.bound_ops);
+    let sites = |method: &str| -> BTreeSet<String> {
+        ops.keys()
+            .filter_map(|key| key.strip_suffix(&format!(" bound.{method}")))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        sites("insert"),
+        expected(&[
+            "task.rs: TaskManager::admit_restored",
+            "task.rs: TaskManager::submit_audited",
+            "task.rs: TaskManager::submit_bound",
+        ]),
+        "an insert into `runner.bound` was added or moved: give the new site a remove path (terminal status, cancel, or consumption by resolve_identity) and update this list in the same change"
+    );
+    assert_eq!(
+        sites("remove"),
+        expected(&[
+            "task.rs: TaskManager::cancel",
+            "task.rs: TaskRunner::resolve_identity",
+            "task.rs: TaskRunner::set_status",
+        ]),
+        "a removal from `runner.bound` was added, deleted or moved: every insert site needs a remove reachable for it; update this list only after checking that"
+    );
+    assert!(
+        guarded_by_condition("TaskRunner::set_status", "task.rs", "is_terminal", "remove"),
+        "set_status must remove the bound identity inside the `if status.is_terminal()` branch"
+    );
+    let guarded_removes: BTreeMap<String, usize> = union_counts(|scan| &scan.bound_guarded)
+        .into_iter()
+        .filter(|(key, _)| key.ends_with(" bound.remove"))
+        .collect();
+    assert_eq!(
+        guarded_removes,
+        counts(&[
+            ("task.rs: TaskManager::cancel bound.remove", 1),
+            ("task.rs: TaskRunner::set_status bound.remove", 1),
+        ]),
+        "cancel and set_status must remove the bound identity only on a conditional branch (cancel: when the task was dequeued; set_status: when the status is terminal)"
+    );
+    assert!(
+        guarded_by_condition("TaskManager::submit_task", "task.rs", "enqueue", "fail"),
+        "submit_task must call fail inside the branch taken when enqueue errors, so a failed submit reaches the terminal remove in set_status"
+    );
+    let fail = calls_in("TaskRunner::fail", "task.rs");
+    assert!(
+        fail.iter().any(|(name, _)| name == "set_status"),
+        "TaskRunner::fail must reach set_status, where the terminal remove lives"
+    );
+}
+
+#[test]
+fn the_bound_scanner_sees_raw_identifiers_aliases_macros_and_ignores_cfg_test_items() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(r: R) { r.r#bound.write().await.r#insert(1, 2); } \
+         fn g(r: R) { let b = &r.bound; } \
+         fn h(r: R) { m!(r.bound.write().await.insert(1, 2)); } \
+         #[cfg(test)] fn t(r: R) { r.bound.write().await.insert(1, 2); }",
+    );
+    assert_eq!(scan.bound_ops["x.rs: f bound.insert"], 1);
+    assert_eq!(scan.bound_ops["x.rs: f bound.write"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: f"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: g"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: h"], 1);
+    assert!(!scan.bound_mentions.contains_key("x.rs: t"));
+    assert!(!scan.bound_ops.contains_key("x.rs: h bound.insert"));
+}
+
+struct FieldTypes {
+    idents: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for FieldTypes {
+    fn visit_path_segment(&mut self, node: &'ast syn::PathSegment) {
+        self.idents.insert(node.ident.to_string());
+        syn::visit::visit_path_segment(self, node);
+    }
+}
+
+fn task_runner_fields(source: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let syntax = syn::parse_file(source).unwrap();
+    let mut fields = BTreeMap::new();
+    for item in &syntax.items {
+        let syn::Item::Struct(item) = item else {
+            continue;
+        };
+        if item.ident != "TaskRunner" {
+            continue;
+        }
+        for field in &item.fields {
+            let mut types = FieldTypes {
+                idents: BTreeSet::new(),
+            };
+            types.visit_type(&field.ty);
+            let name = field
+                .ident
+                .as_ref()
+                .map(|i| plain(&i.to_string()).to_string());
+            fields.insert(name.unwrap_or_default(), types.idents);
+        }
+    }
+    fields
+}
+
+fn task_source() -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/task.rs")).unwrap()
+}
+
+#[test]
+fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
+    let fields = task_runner_fields(&task_source());
+    let holders: BTreeSet<String> = fields
+        .iter()
+        .filter(|(_, types)| {
+            ["BoundIdentity", "AuditedIdentity", "Allowed"]
+                .iter()
+                .any(|token| types.contains(*token))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(
+        holders,
+        expected(&["bound"]),
+        "a second TaskRunner field holds bound or audited identities; the pairing pin is keyed on the field name `bound` and does not see it: extend the scanner to the new field and give it a remove path"
+    );
+    assert_eq!(
+        fields.keys().cloned().collect::<BTreeSet<_>>(),
+        expected(&[
+            "action_gate",
+            "audit",
+            "bound",
+            "build_locks",
+            "ci_client",
+            "cost_accountant",
+            "default_provider",
+            "escalations",
+            "escalator",
+            "identities",
+            "image_cache",
+            "leases",
+            "progress",
+            "providers",
+            "sink",
+            "status_senders",
+            "tasks",
+        ]),
+        "TaskRunner gained or lost a field: if it keeps per-task state, check that it is cleaned up on terminal status, then update this list"
+    );
+}
+
+#[test]
+fn the_field_list_scanner_reads_struct_fields_and_their_type_names() {
+    let fields = task_runner_fields(
+        "struct TaskRunner { bound: RwLock<HashMap<TaskId, BoundIdentity>>, r#other: Arc<X> } struct Other { z: u8 }",
+    );
+    assert_eq!(fields.len(), 2);
+    assert!(fields["bound"].contains("BoundIdentity"));
+    assert!(fields["other"].contains("X"));
+}
+
+#[test]
+fn the_bound_scanner_sees_struct_pattern_destructuring_of_the_field() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(s: S) { let TaskRunner { bound, .. } = &*s.runner; } \
+         fn g(r: &TaskRunner) { let TaskRunner { bound: m, .. } = r; } \
+         fn h(r: &TaskRunner) { let TaskRunner { r#bound: m, .. } = r; }",
+    );
+    assert_eq!(scan.bound_mentions["x.rs: f"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: g"], 1);
+    assert_eq!(scan.bound_mentions["x.rs: h"], 1);
+}
+
+#[test]
+fn a_condition_guards_only_the_branch_it_selects() {
+    let guarded = |source: &str| {
+        let scan = scan_source("x.rs", source);
+        let calls = &scan.sequences["f"];
+        let index = calls.iter().position(|(name, _)| name == "cond").unwrap();
+        let guard = scan.guards["f"][&index];
+        calls
+            .iter()
+            .filter(|(name, _)| name == "act")
+            .all(|(_, path)| path.contains(&guard))
+    };
+    assert!(guarded("fn f(s: S) { if s.cond() { s.act(); } }"));
+    assert!(!guarded("fn f(s: S) { if s.cond() { } s.act(); }"));
+    assert!(!guarded(
+        "fn f(s: S) { if s.cond() { } if s.other() { s.act(); } }"
+    ));
+    assert!(!guarded("fn f(s: S) { if s.cond() { } else { s.act(); } }"));
+}
+
+#[test]
+fn a_missing_function_or_a_missing_condition_does_not_count_as_guarded() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(s: S) { s.act(); if s.cond() { s.act(); } } fn g(s: S) { if s.cond() { s.act(); } } fn h(s: S) { s.cond(); s.act(); }",
+    );
+    assert!(guarded_in(&scan, "g", "cond", "act"));
+    assert!(!guarded_in(&scan, "g", "missing", "act"));
+    assert!(!guarded_in(&scan, "g", "cond", "missing"));
+    assert!(!guarded_in(&scan, "h", "cond", "act"));
+    assert!(!guarded_in(&scan, "f", "act", "act"));
+}
+
+#[test]
+#[should_panic(expected = "is no longer scanned")]
+fn a_function_that_is_no_longer_scanned_fails_with_an_actionable_message() {
+    guarded_by_condition("TaskRunner::missing", "task.rs", "a", "b");
+}
+
+#[test]
+fn the_bound_root_follows_parentheses_references_and_dereferences() {
+    let rooted = |source: &str| rooted_at_bound(&syn::parse_str::<syn::Expr>(source).unwrap());
+    assert!(rooted("self.runner.bound"));
+    assert!(rooted("(self.runner.bound)"));
+    assert!(rooted("&self.runner.bound"));
+    assert!(rooted("*self.runner.bound"));
+    assert!(rooted("self.runner.bound.write().await"));
+    assert!(!rooted("self.runner.tasks.write().await"));
+    assert!(!rooted("bound"));
 }
