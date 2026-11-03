@@ -21,7 +21,7 @@ use harness::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
     ReadOnlyMount,
 };
-use harness::protected::ProtectedPaths;
+use harness::protected::{ProtectedExtras, ProtectedPaths};
 use harness::tools::{create_container_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR};
 use harness::workspace::protected_mounts;
 use serde_json::{json, Value};
@@ -186,7 +186,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let gitlink = std::fs::read_to_string(workspace.join(".git")).unwrap();
     assert!(gitlink.starts_with("gitdir:"), "{gitlink}");
 
-    let protected = ProtectedPaths::with_config_dir(&workspace, None);
+    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\", \"tools/**\"]").unwrap();
+    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
     let shielded = protected_mounts(&protected, &workspace).unwrap();
 
     let handle = start(&workspace, shielded.mounts).await;
@@ -280,6 +281,9 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/harness/src/identity/new.rs").await;
     assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
     assert_refused(&registry, "echo x > /workspace/windows.toml").await;
+    assert_refused(&registry, "echo x > /workspace/src/gate.rs").await;
+    assert_refused(&registry, "echo x > /workspace/tools/new.sh").await;
+    assert_refused(&registry, "mkdir /workspace/tools/sub").await;
     assert_blocked(&registry, "echo 'gitdir: /tmp/evil' > /workspace/.git").await;
     assert_blocked(&registry, "rm -f /workspace/.git").await;
     assert_blocked(&registry, "mkdir -p /workspace/.git/hooks").await;

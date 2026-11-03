@@ -1826,22 +1826,30 @@ fn pr_number_schema() -> JsonSchema {
 pub struct GitPushBranchTool {
     workspace_root: PathBuf,
     identity_name: String,
+    protected: ProtectedPaths,
 }
 
 impl GitPushBranchTool {
     pub fn new(workspace_root: PathBuf, identity_name: impl Into<String>) -> Self {
+        let protected = ProtectedPaths::for_repo(&workspace_root);
         Self {
             workspace_root,
             identity_name: identity_name.into(),
+            protected,
         }
+    }
+
+    pub fn with_protected(mut self, protected: ProtectedPaths) -> Self {
+        self.protected = protected;
+        self
     }
 }
 
 fn ensure_unpushed_commits_are_attributed_and_unprotected(
     workspace_root: &Path,
     identity_name: &str,
+    protected: &ProtectedPaths,
 ) -> ToolResult<()> {
-    let protected = ProtectedPaths::for_repo(workspace_root);
     let shas = run_git(
         workspace_root,
         &["rev-list", "HEAD", "--not", "--remotes=origin"],
@@ -1900,6 +1908,7 @@ impl Tool for GitPushBranchTool {
         ensure_unpushed_commits_are_attributed_and_unprotected(
             &self.workspace_root,
             &self.identity_name,
+            &self.protected,
         )?;
         let refspec = format!("HEAD:refs/heads/{branch}");
         run_git(&self.workspace_root, &["push", "origin", &refspec])?;
@@ -1956,14 +1965,22 @@ fn escaped(path: &str) -> String {
 pub struct GitCommitTool {
     workspace_root: PathBuf,
     identity_name: String,
+    protected: ProtectedPaths,
 }
 
 impl GitCommitTool {
     pub fn new(workspace_root: PathBuf, identity_name: impl Into<String>) -> Self {
+        let protected = ProtectedPaths::for_repo(&workspace_root);
         Self {
             workspace_root,
             identity_name: identity_name.into(),
+            protected,
         }
+    }
+
+    pub fn with_protected(mut self, protected: ProtectedPaths) -> Self {
+        self.protected = protected;
+        self
     }
 }
 
@@ -1995,7 +2012,7 @@ impl Tool for GitCommitTool {
         let body = optional_text_arg(&args, "body", Shape::Block, COMMIT_BODY_MAX)?;
         let (trailer, _) = identity_markers(&self.identity_name)?;
         let (branch, _) = working_branch(&self.workspace_root)?;
-        let protected = ProtectedPaths::for_repo(&self.workspace_root);
+        let protected = &self.protected;
         let status = run_git_raw(
             &self.workspace_root,
             &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -2574,6 +2591,38 @@ pub fn register(
             .iter()
             .any(|pattern| pattern.as_str() == name)
     });
+}
+
+pub fn register_guarded(
+    registry: &mut ToolRegistry,
+    workspace_root: &Path,
+    identity: &crate::identity::AgentIdentity,
+    protected: &ProtectedPaths,
+) {
+    register(registry, workspace_root, identity);
+    let granted = |name: &str| {
+        identity
+            .scope
+            .tools
+            .iter()
+            .any(|pattern| pattern.as_str() == name)
+    };
+    register_if(
+        registry,
+        &granted,
+        Box::new(
+            GitCommitTool::new(workspace_root.to_path_buf(), identity.name())
+                .with_protected(protected.clone()),
+        ),
+    );
+    register_if(
+        registry,
+        &granted,
+        Box::new(
+            GitPushBranchTool::new(workspace_root.to_path_buf(), identity.name())
+                .with_protected(protected.clone()),
+        ),
+    );
 }
 
 fn register_granted(
@@ -4770,6 +4819,139 @@ mod tests {
             .collect();
         skipped.sort();
         assert_eq!(skipped, vec![".github/workflows/x.yml", "codecov.yml"]);
+    }
+
+    fn declared_extras() -> ProtectedPaths {
+        let extras =
+            crate::protected::ProtectedExtras::parse(r#"extra = ["src/gate.rs", "ci/**"]"#)
+                .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_repo_declared_paths_out_of_the_commit() {
+        let dir = feature_repo();
+        std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+        std::fs::write(dir.path().join("ci/deploy.sh"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/gate.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(declared_extras());
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(committed, "ok.txt");
+        let mut skipped: Vec<String> = result["skipped_protected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        skipped.sort();
+        assert_eq!(skipped, vec!["ci/deploy.sh", "src/gate.rs"]);
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_a_tracked_change_to_a_repo_declared_path() {
+        let dir = github_repo_fixture();
+        commit_file(dir.path(), "src/gate.rs", "a\n", "base");
+        git(dir.path(), &["checkout", "-q", "-b", "feature-x"]);
+        std::fs::write(dir.path().join("src/gate.rs"), "b\n").unwrap();
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(declared_extras());
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("protected"), "{err}");
+        assert_eq!(head_sha(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn push_refuses_a_commit_under_a_repo_declared_pattern() {
+        for path in ["src/gate.rs", "ci/sub/deploy.sh"] {
+            let fixture = push_fixture();
+            git(fixture.work.path(), &["checkout", "-q", "-b", "feature-rd"]);
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "declared\n\nNanna-Identity: sdlc-dev",
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+                .with_protected(declared_extras());
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("changes protected path '{path}'")),
+                "{path}: {err}"
+            );
+            assert!(!remote_has(fixture.work.path(), "feature-rd"), "{path}");
+        }
+    }
+
+    fn granted_identity() -> crate::identity::AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Repository;
+        identity.scope.tools = vec![
+            "git_commit".parse().unwrap(),
+            "git_push_branch".parse().unwrap(),
+        ];
+        identity.scope.paths = vec!["**".to_string()];
+        identity
+    }
+
+    #[tokio::test]
+    async fn registered_commit_and_push_tools_carry_the_declared_set() {
+        let identity = granted_identity();
+        let fixture = push_fixture();
+        git(
+            fixture.work.path(),
+            &["checkout", "-q", "-b", "feature-reg"],
+        );
+        std::fs::create_dir_all(fixture.work.path().join("ci")).unwrap();
+        std::fs::write(fixture.work.path().join("ci/deploy.sh"), "x").unwrap();
+        std::fs::write(fixture.work.path().join("ok.txt"), "ok").unwrap();
+        let mut registry = ToolRegistry::new();
+        register_guarded(
+            &mut registry,
+            fixture.work.path(),
+            &identity,
+            &declared_extras(),
+        );
+        let commit = registry.get_tool("git_commit").unwrap();
+        let result = commit.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["skipped_protected"], json!(["ci/deploy.sh"]));
+        git(fixture.work.path(), &["add", "ci/deploy.sh"]);
+        git(
+            fixture.work.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "d\n\nNanna-Identity: rust-implementer",
+            ],
+        );
+        let push = registry.get_tool("git_push_branch").unwrap();
+        let err = push.execute(json!({})).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changes protected path 'ci/deploy.sh'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_allows_the_same_commit_when_nothing_is_declared() {
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-nd"]);
+        commit_file(
+            fixture.work.path(),
+            "src/gate.rs",
+            "x",
+            "plain\n\nNanna-Identity: sdlc-dev",
+        );
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+        tool.execute(json!({})).await.unwrap();
+        assert!(remote_has(fixture.work.path(), "feature-nd"));
     }
 
     fn pattern_example_path(pattern: &str) -> String {
