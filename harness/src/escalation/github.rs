@@ -219,6 +219,14 @@ pub(super) mod tests {
             unreachable!("escalation delivery never reads issue comments")
         }
 
+        async fn list_pull_request_reviews(
+            &self,
+            _repo: &str,
+            _number: u64,
+        ) -> Result<Vec<crate::backlog::GithubReview>, BacklogError> {
+            unreachable!("escalation delivery never reads pull request reviews")
+        }
+
         async fn get_issue(
             &self,
             _repo: &str,

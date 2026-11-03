@@ -18,9 +18,13 @@ Every git subprocess runs with a cleared environment plus an allow-list: PATH, H
 
 The credentials must not carry merge scope; no tool merges.
 
+The API tools always talk to `https://api.github.com`. No configuration file, environment variable, identity field or tool argument changes that base URL, so a task cannot redirect the token-bearing client. A private seam lets this module's own tests drive the production registration against a loopback server; `harness/tests/pr_tools_base_url_structural.rs` fails if any production path passes it anything but the GitHub default.
+
 ## Limits
 
 The `Nanna-Identity` trailer and the PR body marker are attribution, not authentication. Repository hooks are disabled for the tools' git calls. GitHub-sourced text returned to the model is escaped, capped and fenced as untrusted data.
+
+`github_pr_comments` returns three lists from the same author allow-list: `reviews` (submitted review summaries with their `state`, one of APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING, or UNKNOWN for anything else), `review_comments` and `issue_comments`. Reviews come first, share the same per-call item limit and character budget as the comments, and at most the first 1,000 reviews of a pull request are fetched. Items beyond a limit are counted in `omitted_comments`.
 
 ## Accepted characters
 
