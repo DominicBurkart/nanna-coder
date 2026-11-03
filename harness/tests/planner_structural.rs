@@ -346,3 +346,58 @@ fn the_checker_flags_a_missing_extra_or_misordered_gate_call() {
         .unwrap()
         .contains("before checking"));
 }
+
+const DISPATCH_ALLOWED: &[&str] = &["names dispatch function submit_spawn", "uses TaskManager"];
+
+fn dispatch_module_problems(source: &str) -> Vec<String> {
+    let found = forbidden_constructs(source);
+    let submits = found
+        .iter()
+        .filter(|f| *f == "names dispatch function submit_spawn")
+        .count();
+    let mut problems: Vec<String> = found
+        .into_iter()
+        .filter(|f| !DISPATCH_ALLOWED.contains(&f.as_str()))
+        .collect();
+    if submits != 1 {
+        problems.push(format!("submit_spawn is named {submits} times"));
+    }
+    problems
+}
+
+#[test]
+fn the_plan_dispatcher_names_submit_spawn_once_and_builds_no_gate_or_audit_token() {
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plan_dispatch.rs"))
+            .unwrap();
+    assert_eq!(dispatch_module_problems(&source), Vec::<String>::new());
+}
+
+#[test]
+fn the_planner_itself_never_names_a_dispatch_function() {
+    let found = forbidden_constructs(&planner_source());
+    assert!(!found
+        .iter()
+        .any(|f| f.starts_with("names dispatch function")));
+}
+
+#[test]
+fn the_dispatch_checker_flags_a_second_call_a_missing_call_and_a_gate() {
+    let once = "fn start() { m.submit_spawn(a); }";
+    assert_eq!(dispatch_module_problems(once), Vec::<String>::new());
+    let twice = "fn start() { m.submit_spawn(a); m.submit_spawn(b); }";
+    assert_eq!(
+        dispatch_module_problems(twice),
+        ["submit_spawn is named 2 times"]
+    );
+    let none = "fn start() {}";
+    assert_eq!(
+        dispatch_module_problems(none),
+        ["submit_spawn is named 0 times"]
+    );
+    let sneaky =
+        "fn start() { m.submit_spawn(a); m.submit_task(b); let _ = AuditedIdentity::split(p); }";
+    let problems = dispatch_module_problems(sneaky);
+    assert!(problems.contains(&"names dispatch function submit_task".to_string()));
+    assert!(problems.contains(&"uses AuditedIdentity".to_string()));
+}
