@@ -1,9 +1,12 @@
 use super::eval::{default_catalog_dir, score, AuditorEvalCase, AuditorEvalError, CaseOutcome};
 use super::llm::AUDIT_TEMPERATURE;
+use super::shard::{
+    call_at, call_index, differing_field, total_calls, CallOutcome, Phase, RunIdentity,
+    ShardResult, ShardSpec, MAX_RUNS, MAX_SHARDS, SHARD_SCHEMA_VERSION,
+};
 use super::{
     content_hash, AuditContext, AuditError, AuditOutcome, Auditor, FailClosedModelAuditor,
     ModelAuditor, Reason, ReasonCode, RuleAuditor, SpawnRequest, SpawnVerdict, VerdictKind,
-    MODEL_AUDIT_TIMEOUT,
 };
 use crate::identity::IdentityCatalog;
 use async_trait::async_trait;
@@ -19,6 +22,8 @@ pub fn default_heldout_cases_dir() -> PathBuf {
 }
 
 pub const DEFAULT_RUNS: usize = 3;
+
+pub const DEFAULT_EVAL_TIMEOUT_SECS: u64 = 600;
 
 const UNKNOWN: &str = "unknown";
 
@@ -38,6 +43,14 @@ pub struct ScorecardOptions {
     pub model_digest: Option<String>,
     pub repo_sha: String,
     pub max_cases: Option<usize>,
+    pub expect: MergeExpect,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MergeExpect {
+    pub shards: Option<usize>,
+    pub model: Option<String>,
+    pub runs: Option<usize>,
 }
 
 impl ScorecardOptions {
@@ -46,11 +59,12 @@ impl ScorecardOptions {
             cases_dir,
             catalog_dir: None,
             max_false_allow,
-            model_timeout: MODEL_AUDIT_TIMEOUT,
+            model_timeout: Duration::from_secs(DEFAULT_EVAL_TIMEOUT_SECS),
             runs: DEFAULT_RUNS,
             model_digest: None,
             repo_sha: UNKNOWN.to_string(),
             max_cases: None,
+            expect: MergeExpect::default(),
         }
     }
 
@@ -223,6 +237,7 @@ pub struct AuditorScorecard {
     pub cases_dir: PathBuf,
     pub max_false_allow: usize,
     pub runs: usize,
+    pub timeout_secs: u64,
     pub model_digest: Option<String>,
     pub repo_sha: String,
     pub prompt_hash: String,
@@ -259,10 +274,11 @@ impl AuditorScorecard {
         let _ = writeln!(out, "auditor: {}", self.auditor);
         let _ = writeln!(
             out,
-            "model_digest: {} temperature: {} seed: not supported by the model provider runs: {} prompt_hash: {} repo_sha: {}",
+            "model_digest: {} temperature: {} seed: not supported by the model provider runs: {} timeout_secs: {} prompt_hash: {} repo_sha: {}",
             self.model_digest.as_deref().unwrap_or(UNKNOWN),
             AUDIT_TEMPERATURE,
             self.runs,
+            self.timeout_secs,
             self.prompt_hash,
             self.repo_sha
         );
@@ -393,6 +409,7 @@ fn build_scorecard(
         cases_dir: options.cases_dir.clone(),
         max_false_allow: options.max_false_allow,
         runs: options.runs,
+        timeout_secs: options.model_timeout.as_secs(),
         model_digest: options.model_digest.clone(),
         repo_sha: options.repo_sha.clone(),
         prompt_hash,
@@ -442,11 +459,14 @@ fn worst_case(runs: &[Vec<CaseOutcome>]) -> Vec<CaseOutcome> {
         .collect()
 }
 
-pub async fn measure<C: Auditor + ?Sized, M: Auditor + ?Sized>(
-    composed: &C,
-    model_only: &M,
-    options: &ScorecardOptions,
-) -> Result<AuditorScorecard, AuditorEvalError> {
+struct Loaded {
+    cases: Vec<AuditorEvalCase>,
+    cases_available: usize,
+    context: AuditContext,
+    ambiguous: Vec<bool>,
+}
+
+fn load_cases(options: &ScorecardOptions) -> Result<Loaded, AuditorEvalError> {
     let mut cases = AuditorEvalCase::discover(&options.cases_dir)?;
     if cases.is_empty() {
         return Err(AuditorEvalError::NoCases(options.cases_dir.clone()));
@@ -469,34 +489,74 @@ pub async fn measure<C: Auditor + ?Sized, M: Auditor + ?Sized>(
     if options.runs == 0 {
         return Err(AuditorEvalError::NoRuns);
     }
-    let (rule, _) = score(&RuleAuditor::new(), &context, &cases).await?;
+    Ok(Loaded {
+        cases,
+        cases_available,
+        context,
+        ambiguous,
+    })
+}
+
+fn prompt_hash_of(loaded: &Loaded) -> String {
+    let first = loaded.cases[0].request.to_request();
+    let system = &ModelAuditor::build_prompt(&first, &loaded.context)[0];
+    content_hash(&format!("{system:?}"))
+}
+
+struct Parts<'a> {
+    rule: &'a [CaseOutcome],
+    runs: &'a [Vec<CaseOutcome>],
+    composed: &'a [CaseOutcome],
+}
+
+fn assemble(
+    options: &ScorecardOptions,
+    loaded: &Loaded,
+    auditor: &str,
+    parts: Parts<'_>,
+) -> AuditorScorecard {
+    let Parts {
+        rule,
+        runs,
+        composed,
+    } = parts;
+    let cases = loaded.cases.len();
+    let allow_runs: Vec<usize> = (0..cases)
+        .map(|index| runs.iter().filter(|run| run[index].is_false_allow).count())
+        .collect();
+    let model_only = worst_case(runs);
+    let measured = Measured {
+        ambiguous: &loaded.ambiguous,
+        allow_runs: &allow_runs,
+        prompt_hash: prompt_hash_of(loaded),
+        rule,
+        model_only: &model_only,
+        composed,
+    };
+    build_scorecard(auditor, options, loaded.cases_available, measured)
+}
+
+pub async fn measure<C: Auditor + ?Sized, M: Auditor + ?Sized>(
+    composed: &C,
+    model_only: &M,
+    options: &ScorecardOptions,
+) -> Result<AuditorScorecard, AuditorEvalError> {
+    let loaded = load_cases(options)?;
+    let (cases, context) = (&loaded.cases, &loaded.context);
+    let (rule, _) = score(&RuleAuditor::new(), context, cases).await?;
     let model_only = &Progress::new(model_only, "model_only", cases.len() * options.runs);
     let composed_progress = Progress::new(composed, "composed", cases.len());
     let mut runs = Vec::with_capacity(options.runs);
     for _ in 0..options.runs {
-        runs.push(score(model_only, &context, &cases).await?.0);
+        runs.push(score(model_only, context, cases).await?.0);
     }
-    let allow_runs: Vec<usize> = (0..cases.len())
-        .map(|index| runs.iter().filter(|run| run[index].is_false_allow).count())
-        .collect();
-    let model_only_outcomes = worst_case(&runs);
-    let first = cases[0].request.to_request();
-    let system = &ModelAuditor::build_prompt(&first, &context)[0];
-    let prompt_hash = content_hash(&format!("{system:?}"));
-    let (composed_outcomes, _) = score(&composed_progress, &context, &cases).await?;
-    Ok(build_scorecard(
-        composed.name(),
-        options,
-        cases_available,
-        Measured {
-            ambiguous: &ambiguous,
-            allow_runs: &allow_runs,
-            prompt_hash,
-            rule: &rule,
-            model_only: &model_only_outcomes,
-            composed: &composed_outcomes,
-        },
-    ))
+    let (composed_outcomes, _) = score(&composed_progress, context, cases).await?;
+    let parts = Parts {
+        rule: &rule,
+        runs: &runs,
+        composed: &composed_outcomes,
+    };
+    Ok(assemble(options, &loaded, composed.name(), parts))
 }
 
 pub async fn run_auditor_eval<C: Auditor + ?Sized, M: Auditor + ?Sized>(
@@ -702,6 +762,27 @@ impl Auditor for ModelOnly {
     }
 }
 
+async fn build_auditors(
+    provider: Arc<dyn ModelProvider>,
+    model: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    options: &ScorecardOptions,
+) -> Result<(ModelMustDecide<FailClosedModelAuditor>, ModelOnly), AuditorEvalError> {
+    let name = resolve_eval_model(model, env)?;
+    if options.model_digest.is_none() {
+        return Err(AuditorEvalError::ModelDigestUnknown(name));
+    }
+    let health = provider.health_check().await;
+    health.map_err(|e| AuditorEvalError::ModelUnreachable(e.to_string()))?;
+    let failing = FailClosedModelAuditor::new(provider.clone(), name.clone());
+    let composed = ModelMustDecide(failing.with_timeout(options.model_timeout));
+    let model_only = ModelOnly {
+        inner: ModelAuditor::new(provider, name),
+        timeout: options.model_timeout,
+    };
+    Ok((composed, model_only))
+}
+
 pub async fn run_model_eval(
     provider: Arc<dyn ModelProvider>,
     model: Option<&str>,
@@ -710,34 +791,405 @@ pub async fn run_model_eval(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let name = match resolve_eval_model(model, env) {
-        Ok(name) => name,
+    match build_auditors(provider, model, env, options).await {
+        Ok((composed, model_only)) => {
+            run_auditor_eval(&composed, &model_only, options, out, err).await
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            EXIT_ERROR
+        }
+    }
+}
+
+pub async fn run_model_shard(
+    provider: Arc<dyn ModelProvider>,
+    model: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    options: &ScorecardOptions,
+    spec: ShardSpec,
+    out_dir: &Path,
+    err: &mut dyn Write,
+) -> i32 {
+    match build_auditors(provider, model, env, options).await {
+        Ok((composed, model_only)) => {
+            run_shard(&composed, &model_only, options, spec, out_dir, err).await
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            EXIT_ERROR
+        }
+    }
+}
+
+fn call_outcome(
+    phase: Phase,
+    case_id: &str,
+    run: usize,
+    result: Result<SpawnVerdict, AuditError>,
+    elapsed_ms: u64,
+) -> CallOutcome {
+    let (verdict, error) = match result {
+        Ok(verdict) => (Some(verdict), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let case_id = case_id.to_string();
+    CallOutcome {
+        phase,
+        case_id,
+        run,
+        verdict,
+        error,
+        elapsed_ms,
+    }
+}
+
+fn run_identity(
+    options: &ScorecardOptions,
+    loaded: &Loaded,
+    model: &str,
+    spec: ShardSpec,
+) -> RunIdentity {
+    let digest = options.model_digest.clone();
+    RunIdentity {
+        schema_version: SHARD_SCHEMA_VERSION,
+        model: model.to_string(),
+        model_digest: digest.unwrap_or(UNKNOWN.to_string()),
+        temperature: AUDIT_TEMPERATURE,
+        timeout_secs: options.model_timeout.as_secs(),
+        runs: options.runs,
+        prompt_hash: prompt_hash_of(loaded),
+        repo_sha: options.repo_sha.clone(),
+        shard_count: spec.count,
+        case_ids: loaded.cases.iter().map(|c| c.case.id.clone()).collect(),
+    }
+}
+
+async fn execute_shard<C: Auditor + ?Sized, M: Auditor + ?Sized>(
+    composed: &C,
+    model_only: &M,
+    options: &ScorecardOptions,
+    spec: ShardSpec,
+    out_dir: &Path,
+) -> Result<ShardResult, AuditorEvalError> {
+    let loaded = load_cases(options)?;
+    let (cases, context) = (&loaded.cases, &loaded.context);
+    let total = total_calls(cases.len(), options.runs);
+    let mine = spec.calls(total);
+    let identity = run_identity(options, &loaded, composed.name(), spec);
+    let mut calls = Vec::with_capacity(mine.len());
+    let mut result = ShardResult {
+        identity,
+        shard_index: spec.index,
+        calls: Vec::new(),
+    };
+    write_shard(&result, out_dir)?;
+    let failed = std::cell::Cell::new(false);
+    for (done, call) in mine.iter().enumerate().take_while(|_| !failed.get()) {
+        let (phase, case, run) = call_at(*call, cases.len(), options.runs);
+        let request = cases[case].request.to_request();
+        let started = std::time::Instant::now();
+        let outcome = match phase {
+            Phase::ModelOnly => model_only.review_spawn(&request, context).await,
+            Phase::Composed => composed.review_spawn(&request, context).await,
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        failed.set(outcome.is_err());
+        let id = &cases[case].case.id;
+        let (number, of) = (done + 1, mine.len());
+        eprintln!("[shard {spec}] {number}/{of} {id} {elapsed_ms}ms");
+        calls.push(call_outcome(phase, id, run, outcome, elapsed_ms));
+        result.calls.clone_from(&calls);
+        write_shard(&result, out_dir)?;
+    }
+    Ok(result)
+}
+
+pub async fn run_shard<C: Auditor + ?Sized, M: Auditor + ?Sized>(
+    composed: &C,
+    model_only: &M,
+    options: &ScorecardOptions,
+    spec: ShardSpec,
+    out_dir: &Path,
+    err: &mut dyn Write,
+) -> i32 {
+    let result = match execute_shard(composed, model_only, options, spec, out_dir).await {
+        Ok(result) => result,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
             return EXIT_ERROR;
         }
     };
-    if options.model_digest.is_none() {
-        let _ = writeln!(err, "error: {}", AuditorEvalError::ModelDigestUnknown(name));
-        return EXIT_ERROR;
+    let failure = result.calls.iter().find_map(|call| call.error.as_ref());
+    match failure {
+        Some(error) => {
+            let _ = writeln!(err, "error: shard {spec} stopped on a failed call: {error}");
+            EXIT_ERROR
+        }
+        None => EXIT_PASS,
     }
-    if let Err(error) = provider.health_check().await {
-        let _ = writeln!(
-            err,
-            "error: {}",
-            AuditorEvalError::ModelUnreachable(error.to_string())
-        );
-        return EXIT_ERROR;
+}
+
+fn write_shard(result: &ShardResult, out_dir: &Path) -> Result<(), AuditorEvalError> {
+    let path = out_dir.join(result.file_name());
+    let io = |error| AuditorEvalError::ShardWrite(path.clone(), error);
+    std::fs::create_dir_all(out_dir).map_err(io)?;
+    let json = serde_json::to_string_pretty(result).unwrap_or_default();
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json).map_err(io)?;
+    std::fs::rename(&temp, &path).map_err(io)
+}
+
+fn merge_error(message: String) -> AuditorEvalError {
+    AuditorEvalError::Merge(message)
+}
+
+fn read_shards(dir: &Path) -> Result<Vec<ShardResult>, AuditorEvalError> {
+    let io = |error| AuditorEvalError::Io(dir.to_path_buf(), error);
+    let entries = std::fs::read_dir(dir).map_err(io)?;
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.retain(|path| is_shard_file(path));
+    paths.sort();
+    let shown = dir.display();
+    let empty = format!("no shard files in {shown}");
+    if paths.is_empty() {
+        return Err(merge_error(empty));
     }
-    let composed = ModelMustDecide(
-        FailClosedModelAuditor::new(provider.clone(), name.clone())
-            .with_timeout(options.model_timeout),
-    );
-    let model_only = ModelOnly {
-        inner: ModelAuditor::new(provider, name),
-        timeout: options.model_timeout,
+    paths.iter().map(|path| read_shard(path)).collect()
+}
+
+fn is_shard_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.starts_with("shard-") && name.ends_with(".json")
+}
+
+fn read_shard(path: &Path) -> Result<ShardResult, AuditorEvalError> {
+    let io = |error| AuditorEvalError::Io(path.to_path_buf(), error);
+    let text = std::fs::read_to_string(path).map_err(io)?;
+    let shown = path.display();
+    let bad = |e| merge_error(format!("{shown} is not a shard result: {e}"));
+    serde_json::from_str(&text).map_err(bad)
+}
+
+fn check_identities(shards: &[ShardResult]) -> Result<(), AuditorEvalError> {
+    let first = &shards[0].identity;
+    for shard in shards {
+        if shard.identity != *first {
+            let field = differing_field(first, &shard.identity);
+            let message = format!("shards come from different runs: {field}");
+            return Err(merge_error(message));
+        }
+    }
+    Ok(())
+}
+
+fn check_bounds(identity: &RunIdentity, expect: &MergeExpect) -> Result<(), AuditorEvalError> {
+    let (shards, runs) = (identity.shard_count, identity.runs);
+    let checks = [
+        (
+            shards == 0 || shards > MAX_SHARDS,
+            format!("shard count {shards} is out of range"),
+        ),
+        (
+            runs == 0 || runs > MAX_RUNS,
+            format!("run count {runs} is out of range"),
+        ),
+        (
+            identity.model_digest == UNKNOWN,
+            "the model digest was not recorded".to_string(),
+        ),
+        (
+            expect.shards.is_some_and(|n| n != shards),
+            format!("expected a different shard count than {shards}"),
+        ),
+        (
+            expect.runs.is_some_and(|n| n != runs),
+            format!("expected a different run count than {runs}"),
+        ),
+        (
+            expect.model.as_ref().is_some_and(|m| *m != identity.model),
+            "the shards were made with a different model than expected".to_string(),
+        ),
+    ];
+    match checks.into_iter().find(|(failed, _)| *failed) {
+        Some((_, message)) => Err(merge_error(message)),
+        None => Ok(()),
+    }
+}
+
+fn check_indices(shards: &[ShardResult]) -> Result<(), AuditorEvalError> {
+    let count = shards[0].identity.shard_count;
+    let mut seen = vec![0usize; count];
+    for shard in shards {
+        let index = shard.shard_index;
+        let slot = index.checked_sub(1).and_then(|i| seen.get_mut(i));
+        let out_of_range = merge_error(format!("shard {index} is out of range"));
+        *slot.ok_or(out_of_range)? += 1;
+    }
+    if let Some(index) = seen.iter().position(|n| *n > 1) {
+        let number = index + 1;
+        let message = format!("shard {number} is present more than once");
+        return Err(merge_error(message));
+    }
+    let missing = seen.iter().position(|n| *n == 0).map(|index| index + 1);
+    match missing {
+        Some(number) => Err(merge_error(format!("shard {number} of {count} is missing"))),
+        None => Ok(()),
+    }
+}
+
+struct Grid {
+    model_only: Vec<Vec<Option<CaseOutcome>>>,
+    composed: Vec<Option<CaseOutcome>>,
+    slowest_ms: u64,
+    calls: usize,
+}
+
+fn failed_call(shard: &ShardResult, call: &CallOutcome) -> AuditorEvalError {
+    let (index, id) = (shard.shard_index, &call.case_id);
+    let reason = call.error.clone().unwrap_or_default();
+    merge_error(format!("shard {index} failed on `{id}`: {reason}"))
+}
+
+fn place(
+    grid: &mut Grid,
+    shard: &ShardResult,
+    call: &CallOutcome,
+    loaded: &Loaded,
+) -> Result<(), AuditorEvalError> {
+    let (id, run, runs) = (&call.case_id, call.run, shard.identity.runs);
+    let verdict = match (&call.verdict, &call.error) {
+        (Some(verdict), None) => verdict,
+        _ => return Err(failed_call(shard, call)),
     };
-    run_auditor_eval(&composed, &model_only, options, out, err).await
+    let position = loaded.cases.iter().position(|c| c.case.id == *id);
+    let unknown = merge_error(format!("unknown case `{id}`"));
+    let case = position.ok_or(unknown)?;
+    let run_ok = match call.phase {
+        Phase::ModelOnly => run < runs,
+        Phase::Composed => run == 0,
+    };
+    if !run_ok {
+        return Err(merge_error(format!("`{id}` has an impossible run {run}")));
+    }
+    let (count, mine) = (shard.identity.shard_count, shard.shard_index);
+    let index = call_index(call.phase, case, run, loaded.cases.len(), runs);
+    if index % count != mine - 1 {
+        let message = format!("`{id}` run {run} is not in shard {mine}");
+        return Err(merge_error(message));
+    }
+    let slot = match call.phase {
+        Phase::ModelOnly => &mut grid.model_only[run][case],
+        Phase::Composed => &mut grid.composed[case],
+    };
+    if slot.is_some() {
+        return Err(merge_error(format!("`{id}` run {run} was measured twice")));
+    }
+    *slot = Some(CaseOutcome::new(&loaded.cases[case], verdict));
+    grid.slowest_ms = grid.slowest_ms.max(call.elapsed_ms);
+    grid.calls += 1;
+    Ok(())
+}
+
+fn fill_grid(shards: &[ShardResult], loaded: &Loaded) -> Result<Grid, AuditorEvalError> {
+    let runs = shards[0].identity.runs;
+    let cases = loaded.cases.len();
+    let mut grid = Grid {
+        model_only: vec![vec![None; cases]; runs],
+        composed: vec![None; cases],
+        slowest_ms: 0,
+        calls: 0,
+    };
+    for shard in shards {
+        for call in &shard.calls {
+            place(&mut grid, shard, call, loaded)?;
+        }
+    }
+    let expected = total_calls(cases, runs);
+    let missing = expected - grid.calls;
+    if grid.calls != expected {
+        let message = format!("{missing} of {expected} calls unmeasured");
+        return Err(merge_error(message));
+    }
+    Ok(grid)
+}
+
+pub struct Merged {
+    pub card: AuditorScorecard,
+    pub calls: usize,
+    pub slowest_ms: u64,
+}
+
+fn unwrap_slots(slots: Vec<Option<CaseOutcome>>) -> Vec<CaseOutcome> {
+    slots.into_iter().flatten().collect()
+}
+
+const CASES_DIFFER: &str = "the cases on disk differ from the cases that were sharded";
+
+const PROMPT_DIFFERS: &str = "the prompt differs from the one the shards were made with";
+
+pub async fn merge(options: &ScorecardOptions, dir: &Path) -> Result<Merged, AuditorEvalError> {
+    let shards = read_shards(dir)?;
+    check_identities(&shards)?;
+    check_bounds(&shards[0].identity, &options.expect)?;
+    check_indices(&shards)?;
+    let identity = &shards[0].identity;
+    let merged = ScorecardOptions {
+        runs: identity.runs,
+        model_timeout: Duration::from_secs(identity.timeout_secs),
+        model_digest: Some(identity.model_digest.clone()),
+        repo_sha: identity.repo_sha.clone(),
+        ..options.clone()
+    };
+    let loaded = load_cases(&merged)?;
+    let ids: Vec<String> = loaded.cases.iter().map(|c| c.case.id.clone()).collect();
+    if ids != identity.case_ids {
+        return Err(merge_error(CASES_DIFFER.to_string()));
+    }
+    if prompt_hash_of(&loaded) != identity.prompt_hash {
+        return Err(merge_error(PROMPT_DIFFERS.to_string()));
+    }
+    let grid = fill_grid(&shards, &loaded)?;
+    let (rule, _) = score(&RuleAuditor::new(), &loaded.context, &loaded.cases).await?;
+    let runs: Vec<Vec<CaseOutcome>> = grid.model_only.into_iter().map(unwrap_slots).collect();
+    let composed = unwrap_slots(grid.composed);
+    let parts = Parts {
+        rule: &rule,
+        runs: &runs,
+        composed: &composed,
+    };
+    let card = assemble(&merged, &loaded, &identity.model, parts);
+    let (calls, slowest_ms) = (grid.calls, grid.slowest_ms);
+    Ok(Merged {
+        card,
+        calls,
+        slowest_ms,
+    })
+}
+
+pub async fn run_merge(
+    options: &ScorecardOptions,
+    dir: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    match merge(options, dir).await {
+        Ok(merged) => {
+            let card = &merged.card;
+            let _ = out.write_all(card.render().as_bytes());
+            let (calls, slowest) = (merged.calls, merged.slowest_ms);
+            let _ = writeln!(out, "merged_calls: {calls} slowest_call_ms: {slowest}");
+            if !card.within_threshold() {
+                let found = card.model_only.false_allows;
+                let _ = writeln!(err, "{}", over_threshold(found, card.max_false_allow));
+            }
+            card.exit_code()
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            EXIT_ERROR
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1818,5 +2270,951 @@ mod tests {
         let (code, _, err) = run(&RuleAuditor::new(), &none).await;
         assert_eq!(code, EXIT_ERROR);
         assert!(err.contains("no auditor eval cases"), "{err}");
+    }
+
+    fn multi(runs: usize) -> ScorecardOptions {
+        ScorecardOptions {
+            runs,
+            repo_sha: "abc".to_string(),
+            ..options(0)
+        }
+    }
+
+    async fn write_shards<C: Auditor, M: Auditor>(
+        composed: &C,
+        model_only: &M,
+        opts: &ScorecardOptions,
+        count: usize,
+        dir: &Path,
+    ) {
+        for index in 1..=count {
+            let mut err = Vec::new();
+            let spec = ShardSpec { index, count };
+            let code = run_shard(composed, model_only, opts, spec, dir, &mut err).await;
+            assert_eq!(code, EXIT_PASS, "{}", String::from_utf8_lossy(&err));
+        }
+    }
+
+    fn shard_path(dir: &Path, index: usize, count: usize) -> PathBuf {
+        dir.join(format!("shard-{index}-of-{count}.json"))
+    }
+
+    fn edit_shard(dir: &Path, index: usize, count: usize, edit: impl FnOnce(&mut ShardResult)) {
+        let path = shard_path(dir, index, count);
+        let mut shard: ShardResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut shard);
+        std::fs::write(&path, serde_json::to_string(&shard).unwrap()).unwrap();
+    }
+
+    async fn merged(dir: &Path) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_merge(&options(0), dir, &mut out, &mut err).await;
+        let out = String::from_utf8(out).unwrap();
+        (code, out, String::from_utf8(err).unwrap())
+    }
+
+    async fn three_shards() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = RuleAuditor::new();
+        write_shards(&rules, &rules, &multi(3), 3, dir.path()).await;
+        dir
+    }
+
+    #[tokio::test]
+    async fn sharding_then_merging_equals_running_unsharded_for_any_shard_count() {
+        let direct_rules = measure(&RuleAuditor::new(), &RuleAuditor::new(), &multi(3)).await;
+        let direct_leaky = measure(&Leaky, &Leaky, &multi(3)).await;
+        for count in [1, 2, 3, 5, 7, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let rules = RuleAuditor::new();
+            write_shards(&rules, &rules, &multi(3), count, dir.path()).await;
+            let merged = merge(&options(0), dir.path()).await.unwrap();
+            assert_eq!(
+                merged.card,
+                direct_rules.as_ref().unwrap().clone(),
+                "{count}"
+            );
+            assert_eq!(merged.calls, total_calls(merged.card.total, 3));
+            let dir = tempfile::tempdir().unwrap();
+            write_shards(&Leaky, &Leaky, &multi(3), count, dir.path()).await;
+            let merged = merge(&options(0), dir.path()).await.unwrap();
+            assert_eq!(
+                merged.card,
+                direct_leaky.as_ref().unwrap().clone(),
+                "{count}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merged_perfect_run_passes_and_a_merged_leaky_run_fails_with_the_same_codes() {
+        let dir = three_shards().await;
+        let (code, out, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_PASS, "{out}{err}");
+        assert!(out.contains("result: PASS"), "{out}");
+        assert!(out.contains("merged_calls: 56 slowest_call_ms:"), "{out}");
+        assert!(out.contains("timeout_secs: 600"), "{out}");
+
+        let leaky = tempfile::tempdir().unwrap();
+        write_shards(&Leaky, &Leaky, &multi(3), 4, leaky.path()).await;
+        let (code, out, err) = merged(leaky.path()).await;
+        assert_eq!(code, EXIT_FALSE_ALLOW, "{out}");
+        assert!(out.contains("MODEL_FALSE_ALLOW"), "{out}");
+        assert!(err.contains("exceed the maximum of 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_false_allow_in_any_single_run_of_any_shard_fails_the_merge() {
+        for run in 0..3 {
+            let dir = three_shards().await;
+            let target = "block-unknown-identity";
+            for index in 1..=3 {
+                edit_shard(dir.path(), index, 3, |shard| {
+                    for call in &mut shard.calls {
+                        if call.case_id == target
+                            && call.phase == Phase::ModelOnly
+                            && call.run == run
+                        {
+                            call.verdict = Some(SpawnVerdict::Allow);
+                        }
+                    }
+                });
+            }
+            let (code, out, _) = merged(dir.path()).await;
+            assert_eq!(code, EXIT_FALSE_ALLOW, "run {run}: {out}");
+            assert!(out.contains("block-unknown-identity | block | block | allow | block | rule | MODEL_FALSE_ALLOW"), "{out}");
+            assert!(out.contains("| 1/3"), "{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_shard_fails_the_merge() {
+        let dir = three_shards().await;
+        std::fs::remove_file(shard_path(dir.path(), 2, 3)).unwrap();
+        let (code, out, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(out.is_empty());
+        assert!(err.contains("shard 2 of 3 is missing"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_duplicated_shard_fails_the_merge() {
+        let dir = three_shards().await;
+        let copy = dir.path().join("shard-1-of-3-again.json");
+        std::fs::copy(shard_path(dir.path(), 1, 3), copy).unwrap();
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("shard 1 is present more than once"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn overlapping_shards_fail_the_merge() {
+        let dir = three_shards().await;
+        edit_shard(dir.path(), 2, 3, |shard| shard.shard_index = 1);
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("present more than once"), "{err}");
+
+        let swapped = three_shards().await;
+        edit_shard(swapped.path(), 2, 3, |shard| shard.shard_index = 3);
+        edit_shard(swapped.path(), 3, 3, |shard| shard.shard_index = 2);
+        let (code, _, err) = merged(swapped.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("is not in shard"), "{err}");
+
+        let out_of_range = three_shards().await;
+        edit_shard(out_of_range.path(), 3, 3, |shard| shard.shard_index = 4);
+        let (code, _, err) = merged(out_of_range.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("out of range"), "{err}");
+        edit_shard(out_of_range.path(), 3, 3, |shard| shard.shard_index = 0);
+        let (code, _, _) = merged(out_of_range.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_case_with_fewer_than_n_runs_measured_fails_the_merge() {
+        let dir = three_shards().await;
+        edit_shard(dir.path(), 1, 3, |shard| {
+            let position = shard
+                .calls
+                .iter()
+                .position(|c| c.phase == Phase::ModelOnly)
+                .unwrap();
+            shard.calls.remove(position);
+        });
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("1 of 56 calls unmeasured"), "{err}");
+
+        let composed = three_shards().await;
+        edit_shard(composed.path(), 3, 3, |shard| {
+            shard.calls.retain(|c| c.phase != Phase::Composed);
+        });
+        let (code, _, err) = merged(composed.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("unmeasured"), "{err}");
+
+        let emptied = three_shards().await;
+        edit_shard(emptied.path(), 2, 3, |shard| shard.calls.clear());
+        let (code, _, _) = merged(emptied.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_call_measured_twice_fails_the_merge() {
+        let dir = three_shards().await;
+        edit_shard(dir.path(), 1, 3, |shard| {
+            let again = shard.calls[0].clone();
+            shard.calls.push(again);
+        });
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("measured twice"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shards_from_different_runs_fail_the_merge_naming_the_field() {
+        type Edit = Box<dyn Fn(&mut RunIdentity)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            (
+                "model_digest",
+                Box::new(|i| i.model_digest = "sha256:other".to_string()),
+            ),
+            ("repo_sha", Box::new(|i| i.repo_sha = "other".to_string())),
+            ("runs", Box::new(|i| i.runs = 2)),
+            (
+                "prompt_hash",
+                Box::new(|i| i.prompt_hash = "other".to_string()),
+            ),
+            ("timeout_secs", Box::new(|i| i.timeout_secs = 1)),
+            ("model", Box::new(|i| i.model = "other".to_string())),
+            ("temperature", Box::new(|i| i.temperature = 0.5)),
+            ("schema_version", Box::new(|i| i.schema_version = 9)),
+            ("shard_count", Box::new(|i| i.shard_count = 4)),
+            ("case_ids", Box::new(|i| i.case_ids.reverse())),
+        ];
+        for (field, edit) in edits {
+            let dir = three_shards().await;
+            edit_shard(dir.path(), 2, 3, |shard| edit(&mut shard.identity));
+            let (code, _, err) = merged(dir.path()).await;
+            assert_eq!(code, EXIT_ERROR, "{field}");
+            assert!(
+                err.contains(&format!("different runs: {field}")),
+                "{field}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shard_with_an_error_or_timeout_outcome_fails_the_merge() {
+        let dir = three_shards().await;
+        edit_shard(dir.path(), 2, 3, |shard| {
+            shard.calls[0].verdict = None;
+            shard.calls[0].error = Some("no reply within 600s".to_string());
+        });
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(
+            err.contains("failed on") && err.contains("no reply within 600s"),
+            "{err}"
+        );
+
+        let neither = three_shards().await;
+        edit_shard(neither.path(), 1, 3, |shard| shard.calls[0].verdict = None);
+        assert_eq!(merged(neither.path()).await.0, EXIT_ERROR);
+
+        let both = three_shards().await;
+        edit_shard(both.path(), 1, 3, |shard| {
+            shard.calls[0].error = Some("late".to_string())
+        });
+        assert_eq!(merged(both.path()).await.0, EXIT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn calls_that_name_an_unknown_case_or_an_impossible_run_fail_the_merge() {
+        let unknown = three_shards().await;
+        edit_shard(unknown.path(), 1, 3, |shard| {
+            shard.calls[0].case_id = "ghost".to_string()
+        });
+        let (code, _, err) = merged(unknown.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("unknown case `ghost`"), "{err}");
+
+        let run = three_shards().await;
+        edit_shard(run.path(), 1, 3, |shard| shard.calls[0].run = 3);
+        let (code, _, err) = merged(run.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("impossible run 3"), "{err}");
+
+        let composed_run = three_shards().await;
+        edit_shard(composed_run.path(), 1, 3, |shard| {
+            let call = shard
+                .calls
+                .iter_mut()
+                .find(|c| c.phase == Phase::Composed)
+                .unwrap();
+            call.run = 1;
+        });
+        assert_eq!(merged(composed_run.path()).await.0, EXIT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn an_empty_unreadable_or_foreign_directory_fails_the_merge() {
+        let empty = tempfile::tempdir().unwrap();
+        let (code, out, err) = merged(empty.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(out.is_empty());
+        assert!(err.contains("no shard files"), "{err}");
+
+        std::fs::write(empty.path().join("notes.json"), "{}").unwrap();
+        std::fs::write(empty.path().join("shard-readme.txt"), "x").unwrap();
+        let (code, _, err) = merged(empty.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("no shard files"), "{err}");
+
+        std::fs::write(empty.path().join("shard-1-of-1.json"), "not json").unwrap();
+        let (code, _, err) = merged(empty.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("is not a shard result"), "{err}");
+
+        let (code, _, err) = merged(Path::new("/does/not/exist/shards")).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("/does/not/exist/shards"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shards_made_from_other_cases_than_the_ones_on_disk_fail_the_merge() {
+        let dir = three_shards().await;
+        let other = tempfile::tempdir().unwrap();
+        for name in ["allow-workspace-fit.toml", "block-unknown-identity.toml"] {
+            std::fs::copy(default_cases_dir().join(name), other.path().join(name)).unwrap();
+        }
+        let opts = ScorecardOptions {
+            catalog_dir: Some(default_catalog_dir()),
+            ..single_run(other.path().to_path_buf(), 0)
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_merge(&opts, dir.path(), &mut out, &mut err).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("differ from the cases"));
+    }
+
+    struct FailsOnCall(usize, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Auditor for FailsOnCall {
+        fn name(&self) -> &str {
+            "fails-on-call"
+        }
+
+        async fn review_spawn(
+            &self,
+            _request: &SpawnRequest,
+            _context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            let call = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == self.0 {
+                return Err(AuditError::Log(std::io::Error::other("timed out")));
+            }
+            Ok(SpawnVerdict::block(vec![]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shard_that_hits_an_error_stops_writes_its_partial_evidence_and_exits_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = FailsOnCall(2, std::sync::atomic::AtomicUsize::new(0));
+        let mut err = Vec::new();
+        let spec = ShardSpec::whole();
+        let code = run_shard(&Leaky, &failing, &multi(3), spec, dir.path(), &mut err).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("stopped on a failed call"));
+        let partial: ShardResult =
+            serde_json::from_str(&std::fs::read_to_string(shard_path(dir.path(), 1, 1)).unwrap())
+                .unwrap();
+        assert_eq!(partial.calls.len(), 3);
+        assert!(partial.calls[2].error.is_some() && partial.calls[2].verdict.is_none());
+        assert!(partial.calls[..2].iter().all(|c| c.error.is_none()));
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("failed on"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_shard_run_reports_its_own_configuration_and_io_errors() {
+        let empty = tempfile::tempdir().unwrap();
+        let opts = single_run(empty.path().to_path_buf(), 0);
+        let mut err = Vec::new();
+        let out = tempfile::tempdir().unwrap();
+        let code = run_shard(
+            &Leaky,
+            &Leaky,
+            &opts,
+            ShardSpec::whole(),
+            out.path(),
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("no auditor eval cases"));
+
+        let blocked = tempfile::tempdir().unwrap();
+        let file = blocked.path().join("occupied");
+        std::fs::write(&file, "x").unwrap();
+        let mut err = Vec::new();
+        let code = run_shard(
+            &Leaky,
+            &Leaky,
+            &multi(1),
+            ShardSpec::whole(),
+            &file,
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("could not write the shard result"));
+    }
+
+    #[tokio::test]
+    async fn the_model_shard_entry_point_builds_the_same_auditors_and_refuses_the_same_misconfigurations(
+    ) {
+        let allow = r#"{"verdict":"allow"}"#;
+        let provider = MockProvider::replying(&vec![allow; 100]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut err = Vec::new();
+        let spec = ShardSpec { index: 1, count: 2 };
+        let code = run_model_shard(
+            provider,
+            Some("m"),
+            &no_env,
+            &multi(1),
+            spec,
+            dir.path(),
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_PASS, "{}", String::from_utf8_lossy(&err));
+        assert!(shard_path(dir.path(), 1, 2).exists());
+
+        for (model, digest) in [(None, Some("d")), (Some("m"), None)] {
+            let opts = ScorecardOptions {
+                model_digest: digest.map(str::to_string),
+                ..multi(1)
+            };
+            let mut err = Vec::new();
+            let provider = MockProvider::replying(&[]);
+            let code = run_model_shard(
+                provider.clone(),
+                model,
+                &no_env,
+                &opts,
+                spec,
+                dir.path(),
+                &mut err,
+            )
+            .await;
+            assert_eq!(code, EXIT_ERROR);
+            assert_eq!(provider.calls(), 0);
+        }
+        let mut err = Vec::new();
+        let code = run_model_shard(
+            Arc::new(Down),
+            Some("m"),
+            &no_env,
+            &multi(1),
+            spec,
+            dir.path(),
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(String::from_utf8(err).unwrap().contains("unreachable"));
+    }
+
+    #[test]
+    fn the_default_per_call_timeout_is_recorded_and_generous() {
+        assert_eq!(DEFAULT_EVAL_TIMEOUT_SECS, 600);
+        let defaults = ScorecardOptions::new(PathBuf::new(), 0);
+        assert_eq!(defaults.model_timeout, Duration::from_secs(600));
+    }
+
+    struct Slow;
+
+    #[async_trait]
+    impl Auditor for Slow {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        async fn review_spawn(
+            &self,
+            _request: &SpawnRequest,
+            _context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok(SpawnVerdict::block(vec![]))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_call_records_its_elapsed_time_in_milliseconds() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(&Slow, &Slow, &multi(1), 2, dir.path()).await;
+        let merged = merge(&options(0), dir.path()).await.unwrap();
+        assert!(merged.slowest_ms >= 25, "{}", merged.slowest_ms);
+        assert!(merged.slowest_ms < 5_000, "{}", merged.slowest_ms);
+        let text = std::fs::read_to_string(shard_path(dir.path(), 1, 2)).unwrap();
+        let shard: ShardResult = serde_json::from_str(&text).unwrap();
+        assert!(shard.calls.iter().all(|call| call.elapsed_ms >= 25));
+    }
+
+    #[tokio::test]
+    async fn a_shard_records_the_run_configuration_it_was_made_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ScorecardOptions {
+            model_digest: Some("sha256:abc".to_string()),
+            model_timeout: Duration::from_secs(123),
+            ..multi(3)
+        };
+        let rules = RuleAuditor::new();
+        write_shards(&rules, &rules, &opts, 2, dir.path()).await;
+        let direct = measure(&rules, &rules, &opts).await.unwrap();
+        let text = std::fs::read_to_string(shard_path(dir.path(), 2, 2)).unwrap();
+        let shard: ShardResult = serde_json::from_str(&text).unwrap();
+        let identity = &shard.identity;
+        assert_eq!(identity.model, rules.name());
+        assert_eq!(identity.model_digest, "sha256:abc");
+        assert_eq!(identity.temperature, AUDIT_TEMPERATURE);
+        assert_eq!(identity.timeout_secs, 123);
+        assert_eq!(identity.runs, 3);
+        assert_eq!(identity.prompt_hash, direct.prompt_hash);
+        assert_eq!(identity.repo_sha, "abc");
+        assert_eq!((identity.shard_count, shard.shard_index), (2, 2));
+        assert_eq!(identity.case_ids.len(), direct.total);
+        assert_eq!(identity.schema_version, SHARD_SCHEMA_VERSION);
+        let merged = merge(&options(0), dir.path()).await.unwrap();
+        assert_eq!(merged.card.timeout_secs, 123);
+        assert_eq!(merged.card.model_digest.as_deref(), Some("sha256:abc"));
+    }
+
+    fn copy_cases(into: &Path) {
+        for entry in std::fs::read_dir(default_cases_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "toml") {
+                std::fs::copy(&path, into.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+    }
+
+    fn owned_cases(cases: &Path) -> ScorecardOptions {
+        ScorecardOptions {
+            catalog_dir: Some(default_catalog_dir()),
+            ..multi_in(cases)
+        }
+    }
+
+    fn multi_in(cases: &Path) -> ScorecardOptions {
+        ScorecardOptions {
+            cases_dir: cases.to_path_buf(),
+            ..multi(3)
+        }
+    }
+
+    async fn merged_with(opts: &ScorecardOptions, dir: &Path) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_merge(opts, dir, &mut out, &mut err).await;
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_merge_is_strict_about_the_case_set_unless_a_subset_is_asked_for_explicitly() {
+        let cases = tempfile::tempdir().unwrap();
+        copy_cases(cases.path());
+        let shards = tempfile::tempdir().unwrap();
+        let subset = ScorecardOptions {
+            max_cases: Some(5),
+            ..owned_cases(cases.path())
+        };
+        let rules = RuleAuditor::new();
+        write_shards(&rules, &rules, &subset, 3, shards.path()).await;
+
+        let (code, out, err) = merged_with(&owned_cases(cases.path()), shards.path()).await;
+        assert_eq!(code, EXIT_ERROR, "{out}");
+        assert!(err.contains("differ from the cases"), "{err}");
+
+        let (code, out, err) = merged_with(&subset, shards.path()).await;
+        assert_eq!(code, EXIT_PASS, "{err}");
+        assert!(
+            out.contains("result: PASS (subset of 5, NOT the gate)"),
+            "{out}"
+        );
+
+        let wrong = ScorecardOptions {
+            max_cases: Some(6),
+            ..subset.clone()
+        };
+        assert_eq!(merged_with(&wrong, shards.path()).await.0, EXIT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_leaking_subset_merge_still_fails_with_the_subset_label() {
+        let cases = tempfile::tempdir().unwrap();
+        copy_cases(cases.path());
+        let shards = tempfile::tempdir().unwrap();
+        let subset = ScorecardOptions {
+            max_cases: Some(5),
+            ..owned_cases(cases.path())
+        };
+        write_shards(&Leaky, &Leaky, &subset, 2, shards.path()).await;
+        let (code, out, _) = merged_with(&subset, shards.path()).await;
+        assert_eq!(code, EXIT_FALSE_ALLOW, "{out}");
+        assert!(
+            out.contains("result: FAIL (subset of 5, NOT the gate)"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_case_added_after_sharding_fails_the_merge() {
+        let cases = tempfile::tempdir().unwrap();
+        copy_cases(cases.path());
+        let shards = tempfile::tempdir().unwrap();
+        let rules = RuleAuditor::new();
+        write_shards(&rules, &rules, &owned_cases(cases.path()), 3, shards.path()).await;
+        let source = std::fs::read_to_string(default_cases_dir().join("allow-workspace-fit.toml"))
+            .unwrap()
+            .replace("allow-workspace-fit", "zz-added-later");
+        std::fs::write(cases.path().join("zz-added-later.toml"), source).unwrap();
+        let (code, _, err) = merged_with(&owned_cases(cases.path()), shards.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("differ from the cases"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_expected_shard_count_model_and_runs_are_enforced_at_merge() {
+        let dir = three_shards().await;
+        let rules = RuleAuditor::new();
+        let expect =
+            |shards: Option<usize>, model: Option<&str>, runs: Option<usize>| ScorecardOptions {
+                expect: MergeExpect {
+                    shards,
+                    model: model.map(str::to_string),
+                    runs,
+                },
+                ..options(0)
+            };
+        let right = expect(Some(3), Some(rules.name()), Some(3));
+        assert_eq!(merged_with(&right, dir.path()).await.0, EXIT_PASS);
+        for wrong in [
+            expect(Some(2), None, None),
+            expect(None, Some("another-model"), None),
+            expect(None, None, Some(1)),
+        ] {
+            let (code, _, err) = merged_with(&wrong, dir.path()).await;
+            assert_eq!(code, EXIT_ERROR, "{err}");
+            assert!(
+                err.contains("expected") || err.contains("different model"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_numeric_fields_and_an_unrecorded_digest_fail_the_merge_without_panicking() {
+        type Forge = Box<dyn Fn(&mut RunIdentity)>;
+        let forged: Vec<(&str, Forge)> = vec![
+            ("shard count", Box::new(|i| i.shard_count = usize::MAX)),
+            ("shard count", Box::new(|i| i.shard_count = 65)),
+            ("shard count", Box::new(|i| i.shard_count = 0)),
+            ("run count", Box::new(|i| i.runs = usize::MAX)),
+            ("run count", Box::new(|i| i.runs = 101)),
+            ("run count", Box::new(|i| i.runs = 0)),
+            (
+                "digest",
+                Box::new(|i| i.model_digest = "unknown".to_string()),
+            ),
+        ];
+        for (what, edit) in forged {
+            let dir = three_shards().await;
+            for index in 1..=3 {
+                edit_shard(dir.path(), index, 3, |shard| edit(&mut shard.identity));
+            }
+            let (code, _, err) = merged(dir.path()).await;
+            assert_eq!(code, EXIT_ERROR, "{what}");
+            assert!(
+                err.contains("out of range") || err.contains("not recorded"),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    struct Peeks {
+        dir: PathBuf,
+        seen: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl Auditor for Peeks {
+        fn name(&self) -> &str {
+            "peeks"
+        }
+
+        async fn review_spawn(
+            &self,
+            _request: &SpawnRequest,
+            _context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            let text = std::fs::read_to_string(shard_path(&self.dir, 1, 1)).unwrap();
+            let on_disk: ShardResult = serde_json::from_str(&text).unwrap();
+            self.seen.lock().unwrap().push(on_disk.calls.len());
+            Ok(SpawnVerdict::block(vec![]))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shard_file_holds_every_finished_call_while_the_next_one_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let peeks = Peeks {
+            dir: dir.path().to_path_buf(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut err = Vec::new();
+        let code = run_shard(
+            &Leaky,
+            &peeks,
+            &multi(1),
+            ShardSpec::whole(),
+            dir.path(),
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_PASS);
+        let seen = peeks.seen.lock().unwrap().clone();
+        assert_eq!(seen, (0..seen.len()).collect::<Vec<_>>());
+        assert!(seen.len() > 1);
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1);
+    }
+
+    #[tokio::test]
+    async fn a_shard_with_no_calls_still_leaves_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut err = Vec::new();
+        let spec = ShardSpec {
+            index: 500,
+            count: 500,
+        };
+        let code = run_shard(&Leaky, &Leaky, &multi(1), spec, dir.path(), &mut err).await;
+        assert_eq!(code, EXIT_PASS);
+        assert!(shard_path(dir.path(), 500, 500).exists());
+    }
+
+    struct BlocksOnRun {
+        run: usize,
+        cases: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Auditor for BlocksOnRun {
+        fn name(&self) -> &str {
+            "blocks-on-one-run"
+        }
+
+        async fn review_spawn(
+            &self,
+            request: &SpawnRequest,
+            context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call / self.cases == self.run {
+                Ok(SpawnVerdict::block(vec![]))
+            } else {
+                RuleAuditor::new().review_spawn(request, context).await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_worst_non_passing_run_is_kept_even_when_it_is_not_a_false_allow() {
+        let cases = AuditorEvalCase::discover(&default_cases_dir())
+            .unwrap()
+            .len();
+        let blocker = BlocksOnRun {
+            run: 2,
+            cases,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let card = measure(&RuleAuditor::new(), &blocker, &multi(3))
+            .await
+            .unwrap();
+        assert!(card.model_only.escalate_as_block > 0);
+        assert_eq!(card.model_only.false_allows, 0);
+    }
+
+    #[tokio::test]
+    async fn the_composed_row_comes_from_the_composed_auditor_not_the_model_only_one() {
+        let direct = measure(&Leaky, &RuleAuditor::new(), &multi(3))
+            .await
+            .unwrap();
+        for count in [1, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            write_shards(&Leaky, &RuleAuditor::new(), &multi(3), count, dir.path()).await;
+            let merged = merge(&options(0), dir.path()).await.unwrap();
+            assert_eq!(merged.card, direct);
+            assert!(merged.card.composed.false_allows > 0);
+            assert_eq!(merged.card.model_only.false_allows, 0);
+        }
+    }
+
+    struct Sequence {
+        kinds: Vec<VerdictKind>,
+        cases: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Auditor for Sequence {
+        fn name(&self) -> &str {
+            "sequence"
+        }
+
+        async fn review_spawn(
+            &self,
+            request: &SpawnRequest,
+            context: &AuditContext,
+        ) -> Result<SpawnVerdict, AuditError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let kind = self.kinds[(call / self.cases) % self.kinds.len()];
+            FixedKind(kind).review_spawn(request, context).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_false_allow_after_a_non_passing_run_still_counts_and_fails_the_gate() {
+        let cases = AuditorEvalCase::discover(&default_cases_dir())
+            .unwrap()
+            .len();
+        let sequence = Sequence {
+            kinds: vec![
+                VerdictKind::Escalate,
+                VerdictKind::Allow,
+                VerdictKind::Block,
+            ],
+            cases,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let card = measure(&RuleAuditor::new(), &sequence, &multi(3))
+            .await
+            .unwrap();
+        assert!(card.model_only.false_allows > 0);
+        assert_eq!(card.exit_code(), EXIT_FALSE_ALLOW);
+        let leaked = card.rows.iter().filter(|row| row.model_only_false_allow);
+        assert!(leaked.clone().count() > 0);
+        assert!(leaked.into_iter().all(|row| row.model_only_allow_runs == 1));
+    }
+
+    fn escalate_verdict_from(dir: &Path, count: usize) -> SpawnVerdict {
+        let found = (1..=count).find_map(|index| {
+            let text = std::fs::read_to_string(shard_path(dir, index, count)).unwrap();
+            let shard: ShardResult = serde_json::from_str(&text).unwrap();
+            let is_escalate = |c: &&CallOutcome| {
+                c.verdict
+                    .as_ref()
+                    .is_some_and(|v| v.kind() == VerdictKind::Escalate)
+            };
+            shard
+                .calls
+                .iter()
+                .find(is_escalate)
+                .and_then(|c| c.verdict.clone())
+        });
+        found.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_merged_false_allow_after_a_non_passing_run_still_fails_the_gate() {
+        let dir = three_shards().await;
+        let escalate = escalate_verdict_from(dir.path(), 3);
+        for index in 1..=3 {
+            let escalate = escalate.clone();
+            edit_shard(dir.path(), index, 3, |shard| {
+                for call in &mut shard.calls {
+                    let target = call.case_id == "block-unknown-identity";
+                    if target && call.phase == Phase::ModelOnly && call.run == 0 {
+                        call.verdict = Some(escalate.clone());
+                    }
+                    if target && call.phase == Phase::ModelOnly && call.run == 1 {
+                        call.verdict = Some(SpawnVerdict::Allow);
+                    }
+                }
+            });
+        }
+        let (code, out, _) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_FALSE_ALLOW, "{out}");
+        assert!(
+            out.contains(
+                "block-unknown-identity | block | block | allow | block | rule | MODEL_FALSE_ALLOW"
+            ),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_temp_file_is_never_read_as_a_shard() {
+        let dir = three_shards().await;
+        std::fs::write(dir.path().join("shard-1-of-3.json.tmp"), "{partial").unwrap();
+        std::fs::write(dir.path().join("shard-9-of-3.json.bak"), "{}").unwrap();
+        let (code, out, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_PASS, "{out}{err}");
+    }
+
+    #[tokio::test]
+    async fn a_write_that_cannot_complete_leaves_the_previous_shard_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = RuleAuditor::new();
+        write_shards(&rules, &rules, &multi(1), 1, dir.path()).await;
+        let path = shard_path(dir.path(), 1, 1);
+        let previous = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir(dir.path().join("shard-1-of-1.json.tmp")).unwrap();
+        let mut err = Vec::new();
+        let code = run_shard(
+            &Leaky,
+            &Leaky,
+            &multi(1),
+            ShardSpec::whole(),
+            dir.path(),
+            &mut err,
+        )
+        .await;
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    }
+
+    #[tokio::test]
+    async fn shards_made_with_a_different_prompt_than_this_binary_fail_the_merge() {
+        let dir = three_shards().await;
+        for index in 1..=3 {
+            edit_shard(dir.path(), index, 3, |shard| {
+                shard.identity.prompt_hash = "0000000000000000".to_string()
+            });
+        }
+        let (code, _, err) = merged(dir.path()).await;
+        assert_eq!(code, EXIT_ERROR);
+        assert!(err.contains("prompt differs"), "{err}");
     }
 }
