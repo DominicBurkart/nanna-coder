@@ -582,13 +582,7 @@ fn calls_in(function: &str, file: &str) -> Calls {
         .collect()
 }
 
-fn guarded_by_condition(function: &str, file: &str, first: &str, then: &str) -> bool {
-    let scan = scan_all()
-        .into_iter()
-        .find(|scan| scan.file == file && scan.sequences.contains_key(function))
-        .unwrap_or_else(|| {
-            panic!("{file}: {function} is no longer scanned; update the pairing pin")
-        });
+fn guarded_in(scan: &Scan, function: &str, first: &str, then: &str) -> bool {
     let calls = &scan.sequences[function];
     let Some(index) = calls.iter().position(|(name, _)| name == first) else {
         return false;
@@ -598,6 +592,16 @@ fn guarded_by_condition(function: &str, file: &str, first: &str, then: &str) -> 
     };
     let dependents: Vec<_> = calls.iter().filter(|(name, _)| name == then).collect();
     !dependents.is_empty() && dependents.iter().all(|(_, path)| path.contains(guard))
+}
+
+fn guarded_by_condition(function: &str, file: &str, first: &str, then: &str) -> bool {
+    let scan = scan_all()
+        .into_iter()
+        .find(|scan| scan.file == file && scan.sequences.contains_key(function))
+        .unwrap_or_else(|| {
+            panic!("{file}: {function} is no longer scanned; update the pairing pin")
+        });
+    guarded_in(&scan, function, first, then)
 }
 
 fn dominates(calls: &Calls, first: &str, then: &str) -> bool {
@@ -1242,4 +1246,35 @@ fn a_condition_guards_only_the_branch_it_selects() {
         "fn f(s: S) { if s.cond() { } if s.other() { s.act(); } }"
     ));
     assert!(!guarded("fn f(s: S) { if s.cond() { } else { s.act(); } }"));
+}
+
+#[test]
+fn a_missing_function_or_a_missing_condition_does_not_count_as_guarded() {
+    let scan = scan_source(
+        "x.rs",
+        "fn f(s: S) { s.act(); if s.cond() { s.act(); } } fn g(s: S) { if s.cond() { s.act(); } } fn h(s: S) { s.cond(); s.act(); }",
+    );
+    assert!(guarded_in(&scan, "g", "cond", "act"));
+    assert!(!guarded_in(&scan, "g", "missing", "act"));
+    assert!(!guarded_in(&scan, "g", "cond", "missing"));
+    assert!(!guarded_in(&scan, "h", "cond", "act"));
+    assert!(!guarded_in(&scan, "f", "act", "act"));
+}
+
+#[test]
+#[should_panic(expected = "is no longer scanned")]
+fn a_function_that_is_no_longer_scanned_fails_with_an_actionable_message() {
+    guarded_by_condition("TaskRunner::missing", "task.rs", "a", "b");
+}
+
+#[test]
+fn the_bound_root_follows_parentheses_references_and_dereferences() {
+    let rooted = |source: &str| rooted_at_bound(&syn::parse_str::<syn::Expr>(source).unwrap());
+    assert!(rooted("self.runner.bound"));
+    assert!(rooted("(self.runner.bound)"));
+    assert!(rooted("&self.runner.bound"));
+    assert!(rooted("*self.runner.bound"));
+    assert!(rooted("self.runner.bound.write().await"));
+    assert!(!rooted("self.runner.tasks.write().await"));
+    assert!(!rooted("bound"));
 }
