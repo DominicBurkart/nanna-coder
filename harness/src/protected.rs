@@ -43,14 +43,10 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".cargo/**",
     ".devcontainer/**",
     "AGENTS.md",
-    "evals/cases/**",
-    "harness/src/protected.rs",
     ".gitattributes",
     ".gitmodules",
-    "harness/src/scope.rs",
     "CODEOWNERS",
     "docs/CODEOWNERS",
-    "harness/src/auditor/**",
     ".github/**",
     ".cargo-husky/**",
     ".envrc",
@@ -58,46 +54,6 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".claude/**",
     "nix/**",
     "CLAUDE.md",
-    "docs/ci/protected-paths-guard.yml",
-    "harness/src/workspace.rs",
-    "harness/src/tools.rs",
-    "harness/src/marker.rs",
-    "harness/src/identity/**",
-    "harness/src/action_auditor/**",
-    "harness/src/windows.rs",
-    "harness/src/capabilities.rs",
-    "harness/src/container.rs",
-    "harness/src/harness_adapter/isolation.rs",
-    "harness/src/harness_adapter/checked.rs",
-    "scripts/**",
-    "tests/security/**",
-    "tests/lib/**",
-    "tests/run-all-tests.sh",
-    "harness/dev-container.toml",
-    "harness/src/rollout/executor.rs",
-    "harness/src/rollout/hooks.rs",
-    "harness/src/rollout/serverless.rs",
-    "harness/src/rollout/state.rs",
-    "harness/src/effects.rs",
-    "harness/src/leases/**",
-    "auto-issue-pr.sh",
-    "test-agentic-security.sh",
-    "harness/src/pr_tools.rs",
-    "docs/pr-lifecycle-tools.md",
-    "harness/src/budget.rs",
-    "harness/src/ci_tools.rs",
-    "harness/src/ci_policy.rs",
-    "harness/src/ci_integrity.rs",
-    "harness/src/deploy/template.rs",
-    "harness/src/sandbox_tools.rs",
-    "harness/tests/spawn_gate_structural.rs",
-    "harness/tests/protected_audit_hook_structural.rs",
-    "harness/tests/escalation_sinks_structural.rs",
-    "harness/tests/fixtures/identities/global/auditor.toml",
-    "harness/tests/fixtures/identities/global/prompts/auditor.md",
-    "harness/tests/fixtures/one_track/catalog/auditor.toml",
-    "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-    "harness/tests/planner_structural.rs",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -452,14 +408,10 @@ mod tests {
         (".cargo/**", ".cargo/config.toml"),
         (".devcontainer/**", ".devcontainer/devcontainer.json"),
         ("AGENTS.md", "AGENTS.md"),
-        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
-        ("harness/src/protected.rs", "harness/src/protected.rs"),
         (".gitattributes", ".gitattributes"),
         (".gitmodules", ".gitmodules"),
-        ("harness/src/scope.rs", "harness/src/scope.rs"),
         ("CODEOWNERS", "CODEOWNERS"),
         ("docs/CODEOWNERS", "docs/CODEOWNERS"),
-        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
         (".github/**", ".github/actions/setup/action.yml"),
         (".github/**", ".github/dependabot.yml"),
         (".github/**", ".github/ISSUE_TEMPLATE/bug.md"),
@@ -469,101 +421,6 @@ mod tests {
         (".claude/**", ".claude/settings.json"),
         ("nix/**", "nix/containers.nix"),
         ("CLAUDE.md", "CLAUDE.md"),
-        (
-            "docs/ci/protected-paths-guard.yml",
-            "docs/ci/protected-paths-guard.yml",
-        ),
-        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
-        ("harness/src/tools.rs", "harness/src/tools.rs"),
-        ("harness/src/marker.rs", "harness/src/marker.rs"),
-        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
-        (
-            "harness/src/action_auditor/**",
-            "harness/src/action_auditor/gate.rs",
-        ),
-        ("harness/src/windows.rs", "harness/src/windows.rs"),
-        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
-        ("harness/src/container.rs", "harness/src/container.rs"),
-        (
-            "harness/src/harness_adapter/isolation.rs",
-            "harness/src/harness_adapter/isolation.rs",
-        ),
-        (
-            "harness/src/harness_adapter/checked.rs",
-            "harness/src/harness_adapter/checked.rs",
-        ),
-        ("scripts/**", "scripts/install.sh"),
-        ("scripts/**", "scripts/check-flake-source-filter.nix"),
-        ("tests/security/**", "tests/security/test-ai-security.sh"),
-        ("tests/lib/**", "tests/lib/test-helpers.sh"),
-        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
-        ("harness/dev-container.toml", "harness/dev-container.toml"),
-        (
-            "harness/src/rollout/executor.rs",
-            "harness/src/rollout/executor.rs",
-        ),
-        (
-            "harness/src/rollout/hooks.rs",
-            "harness/src/rollout/hooks.rs",
-        ),
-        (
-            "harness/src/rollout/serverless.rs",
-            "harness/src/rollout/serverless.rs",
-        ),
-        (
-            "harness/src/rollout/state.rs",
-            "harness/src/rollout/state.rs",
-        ),
-        ("harness/src/effects.rs", "harness/src/effects.rs"),
-        ("harness/src/leases/**", "harness/src/leases/store.rs"),
-        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
-        ("test-agentic-security.sh", "test-agentic-security.sh"),
-        ("harness/src/pr_tools.rs", "harness/src/pr_tools.rs"),
-        ("docs/pr-lifecycle-tools.md", "docs/pr-lifecycle-tools.md"),
-        ("harness/src/budget.rs", "harness/src/budget.rs"),
-        ("harness/src/ci_tools.rs", "harness/src/ci_tools.rs"),
-        ("harness/src/ci_policy.rs", "harness/src/ci_policy.rs"),
-        ("harness/src/ci_integrity.rs", "harness/src/ci_integrity.rs"),
-        (
-            "harness/src/deploy/template.rs",
-            "harness/src/deploy/template.rs",
-        ),
-        (
-            "harness/src/sandbox_tools.rs",
-            "harness/src/sandbox_tools.rs",
-        ),
-        (
-            "harness/tests/spawn_gate_structural.rs",
-            "harness/tests/spawn_gate_structural.rs",
-        ),
-        (
-            "harness/tests/protected_audit_hook_structural.rs",
-            "harness/tests/protected_audit_hook_structural.rs",
-        ),
-        (
-            "harness/tests/escalation_sinks_structural.rs",
-            "harness/tests/escalation_sinks_structural.rs",
-        ),
-        (
-            "harness/tests/fixtures/identities/global/auditor.toml",
-            "harness/tests/fixtures/identities/global/auditor.toml",
-        ),
-        (
-            "harness/tests/fixtures/identities/global/prompts/auditor.md",
-            "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        ),
-        (
-            "harness/tests/fixtures/one_track/catalog/auditor.toml",
-            "harness/tests/fixtures/one_track/catalog/auditor.toml",
-        ),
-        (
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-        ),
-        (
-            "harness/tests/planner_structural.rs",
-            "harness/tests/planner_structural.rs",
-        ),
     ];
 
     #[test]
@@ -581,6 +438,93 @@ mod tests {
                 "{pattern} has no example in the table"
             );
         }
+    }
+
+    const MOVED_TO_DECLARATION: [&str; 44] = [
+        "evals/cases/**",
+        "harness/src/protected.rs",
+        "harness/src/scope.rs",
+        "harness/src/auditor/**",
+        "docs/ci/protected-paths-guard.yml",
+        "harness/src/workspace.rs",
+        "harness/src/tools.rs",
+        "harness/src/marker.rs",
+        "harness/src/identity/**",
+        "harness/src/action_auditor/**",
+        "harness/src/windows.rs",
+        "harness/src/capabilities.rs",
+        "harness/src/container.rs",
+        "harness/src/harness_adapter/isolation.rs",
+        "harness/src/harness_adapter/checked.rs",
+        "scripts/**",
+        "tests/security/**",
+        "tests/lib/**",
+        "tests/run-all-tests.sh",
+        "harness/dev-container.toml",
+        "harness/src/rollout/executor.rs",
+        "harness/src/rollout/hooks.rs",
+        "harness/src/rollout/serverless.rs",
+        "harness/src/rollout/state.rs",
+        "harness/src/effects.rs",
+        "harness/src/leases/**",
+        "auto-issue-pr.sh",
+        "test-agentic-security.sh",
+        "harness/src/pr_tools.rs",
+        "docs/pr-lifecycle-tools.md",
+        "harness/src/budget.rs",
+        "harness/src/ci_tools.rs",
+        "harness/src/ci_policy.rs",
+        "harness/src/ci_integrity.rs",
+        "harness/src/deploy/template.rs",
+        "harness/src/sandbox_tools.rs",
+        "harness/tests/spawn_gate_structural.rs",
+        "harness/tests/protected_audit_hook_structural.rs",
+        "harness/tests/escalation_sinks_structural.rs",
+        "harness/tests/fixtures/identities/global/auditor.toml",
+        "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/planner_structural.rs",
+    ];
+
+    fn declaration_example_path(pattern: &str) -> String {
+        match pattern.strip_suffix("/**") {
+            Some(prefix) => format!("{prefix}/sub/x.txt"),
+            None => pattern.to_string(),
+        }
+    }
+
+    fn own_declaration() -> ProtectedExtras {
+        ProtectedExtras::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("..")).unwrap()
+    }
+
+    #[test]
+    fn nanna_coders_own_declaration_is_exactly_the_patterns_that_left_the_shipped_list() {
+        assert_eq!(own_declaration().globs(), MOVED_TO_DECLARATION);
+    }
+
+    #[test]
+    fn none_of_the_patterns_that_left_the_shipped_list_is_protected_by_default() {
+        let protected = protected();
+        for pattern in MOVED_TO_DECLARATION {
+            assert!(!PROTECTED_PATTERNS.contains(&pattern), "{pattern}");
+            let path = declaration_example_path(pattern);
+            assert!(!protected.is_protected(Path::new(&path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn with_its_own_declaration_loaded_every_moved_path_is_protected_by_its_declared_rule() {
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
+        for pattern in MOVED_TO_DECLARATION {
+            let path = declaration_example_path(pattern);
+            let violation = protected.check(Path::new(&path)).unwrap_err();
+            assert_eq!(violation.rule, pattern, "{path}");
+        }
+        let declaration = protected
+            .check(Path::new(".nanna/protected.toml"))
+            .unwrap_err();
+        assert_eq!(declaration.rule, ".nanna/**");
     }
 
     fn codeowners_paths() -> Vec<String> {
@@ -605,60 +549,6 @@ mod tests {
                 let nested = format!("{}/nested/file", entry.trim_end_matches("/*"));
                 assert!(protected.is_protected(Path::new(&nested)), "{nested}");
             }
-        }
-    }
-
-    #[test]
-    fn every_previously_unprotected_path_is_now_protected() {
-        let protected = protected();
-        for path in [
-            ".gitattributes",
-            ".gitmodules",
-            "harness/src/scope.rs",
-            "CODEOWNERS",
-            "docs/CODEOWNERS",
-            ".github/CODEOWNERS",
-            "harness/src/auditor/mod.rs",
-            "harness/src/auditor/review/rules.rs",
-            "harness/src/auditor",
-            ".github/actions/setup/action.yml",
-            ".github/dependabot.yml",
-            ".cargo-husky/hooks/pre-commit",
-            ".envrc",
-            ".config/nextest.toml",
-            ".claude/settings.json",
-            "nix/containers.nix",
-            "CLAUDE.md",
-            "docs/ci/protected-paths-guard.yml",
-            "harness/src/workspace.rs",
-            "harness/src/tools.rs",
-            "harness/src/marker.rs",
-            "harness/src/identity/schema.rs",
-            "harness/src/action_auditor/rules.rs",
-            "harness/src/action_auditor",
-            "scripts/install.ps1",
-            "tests/security/test-environment.sh",
-            "harness/src/leases/acquire.rs",
-            "harness/src/leases",
-            "auto-issue-pr.sh",
-            "harness/src/pr_tools.rs",
-            "docs/pr-lifecycle-tools.md",
-            "harness/src/budget.rs",
-            "harness/src/ci_tools.rs",
-            "harness/src/ci_policy.rs",
-            "harness/src/ci_integrity.rs",
-            "harness/src/deploy/template.rs",
-            "harness/src/sandbox_tools.rs",
-            "harness/tests/spawn_gate_structural.rs",
-            "harness/tests/protected_audit_hook_structural.rs",
-            "harness/tests/escalation_sinks_structural.rs",
-            "harness/tests/fixtures/identities/global/auditor.toml",
-            "harness/tests/fixtures/identities/global/prompts/auditor.md",
-            "harness/tests/fixtures/one_track/catalog/auditor.toml",
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-            "harness/tests/planner_structural.rs",
-        ] {
-            assert!(protected.is_protected(Path::new(path)), "{path}");
         }
     }
 
@@ -802,7 +692,7 @@ mod tests {
 
     #[test]
     fn every_auditor_identity_card_and_prompt_in_the_repository_is_protected() {
-        let protected = protected();
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
         let found = auditor_identity_files();
         for expected in [
             "evals/cases/auditor_heldout/catalog/auditor.toml",
@@ -862,12 +752,8 @@ mod tests {
             ".GitHooks/pre-commit",
             ".Cargo/Config.toml",
             ".DevContainer/devcontainer.json",
-            "Evals/Cases/happy-path-001/case.toml",
-            "Harness/Src/Protected.rs",
-            "Harness/SRC/Auditor/mod.rs",
             ".GitAttributes",
             ".GITMODULES",
-            "harness/src/SCOPE.rs",
             "codeowners",
             "Docs/CodeOwners",
             "Windows.TOML",
@@ -1083,14 +969,10 @@ mod tests {
                 PathBuf::from(".cargo"),
                 PathBuf::from(".devcontainer"),
                 PathBuf::from("AGENTS.md"),
-                PathBuf::from("evals/cases"),
-                PathBuf::from("harness/src/protected.rs"),
                 PathBuf::from(".gitattributes"),
                 PathBuf::from(".gitmodules"),
-                PathBuf::from("harness/src/scope.rs"),
                 PathBuf::from("CODEOWNERS"),
                 PathBuf::from("docs/CODEOWNERS"),
-                PathBuf::from("harness/src/auditor"),
                 PathBuf::from(".github"),
                 PathBuf::from(".cargo-husky"),
                 PathBuf::from(".envrc"),
@@ -1098,46 +980,6 @@ mod tests {
                 PathBuf::from(".claude"),
                 PathBuf::from("nix"),
                 PathBuf::from("CLAUDE.md"),
-                PathBuf::from("docs/ci/protected-paths-guard.yml"),
-                PathBuf::from("harness/src/workspace.rs"),
-                PathBuf::from("harness/src/tools.rs"),
-                PathBuf::from("harness/src/marker.rs"),
-                PathBuf::from("harness/src/identity"),
-                PathBuf::from("harness/src/action_auditor"),
-                PathBuf::from("harness/src/windows.rs"),
-                PathBuf::from("harness/src/capabilities.rs"),
-                PathBuf::from("harness/src/container.rs"),
-                PathBuf::from("harness/src/harness_adapter/isolation.rs"),
-                PathBuf::from("harness/src/harness_adapter/checked.rs"),
-                PathBuf::from("scripts"),
-                PathBuf::from("tests/security"),
-                PathBuf::from("tests/lib"),
-                PathBuf::from("tests/run-all-tests.sh"),
-                PathBuf::from("harness/dev-container.toml"),
-                PathBuf::from("harness/src/rollout/executor.rs"),
-                PathBuf::from("harness/src/rollout/hooks.rs"),
-                PathBuf::from("harness/src/rollout/serverless.rs"),
-                PathBuf::from("harness/src/rollout/state.rs"),
-                PathBuf::from("harness/src/effects.rs"),
-                PathBuf::from("harness/src/leases"),
-                PathBuf::from("auto-issue-pr.sh"),
-                PathBuf::from("test-agentic-security.sh"),
-                PathBuf::from("harness/src/pr_tools.rs"),
-                PathBuf::from("docs/pr-lifecycle-tools.md"),
-                PathBuf::from("harness/src/budget.rs"),
-                PathBuf::from("harness/src/ci_tools.rs"),
-                PathBuf::from("harness/src/ci_policy.rs"),
-                PathBuf::from("harness/src/ci_integrity.rs"),
-                PathBuf::from("harness/src/deploy/template.rs"),
-                PathBuf::from("harness/src/sandbox_tools.rs"),
-                PathBuf::from("harness/tests/spawn_gate_structural.rs"),
-                PathBuf::from("harness/tests/protected_audit_hook_structural.rs"),
-                PathBuf::from("harness/tests/escalation_sinks_structural.rs"),
-                PathBuf::from("harness/tests/fixtures/identities/global/auditor.toml"),
-                PathBuf::from("harness/tests/fixtures/identities/global/prompts/auditor.md"),
-                PathBuf::from("harness/tests/fixtures/one_track/catalog/auditor.toml"),
-                PathBuf::from("harness/tests/fixtures/one_track/catalog/prompts/auditor.md"),
-                PathBuf::from("harness/tests/planner_structural.rs"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -1165,14 +1007,10 @@ mod tests {
                 (".cargo".to_string(), true),
                 (".devcontainer".to_string(), true),
                 ("AGENTS.md".to_string(), false),
-                ("evals/cases".to_string(), true),
-                ("harness/src/protected.rs".to_string(), false),
                 (".gitattributes".to_string(), false),
                 (".gitmodules".to_string(), false),
-                ("harness/src/scope.rs".to_string(), false),
                 ("CODEOWNERS".to_string(), false),
                 ("docs/CODEOWNERS".to_string(), false),
-                ("harness/src/auditor".to_string(), true),
                 (".github".to_string(), true),
                 (".cargo-husky".to_string(), true),
                 (".envrc".to_string(), false),
@@ -1180,67 +1018,6 @@ mod tests {
                 (".claude".to_string(), true),
                 ("nix".to_string(), true),
                 ("CLAUDE.md".to_string(), false),
-                ("docs/ci/protected-paths-guard.yml".to_string(), false),
-                ("harness/src/workspace.rs".to_string(), false),
-                ("harness/src/tools.rs".to_string(), false),
-                ("harness/src/marker.rs".to_string(), false),
-                ("harness/src/identity".to_string(), true),
-                ("harness/src/action_auditor".to_string(), true),
-                ("harness/src/windows.rs".to_string(), false),
-                ("harness/src/capabilities.rs".to_string(), false),
-                ("harness/src/container.rs".to_string(), false),
-                (
-                    "harness/src/harness_adapter/isolation.rs".to_string(),
-                    false
-                ),
-                ("harness/src/harness_adapter/checked.rs".to_string(), false),
-                ("scripts".to_string(), true),
-                ("tests/security".to_string(), true),
-                ("tests/lib".to_string(), true),
-                ("tests/run-all-tests.sh".to_string(), false),
-                ("harness/dev-container.toml".to_string(), false),
-                ("harness/src/rollout/executor.rs".to_string(), false),
-                ("harness/src/rollout/hooks.rs".to_string(), false),
-                ("harness/src/rollout/serverless.rs".to_string(), false),
-                ("harness/src/rollout/state.rs".to_string(), false),
-                ("harness/src/effects.rs".to_string(), false),
-                ("harness/src/leases".to_string(), true),
-                ("auto-issue-pr.sh".to_string(), false),
-                ("test-agentic-security.sh".to_string(), false),
-                ("harness/src/pr_tools.rs".to_string(), false),
-                ("docs/pr-lifecycle-tools.md".to_string(), false),
-                ("harness/src/budget.rs".to_string(), false),
-                ("harness/src/ci_tools.rs".to_string(), false),
-                ("harness/src/ci_policy.rs".to_string(), false),
-                ("harness/src/ci_integrity.rs".to_string(), false),
-                ("harness/src/deploy/template.rs".to_string(), false),
-                ("harness/src/sandbox_tools.rs".to_string(), false),
-                ("harness/tests/spawn_gate_structural.rs".to_string(), false),
-                (
-                    "harness/tests/protected_audit_hook_structural.rs".to_string(),
-                    false
-                ),
-                (
-                    "harness/tests/escalation_sinks_structural.rs".to_string(),
-                    false
-                ),
-                (
-                    "harness/tests/fixtures/identities/global/auditor.toml".to_string(),
-                    false
-                ),
-                (
-                    "harness/tests/fixtures/identities/global/prompts/auditor.md".to_string(),
-                    false
-                ),
-                (
-                    "harness/tests/fixtures/one_track/catalog/auditor.toml".to_string(),
-                    false
-                ),
-                (
-                    "harness/tests/fixtures/one_track/catalog/prompts/auditor.md".to_string(),
-                    false
-                ),
-                ("harness/tests/planner_structural.rs".to_string(), false),
             ]
         );
     }

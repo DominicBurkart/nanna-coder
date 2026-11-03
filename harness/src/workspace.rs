@@ -2480,7 +2480,7 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const PLACEHOLDER_FILES: [&str; 49] = [
+    const PLACEHOLDER_FILES: [&str; 13] = [
         "codecov.yml",
         "windows.toml",
         "tarpaulin.toml",
@@ -2488,48 +2488,12 @@ mod tests {
         "flake.nix",
         "flake.lock",
         "AGENTS.md",
-        "harness/src/protected.rs",
         ".gitattributes",
         ".gitmodules",
-        "harness/src/scope.rs",
         "CODEOWNERS",
         "docs/CODEOWNERS",
         ".envrc",
         "CLAUDE.md",
-        "docs/ci/protected-paths-guard.yml",
-        "harness/src/workspace.rs",
-        "harness/src/tools.rs",
-        "harness/src/marker.rs",
-        "harness/src/windows.rs",
-        "harness/src/capabilities.rs",
-        "harness/src/container.rs",
-        "harness/src/harness_adapter/isolation.rs",
-        "harness/src/harness_adapter/checked.rs",
-        "tests/run-all-tests.sh",
-        "harness/dev-container.toml",
-        "harness/src/rollout/executor.rs",
-        "harness/src/rollout/hooks.rs",
-        "harness/src/rollout/serverless.rs",
-        "harness/src/rollout/state.rs",
-        "harness/src/effects.rs",
-        "auto-issue-pr.sh",
-        "test-agentic-security.sh",
-        "harness/src/pr_tools.rs",
-        "docs/pr-lifecycle-tools.md",
-        "harness/src/budget.rs",
-        "harness/src/ci_tools.rs",
-        "harness/src/ci_policy.rs",
-        "harness/src/ci_integrity.rs",
-        "harness/src/deploy/template.rs",
-        "harness/src/sandbox_tools.rs",
-        "harness/tests/spawn_gate_structural.rs",
-        "harness/tests/protected_audit_hook_structural.rs",
-        "harness/tests/escalation_sinks_structural.rs",
-        "harness/tests/fixtures/identities/global/auditor.toml",
-        "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        "harness/tests/fixtures/one_track/catalog/auditor.toml",
-        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-        "harness/tests/planner_structural.rs",
     ];
 
     fn sorted_placeholder_files() -> Vec<PathBuf> {
@@ -2552,14 +2516,10 @@ mod tests {
             ".cargo",
             ".devcontainer",
             "AGENTS.md",
-            "evals/cases",
-            "harness/src/protected.rs",
             ".gitattributes",
             ".gitmodules",
-            "harness/src/scope.rs",
             "CODEOWNERS",
             "docs/CODEOWNERS",
-            "harness/src/auditor",
             ".github",
             ".cargo-husky",
             ".envrc",
@@ -2567,46 +2527,6 @@ mod tests {
             ".claude",
             "nix",
             "CLAUDE.md",
-            "docs/ci/protected-paths-guard.yml",
-            "harness/src/workspace.rs",
-            "harness/src/tools.rs",
-            "harness/src/marker.rs",
-            "harness/src/identity",
-            "harness/src/action_auditor",
-            "harness/src/windows.rs",
-            "harness/src/capabilities.rs",
-            "harness/src/container.rs",
-            "harness/src/harness_adapter/isolation.rs",
-            "harness/src/harness_adapter/checked.rs",
-            "scripts",
-            "tests/security",
-            "tests/lib",
-            "tests/run-all-tests.sh",
-            "harness/dev-container.toml",
-            "harness/src/rollout/executor.rs",
-            "harness/src/rollout/hooks.rs",
-            "harness/src/rollout/serverless.rs",
-            "harness/src/rollout/state.rs",
-            "harness/src/effects.rs",
-            "harness/src/leases",
-            "auto-issue-pr.sh",
-            "test-agentic-security.sh",
-            "harness/src/pr_tools.rs",
-            "docs/pr-lifecycle-tools.md",
-            "harness/src/budget.rs",
-            "harness/src/ci_tools.rs",
-            "harness/src/ci_policy.rs",
-            "harness/src/ci_integrity.rs",
-            "harness/src/deploy/template.rs",
-            "harness/src/sandbox_tools.rs",
-            "harness/tests/spawn_gate_structural.rs",
-            "harness/tests/protected_audit_hook_structural.rs",
-            "harness/tests/escalation_sinks_structural.rs",
-            "harness/tests/fixtures/identities/global/auditor.toml",
-            "harness/tests/fixtures/identities/global/prompts/auditor.md",
-            "harness/tests/fixtures/one_track/catalog/auditor.toml",
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-            "harness/tests/planner_structural.rs",
         ]
         .iter()
         .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
@@ -2661,17 +2581,9 @@ mod tests {
             ".config",
             ".claude",
             "nix",
-            "harness/src/identity",
-            "harness/src/action_auditor",
-            "harness/src/leases",
-            "scripts",
-            "tests/security",
-            "tests/lib",
             ".githooks",
             ".cargo",
             ".devcontainer",
-            "evals/cases",
-            "harness/src/auditor",
         ] {
             assert!(root.join(dir).is_dir(), "{dir}");
         }
@@ -2723,10 +2635,10 @@ mod tests {
     async fn test_an_unpreparable_protected_root_fails_container_setup_and_removes_the_worktree() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        std::fs::write(source.path().join("harness"), "not a directory").unwrap();
+        std::fs::write(source.path().join("docs"), "not a directory").unwrap();
         git_cmd(source.path()).args(["add", "."]).output().unwrap();
         git_cmd(source.path())
-            .args(["commit", "-m", "harness is a file"])
+            .args(["commit", "-m", "docs is a file"])
             .output()
             .unwrap();
 
@@ -2776,7 +2688,7 @@ mod tests {
     #[test]
     fn test_protected_mounts_report_an_unwritable_parent() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("harness"), "file").unwrap();
+        std::fs::write(dir.path().join("docs"), "file").unwrap();
         let protected = ProtectedPaths::with_config_dir(dir.path(), None);
         let err = protected_mounts(&protected, dir.path()).unwrap_err();
         assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");

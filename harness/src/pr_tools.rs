@@ -4821,6 +4821,12 @@ mod tests {
         assert_eq!(skipped, vec![".github/workflows/x.yml", "codecov.yml"]);
     }
 
+    fn own_protected() -> ProtectedPaths {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let extras = crate::protected::ProtectedExtras::load(&root).unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
     fn declared_extras() -> ProtectedPaths {
         let extras =
             crate::protected::ProtectedExtras::parse(r#"extra = ["src/gate.rs", "ci/**"]"#)
@@ -7280,7 +7286,8 @@ mod tests {
         .unwrap();
         std::fs::write(fixture.work.path().join("ok.txt"), "ok").unwrap();
         let before = head_sha(fixture.work.path());
-        let commit = GitCommitTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+        let commit = GitCommitTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_protected(own_protected());
         let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
         assert_eq!(head_sha(fixture.work.path()), before);
@@ -7290,7 +7297,8 @@ mod tests {
             fixture.work.path(),
             &["commit", "-q", "-m", "self\n\nNanna-Identity: sdlc-dev"],
         );
-        let push = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev");
+        let push = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_protected(own_protected());
         let err = push.execute(json!({})).await.unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
         assert!(!remote_has(fixture.work.path(), "feature-self"));
@@ -7302,7 +7310,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("harness/src")).unwrap();
         std::fs::write(dir.path().join("harness/src/pr_tools.rs"), "x").unwrap();
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
-        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(own_protected());
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         assert_eq!(
             result["skipped_protected"],

@@ -205,80 +205,6 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/.envrc").await;
     assert_refused(&registry, "echo x > /workspace/CLAUDE.md").await;
     assert_refused(&registry, "mkdir -p /workspace/nix/sub").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/container.rs").await;
-    assert_refused(&registry, "echo x > /workspace/scripts/install.sh").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/effects.rs").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/rollout/executor.rs",
-    )
-    .await;
-    assert_refused(&registry, "mkdir /workspace/harness/src/leases/sub").await;
-    assert_refused(&registry, "echo x > /workspace/auto-issue-pr.sh").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/pr_tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/docs/pr-lifecycle-tools.md").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/budget.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_policy.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_integrity.rs").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/deploy/template.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/sandbox_tools.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/spawn_gate_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/protected_audit_hook_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/escalation_sinks_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/identities/global/auditor.toml",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/identities/global/prompts/auditor.md",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/auditor.toml",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/planner_structural.rs",
-    )
-    .await;
-    assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/action_auditor/gate.rs",
-    )
-    .await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/identity/new.rs").await;
     assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
     assert_refused(&registry, "echo x > /workspace/windows.toml").await;
     assert_refused(&registry, "echo x > /workspace/src/gate.rs").await;
@@ -304,29 +230,7 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
             .count(),
         0
     );
-    for placeholder in [
-        "codecov.yml",
-        "windows.toml",
-        ".envrc",
-        "CLAUDE.md",
-        "harness/src/tools.rs",
-        "harness/src/pr_tools.rs",
-        "docs/pr-lifecycle-tools.md",
-        "harness/src/budget.rs",
-        "harness/src/ci_tools.rs",
-        "harness/src/ci_policy.rs",
-        "harness/src/ci_integrity.rs",
-        "harness/src/deploy/template.rs",
-        "harness/src/sandbox_tools.rs",
-        "harness/tests/spawn_gate_structural.rs",
-        "harness/tests/protected_audit_hook_structural.rs",
-        "harness/tests/escalation_sinks_structural.rs",
-        "harness/tests/fixtures/identities/global/auditor.toml",
-        "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        "harness/tests/fixtures/one_track/catalog/auditor.toml",
-        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-        "harness/tests/planner_structural.rs",
-    ] {
+    for placeholder in ["codecov.yml", "windows.toml", ".envrc", "CLAUDE.md"] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
                 .unwrap()
