@@ -95,12 +95,10 @@ impl<'ast> Visit<'ast> for Idents {
     }
 
     fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
-        if watched(&plain(&node.ident.to_string())) {
-            self.aliases.push(format!(
-                "renames {} as {}",
-                plain(&node.ident.to_string()),
-                node.rename
-            ));
+        let renamed = plain(&node.ident.to_string());
+        if watched(&renamed) {
+            self.aliases
+                .push(format!("renames {renamed} as {}", node.rename));
         }
     }
 
