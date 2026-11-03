@@ -108,6 +108,108 @@ const MATCH_OPTIONS: MatchOptions = MatchOptions {
 
 const RECURSIVE_SUFFIX: &str = "/**";
 
+pub const EXTRAS_FILE: &str = ".nanna/protected.toml";
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProtectedConfigError {
+    #[error("`{EXTRAS_FILE}` is unreadable: {0}")]
+    Unreadable(String),
+    #[error("`{EXTRAS_FILE}` is malformed: {0}")]
+    Malformed(String),
+    #[error("`{EXTRAS_FILE}` declares the invalid pattern `{pattern}`: {reason}")]
+    InvalidPattern { pattern: String, reason: String },
+}
+
+/// Extra protected globs a repository declares in `.nanna/protected.toml`.
+/// They only add to [`PROTECTED_PATTERNS`]; a malformed declaration is an
+/// error, never an empty set.
+///
+/// ```
+/// use harness::protected::{ProtectedExtras, ProtectedPaths};
+/// use std::path::Path;
+///
+/// let extras = ProtectedExtras::parse(r#"extra = ["src/gate.rs", "ci/**"]"#).unwrap();
+/// let protected = ProtectedPaths::for_repo_with_extras(Path::new("."), &extras);
+/// assert!(protected.is_protected(Path::new("src/gate.rs")));
+/// assert!(protected.is_protected(Path::new("ci/deploy.sh")));
+/// assert!(protected.is_protected(Path::new(".git/config")));
+/// assert!(ProtectedExtras::parse("remove = [\".git/**\"]").is_err());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtectedExtras(Vec<String>);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtrasFile {
+    #[serde(default)]
+    extra: Vec<String>,
+}
+
+fn invalid_pattern(pattern: &str, reason: &str) -> ProtectedConfigError {
+    ProtectedConfigError::InvalidPattern {
+        pattern: pattern.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn validate_extra(pattern: &str) -> Result<(), ProtectedConfigError> {
+    let literal = pattern.strip_suffix(RECURSIVE_SUFFIX).unwrap_or(pattern);
+    if literal.is_empty() {
+        return Err(invalid_pattern(pattern, "the pattern is empty"));
+    }
+    if literal.starts_with('/') {
+        return Err(invalid_pattern(pattern, "the pattern must be relative"));
+    }
+    if literal.starts_with('!') {
+        return Err(invalid_pattern(pattern, "patterns cannot be negated"));
+    }
+    if literal.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r', '\0']) {
+        return Err(invalid_pattern(
+            pattern,
+            "use a literal path, optionally ending in `/**`",
+        ));
+    }
+    if literal
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(invalid_pattern(
+            pattern,
+            "the path must be normalised and stay inside the repository",
+        ));
+    }
+    Ok(())
+}
+
+impl ProtectedExtras {
+    pub fn parse(text: &str) -> Result<Self, ProtectedConfigError> {
+        let file: ExtrasFile =
+            toml::from_str(text).map_err(|e| ProtectedConfigError::Malformed(e.to_string()))?;
+        file.extra
+            .iter()
+            .try_for_each(|pattern| validate_extra(pattern))?;
+        Ok(Self(file.extra))
+    }
+
+    pub fn load(base: &Path) -> Result<Self, ProtectedConfigError> {
+        let unreadable =
+            |e: &dyn std::fmt::Display| ProtectedConfigError::Unreadable(e.to_string());
+        let path = base.join(EXTRAS_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(unreadable(&e)),
+            Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
+            Ok(_) => {}
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| unreadable(&e))?;
+        Self::parse(&text)
+    }
+
+    pub fn globs(&self) -> &[String] {
+        &self.0
+    }
+}
+
 /// A write that reached a protected path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Error)]
 #[error("`{path}` is protected by rule `{rule}`: Nanna may not modify its own configuration")]
@@ -225,6 +327,20 @@ impl ProtectedPaths {
     /// The protected set for `repo_root` with an explicit configuration
     /// directory (`None` when Nanna has no configuration directory).
     pub fn with_config_dir(repo_root: &Path, config_dir: Option<&Path>) -> Self {
+        Self::with_extras(repo_root, config_dir, &ProtectedExtras::default())
+    }
+
+    pub fn for_repo_with_extras(repo_root: &Path, extras: &ProtectedExtras) -> Self {
+        let agents_dir = IdentityCatalog::default_global_dir();
+        let config_dir = agents_dir.as_deref().and_then(Path::parent);
+        Self::with_extras(repo_root, config_dir, extras)
+    }
+
+    pub fn with_extras(
+        repo_root: &Path,
+        config_dir: Option<&Path>,
+        extras: &ProtectedExtras,
+    ) -> Self {
         let mut rules: Vec<Rule> = PROTECTED_PATTERNS
             .iter()
             .map(|glob| Rule::new(glob.to_string()))
@@ -233,6 +349,7 @@ impl ProtectedPaths {
             let escaped = Pattern::escape(&crate::scope::denial_path(&relative));
             rules.push(Rule::new(format!("{escaped}{RECURSIVE_SUFFIX}")));
         }
+        rules.extend(extras.globs().iter().cloned().map(Rule::new));
         Self {
             rules,
             config_dir: config_dir.map(Path::to_path_buf),
@@ -1393,6 +1510,253 @@ mod tests {
             assert_eq!(written, "name=from-body\n");
             let (_, written) = detect(&plain, &plain.base, &plain.head, "no marker here");
             assert_eq!(written, "name=\n");
+        }
+    }
+
+    mod extras {
+        use super::*;
+
+        fn declared(globs: &[&str]) -> ProtectedExtras {
+            let quoted: Vec<String> = globs.iter().map(|g| format!("{g:?}")).collect();
+            ProtectedExtras::parse(&format!("extra = [{}]", quoted.join(", "))).unwrap()
+        }
+
+        fn with(globs: &[&str]) -> ProtectedPaths {
+            ProtectedPaths::with_extras(Path::new("/repo"), None, &declared(globs))
+        }
+
+        fn write_declaration(base: &Path, body: &[u8]) {
+            std::fs::create_dir_all(base.join(".nanna")).unwrap();
+            std::fs::write(base.join(EXTRAS_FILE), body).unwrap();
+        }
+
+        #[test]
+        fn a_declared_list_is_read_in_order() {
+            let extras = declared(&["src/gate.rs", "scripts/**"]);
+            assert_eq!(extras.globs(), ["src/gate.rs", "scripts/**"]);
+        }
+
+        #[test]
+        fn an_empty_file_or_an_empty_list_declares_nothing() {
+            assert!(ProtectedExtras::parse("").unwrap().globs().is_empty());
+            assert!(ProtectedExtras::parse("extra = []")
+                .unwrap()
+                .globs()
+                .is_empty());
+        }
+
+        #[test]
+        fn an_absent_declaration_declares_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap(),
+                ProtectedExtras::default()
+            );
+        }
+
+        #[test]
+        fn a_present_declaration_is_loaded_from_the_base_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), b"extra = [\"src/gate.rs\"]\n");
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap().globs(),
+                ["src/gate.rs"]
+            );
+        }
+
+        #[test]
+        fn unknown_keys_are_rejected_at_every_level() {
+            for text in [
+                "extras = [\"a\"]",
+                "extra = [\"a\"]\nremove = [\".git/**\"]",
+                "[extra]\nsrc = \"a\"",
+                "[other]\nextra = [\"a\"]",
+            ] {
+                let err = ProtectedExtras::parse(text).unwrap_err();
+                assert!(matches!(err, ProtectedConfigError::Malformed(_)), "{text}");
+            }
+        }
+
+        #[test]
+        fn malformed_toml_and_wrong_types_are_rejected() {
+            for text in [
+                "extra = [",
+                "extra = \"src/gate.rs\"",
+                "extra = [1]",
+                "extra = [[\"a\"]]",
+                "= 3",
+            ] {
+                let err = ProtectedExtras::parse(text).unwrap_err();
+                assert!(matches!(err, ProtectedConfigError::Malformed(_)), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_malformed_file_on_disk_fails_to_load() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), b"extra = [");
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Malformed(_))
+            ));
+        }
+
+        #[test]
+        fn a_non_utf8_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), &[0xff, 0xfe, 0x00]);
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn a_directory_in_place_of_the_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(EXTRAS_FILE)).unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_symlink_in_place_of_the_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("elsewhere.toml");
+            std::fs::write(&target, "extra = []").unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::os::unix::fs::symlink(&target, dir.path().join(EXTRAS_FILE)).unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn a_base_that_is_not_a_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("plain");
+            std::fs::write(&file, "x").unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(&file),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn patterns_that_cannot_be_mounted_or_matched_literally_are_rejected() {
+            for pattern in [
+                "",
+                "/etc/passwd",
+                "../outside",
+                "a/../b",
+                "./a",
+                "a/./b",
+                "a//b",
+                "a\\b",
+                "!a",
+                "a/",
+                "*",
+                "**",
+                "**/a",
+                "src/*.rs",
+                "src/?.rs",
+                "src/[ab].rs",
+                "src/{a,b}.rs",
+                "a/**/b",
+                "/**",
+                "src/**/",
+                "a\nb",
+            ] {
+                let text = format!("extra = [{pattern:?}]");
+                let err = ProtectedExtras::parse(&text).unwrap_err();
+                assert!(
+                    matches!(&err, ProtectedConfigError::InvalidPattern { pattern: p, .. } if p == pattern),
+                    "{pattern:?}: {err:?}"
+                );
+                assert!(err.to_string().contains(".nanna/protected.toml"));
+            }
+        }
+
+        #[test]
+        fn literal_files_and_recursive_directories_are_accepted() {
+            let extras = declared(&["a", "a/b.rs", "dir/**", "dir/sub/**", "weird name.txt"]);
+            assert_eq!(extras.globs().len(), 5);
+        }
+
+        #[test]
+        fn declared_patterns_protect_files_and_directories_case_insensitively() {
+            let protected = with(&["src/gate.rs", "tools/**"]);
+            let violation = protected.check(Path::new("src/gate.rs")).unwrap_err();
+            assert_eq!(violation.rule, "src/gate.rs");
+            assert!(protected.is_protected(Path::new("SRC/Gate.rs")));
+            assert!(protected.is_protected(Path::new("tools")));
+            assert!(protected.is_protected(Path::new("tools/deep/file.sh")));
+            assert!(!protected.is_protected(Path::new("src/other.rs")));
+            assert!(!protected.is_protected(Path::new("toolsmith/file.sh")));
+        }
+
+        #[test]
+        fn without_a_declaration_the_same_paths_are_unprotected() {
+            let bare = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            assert!(!bare.is_protected(Path::new("src/gate.rs")));
+            assert!(!bare.is_protected(Path::new("tools/deep/file.sh")));
+        }
+
+        #[test]
+        fn declarations_only_add_never_remove_a_shipped_rule() {
+            let config = Path::new("/repo/home/cfg");
+            let hostile = declared(&["src/gate.rs", ".nanna/protected.toml", "home/cfg/x"]);
+            let protected = ProtectedPaths::with_extras(Path::new("/repo"), Some(config), &hostile);
+            for (rule, path) in EXAMPLES {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert_eq!(violation.rule, *rule, "{path}");
+            }
+            assert!(protected.is_protected(Path::new("home/cfg/agents/x.toml")));
+            let rules = protected.rules();
+            for pattern in PROTECTED_PATTERNS {
+                assert!(rules.contains(pattern), "{pattern}");
+            }
+            assert!(rules.contains(&"home/cfg/**"));
+            assert_eq!(&rules[..PROTECTED_PATTERNS.len()], PROTECTED_PATTERNS);
+        }
+
+        #[test]
+        fn declared_rules_follow_the_shipped_and_config_dir_rules() {
+            let extras = declared(&["src/gate.rs"]);
+            let protected = ProtectedPaths::with_extras(
+                Path::new("/repo"),
+                Some(Path::new("/repo/cfg")),
+                &extras,
+            );
+            let rules = protected.rules();
+            assert_eq!(rules.len(), PROTECTED_PATTERNS.len() + 2);
+            assert_eq!(rules[PROTECTED_PATTERNS.len()], "cfg/**");
+            assert_eq!(rules[PROTECTED_PATTERNS.len() + 1], "src/gate.rs");
+        }
+
+        #[test]
+        fn declared_patterns_become_mount_roots() {
+            let protected = with(&["src/gate.rs", "tools/**", "tools/inner/**"]);
+            let targets = protected.mount_targets();
+            let find = |path: &str| targets.iter().find(|t| t.path == Path::new(path));
+            assert!(!find("src/gate.rs").unwrap().directory);
+            assert!(find("tools").unwrap().directory);
+            assert!(find("tools/inner").is_none());
+        }
+
+        #[test]
+        fn for_repo_with_extras_keeps_the_catalog_config_dir() {
+            let extras = declared(&["src/gate.rs"]);
+            let protected = ProtectedPaths::for_repo_with_extras(Path::new("/repo"), &extras);
+            let expected = IdentityCatalog::default_global_dir()
+                .and_then(|d| d.parent().map(Path::to_path_buf));
+            assert_eq!(protected.config_dir(), expected.as_deref());
+            assert!(protected.is_protected(Path::new("src/gate.rs")));
+            assert!(protected.is_protected(Path::new(".nanna/agents/x.toml")));
         }
     }
 }
