@@ -1860,6 +1860,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_allow_completing_exactly_at_the_deadline_is_timed_out_and_one_tick_earlier_is_approved(
+    ) {
+        let plan = Plan::new(vec![work(
+            "a",
+            "rust-implementer",
+            DevLoop::Inner,
+            "Fix bug A.",
+            &[],
+        )])
+        .unwrap();
+        let (gate, _) = slow_gate(Duration::from_secs(5));
+        let at_deadline = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert_eq!(statuses(&at_deadline), [("a", "timed_out")]);
+        assert!(at_deadline.into_approved().is_err());
+        let (gate, _) = slow_gate(Duration::from_millis(4_999));
+        let before = run_within(&plan, &gate, Duration::from_secs(5)).await;
+        assert_eq!(before.into_approved().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_plan_that_finishes_inside_the_deadline_is_approved() {
         let (gate, calls) = slow_gate(Duration::from_secs(3));
         let plan = Plan::new(vec![

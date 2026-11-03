@@ -96,8 +96,11 @@ impl<'ast> Visit<'ast> for Idents {
 
     fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
         if watched(&plain(&node.ident.to_string())) {
-            self.aliases
-                .push(format!("renames {} as {}", node.ident, node.rename));
+            self.aliases.push(format!(
+                "renames {} as {}",
+                plain(&node.ident.to_string()),
+                node.rename
+            ));
         }
     }
 
@@ -318,12 +321,24 @@ fn the_checker_sees_raw_identifiers_inherent_impls_and_qualified_paths() {
 }
 
 #[test]
+fn a_raw_identifier_in_a_use_rename_or_a_macro_body_is_normalised() {
+    let renamed = forbidden_constructs("use a::r#SpawnGate as G;");
+    assert_eq!(renamed, ["renames SpawnGate as G"]);
+    let in_macro = forbidden_constructs("fn z() { m!(r#SpawnGate::new); }");
+    assert!(in_macro.contains(&"passes SpawnGate to a macro".to_string()));
+    assert!(in_macro.contains(&"calls SpawnGate::new".to_string()));
+}
+
+#[test]
 fn the_checker_flags_a_missing_extra_or_misordered_gate_call() {
     let ordered =
         "async fn audit_plan_within() { let r = gate.request_with_caller(); gate.check(r).await; }";
     assert_eq!(gate_order_problem(ordered), None);
     let none = "async fn audit_plan_within() { let r = gate.request_with_caller(); }";
     assert!(gate_order_problem(none).unwrap().contains("0 times"));
+    assert!(gate_order_problem(none)
+        .unwrap()
+        .contains("audit_plan_within"));
     let twice = "async fn audit_plan_within() { gate.check(a); gate.check(b); }";
     assert!(gate_order_problem(twice).unwrap().contains("2 times"));
     let outside = "fn helper() { g.check(a); } async fn audit_plan_within() { gate.check(r); }";
