@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
 const ENTRY_FILE: &str = "mcp/plan.rs";
+const GUARDED: &[&str] = &[
+    "audit_plan",
+    "audit_plan_within",
+    "Planner",
+    "PlanRun",
+    "into_approved",
+];
 const ENTRY_FN: &str = "handle_plan_task";
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -83,6 +90,16 @@ impl<'ast> Visit<'ast> for Sites {
         self.function.push("<use>".to_string());
         syn::visit::visit_item_use(self, node);
         self.function.pop();
+    }
+
+    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+        let source = plain(&node.ident.to_string());
+        if GUARDED.contains(&source.as_str()) {
+            self.function.push("<use as>".to_string());
+            self.record(&source);
+            self.function.pop();
+        }
+        syn::visit::visit_use_rename(self, node);
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
@@ -226,6 +243,23 @@ fn a_module_level_mention_outside_a_use_item_is_not_an_allowed_site() {
         scan.uses["audit_plan"],
         expected(&["x.rs: <use>", "x.rs: ", "x.rs: entry"])
     );
+}
+
+#[test]
+fn renaming_a_guarded_name_in_a_use_item_is_a_failing_site_at_module_level_and_in_a_body() {
+    let source = r#"
+        use crate::planner::audit_plan as audit_again;
+        use crate::planner::{Planner as P, PlanRun};
+        fn entry() { audit_again(a); }
+        fn nested() { use crate::planner::into_approved as approve; approve(b); }
+    "#;
+    let scan = scan_source("x.rs", source);
+    assert!(scan.uses["audit_plan"].contains("x.rs: <use as>"));
+    assert!(scan.uses["Planner"].contains("x.rs: <use as>"));
+    assert!(scan.uses["into_approved"].contains("x.rs: <use as>"));
+    assert!(!scan.uses["PlanRun"].contains("x.rs: <use as>"));
+    let plain_use = scan_source("y.rs", "use crate::planner::audit_plan;");
+    assert_eq!(plain_use.uses["audit_plan"], expected(&["y.rs: <use>"]));
 }
 
 #[test]
