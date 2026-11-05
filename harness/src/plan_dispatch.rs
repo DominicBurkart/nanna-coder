@@ -651,6 +651,8 @@ mod tests {
         auto_complete: bool,
         start_delay: Duration,
         status_delay: Duration,
+        status_calls: std::sync::atomic::AtomicUsize,
+        max_status_calls: usize,
     }
 
     impl Fake {
@@ -663,6 +665,8 @@ mod tests {
                 auto_complete: false,
                 start_delay: Duration::ZERO,
                 status_delay: Duration::ZERO,
+                status_calls: std::sync::atomic::AtomicUsize::new(0),
+                max_status_calls: usize::MAX,
             }
         }
 
@@ -714,6 +718,10 @@ mod tests {
         }
 
         async fn status(&self, id: &TaskId) -> Option<TaskStatus> {
+            let calls = self
+                .status_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(calls < self.max_status_calls, "the wait is spinning");
             tokio::time::sleep(self.status_delay).await;
             self.statuses.lock().unwrap().get(id).cloned()
         }
@@ -1075,7 +1083,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_dropped_cancel_sender_does_not_make_the_wait_spin() {
-        let (mut run, fake) = (ship_run().await, Fake::new());
+        let (mut run, mut fake) = (ship_run().await, Fake::new());
+        fake.max_status_calls = 50;
         let (tx, rx) = watch::channel(false);
         drop(tx);
         let (poll, budget) = (Duration::from_millis(100), Duration::from_secs(1));

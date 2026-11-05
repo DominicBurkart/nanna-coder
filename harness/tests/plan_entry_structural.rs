@@ -64,20 +64,24 @@ impl<'ast> Visit<'ast> for Sites {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.function.push(plain(&node.sig.ident.to_string()));
+            syn::visit::visit_item_fn(self, node);
+            self.function.pop();
         }
-        self.function.push(plain(&node.sig.ident.to_string()));
-        syn::visit::visit_item_fn(self, node);
-        self.function.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.function.push(plain(&node.sig.ident.to_string()));
+            syn::visit::visit_impl_item_fn(self, node);
+            self.function.pop();
         }
-        self.function.push(plain(&node.sig.ident.to_string()));
-        syn::visit::visit_impl_item_fn(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        self.function.push("<use>".to_string());
+        syn::visit::visit_item_use(self, node);
         self.function.pop();
     }
 
@@ -154,7 +158,7 @@ fn audit_plan_is_called_only_by_the_single_plan_entry() {
         expected(&[
             "planner.rs: audit_plan",
             "mcp/plan.rs: handle_plan_task",
-            "mcp/plan.rs: ",
+            "mcp/plan.rs: <use>",
         ]),
         "audit_plan gained or lost a caller; handle_plan_task must stay the only entry into the audit"
     );
@@ -170,7 +174,7 @@ fn the_planner_and_the_plan_run_are_built_only_by_the_single_plan_entry() {
         .collect();
     assert_eq!(
         outside,
-        expected(&["mcp/plan.rs: handle_plan_task", "mcp/plan.rs: "])
+        expected(&["mcp/plan.rs: handle_plan_task", "mcp/plan.rs: <use>"])
     );
     let run_sites = use_sites(&all, "PlanRun");
     let outside: Vec<&String> = run_sites
@@ -188,10 +192,39 @@ fn the_planner_and_the_plan_run_are_built_only_by_the_single_plan_entry() {
     assert_eq!(
         entry,
         expected(&[
-            "mcp/plan.rs: ",
+            "mcp/plan.rs: <use>",
             "mcp/plan.rs: handle_plan_task",
             "mcp/plan.rs: render"
         ])
+    );
+}
+
+#[test]
+fn the_audit_core_and_the_approval_proofs_are_reached_only_through_the_single_entry() {
+    let all = scan_all();
+    let within = use_sites(&all, "audit_plan_within");
+    assert_eq!(
+        within,
+        expected(&["planner.rs: audit_plan", "planner.rs: audit_plan_within"])
+    );
+    let approved: BTreeSet<String> = use_sites(&all, "into_approved")
+        .into_iter()
+        .filter(|site| !site.starts_with("planner.rs:"))
+        .collect();
+    assert_eq!(approved, expected(&["mcp/plan.rs: handle_plan_task"]));
+}
+
+#[test]
+fn a_module_level_mention_outside_a_use_item_is_not_an_allowed_site() {
+    let source = r#"
+        use crate::planner::audit_plan;
+        const TAKEN: fn() = audit_plan;
+        fn entry() { audit_plan(a); }
+    "#;
+    let scan = scan_source("x.rs", source);
+    assert_eq!(
+        scan.uses["audit_plan"],
+        expected(&["x.rs: <use>", "x.rs: ", "x.rs: entry"])
     );
 }
 

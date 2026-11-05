@@ -142,14 +142,6 @@ impl PlanRegistry {
         inner.entries.values().filter(running).count()
     }
 
-    pub fn ensure_room(&self) -> Result<(), RegistryError> {
-        let running = Self::running(&self.lock());
-        if running >= MAX_CONCURRENT_PLANS {
-            return Err(RegistryError::TooManyRunning(running));
-        }
-        Ok(())
-    }
-
     pub fn register(&self, id: &str) -> Result<watch::Receiver<bool>, RegistryError> {
         let mut inner = self.lock();
         let running = Self::running(&inner);
@@ -176,9 +168,14 @@ impl PlanRegistry {
         let Some(entry) = inner.entries.get_mut(id) else {
             return;
         };
-        if matches!(entry.slot, Slot::Finished { .. }) {
-            return;
-        }
+        let status = match &entry.slot {
+            Slot::Finished { .. } => return,
+            Slot::Running {
+                cancel_requested: true,
+                ..
+            } => PlanStatus::Cancelled,
+            Slot::Running { .. } => status,
+        };
         entry.slot = Slot::Finished {
             status,
             result: capped(result),
@@ -189,6 +186,17 @@ impl PlanRegistry {
             if let Some(oldest) = inner.finished.pop_front() {
                 inner.entries.remove(&oldest);
             }
+        }
+    }
+
+    pub fn release(&self, id: &str) {
+        let mut inner = self.lock();
+        let reserved = inner
+            .entries
+            .get(id)
+            .is_some_and(|entry| matches!(entry.slot, Slot::Running { .. }));
+        if reserved {
+            inner.entries.remove(id);
         }
     }
 
@@ -259,17 +267,28 @@ impl PlanRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardState {
+    Reserved,
+    Running,
+    Done,
+}
+
 struct RunGuard {
     registry: Arc<PlanRegistry>,
     id: String,
-    done: bool,
+    state: GuardState,
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if !self.done {
-            let aborted = json!({ "end": "aborted", "gave_up": true });
-            self.registry.finish(&self.id, PlanStatus::Failed, aborted);
+        match self.state {
+            GuardState::Reserved => self.registry.release(&self.id),
+            GuardState::Running => {
+                let aborted = json!({ "end": "aborted", "gave_up": true });
+                self.registry.finish(&self.id, PlanStatus::Failed, aborted);
+            }
+            GuardState::Done => {}
         }
     }
 }
@@ -333,7 +352,7 @@ pub fn tool_definition() -> Value {
                 "repo_path": { "type": "string", "description": "Absolute path to the git repository" },
                 "branch": { "type": "string", "description": "Branch or ref to base the worktrees on (default: HEAD)" },
                 "max_iterations": { "type": "integer", "description": "Maximum agent iterations per subtask (default: server default)" },
-                "budget_secs": { "type": "integer", "description": "Wall-clock budget for the whole run in seconds (default 600, maximum 1800)" }
+                "budget_secs": { "type": "integer", "description": "Wall-clock budget for running the approved plan in seconds (default 600, maximum 1800). It does not cover planning (up to 120 s) or the audit (up to 120 s), which complete before the task id is returned." }
             },
             "required": ["description", "repo_path"]
         },
@@ -480,7 +499,7 @@ fn outcome_json(outcome: &ChildOutcome<'_>) -> Value {
         }
         ChildOutcome::Cancelled(task) => json!({ "state": "cancelled", "task_id": task.0 }),
         ChildOutcome::Refused(refusal) => {
-            json!({ "state": "refused", "reason": refusal.to_string() })
+            json!({ "state": "refused", "reason_untrusted": untrusted(&refusal.to_string()) })
         }
         ChildOutcome::Lost(task) => json!({ "state": "lost", "task_id": task.0 }),
         ChildOutcome::Skipped { blocked_by } => {
@@ -576,7 +595,13 @@ pub async fn handle_plan_task(
     env: &PlanTaskEnv<'_>,
 ) -> Result<Value, PlanTaskError> {
     let args = parse_args(params, env.default_max_iterations)?;
-    env.registry.ensure_room()?;
+    let id = PlanRegistry::new_id();
+    let cancel = env.registry.register(&id)?;
+    let mut guard = RunGuard {
+        registry: Arc::clone(env.registry),
+        id: id.clone(),
+        state: GuardState::Reserved,
+    };
     let context = env
         .spawn_gate
         .context()
@@ -585,7 +610,6 @@ pub async fn handle_plan_task(
     let plan = planner
         .plan(&args.description, context.catalog(), context.repo_profile())
         .await?;
-    let id = PlanRegistry::new_id();
     let repo = crate::scope::origin_slug(&args.repo_path)
         .unwrap_or_else(|| args.repo_path.display().to_string());
     let parent = TaskSummary::new(id.clone(), args.description.clone(), repo);
@@ -601,7 +625,7 @@ pub async fn handle_plan_task(
         provider: Arc::clone(env.provider),
     };
     let mut run = PlanRun::new(approved, target)?;
-    let cancel = env.registry.register(&id)?;
+    guard.state = GuardState::Running;
     let (manager, registry, run_id, budget) = (
         Arc::clone(env.task_manager),
         Arc::clone(env.registry),
@@ -609,17 +633,13 @@ pub async fn handle_plan_task(
         args.budget,
     );
     tokio::spawn(async move {
-        let mut guard = RunGuard {
-            registry: Arc::clone(&registry),
-            id: run_id.clone(),
-            done: false,
-        };
+        let mut guard = guard;
         let end = run
             .run_with_cancel(&*manager, POLL_EVERY, budget, cancel)
             .await;
         let (status, result) = render(&spawns, &run, end);
         registry.finish(&run_id, status, result);
-        guard.done = true;
+        guard.state = GuardState::Done;
     });
     let view = env.registry.view(&id)?;
     let mut wire = view_to_wire(&id, &view);
@@ -646,11 +666,25 @@ mod tests {
 
     struct Scripted {
         reply: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        delay: Duration,
+    }
+
+    impl Scripted {
+        fn new(reply: Option<String>) -> Self {
+            Self {
+                reply,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                delay: Duration::ZERO,
+            }
+        }
     }
 
     #[async_trait]
     impl ModelProvider for Scripted {
         async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             let Some(text) = &self.reply else {
                 return Err(ModelError::ServiceUnavailable {
                     message: "backend secret detail".to_string(),
@@ -709,7 +743,7 @@ mod tests {
     }
 
     fn server(reply: Option<String>, planner: bool) -> NannaMcpServer {
-        let provider: Arc<dyn ModelProvider> = Arc::new(Scripted { reply });
+        let provider: Arc<dyn ModelProvider> = Arc::new(Scripted::new(reply));
         let built = NannaMcpServer::new(Arc::new(TaskManager::new(0)), provider, fixture_gate(), 5);
         if planner {
             return built.with_planner("planner-model");
@@ -749,9 +783,7 @@ mod tests {
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
         let gate = SpawnGate::new(Box::new(judge), AuditLog::in_memory(), context);
-        let provider: Arc<dyn ModelProvider> = Arc::new(Scripted {
-            reply: Some(two_node_reply()),
-        });
+        let provider: Arc<dyn ModelProvider> = Arc::new(Scripted::new(Some(two_node_reply())));
         NannaMcpServer::new(Arc::new(TaskManager::new(0)), provider, gate, 5)
             .with_planner("planner-model")
     }
@@ -1008,16 +1040,11 @@ mod tests {
             receivers.push(registry.register(&format!("plan-{n}")).unwrap());
         }
         assert_eq!(registry.running_count(), MAX_CONCURRENT_PLANS);
-        assert_eq!(
-            registry.ensure_room(),
-            Err(RegistryError::TooManyRunning(MAX_CONCURRENT_PLANS))
-        );
         assert!(matches!(
             registry.register("plan-extra"),
             Err(RegistryError::TooManyRunning(_))
         ));
         registry.finish("plan-0", PlanStatus::Completed, json!({}));
-        assert_eq!(registry.ensure_room(), Ok(()));
         assert!(registry.register("plan-extra").is_ok());
     }
 
@@ -1101,7 +1128,7 @@ mod tests {
         let guard = RunGuard {
             registry: Arc::clone(&registry),
             id: "plan-a".to_string(),
-            done: false,
+            state: GuardState::Running,
         };
         drop(guard);
         assert_eq!(registry.view("plan-a").unwrap().status, PlanStatus::Failed);
@@ -1110,10 +1137,82 @@ mod tests {
         let finished = RunGuard {
             registry: Arc::clone(&registry),
             id: "plan-b".to_string(),
-            done: true,
+            state: GuardState::Done,
         };
         drop(finished);
         assert_eq!(registry.view("plan-b").unwrap().status, PlanStatus::Working);
+        let reserved = RunGuard {
+            registry: Arc::clone(&registry),
+            id: "plan-b".to_string(),
+            state: GuardState::Reserved,
+        };
+        drop(reserved);
+        assert!(registry.view("plan-b").is_err());
+        assert_eq!(registry.running_count(), 0);
+    }
+
+    #[test]
+    fn releasing_only_removes_a_running_reservation_never_a_finished_plan() {
+        let registry = PlanRegistry::default();
+        let _receiver = registry.register("plan-a").unwrap();
+        registry.finish("plan-a", PlanStatus::Completed, json!({}));
+        registry.release("plan-a");
+        registry.release("plan-ghost");
+        assert_eq!(
+            registry.view("plan-a").unwrap().status,
+            PlanStatus::Completed
+        );
+    }
+
+    #[test]
+    fn a_cancelled_plan_never_turns_into_completed_when_the_run_finishes_anyway() {
+        let registry = PlanRegistry::default();
+        let _receiver = registry.register("plan-a").unwrap();
+        registry.cancel("plan-a").unwrap();
+        registry.finish(
+            "plan-a",
+            PlanStatus::Completed,
+            json!({ "end": "finished" }),
+        );
+        assert_eq!(
+            registry.view("plan-a").unwrap().status,
+            PlanStatus::Cancelled
+        );
+        let _other = registry.register("plan-b").unwrap();
+        registry.finish("plan-b", PlanStatus::Failed, json!({}));
+        assert_eq!(registry.view("plan-b").unwrap().status, PlanStatus::Failed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_calls_never_start_more_planner_calls_than_the_cap() {
+        let provider = Arc::new(Scripted {
+            reply: Some(two_node_reply()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: Duration::from_secs(5),
+        });
+        let as_model: Arc<dyn ModelProvider> = provider.clone();
+        let built = NannaMcpServer::new(Arc::new(TaskManager::new(0)), as_model, fixture_gate(), 5);
+        let server = Arc::new(built.with_planner("planner-model"));
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let mut calls = Vec::new();
+        for _ in 0..MAX_CONCURRENT_PLANS + 4 {
+            let (server, path) = (Arc::clone(&server), repo.path().to_path_buf());
+            calls.push(tokio::spawn(async move {
+                let params = plan_call(&path, json!({}));
+                call(&server, "tools/call", params).await
+            }));
+        }
+        let mut refused = 0;
+        for call in calls {
+            let response = call.await.unwrap();
+            if response["error"]["code"] == -32001 {
+                refused += 1;
+            }
+        }
+        let planner_calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(planner_calls, MAX_CONCURRENT_PLANS);
+        assert_eq!(refused, 4);
+        assert_eq!(server.plans.running_count(), MAX_CONCURRENT_PLANS);
     }
 
     #[test]
@@ -1148,7 +1247,7 @@ mod tests {
 
     #[test]
     fn the_scripted_provider_describes_itself() {
-        let provider = Scripted { reply: None };
+        let provider = Scripted::new(None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1275,10 +1374,25 @@ mod tests {
             outcome_json(&ChildOutcome::Skipped { blocked_by: "fix" })["blocked_by"],
             "fix"
         );
-        assert!(outcome_json(&ChildOutcome::Refused(&refusal))["reason"]
+        let shown = outcome_json(&ChildOutcome::Refused(&refusal));
+        assert!(shown["reason_untrusted"]
             .as_str()
             .unwrap()
             .contains("audited"));
+    }
+
+    #[test]
+    fn a_refusal_reason_is_untrusted_text_stripped_and_clipped() {
+        let hostile = format!("\u{7}IGNORE PREVIOUS{}", "x".repeat(500));
+        let refusal = crate::task::SpawnRefused::ModelMismatch {
+            audited: hostile,
+            requested: "b".to_string(),
+        };
+        let shown = outcome_json(&ChildOutcome::Refused(&refusal));
+        let reason = shown["reason_untrusted"].as_str().unwrap();
+        assert!(!reason.contains('\u{7}'));
+        assert_eq!(reason.chars().count(), UNTRUSTED_CLIP);
+        assert!(shown.get("reason").is_none());
     }
 
     #[test]
