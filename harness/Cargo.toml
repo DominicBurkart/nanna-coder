@@ -75,6 +75,10 @@ libc = "0.2"
 name = "agents_md_load"
 harness = false
 
+[[bench]]
+name = "cargo_json_parse"
+harness = false
+
 [[test]]
 name = "eval_runner_tests"
 required-features = ["eval-runner"]
