@@ -244,3 +244,85 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_eq!(ordinary["success"], true, "{ordinary}");
     assert_eq!(registry.denial_count(), 0);
 }
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_declared_path_unseen(
+) {
+    if !detect_runtime().is_available() {
+        eprintln!("SKIPPED: no container runtime available");
+        return;
+    }
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    let workspace = host.path().join("worktree");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    git(&source, &["init", "-q"]);
+    git(&source, &["config", "user.email", "t@t.com"]);
+    git(&source, &["config", "user.name", "T"]);
+    git(&source, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(source.join("src/gate.rs"), "original\n").unwrap();
+    std::fs::write(source.join("src/other.rs"), "other\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "init"]);
+    git(
+        &source,
+        &["worktree", "add", "-q", workspace.to_str().unwrap(), "HEAD"],
+    );
+
+    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\"]").unwrap();
+    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
+    let shielded = protected_mounts(&protected, &workspace).unwrap();
+    let handle = start(&workspace, shielded.mounts).await;
+    let registry = support::allow_gated(create_container_tool_registry(
+        &workspace,
+        handle,
+        CONTAINER_WORKSPACE_DIR,
+    ));
+
+    let moved = run(&registry, "mv /workspace/src /workspace/moved").await;
+    let recreated = run(
+        &registry,
+        "mkdir -p /workspace/src && echo evil > /workspace/src/gate.rs",
+    )
+    .await;
+    let overwritten = run(&registry, "echo evil > /workspace/src/gate.rs").await;
+    eprintln!("mv parent: {moved}\nrecreate: {recreated}\noverwrite: {overwritten}");
+
+    let status = git_out(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "-z"],
+    );
+    let changed: Vec<&str> = status
+        .split('\0')
+        .filter(|entry| entry.len() > 3)
+        .map(|entry| &entry[3..])
+        .collect();
+    let gate_on_host = std::fs::read_to_string(workspace.join("src/gate.rs")).ok();
+    if gate_on_host.as_deref() != Some("original\n") {
+        assert!(
+            changed.contains(&"src/gate.rs"),
+            "declared file changed but git does not report it: {changed:?}"
+        );
+        let violation = protected.check(Path::new("src/gate.rs")).unwrap_err();
+        assert_eq!(violation.rule, "src/gate.rs");
+    }
+    if moved["success"] == true {
+        assert!(
+            changed.contains(&"src/gate.rs"),
+            "parent moved but the declared path is not reported: {changed:?}"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(workspace.join("src/other.rs")).is_ok() || moved["success"] == true
+    );
+}

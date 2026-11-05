@@ -2342,6 +2342,23 @@ mod tests {
     }
 
     #[test]
+    fn test_a_nested_config_directory_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-nested-nanna"), "HEAD").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join("crates/api/.nanna/agents")).unwrap();
+        std::fs::write(
+            ws.workspace_path.join("crates/api/.nanna/agents/x.toml"),
+            "[identity]",
+        )
+        .unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, "**/.nanna/**");
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
     fn test_repo_declared_directories_are_refused_when_a_patch_is_extracted() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
@@ -2454,6 +2471,90 @@ mod tests {
             );
         }
         ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_workspace_identity_registries_hand_the_declared_set_to_commit_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        for container in [false, true] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            let bare = TempDir::new().unwrap();
+            git_cmd(bare.path())
+                .args(["init", "--bare", "-q"])
+                .output()
+                .unwrap();
+            for args in [
+                vec!["branch", "-M", "main"],
+                vec!["remote", "add", "origin", bare.path().to_str().unwrap()],
+                vec!["push", "-q", "origin", "main"],
+                vec![
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            ] {
+                let out = git_cmd(source.path()).args(&args).output().unwrap();
+                assert!(out.status.success(), "{args:?}");
+            }
+            declare(source.path(), "extra = [\"ci/**\"]\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-git"), "HEAD").unwrap();
+            git_cmd(&ws.workspace_path)
+                .args(["checkout", "-q", "-b", "feature-ws"])
+                .output()
+                .unwrap();
+            if container {
+                ws.container_handle = Some(Arc::new(ContainerHandle {
+                    name: "test-handle".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                }));
+            }
+            let mut identity = workspace_identity(EffectClass::Repository);
+            identity.scope.tools = vec![
+                "git_commit".parse().unwrap(),
+                "git_push_branch".parse().unwrap(),
+            ];
+            let registry = ws.build_tool_registry_for(&identity).unwrap();
+            std::fs::create_dir_all(ws.workspace_path.join("ci")).unwrap();
+            std::fs::write(ws.workspace_path.join("ci/deploy.sh"), "x").unwrap();
+            std::fs::write(ws.workspace_path.join("ok.txt"), "ok").unwrap();
+            let commit = registry.get_tool("git_commit").expect("git_commit granted");
+            let result = commit
+                .execute(serde_json::json!({ "subject": "x" }))
+                .await
+                .unwrap();
+            assert_eq!(
+                result["skipped_protected"],
+                serde_json::json!(["ci/deploy.sh"])
+            );
+            git_cmd(&ws.workspace_path)
+                .args(["add", "ci/deploy.sh"])
+                .output()
+                .unwrap();
+            git_cmd(&ws.workspace_path)
+                .args([
+                    "commit",
+                    "-q",
+                    "-m",
+                    "d\n\nNanna-Identity: rust-implementer",
+                ])
+                .output()
+                .unwrap();
+            let push = registry
+                .get_tool("git_push_branch")
+                .expect("git_push_branch granted");
+            let err = push.execute(serde_json::json!({})).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("changes protected path 'ci/deploy.sh'"),
+                "container={container}: {err}"
+            );
+            ws.cleanup().unwrap();
+        }
     }
 
     #[tokio::test]

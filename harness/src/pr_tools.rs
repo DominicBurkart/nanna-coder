@@ -4945,6 +4945,72 @@ mod tests {
         );
     }
 
+    async fn assert_registry_commit_and_push_honour_the_declared_set(
+        registry: ToolRegistry,
+        work: &Path,
+    ) {
+        std::fs::create_dir_all(work.join("ci")).unwrap();
+        std::fs::write(work.join("ci/deploy.sh"), "x").unwrap();
+        std::fs::write(work.join("ok.txt"), "ok").unwrap();
+        let commit = registry.get_tool("git_commit").expect("git_commit granted");
+        let result = commit.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["skipped_protected"], json!(["ci/deploy.sh"]));
+        git(work, &["add", "ci/deploy.sh"]);
+        git(
+            work,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "d\n\nNanna-Identity: rust-implementer",
+            ],
+        );
+        let push = registry
+            .get_tool("git_push_branch")
+            .expect("git_push_branch granted");
+        let err = push.execute(json!({})).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changes protected path 'ci/deploy.sh'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_registries_built_with_a_declared_set_hand_it_to_commit_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        let identity = granted_identity();
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-g1"]);
+        let registry = crate::tools::create_tool_registry_for_guarded(
+            fixture.work.path(),
+            &identity,
+            declared_extras(),
+        )
+        .unwrap();
+        assert_registry_commit_and_push_honour_the_declared_set(registry, fixture.work.path())
+            .await;
+
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-g2"]);
+        let handle = Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let registry = crate::tools::create_container_tool_registry_for_guarded(
+            fixture.work.path(),
+            handle,
+            "/workspace",
+            &identity,
+            declared_extras(),
+        )
+        .unwrap();
+        assert_registry_commit_and_push_honour_the_declared_set(registry, fixture.work.path())
+            .await;
+    }
+
     #[tokio::test]
     async fn push_allows_the_same_commit_when_nothing_is_declared() {
         let fixture = push_fixture();
