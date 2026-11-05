@@ -218,7 +218,18 @@ fn the_scanner_sees_macro_bodies_and_skips_test_code() {
         fn entry() { println!("{}", audit_plan(a)); }
         #[cfg(test)]
         mod tests { fn t() { audit_plan(b); } }
+        #[cfg(test)]
+        fn only_in_tests() { audit_plan(c); }
+        struct S;
+        impl S {
+            #[cfg(test)]
+            fn only_in_tests_too(&self) { audit_plan(d); }
+            fn kept(&self) { audit_plan(e); }
+        }
     "#;
     let scan = scan_source("x.rs", source);
-    assert_eq!(scan.uses["audit_plan"], expected(&["x.rs: entry"]));
+    assert_eq!(
+        scan.uses["audit_plan"],
+        expected(&["x.rs: entry", "x.rs: kept"])
+    );
 }

@@ -1209,4 +1209,90 @@ mod tests {
         let small = summary_json(&PlanSummary::default());
         assert_eq!(small["files_truncated"], false);
     }
+
+    fn finished_result() -> crate::task::TaskResult {
+        crate::task::TaskResult {
+            result_summary: "done".to_string(),
+            changes_patch: None,
+            format_patch: None,
+            files_modified: vec![],
+            tool_calls_made: vec![],
+            denials: vec![],
+            action_audit: vec![],
+            iterations: 1,
+            model_used: "mock".to_string(),
+            blast_radius: None,
+            qa_summary: Default::default(),
+            budget: Default::default(),
+        }
+    }
+
+    #[test]
+    fn every_child_outcome_has_a_stable_json_form() {
+        let task = crate::task::TaskId("t-1".to_string());
+        let result = finished_result();
+        let refusal = crate::task::SpawnRefused::ModelMismatch {
+            audited: "a".to_string(),
+            requested: "b".to_string(),
+        };
+        let cases = [
+            (ChildOutcome::Waiting, "waiting"),
+            (ChildOutcome::Starting, "starting"),
+            (ChildOutcome::Abandoned, "abandoned"),
+            (ChildOutcome::Running(&task), "running"),
+            (
+                ChildOutcome::Completed {
+                    task: &task,
+                    result: &result,
+                },
+                "completed",
+            ),
+            (
+                ChildOutcome::Failed {
+                    task: &task,
+                    error: "boom\nline",
+                },
+                "failed",
+            ),
+            (ChildOutcome::Cancelled(&task), "cancelled"),
+            (ChildOutcome::Refused(&refusal), "refused"),
+            (ChildOutcome::Lost(&task), "lost"),
+            (ChildOutcome::Skipped { blocked_by: "fix" }, "skipped"),
+        ];
+        for (outcome, state) in cases {
+            assert_eq!(outcome_json(&outcome)["state"], state);
+        }
+        let failed = ChildOutcome::Failed {
+            task: &task,
+            error: "boom\nline",
+        };
+        assert_eq!(outcome_json(&failed)["error_untrusted"], "boomline");
+        assert_eq!(
+            outcome_json(&ChildOutcome::Running(&task))["task_id"],
+            "t-1"
+        );
+        assert_eq!(
+            outcome_json(&ChildOutcome::Skipped { blocked_by: "fix" })["blocked_by"],
+            "fix"
+        );
+        assert!(outcome_json(&ChildOutcome::Refused(&refusal))["reason"]
+            .as_str()
+            .unwrap()
+            .contains("audited"));
+    }
+
+    #[test]
+    fn a_poisoned_registry_lock_is_recovered_not_propagated() {
+        let registry = Arc::new(PlanRegistry::default());
+        let _receiver = registry.register("plan-a").unwrap();
+        let shared = Arc::clone(&registry);
+        let crashed = std::thread::spawn(move || {
+            let _held = shared.inner.lock().unwrap();
+            panic!("poison the registry lock");
+        })
+        .join();
+        assert!(crashed.is_err());
+        assert_eq!(registry.view("plan-a").unwrap().status, PlanStatus::Working);
+        assert!(registry.register("plan-b").is_ok());
+    }
 }
