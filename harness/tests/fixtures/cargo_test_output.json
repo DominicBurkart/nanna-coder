@@ -1,0 +1,7 @@
+{"type":"suite","event":"started","test_count":3}
+{"type":"test","event":"started","name":"math::tests::adds_two_numbers"}
+{"type":"test","event":"ok","name":"math::tests::adds_two_numbers","exec_time":0.012}
+{"type":"test","event":"started","name":"math::tests::subtracts_numbers"}
+{"type":"test","event":"failed","name":"math::tests::subtracts_numbers","exec_time":0.034,"stdout":"thread 'math::tests::subtracts_numbers' panicked at 'assertion `left == right` failed'"}
+{"type":"test","event":"ignored","name":"math::tests::slow_integration"}
+{"type":"suite","event":"ok","passed":1,"failed":1,"ignored":1,"exec_time":0.046}

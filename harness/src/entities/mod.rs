@@ -105,6 +105,9 @@ pub enum EntityType {
     /// Test/Analysis entity
     Test,
 
+    /// Lint/static-analysis result entity
+    Lint,
+
     /// Environment/Deployment entity
     Env,
 
@@ -793,6 +796,7 @@ mod tests {
             EntityType::Git
             | EntityType::Ast
             | EntityType::Test
+            | EntityType::Lint
             | EntityType::Env
             | EntityType::Context
             | EntityType::Telemetry => {}
@@ -801,6 +805,7 @@ mod tests {
             EntityType::Git,
             EntityType::Ast,
             EntityType::Test,
+            EntityType::Lint,
             EntityType::Env,
             EntityType::Context,
             EntityType::Telemetry,
