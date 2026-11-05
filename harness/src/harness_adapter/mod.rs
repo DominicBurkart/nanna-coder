@@ -62,6 +62,8 @@
 //! # }
 //! ```
 
+mod bind;
+mod broker;
 mod checked;
 mod isolation;
 mod pi;
@@ -71,6 +73,12 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use bind::{BindError, BoundWorkspace};
+pub use broker::{
+    ArmError, ArmedBroker, AuditOutcome, AuditSink, Broker, BrokerError, BrokerOutcome,
+    BrokerPolicy, BrokerRequest, BrokerResponse, CallRecord, HaltReason, RingAuditSink,
+    ToolErrorKind, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES,
+};
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
@@ -127,11 +135,23 @@ impl Endpoint {
     }
 
     /// The host name or address.
+    ///
+    /// ```
+    /// use harness::harness_adapter::Endpoint;
+    ///
+    /// assert_eq!(Endpoint::new("gw.local", 80).unwrap().host(), "gw.local");
+    /// ```
     pub fn host(&self) -> &str {
         &self.host
     }
 
     /// The TCP port.
+    ///
+    /// ```
+    /// use harness::harness_adapter::Endpoint;
+    ///
+    /// assert_eq!(Endpoint::new("gw.local", 80).unwrap().port(), 80);
+    /// ```
     pub fn port(&self) -> u16 {
         self.port
     }
@@ -183,6 +203,18 @@ fn host_is_ambient(host: &str) -> bool {
 
 /// One capability an agent may call: a tool nanna runs on its behalf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// ```
+/// use harness::effects::EffectClass;
+/// use harness::harness_adapter::CapabilitySpec;
+///
+/// let spec = CapabilitySpec {
+///     name: "read_file".into(),
+///     description: "Read a file.".into(),
+///     parameters: serde_json::json!({"type": "object"}),
+///     effect: EffectClass::None,
+/// };
+/// assert_eq!(spec.effect, EffectClass::None);
+/// ```
 pub struct CapabilitySpec {
     /// Tool name, as in identity `scope.tools` patterns.
     pub name: String,
@@ -229,6 +261,33 @@ impl CapabilitySpec {
 /// example from `create_tool_registry_for`): `scoped_for` filters tool names
 /// but does not attach path restrictions to file tools.
 #[derive(Debug, Clone, PartialEq)]
+/// ```
+/// use harness::harness_adapter::ScopedCapabilities;
+/// use harness::identity::AgentIdentity;
+/// use harness::tools::create_tool_registry;
+///
+/// let toml = r#"
+/// [identity]
+/// name = "a"
+/// description = "d"
+/// loop = "inner"
+/// model = "m"
+/// system_prompt = { inline = "p" }
+/// [scope]
+/// repos = ["r"]
+/// paths = ["**"]
+/// max_effect = "none"
+/// tools = ["read_file"]
+/// [limits]
+/// max_iterations = 1
+/// max_wall_clock_secs = 1
+/// max_concurrent = 1
+/// "#;
+/// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+/// let grant = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+/// assert_eq!(grant.identity(), "a");
+/// assert_eq!(grant.specs().len(), 1);
+/// ```
 pub struct ScopedCapabilities {
     identity: String,
     scope: ScopeSection,
@@ -238,6 +297,33 @@ pub struct ScopedCapabilities {
 impl ScopedCapabilities {
     /// Scope `base` to `identity` with [`ToolRegistry::scoped_for`] and
     /// describe what remains, sorted by name.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ScopedCapabilities;
+    /// use harness::identity::AgentIdentity;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "a"
+    /// description = "d"
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "p" }
+    /// [scope]
+    /// repos = ["r"]
+    /// paths = ["**"]
+    /// max_effect = "none"
+    /// tools = ["read_file"]
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+    /// let grant = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+    /// assert_eq!(grant.specs()[0].name, "read_file");
+    /// ```
     pub fn scope(base: ToolRegistry, identity: &AgentIdentity) -> Self {
         let registry = base.scoped_for(identity);
         let mut specs: Vec<CapabilitySpec> = registry
@@ -263,11 +349,65 @@ impl ScopedCapabilities {
     }
 
     /// Name of the identity the capabilities were scoped by.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ScopedCapabilities;
+    /// use harness::identity::AgentIdentity;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "a"
+    /// description = "d"
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "p" }
+    /// [scope]
+    /// repos = ["r"]
+    /// paths = ["**"]
+    /// max_effect = "none"
+    /// tools = ["read_file"]
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+    /// let grant = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+    /// assert_eq!(grant.identity(), identity.name());
+    /// ```
     pub fn identity(&self) -> &str {
         &self.identity
     }
 
     /// The scoped capabilities, sorted by name.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ScopedCapabilities;
+    /// use harness::identity::AgentIdentity;
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// let toml = r#"
+    /// [identity]
+    /// name = "a"
+    /// description = "d"
+    /// loop = "inner"
+    /// model = "m"
+    /// system_prompt = { inline = "p" }
+    /// [scope]
+    /// repos = ["r"]
+    /// paths = ["**"]
+    /// max_effect = "none"
+    /// tools = ["read_file"]
+    /// [limits]
+    /// max_iterations = 1
+    /// max_wall_clock_secs = 1
+    /// max_concurrent = 1
+    /// "#;
+    /// let identity = AgentIdentity::from_toml_str(toml, "a.toml").unwrap();
+    /// let grant = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), &identity);
+    /// assert!(grant.specs().windows(2).all(|w| w[0].name <= w[1].name));
+    /// ```
     pub fn specs(&self) -> &[CapabilitySpec] {
         &self.specs
     }
@@ -275,6 +415,14 @@ impl ScopedCapabilities {
 
 /// Failures resolving an audited spawn into a [`ResolvedAgent`].
 #[derive(Debug, Error)]
+/// ```
+/// use harness::harness_adapter::ResolveError;
+///
+/// let error = ResolveError::InvalidModel { model: "-x".into() };
+/// assert_eq!(error.to_string(), "invalid model name `-x`");
+/// let error = ResolveError::InvalidBrokerSocket { path: "/etc".into() };
+/// assert_eq!(error.to_string(), "invalid broker socket path `/etc`");
+/// ```
 pub enum ResolveError {
     /// The capabilities were scoped by an identity whose name or scope differs
     /// from the one being resolved.
@@ -365,6 +513,17 @@ fn broker_socket_is_valid(path: &str) -> bool {
 /// What an identity may touch, carried so that whatever enforces it cannot
 /// be handed a plan that forgot it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ```
+/// use harness::harness_adapter::ScopeGrant;
+///
+/// let scope = ScopeGrant {
+///     repos: vec!["r".into()],
+///     paths: vec!["**".into()],
+///     read_paths: None,
+///     tools: vec!["read_file".into()],
+/// };
+/// assert_eq!(scope.tools, vec!["read_file"]);
+/// ```
 pub struct ScopeGrant {
     /// Repositories the agent may be spawned against.
     pub repos: Vec<String>,
@@ -372,12 +531,21 @@ pub struct ScopeGrant {
     pub paths: Vec<String>,
     /// Readable globs; `None` leaves reads unrestricted inside the worktree.
     pub read_paths: Option<Vec<String>>,
+    /// The identity's tool-name patterns.
+    pub tools: Vec<String>,
 }
 
 /// An audited spawn bound to a task: everything a runtime needs, already
 /// narrowed to what the identity's scope permits. Fields are private and can
 /// only come from [`ResolvedAgent::resolve`].
 #[derive(Debug, Clone, PartialEq)]
+/// ```
+/// use harness::harness_adapter::ResolvedAgent;
+///
+/// fn describe(agent: &ResolvedAgent) -> String {
+///     format!("{} on {}", agent.name(), agent.model())
+/// }
+/// ```
 pub struct ResolvedAgent {
     name: String,
     system_prompt: String,
@@ -404,6 +572,51 @@ impl ResolvedAgent {
     /// filter, only an assertion that nothing in it exceeds the identity's
     /// tool patterns, effect ceiling, or (for a path-restricted identity) the
     /// tools that cannot honour path scope.
+    ///
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use harness::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    /// use harness::effects::EffectClass;
+    /// use harness::harness_adapter::{Endpoint, ResolvedAgent, ScopedCapabilities};
+    /// use harness::identity::{DevLoop, IdentityCatalog};
+    /// use harness::tools::create_tool_registry;
+    ///
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let card = |name: &str, tools: &str| format!(
+    /// #     "[identity]\nname = \"{name}\"\ndescription = \"d\"\nloop = \"inner\"\nmodel = \"m\"\n\
+    /// #      system_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = []\npaths = [\"**\"]\n\
+    /// #      max_effect = \"none\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 1\n\
+    /// #      max_wall_clock_secs = 1\nmax_concurrent = 1\n"
+    /// # );
+    /// # std::fs::write(dir.path().join("reader.toml"), card("reader", "\"read_file\"")).unwrap();
+    /// # std::fs::write(dir.path().join("auditor.toml"), card("auditor", "")).unwrap();
+    /// # let catalog = IdentityCatalog::load(dir.path()).unwrap();
+    /// # let context = AuditContext::new(catalog.clone(), catalog.get("auditor").unwrap().clone()).unwrap();
+    /// # let request = SpawnRequest {
+    /// #     parent_task: TaskSummary::new("t1", "Read code", "github.com/example/repo"),
+    /// #     identity: "reader".to_string(),
+    /// #     subtask: "Summarise src/lib.rs.".to_string(),
+    /// #     dev_loop: DevLoop::Inner,
+    /// #     requested_effect: EffectClass::None,
+    /// # };
+    /// # let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+    /// let allowed = gate.check(request, &context).await.unwrap();
+    /// let scoped = ScopedCapabilities::scope(create_tool_registry(std::path::Path::new(".")), allowed.identity());
+    /// let agent = ResolvedAgent::resolve(
+    ///     &allowed,
+    ///     &scoped,
+    ///     Endpoint::new("model-gateway", 11434).unwrap(),
+    ///     "nanna-agent:pi",
+    ///     "/run/nanna/broker.sock".into(),
+    /// )
+    /// .unwrap();
+    /// assert_eq!(agent.name(), "reader");
+    /// assert_eq!(agent.task_prompt(), "Summarise src/lib.rs.");
+    /// assert_eq!(agent.audited_repo(), "github.com/example/repo");
+    /// assert_eq!(agent.capability_names(), vec!["read_file"]);
+    /// # }
+    /// ```
     pub fn resolve(
         allowed: &Allowed,
         scoped: &ScopedCapabilities,
@@ -455,6 +668,12 @@ impl ResolvedAgent {
                 repos: identity.scope.repos.clone(),
                 paths: identity.scope.paths.clone(),
                 read_paths: identity.scope.read_paths.clone(),
+                tools: identity
+                    .scope
+                    .tools
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
             },
             image,
             broker_socket,
@@ -463,67 +682,171 @@ impl ResolvedAgent {
     }
 
     /// Identity name.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.name();
+    /// }
+    /// ```
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// System prompt text.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.system_prompt();
+    /// }
+    /// ```
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
 
     /// The task the agent is asked to perform: the subtask the auditor saw.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.task_prompt();
+    /// }
+    /// ```
     pub fn task_prompt(&self) -> &str {
         &self.task_prompt
     }
 
     /// The repository label the auditor allowed this spawn against.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.audited_repo();
+    /// }
+    /// ```
     pub fn audited_repo(&self) -> &str {
         &self.audited_repo
     }
 
     /// Model identifier at the gateway.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.model();
+    /// }
+    /// ```
     pub fn model(&self) -> &str {
         &self.model
     }
 
     /// The only network endpoint the runtime may reach.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.endpoint();
+    /// }
+    /// ```
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
     /// Highest effect class any capability may reach.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.max_effect();
+    /// }
+    /// ```
     pub fn max_effect(&self) -> EffectClass {
         self.max_effect
     }
 
     /// Resource ceilings for the run.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.limits();
+    /// }
+    /// ```
     pub fn limits(&self) -> LimitsSection {
         self.limits
     }
 
     /// Path and repository scope the broker must enforce.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.scope();
+    /// }
+    /// ```
     pub fn scope(&self) -> &ScopeGrant {
         &self.scope
     }
 
     /// Container image the runtime starts from.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.image();
+    /// }
+    /// ```
     pub fn image(&self) -> &str {
         &self.image
     }
 
     /// Host path of the broker socket. The executor must also confirm it is a
     /// socket it created and owns before mounting it.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.broker_socket();
+    /// }
+    /// ```
     pub fn broker_socket(&self) -> &std::path::Path {
         &self.broker_socket
     }
 
     /// The capabilities granted, sorted by name.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.capabilities();
+    /// }
+    /// ```
     pub fn capabilities(&self) -> &[CapabilitySpec] {
         &self.capabilities
     }
 
     /// Names of the granted capabilities, sorted.
+    ///
+    /// ```
+    /// use harness::harness_adapter::ResolvedAgent;
+    ///
+    /// fn read(agent: &ResolvedAgent) {
+    ///     let _ = agent.capability_names();
+    /// }
+    /// ```
     pub fn capability_names(&self) -> Vec<&str> {
         self.capabilities.iter().map(|c| c.name.as_str()).collect()
     }
@@ -531,6 +854,12 @@ impl ResolvedAgent {
 
 /// A file written into the container before the runtime starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ```
+/// use harness::harness_adapter::PlanFile;
+///
+/// let file = PlanFile { path: "/nanna/pi/SYSTEM.md".into(), contents: "p".into() };
+/// assert_eq!(file.path.to_str(), Some("/nanna/pi/SYSTEM.md"));
+/// ```
 pub struct PlanFile {
     /// Absolute path inside the container, under `/nanna/`.
     pub path: PathBuf,
@@ -542,7 +871,18 @@ pub struct PlanFile {
 /// widen the sandbox: privileges, Linux capabilities, devices and any mount
 /// other than the broker socket are not expressible here.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ```
+/// use harness::harness_adapter::LaunchPlan;
+///
+/// fn first_argument(plan: &LaunchPlan) -> Option<&String> {
+///     plan.argv.first()
+/// }
+/// ```
 pub struct LaunchPlan {
+    /// Name of the agent the plan was built for.
+    pub agent: String,
+    /// Model name the runtime is told to use.
+    pub model: String,
     /// Container image.
     pub image: String,
     /// Files to place in the container.
@@ -574,6 +914,12 @@ pub struct LaunchPlan {
 /// The runtime reported a tool set that differs from the granted one.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("runtime tools differ from the plan: unexpected {unexpected:?}, missing {missing:?}")]
+/// ```
+/// use harness::harness_adapter::HandshakeMismatch;
+///
+/// let mismatch = HandshakeMismatch { unexpected: vec!["bash".into()], missing: vec![] };
+/// assert!(mismatch.to_string().contains("bash"));
+/// ```
 pub struct HandshakeMismatch {
     /// Tools the runtime has that the plan did not grant.
     pub unexpected: Vec<String>,
@@ -587,6 +933,14 @@ pub struct HandshakeMismatch {
 /// appears only in the first system `message_start` event (`toolsAdded`),
 /// emitted after a prompt is sent, so the broker must refuse every call until
 /// this check has passed.
+///
+/// ```
+/// use harness::harness_adapter::{verify_runtime_tools, CheckedPlan, HandshakeMismatch};
+///
+/// fn check(plan: &CheckedPlan, reported: &[String]) -> Result<(), HandshakeMismatch> {
+///     verify_runtime_tools(plan, reported)
+/// }
+/// ```
 pub fn verify_runtime_tools(
     plan: &CheckedPlan,
     reported: &[String],
@@ -608,6 +962,12 @@ pub fn verify_runtime_tools(
 /// An agent definition a runtime cannot honour. Adapters fail closed with
 /// this instead of dropping a constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// ```
+/// use harness::harness_adapter::Unsupported;
+///
+/// let error = Unsupported::NoCapabilities { agent: "a".into() };
+/// assert_eq!(error.to_string(), "agent `a` has no capabilities");
+/// ```
 pub enum Unsupported {
     /// The agent has no capabilities, so there is nothing for it to do.
     #[error("agent `{agent}` has no capabilities")]
