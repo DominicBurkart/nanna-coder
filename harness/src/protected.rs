@@ -66,6 +66,10 @@ const RECURSIVE_SUFFIX: &str = "/**";
 
 pub const EXTRAS_FILE: &str = ".nanna/protected.toml";
 
+pub const MAX_EXTRAS_BYTES: usize = 64 * 1024;
+
+pub const MAX_EXTRAS_ENTRIES: usize = 256;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtectedConfigError {
     #[error("`{EXTRAS_FILE}` is unreadable: {0}")]
@@ -74,6 +78,12 @@ pub enum ProtectedConfigError {
     Malformed(String),
     #[error("`{EXTRAS_FILE}` declares the invalid pattern `{pattern}`: {reason}")]
     InvalidPattern { pattern: String, reason: String },
+    #[error("`{EXTRAS_FILE}` is larger than {MAX_EXTRAS_BYTES} bytes")]
+    TooLarge,
+    #[error(
+        "`{EXTRAS_FILE}` declares {count} patterns, more than the {MAX_EXTRAS_ENTRIES} allowed"
+    )]
+    TooManyEntries { count: usize },
 }
 
 /// Extra protected globs a repository declares in `.nanna/protected.toml`.
@@ -139,8 +149,16 @@ fn validate_extra(pattern: &str) -> Result<(), ProtectedConfigError> {
 
 impl ProtectedExtras {
     pub fn parse(text: &str) -> Result<Self, ProtectedConfigError> {
+        if text.len() > MAX_EXTRAS_BYTES {
+            return Err(ProtectedConfigError::TooLarge);
+        }
         let file: ExtrasFile =
             toml::from_str(text).map_err(|e| ProtectedConfigError::Malformed(e.to_string()))?;
+        if file.extra.len() > MAX_EXTRAS_ENTRIES {
+            return Err(ProtectedConfigError::TooManyEntries {
+                count: file.extra.len(),
+            });
+        }
         file.extra
             .iter()
             .try_for_each(|pattern| validate_extra(pattern))?;
@@ -159,7 +177,15 @@ impl ProtectedExtras {
             Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
             Ok(_) => {}
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| unreadable(&e))?;
+        let mut text = String::new();
+        std::fs::File::open(&path)
+            .and_then(|file| {
+                std::io::Read::read_to_string(
+                    &mut std::io::Read::take(file, MAX_EXTRAS_BYTES as u64 + 1),
+                    &mut text,
+                )
+            })
+            .map_err(|e| unreadable(&e))?;
         Self::parse(&text)
     }
 
@@ -1442,6 +1468,68 @@ mod tests {
             std::fs::write(&file, "x").unwrap();
             assert!(ProtectedExtras::absent(&file).is_err());
             assert!(ProtectedExtras::absent(dir.path()).is_ok());
+        }
+
+        fn padded_to(len: usize) -> String {
+            let head = "extra = [\"src/gate.rs\"]\n";
+            format!("{head}{}", "\n".repeat(len - head.len()))
+        }
+
+        fn with_entries(count: usize) -> String {
+            let entries: Vec<String> = (0..count).map(|i| format!("\"p{i}\"")).collect();
+            format!("extra = [{}]", entries.join(", "))
+        }
+
+        #[test]
+        fn a_file_of_exactly_the_size_cap_loads_and_one_byte_more_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), padded_to(MAX_EXTRAS_BYTES).as_bytes());
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap().globs(),
+                ["src/gate.rs"]
+            );
+            write_declaration(dir.path(), padded_to(MAX_EXTRAS_BYTES + 1).as_bytes());
+            assert_eq!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::TooLarge)
+            );
+            assert!(ProtectedConfigError::TooLarge
+                .to_string()
+                .contains("65536 bytes"));
+        }
+
+        #[test]
+        fn text_over_the_size_cap_is_refused_by_parse_too() {
+            assert!(ProtectedExtras::parse(&padded_to(MAX_EXTRAS_BYTES)).is_ok());
+            assert_eq!(
+                ProtectedExtras::parse(&padded_to(MAX_EXTRAS_BYTES + 1)),
+                Err(ProtectedConfigError::TooLarge)
+            );
+        }
+
+        #[test]
+        fn a_file_far_over_the_size_cap_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), &vec![b'\n'; MAX_EXTRAS_BYTES * 4]);
+            assert_eq!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::TooLarge)
+            );
+        }
+
+        #[test]
+        fn exactly_the_entry_cap_is_accepted_and_one_more_is_refused() {
+            let at_cap = ProtectedExtras::parse(&with_entries(MAX_EXTRAS_ENTRIES)).unwrap();
+            assert_eq!(at_cap.globs().len(), MAX_EXTRAS_ENTRIES);
+            let err = ProtectedExtras::parse(&with_entries(MAX_EXTRAS_ENTRIES + 1)).unwrap_err();
+            assert_eq!(
+                err,
+                ProtectedConfigError::TooManyEntries {
+                    count: MAX_EXTRAS_ENTRIES + 1
+                }
+            );
+            assert!(err.to_string().contains("257 patterns"));
+            assert!(err.to_string().contains("256 allowed"));
         }
 
         #[test]
