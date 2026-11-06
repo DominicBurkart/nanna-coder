@@ -434,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ensure_pod_or_exit(no_ensure_pod).await;
             let provider = OllamaProvider::new(OllamaConfig::default())?;
             let workspace_root = std::env::current_dir()?;
-            let tool_registry = create_tool_registry(&workspace_root);
+            let tool_registry = registry_for_checkout(&workspace_root)?;
             let entity_store = initialize_workspace(&workspace_root).await;
 
             if let Some(initial_prompt) = prompt {
@@ -465,7 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Tools => {
             let workspace_root = std::env::current_dir()?;
-            let tool_registry = create_tool_registry(&workspace_root);
+            let tool_registry = registry_for_checkout(&workspace_root)?;
             list_tools(&tool_registry);
         }
         Commands::Agents {
@@ -976,8 +976,10 @@ fn generate_swebench_report(
     Ok((report_path, comparison_path))
 }
 
-fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    harness::tools::create_tool_registry(workspace_root)
+fn registry_for_checkout(
+    workspace_root: &std::path::Path,
+) -> Result<ToolRegistry, harness::protected::ProtectedConfigError> {
+    harness::tools::create_tool_registry_in_checkout(workspace_root)
 }
 
 async fn initialize_workspace(workspace_root: &std::path::Path) -> InMemoryEntityStore {
@@ -1554,7 +1556,7 @@ async fn run_agent(
     }
 
     let mut agent = if tools {
-        let tool_registry = create_tool_registry(workspace_root);
+        let tool_registry = registry_for_checkout(workspace_root)?;
         AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry)
     } else {
         AgentLoop::with_llm(agent_config, entity_store, provider)

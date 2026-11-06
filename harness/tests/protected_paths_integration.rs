@@ -21,7 +21,7 @@ use harness::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
     ReadOnlyMount,
 };
-use harness::protected::ProtectedPaths;
+use harness::protected::{ProtectedExtras, ProtectedPaths};
 use harness::tools::{create_container_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR};
 use harness::workspace::protected_mounts;
 use serde_json::{json, Value};
@@ -186,7 +186,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let gitlink = std::fs::read_to_string(workspace.join(".git")).unwrap();
     assert!(gitlink.starts_with("gitdir:"), "{gitlink}");
 
-    let protected = ProtectedPaths::with_config_dir(&workspace, None);
+    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\", \"tools/**\"]").unwrap();
+    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
     let shielded = protected_mounts(&protected, &workspace).unwrap();
 
     let handle = start(&workspace, shielded.mounts).await;
@@ -204,82 +205,11 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     assert_refused(&registry, "echo x > /workspace/.envrc").await;
     assert_refused(&registry, "echo x > /workspace/CLAUDE.md").await;
     assert_refused(&registry, "mkdir -p /workspace/nix/sub").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/container.rs").await;
-    assert_refused(&registry, "echo x > /workspace/scripts/install.sh").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/effects.rs").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/rollout/executor.rs",
-    )
-    .await;
-    assert_refused(&registry, "mkdir /workspace/harness/src/leases/sub").await;
-    assert_refused(&registry, "echo x > /workspace/auto-issue-pr.sh").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/pr_tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/docs/pr-lifecycle-tools.md").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/budget.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_tools.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_policy.rs").await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/ci_integrity.rs").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/deploy/template.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/sandbox_tools.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/spawn_gate_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/protected_audit_hook_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/escalation_sinks_structural.rs",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/identities/global/auditor.toml",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/identities/global/prompts/auditor.md",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/auditor.toml",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-    )
-    .await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/tests/planner_structural.rs",
-    )
-    .await;
-    assert_refused(&registry, "mkdir /workspace/tests/security/sub").await;
-    assert_refused(
-        &registry,
-        "echo x > /workspace/harness/src/action_auditor/gate.rs",
-    )
-    .await;
-    assert_refused(&registry, "echo x > /workspace/harness/src/identity/new.rs").await;
     assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
     assert_refused(&registry, "echo x > /workspace/windows.toml").await;
+    assert_refused(&registry, "echo x > /workspace/src/gate.rs").await;
+    assert_refused(&registry, "echo x > /workspace/tools/new.sh").await;
+    assert_refused(&registry, "mkdir /workspace/tools/sub").await;
     assert_blocked(&registry, "echo 'gitdir: /tmp/evil' > /workspace/.git").await;
     assert_blocked(&registry, "rm -f /workspace/.git").await;
     assert_blocked(&registry, "mkdir -p /workspace/.git/hooks").await;
@@ -300,29 +230,7 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
             .count(),
         0
     );
-    for placeholder in [
-        "codecov.yml",
-        "windows.toml",
-        ".envrc",
-        "CLAUDE.md",
-        "harness/src/tools.rs",
-        "harness/src/pr_tools.rs",
-        "docs/pr-lifecycle-tools.md",
-        "harness/src/budget.rs",
-        "harness/src/ci_tools.rs",
-        "harness/src/ci_policy.rs",
-        "harness/src/ci_integrity.rs",
-        "harness/src/deploy/template.rs",
-        "harness/src/sandbox_tools.rs",
-        "harness/tests/spawn_gate_structural.rs",
-        "harness/tests/protected_audit_hook_structural.rs",
-        "harness/tests/escalation_sinks_structural.rs",
-        "harness/tests/fixtures/identities/global/auditor.toml",
-        "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        "harness/tests/fixtures/one_track/catalog/auditor.toml",
-        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
-        "harness/tests/planner_structural.rs",
-    ] {
+    for placeholder in ["codecov.yml", "windows.toml", ".envrc", "CLAUDE.md"] {
         assert_eq!(
             std::fs::metadata(workspace.join(placeholder))
                 .unwrap()
@@ -335,4 +243,86 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let ordinary = run(&registry, "echo edited > /workspace/README.md").await;
     assert_eq!(ordinary["success"], true, "{ordinary}");
     assert_eq!(registry.denial_count(), 0);
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_declared_path_unseen(
+) {
+    if !detect_runtime().is_available() {
+        eprintln!("SKIPPED: no container runtime available");
+        return;
+    }
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    let workspace = host.path().join("worktree");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    git(&source, &["init", "-q"]);
+    git(&source, &["config", "user.email", "t@t.com"]);
+    git(&source, &["config", "user.name", "T"]);
+    git(&source, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(source.join("src/gate.rs"), "original\n").unwrap();
+    std::fs::write(source.join("src/other.rs"), "other\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "init"]);
+    git(
+        &source,
+        &["worktree", "add", "-q", workspace.to_str().unwrap(), "HEAD"],
+    );
+
+    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\"]").unwrap();
+    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
+    let shielded = protected_mounts(&protected, &workspace).unwrap();
+    let handle = start(&workspace, shielded.mounts).await;
+    let registry = support::allow_gated(create_container_tool_registry(
+        &workspace,
+        handle,
+        CONTAINER_WORKSPACE_DIR,
+    ));
+
+    let moved = run(&registry, "mv /workspace/src /workspace/moved").await;
+    let recreated = run(
+        &registry,
+        "mkdir -p /workspace/src && echo evil > /workspace/src/gate.rs",
+    )
+    .await;
+    let overwritten = run(&registry, "echo evil > /workspace/src/gate.rs").await;
+    eprintln!("mv parent: {moved}\nrecreate: {recreated}\noverwrite: {overwritten}");
+
+    let status = git_out(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "-z"],
+    );
+    let changed: Vec<&str> = status
+        .split('\0')
+        .filter(|entry| entry.len() > 3)
+        .map(|entry| &entry[3..])
+        .collect();
+    let gate_on_host = std::fs::read_to_string(workspace.join("src/gate.rs")).ok();
+    if gate_on_host.as_deref() != Some("original\n") {
+        assert!(
+            changed.contains(&"src/gate.rs"),
+            "declared file changed but git does not report it: {changed:?}"
+        );
+        let violation = protected.check(Path::new("src/gate.rs")).unwrap_err();
+        assert_eq!(violation.rule, "src/gate.rs");
+    }
+    if moved["success"] == true {
+        assert!(
+            changed.contains(&"src/gate.rs"),
+            "parent moved but the declared path is not reported: {changed:?}"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(workspace.join("src/other.rs")).is_ok() || moved["success"] == true
+    );
 }
