@@ -191,6 +191,14 @@ pub(super) mod tests {
             unreachable!("escalation delivery never reads pull request detail")
         }
 
+        async fn pull_requests_for_head(
+            &self,
+            _repo: &str,
+            _head: &str,
+        ) -> Result<Vec<crate::backlog::GithubPullRequestDetail>, BacklogError> {
+            unreachable!("escalation delivery never looks up pull requests by head")
+        }
+
         async fn mark_pull_request_ready(
             &self,
             _repo: &str,

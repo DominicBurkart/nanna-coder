@@ -210,6 +210,12 @@ pub trait GithubClient: Send + Sync {
         number: u64,
     ) -> Result<GithubPullRequestDetail, BacklogError>;
 
+    async fn pull_requests_for_head(
+        &self,
+        repo: &str,
+        head: &str,
+    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError>;
+
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
 
     async fn close_pull_request(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
@@ -476,6 +482,9 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn get_pull_request(&self, _: &str, _: u64) -> Result<GithubPullRequestDetail, BacklogError> {
 ///         unreachable!("ingestion never reads pull request detail")
+///     }
+///     async fn pull_requests_for_head(&self, _: &str, _: &str) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+///         unreachable!("ingestion never looks up pull requests by head")
 ///     }
 ///     async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
 ///         unreachable!("ingestion never promotes pull requests")
@@ -1289,6 +1298,22 @@ impl GithubClient for ReqwestGithubClient {
         Ok(raw.into())
     }
 
+    async fn pull_requests_for_head(
+        &self,
+        repo: &str,
+        head: &str,
+    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+        validate_repo(repo)?;
+        let owner = repo.split('/').next().unwrap_or_default();
+        let query = [
+            ("state", "open".to_string()),
+            ("head", format!("{owner}:{head}")),
+        ];
+        let path = format!("/repos/{repo}/pulls");
+        let raw: Vec<RawPrDetail> = self.paginate(&path, &query, |v| v).await?;
+        Ok(raw.into_iter().map(Into::into).collect())
+    }
+
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError> {
         validate_repo(repo)?;
         let detail = self.get_pull_request(repo, number).await?;
@@ -1474,6 +1499,7 @@ pub(crate) mod test_support {
         pub issues: HashMap<String, Vec<GithubIssue>>,
         pub pulls: HashMap<String, Vec<GithubPullRequest>>,
         pub pr_details: HashMap<(String, u64), GithubPullRequestDetail>,
+        pub head_prs: HashMap<(String, String), Vec<GithubPullRequestDetail>>,
         pub issue_details: HashMap<(String, u64), GithubIssueDetail>,
         pub review_comments: HashMap<(String, u64), Vec<GithubComment>>,
         pub issue_comments: HashMap<(String, u64), Vec<GithubComment>>,
@@ -1577,6 +1603,20 @@ pub(crate) mod test_support {
                     url: format!("mock:pulls/{number}"),
                     status: 404,
                 })
+        }
+
+        async fn pull_requests_for_head(
+            &self,
+            repo: &str,
+            head: &str,
+        ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+            self.record(format!("pull_requests_for_head {repo} {head}"));
+            self.maybe_fail("mock:pull_requests_for_head")?;
+            Ok(self
+                .head_prs
+                .get(&(repo.to_string(), head.to_string()))
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn mark_pull_request_ready(
@@ -2784,6 +2824,46 @@ mod tests {
         assert!(detail.draft);
         assert_eq!(detail.state, "open");
         assert_eq!(detail.body.as_deref(), Some("desc"));
+        server.abort();
+    }
+
+    const HEAD_LISTING: &str = r#"[{"number": 7, "node_id": "PR_a", "draft": true, "state": "open", "body": "d", "html_url": "u7"}, {"number": 8, "node_id": "PR_b", "draft": false, "state": "open", "body": null, "html_url": "u8"}]"#;
+
+    #[tokio::test]
+    async fn reqwest_client_lists_the_open_pull_requests_of_a_head_branch() {
+        let (base, requests, server) = fake_github_ext(vec![MockRoute::new(
+            "GET",
+            "/repos/o/n/pulls",
+            200,
+            HEAD_LISTING,
+        )])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let found = client
+            .pull_requests_for_head("o/n", "feature/x")
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].draft && !found[1].draft);
+        assert_eq!(found[1].number, 8);
+        assert_eq!(found[1].body, None);
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("head=o%3Afeature%2Fx"), "{}", sent[0]);
+        assert!(sent[0].contains("state=open"), "{}", sent[0]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_head_lookup_surfaces_errors_and_rejects_a_bad_repo() {
+        let (base, _requests, server) =
+            fake_github_ext(vec![MockRoute::new("GET", "/repos/o/n/pulls", 500, "boom")]).await;
+        let client = ReqwestGithubClient::new(base, None);
+        assert!(client.pull_requests_for_head("o/n", "x").await.is_err());
+        assert!(client
+            .pull_requests_for_head("not a repo", "x")
+            .await
+            .is_err());
         server.abort();
     }
 

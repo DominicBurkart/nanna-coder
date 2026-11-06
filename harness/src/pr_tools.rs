@@ -5295,6 +5295,7 @@ mod tests {
                 "list_review_comments",
                 "mark_pull_request_ready",
                 "open_pull_requests",
+                "pull_requests_for_head",
                 "search_open_issues",
             ]
         );
@@ -6961,6 +6962,16 @@ mod tests {
                 return Err(hostile_failure());
             }
             self.inner.get_pull_request(repo, number).await
+        }
+        async fn pull_requests_for_head(
+            &self,
+            repo: &str,
+            head: &str,
+        ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+            if self.failing == "pull_requests_for_head" {
+                return Err(hostile_failure());
+            }
+            self.inner.pull_requests_for_head(repo, head).await
         }
         async fn mark_pull_request_ready(
             &self,
