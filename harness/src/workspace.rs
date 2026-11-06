@@ -10,6 +10,7 @@ use crate::container::{
 use crate::identity::AgentIdentity;
 use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
 use crate::onboarding::OnboardingError;
+use crate::policy::RepoPolicy;
 use crate::protected::{
     AuditHook, NoopAuditHook, ProtectedConfigError, ProtectedExtras, ProtectedPathViolation,
     ProtectedPaths,
@@ -216,6 +217,7 @@ pub struct TaskWorkspace {
 impl TaskWorkspace {
     pub fn create(source_repo: &Path, task_id: &str, branch: &str) -> Result<Self, WorkspaceError> {
         let extras = ProtectedExtras::load(source_repo)?;
+        let policy = RepoPolicy::load(source_repo)?;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -229,7 +231,8 @@ impl TaskWorkspace {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
-        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected =
+            ProtectedPaths::for_repo_with_extras(&workspace_path, &extras).with_policy(policy);
         Ok(Self {
             workspace_path,
             source_repo: source_repo.to_path_buf(),
@@ -393,6 +396,7 @@ impl TaskWorkspace {
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
         let extras = ProtectedExtras::load(source_repo)?;
+        let policy = RepoPolicy::load(source_repo)?;
         let tmp_dir = dev_container_paths()?.tmp_dir;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
@@ -429,7 +433,8 @@ impl TaskWorkspace {
             additional_args.extend(set.container_args());
             env_vars.extend(set.exports().iter().cloned());
         }
-        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected =
+            ProtectedPaths::for_repo_with_extras(&workspace_path, &extras).with_policy(policy);
         let shielded = match protected_mounts(&protected, &workspace_path) {
             Ok(shielded) => shielded,
             Err(e) => {
@@ -2315,6 +2320,139 @@ mod tests {
             );
             assert_eq!(worktree_count(source.path()), 1, "{body}");
         }
+    }
+
+    fn declare_policy(source: &Path, body: &[u8]) {
+        std::fs::create_dir_all(source.join(".nanna")).unwrap();
+        std::fs::write(source.join(".nanna/policy.toml"), body).unwrap();
+    }
+
+    fn oversized_policy() -> Vec<u8> {
+        let mut body = b"human_gate = \"solo\"\n".to_vec();
+        body.resize(crate::policy::MAX_POLICY_BYTES + 1, b'\n');
+        body
+    }
+
+    fn bad_policies() -> Vec<Vec<u8>> {
+        vec![
+            b"human_gate = \"duo\"".to_vec(),
+            b"human_gate = ".to_vec(),
+            b"human_gate = \"solo\"\nextra = []".to_vec(),
+            vec![0xff, 0xfe, 0x00],
+            oversized_policy(),
+        ]
+    }
+
+    fn is_policy_refusal(err: &WorkspaceError) -> bool {
+        matches!(
+            err,
+            WorkspaceError::ProtectedConfig(ProtectedConfigError::Policy(_))
+        )
+    }
+
+    #[test]
+    fn test_a_bad_policy_refuses_to_start_the_task_and_adds_no_worktree() {
+        for body in bad_policies() {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), &body);
+            let id = unique_id("ws-bad-policy");
+            let err = TaskWorkspace::create(source.path(), &id, "HEAD")
+                .err()
+                .unwrap();
+            assert!(is_policy_refusal(&err), "{err:?}");
+            assert!(!std::env::temp_dir()
+                .join(format!("nanna-task-{id}"))
+                .exists());
+            assert_eq!(worktree_count(source.path()), 1);
+        }
+    }
+
+    #[test]
+    fn test_a_policy_that_is_a_directory_or_a_symlink_refuses_to_start_the_task() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".nanna/policy.toml")).unwrap();
+        let err = TaskWorkspace::create(source.path(), &unique_id("ws-dir-policy"), "HEAD")
+            .err()
+            .unwrap();
+        assert!(is_policy_refusal(&err), "{err:?}");
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::write(
+            source.path().join("elsewhere.toml"),
+            "human_gate = \"github\"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.path().join(".nanna")).unwrap();
+        std::os::unix::fs::symlink(
+            source.path().join("elsewhere.toml"),
+            source.path().join(".nanna/policy.toml"),
+        )
+        .unwrap();
+        let err = TaskWorkspace::create(source.path(), &unique_id("ws-link-policy"), "HEAD")
+            .err()
+            .unwrap();
+        assert!(is_policy_refusal(&err), "{err:?}");
+        assert_eq!(worktree_count(source.path()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_bad_policy_refuses_to_start_a_container_task_and_adds_no_worktree() {
+        for body in bad_policies() {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), &body);
+            let err = workspace_capturing_config(source.path(), "ws-bad-policy-c")
+                .await
+                .err()
+                .unwrap();
+            assert!(is_policy_refusal(&err), "{err:?}");
+            assert_eq!(worktree_count(source.path()), 1);
+        }
+    }
+
+    #[test]
+    fn test_without_a_policy_file_the_task_has_github_semantics() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-no-policy"), "HEAD").unwrap();
+        assert!(!ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_the_policy_is_taken_from_the_base_checkout_before_the_task_runs() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-policy-base"), "HEAD").unwrap();
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        std::fs::remove_file(source.path().join(".nanna/policy.toml")).unwrap();
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_container_task_carries_the_base_checkouts_policy() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-policy-c")
+            .await
+            .unwrap();
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-nopolicy-c")
+            .await
+            .unwrap();
+        assert!(!ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
     }
 
     #[test]

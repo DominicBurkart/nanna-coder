@@ -18,6 +18,7 @@
 //! at a different repository than the one the auditor approved.
 
 use crate::identity::IdentityCatalog;
+use crate::policy::RepoPolicy;
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -307,6 +308,7 @@ pub struct MountRoot {
 pub struct ProtectedPaths {
     rules: Vec<Rule>,
     config_dir: Option<PathBuf>,
+    policy: RepoPolicy,
 }
 
 fn relative_config_dir(repo_root: &Path, config_dir: &Path) -> Option<PathBuf> {
@@ -357,7 +359,17 @@ impl ProtectedPaths {
         Self {
             rules,
             config_dir: config_dir.map(Path::to_path_buf),
+            policy: RepoPolicy::default(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: RepoPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> RepoPolicy {
+        self.policy
     }
 
     /// Whether the repository-relative `path` may not be written.
@@ -1335,6 +1347,37 @@ mod tests {
             assert_eq!(written, "name=from-body\n");
             let (_, written) = detect(&plain, &plain.base, &plain.head, "no marker here");
             assert_eq!(written, "name=\n");
+        }
+    }
+
+    mod policy_carriage {
+        use super::*;
+        use crate::policy::RepoPolicy;
+
+        #[test]
+        fn a_protected_set_defaults_to_github_and_carries_the_policy_it_is_given() {
+            let plain = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            assert!(!plain.policy().is_solo());
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            assert!(solo.policy().is_solo());
+            assert_eq!(solo.rules(), plain.rules());
+            assert!(!solo.with_policy(RepoPolicy::default()).policy().is_solo());
+        }
+
+        #[test]
+        fn the_policy_file_is_protected_like_the_protected_declaration() {
+            let protected = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            for path in [
+                ".nanna/policy.toml",
+                ".nanna/protected.toml",
+                "crates/a/.nanna/policy.toml",
+            ] {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert!(
+                    violation.rule.ends_with(".nanna/**"),
+                    "{path}: {violation:?}"
+                );
+            }
         }
     }
 

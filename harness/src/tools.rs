@@ -6,6 +6,7 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
+use crate::policy::RepoPolicy;
 use crate::protected::{
     ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
 };
@@ -3287,7 +3288,9 @@ pub fn create_tool_registry_in_checkout(
     workspace_root: &std::path::Path,
 ) -> Result<ToolRegistry, ProtectedConfigError> {
     let extras = ProtectedExtras::load(workspace_root)?;
-    let protected = ProtectedPaths::for_repo_with_extras(workspace_root, &extras);
+    let policy = RepoPolicy::load(workspace_root)?;
+    let protected =
+        ProtectedPaths::for_repo_with_extras(workspace_root, &extras).with_policy(policy);
     Ok(create_tool_registry_guarded(workspace_root, protected))
 }
 
@@ -4987,6 +4990,34 @@ mod tests {
             create_tool_registry_in_checkout(dir.path()),
             Err(ProtectedConfigError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_checkout_registry_is_refused_for_a_bad_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            create_tool_registry_in_checkout(dir.path()),
+            Err(ProtectedConfigError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn a_checkout_registry_accepts_a_valid_solo_or_missing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
     }
 
     #[test]
