@@ -1520,6 +1520,20 @@ mod tests {
             }
         }
 
+        struct Broken;
+
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("device failure"))
+            }
+        }
+
+        #[test]
+        fn a_reader_that_fails_midway_is_an_error_not_an_empty_declaration() {
+            let err = read_bounded(Broken).unwrap_err();
+            assert_eq!(err.to_string(), "device failure");
+        }
+
         #[test]
         fn the_reader_stops_one_byte_past_the_cap_however_much_more_is_available() {
             let served = std::rc::Rc::new(std::cell::Cell::new(0));
