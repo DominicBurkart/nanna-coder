@@ -378,3 +378,32 @@ fn a_listed_site_does_not_allow_the_same_call_from_another_function_or_file() {
     let source = "fn sneaky() { ProtectedPaths::for_repo(r); }";
     assert_eq!(unguarded_sites("src/tools.rs", source).len(), 1);
 }
+
+#[test]
+fn cfg_combinators_decide_what_counts_as_test_only() {
+    let call = "{ create_tool_registry(r); }";
+    for (attr, flagged) in [
+        ("#[cfg(not(test))]", 1),
+        ("#[cfg(any(test, feature = \"x\"))]", 1),
+        ("#[cfg(all(test, unix))]", 0),
+        ("#[cfg(all(unix, feature = \"x\"))]", 1),
+        ("#[cfg(feature = \"x\")]", 1),
+        ("#[cfg(test)]", 0),
+    ] {
+        let source = format!("{attr} fn f() {call}");
+        assert_eq!(
+            unguarded_sites("src/x.rs", &source).len(),
+            flagged,
+            "{attr}"
+        );
+    }
+}
+
+#[test]
+fn test_only_functions_nested_in_production_modules_and_impls_are_skipped() {
+    let call = "{ create_tool_registry(r); }";
+    let source = format!(
+        "mod m {{ #[cfg(test)] fn t() {call} fn p() {call} }} impl X {{ #[cfg(test)] fn t() {call} fn p() {call} }}"
+    );
+    assert_eq!(unguarded_sites("src/x.rs", &source).len(), 2);
+}
