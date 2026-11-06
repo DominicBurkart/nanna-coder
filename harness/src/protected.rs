@@ -72,6 +72,8 @@ pub const MAX_EXTRAS_ENTRIES: usize = 256;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtectedConfigError {
+    #[error(transparent)]
+    Policy(#[from] crate::policy::PolicyError),
     #[error("`{EXTRAS_FILE}` is unreadable: {0}")]
     Unreadable(String),
     #[error("`{EXTRAS_FILE}` is malformed: {0}")]
@@ -116,6 +118,24 @@ fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
     let mut bounded = std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1);
     std::io::Read::read_to_string(&mut bounded, &mut text)?;
     Ok(text)
+}
+
+pub(crate) fn declaration_text(base: &Path, file: &str) -> Result<Option<String>, String> {
+    let path = base.join(file);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ProtectedExtras::absent(base)
+                .map(|_| None)
+                .map_err(String::from);
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(meta) if !meta.is_file() => return Err("not a regular file".to_string()),
+        Ok(_) => {}
+    }
+    std::fs::File::open(&path)
+        .and_then(read_bounded)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 fn invalid_pattern(pattern: &str, reason: &str) -> ProtectedConfigError {
@@ -173,21 +193,10 @@ impl ProtectedExtras {
     }
 
     pub fn load(base: &Path) -> Result<Self, ProtectedConfigError> {
-        let unreadable =
-            |e: &dyn std::fmt::Display| ProtectedConfigError::Unreadable(e.to_string());
-        let path = base.join(EXTRAS_FILE);
-        match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Self::absent(base).map_err(|e| unreadable(&e))
-            }
-            Err(e) => return Err(unreadable(&e)),
-            Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
-            Ok(_) => {}
+        match declaration_text(base, EXTRAS_FILE).map_err(ProtectedConfigError::Unreadable)? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
         }
-        let text = std::fs::File::open(&path)
-            .and_then(read_bounded)
-            .map_err(|e| unreadable(&e))?;
-        Self::parse(&text)
     }
 
     fn absent(base: &Path) -> Result<Self, &'static str> {
