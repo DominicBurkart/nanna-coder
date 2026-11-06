@@ -113,10 +113,8 @@ struct ExtrasFile {
 
 fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
     let mut text = String::new();
-    std::io::Read::read_to_string(
-        &mut std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1),
-        &mut text,
-    )?;
+    let mut bounded = std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1);
+    std::io::Read::read_to_string(&mut bounded, &mut text)?;
     Ok(text)
 }
 
