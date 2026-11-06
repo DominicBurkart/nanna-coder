@@ -138,23 +138,21 @@ struct Sites {
 
 impl<'ast> Visit<'ast> for Sites {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_test_only(&node.attrs) {
-            return;
+        if !is_test_only(&node.attrs) {
+            self.function
+                .push(plain(&node.sig.ident.to_string()).to_string());
+            syn::visit::visit_item_fn(self, node);
+            self.function.pop();
         }
-        self.function
-            .push(plain(&node.sig.ident.to_string()).to_string());
-        syn::visit::visit_item_fn(self, node);
-        self.function.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_test_only(&node.attrs) {
-            return;
+        if !is_test_only(&node.attrs) {
+            self.function
+                .push(plain(&node.sig.ident.to_string()).to_string());
+            syn::visit::visit_impl_item_fn(self, node);
+            self.function.pop();
         }
-        self.function
-            .push(plain(&node.sig.ident.to_string()).to_string());
-        syn::visit::visit_impl_item_fn(self, node);
-        self.function.pop();
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
