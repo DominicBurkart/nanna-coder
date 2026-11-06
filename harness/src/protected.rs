@@ -111,6 +111,15 @@ struct ExtrasFile {
     extra: Vec<String>,
 }
 
+fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1),
+        &mut text,
+    )?;
+    Ok(text)
+}
+
 fn invalid_pattern(pattern: &str, reason: &str) -> ProtectedConfigError {
     ProtectedConfigError::InvalidPattern {
         pattern: pattern.to_string(),
@@ -177,14 +186,8 @@ impl ProtectedExtras {
             Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
             Ok(_) => {}
         }
-        let mut text = String::new();
-        std::fs::File::open(&path)
-            .and_then(|file| {
-                std::io::Read::read_to_string(
-                    &mut std::io::Read::take(file, MAX_EXTRAS_BYTES as u64 + 1),
-                    &mut text,
-                )
-            })
+        let text = std::fs::File::open(&path)
+            .and_then(read_bounded)
             .map_err(|e| unreadable(&e))?;
         Self::parse(&text)
     }
@@ -1505,6 +1508,24 @@ mod tests {
                 ProtectedExtras::parse(&padded_to(MAX_EXTRAS_BYTES + 1)),
                 Err(ProtectedConfigError::TooLarge)
             );
+        }
+
+        struct Endless(std::rc::Rc<std::cell::Cell<usize>>);
+
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(b' ');
+                self.0.set(self.0.get() + buf.len());
+                Ok(buf.len())
+            }
+        }
+
+        #[test]
+        fn the_reader_stops_one_byte_past_the_cap_however_much_more_is_available() {
+            let served = std::rc::Rc::new(std::cell::Cell::new(0));
+            let text = read_bounded(Endless(served.clone())).unwrap();
+            assert_eq!(text.len(), MAX_EXTRAS_BYTES + 1);
+            assert_eq!(served.get(), MAX_EXTRAS_BYTES + 1);
         }
 
         #[test]

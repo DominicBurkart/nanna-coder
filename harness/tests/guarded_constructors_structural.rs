@@ -12,6 +12,13 @@ const TYPE_CONSTRUCTORS: [(&str, &str); 6] = [
     ("GitPushBranchTool", "new"),
 ];
 
+const GUARDED_TYPES: [&str; 4] = [
+    "ProtectedPaths",
+    "WriteFileTool",
+    "GitCommitTool",
+    "GitPushBranchTool",
+];
+
 const FREE_CONSTRUCTORS: [&str; 4] = [
     "create_tool_registry",
     "create_tool_registry_for",
@@ -19,7 +26,7 @@ const FREE_CONSTRUCTORS: [&str; 4] = [
     "create_container_tool_registry_for",
 ];
 
-const SHIPPED_ONLY_SITES: [(&str, &str, &str); 11] = [
+const SHIPPED_ONLY_SITES: [(&str, &str, &str); 13] = [
     ("src/tools.rs", "scoped", "ProtectedPaths::for_repo"),
     (
         "src/tools.rs",
@@ -63,6 +70,21 @@ const SHIPPED_ONLY_SITES: [(&str, &str, &str); 11] = [
         "protected_paths",
         "ProtectedPaths::with_config_dir",
     ),
+    ("src/tools.rs", "new", "WriteFileTool::scoped"),
+    (
+        "src/protected.rs",
+        "for_repo",
+        "ProtectedPaths::with_config_dir",
+    ),
+];
+
+const PINNED_LIMITS: [&str; 6] = [
+    "only files under src/ are scanned; tests, benches, examples and build scripts are not",
+    "test-only code (cfg(test) items and files declared by a cfg(test) mod) is not scanned",
+    "constructors are matched by name and owning type, not by resolving imports: a glob import followed by a call is caught by the call, an unrelated type with the same function names is not",
+    "generic or trait-dispatched construction (T::new) is not seen",
+    "method-call syntax is not seen",
+    "code produced by include!, proc macros or build scripts is not seen",
 ];
 
 fn plain(name: &str) -> &str {
@@ -111,29 +133,107 @@ fn path_segments(path: &syn::Path) -> Vec<String> {
         .collect()
 }
 
-fn macro_idents(stream: TokenStream, out: &mut Vec<String>) {
+fn flatten(stream: TokenStream, out: &mut Vec<String>) {
     for token in stream {
         match token {
-            TokenTree::Group(group) => macro_idents(group.stream(), out),
+            TokenTree::Group(group) => flatten(group.stream(), out),
             TokenTree::Ident(ident) => out.push(plain(&ident.to_string()).to_string()),
-            _ => {}
+            TokenTree::Punct(punct) => out.push(punct.as_char().to_string()),
+            TokenTree::Literal(_) => out.push(String::new()),
         }
     }
 }
 
-fn is_constructor_name(name: &str) -> bool {
+fn is_constructor_method(name: &str) -> bool {
+    TYPE_CONSTRUCTORS
+        .iter()
+        .any(|(_, constructor)| *constructor == name && name != "new")
+}
+
+fn is_guarded_name(name: &str) -> bool {
     FREE_CONSTRUCTORS.contains(&name)
-        || TYPE_CONSTRUCTORS
-            .iter()
-            .any(|(_, constructor)| *constructor == name && name != "new")
+        || GUARDED_TYPES.contains(&name)
+        || is_constructor_method(name)
+}
+
+fn is_constructor_name(name: &str) -> bool {
+    FREE_CONSTRUCTORS.contains(&name) || is_constructor_method(name)
+}
+
+fn follows_guarded_type(tokens: &[String], at: usize) -> bool {
+    let guarded = |i: usize| GUARDED_TYPES.contains(&tokens[i].as_str());
+    at >= 3
+        && tokens[at - 1] == ":"
+        && tokens[at - 2] == ":"
+        && (guarded(at - 3) || (tokens[at - 3] == ">" && at >= 4 && guarded(at - 4)))
+}
+
+fn macro_mentions(tokens: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        if is_constructor_name(token) || (token == "new" && follows_guarded_type(tokens, at)) {
+            found.push(token.clone());
+        }
+    }
+    found
+}
+
+fn type_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => path_segments(&path.path).last().cloned(),
+        _ => None,
+    }
+}
+
+fn use_renames(tree: &syn::UseTree, out: &mut Vec<String>) {
+    match tree {
+        syn::UseTree::Rename(rename) => out.push(plain(&rename.ident.to_string()).to_string()),
+        syn::UseTree::Path(path) => use_renames(&path.tree, out),
+        syn::UseTree::Group(group) => group.items.iter().for_each(|t| use_renames(t, out)),
+        _ => {}
+    }
 }
 
 #[derive(Default)]
 struct Sites {
     function: Vec<String>,
+    impl_types: Vec<Option<String>>,
     calls: Vec<(String, String)>,
+    references: Vec<String>,
     renames: Vec<String>,
+    aliases: Vec<String>,
     macro_mentions: Vec<String>,
+}
+
+impl Sites {
+    fn note_path(&mut self, path: &syn::ExprPath, callee: bool) {
+        let segments = path_segments(&path.path);
+        let name = segments.last().cloned().unwrap_or_default();
+        let owner = match &path.qself {
+            Some(qself) => type_name(&qself.ty),
+            None if segments.len() >= 2 => Some(segments[segments.len() - 2].clone()),
+            None => None,
+        };
+        let owner = match owner.as_deref() {
+            Some("Self") => self.impl_types.last().cloned().flatten(),
+            _ => owner,
+        };
+        let label = if FREE_CONSTRUCTORS.contains(&name.as_str()) {
+            Some(name.clone())
+        } else {
+            owner
+                .filter(|ty| TYPE_CONSTRUCTORS.iter().any(|(t, c)| t == ty && *c == name))
+                .map(|ty| format!("{ty}::{name}"))
+        };
+        if let Some(label) = label {
+            if callee {
+                let function = self.function.last().cloned().unwrap_or_default();
+                self.calls.push((function, label));
+            } else {
+                self.references.push(label);
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for Sites {
@@ -163,44 +263,41 @@ impl<'ast> Visit<'ast> for Sites {
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if !is_test_only(&node.attrs) {
+            self.impl_types.push(type_name(&node.self_ty));
             syn::visit::visit_item_impl(self, node);
+            self.impl_types.pop();
         }
     }
 
-    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
-        self.renames
-            .push(plain(&node.rename.to_string()).to_string());
-        syn::visit::visit_use_rename(self, node);
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        let mut sources = Vec::new();
+        use_renames(&node.tree, &mut sources);
+        self.renames.extend(sources);
+    }
+
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        if type_name(&node.ty).is_some_and(|name| GUARDED_TYPES.contains(&name.as_str())) {
+            self.aliases
+                .push(plain(&node.ident.to_string()).to_string());
+        }
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        let mut idents = Vec::new();
-        macro_idents(node.tokens.clone(), &mut idents);
-        for ident in idents {
-            if is_constructor_name(&ident) {
-                self.macro_mentions.push(ident);
-            }
-        }
-        syn::visit::visit_macro(self, node);
+        let mut tokens = Vec::new();
+        flatten(node.tokens.clone(), &mut tokens);
+        self.macro_mentions.extend(macro_mentions(&tokens));
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = &*node.func {
-            let segments = path_segments(&path.path);
-            let function = self.function.last().cloned().unwrap_or_default();
-            if let Some(last) = segments.last() {
-                if FREE_CONSTRUCTORS.contains(&last.as_str()) {
-                    self.calls.push((function.clone(), last.clone()));
-                }
-                if segments.len() >= 2 {
-                    let ty = &segments[segments.len() - 2];
-                    if TYPE_CONSTRUCTORS.iter().any(|(t, c)| t == ty && c == last) {
-                        self.calls.push((function, format!("{ty}::{last}")));
-                    }
-                }
-            }
+        match &*node.func {
+            syn::Expr::Path(path) => self.note_path(path, true),
+            other => self.visit_expr(other),
         }
-        syn::visit::visit_expr_call(self, node);
+        node.args.iter().for_each(|arg| self.visit_expr(arg));
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        self.note_path(node, false);
     }
 }
 
@@ -235,12 +332,20 @@ fn unguarded_sites(relative: &str, source: &str) -> Vec<String> {
             found.push(format!("{relative}: `{function}` calls `{constructor}`"));
         }
     }
-    for rename in &sites.renames {
-        if is_constructor_name(rename) {
-            found.push(format!(
-                "{relative}: constructor imported under another name `{rename}`"
-            ));
-        }
+    for source in sites.renames.iter().filter(|name| is_guarded_name(name)) {
+        found.push(format!(
+            "{relative}: `{source}` imported under another name"
+        ));
+    }
+    for alias in &sites.aliases {
+        found.push(format!(
+            "{relative}: type alias `{alias}` to a guarded type"
+        ));
+    }
+    for reference in &sites.references {
+        found.push(format!(
+            "{relative}: `{reference}` used as a value outside a call"
+        ));
     }
     for mention in &sites.macro_mentions {
         found.push(format!("{relative}: macro mentions `{mention}`"));
@@ -404,4 +509,170 @@ fn test_only_functions_nested_in_production_modules_and_impls_are_skipped() {
         "mod m {{ #[cfg(test)] fn t() {call} fn p() {call} }} impl X {{ #[cfg(test)] fn t() {call} fn p() {call} }}"
     );
     assert_eq!(unguarded_sites("src/x.rs", &source).len(), 2);
+}
+
+fn found(source: &str) -> Vec<String> {
+    unguarded_sites("src/x.rs", source)
+}
+
+#[test]
+fn an_import_renamed_with_as_is_flagged_for_constructors_and_guarded_types() {
+    for source in [
+        "use crate::tools::create_tool_registry as ctr; fn f() { ctr(r); }",
+        "use crate::tools::{create_tool_registry_for as ctf, other}; fn f() { ctf(r, i); }",
+        "use crate::protected::ProtectedPaths as PP; fn f() { PP::for_repo(r); }",
+        "use crate::tools::WriteFileTool as W;",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    for source in [
+        "use crate::tools::Other as O;",
+        "use crate::protected::ProtectedPaths;",
+        "use crate::tools::{create_tool_registry_guarded as g, other};",
+        "use crate::tools::*;",
+    ] {
+        assert!(found(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn a_type_alias_to_a_guarded_type_is_flagged() {
+    for source in [
+        "type PP = ProtectedPaths;",
+        "type W = crate::tools::WriteFileTool;",
+        "pub type C = GitCommitTool;",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    for source in [
+        "type V = Vec<u8>;",
+        "type Refs = &'static [ProtectedPaths];",
+    ] {
+        assert!(found(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn qualified_path_calls_are_flagged() {
+    for source in [
+        "fn f() { <ProtectedPaths>::for_repo(r); }",
+        "fn f() { <WriteFileTool>::new(r); }",
+        "fn f() { <crate::tools::WriteFileTool>::scoped(r, s); }",
+        "fn f() { <GitPushBranchTool as Tool>::new(r, n); }",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    assert!(
+        found("fn f() { <Vec<u8>>::new(); <ProtectedPaths>::with_extras(r, c, e); }").is_empty()
+    );
+}
+
+#[test]
+fn function_pointer_references_are_flagged() {
+    for source in [
+        "fn f() { let g = create_tool_registry; }",
+        "fn f() { x.map(create_tool_registry_for); }",
+        "fn f() { x.map(crate::tools::create_container_tool_registry); }",
+        "static F: fn(&Path) -> R = create_tool_registry;",
+        "const G: fn(&Path) -> R = create_tool_registry_for;",
+        "fn f() { let g = ProtectedPaths::for_repo; }",
+        "fn f() { let g = <WriteFileTool>::new; }",
+        "fn f() { let g: fn(&Path) -> P = ProtectedPaths::with_config_dir; }",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    assert!(found("fn f() { let g = create_tool_registry_guarded; let h = Vec::new; }").is_empty());
+}
+
+#[test]
+fn new_inside_macro_invocations_is_flagged_after_a_guarded_type() {
+    for source in [
+        "fn f() { foo!(GitCommitTool::new(r, n)); }",
+        "fn f() { foo!(WriteFileTool::new(r)); }",
+        "fn f() { foo!(a, GitPushBranchTool::new(r, n)); }",
+        "fn f() { foo!(<WriteFileTool>::new(r)); }",
+        "fn f() { foo!({ ProtectedPaths::for_repo(r) }); }",
+        "fn f() { foo!(create_tool_registry(r)); }",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    for source in [
+        "fn f() { foo!(Vec::new()); }",
+        "fn f() { foo!(new); }",
+        "fn f() { foo!(x::new); }",
+        "fn f() { foo!(); }",
+    ] {
+        assert!(found(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn constructors_inside_a_macro_rules_body_are_flagged() {
+    for source in [
+        "macro_rules! m { () => { create_tool_registry(r) }; }",
+        "macro_rules! m { () => { GitPushBranchTool::new(r, n) }; }",
+        "macro_rules! m { ($r:expr) => { ProtectedPaths::for_repo($r) }; }",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    assert!(found("macro_rules! m { () => { Vec::new() }; }").is_empty());
+}
+
+#[test]
+fn self_calls_inside_an_impl_of_a_guarded_type_are_flagged() {
+    for source in [
+        "impl ProtectedPaths { fn x() { Self::for_repo(r); } }",
+        "impl WriteFileTool { fn x() { Self::new(r); } }",
+        "impl GitCommitTool { fn x() { Self::new(r, n); } }",
+        "impl ProtectedPaths { fn x() { let g = Self::with_config_dir; } }",
+    ] {
+        assert_eq!(found(source).len(), 1, "{source}");
+    }
+    for source in [
+        "impl Other { fn x() { Self::for_repo(r); } }",
+        "impl ProtectedPaths { fn x() { Self::with_extras(r, c, e); } }",
+        "fn x() { Self::for_repo(r); }",
+        "impl<T> Tr for Vec<T> { fn x() { Self::new(); } }",
+        "impl (A, B) { fn x() { Self::new(); } }",
+    ] {
+        assert!(found(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn a_callee_that_is_not_a_path_is_inspected_for_nested_constructors() {
+    assert!(found("fn f() { handler()(r); }").is_empty());
+    assert_eq!(found("fn f() { create_tool_registry(r)(x); }").len(), 1);
+    assert_eq!(
+        found("fn f() { (move || create_tool_registry(r))(); }").len(),
+        1
+    );
+}
+
+#[test]
+fn literals_in_macro_tokens_do_not_hide_a_constructor() {
+    assert_eq!(
+        found("fn f() { foo!(\"x\", 1, WriteFileTool::new(r)); }").len(),
+        1
+    );
+    assert!(found("fn f() { foo!(\"WriteFileTool::new\"); }").is_empty());
+}
+
+#[test]
+fn a_listed_site_allows_a_self_call_only_from_its_named_function() {
+    let source = "impl WriteFileTool { fn new() { Self::scoped(r, None); } fn other() { Self::scoped(r, None); } }";
+    assert_eq!(unguarded_sites("src/tools.rs", source).len(), 1);
+}
+
+#[test]
+fn the_documented_blind_spots_are_really_not_seen() {
+    assert_eq!(PINNED_LIMITS.len(), 6);
+    for source in [
+        "fn f<T: Ctor>() { T::new(r); }",
+        "fn f(x: X) { x.scoped(r); x.for_repo(); }",
+        "fn f() { include!(\"generated.rs\"); }",
+        "fn f() { OtherType::for_repo(r); OtherType::new(r); }",
+    ] {
+        assert!(found(source).is_empty(), "{source}");
+    }
 }
