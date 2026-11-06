@@ -101,6 +101,10 @@ enum Commands {
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
+        /// Model that plans tasks into subtasks; enables the `plan_task` tool
+        /// (falls back to NANNA_PLANNER_MODEL; without either the tool is off)
+        #[arg(long)]
+        planner_model: Option<String>,
     },
     /// Delegate a coding task through the MCP Tasks protocol.
     ///
@@ -513,8 +517,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::McpServe {
             model,
             max_iterations,
+            planner_model,
         } => {
-            run_mcp_server(&model, max_iterations).await?;
+            let from_env = std::env::var("NANNA_PLANNER_MODEL").ok();
+            let planner = planner_model
+                .or(from_env)
+                .filter(|name| !name.trim().is_empty());
+            run_mcp_server(&model, max_iterations, planner).await?;
         }
         Commands::Delegate {
             description,
@@ -1786,6 +1795,7 @@ fn build_delegate_task_manager(
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
+    planner_model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
@@ -1825,12 +1835,12 @@ async fn run_mcp_server(
         &catalog,
         plane,
     )?;
-    let server = Arc::new(NannaMcpServer::new(
-        task_manager,
-        provider,
-        gate,
-        max_iterations,
-    ));
+    let mut server = NannaMcpServer::new(task_manager, provider, gate, max_iterations);
+    if let Some(planner) = planner_model {
+        info!("plan_task enabled (planner model: {})", planner);
+        server = server.with_planner(planner);
+    }
+    let server = Arc::new(server);
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
