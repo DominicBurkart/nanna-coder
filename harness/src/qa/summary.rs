@@ -29,7 +29,7 @@ pub struct QaSummary {
     /// Host paths of every report and screenshot, in the order written.
     pub artifacts: Vec<String>,
     /// Outcomes of the repository-declared checks a verifier ran, in order.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<crate::verify::CheckOutcome>,
 }
 
@@ -194,6 +194,28 @@ mod tests {
         let back: QaSummary = serde_json::from_value(json).unwrap();
         assert_eq!(back, summary);
         assert!(format!("{ledger:?}").contains("endpoint_runs: 2"));
+    }
+
+    #[test]
+    fn checks_are_omitted_from_the_json_until_a_verifier_records_some() {
+        let mut summary = QaSummary::default();
+        assert!(summary.to_json().get("checks").is_none());
+        summary.checks.push(crate::verify::CheckOutcome {
+            name: "fmt".to_string(),
+            command: "cargo fmt --check".to_string(),
+            status: crate::verify::CheckStatus::Passed,
+            exit_code: Some(0),
+            timeout_secs: 60,
+            duration_ms: 3,
+            output: String::new(),
+            output_truncated: false,
+        });
+        let json = summary.to_json();
+        assert_eq!(json["checks"][0]["name"], "fmt");
+        let back: QaSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(back, summary);
+        let legacy: QaSummary = serde_json::from_value(QaSummary::default().to_json()).unwrap();
+        assert!(legacy.checks.is_empty());
     }
 
     #[test]
