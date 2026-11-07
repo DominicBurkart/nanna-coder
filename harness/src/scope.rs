@@ -1403,6 +1403,44 @@ mod tests {
     }
 
     #[test]
+    fn windows_name_aliases_of_a_declared_path_are_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]",
+        )
+        .unwrap();
+        let protected = ProtectedPaths::with_extras(root, None, &extras);
+        for (path, rule) in [
+            ("tools/release-helper.sh.", "tools/release-helper.sh"),
+            ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+            ("src/lib.rs::$DATA", "src/lib.rs"),
+            ("gate~1/x.rs", "gate/**"),
+            ("gate./x.rs", "gate/**"),
+        ] {
+            let violation = protected_error(resolve_path_guarded(
+                None,
+                &protected,
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            ));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+        }
+        let allowed = resolve_path_guarded(
+            None,
+            &protected,
+            "write_file",
+            PathAccess::Write,
+            Path::new("tools/OTHER~1.SH"),
+            root,
+        );
+        assert!(allowed.is_ok());
+    }
+
+    #[test]
     fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
         let ws = workspace();
         let root = ws.path();

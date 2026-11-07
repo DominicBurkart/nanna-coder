@@ -44,14 +44,10 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".cargo/**",
     ".devcontainer/**",
     "AGENTS.md",
-    "evals/cases/**",
-    "harness/src/protected.rs",
     ".gitattributes",
     ".gitmodules",
-    "harness/src/scope.rs",
     "CODEOWNERS",
     "docs/CODEOWNERS",
-    "harness/src/auditor/**",
     ".github/**",
     ".cargo-husky/**",
     ".envrc",
@@ -59,30 +55,6 @@ pub const PROTECTED_PATTERNS: &[&str] = &[
     ".claude/**",
     "nix/**",
     "CLAUDE.md",
-    "docs/ci/protected-paths-guard.yml",
-    "harness/src/workspace.rs",
-    "harness/src/tools.rs",
-    "harness/src/marker.rs",
-    "harness/src/identity/**",
-    "harness/src/action_auditor/**",
-    "harness/src/windows.rs",
-    "harness/src/capabilities.rs",
-    "harness/src/container.rs",
-    "harness/src/harness_adapter/isolation.rs",
-    "harness/src/harness_adapter/checked.rs",
-    "scripts/**",
-    "tests/security/**",
-    "tests/lib/**",
-    "tests/run-all-tests.sh",
-    "harness/dev-container.toml",
-    "harness/src/rollout/executor.rs",
-    "harness/src/rollout/hooks.rs",
-    "harness/src/rollout/serverless.rs",
-    "harness/src/rollout/state.rs",
-    "harness/src/effects.rs",
-    "harness/src/leases/**",
-    "auto-issue-pr.sh",
-    "test-agentic-security.sh",
 ];
 
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -92,6 +64,147 @@ const MATCH_OPTIONS: MatchOptions = MatchOptions {
 };
 
 const RECURSIVE_SUFFIX: &str = "/**";
+
+pub const EXTRAS_FILE: &str = ".nanna/protected.toml";
+
+pub const MAX_EXTRAS_BYTES: usize = 64 * 1024;
+
+pub const MAX_EXTRAS_ENTRIES: usize = 256;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProtectedConfigError {
+    #[error("`{EXTRAS_FILE}` is unreadable: {0}")]
+    Unreadable(String),
+    #[error("`{EXTRAS_FILE}` is malformed: {0}")]
+    Malformed(String),
+    #[error("`{EXTRAS_FILE}` declares the invalid pattern `{pattern}`: {reason}")]
+    InvalidPattern { pattern: String, reason: String },
+    #[error("`{EXTRAS_FILE}` is larger than {MAX_EXTRAS_BYTES} bytes")]
+    TooLarge,
+    #[error(
+        "`{EXTRAS_FILE}` declares {count} patterns, more than the {MAX_EXTRAS_ENTRIES} allowed"
+    )]
+    TooManyEntries { count: usize },
+}
+
+/// Extra protected globs a repository declares in `.nanna/protected.toml`.
+/// They only add to [`PROTECTED_PATTERNS`]; a malformed declaration is an
+/// error, never an empty set.
+///
+/// ```
+/// use harness::protected::{ProtectedExtras, ProtectedPaths};
+/// use std::path::Path;
+///
+/// let extras = ProtectedExtras::parse(r#"extra = ["src/gate.rs", "ci/**"]"#).unwrap();
+/// let protected = ProtectedPaths::for_repo_with_extras(Path::new("."), &extras);
+/// assert!(protected.is_protected(Path::new("src/gate.rs")));
+/// assert!(protected.is_protected(Path::new("ci/deploy.sh")));
+/// assert!(protected.is_protected(Path::new(".git/config")));
+/// assert!(ProtectedExtras::parse("remove = [\".git/**\"]").is_err());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtectedExtras(Vec<String>);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtrasFile {
+    #[serde(default)]
+    extra: Vec<String>,
+}
+
+fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut text = String::new();
+    let mut bounded = std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1);
+    std::io::Read::read_to_string(&mut bounded, &mut text)?;
+    Ok(text)
+}
+
+fn invalid_pattern(pattern: &str, reason: &str) -> ProtectedConfigError {
+    ProtectedConfigError::InvalidPattern {
+        pattern: pattern.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn validate_extra(pattern: &str) -> Result<(), ProtectedConfigError> {
+    let literal = pattern.strip_suffix(RECURSIVE_SUFFIX).unwrap_or(pattern);
+    if literal.is_empty() {
+        return Err(invalid_pattern(pattern, "the pattern is empty"));
+    }
+    if literal.starts_with('/') {
+        return Err(invalid_pattern(pattern, "the pattern must be relative"));
+    }
+    if literal.starts_with('!') {
+        return Err(invalid_pattern(pattern, "patterns cannot be negated"));
+    }
+    if literal.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r', '\0']) {
+        return Err(invalid_pattern(
+            pattern,
+            "use a literal path, optionally ending in `/**`",
+        ));
+    }
+    if literal
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(invalid_pattern(
+            pattern,
+            "the path must be normalised and stay inside the repository",
+        ));
+    }
+    Ok(())
+}
+
+impl ProtectedExtras {
+    pub fn parse(text: &str) -> Result<Self, ProtectedConfigError> {
+        if text.len() > MAX_EXTRAS_BYTES {
+            return Err(ProtectedConfigError::TooLarge);
+        }
+        let file: ExtrasFile =
+            toml::from_str(text).map_err(|e| ProtectedConfigError::Malformed(e.to_string()))?;
+        if file.extra.len() > MAX_EXTRAS_ENTRIES {
+            return Err(ProtectedConfigError::TooManyEntries {
+                count: file.extra.len(),
+            });
+        }
+        file.extra
+            .iter()
+            .try_for_each(|pattern| validate_extra(pattern))?;
+        Ok(Self(file.extra))
+    }
+
+    pub fn load(base: &Path) -> Result<Self, ProtectedConfigError> {
+        let unreadable =
+            |e: &dyn std::fmt::Display| ProtectedConfigError::Unreadable(e.to_string());
+        let path = base.join(EXTRAS_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::absent(base).map_err(|e| unreadable(&e))
+            }
+            Err(e) => return Err(unreadable(&e)),
+            Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
+            Ok(_) => {}
+        }
+        let text = std::fs::File::open(&path)
+            .and_then(read_bounded)
+            .map_err(|e| unreadable(&e))?;
+        Self::parse(&text)
+    }
+
+    fn absent(base: &Path) -> Result<Self, &'static str> {
+        if !base.is_dir() {
+            return Err("the base checkout is not a directory");
+        }
+        match std::fs::symlink_metadata(base.join(".nanna")) {
+            Ok(meta) if !meta.is_dir() => Err("`.nanna` is not a directory"),
+            _ => Ok(Self::default()),
+        }
+    }
+
+    pub fn globs(&self) -> &[String] {
+        &self.0
+    }
+}
 
 /// A write that reached a protected path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Error)]
@@ -279,6 +392,20 @@ impl ProtectedPaths {
     /// The protected set for `repo_root` with an explicit configuration
     /// directory (`None` when Nanna has no configuration directory).
     pub fn with_config_dir(repo_root: &Path, config_dir: Option<&Path>) -> Self {
+        Self::with_extras(repo_root, config_dir, &ProtectedExtras::default())
+    }
+
+    pub fn for_repo_with_extras(repo_root: &Path, extras: &ProtectedExtras) -> Self {
+        let agents_dir = IdentityCatalog::default_global_dir();
+        let config_dir = agents_dir.as_deref().and_then(Path::parent);
+        Self::with_extras(repo_root, config_dir, extras)
+    }
+
+    pub fn with_extras(
+        repo_root: &Path,
+        config_dir: Option<&Path>,
+        extras: &ProtectedExtras,
+    ) -> Self {
         let mut rules: Vec<Rule> = PROTECTED_PATTERNS
             .iter()
             .map(|glob| Rule::new(glob.to_string()))
@@ -293,6 +420,13 @@ impl ProtectedPaths {
             rules.push(Rule::new(format!("{escaped}{RECURSIVE_SUFFIX}")));
             literals.extend(raw.split('/').map(str::to_string));
         }
+        rules.extend(extras.globs().iter().cloned().map(Rule::new));
+        literals.extend(
+            extras
+                .globs()
+                .iter()
+                .flat_map(|glob| literal_components(glob)),
+        );
         literals.sort_by_key(|literal| literal.to_lowercase());
         literals.dedup_by_key(|literal| literal.to_lowercase());
         Self {
@@ -447,14 +581,10 @@ mod tests {
         (".cargo/**", ".cargo/config.toml"),
         (".devcontainer/**", ".devcontainer/devcontainer.json"),
         ("AGENTS.md", "AGENTS.md"),
-        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
-        ("harness/src/protected.rs", "harness/src/protected.rs"),
         (".gitattributes", ".gitattributes"),
         (".gitmodules", ".gitmodules"),
-        ("harness/src/scope.rs", "harness/src/scope.rs"),
         ("CODEOWNERS", "CODEOWNERS"),
         ("docs/CODEOWNERS", "docs/CODEOWNERS"),
-        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
         (".github/**", ".github/actions/setup/action.yml"),
         (".github/**", ".github/dependabot.yml"),
         (".github/**", ".github/ISSUE_TEMPLATE/bug.md"),
@@ -464,55 +594,6 @@ mod tests {
         (".claude/**", ".claude/settings.json"),
         ("nix/**", "nix/containers.nix"),
         ("CLAUDE.md", "CLAUDE.md"),
-        (
-            "docs/ci/protected-paths-guard.yml",
-            "docs/ci/protected-paths-guard.yml",
-        ),
-        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
-        ("harness/src/tools.rs", "harness/src/tools.rs"),
-        ("harness/src/marker.rs", "harness/src/marker.rs"),
-        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
-        (
-            "harness/src/action_auditor/**",
-            "harness/src/action_auditor/gate.rs",
-        ),
-        ("harness/src/windows.rs", "harness/src/windows.rs"),
-        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
-        ("harness/src/container.rs", "harness/src/container.rs"),
-        (
-            "harness/src/harness_adapter/isolation.rs",
-            "harness/src/harness_adapter/isolation.rs",
-        ),
-        (
-            "harness/src/harness_adapter/checked.rs",
-            "harness/src/harness_adapter/checked.rs",
-        ),
-        ("scripts/**", "scripts/install.sh"),
-        ("scripts/**", "scripts/check-flake-source-filter.nix"),
-        ("tests/security/**", "tests/security/test-ai-security.sh"),
-        ("tests/lib/**", "tests/lib/test-helpers.sh"),
-        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
-        ("harness/dev-container.toml", "harness/dev-container.toml"),
-        (
-            "harness/src/rollout/executor.rs",
-            "harness/src/rollout/executor.rs",
-        ),
-        (
-            "harness/src/rollout/hooks.rs",
-            "harness/src/rollout/hooks.rs",
-        ),
-        (
-            "harness/src/rollout/serverless.rs",
-            "harness/src/rollout/serverless.rs",
-        ),
-        (
-            "harness/src/rollout/state.rs",
-            "harness/src/rollout/state.rs",
-        ),
-        ("harness/src/effects.rs", "harness/src/effects.rs"),
-        ("harness/src/leases/**", "harness/src/leases/store.rs"),
-        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
-        ("test-agentic-security.sh", "test-agentic-security.sh"),
     ];
 
     #[test]
@@ -530,6 +611,93 @@ mod tests {
                 "{pattern} has no example in the table"
             );
         }
+    }
+
+    const MOVED_TO_DECLARATION: [&str; 44] = [
+        "evals/cases/**",
+        "harness/src/protected.rs",
+        "harness/src/scope.rs",
+        "harness/src/auditor/**",
+        "docs/ci/protected-paths-guard.yml",
+        "harness/src/workspace.rs",
+        "harness/src/tools.rs",
+        "harness/src/marker.rs",
+        "harness/src/identity/**",
+        "harness/src/action_auditor/**",
+        "harness/src/windows.rs",
+        "harness/src/capabilities.rs",
+        "harness/src/container.rs",
+        "harness/src/harness_adapter/isolation.rs",
+        "harness/src/harness_adapter/checked.rs",
+        "scripts/**",
+        "tests/security/**",
+        "tests/lib/**",
+        "tests/run-all-tests.sh",
+        "harness/dev-container.toml",
+        "harness/src/rollout/executor.rs",
+        "harness/src/rollout/hooks.rs",
+        "harness/src/rollout/serverless.rs",
+        "harness/src/rollout/state.rs",
+        "harness/src/effects.rs",
+        "harness/src/leases/**",
+        "auto-issue-pr.sh",
+        "test-agentic-security.sh",
+        "harness/src/pr_tools.rs",
+        "docs/pr-lifecycle-tools.md",
+        "harness/src/budget.rs",
+        "harness/src/ci_tools.rs",
+        "harness/src/ci_policy.rs",
+        "harness/src/ci_integrity.rs",
+        "harness/src/deploy/template.rs",
+        "harness/src/sandbox_tools.rs",
+        "harness/tests/spawn_gate_structural.rs",
+        "harness/tests/protected_audit_hook_structural.rs",
+        "harness/tests/escalation_sinks_structural.rs",
+        "harness/tests/fixtures/identities/global/auditor.toml",
+        "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        "harness/tests/fixtures/one_track/catalog/auditor.toml",
+        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/planner_structural.rs",
+    ];
+
+    fn declaration_example_path(pattern: &str) -> String {
+        match pattern.strip_suffix("/**") {
+            Some(prefix) => format!("{prefix}/sub/x.txt"),
+            None => pattern.to_string(),
+        }
+    }
+
+    fn own_declaration() -> ProtectedExtras {
+        ProtectedExtras::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("..")).unwrap()
+    }
+
+    #[test]
+    fn nanna_coders_own_declaration_is_exactly_the_patterns_that_left_the_shipped_list() {
+        assert_eq!(own_declaration().globs(), MOVED_TO_DECLARATION);
+    }
+
+    #[test]
+    fn none_of_the_patterns_that_left_the_shipped_list_is_protected_by_default() {
+        let protected = protected();
+        for pattern in MOVED_TO_DECLARATION {
+            assert!(!PROTECTED_PATTERNS.contains(&pattern), "{pattern}");
+            let path = declaration_example_path(pattern);
+            assert!(!protected.is_protected(Path::new(&path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn with_its_own_declaration_loaded_every_moved_path_is_protected_by_its_declared_rule() {
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
+        for pattern in MOVED_TO_DECLARATION {
+            let path = declaration_example_path(pattern);
+            let violation = protected.check(Path::new(&path)).unwrap_err();
+            assert_eq!(violation.rule, pattern, "{path}");
+        }
+        let declaration = protected
+            .check(Path::new(".nanna/protected.toml"))
+            .unwrap_err();
+        assert_eq!(declaration.rule, ".nanna/**");
     }
 
     fn codeowners_paths() -> Vec<String> {
@@ -557,44 +725,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_previously_unprotected_path_is_now_protected() {
-        let protected = protected();
-        for path in [
-            ".gitattributes",
-            ".gitmodules",
-            "harness/src/scope.rs",
-            "CODEOWNERS",
-            "docs/CODEOWNERS",
-            ".github/CODEOWNERS",
-            "harness/src/auditor/mod.rs",
-            "harness/src/auditor/review/rules.rs",
-            "harness/src/auditor",
-            ".github/actions/setup/action.yml",
-            ".github/dependabot.yml",
-            ".cargo-husky/hooks/pre-commit",
-            ".envrc",
-            ".config/nextest.toml",
-            ".claude/settings.json",
-            "nix/containers.nix",
-            "CLAUDE.md",
-            "docs/ci/protected-paths-guard.yml",
-            "harness/src/workspace.rs",
-            "harness/src/tools.rs",
-            "harness/src/marker.rs",
-            "harness/src/identity/schema.rs",
-            "harness/src/action_auditor/rules.rs",
-            "harness/src/action_auditor",
-            "scripts/install.ps1",
-            "tests/security/test-environment.sh",
-            "harness/src/leases/acquire.rs",
-            "harness/src/leases",
-            "auto-issue-pr.sh",
-        ] {
-            assert!(protected.is_protected(Path::new(path)), "{path}");
-        }
-    }
-
     fn agents_md_protected_paths_line() -> String {
         include_str!("../../AGENTS.md")
             .lines()
@@ -611,6 +741,168 @@ mod tests {
                 line.contains(&format!("`{pattern}`")),
                 "{pattern} missing from AGENTS.md"
             );
+        }
+    }
+
+    fn files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let skipped = dir == root
+                    && [".git", "target", ".claude"]
+                        .contains(&entry.file_name().to_str().unwrap_or(""));
+                if !skipped {
+                    files_under(root, &path, out);
+                }
+            } else if kind.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn the_auditor_card_walk_skips_build_and_vcs_directories_only_at_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for relative in [
+            "target/a.toml",
+            ".git/b.toml",
+            ".claude/c.toml",
+            "x/target/d.toml",
+            "x/.git/e.toml",
+            "x/.claude/f.toml",
+            "g.toml",
+        ] {
+            let file = dir.path().join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "").unwrap();
+        }
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        let mut found: Vec<String> = found
+            .iter()
+            .map(|file| {
+                file.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "g.toml",
+                "x/.claude/f.toml",
+                "x/.git/e.toml",
+                "x/target/d.toml"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_auditor_card_walk_follows_no_symlinks_and_survives_unreadable_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("o.toml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("o.toml"), dir.path().join("l.toml"))
+            .unwrap();
+        let mut found = Vec::new();
+        files_under(dir.path(), dir.path(), &mut found);
+        assert!(found.is_empty(), "{found:?}");
+        files_under(dir.path(), &dir.path().join("missing"), &mut found);
+        assert!(found.is_empty());
+    }
+
+    fn auditor_identity_files() -> Vec<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        files_under(&root, &root, &mut files);
+        let mut found = Vec::new();
+        for file in files {
+            if file.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+            let Ok(card) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(value) = card.parse::<toml::Table>() else {
+                continue;
+            };
+            let named_auditor = value
+                .get("identity")
+                .and_then(|identity| identity.get("name"))
+                .and_then(toml::Value::as_str)
+                == Some(crate::identity::AUDITOR_IDENTITY);
+            if !named_auditor {
+                continue;
+            }
+            let relative = |path: &Path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
+            found.push(relative(&file));
+            let prompt = value
+                .get("identity")
+                .and_then(|identity| identity.get("system_prompt"))
+                .and_then(toml::Value::as_str);
+            if let Some(prompt) = prompt {
+                found.push(relative(&file.parent().unwrap().join(prompt)));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn every_auditor_identity_card_and_prompt_in_the_repository_is_protected() {
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
+        let found = auditor_identity_files();
+        for expected in [
+            "evals/cases/auditor_heldout/catalog/auditor.toml",
+            "evals/cases/auditor_spawn/catalog/auditor.toml",
+            "harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        ] {
+            assert!(found.iter().any(|file| file == expected), "{expected}");
+        }
+        for file in &found {
+            assert!(
+                protected.is_protected(Path::new(file)),
+                "{file} defines the auditor identity but is not protected"
+            );
+        }
+    }
+
+    #[test]
+    fn every_auditor_identity_card_in_the_repository_has_no_effect_ceiling_above_none() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let cards: Vec<String> = auditor_identity_files()
+            .into_iter()
+            .filter(|file| file.ends_with(".toml"))
+            .collect();
+        assert!(!cards.is_empty());
+        for card in cards {
+            let value = std::fs::read_to_string(root.join(&card))
+                .unwrap()
+                .parse::<toml::Table>()
+                .unwrap();
+            let max_effect = value
+                .get("scope")
+                .and_then(|scope| scope.get("max_effect"))
+                .and_then(toml::Value::as_str);
+            assert_eq!(max_effect, Some("none"), "{card}");
         }
     }
 
@@ -633,12 +925,8 @@ mod tests {
             ".GitHooks/pre-commit",
             ".Cargo/Config.toml",
             ".DevContainer/devcontainer.json",
-            "Evals/Cases/happy-path-001/case.toml",
-            "Harness/Src/Protected.rs",
-            "Harness/SRC/Auditor/mod.rs",
             ".GitAttributes",
             ".GITMODULES",
-            "harness/src/SCOPE.rs",
             "codeowners",
             "Docs/CodeOwners",
             "Windows.TOML",
@@ -672,7 +960,7 @@ mod tests {
                 (".github/workflows /ci.yml", ".github/workflows/**"),
                 (".nanna /agents/x.toml", ".nanna/**"),
                 ("crates/api/.nanna./x.toml", "**/.nanna/**"),
-                ("harness/src/protected.rs.", "harness/src/protected.rs"),
+                ("AGENTS.md.", "AGENTS.md"),
                 (".git./config", ".git/**"),
             ] {
                 assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
@@ -750,8 +1038,8 @@ mod tests {
                 ("NANNA~1/agents/x.toml", ".nanna/**"),
                 ("crates/NANNA~1/x.toml", "**/.nanna/**"),
                 ("GIT~1/config", ".git/**"),
-                ("HARNES~1/src/PROTEC~1.RS", "harness/src/protected.rs"),
-                ("harness/SRC/PROTEC~1.RS", "harness/src/protected.rs"),
+                ("DEVCON~1/devcontainer.json", ".devcontainer/**"),
+                ("docs/CODEOW~1", "docs/CODEOWNERS"),
                 ("FL1A2B~1.NIX", "flake.nix"),
                 ("CO3F9A~2.YML", "codecov.yml"),
                 ("CLAUDE~1.MD", "CLAUDE.md"),
@@ -844,6 +1132,55 @@ mod tests {
             "nanna/agents/x.toml",
             "codecov.yml.bak",
             "docs/windows.toml",
+            "harness/src/pr_tool.rs",
+            "harness/src/pr_tools.rs.bak",
+            "harness/src/pr_tools",
+            "other/harness/src/pr_tools.rs",
+            "harness/pr_tools.rs",
+            "docs/pr-lifecycle-tools.md.bak",
+            "docs/other/pr-lifecycle-tools.md",
+            "docs/pr-lifecycle-tool.md",
+            "harness/src/budget.rs.bak",
+            "harness/src/budget",
+            "other/harness/src/budget.rs",
+            "harness/budget.rs",
+            "harness/src/budgets.rs",
+            "harness/src/ci_tools.rs.bak",
+            "other/harness/src/ci_tools.rs",
+            "harness/src/ci_toolsx.rs",
+            "harness/src/ci_policy.rs.bak",
+            "other/harness/src/ci_policy.rs",
+            "harness/src/ci_policyx.rs",
+            "harness/src/ci_integrity.rs.bak",
+            "other/harness/src/ci_integrity.rs",
+            "harness/src/ci_integrityx.rs",
+            "harness/src/deploy/template.rs.bak",
+            "other/harness/src/deploy/template.rs",
+            "harness/src/deploy/templatex.rs",
+            "harness/src/sandbox_tools.rs.bak",
+            "other/harness/src/sandbox_tools.rs",
+            "harness/src/sandbox_toolsx.rs",
+            "harness/tests/spawn_gate_structural.rs.bak",
+            "other/harness/tests/spawn_gate_structural.rs",
+            "harness/tests/protected_audit_hook_structural.rs.bak",
+            "other/harness/tests/protected_audit_hook_structural.rs",
+            "harness/tests/escalation_sinks_structural.rs.bak",
+            "other/harness/tests/escalation_sinks_structural.rs",
+            "harness/tests/fixtures/identities/global/auditor.toml.bak",
+            "other/harness/tests/fixtures/identities/global/auditor.toml",
+            "harness/tests/fixtures/identities/global/prompts/auditor.md.bak",
+            "other/harness/tests/fixtures/identities/global/prompts/auditor.md",
+            "harness/tests/fixtures/one_track/catalog/auditor.toml.bak",
+            "other/harness/tests/fixtures/one_track/catalog/auditor.toml",
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md.bak",
+            "other/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/planner_structural.rs.bak",
+            "other/harness/tests/planner_structural.rs",
+            "harness/src/pr_tool.rs",
+            "harness/src/pr_tools.rs.bak",
+            "harness/src/pr_tools",
+            "other/harness/src/pr_tools.rs",
+            "harness/pr_tools.rs",
             ".nannax/agents/x.toml",
             "evals/datasets/x.json",
             "docs/AGENTS.md",
@@ -993,14 +1330,10 @@ mod tests {
                 PathBuf::from(".cargo"),
                 PathBuf::from(".devcontainer"),
                 PathBuf::from("AGENTS.md"),
-                PathBuf::from("evals/cases"),
-                PathBuf::from("harness/src/protected.rs"),
                 PathBuf::from(".gitattributes"),
                 PathBuf::from(".gitmodules"),
-                PathBuf::from("harness/src/scope.rs"),
                 PathBuf::from("CODEOWNERS"),
                 PathBuf::from("docs/CODEOWNERS"),
-                PathBuf::from("harness/src/auditor"),
                 PathBuf::from(".github"),
                 PathBuf::from(".cargo-husky"),
                 PathBuf::from(".envrc"),
@@ -1008,30 +1341,6 @@ mod tests {
                 PathBuf::from(".claude"),
                 PathBuf::from("nix"),
                 PathBuf::from("CLAUDE.md"),
-                PathBuf::from("docs/ci/protected-paths-guard.yml"),
-                PathBuf::from("harness/src/workspace.rs"),
-                PathBuf::from("harness/src/tools.rs"),
-                PathBuf::from("harness/src/marker.rs"),
-                PathBuf::from("harness/src/identity"),
-                PathBuf::from("harness/src/action_auditor"),
-                PathBuf::from("harness/src/windows.rs"),
-                PathBuf::from("harness/src/capabilities.rs"),
-                PathBuf::from("harness/src/container.rs"),
-                PathBuf::from("harness/src/harness_adapter/isolation.rs"),
-                PathBuf::from("harness/src/harness_adapter/checked.rs"),
-                PathBuf::from("scripts"),
-                PathBuf::from("tests/security"),
-                PathBuf::from("tests/lib"),
-                PathBuf::from("tests/run-all-tests.sh"),
-                PathBuf::from("harness/dev-container.toml"),
-                PathBuf::from("harness/src/rollout/executor.rs"),
-                PathBuf::from("harness/src/rollout/hooks.rs"),
-                PathBuf::from("harness/src/rollout/serverless.rs"),
-                PathBuf::from("harness/src/rollout/state.rs"),
-                PathBuf::from("harness/src/effects.rs"),
-                PathBuf::from("harness/src/leases"),
-                PathBuf::from("auto-issue-pr.sh"),
-                PathBuf::from("test-agentic-security.sh"),
                 PathBuf::from("cfg"),
             ]
         );
@@ -1059,14 +1368,10 @@ mod tests {
                 (".cargo".to_string(), true),
                 (".devcontainer".to_string(), true),
                 ("AGENTS.md".to_string(), false),
-                ("evals/cases".to_string(), true),
-                ("harness/src/protected.rs".to_string(), false),
                 (".gitattributes".to_string(), false),
                 (".gitmodules".to_string(), false),
-                ("harness/src/scope.rs".to_string(), false),
                 ("CODEOWNERS".to_string(), false),
                 ("docs/CODEOWNERS".to_string(), false),
-                ("harness/src/auditor".to_string(), true),
                 (".github".to_string(), true),
                 (".cargo-husky".to_string(), true),
                 (".envrc".to_string(), false),
@@ -1074,33 +1379,6 @@ mod tests {
                 (".claude".to_string(), true),
                 ("nix".to_string(), true),
                 ("CLAUDE.md".to_string(), false),
-                ("docs/ci/protected-paths-guard.yml".to_string(), false),
-                ("harness/src/workspace.rs".to_string(), false),
-                ("harness/src/tools.rs".to_string(), false),
-                ("harness/src/marker.rs".to_string(), false),
-                ("harness/src/identity".to_string(), true),
-                ("harness/src/action_auditor".to_string(), true),
-                ("harness/src/windows.rs".to_string(), false),
-                ("harness/src/capabilities.rs".to_string(), false),
-                ("harness/src/container.rs".to_string(), false),
-                (
-                    "harness/src/harness_adapter/isolation.rs".to_string(),
-                    false
-                ),
-                ("harness/src/harness_adapter/checked.rs".to_string(), false),
-                ("scripts".to_string(), true),
-                ("tests/security".to_string(), true),
-                ("tests/lib".to_string(), true),
-                ("tests/run-all-tests.sh".to_string(), false),
-                ("harness/dev-container.toml".to_string(), false),
-                ("harness/src/rollout/executor.rs".to_string(), false),
-                ("harness/src/rollout/hooks.rs".to_string(), false),
-                ("harness/src/rollout/serverless.rs".to_string(), false),
-                ("harness/src/rollout/state.rs".to_string(), false),
-                ("harness/src/effects.rs".to_string(), false),
-                ("harness/src/leases".to_string(), true),
-                ("auto-issue-pr.sh".to_string(), false),
-                ("test-agentic-security.sh".to_string(), false),
             ]
         );
     }
@@ -1329,33 +1607,6 @@ mod tests {
         }
 
         #[test]
-        fn trailing_dots_spaces_and_stream_suffixes_are_caught_by_the_guard() {
-            let repo = repo_changing(
-                &[
-                    "flake.nix.",
-                    "codecov.yml ",
-                    ".github./workflows/ci.yml",
-                    "deny.toml:stream",
-                    "crates/api/.nanna ./x.toml",
-                ],
-                "work",
-            );
-            let stderr = stderr(&enforce(&repo, "", "stranger", "owner"));
-            for expected in [
-                "  - flake.nix. (rule: flake.nix)",
-                "  - codecov.yml  (rule: codecov.yml)",
-                "  - .github./workflows/ci.yml (rule: .github/workflows/**)",
-                "  - deny.toml:stream (rule: deny.toml)",
-                "  - crates/api/.nanna ./x.toml (rule: **/.nanna/**)",
-            ] {
-                assert!(
-                    stderr.contains(expected),
-                    "{expected} missing from:\n{stderr}"
-                );
-            }
-        }
-
-        #[test]
         fn ordinary_names_with_dots_spaces_or_colons_still_pass_the_guard() {
             let repo = repo_changing(&["src/main.rs.", "docs/a b.md", "notes:flake.nix"], "work");
             let output = enforce(&repo, "rust-implementer", "stranger", "");
@@ -1404,6 +1655,452 @@ mod tests {
             assert_eq!(written, "name=from-body\n");
             let (_, written) = detect(&plain, &plain.base, &plain.head, "no marker here");
             assert_eq!(written, "name=\n");
+        }
+    }
+
+    mod extras {
+        use super::*;
+
+        fn declared(globs: &[&str]) -> ProtectedExtras {
+            let quoted: Vec<String> = globs.iter().map(|g| format!("{g:?}")).collect();
+            ProtectedExtras::parse(&format!("extra = [{}]", quoted.join(", "))).unwrap()
+        }
+
+        fn with(globs: &[&str]) -> ProtectedPaths {
+            ProtectedPaths::with_extras(Path::new("/repo"), None, &declared(globs))
+        }
+
+        fn write_declaration(base: &Path, body: &[u8]) {
+            std::fs::create_dir_all(base.join(".nanna")).unwrap();
+            std::fs::write(base.join(EXTRAS_FILE), body).unwrap();
+        }
+
+        #[test]
+        fn a_declared_list_is_read_in_order() {
+            let extras = declared(&["src/gate.rs", "scripts/**"]);
+            assert_eq!(extras.globs(), ["src/gate.rs", "scripts/**"]);
+        }
+
+        #[test]
+        fn an_empty_file_or_an_empty_list_declares_nothing() {
+            assert!(ProtectedExtras::parse("").unwrap().globs().is_empty());
+            assert!(ProtectedExtras::parse("extra = []")
+                .unwrap()
+                .globs()
+                .is_empty());
+        }
+
+        #[test]
+        fn an_absent_declaration_declares_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap(),
+                ProtectedExtras::default()
+            );
+        }
+
+        #[test]
+        fn a_present_declaration_is_loaded_from_the_base_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), b"extra = [\"src/gate.rs\"]\n");
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap().globs(),
+                ["src/gate.rs"]
+            );
+        }
+
+        #[test]
+        fn unknown_keys_are_rejected_at_every_level() {
+            for text in [
+                "extras = [\"a\"]",
+                "extra = [\"a\"]\nremove = [\".git/**\"]",
+                "[extra]\nsrc = \"a\"",
+                "[other]\nextra = [\"a\"]",
+            ] {
+                let err = ProtectedExtras::parse(text).unwrap_err();
+                assert!(matches!(err, ProtectedConfigError::Malformed(_)), "{text}");
+            }
+        }
+
+        #[test]
+        fn malformed_toml_and_wrong_types_are_rejected() {
+            for text in [
+                "extra = [",
+                "extra = \"src/gate.rs\"",
+                "extra = [1]",
+                "extra = [[\"a\"]]",
+                "= 3",
+            ] {
+                let err = ProtectedExtras::parse(text).unwrap_err();
+                assert!(matches!(err, ProtectedConfigError::Malformed(_)), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_malformed_file_on_disk_fails_to_load() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), b"extra = [");
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Malformed(_))
+            ));
+        }
+
+        #[test]
+        fn a_non_utf8_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), &[0xff, 0xfe, 0x00]);
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn a_directory_in_place_of_the_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(EXTRAS_FILE)).unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_symlink_in_place_of_the_file_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("elsewhere.toml");
+            std::fs::write(&target, "extra = []").unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::os::unix::fs::symlink(&target, dir.path().join(EXTRAS_FILE)).unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn a_base_that_is_not_a_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("plain");
+            std::fs::write(&file, "x").unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(&file),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn an_absent_declaration_under_a_base_that_is_not_a_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("plain");
+            std::fs::write(&file, "x").unwrap();
+            assert!(ProtectedExtras::absent(&file).is_err());
+            assert!(ProtectedExtras::absent(dir.path()).is_ok());
+        }
+
+        fn padded_to(len: usize) -> String {
+            let head = "extra = [\"src/gate.rs\"]\n";
+            format!("{head}{}", "\n".repeat(len - head.len()))
+        }
+
+        fn with_entries(count: usize) -> String {
+            let entries: Vec<String> = (0..count).map(|i| format!("\"p{i}\"")).collect();
+            format!("extra = [{}]", entries.join(", "))
+        }
+
+        #[test]
+        fn a_file_of_exactly_the_size_cap_loads_and_one_byte_more_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), padded_to(MAX_EXTRAS_BYTES).as_bytes());
+            assert_eq!(
+                ProtectedExtras::load(dir.path()).unwrap().globs(),
+                ["src/gate.rs"]
+            );
+            write_declaration(dir.path(), padded_to(MAX_EXTRAS_BYTES + 1).as_bytes());
+            assert_eq!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::TooLarge)
+            );
+            assert!(ProtectedConfigError::TooLarge
+                .to_string()
+                .contains("65536 bytes"));
+        }
+
+        #[test]
+        fn text_over_the_size_cap_is_refused_by_parse_too() {
+            assert!(ProtectedExtras::parse(&padded_to(MAX_EXTRAS_BYTES)).is_ok());
+            assert_eq!(
+                ProtectedExtras::parse(&padded_to(MAX_EXTRAS_BYTES + 1)),
+                Err(ProtectedConfigError::TooLarge)
+            );
+        }
+
+        struct Endless(std::rc::Rc<std::cell::Cell<usize>>);
+
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(b' ');
+                self.0.set(self.0.get() + buf.len());
+                Ok(buf.len())
+            }
+        }
+
+        struct Broken;
+
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("device failure"))
+            }
+        }
+
+        #[test]
+        fn a_reader_that_fails_midway_is_an_error_not_an_empty_declaration() {
+            let err = read_bounded(Broken).unwrap_err();
+            assert_eq!(err.to_string(), "device failure");
+        }
+
+        #[test]
+        fn the_reader_stops_one_byte_past_the_cap_however_much_more_is_available() {
+            let served = std::rc::Rc::new(std::cell::Cell::new(0));
+            let text = read_bounded(Endless(served.clone())).unwrap();
+            assert_eq!(text.len(), MAX_EXTRAS_BYTES + 1);
+            assert_eq!(served.get(), MAX_EXTRAS_BYTES + 1);
+        }
+
+        #[test]
+        fn a_file_far_over_the_size_cap_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            write_declaration(dir.path(), &vec![b'\n'; MAX_EXTRAS_BYTES * 4]);
+            assert_eq!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::TooLarge)
+            );
+        }
+
+        #[test]
+        fn exactly_the_entry_cap_is_accepted_and_one_more_is_refused() {
+            let at_cap = ProtectedExtras::parse(&with_entries(MAX_EXTRAS_ENTRIES)).unwrap();
+            assert_eq!(at_cap.globs().len(), MAX_EXTRAS_ENTRIES);
+            let err = ProtectedExtras::parse(&with_entries(MAX_EXTRAS_ENTRIES + 1)).unwrap_err();
+            assert_eq!(
+                err,
+                ProtectedConfigError::TooManyEntries {
+                    count: MAX_EXTRAS_ENTRIES + 1
+                }
+            );
+            assert!(err.to_string().contains("257 patterns"));
+            assert!(err.to_string().contains("256 allowed"));
+        }
+
+        #[test]
+        fn a_file_in_place_of_the_config_directory_is_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".nanna"), "x").unwrap();
+            assert!(matches!(
+                ProtectedExtras::load(dir.path()),
+                Err(ProtectedConfigError::Unreadable(_))
+            ));
+        }
+
+        #[test]
+        fn patterns_that_cannot_be_mounted_or_matched_literally_are_rejected() {
+            for pattern in [
+                "",
+                "/etc/passwd",
+                "../outside",
+                "a/../b",
+                "./a",
+                "a/./b",
+                "a//b",
+                "a\\b",
+                "!a",
+                "a/",
+                "*",
+                "**",
+                "**/a",
+                "src/*.rs",
+                "src/?.rs",
+                "src/[ab].rs",
+                "src/{a,b}.rs",
+                "a/**/b",
+                "/**",
+                "src/**/",
+                "a\nb",
+            ] {
+                let text = format!("extra = [{pattern:?}]");
+                let err = ProtectedExtras::parse(&text).unwrap_err();
+                assert!(
+                    matches!(&err, ProtectedConfigError::InvalidPattern { pattern: p, .. } if p == pattern),
+                    "{pattern:?}: {err:?}"
+                );
+                assert!(err.to_string().contains(".nanna/protected.toml"));
+            }
+        }
+
+        #[test]
+        fn literal_files_and_recursive_directories_are_accepted() {
+            let extras = declared(&["a", "a/b.rs", "dir/**", "dir/sub/**", "weird name.txt"]);
+            assert_eq!(extras.globs().len(), 5);
+        }
+
+        #[test]
+        fn declared_patterns_protect_files_and_directories_case_insensitively() {
+            let protected = with(&["src/gate.rs", "tools/**"]);
+            let violation = protected.check(Path::new("src/gate.rs")).unwrap_err();
+            assert_eq!(violation.rule, "src/gate.rs");
+            assert!(protected.is_protected(Path::new("SRC/Gate.rs")));
+            assert!(protected.is_protected(Path::new("tools")));
+            assert!(protected.is_protected(Path::new("tools/deep/file.sh")));
+            assert!(!protected.is_protected(Path::new("src/other.rs")));
+            assert!(!protected.is_protected(Path::new("toolsmith/file.sh")));
+        }
+
+        #[test]
+        fn without_a_declaration_the_same_paths_are_unprotected() {
+            let bare = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            assert!(!bare.is_protected(Path::new("src/gate.rs")));
+            assert!(!bare.is_protected(Path::new("tools/deep/file.sh")));
+        }
+
+        #[test]
+        fn declarations_only_add_never_remove_a_shipped_rule() {
+            let config = Path::new("/repo/home/cfg");
+            let hostile = declared(&["src/gate.rs", ".nanna/protected.toml", "home/cfg/x"]);
+            let protected = ProtectedPaths::with_extras(Path::new("/repo"), Some(config), &hostile);
+            for (rule, path) in EXAMPLES {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert_eq!(violation.rule, *rule, "{path}");
+            }
+            assert!(protected.is_protected(Path::new("home/cfg/agents/x.toml")));
+            let rules = protected.rules();
+            for pattern in PROTECTED_PATTERNS {
+                assert!(rules.contains(pattern), "{pattern}");
+            }
+            assert!(rules.contains(&"home/cfg/**"));
+            assert_eq!(&rules[..PROTECTED_PATTERNS.len()], PROTECTED_PATTERNS);
+        }
+
+        #[test]
+        fn declared_rules_follow_the_shipped_and_config_dir_rules() {
+            let extras = declared(&["src/gate.rs"]);
+            let protected = ProtectedPaths::with_extras(
+                Path::new("/repo"),
+                Some(Path::new("/repo/cfg")),
+                &extras,
+            );
+            let rules = protected.rules();
+            assert_eq!(rules.len(), PROTECTED_PATTERNS.len() + 2);
+            assert_eq!(rules[PROTECTED_PATTERNS.len()], "cfg/**");
+            assert_eq!(rules[PROTECTED_PATTERNS.len() + 1], "src/gate.rs");
+        }
+
+        #[test]
+        fn declared_patterns_become_mount_roots() {
+            let protected = with(&["src/gate.rs", "tools/**", "tools/inner/**"]);
+            let targets = protected.mount_targets();
+            let find = |path: &str| targets.iter().find(|t| t.path == Path::new(path));
+            assert!(!find("src/gate.rs").unwrap().directory);
+            assert!(find("tools").unwrap().directory);
+            assert!(find("tools/inner").is_none());
+        }
+
+        #[test]
+        fn for_repo_with_extras_keeps_the_catalog_config_dir() {
+            let extras = declared(&["src/gate.rs"]);
+            let protected = ProtectedPaths::for_repo_with_extras(Path::new("/repo"), &extras);
+            let expected = IdentityCatalog::default_global_dir()
+                .and_then(|d| d.parent().map(Path::to_path_buf));
+            assert_eq!(protected.config_dir(), expected.as_deref());
+            assert!(protected.is_protected(Path::new("src/gate.rs")));
+            assert!(protected.is_protected(Path::new(".nanna/agents/x.toml")));
+        }
+
+        fn alias_declaration() -> ProtectedPaths {
+            with(&["tools/release-helper.sh", "gate/**", "src/lib.rs"])
+        }
+
+        fn rule_of(protected: &ProtectedPaths, path: &str) -> Option<String> {
+            protected.check(Path::new(path)).err().map(|v| v.rule)
+        }
+
+        #[test]
+        fn trailing_dots_spaces_and_streams_fold_onto_a_declared_path() {
+            let protected = alias_declaration();
+            for (path, rule) in [
+                ("tools/release-helper.sh.", "tools/release-helper.sh"),
+                ("tools/release-helper.sh ", "tools/release-helper.sh"),
+                ("TOOLS./Release-Helper.SH. .", "tools/release-helper.sh"),
+                ("src/lib.rs::$DATA", "src/lib.rs"),
+                ("src/lib.rs:stream", "src/lib.rs"),
+                ("gate./x.rs", "gate/**"),
+                ("gate /sub/x.rs", "gate/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_of_declared_paths_are_refused() {
+            let protected = alias_declaration();
+            for (path, rule) in [
+                ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+                ("tools/RE3F9A~1.SH", "tools/release-helper.sh"),
+                ("TOOLS/relea~12.sh", "tools/release-helper.sh"),
+                ("gate~1/x.rs", "gate/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_that_cannot_alias_a_declared_path_are_allowed() {
+            let protected = alias_declaration();
+            for path in [
+                "tools/OTHER~1.SH",
+                "tools/RELEAS~1.TXT",
+                "src/RELEAS~1.SH",
+                "tools/release-helper.sh.bak",
+                "tools/release-helper.shx",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn without_a_declaration_the_same_aliases_are_unprotected() {
+            let protected = with(&[]);
+            for path in [
+                "tools/release-helper.sh.",
+                "tools/RELEAS~1.SH",
+                "src/lib.rs::$DATA",
+                "gate~1/x.rs",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_declared_alias_violation_reports_the_written_spelling_and_the_declared_glob() {
+            let protected = alias_declaration();
+            let violation = protected.check(Path::new("tools/RELEAS~1.SH")).unwrap_err();
+            assert_eq!(violation.path, "tools/RELEAS~1.SH");
+            assert_eq!(violation.rule, "tools/release-helper.sh");
+        }
+
+        #[test]
+        fn a_declared_path_with_a_trailing_dot_still_matches_as_written() {
+            let protected = with(&["docs/notes."]);
+            assert!(protected.is_protected(Path::new("docs/notes.")));
+        }
+
+        #[test]
+        fn too_many_short_name_spellings_of_a_declared_path_fail_closed() {
+            let protected = with(&["tools/release-helper.sh"]);
+            let many = ["RELEAS~1.SH"; 11].join("/");
+            let violation = protected.check(Path::new(&many)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
         }
     }
 }

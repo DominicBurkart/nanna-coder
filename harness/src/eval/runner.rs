@@ -29,7 +29,7 @@ use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, S
 use crate::eval::swebench_verify::{
     verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
 };
-use crate::tools::create_tool_registry;
+use crate::tools::create_tool_registry_in_checkout;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,8 @@ pub enum EvalRunnerError {
     Agent(#[from] crate::agent::AgentError),
     #[error("Eval case error: {0}")]
     EvalCase(#[from] EvalCaseError),
+    #[error("Refusing to start the agent: {0}")]
+    ProtectedConfig(#[from] crate::protected::ProtectedConfigError),
     #[error("Model provider error: {0}")]
     ModelProvider(String),
     #[error("Timeout after {0:?}")]
@@ -410,7 +412,7 @@ async fn run_agent_in_process(
         model_name: config.model_name.clone(),
     };
 
-    let tool_registry = create_tool_registry(work_dir);
+    let tool_registry = create_tool_registry_in_checkout(work_dir)?;
     let entity_store = crate::entities::InMemoryEntityStore::new();
 
     // Create LLM provider so the agent uses the tool-calling loop
@@ -3313,6 +3315,21 @@ timeout_secs = 5
             resolved,
             PathBuf::from("/tmp/evals/datasets/swebench-verified-sample.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn run_agent_in_process_refuses_a_bad_protected_declaration_in_the_work_dir() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work_dir.path().join(".nanna")).unwrap();
+        std::fs::write(work_dir.path().join(".nanna/protected.toml"), "extra = [").unwrap();
+        let outcome = run_agent_in_process(
+            work_dir.path(),
+            &sample_eval_case(),
+            &EvalRunnerConfig::default(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(outcome, Err(EvalRunnerError::ProtectedConfig(_))));
     }
 
     fn sample_eval_case() -> EvalCase {

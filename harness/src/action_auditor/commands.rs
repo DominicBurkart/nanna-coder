@@ -5313,16 +5313,14 @@ mod tests {
     fn removing_or_moving_an_ancestor_of_a_protected_path_is_refused() {
         refuse_all(
             &[
-                "rm -rf harness",
-                "rm -rf harness/src",
-                "rm -rf harness/src/rollout",
                 "rm -rf docs",
-                "rm -rf tests",
                 "rm -rf .github",
-                "mv harness x",
-                "mv harness/src x",
-                "chmod -R 000 harness",
-                "chmod -R 000 harness/src",
+                "rm -rf .github/workflows",
+                "rm -rf .cargo",
+                "mv .github x",
+                "mv docs x",
+                "chmod -R 000 .github",
+                "chmod -R 000 .cargo",
             ],
             "protected path",
         );
@@ -5330,7 +5328,10 @@ mod tests {
             "rm -rf target",
             "rm target/debug/x",
             "rm -rf build",
-            "rm -rf harness/tests",
+            "rm -rf harness",
+            "rm -rf harness/src/rollout",
+            "rm -rf tests",
+            "mv harness x",
             "mv a b",
             "chmod -R 755 src",
         ]);
@@ -7030,13 +7031,13 @@ mod tests {
         blocked("echo x > flake.nix:stream", "protected path");
         blocked("echo x > .github./workflows/ci.yml", "protected path");
         blocked("rm -rf GITHUB~1", "protected path");
-        blocked("rm -rf HARNES~1", "protected path");
-        blocked("rm -rf HARNES~1/src", "protected path");
-        blocked("rm -rf harness.", "protected path");
+        blocked("rm -rf DEVCON~1", "protected path");
+        blocked("rm -rf DEVCON~1/x", "protected path");
+        blocked("rm -rf nix.", "protected path");
         blocked(
             "rm -rf src/G~1/G~1/G~1/G~1/G~1/G~1/G~1/G~1/x",
             "protected path",
         );
-        blocked("mv 'harness ' x", "protected path");
+        blocked("mv 'nix ' x", "protected path");
     }
 }
