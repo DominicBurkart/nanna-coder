@@ -2403,6 +2403,91 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn objects_are_hardlinked(repo: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir(repo.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|dir| dir.file_name().len() == 2)
+            .flat_map(|dir| std::fs::read_dir(dir.path()).unwrap().flatten())
+            .any(|object| object.metadata().unwrap().nlink() > 1)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_workspace_of_a_local_clone_with_hardlinked_objects_has_no_false_refusals() {
+        use crate::effects::EffectClass;
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let clone_parent = TempDir::new().unwrap();
+        let clone = clone_parent.path().join("clone");
+        let out = git_cmd(clone_parent.path())
+            .args(["clone", "-q"])
+            .arg(origin.path())
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(objects_are_hardlinked(&clone));
+        let mut ws = TaskWorkspace::create(&clone, &unique_id("ws-clone"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        for registry in [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ] {
+            let ok = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "src/ordinary.rs", "content": "fn main() {}" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            let overwrite = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "README.md", "content": "# changed" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(overwrite["success"], true);
+        }
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("src/ordinary.rs"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_hardlink_to_a_symlink_is_refused_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-hl"), "HEAD").unwrap();
+        let link = ws.workspace_path.join("link-one");
+        std::os::unix::fs::symlink("README.md", &link).unwrap();
+        std::fs::hard_link(&link, ws.workspace_path.join("link-two")).unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_symlink_to_a_multiply_linked_file_is_judged_by_the_target_not_the_symlink() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-t"), "HEAD").unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared.txt");
+        std::fs::write(&target, "shared").unwrap();
+        std::fs::hard_link(&target, outside.path().join("other.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, ws.workspace_path.join("only-a-symlink")).unwrap();
+        assert!(ws.extract_changes().unwrap().contains("only-a-symlink"));
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn test_format_patch_refuses_a_hardlinked_path_and_commits_nothing() {
         let source = TempDir::new().unwrap();

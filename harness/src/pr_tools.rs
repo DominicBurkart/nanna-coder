@@ -1984,12 +1984,17 @@ impl GitCommitTool {
     }
 }
 
+fn hardlinked_in_worktree(workspace_root: &Path, relative: &str) -> bool {
+    std::fs::symlink_metadata(workspace_root.join(relative))
+        .is_ok_and(|metadata| crate::protected::is_hardlinked(&metadata))
+}
+
 #[async_trait]
 impl Tool for GitCommitTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "git_commit",
-            "Commit the working tree changes on the current branch with this identity's Nanna-Identity trailer appended to the message. Refuses the default or a protected branch and any tracked or staged change to a protected path; untracked protected paths are left out of the commit and reported.",
+            "Commit the working tree changes on the current branch with this identity's Nanna-Identity trailer appended to the message. Refuses the default or a protected branch, any tracked or staged change to a protected path and any changed file that has other hard links; untracked protected paths are left out of the commit and reported.",
             object_schema(
                 vec![
                     (
@@ -2035,6 +2040,13 @@ impl Tool for GitCommitTool {
                     escaped(&entry.path)
                 )));
             } else if entry.worktree != b' ' {
+                if hardlinked_in_worktree(&self.workspace_root, &entry.path) {
+                    return Err(failed(format!(
+                        "refusing to commit: '{}' has other hard links ({})",
+                        escaped(&entry.path),
+                        crate::protected::HARDLINK_RULE
+                    )));
+                }
                 to_stage.push(format!(":(literal){}", entry.path));
             }
         }
@@ -5082,6 +5094,137 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_an_untracked_hardlink_to_a_repo_declared_file() {
+        let dir = feature_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/gate.rs"), "original").unwrap();
+        std::fs::hard_link(dir.path().join("src/gate.rs"), dir.path().join("alias.txt")).unwrap();
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(declared_extras());
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(
+            err.to_string().contains(crate::protected::HARDLINK_RULE),
+            "{err}"
+        );
+        assert_eq!(head_sha(dir.path()), before);
+        assert!(run_git(dir.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_a_hardlink_reached_through_a_folded_spelling() {
+        for name in ["cafe\u{301}-x.txt.", "tools/RELEAS~1.SH", "plain.txt"] {
+            let dir = feature_repo();
+            let original = dir.path().join("keep.bin");
+            std::fs::write(&original, "original").unwrap();
+            let linked = dir.path().join(name);
+            std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+            std::fs::hard_link(&original, &linked).unwrap();
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+                .with_protected(combined_declared());
+            let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+            assert!(
+                err.to_string().contains("has other hard links"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_a_modified_tracked_file_whose_inode_is_shared() {
+        let dir = feature_repo();
+        commit_file(dir.path(), "shared.txt", "a\n", "base");
+        std::fs::hard_link(dir.path().join("shared.txt"), dir.path().join("zz.txt")).unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "b\n").unwrap();
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+        assert_eq!(head_sha(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_registered_commit_tool_refuses_a_hardlink_to_a_declared_file() {
+        let identity = granted_identity();
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-hl"]);
+        std::fs::create_dir_all(fixture.work.path().join("ci")).unwrap();
+        std::fs::write(fixture.work.path().join("ci/deploy.sh"), "original").unwrap();
+        std::fs::hard_link(
+            fixture.work.path().join("ci/deploy.sh"),
+            fixture.work.path().join("alias.sh"),
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        register_guarded(
+            &mut registry,
+            fixture.work.path(),
+            &identity,
+            &declared_extras(),
+        );
+        let commit = registry.get_tool("git_commit").unwrap();
+        let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_judges_a_symlink_itself_and_not_the_file_it_points_at() {
+        let dir = feature_repo();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared.txt");
+        std::fs::write(&target, "shared").unwrap();
+        std::fs::hard_link(&target, outside.path().join("other.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("only-a-symlink")).unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+        std::os::unix::fs::symlink("README.md", dir.path().join("one")).unwrap();
+        std::fs::hard_link(dir.path().join("one"), dir.path().join("two")).unwrap();
+        let err = tool.execute(json!({ "subject": "y" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_in_a_fresh_local_clone_with_hardlinked_objects_is_not_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = push_fixture();
+        let parent = TempDir::new().unwrap();
+        let clone = parent.path().join("clone");
+        git(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                fixture.work.path().to_str().unwrap(),
+                "clone",
+            ],
+        );
+        git(&clone, &["config", "user.email", "test@example.com"]);
+        git(&clone, &["config", "user.name", "Test User"]);
+        git(&clone, &["checkout", "-q", "-b", "feature-clone"]);
+        let linked = std::fs::read_dir(clone.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|dir| dir.file_name().len() == 2)
+            .flat_map(|dir| std::fs::read_dir(dir.path()).unwrap().flatten())
+            .any(|object| object.metadata().unwrap().nlink() > 1);
+        assert!(linked);
+        std::fs::write(clone.join("README.md"), "changed\n").unwrap();
+        std::fs::write(clone.join("new.txt"), "new\n").unwrap();
+        let tool = GitCommitTool::new(clone.clone(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
     }
 
     fn granted_identity() -> crate::identity::AgentIdentity {

@@ -5127,6 +5127,44 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_symlink_to_a_multiply_linked_file_is_refused_by_the_target_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            std::os::unix::fs::symlink("a.txt", dir.path().join("sym")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "sym", "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hardlink_to_a_symlink_writes_to_the_single_link_target() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("target.txt"), "old").unwrap();
+            std::os::unix::fs::symlink("target.txt", dir.path().join("sym")).unwrap();
+            std::fs::hard_link(dir.path().join("sym"), dir.path().join("sym-two")).unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sym-two", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
         async fn a_directory_target_is_an_io_error_and_is_left_alone() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("occupied")).unwrap();
