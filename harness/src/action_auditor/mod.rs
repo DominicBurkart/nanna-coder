@@ -28,6 +28,7 @@
 
 mod commands;
 mod context;
+mod export;
 mod gate;
 mod llm;
 mod log;
@@ -36,6 +37,7 @@ mod rules;
 mod verdict;
 
 pub use context::ActionContext;
+pub use export::{ActionAuditEvent, ActionAuditSink, NullSink, TelemetrySink};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{ActionAuditLog, ActionAuditLogEntry};

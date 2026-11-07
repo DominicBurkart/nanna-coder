@@ -6,7 +6,7 @@ use harness::identity::IdentityCatalog;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // NOTE: `main.rs` binds the workspace entity store to `InMemoryEntityStore`
 // concretely today, but the downstream callers accept any `EntityStore` via
@@ -415,8 +415,24 @@ enum DeployCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+const RUNTIME_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn run_to_completion<F: std::future::Future>(
+    runtime: tokio::runtime::Runtime,
+    future: F,
+    limit: std::time::Duration,
+) -> F::Output {
+    let outcome = runtime.block_on(future);
+    runtime.shutdown_timeout(limit);
+    outcome
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    run_to_completion(runtime, run(), RUNTIME_SHUTDOWN_LIMIT)
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -1792,6 +1808,120 @@ fn build_delegate_task_manager(
     )
 }
 
+const TELEMETRY_FILE: &str = "telemetry.jsonl";
+const DELEGATE_TELEMETRY_FILE: &str = "telemetry-delegate.jsonl";
+const TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const TELEMETRY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn export_action_audit(
+    gate: &harness::action_auditor::ActionGate,
+    path: std::path::PathBuf,
+) -> std::sync::Arc<harness::telemetry::TelemetrySystem> {
+    use harness::action_auditor::TelemetrySink;
+    use harness::telemetry::{JsonlExporter, TelemetrySystem};
+    use std::sync::Arc;
+
+    let exporter = JsonlExporter::new(path, TELEMETRY_MAX_BYTES);
+    let system = TelemetrySystem::new()
+        .with_service_name("nanna-coder")
+        .add_exporter(Box::new(exporter));
+    let telemetry = Arc::new(system);
+    let sink = Arc::new(TelemetrySink::new(Arc::clone(&telemetry)));
+    if !gate.set_sink(sink) {
+        warn!("the action gate already had an audit sink; telemetry export is not attached");
+    }
+    telemetry
+}
+
+fn spawn_telemetry_flush(
+    telemetry: std::sync::Arc<harness::telemetry::TelemetrySystem>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        loop {
+            tick.tick().await;
+            if let Err(e) = telemetry.export_all().await {
+                warn!("telemetry export failed: {e}");
+            }
+        }
+    })
+}
+
+const TELEMETRY_FINAL_FLUSH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn finish_with_flush<T>(
+    telemetry: &std::sync::Arc<harness::telemetry::TelemetrySystem>,
+    flush: Option<tokio::task::JoinHandle<()>>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    finish_within(telemetry, flush, work, TELEMETRY_FINAL_FLUSH_LIMIT).await
+}
+
+async fn finish_within<T>(
+    telemetry: &std::sync::Arc<harness::telemetry::TelemetrySystem>,
+    flush: Option<tokio::task::JoinHandle<()>>,
+    work: impl std::future::Future<Output = T>,
+    limit: std::time::Duration,
+) -> T {
+    let outcome = work.await;
+    if let Some(flush) = flush {
+        flush.abort();
+    }
+    let runtime = tokio::runtime::Handle::current();
+    let system = std::sync::Arc::clone(telemetry);
+    let export = tokio::task::spawn_blocking(move || runtime.block_on(system.export_all()));
+    let finished = tokio::time::timeout(limit, export).await;
+    let report = match finished {
+        Ok(Ok(exported)) => exported.map_err(|e| e.to_string()),
+        Ok(Err(e)) => Err(format!("the export task failed: {e}")),
+        Err(_) => Err("the export timed out".to_string()),
+    };
+    if let Err(reason) = report {
+        warn!("telemetry export failed: {reason}");
+    }
+    outcome
+}
+
+#[cfg(unix)]
+async fn signal_arrived(kind: tokio::signal::unix::SignalKind) {
+    match tokio::signal::unix::signal(kind) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(e) => {
+            warn!("cannot listen for shutdown signal {kind:?}: {e}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_on(kinds: [tokio::signal::unix::SignalKind; 2]) {
+    let [first, second] = kinds;
+    tokio::select! {
+        _ = signal_arrived(first) => {}
+        _ = signal_arrived(second) => {}
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::SignalKind;
+    shutdown_on([SignalKind::interrupt(), SignalKind::terminate()]).await;
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {}
+        Err(e) => {
+            warn!("cannot listen for the interrupt signal: {e}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1819,6 +1949,12 @@ async fn run_mcp_server(
         .await?,
     );
 
+    let telemetry = export_action_audit(
+        &task_manager.action_gate(),
+        queue_path.with_file_name(TELEMETRY_FILE),
+    );
+    let flush = spawn_telemetry_flush(Arc::clone(&telemetry), TELEMETRY_FLUSH_EVERY);
+
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
         model,
@@ -1844,7 +1980,13 @@ async fn run_mcp_server(
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    server.serve(reader, writer).await?;
+    let serving = async {
+        tokio::select! {
+            served = server.serve(reader, writer) => served,
+            _ = shutdown_signal() => Ok(()),
+        }
+    };
+    finish_with_flush(&telemetry, Some(flush), serving).await?;
     Ok(())
 }
 
@@ -1874,55 +2016,379 @@ async fn run_delegate(
         model,
         plane.clone(),
     ));
-    let gate = delegate_spawn_gate(
-        model,
-        provider.clone() as Arc<dyn model::ModelProvider>,
-        &queue_path,
-        &load_identities(),
-        plane,
-    )?;
-    let server = Arc::new(NannaMcpServer::new(
-        task_manager,
-        provider,
-        gate,
-        max_iterations,
-    ));
+    let telemetry = export_action_audit(
+        &task_manager.action_gate(),
+        queue_path.with_file_name(DELEGATE_TELEMETRY_FILE),
+    );
+    let session = async {
+        let gate = delegate_spawn_gate(
+            model,
+            provider.clone() as Arc<dyn model::ModelProvider>,
+            &queue_path,
+            &load_identities(),
+            plane,
+        )?;
+        let server = Arc::new(NannaMcpServer::new(
+            task_manager,
+            provider,
+            gate,
+            max_iterations,
+        ));
 
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-    let (server_read, server_write) = tokio::io::split(server_side);
-    let serve_handle = tokio::spawn(async move {
-        let _ = server
-            .serve(tokio::io::BufReader::new(server_read), server_write)
-            .await;
-    });
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let serve_handle = tokio::spawn(async move {
+            let _ = server
+                .serve(tokio::io::BufReader::new(server_read), server_write)
+                .await;
+        });
 
-    let (client_read, client_write) = tokio::io::split(client_side);
-    let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
 
-    client.initialize().await?;
-    let mut arguments = serde_json::json!({
-        "description": description,
-        "repo_path": repo_path.to_string_lossy(),
-        "branch": branch,
-        "max_iterations": max_iterations,
-        "identity": identity,
-    });
-    if let Some(model) = model {
-        arguments["model"] = serde_json::json!(model);
-    }
-    let task_id = client.submit_task(arguments, ttl_ms).await?;
-    info!("Delegated task {task_id}; awaiting completion...");
+        client.initialize().await?;
+        let mut arguments = serde_json::json!({
+            "description": description,
+            "repo_path": repo_path.to_string_lossy(),
+            "branch": branch,
+            "max_iterations": max_iterations,
+            "identity": identity,
+        });
+        if let Some(model) = model {
+            arguments["model"] = serde_json::json!(model);
+        }
+        let task_id = client.submit_task(arguments, ttl_ms).await?;
+        info!("Delegated task {task_id}; awaiting completion...");
 
-    let result = client.wait_result(&task_id).await?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+        let result = client.wait_result(&task_id).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
 
-    drop(client);
-    let _ = serve_handle.await;
-    Ok(())
+        drop(client);
+        let _ = serve_handle.await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    finish_with_flush(&telemetry, None, session).await
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_action_gate_exports_its_decisions_once_a_sink_is_attached() {
+        use harness::action_auditor::{ActionContext, ActionReview};
+        use harness::effects::EffectClass;
+        use harness::task::TaskId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let manager = harness::task::TaskManager::default();
+        let telemetry = export_action_audit(&manager.action_gate(), path.clone());
+        let review = ActionReview {
+            identity: "rust-implementer".to_string(),
+            task_id: TaskId("t1".to_string()),
+            tool: "write_file".to_string(),
+            args: serde_json::json!({ "content": "sk-live-SECRET" }),
+            effect_class: EffectClass::Repository,
+            prior_actions: vec![],
+        };
+        let context = ActionContext {
+            max_effect: EffectClass::Workspace,
+            window: None,
+            lease: harness::leases::LeaseContext::default(),
+            now: chrono::Utc::now(),
+            task: "",
+        };
+        manager.action_gate().run_gate(&review, &context).await;
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nanna_action_audit_total") && text.contains("action_audit"));
+        assert!(text.contains("\"verdict\":\"block\""));
+        assert!(!text.contains("SECRET"));
+        let second = export_action_audit(&manager.action_gate(), path);
+        assert_eq!(second.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn work_that_fails_still_gets_a_final_flush_and_the_loop_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("final_flush_marker", 1.0, vec![]);
+        let hour = std::time::Duration::from_secs(3600);
+        let flush = spawn_telemetry_flush(std::sync::Arc::clone(&telemetry), hour);
+        let failing = async { Err::<(), String>("boom".to_string()) };
+        let outcome = finish_with_flush(&telemetry, Some(flush), failing).await;
+        assert_eq!(outcome, Err("boom".to_string()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("final_flush_marker").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_work_without_a_flush_task_passes_its_value_through_after_exporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("delegate_marker", 1.0, vec![]);
+        let outcome = finish_with_flush(&telemetry, None, async { 7 }).await;
+        assert_eq!(outcome, 7);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("delegate_marker"));
+        let unwritable = dir.path().join("blocked");
+        std::fs::write(&unwritable, b"x").unwrap();
+        let exporter = harness::telemetry::JsonlExporter::new(unwritable.join("t.jsonl"), 1024);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let broken = std::sync::Arc::new(system);
+        broken.record_counter("lost", 1.0, vec![]);
+        assert_eq!(finish_with_flush(&broken, None, async { 8 }).await, 8);
+    }
+
+    struct StuckExporter {
+        pause: std::time::Duration,
+        panics: bool,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl harness::telemetry::TelemetryExporter for StuckExporter {
+        async fn export_traces(
+            &self,
+            _traces: Vec<harness::telemetry::TraceContext>,
+        ) -> Result<(), harness::telemetry::TelemetryError> {
+            Ok(())
+        }
+
+        async fn export_metrics(
+            &self,
+            _metrics: Vec<harness::telemetry::MetricPoint>,
+        ) -> Result<(), harness::telemetry::TelemetryError> {
+            assert!(!self.panics, "the exporter panicked");
+            std::thread::sleep(self.pause);
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn export_events(
+            &self,
+            _events: Vec<harness::telemetry::CustomEvent>,
+        ) -> Result<(), harness::telemetry::TelemetryError> {
+            Ok(())
+        }
+
+        async fn export_system_metrics(
+            &self,
+            _metrics: harness::monitoring::SystemMetrics,
+        ) -> Result<(), harness::telemetry::TelemetryError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<bool, harness::telemetry::TelemetryError> {
+            Ok(true)
+        }
+    }
+
+    type Stuck = (
+        std::sync::Arc<harness::telemetry::TelemetrySystem>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    );
+
+    fn stuck(pause_ms: u64, panics: bool) -> Stuck {
+        let pause = std::time::Duration::from_millis(pause_ms);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exporter = StuckExporter {
+            pause,
+            panics,
+            done: std::sync::Arc::clone(&done),
+        };
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("pending", 1.0, vec![]);
+        (telemetry, done)
+    }
+
+    #[tokio::test]
+    async fn a_final_flush_that_hangs_is_abandoned_after_the_limit() {
+        let (telemetry, _) = stuck(4000, false);
+        let limit = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let outcome = finish_within(&telemetry, None, async { 5 }, limit).await;
+        assert_eq!(outcome, 5);
+        assert!(started.elapsed() < std::time::Duration::from_millis(3000));
+    }
+
+    #[tokio::test]
+    async fn a_final_flush_that_panics_does_not_lose_the_outcome() {
+        let (telemetry, _) = stuck(0, true);
+        let limit = std::time::Duration::from_secs(5);
+        let outcome = finish_within(&telemetry, None, async { 6 }, limit).await;
+        assert_eq!(outcome, 6);
+    }
+
+    #[tokio::test]
+    async fn a_final_flush_that_completes_is_not_cut_short() {
+        let (telemetry, done) = stuck(50, false);
+        let limit = std::time::Duration::from_secs(5);
+        let outcome = finish_within(&telemetry, None, async { 7 }, limit).await;
+        assert_eq!(outcome, 7);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[test]
+    fn a_hung_exporter_cannot_hold_the_process_open_past_the_runtime_limit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (telemetry, _) = stuck(12_000, false);
+        let limit = std::time::Duration::from_millis(100);
+        let finishing = finish_within(&telemetry, None, async { 3 }, limit);
+        let started = std::time::Instant::now();
+        let outcome = run_to_completion(runtime, finishing, std::time::Duration::from_millis(200));
+        assert_eq!(outcome, 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn finishing_stops_the_periodic_flush_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        let period = std::time::Duration::from_millis(20);
+        let flush = spawn_telemetry_flush(std::sync::Arc::clone(&telemetry), period);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        finish_with_flush(&telemetry, Some(flush), async {}).await;
+        telemetry.record_counter("late_marker", 1.0, vec![]);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+    }
+
+    #[test]
+    fn the_two_commands_export_to_different_files() {
+        let names = [TELEMETRY_FILE, DELEGATE_TELEMETRY_FILE];
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_at_the_export_path_cannot_hang_the_final_flush() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        let mut reader = std::fs::OpenOptions::new();
+        reader.read(true).custom_flags(libc::O_NONBLOCK);
+        let _held = reader.open(&path).unwrap();
+        telemetry.record_counter("blocked", 1.0, vec![]);
+        let limit = std::time::Duration::from_secs(10);
+        let finishing = finish_within(&telemetry, None, async { 9 }, limit);
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(3), finishing).await;
+        assert_eq!(finished.unwrap(), 9);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn either_signal_of_the_pair_ends_the_shutdown_wait() {
+        use std::future::Future;
+        use tokio::signal::unix::SignalKind;
+        let kinds = [
+            SignalKind::from_raw(libc::SIGUSR1),
+            SignalKind::from_raw(libc::SIGUSR2),
+        ];
+        for signal in [libc::SIGUSR1, libc::SIGUSR2] {
+            let mut waiting = Box::pin(shutdown_on(kinds));
+            let polled = std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            });
+            polled.await;
+            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+            let limit = std::time::Duration::from_secs(10);
+            let arrived = tokio::time::timeout(limit, waiting).await;
+            assert!(arrived.is_ok(), "signal {signal} did not end the wait");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_that_cannot_be_registered_does_not_end_the_wait() {
+        let kind = tokio::signal::unix::SignalKind::from_raw(libc::SIGKILL);
+        let limit = std::time::Duration::from_millis(100);
+        let waited = tokio::time::timeout(limit, signal_arrived(kind)).await;
+        assert!(waited.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_stuck_exporter_accepts_everything_except_the_metrics_it_stalls_on() {
+        use harness::telemetry::TelemetryExporter;
+        let exporter = StuckExporter {
+            pause: std::time::Duration::ZERO,
+            panics: false,
+            done: std::sync::Arc::default(),
+        };
+        assert!(exporter.export_traces(vec![]).await.is_ok());
+        assert!(exporter.export_events(vec![]).await.is_ok());
+        assert!(exporter.health_check().await.unwrap());
+        let collector = harness::monitoring::DefaultMetricsCollector::new();
+        let metrics = harness::monitoring::MetricsCollector::get_current_metrics(&collector)
+            .await
+            .unwrap();
+        assert!(exporter.export_system_metrics(metrics).await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_production_wait_stays_pending_until_a_signal_arrives() {
+        use std::future::Future;
+        let mut waiting = Box::pin(shutdown_signal());
+        let polled = std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        });
+        polled.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_export_does_not_stop_the_flush_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let exporter = harness::telemetry::JsonlExporter::new(blocker.join("t.jsonl"), 1024);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("lost", 1.0, vec![]);
+        let period = std::time::Duration::from_secs(5);
+        let flush = spawn_telemetry_flush(std::sync::Arc::clone(&telemetry), period);
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        assert!(!flush.is_finished());
+        flush.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flush_loop_drains_the_telemetry_buffers_on_its_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("c", 1.0, vec![]);
+        let flush = spawn_telemetry_flush(
+            std::sync::Arc::clone(&telemetry),
+            std::time::Duration::from_secs(5),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"c\""));
+        flush.abort();
+    }
+
     use super::*;
     use harness::action_auditor::RULE_ACTION_AUDITOR_NAME;
 
