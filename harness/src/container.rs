@@ -145,6 +145,9 @@ pub const NO_READ_ONLY_MOUNTS: Vec<ReadOnlyMount> = Vec::new();
 ///
 /// let mount = ReadOnlyMount::new("/repo/.nanna", "/workspace/.nanna");
 /// assert_eq!(mount.run_arg(), "-v=/repo/.nanna:/workspace/.nanna:ro");
+///
+/// let staged = ReadOnlyMount::relabeled("/tmp/stage/vendor", "/opt/vendor");
+/// assert_eq!(staged.run_arg(), "-v=/tmp/stage/vendor:/opt/vendor:ro,z");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOnlyMount {
@@ -152,6 +155,9 @@ pub struct ReadOnlyMount {
     pub host: PathBuf,
     /// Where it appears inside the container.
     pub container: PathBuf,
+    /// Whether the runtime relabels `host` for SELinux (`z`), needed for a
+    /// host path outside an already labelled mount.
+    pub relabel: bool,
 }
 
 impl ReadOnlyMount {
@@ -160,12 +166,27 @@ impl ReadOnlyMount {
         Self {
             host: host.as_ref().to_path_buf(),
             container: container.as_ref().to_path_buf(),
+            relabel: false,
+        }
+    }
+
+    /// Mount `host` read-only at `container` with the SELinux `z` label, for
+    /// a host directory the harness created outside the labelled worktree.
+    pub fn relabeled(host: impl AsRef<Path>, container: impl AsRef<Path>) -> Self {
+        Self {
+            relabel: true,
+            ..Self::new(host, container)
         }
     }
 
     /// The `run` flag implementing this mount, understood by podman and docker.
     pub fn run_arg(&self) -> String {
-        format!("-v={}:{}:ro", self.host.display(), self.container.display())
+        let flags = if self.relabel { "ro,z" } else { "ro" };
+        format!(
+            "-v={}:{}:{flags}",
+            self.host.display(),
+            self.container.display()
+        )
     }
 }
 
@@ -1201,6 +1222,34 @@ mod tests {
         assert_eq!(mount.run_arg(), "-v=/host/repo/.nanna:/workspace/.nanna:ro");
         assert_eq!(mount.host, PathBuf::from("/host/repo/.nanna"));
         assert_eq!(mount.container, PathBuf::from("/workspace/.nanna"));
+        assert!(!mount.relabel);
+    }
+
+    #[test]
+    fn relabeled_mount_adds_the_selinux_flag_and_stays_read_only() {
+        let mount = ReadOnlyMount::relabeled("/tmp/stage/vendor", "/opt/vendor");
+        assert!(mount.relabel);
+        assert_eq!(mount.run_arg(), "-v=/tmp/stage/vendor:/opt/vendor:ro,z");
+        assert_eq!(mount.host, PathBuf::from("/tmp/stage/vendor"));
+        assert_eq!(mount.container, PathBuf::from("/opt/vendor"));
+    }
+
+    #[test]
+    fn run_args_render_relabeled_mounts_in_order() {
+        let mut config = run_args_config(NetworkPolicy::Disabled);
+        config.read_only_mounts = vec![
+            ReadOnlyMount::new("/h/.nanna", "/workspace/.nanna"),
+            ReadOnlyMount::relabeled("/s/config.toml", "/.cargo/config.toml"),
+        ];
+        let args = config.run_args(&ContainerRuntime::Podman, "img");
+        let mounts: Vec<&String> = args.iter().filter(|a| a.starts_with("-v=")).collect();
+        assert_eq!(
+            mounts,
+            [
+                "-v=/h/.nanna:/workspace/.nanna:ro",
+                "-v=/s/config.toml:/.cargo/config.toml:ro,z"
+            ]
+        );
     }
 
     #[test]
