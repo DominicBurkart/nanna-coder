@@ -4941,6 +4941,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_registry_refuses_a_write_to_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registries = [
+            create_tool_registry(dir.path()),
+            create_tool_registry_for(dir.path(), &identity).unwrap(),
+            create_tool_registry_in_checkout(dir.path()).unwrap(),
+        ];
+        for registry in registries {
+            for path in [".nanna/policy.toml", "crates/api/.nanna/policy.toml"] {
+                let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+                let err = registry.execute("write_file", args).await.unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                    "{path}: {err:?}"
+                );
+                assert!(!dir.path().join(path).exists(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cfg/nanna");

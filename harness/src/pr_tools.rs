@@ -4487,7 +4487,9 @@ mod tests {
             "codecov.yml",
             "windows.toml",
             ".nanna/agents/x.toml",
+            ".nanna/policy.toml",
             "crates/api/.nanna/agents/x.toml",
+            "crates/api/.nanna/policy.toml",
         ] {
             let fixture = push_fixture();
             git(fixture.work.path(), &["checkout", "-q", "-b", "feature-p"]);
@@ -4815,6 +4817,7 @@ mod tests {
             "codecov.yml",
             ".github/workflows/ci.yml",
             ".nanna/agents/x.toml",
+            ".nanna/policy.toml",
         ] {
             let dir = github_repo_fixture();
             commit_file(dir.path(), path, "a: 1\n", "base");

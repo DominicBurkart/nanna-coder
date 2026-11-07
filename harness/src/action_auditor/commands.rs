@@ -5391,6 +5391,31 @@ mod tests {
     }
 
     #[test]
+    fn shell_writes_to_the_policy_file_are_refused() {
+        refuse_all(
+            &[
+                "echo 'human_gate = \"github\"' > .nanna/policy.toml",
+                "echo x >> .nanna/policy.toml",
+                "tee .nanna/policy.toml",
+                "cp x .nanna/policy.toml",
+                "mv x .nanna/policy.toml",
+                "mv .nanna/policy.toml x",
+                "rm .nanna/policy.toml",
+                "rm -f .nanna/policy.toml",
+                "touch .nanna/policy.toml",
+                "chmod 777 .nanna/policy.toml",
+                "echo x > ./.nanna/policy.toml",
+                "cd .nanna; echo x > policy.toml",
+            ],
+            "protected path",
+        );
+        allow_all(&[
+            "cat .nanna/policy.toml",
+            "grep human_gate .nanna/policy.toml",
+        ]);
+    }
+
+    #[test]
     fn secrets_cannot_be_read_by_name_glob_or_variable() {
         refuse_all(
             &[

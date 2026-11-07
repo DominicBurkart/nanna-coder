@@ -2477,6 +2477,43 @@ mod tests {
     }
 
     #[test]
+    fn test_a_rewritten_policy_file_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-policy-extract"), "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, ".nanna/policy.toml");
+        assert_eq!(violation.rule, ".nanna/**");
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.path, ".nanna/policy.toml");
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_the_policy_file_lies_under_a_read_only_mount_root() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-policy-mount"), "HEAD").unwrap();
+        let roots = ws.protected().mount_roots();
+        let policy = Path::new(".nanna/policy.toml");
+        assert!(
+            roots.iter().any(|root| policy.starts_with(root)),
+            "{roots:?}"
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
     fn test_a_nested_config_directory_is_refused_when_a_patch_is_extracted() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
