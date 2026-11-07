@@ -41,8 +41,6 @@ struct PolicyFile {
     human_gate: HumanGate,
 }
 
-/// What a repository declares in `.nanna/policy.toml`.
-///
 /// ```
 /// use harness::policy::{HumanGate, RepoPolicy};
 ///
