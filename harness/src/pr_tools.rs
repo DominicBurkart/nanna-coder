@@ -5116,7 +5116,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_client_without_a_head_lookup_makes_solo_push_fail_closed() {
+    async fn a_client_whose_head_lookup_errors_makes_solo_push_fail_closed() {
+        let fixture = github_push_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(ScriptedGithub {
+            failing: "pull_requests_for_head",
+            inner: MockGithub::default(),
+        });
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Solo)
+            .with_client(client);
+        assert!(tool.execute(json!({})).await.is_err());
+        assert!(!bare_has(&fixture, "feature-solo"));
+    }
+
+    #[tokio::test]
+    async fn a_scripted_client_that_does_not_fail_lets_a_solo_push_through() {
         let fixture = github_push_fixture();
         let client: Arc<dyn GithubClient> = Arc::new(ScriptedGithub {
             failing: "",
@@ -5125,9 +5139,10 @@ mod tests {
         let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
             .with_gate(HumanGate::Solo)
             .with_client(client);
-        let err = tool.execute(json!({})).await.unwrap_err();
-        assert!(err.to_string().contains("501"), "{err}");
-        assert!(!bare_has(&fixture, "feature-solo"));
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap()["pushed"],
+            json!(true)
+        );
     }
 
     #[tokio::test]
@@ -7366,6 +7381,16 @@ mod tests {
                 return Err(hostile_failure());
             }
             self.inner.get_pull_request(repo, number).await
+        }
+        async fn pull_requests_for_head(
+            &self,
+            repo: &str,
+            head: &str,
+        ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+            if self.failing == "pull_requests_for_head" {
+                return Err(hostile_failure());
+            }
+            self.inner.pull_requests_for_head(repo, head).await
         }
         async fn mark_pull_request_ready(
             &self,

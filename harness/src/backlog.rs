@@ -30,6 +30,8 @@ pub const IDENTITY_MARKER: &str = "Nanna-Identity:";
 
 /// Page size used for GitHub list and search requests.
 pub const GITHUB_PAGE_SIZE: usize = 100;
+
+const HEAD_PAGE_BOUND: usize = 5;
 pub const MAX_REVIEW_PAGES: usize = 10;
 
 /// Default GitHub REST endpoint.
@@ -214,10 +216,7 @@ pub trait GithubClient: Send + Sync {
         &self,
         repo: &str,
         head: &str,
-    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
-        let url = format!("/repos/{repo}/pulls?head={head}");
-        Err(BacklogError::Status { url, status: 501 })
-    }
+    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError>;
 
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
 
@@ -485,6 +484,9 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn get_pull_request(&self, _: &str, _: u64) -> Result<GithubPullRequestDetail, BacklogError> {
 ///         unreachable!("ingestion never reads pull request detail")
+///     }
+///     async fn pull_requests_for_head(&self, _: &str, _: &str) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+///         unreachable!("ingestion never looks up pull requests by head")
 ///     }
 ///     async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
 ///         unreachable!("ingestion never promotes pull requests")
@@ -1310,7 +1312,13 @@ impl GithubClient for ReqwestGithubClient {
             ("head", format!("{owner}:{head}")),
         ];
         let path = format!("/repos/{repo}/pulls");
-        let raw: Vec<RawPrDetail> = self.paginate(&path, &query, |v| v).await?;
+        let raw: Vec<RawPrDetail> = self
+            .paginate_up_to(&path, &query, |v| v, HEAD_PAGE_BOUND)
+            .await?;
+        let url = path.clone();
+        if raw.len() >= HEAD_PAGE_BOUND * GITHUB_PAGE_SIZE {
+            return Err(BacklogError::Status { url, status: 413 });
+        }
         Ok(raw.into_iter().map(Into::into).collect())
     }
 
@@ -2851,6 +2859,39 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("head=o%3Afeature%2Fx"), "{}", sent[0]);
         assert!(sent[0].contains("state=open"), "{}", sent[0]);
+        server.abort();
+    }
+
+    fn full_page() -> String {
+        let item = r#"{"number": 1, "node_id": "n", "draft": true, "state": "open", "body": null, "html_url": "u"}"#;
+        format!("[{}]", vec![item; GITHUB_PAGE_SIZE].join(","))
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_head_lookup_follows_pages() {
+        let (base, requests, server) = fake_github_ext(vec![
+            MockRoute::new("GET", "page=2", 200, HEAD_LISTING),
+            MockRoute::new("GET", "/repos/o/n/pulls", 200, &full_page()),
+        ])
+        .await;
+        let client = ReqwestGithubClient::new(base, None);
+        let found = client.pull_requests_for_head("o/n", "x").await.unwrap();
+        assert_eq!(found.len(), GITHUB_PAGE_SIZE + 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_head_lookup_fails_closed_above_its_page_bound() {
+        let page = full_page();
+        let routes: Vec<MockRoute> = (0..5)
+            .map(|_| MockRoute::new("GET", "/repos/o/n/pulls", 200, &page))
+            .collect();
+        let (base, requests, server) = fake_github_ext(routes).await;
+        let client = ReqwestGithubClient::new(base, None);
+        let err = client.pull_requests_for_head("o/n", "x").await.unwrap_err();
+        assert!(err.to_string().contains("413"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 5);
         server.abort();
     }
 
