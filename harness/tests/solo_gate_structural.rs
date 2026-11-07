@@ -169,6 +169,8 @@ const PINNED_LIMITS: &[&str] = &[
     "the shell forms are a fixed enumeration; a form not listed here is covered only by the action auditor's own suites",
     "the enumeration shows the harness gives an agent no path to flip draft state; a raw GitHub token held outside the harness, a pull request created outside it and a human click between the draft check and the push are out of scope",
     "the solo check before the un-drafting call is recognised by the identifiers HumanGate, Solo and gate appearing earlier in the same function, not by control flow: an empty or unreachable check passes the pin and is caught only by the behavioural tests",
+    "include_str!, include! and include_bytes! contents are not scanned, so a needle or a tool kept in an included file is not seen",
+    "only harness/src is scanned: nanna-effects, image-builder and the model crates are not",
     "classification forces a review but proves nothing: a new tool or client method that is classified as local or read-only while it un-drafts passes the pin",
 ];
 
@@ -227,6 +229,8 @@ struct Scan {
     function: Vec<String>,
     idents_in_fn: Vec<Vec<String>>,
     tool_impls: Vec<String>,
+    impls: Vec<(String, String)>,
+    tool_aliases: BTreeSet<String>,
     undraft_sites: Vec<(String, String, Vec<String>)>,
     literals: Vec<(String, String, String)>,
 }
@@ -252,9 +256,8 @@ impl Scan {
     fn enter_impl(&mut self, node: &syn::ItemImpl) {
         let name = type_name(&node.self_ty);
         if let Some((_, path, _)) = &node.trait_ {
-            if path.segments.last().is_some_and(|s| s.ident == "Tool") {
-                self.tool_impls.push(name.clone());
-            }
+            let last = path.segments.last().map(|s| s.ident.to_string());
+            self.impls.push((last.unwrap_or_default(), name.clone()));
         }
         self.impl_type.push(name);
         syn::visit::visit_item_impl(self, node);
@@ -304,6 +307,27 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        tool_aliases(&node.tree, &mut self.tool_aliases);
+        syn::visit::visit_item_use(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if !is_test_only(&node.attrs) {
+            self.impl_type.push(format!("trait:{}", node.ident));
+            syn::visit::visit_item_trait(self, node);
+            self.impl_type.pop();
+        }
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if !is_test_only(&node.attrs) {
+            self.enter_fn(&node.sig.ident, |me| {
+                syn::visit::visit_trait_item_fn(me, node)
+            });
+        }
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !is_test_only(&node.attrs) {
             self.enter_fn(&node.sig.ident, |me| syn::visit::visit_item_fn(me, node));
@@ -343,9 +367,27 @@ impl<'ast> Visit<'ast> for Scan {
     }
 }
 
+fn tool_aliases(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+    if let syn::UseTree::Path(path) = tree {
+        tool_aliases(&path.tree, out);
+    }
+    if let syn::UseTree::Rename(rename) = tree {
+        if rename.ident == "Tool" {
+            out.insert(rename.rename.to_string());
+        }
+    }
+    if let syn::UseTree::Group(group) = tree {
+        group.items.iter().for_each(|item| tool_aliases(item, out));
+    }
+}
+
+#[rustfmt::skip]
 fn scan(source: &str) -> Scan {
     let mut state = Scan::default();
     state.visit_file(&syn::parse_file(source).unwrap());
+    let known = |name: &String| name == "Tool" || state.tool_aliases.contains(name);
+    let tools: Vec<String> = state.impls.iter().filter(|(t, _)| known(t)).map(|(_, n)| n.clone()).collect();
+    state.tool_impls = tools;
     state
 }
 
@@ -422,8 +464,8 @@ fn undraft_violations(files: &[(String, String)]) -> Vec<String> {
     let mut calls = Vec::new();
     for (path, source) in files {
         for (ty, function, prior) in scan(source).undraft_sites {
-            let definition =
-                path == "src/backlog.rs" && (function.is_empty() || function == UNDRAFT_METHOD);
+            let owner = ty == "ReqwestGithubClient" || ty == "trait:GithubClient";
+            let definition = path == "src/backlog.rs" && owner && function == UNDRAFT_METHOD;
             if !definition {
                 calls.push((path.clone(), ty, function, prior));
             }
@@ -824,7 +866,7 @@ fn the_documented_blind_spots_are_really_not_seen() {
         assert!(tool_violations(&mutated).is_empty(), "{addition}");
         assert!(literal_violations(&mutated).is_empty(), "{addition}");
     }
-    assert_eq!(PINNED_LIMITS.len(), 9);
+    assert_eq!(PINNED_LIMITS.len(), 11);
 }
 
 #[derive(Default)]
@@ -1493,4 +1535,49 @@ fn a_tool_on_a_type_without_a_name_and_odd_gh_arms_are_handled() {
     let odd = "fn inspect_gh() { match (top, sub) { (x, \"view\") => f(), (\"pr\", 1) => g(), _ => h() } }";
     let found = gh_violations(odd);
     assert!(found.iter().any(|v| v.contains("no longer matched")));
+}
+
+#[test]
+fn a_trait_default_method_cannot_call_the_un_drafting_method() {
+    let files = real_files();
+    let evil = "pub trait Evil { fn go(&self, c: &dyn GithubClient) { c.mark_pull_request_ready(r, 1); } }";
+    for name in ["src/ci_tools.rs", "src/backlog.rs"] {
+        let found = undraft_violations(&appended(&files, name, evil));
+        assert!(
+            found.iter().any(|v| v.contains("exactly one caller")),
+            "{name}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_renamed_import_of_the_tool_trait_is_still_a_tool() {
+    let files = real_files();
+    for addition in [
+        "use crate::tools::Tool as T; impl T for AliasedTool {}",
+        "use crate::tools::{Tool as Tl, Other as O}; impl Tl for GroupedTool {}",
+        "mod inner { use crate::tools::Tool as Q; impl Q for NestedTool {} }",
+    ] {
+        let found = tool_violations(&appended(&files, "src/ci_tools.rs", addition));
+        assert_eq!(found.len(), 1, "{addition}: {found:?}");
+    }
+    let unrelated = appended(
+        &files,
+        "src/ci_tools.rs",
+        "use crate::x::Other as O; impl O for NotATool {}",
+    );
+    assert!(tool_violations(&unrelated).is_empty());
+}
+
+#[test]
+fn include_macros_hide_needles_and_tools_and_that_is_a_documented_limit() {
+    let files = real_files();
+    let hidden = appended(
+        &files,
+        "src/ci_tools.rs",
+        "const Q: &str = include_str!(\"mutation.graphql\");",
+    );
+    assert!(literal_violations(&hidden).is_empty());
+    assert!(PINNED_LIMITS.iter().any(|l| l.contains("include_str!")));
+    assert!(PINNED_LIMITS.iter().any(|l| l.contains("nanna-effects")));
 }
