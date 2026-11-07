@@ -51,7 +51,7 @@ pub struct JsonRpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
+    pub error: Option<Box<JsonRpcError>>,
 }
 
 /// A JSON-RPC 2.0 error object.
@@ -59,6 +59,8 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl JsonRpcResponse {
@@ -76,7 +78,24 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message }),
+            error: Some(Box::new(JsonRpcError {
+                code,
+                message,
+                data: None,
+            })),
+        }
+    }
+
+    pub fn error_with_data(id: Option<Value>, code: i32, message: String, data: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(Box::new(JsonRpcError {
+                code,
+                message,
+                data: Some(data),
+            })),
         }
     }
 }
@@ -112,6 +131,62 @@ mod tests {
         let err = JsonRpcResponse::error(Some(serde_json::json!(3)), -32602, "bad".to_string());
         assert!(err.result.is_none());
         assert_eq!(err.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn error_data_is_omitted_when_absent_and_round_trips_when_present() {
+        let plain = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "bad".to_string());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("\"data\""));
+        assert!(plain.error.unwrap().data.is_none());
+
+        let with_data = JsonRpcResponse::error_with_data(
+            Some(serde_json::json!(2)),
+            -32602,
+            "refused".to_string(),
+            serde_json::json!({ "failure_kind": "spawn_refused" }),
+        );
+        let text = serde_json::to_string(&with_data).unwrap();
+        let back: JsonRpcResponse = serde_json::from_str(&text).unwrap();
+        let error = back.error.unwrap();
+        assert_eq!(error.message, "refused");
+        assert_eq!(error.data.unwrap()["failure_kind"], "spawn_refused");
+
+        let legacy: JsonRpcResponse = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"old"}}"#,
+        )
+        .unwrap();
+        assert!(legacy.error.unwrap().data.is_none());
+    }
+
+    #[test]
+    fn error_wire_shape_is_exactly_the_jsonrpc_shape_with_and_without_data() {
+        let plain = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "bad".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32602, "message": "bad" }
+            })
+        );
+        let with_data = JsonRpcResponse::error_with_data(
+            Some(serde_json::json!(2)),
+            -32602,
+            "refused".to_string(),
+            serde_json::json!({ "failure_kind": "spawn_refused" }),
+        );
+        assert_eq!(
+            serde_json::to_value(&with_data).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32602,
+                    "message": "refused",
+                    "data": { "failure_kind": "spawn_refused" }
+                }
+            })
+        );
     }
 
     #[test]
