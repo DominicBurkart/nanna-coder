@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn repo_config_overriding_sources_is_refused_in_either_file() {
         for file in [".cargo/config.toml", ".cargo/config"] {
-            for key in OVERRIDING_KEYS {
+            for key in ["source", "patch", "include"] {
                 let f = fixture();
                 write_config(&f.repo, file, &format!("[{key}.x]\na = 1\n"));
                 match check_repo_config(&f.repo) {
@@ -553,12 +553,38 @@ mod tests {
 
     #[test]
     fn real_cargo_vendor_fails_closed_without_a_lockfile() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"nolock\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let out = CargoVendor
+            .vendor(
+                &repo.join("Cargo.toml"),
+                &root.path().join("v"),
+                root.path(),
+            )
+            .unwrap();
+        assert!(!out.success, "{}", out.stderr);
+        assert!(out.stderr.contains("lock file"), "{}", out.stderr);
+        assert!(!repo.join("Cargo.lock").exists());
+    }
+
+    #[test]
+    fn real_cargo_vendor_fails_on_a_missing_manifest() {
         let f = fixture();
         let out = CargoVendor
-            .vendor(&f.repo.join("Cargo.toml"), &f.stage.join("v"), &f.repo)
+            .vendor(
+                &f.repo.join("absent/Cargo.toml"),
+                &f.stage.join("v"),
+                &f.repo,
+            )
             .unwrap();
         assert!(!out.success);
-        assert!(out.stderr.contains("Cargo.toml") || out.stderr.contains("lock"));
     }
 
     #[test]
