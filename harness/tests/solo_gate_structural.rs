@@ -171,6 +171,7 @@ const PINNED_LIMITS: &[&str] = &[
     "the solo check before the un-drafting call is recognised by the identifiers HumanGate, Solo and gate appearing earlier in the same function, not by control flow: an empty or unreachable check passes the pin and is caught only by the behavioural tests",
     "include_str!, include! and include_bytes! contents are not scanned, so a needle or a tool kept in an included file is not seen",
     "only harness/src is scanned: nanna-effects, image-builder and the model crates are not",
+    "the bodies of the two definitions of mark_pull_request_ready (ReqwestGithubClient and the GithubClient trait declaration) are exempt as a whole, so a call to another client's un-draft method nested inside them is not seen; the method is reachable only through the gated promote tool",
     "classification forces a review but proves nothing: a new tool or client method that is classified as local or read-only while it un-drafts passes the pin",
 ];
 
@@ -178,24 +179,20 @@ fn plain(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
 
-fn cfg_holds_outside_tests(meta: &syn::Meta) -> bool {
-    match meta {
-        syn::Meta::Path(path) => !path.is_ident("test"),
-        syn::Meta::NameValue(_) => true,
-        syn::Meta::List(list) => {
-            let nested = list
-                .parse_args_with(
-                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-                )
-                .unwrap();
-            let holds: Vec<bool> = nested.iter().map(cfg_holds_outside_tests).collect();
-            match list.path.get_ident().map(|i| i.to_string()).as_deref() {
-                Some("not") => !holds.iter().all(|held| *held),
-                Some("any") => holds.iter().any(|held| *held),
-                _ => holds.iter().all(|held| *held),
-            }
+fn nested_metas(list: &syn::MetaList) -> Vec<syn::Meta> {
+    let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+    list.parse_args_with(parser).unwrap().into_iter().collect()
+}
+
+fn cfg_is_test(meta: &syn::Meta) -> bool {
+    let bare = matches!(meta, syn::Meta::Path(path) if path.is_ident("test"));
+    let all = match meta {
+        syn::Meta::List(list) if list.path.is_ident("all") => {
+            nested_metas(list).iter().any(cfg_is_test)
         }
-    }
+        _ => false,
+    };
+    bare || all
 }
 
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
@@ -203,7 +200,7 @@ fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         attr.path().is_ident("cfg")
             && attr
                 .parse_args::<syn::Meta>()
-                .map(|meta| !cfg_holds_outside_tests(&meta))
+                .map(|meta| cfg_is_test(&meta))
                 .unwrap_or(false)
     })
 }
@@ -228,7 +225,6 @@ struct Scan {
     impl_type: Vec<String>,
     function: Vec<String>,
     idents_in_fn: Vec<Vec<String>>,
-    tool_impls: Vec<String>,
     impls: Vec<(String, String)>,
     tool_aliases: BTreeSet<String>,
     undraft_sites: Vec<(String, String, Vec<String>)>,
@@ -381,13 +377,9 @@ fn tool_aliases(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
     }
 }
 
-#[rustfmt::skip]
 fn scan(source: &str) -> Scan {
     let mut state = Scan::default();
     state.visit_file(&syn::parse_file(source).unwrap());
-    let known = |name: &String| name == "Tool" || state.tool_aliases.contains(name);
-    let tools: Vec<String> = state.impls.iter().filter(|(t, _)| known(t)).map(|(_, n)| n.clone()).collect();
-    state.tool_impls = tools;
     state
 }
 
@@ -407,6 +399,23 @@ fn trait_methods(source: &str, name: &str) -> Vec<String> {
     }
     found.sort();
     found
+}
+
+fn trait_defaults(source: &str, name: &str) -> Vec<String> {
+    let file = syn::parse_file(source).unwrap();
+    let traits = file.items.iter().filter_map(|item| match item {
+        syn::Item::Trait(item) if item.ident == name => Some(item),
+        _ => None,
+    });
+    let methods = traits
+        .flat_map(|item| item.items.iter())
+        .filter_map(|member| match member {
+            syn::TraitItem::Fn(method) if method.default.is_some() => {
+                Some(method.sig.ident.to_string())
+            }
+            _ => None,
+        });
+    methods.collect()
 }
 
 fn classified(table: &[(&str, ClientEffect)]) -> Vec<String> {
@@ -441,6 +450,12 @@ fn client_violations(backlog: &str) -> Vec<String> {
             ));
         }
     }
+    let defaults = trait_defaults(backlog, "GithubClient");
+    if !defaults.is_empty() {
+        found.push(format!(
+            "`GithubClient` has default bodies for {defaults:?}"
+        ));
+    }
     found.extend(undrafting_violations(&[
         GITHUB_CLIENT_METHODS,
         ACTIONS_CLIENT_METHODS,
@@ -448,11 +463,16 @@ fn client_violations(backlog: &str) -> Vec<String> {
     found
 }
 
+#[rustfmt::skip]
+fn tool_names(files: &[(String, String)]) -> BTreeSet<String> {
+    let scans: Vec<Scan> = files.iter().map(|(_, source)| scan(source)).collect();
+    let aliases: BTreeSet<String> = scans.iter().flat_map(|s| s.tool_aliases.iter().cloned()).collect();
+    let known = |name: &String| name == "Tool" || aliases.contains(name);
+    scans.iter().flat_map(|s| s.impls.iter()).filter(|(t, _)| known(t)).map(|(_, n)| n.clone()).collect()
+}
+
 fn tool_violations(files: &[(String, String)]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    for (_, source) in files {
-        seen.extend(scan(source).tool_impls);
-    }
+    let seen = tool_names(files);
     let table: BTreeSet<String> = TOOL_TABLE.iter().map(|(n, _)| n.to_string()).collect();
     seen.difference(&table)
         .map(|name| format!("tool `{name}` is not classified for solo mode"))
@@ -684,10 +704,7 @@ fn the_production_tree_classifies_every_tool_client_method_and_draft_flipping_pa
 
 #[test]
 fn every_classified_tool_exists_so_the_table_cannot_rot() {
-    let mut seen = BTreeSet::new();
-    for (_, source) in &real_files() {
-        seen.extend(scan(source).tool_impls);
-    }
+    let seen = tool_names(&real_files());
     let stale: Vec<&str> = TOOL_TABLE
         .iter()
         .map(|(name, _)| *name)
@@ -866,7 +883,7 @@ fn the_documented_blind_spots_are_really_not_seen() {
         assert!(tool_violations(&mutated).is_empty(), "{addition}");
         assert!(literal_violations(&mutated).is_empty(), "{addition}");
     }
-    assert_eq!(PINNED_LIMITS.len(), 11);
+    assert_eq!(PINNED_LIMITS.len(), 12);
 }
 
 #[derive(Default)]
@@ -1580,4 +1597,83 @@ fn include_macros_hide_needles_and_tools_and_that_is_a_documented_limit() {
     assert!(literal_violations(&hidden).is_empty());
     assert!(PINNED_LIMITS.iter().any(|l| l.contains("include_str!")));
     assert!(PINNED_LIMITS.iter().any(|l| l.contains("nanna-effects")));
+}
+
+#[test]
+fn a_cfg_other_than_test_never_hides_code_from_the_scan() {
+    let files = real_files();
+    let call = "fn evil(c: &dyn GithubClient) { c.mark_pull_request_ready(r, 1); }";
+    let forms = [
+        "#[cfg(not(feature = \"nonexistent\"))]",
+        "#[cfg(not(unix))]",
+        "#[cfg(not(any(test, feature = \"x\")))]",
+        "#[cfg(any(test, unix))]",
+        "#[cfg(feature = \"x\")]",
+        "#[cfg(all(unix, feature = \"x\"))]",
+    ];
+    for form in forms {
+        let found = undraft_violations(&appended(
+            &files,
+            "src/ci_tools.rs",
+            &format!("{form} {call}"),
+        ));
+        assert!(
+            found.iter().any(|v| v.contains("exactly one caller")),
+            "{form}: {found:?}"
+        );
+    }
+    let trait_form = "#[cfg(not(feature = \"x\"))] pub trait Evil { fn go(&self, c: &dyn GithubClient) { c.mark_pull_request_ready(r, 1); } }";
+    let found = undraft_violations(&appended(&files, "src/ci_tools.rs", trait_form));
+    assert!(
+        found.iter().any(|v| v.contains("exactly one caller")),
+        "{found:?}"
+    );
+    let tool = "#[cfg(not(feature = \"x\"))] impl Tool for Hidden {}";
+    assert_eq!(
+        tool_violations(&appended(&files, "src/ci_tools.rs", tool)).len(),
+        1
+    );
+    for gated in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg(all(unix, test))]",
+    ] {
+        let found = undraft_violations(&appended(
+            &files,
+            "src/ci_tools.rs",
+            &format!("{gated} {call}"),
+        ));
+        assert!(
+            !found.iter().any(|v| v.contains("exactly one caller")),
+            "{gated}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_tool_rename_in_one_file_applies_to_impls_in_every_file() {
+    let files = real_files();
+    let renamed = appended(&files, "src/ci_tools.rs", "use crate::tools::Tool as Far;");
+    let both = appended(&renamed, "src/qa/tools.rs", "impl Far for ElsewhereTool {}");
+    assert_eq!(tool_violations(&both).len(), 1);
+    let alone = appended(&files, "src/qa/tools.rs", "impl Far for ElsewhereTool {}");
+    assert!(tool_violations(&alone).is_empty());
+}
+
+#[test]
+fn a_default_body_on_the_head_lookup_is_flagged() {
+    let files = real_files();
+    let backlog = file(&files, "src/backlog.rs");
+    assert!(trait_defaults(backlog, "GithubClient").is_empty());
+    let marker = "    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError>;";
+    let defaulted = replaced(
+        backlog,
+        marker,
+        "    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {\n        Ok(vec![])\n    }",
+    );
+    let found = client_violations(&defaulted);
+    assert!(
+        found.iter().any(|v| v.contains("default bodies")),
+        "{found:?}"
+    );
 }
