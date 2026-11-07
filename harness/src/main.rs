@@ -1793,6 +1793,7 @@ fn build_delegate_task_manager(
 }
 
 const TELEMETRY_FILE: &str = "telemetry.jsonl";
+const DELEGATE_TELEMETRY_FILE: &str = "telemetry-delegate.jsonl";
 const TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const TELEMETRY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1831,6 +1832,44 @@ fn spawn_telemetry_flush(
     })
 }
 
+async fn finish_with_flush<T>(
+    telemetry: &harness::telemetry::TelemetrySystem,
+    flush: Option<tokio::task::JoinHandle<()>>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let outcome = work.await;
+    if let Some(flush) = flush {
+        flush.abort();
+    }
+    if let Err(e) = telemetry.export_all().await {
+        warn!("telemetry export failed: {e}");
+    }
+    outcome
+}
+
+async fn shutdown_signal() {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = interrupt => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = interrupt.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = interrupt.await;
+    }
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1862,7 +1901,7 @@ async fn run_mcp_server(
         &task_manager.action_gate(),
         queue_path.with_file_name(TELEMETRY_FILE),
     );
-    let _flush = spawn_telemetry_flush(telemetry, TELEMETRY_FLUSH_EVERY);
+    let flush = spawn_telemetry_flush(Arc::clone(&telemetry), TELEMETRY_FLUSH_EVERY);
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
@@ -1889,7 +1928,13 @@ async fn run_mcp_server(
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    server.serve(reader, writer).await?;
+    let serving = async {
+        tokio::select! {
+            served = server.serve(reader, writer) => served,
+            _ = shutdown_signal() => Ok(()),
+        }
+    };
+    finish_with_flush(&telemetry, Some(flush), serving).await?;
     Ok(())
 }
 
@@ -1921,56 +1966,56 @@ async fn run_delegate(
     ));
     let telemetry = export_action_audit(
         &task_manager.action_gate(),
-        queue_path.with_file_name(TELEMETRY_FILE),
+        queue_path.with_file_name(DELEGATE_TELEMETRY_FILE),
     );
-    let gate = delegate_spawn_gate(
-        model,
-        provider.clone() as Arc<dyn model::ModelProvider>,
-        &queue_path,
-        &load_identities(),
-        plane,
-    )?;
-    let server = Arc::new(NannaMcpServer::new(
-        task_manager,
-        provider,
-        gate,
-        max_iterations,
-    ));
+    let session = async {
+        let gate = delegate_spawn_gate(
+            model,
+            provider.clone() as Arc<dyn model::ModelProvider>,
+            &queue_path,
+            &load_identities(),
+            plane,
+        )?;
+        let server = Arc::new(NannaMcpServer::new(
+            task_manager,
+            provider,
+            gate,
+            max_iterations,
+        ));
 
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-    let (server_read, server_write) = tokio::io::split(server_side);
-    let serve_handle = tokio::spawn(async move {
-        let _ = server
-            .serve(tokio::io::BufReader::new(server_read), server_write)
-            .await;
-    });
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let serve_handle = tokio::spawn(async move {
+            let _ = server
+                .serve(tokio::io::BufReader::new(server_read), server_write)
+                .await;
+        });
 
-    let (client_read, client_write) = tokio::io::split(client_side);
-    let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let mut client = NannaMcpClient::new(tokio::io::BufReader::new(client_read), client_write);
 
-    client.initialize().await?;
-    let mut arguments = serde_json::json!({
-        "description": description,
-        "repo_path": repo_path.to_string_lossy(),
-        "branch": branch,
-        "max_iterations": max_iterations,
-        "identity": identity,
-    });
-    if let Some(model) = model {
-        arguments["model"] = serde_json::json!(model);
-    }
-    let task_id = client.submit_task(arguments, ttl_ms).await?;
-    info!("Delegated task {task_id}; awaiting completion...");
+        client.initialize().await?;
+        let mut arguments = serde_json::json!({
+            "description": description,
+            "repo_path": repo_path.to_string_lossy(),
+            "branch": branch,
+            "max_iterations": max_iterations,
+            "identity": identity,
+        });
+        if let Some(model) = model {
+            arguments["model"] = serde_json::json!(model);
+        }
+        let task_id = client.submit_task(arguments, ttl_ms).await?;
+        info!("Delegated task {task_id}; awaiting completion...");
 
-    let result = client.wait_result(&task_id).await?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    if let Err(e) = telemetry.export_all().await {
-        warn!("telemetry export failed: {e}");
-    }
+        let result = client.wait_result(&task_id).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
 
-    drop(client);
-    let _ = serve_handle.await;
-    Ok(())
+        drop(client);
+        let _ = serve_handle.await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    finish_with_flush(&telemetry, None, session).await
 }
 
 #[cfg(test)]
@@ -2008,6 +2053,44 @@ mod tests {
         assert!(!text.contains("SECRET"));
         let second = export_action_audit(&manager.action_gate(), path);
         assert_eq!(second.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn work_that_fails_still_gets_a_final_flush_and_the_loop_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("final_flush_marker", 1.0, vec![]);
+        let hour = std::time::Duration::from_secs(3600);
+        let flush = spawn_telemetry_flush(std::sync::Arc::clone(&telemetry), hour);
+        let failing = async { Err::<(), String>("boom".to_string()) };
+        let outcome = finish_with_flush(&telemetry, Some(flush), failing).await;
+        assert_eq!(outcome, Err("boom".to_string()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("final_flush_marker").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_work_without_a_flush_task_passes_its_value_through_after_exporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("delegate_marker", 1.0, vec![]);
+        let outcome = finish_with_flush(&telemetry, None, async { 7 }).await;
+        assert_eq!(outcome, 7);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("delegate_marker"));
+        let unwritable = dir.path().join("blocked");
+        std::fs::write(&unwritable, b"x").unwrap();
+        let exporter = harness::telemetry::JsonlExporter::new(unwritable.join("t.jsonl"), 1024);
+        let broken = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        broken.record_counter("lost", 1.0, vec![]);
+        assert_eq!(finish_with_flush(&broken, None, async { 8 }).await, 8);
     }
 
     #[tokio::test(start_paused = true)]

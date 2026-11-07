@@ -177,47 +177,380 @@ fn emit_builds_one_event_and_hands_it_to_the_sink_once() {
     assert_eq!(users(&gate, "get"), expected(&["emit"]));
 }
 
-#[test]
-fn every_gate_the_cli_builds_gets_the_telemetry_sink() {
-    let main = source("src/main.rs");
-    let production = main.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-    for builder in ["build_mcp_task_manager", "build_delegate_task_manager"] {
-        let callers: BTreeSet<String> = users(production, builder)
-            .into_iter()
-            .filter(|caller| !caller.starts_with("build_"))
-            .collect();
-        assert!(!callers.is_empty(), "{builder} has no caller");
-        for caller in callers {
-            let attached = users(production, "export_action_audit").contains(&caller);
-            assert!(
-                attached,
-                "{caller} builds a gate without attaching the sink"
-            );
-        }
+#[derive(Default)]
+struct Calls {
+    locals: Vec<(String, Vec<String>)>,
+    calls: Vec<(String, Vec<syn::Expr>, Option<String>)>,
+    bound: Option<String>,
+}
+
+fn last_segment(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None,
     }
-    assert!(users(production, "spawn_telemetry_flush").contains("run_mcp_server"));
+}
+
+fn mentions(expr: &syn::Expr) -> Vec<String> {
+    let mut found = Functions::default();
+    found.visit_expr(expr);
+    found.idents.into_values().flatten().collect()
+}
+
+impl<'ast> Visit<'ast> for Calls {
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let name = match &node.pat {
+            syn::Pat::Ident(bound) => Some(bound.ident.to_string()),
+            _ => None,
+        };
+        if let (Some(name), Some(init)) = (&name, &node.init) {
+            self.locals.push((name.clone(), mentions(&init.expr)));
+        }
+        let outer = self.bound.replace(name.unwrap_or_default());
+        syn::visit::visit_local(self, node);
+        self.bound = outer;
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Some(name) = last_segment(&node.func) {
+            let args = node.args.iter().cloned().collect();
+            self.calls.push((name, args, self.bound.clone()));
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+}
+
+fn borrowed_path(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Reference(reference) => last_segment(&reference.expr),
+        _ => None,
+    }
+}
+
+fn is_action_gate_of(expr: &syn::Expr, manager: &str) -> bool {
+    let syn::Expr::Reference(reference) = expr else {
+        return false;
+    };
+    let syn::Expr::MethodCall(call) = &*reference.expr else {
+        return false;
+    };
+    call.method == "action_gate"
+        && call.args.is_empty()
+        && last_segment(&call.receiver).as_deref() == Some(manager)
+}
+
+fn attachment_problem(
+    source: &str,
+    function: &str,
+    builder: &str,
+    flushes: bool,
+) -> Option<String> {
+    let file = syn::parse_file(source).unwrap();
+    let body = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == function => Some(item.clone()),
+        _ => None,
+    })?;
+    let mut found = Calls::default();
+    found.visit_item_fn(&body);
+    let manager = found
+        .locals
+        .iter()
+        .find(|(_, idents)| idents.iter().any(|ident| ident == builder))
+        .map(|(name, _)| name.clone());
+    let Some(manager) = manager else {
+        return Some(format!(
+            "{function} does not bind the manager from {builder}"
+        ));
+    };
+    let export = found.calls.iter().find(|(name, args, _)| {
+        name == "export_action_audit"
+            && args.first().is_some_and(|a| is_action_gate_of(a, &manager))
+    });
+    let Some((_, _, Some(telemetry))) = export else {
+        return Some(format!(
+            "{function} must bind export_action_audit(&{manager}.action_gate(), ..)"
+        ));
+    };
+    let finish = found.calls.iter().find(|(name, args, _)| {
+        name == "finish_with_flush"
+            && args.first().and_then(borrowed_path).as_deref() == Some(telemetry.as_str())
+    });
+    let Some((_, args, _)) = finish else {
+        return Some(format!(
+            "{function} must end through finish_with_flush(&{telemetry}, ..)"
+        ));
+    };
+    let second = args.get(1).map(mentions).unwrap_or_default();
+    if !flushes {
+        return (second != ["None"])
+            .then(|| format!("{function} must pass None for the flush task"));
+    }
+    let spawned = found.calls.iter().find(|(name, args, bound)| {
+        name == "spawn_telemetry_flush"
+            && bound
+                .as_deref()
+                .is_some_and(|task| second.iter().any(|ident| ident == task))
+            && args
+                .first()
+                .is_some_and(|a| mentions(a).iter().any(|i| i == telemetry))
+    });
+    spawned.is_none().then(|| {
+        format!("{function} must pass the spawned flush task of {telemetry} to finish_with_flush")
+    })
+}
+
+fn production_main() -> String {
+    let main = source("src/main.rs");
+    main.split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
-fn action_gates_are_built_only_in_the_task_manager_and_the_cli() {
+fn each_cli_gate_gets_the_sink_from_its_own_manager_and_is_flushed_on_every_exit() {
+    let main = production_main();
+    let serve = attachment_problem(&main, "run_mcp_server", "build_mcp_task_manager", true);
+    assert_eq!(serve, None);
+    let delegate = attachment_problem(&main, "run_delegate", "build_delegate_task_manager", false);
+    assert_eq!(delegate, None);
+}
+
+#[test]
+fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
+    let wrap = |body: &str| format!("async fn run_x() {{ {body} }}");
+    let says = |body: &str, flushes: bool, needle: &str| -> bool {
+        let source = wrap(body);
+        let problem = attachment_problem(&source, "run_x", "build_x_task_manager", flushes);
+        problem.is_some_and(|text| text.contains(needle))
+    };
+    let clean = |body: &str, flushes: bool| -> bool {
+        let source = wrap(body);
+        attachment_problem(&source, "run_x", "build_x_task_manager", flushes).is_none()
+    };
+    let mgr = "let m = build_x_task_manager(a);";
+    let exp = "let t = export_action_audit(&m.action_gate(), p);";
+    let spawn = "let f = spawn_telemetry_flush(Arc::clone(&t), d);";
+    assert!(clean(
+        &format!("{mgr} {exp} {spawn} finish_with_flush(&t, Some(f), w).await;"),
+        true
+    ));
+    assert!(clean(
+        &format!("{mgr} {exp} finish_with_flush(&t, None, w).await;"),
+        false
+    ));
+    let other = "let t = export_action_audit(&TaskManager::default().action_gate(), p);";
+    assert!(says(
+        &format!("{mgr} {other} {spawn} finish_with_flush(&t, Some(f), w).await;"),
+        true,
+        "export_action_audit"
+    ));
+    assert!(says(
+        &format!("let m = other(a); {exp}"),
+        true,
+        "does not bind"
+    ));
+    let dropped = format!("{mgr} {exp} let f = 1; let _ = spawn_telemetry_flush; finish_with_flush(&t, Some(f), w).await;");
+    assert!(says(&dropped, true, "spawned flush task"));
+    assert!(says(&format!("{mgr} {exp}"), false, "finish_with_flush"));
+    assert!(says(
+        &format!("{mgr} {exp} finish_with_flush(&u, None, w).await;"),
+        false,
+        "finish_with_flush"
+    ));
+    assert!(says(
+        &format!("{mgr} {exp} finish_with_flush(t, None, w).await;"),
+        false,
+        "finish_with_flush"
+    ));
+    assert!(says(
+        &format!("{mgr} {exp} finish_with_flush(&t, Some(f), w).await;"),
+        false,
+        "None"
+    ));
+    assert!(says(
+        &format!("{mgr} export_action_audit(&m.action_gate(), p);"),
+        false,
+        "export_action_audit"
+    ));
+    assert!(says(
+        &format!("{mgr} let t = export_action_audit(m.action_gate(), p);"),
+        false,
+        "export_action_audit"
+    ));
+    assert!(says(
+        &format!("{mgr} let t = export_action_audit(&m, p);"),
+        false,
+        "export_action_audit"
+    ));
+    assert!(attachment_problem("fn other() {}", "run_x", "b", true).is_none());
+}
+
+#[derive(Default)]
+struct GateSites {
+    file: String,
+    function: Vec<String>,
+    sequence: BTreeMap<String, Vec<String>>,
+    aliases: BTreeSet<String>,
+}
+
+impl GateSites {
+    fn record(&mut self, name: String) {
+        let owner = self.function.last().cloned().unwrap_or_default();
+        self.sequence.entry(owner).or_default().push(name);
+    }
+
+    fn tokens(&mut self, stream: TokenStream) {
+        for token in stream {
+            match token {
+                TokenTree::Ident(ident) => self.record(plain(&ident.to_string())),
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn plain(name: &str) -> String {
+    name.strip_prefix("r#").unwrap_or(name).to_string()
+}
+
+impl<'ast> Visit<'ast> for GateSites {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            self.function.push(plain(&node.sig.ident.to_string()));
+            syn::visit::visit_item_fn(self, node);
+            self.function.pop();
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            self.function.push(plain(&node.sig.ident.to_string()));
+            syn::visit::visit_impl_item_fn(self, node);
+            self.function.pop();
+        }
+    }
+
+    fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
+        if plain(&node.ident.to_string()) == "ActionGate" {
+            self.aliases
+                .insert(format!("{}: renames ActionGate", self.file));
+        }
+    }
+
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        let mut mentioned = Functions::default();
+        mentioned.visit_type(&node.ty);
+        let names: Vec<String> = mentioned.idents.into_values().flatten().collect();
+        let hit = names.iter().any(|name| name == "ActionGate");
+        if hit {
+            self.aliases
+                .insert(format!("{}: type alias of ActionGate", self.file));
+        }
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        self.record(plain(&ident.to_string()));
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.tokens(node.tokens.clone());
+    }
+}
+
+const GATE_BUILDERS: &[&str] = &[
+    "with_action_gate",
+    "action_policy_gate",
+    "with_action_policy",
+];
+
+fn gate_builds(file: &str, source: &str) -> BTreeSet<String> {
+    let syntax = syn::parse_file(source).unwrap();
+    let mut sites = GateSites {
+        file: file.to_string(),
+        ..GateSites::default()
+    };
+    sites.visit_file(&syntax);
+    let mut found = sites.aliases.clone();
+    for (function, idents) in &sites.sequence {
+        for pair in idents.windows(2) {
+            if pair[0] == "ActionGate" && pair[1] == "new" {
+                found.insert(format!("{file}: {function}: ActionGate::new"));
+            }
+        }
+        for ident in idents
+            .iter()
+            .filter(|i| GATE_BUILDERS.contains(&i.as_str()))
+        {
+            found.insert(format!("{file}: {function}: {ident}"));
+        }
+    }
+    found
+}
+
+#[test]
+fn action_gates_are_built_only_at_the_pinned_production_sites() {
     let mut files = Vec::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     collect(&root, &mut files);
+    let mut found = BTreeSet::new();
     for path in files {
         let relative = path
             .strip_prefix(&root)
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        if relative == "task.rs" || relative == "main.rs" {
-            continue;
-        }
-        let text = fs::read_to_string(&path).unwrap();
-        for name in ["action_policy_gate", "with_action_policy"] {
-            let builders = users(&text, name);
-            assert!(builders.is_empty(), "{relative} builds a gate with {name}");
-        }
+        found.extend(gate_builds(&relative, &fs::read_to_string(&path).unwrap()));
     }
+    assert_eq!(
+        found,
+        expected(&[
+            "main.rs: build_delegate_task_manager: with_action_policy",
+            "main.rs: build_mcp_task_manager_with_budget: action_policy_gate",
+            "task.rs: action_policy_gate: ActionGate::new",
+            "task.rs: action_policy_gate: action_policy_gate",
+            "task.rs: default_action_gate: ActionGate::new",
+            "task.rs: model_facing_registry: with_action_gate",
+            "task.rs: with_action_gate: with_action_gate",
+            "task.rs: with_action_policy: action_policy_gate",
+            "task.rs: with_action_policy: with_action_gate",
+            "task.rs: with_action_policy: with_action_policy",
+            "tools.rs: with_action_gate: with_action_gate",
+        ]),
+        "an action gate is built somewhere new; it must attach the audit sink or be documented"
+    );
+}
+
+#[test]
+fn the_gate_build_scanner_sees_aliases_calls_and_skips_test_code() {
+    let source = r#"
+        use crate::action_auditor::ActionGate as G;
+        type H = std::sync::Arc<ActionGate>;
+        type Fine = Vec<u8>;
+        fn a() { let _ = ActionGate::new(x, y); }
+        fn b() { m.with_action_gate(g); }
+        fn c() { println!("{}", ActionGate::new(a, b)); }
+        #[cfg(test)]
+        fn only_in_tests() { ActionGate::new(a, b); }
+    "#;
+    let found = gate_builds("x.rs", source);
+    assert_eq!(
+        found,
+        expected(&[
+            "x.rs: renames ActionGate",
+            "x.rs: type alias of ActionGate",
+            "x.rs: a: ActionGate::new",
+            "x.rs: b: with_action_gate",
+            "x.rs: c: ActionGate::new",
+        ])
+    );
 }
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -279,8 +612,12 @@ fn the_scanner_attributes_idents_to_functions_and_skips_test_code() {
     let text = r#"
         fn decide() { log.append(a); }
         fn other() { println!("{}", append); }
+        mod inner { fn nested() { append(); } }
         #[cfg(test)]
         mod tests { fn t() { append(); } }
     "#;
-    assert_eq!(users(text, "append"), expected(&["decide", "other"]));
+    assert_eq!(
+        users(text, "append"),
+        expected(&["decide", "nested", "other"])
+    );
 }

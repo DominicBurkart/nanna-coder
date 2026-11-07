@@ -196,6 +196,24 @@ mod tests {
         assert_eq!(telemetry.get_buffered_metrics_count(), 1);
     }
 
+    #[tokio::test]
+    async fn the_counter_carries_exactly_the_four_bounded_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = crate::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let telemetry = TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let verdict = ActionVerdict::block(vec![Reason::new(ReasonCode::WindowClosed, "closed")]);
+        ActionAuditEvent::new(&review("deployer", "sandbox_deploy"), &verdict, "rule")
+            .record(&telemetry);
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let metric: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let labels = metric["metric"]["labels"].as_object().unwrap();
+        let keys: std::collections::BTreeSet<&str> = labels.keys().map(String::as_str).collect();
+        let allowed = ["effect_class", "identity", "tool", "verdict"];
+        assert_eq!(keys, allowed.into_iter().collect());
+    }
+
     #[test]
     fn the_sinks_accept_events_and_the_telemetry_sink_buffers_them() {
         let event = ActionAuditEvent::new(&review("a", "t"), &ActionVerdict::Allow, "m");
