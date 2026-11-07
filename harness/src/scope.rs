@@ -1383,6 +1383,133 @@ mod tests {
     }
 
     #[test]
+    fn windows_name_aliases_of_a_protected_file_are_refused_and_nothing_is_created() {
+        let ws = workspace();
+        let root = ws.path();
+        for (path, rule) in [
+            ("flake.nix.", "flake.nix"),
+            ("flake.nix ", "flake.nix"),
+            ("FLAKEN~1.NIX", "flake.nix"),
+            ("CODECO~1.YML", "codecov.yml"),
+            ("flake.nix:stream", "flake.nix"),
+            (".github./workflows/ci.yml", ".github/workflows/**"),
+        ] {
+            let violation = protected_error(guarded(None, PathAccess::Write, path, root));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+            assert!(!root.join(path).exists(), "{path}");
+        }
+        assert!(guarded(None, PathAccess::Write, "flake.nix.bak", root).is_ok());
+    }
+
+    #[test]
+    fn windows_name_aliases_of_a_declared_path_are_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]",
+        )
+        .unwrap();
+        let protected = ProtectedPaths::with_extras(root, None, &extras);
+        for (path, rule) in [
+            ("tools/release-helper.sh.", "tools/release-helper.sh"),
+            ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+            ("src/lib.rs::$DATA", "src/lib.rs"),
+            ("gate~1/x.rs", "gate/**"),
+            ("gate./x.rs", "gate/**"),
+        ] {
+            let violation = protected_error(resolve_path_guarded(
+                None,
+                &protected,
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            ));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+        }
+        let allowed = resolve_path_guarded(
+            None,
+            &protected,
+            "write_file",
+            PathAccess::Write,
+            Path::new("tools/OTHER~1.SH"),
+            root,
+        );
+        assert!(allowed.is_ok());
+    }
+
+    #[test]
+    fn a_unicode_equivalent_spelling_of_a_protected_file_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let violation = protected_error(guarded(None, PathAccess::Write, "fla\u{212A}e.nix", root));
+        assert_eq!(violation.rule, "flake.nix");
+        assert_eq!(violation.path, "fla\u{212A}e.nix");
+        assert!(!root.join("fla\u{212A}e.nix").exists());
+    }
+
+    #[test]
+    fn a_unicode_equivalent_spelling_of_a_declared_path_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]",
+        )
+        .unwrap();
+        let protected = ProtectedPaths::with_extras(root, None, &extras);
+        for (path, rule) in [
+            ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+            ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
+            ("src/\u{212A}ey.rs", "src/key.rs"),
+        ] {
+            let violation = protected_error(resolve_path_guarded(
+                None,
+                &protected,
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            ));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+            assert!(!root.join(path).exists(), "{path}");
+        }
+    }
+
+    #[test]
+    fn unicode_and_windows_spellings_of_a_declared_path_are_refused_together() {
+        let ws = workspace();
+        let root = ws.path();
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]",
+        )
+        .unwrap();
+        let protected = ProtectedPaths::with_extras(root, None, &extras);
+        for (path, rule) in [
+            ("docs/cafe\u{301}./x.md", "docs/caf\u{e9}/**"),
+            ("src/caf\u{e9}.rs.", "src/cafe\u{301}.rs"),
+            (
+                "docs/re\u{301}sume\u{301}~1.txt",
+                "docs/r\u{e9}sum\u{e9}-final.txt",
+            ),
+            ("fla\u{212A}e.nix.", "flake.nix"),
+        ] {
+            let violation = protected_error(resolve_path_guarded(
+                None,
+                &protected,
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            ));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+        }
+    }
+
+    #[test]
     fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
         let ws = workspace();
         let root = ws.path();

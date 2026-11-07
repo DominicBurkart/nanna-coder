@@ -20,8 +20,10 @@
 use crate::identity::IdentityCatalog;
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// The fixed, repository-relative globs every agent is refused, matched
 /// with `*` never crossing `/` and `**` spanning directories. A glob
@@ -151,6 +153,15 @@ fn validate_extra(pattern: &str) -> Result<(), ProtectedConfigError> {
             "the path must be normalised and stay inside the repository",
         ));
     }
+    if literal
+        .split('/')
+        .any(|part| part.ends_with(['.', ' ']) || part.contains(':'))
+    {
+        return Err(invalid_pattern(
+            pattern,
+            "a path component cannot end in a dot or a space or contain a colon, because Windows reads those as another spelling of the same name",
+        ));
+    }
     Ok(())
 }
 
@@ -257,6 +268,91 @@ pub fn hardlink_violation(path: &Path) -> ProtectedPathViolation {
     }
 }
 
+/// The rule reported for a path with so many short-name components that its
+/// spellings cannot all be enumerated.
+pub const ALIAS_OVERFLOW_RULE: &str = "ambiguous short-name path";
+
+const MAX_ALIAS_VARIANTS: usize = 1024;
+const MAX_ALIAS_COMPONENTS: usize = 1024;
+const STREAM_SEPARATOR: char = ':';
+const SHORT_NAME_TILDE: char = '~';
+const SHORT_NAME_WIDTH: usize = 8;
+const SHORT_NAME_MAX_PREFIX: usize = 6;
+const SHORT_NAME_MAX_EXTENSION: usize = 3;
+const HASHED_SHORT_NAME_KEPT: usize = 2;
+
+fn fold_component(component: &str) -> String {
+    let without_stream = component
+        .split(STREAM_SEPARATOR)
+        .next()
+        .unwrap_or(component);
+    let trimmed = without_stream.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        component.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn short_name_parts(component: &str) -> Option<(&str, &str)> {
+    let (base, extension) = component.rsplit_once('.').unwrap_or((component, ""));
+    let (prefix, digits) = base.rsplit_once(SHORT_NAME_TILDE)?;
+    let well_formed = !prefix.is_empty()
+        && !prefix.contains('.')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && prefix.chars().count() + 1 + digits.len() <= SHORT_NAME_WIDTH;
+    well_formed.then_some((prefix, extension))
+}
+
+fn short_name_char(c: char) -> char {
+    if matches!(c, '+' | ',' | ';' | '=' | '[' | ']') {
+        '_'
+    } else {
+        c
+    }
+}
+
+fn long_name_parts(literal: &str) -> (String, String) {
+    let stem = literal.trim_start_matches(['.', ' ']);
+    let (base, extension) = stem.rsplit_once('.').unwrap_or((stem, ""));
+    let base: String = base
+        .chars()
+        .filter(|c| !matches!(c, '.' | ' '))
+        .map(short_name_char)
+        .collect();
+    let extension: String = extension
+        .chars()
+        .take(SHORT_NAME_MAX_EXTENSION)
+        .map(short_name_char)
+        .collect();
+    (base.to_lowercase(), extension.to_lowercase())
+}
+
+fn is_short_name_of(literal: &str, prefix: &str, extension: &str) -> bool {
+    let (base, long_extension) = long_name_parts(literal);
+    if extension.to_lowercase() != long_extension {
+        return false;
+    }
+    let prefix = prefix.to_lowercase();
+    if !base.is_ascii() {
+        return true;
+    }
+    let overlaps =
+        base.starts_with(&prefix) || (!long_extension.is_empty() && prefix.starts_with(&base));
+    let hashed = prefix.chars().count() == SHORT_NAME_MAX_PREFIX
+        && prefix.is_ascii()
+        && prefix[..HASHED_SHORT_NAME_KEPT] == *base.get(..HASHED_SHORT_NAME_KEPT).unwrap_or("")
+        && prefix[HASHED_SHORT_NAME_KEPT..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit());
+    overlaps || hashed
+}
+
+fn literal_components(glob: &str) -> impl Iterator<Item = String> + '_ {
+    glob.split('/').map(str::to_string)
+}
+
 #[derive(Debug, Clone)]
 struct Rule {
     glob: String,
@@ -268,10 +364,19 @@ fn compile(glob: &str) -> Pattern {
     Pattern::new(glob).expect("protected glob is valid")
 }
 
+fn nfc(text: &str) -> String {
+    text.nfc().collect()
+}
+
+fn fold_path(path: &Path) -> PathBuf {
+    PathBuf::from(nfc(&path.to_string_lossy()))
+}
+
 impl Rule {
     fn new(glob: String) -> Self {
-        let pattern = compile(&glob);
-        let directory = glob.strip_suffix(RECURSIVE_SUFFIX).map(compile);
+        let folded = nfc(&glob);
+        let pattern = compile(&folded);
+        let directory = folded.strip_suffix(RECURSIVE_SUFFIX).map(compile);
         Self {
             glob,
             pattern,
@@ -324,15 +429,22 @@ pub struct MountRoot {
 pub struct ProtectedPaths {
     rules: Vec<Rule>,
     config_dir: Option<PathBuf>,
+    literals: Vec<String>,
 }
 
 fn relative_config_dir(repo_root: &Path, config_dir: &Path) -> Option<PathBuf> {
     let canonical = repo_root.canonicalize().ok();
+    let folded = fold_path(config_dir);
     std::iter::once(repo_root)
         .chain(canonical.as_deref())
-        .find_map(|root| config_dir.strip_prefix(root).ok())
+        .find(|root| folded.starts_with(fold_path(root)))
+        .map(|root| {
+            config_dir
+                .components()
+                .skip(root.components().count())
+                .collect::<PathBuf>()
+        })
         .filter(|relative| !relative.as_os_str().is_empty())
-        .map(Path::to_path_buf)
 }
 
 impl ProtectedPaths {
@@ -366,15 +478,88 @@ impl ProtectedPaths {
             .iter()
             .map(|glob| Rule::new(glob.to_string()))
             .collect();
+        let mut literals: Vec<String> = PROTECTED_PATTERNS
+            .iter()
+            .flat_map(|glob| literal_components(glob))
+            .collect();
         if let Some(relative) = config_dir.and_then(|dir| relative_config_dir(repo_root, dir)) {
-            let escaped = Pattern::escape(&crate::scope::denial_path(&relative));
+            let raw = crate::scope::denial_path(&relative);
+            let escaped = Pattern::escape(&raw);
             rules.push(Rule::new(format!("{escaped}{RECURSIVE_SUFFIX}")));
+            literals.extend(raw.split('/').map(str::to_string));
         }
         rules.extend(extras.globs().iter().cloned().map(Rule::new));
+        literals.extend(
+            extras
+                .globs()
+                .iter()
+                .flat_map(|glob| literal_components(glob)),
+        );
+        let mut literals: Vec<String> = literals.iter().map(|literal| nfc(literal)).collect();
+        literals.sort_by_key(|literal| literal.to_lowercase());
+        literals.dedup_by_key(|literal| literal.to_lowercase());
         Self {
             rules,
             config_dir: config_dir.map(Path::to_path_buf),
+            literals,
         }
+    }
+
+    pub(crate) fn variants(&self, path: &Path) -> Option<Vec<PathBuf>> {
+        let path = fold_path(path);
+        let mut variants = vec![path.clone()];
+        let options: Vec<Vec<OsString>> = path
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => self.component_options(name.to_string_lossy().as_ref()),
+                other => vec![other.as_os_str().to_os_string()],
+            })
+            .collect();
+        let mut count = 1_usize;
+        for choices in &options {
+            count = count.saturating_mul(choices.len());
+            if count > MAX_ALIAS_VARIANTS {
+                return None;
+            }
+        }
+        if count == 1 {
+            let only: PathBuf = options.into_iter().flatten().collect();
+            if only != path {
+                variants.push(only);
+            }
+            return Some(variants);
+        }
+        if options.len() > MAX_ALIAS_COMPONENTS {
+            return None;
+        }
+        let mut spellings: Vec<Vec<OsString>> = vec![Vec::new()];
+        for choices in &options {
+            let mut next = Vec::with_capacity(spellings.len() * choices.len());
+            for prefix in &spellings {
+                for option in choices {
+                    let mut spelling = prefix.clone();
+                    spelling.push(option.clone());
+                    next.push(spelling);
+                }
+            }
+            spellings = next;
+        }
+        variants.extend(spellings.into_iter().map(PathBuf::from_iter));
+        Some(variants)
+    }
+
+    fn component_options(&self, component: &str) -> Vec<OsString> {
+        let folded = fold_component(component);
+        let mut options = vec![OsString::from(&folded)];
+        if let Some((prefix, extension)) = short_name_parts(&folded) {
+            options.extend(
+                self.literals
+                    .iter()
+                    .filter(|literal| is_short_name_of(literal, prefix, extension))
+                    .map(OsString::from),
+            );
+        }
+        options
     }
 
     /// Whether the repository-relative `path` may not be written.
@@ -384,7 +569,17 @@ impl ProtectedPaths {
 
     /// The rule protecting the repository-relative `path`, as an error.
     pub fn check(&self, path: &Path) -> Result<(), ProtectedPathViolation> {
-        match self.rules.iter().find(|rule| rule.matches(path)) {
+        let Some(variants) = self.variants(path) else {
+            return Err(ProtectedPathViolation {
+                path: crate::scope::denial_path(path),
+                rule: ALIAS_OVERFLOW_RULE.to_string(),
+            });
+        };
+        let hit = self
+            .rules
+            .iter()
+            .find(|rule| variants.iter().any(|variant| rule.matches(variant)));
+        match hit {
             Some(rule) => Err(ProtectedPathViolation {
                 path: crate::scope::denial_path(path),
                 rule: rule.glob.clone(),
@@ -827,6 +1022,224 @@ mod tests {
         }
     }
 
+    mod windows_aliases {
+        use super::*;
+
+        fn with_config_dir_at(config: &str) -> ProtectedPaths {
+            let root = Path::new("/repo");
+            ProtectedPaths::with_config_dir(root, Some(&root.join(config)))
+        }
+
+        fn rule_of(protected: &ProtectedPaths, path: &str) -> Option<String> {
+            protected.check(Path::new(path)).err().map(|v| v.rule)
+        }
+
+        #[test]
+        fn trailing_dots_and_spaces_fold_onto_the_protected_name() {
+            let protected = protected();
+            for (path, rule) in [
+                ("flake.nix.", "flake.nix"),
+                ("flake.nix ", "flake.nix"),
+                ("flake.nix. .", "flake.nix"),
+                ("FLAKE.NIX...", "flake.nix"),
+                ("codecov.yml  ", "codecov.yml"),
+                (".github./workflows/ci.yml", ".github/workflows/**"),
+                (".github/workflows /ci.yml", ".github/workflows/**"),
+                (".nanna /agents/x.toml", ".nanna/**"),
+                ("crates/api/.nanna./x.toml", "**/.nanna/**"),
+                ("AGENTS.md.", "AGENTS.md"),
+                (".git./config", ".git/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_folded_violation_reports_the_spelling_that_was_written() {
+            let violation = protected().check(Path::new("flake.nix. ")).unwrap_err();
+            assert_eq!(violation.path, "flake.nix. ");
+            assert_eq!(violation.rule, "flake.nix");
+        }
+
+        #[test]
+        fn folding_never_empties_a_component_or_touches_dot_components() {
+            let protected = protected();
+            for path in [
+                "...",
+                "src/.../main.rs",
+                "docs/. /x",
+                "src/main.rs.",
+                "a. b",
+                " /flake.nix",
+                ". /flake.nix",
+                "... /codecov.yml",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn names_that_only_resemble_a_protected_name_stay_unprotected() {
+            let protected = protected();
+            for path in [
+                "flake.nix.bak",
+                "flake.nixx.",
+                "xflake.nix.",
+                "codecov.yml.bak ",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_stream_suffix_addresses_the_protected_file() {
+            let protected = protected();
+            for (path, rule) in [
+                ("flake.nix:stream", "flake.nix"),
+                ("flake.nix::$DATA", "flake.nix"),
+                ("flake.nix.:x", "flake.nix"),
+                (".github/workflows/ci.yml:x", ".github/workflows/**"),
+                (".github:x/workflows/ci.yml", ".github/workflows/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+            for path in ["notes:flake.nix", ":flake.nix", "src/a:b.rs"] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_of_protected_files_and_directories_are_refused() {
+            let protected = protected();
+            for (path, rule) in [
+                ("CODECO~1.YML", "codecov.yml"),
+                ("codeco~1.yml", "codecov.yml"),
+                ("TARPAU~1.TOM", "tarpaulin.toml"),
+                ("WINDOW~1.TOM", "windows.toml"),
+                ("DENY~1.TOM", "deny.toml"),
+                ("FLAKEL~1.LOC", "flake.lock"),
+                ("FLAKEN~1.NIX", "flake.nix"),
+                ("FLAKE~12.NIX", "flake.nix"),
+                ("GITHUB~1/WORKFL~1/ci.yml", ".github/workflows/**"),
+                ("GITHUB~1/CODEOW~1", ".github/CODEOWNERS"),
+                ("NANNA~1/agents/x.toml", ".nanna/**"),
+                ("crates/NANNA~1/x.toml", "**/.nanna/**"),
+                ("GIT~1/config", ".git/**"),
+                ("DEVCON~1/devcontainer.json", ".devcontainer/**"),
+                ("docs/CODEOW~1", "docs/CODEOWNERS"),
+                ("FL1A2B~1.NIX", "flake.nix"),
+                ("CO3F9A~2.YML", "codecov.yml"),
+                ("CLAUDE~1.MD", "CLAUDE.md"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_that_cannot_alias_a_protected_name_are_allowed() {
+            let protected = protected();
+            for path in [
+                "README~1.MD",
+                "XLAKEN~1.NIX",
+                "FLAKEN~1.TXT",
+                "FLAKEN~1.NIXX",
+                "src/FLAKEN~1.NIX",
+                "flake~.nix",
+                "~1.NIX",
+                "FLAKEN~.NIX",
+                "FLAKEN~1234567.NIX",
+                "FLAKENIX~1.NIX",
+                "FLAKEN~1.NI.X",
+                "FLA.KE~1.NIX",
+                "ZZ1A2B~1.NIX",
+                "FLZZZZ~1.NIX",
+                "docs/GITHUB~1",
+                "GITLAB~1/x",
+                "FLAKEN~12.NIX",
+                "FLAKE.~1.NIX",
+                "FLAKE~A.NIX",
+                "FA1A2B~1.NIX",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_path_with_too_many_short_name_spellings_fails_closed() {
+            let protected = protected();
+            let many = "src/G~1/G~1/G~1/G~1/G~1/G~1/G~1/G~1/x.rs";
+            let violation = protected.check(Path::new(many)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
+            assert_eq!(violation.path, many);
+            let few = "src/G~1/G~1/x.rs";
+            assert!(!protected.is_protected(Path::new(few)));
+        }
+
+        #[test]
+        fn the_variant_cap_is_exactly_1024_spellings() {
+            let protected = protected();
+            let at_cap = ["CODECO~1.YML"; 10].join("/");
+            assert!(!protected.is_protected(Path::new(&at_cap)));
+            let over_cap = ["CODECO~1.YML"; 11].join("/");
+            let violation = protected.check(Path::new(&over_cap)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
+        }
+
+        #[test]
+        fn a_very_deep_path_with_nothing_aliasable_is_checked_in_linear_time() {
+            let protected = protected();
+            let deep = ["a"; 50_000].join("/");
+            let started = std::time::Instant::now();
+            assert!(protected.check(Path::new(&deep)).is_ok());
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            let variants = protected.variants(Path::new(&deep)).unwrap();
+            assert_eq!(variants.len(), 1);
+        }
+
+        #[test]
+        fn a_deep_path_still_reports_its_folded_spelling_as_a_second_variant() {
+            let protected = protected();
+            let deep = format!("{}/flake.nix.", ["a"; 3_000].join("/"));
+            let variants = protected.variants(Path::new(&deep)).unwrap();
+            assert_eq!(variants.len(), 2);
+            assert!(variants[1].ends_with("flake.nix"));
+        }
+
+        #[test]
+        fn a_deep_path_with_an_aliasable_component_fails_closed_past_the_component_cap() {
+            let protected = protected();
+            let within = format!("{}/CODECO~1.YML", ["a"; 1_000].join("/"));
+            assert!(protected.variants(Path::new(&within)).is_some());
+            let beyond = format!("{}/CODECO~1.YML", ["a"; 1_100].join("/"));
+            let violation = protected.check(Path::new(&beyond)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
+        }
+
+        #[test]
+        fn a_configuration_directory_with_a_trailing_dot_matches_as_written() {
+            let protected = with_config_dir_at("dot./state");
+            assert!(protected.is_protected(Path::new("dot./state/x")));
+            assert!(!protected.is_protected(Path::new("dot./other/x")));
+        }
+
+        #[test]
+        fn a_non_ascii_configuration_directory_matches_any_short_name_prefix() {
+            let protected = with_config_dir_at("cfg/\u{e9}tat-courant");
+            assert!(protected.is_protected(Path::new("cfg/_TAT-C~1/x")));
+            assert!(protected.is_protected(Path::new("cfg/XYZ~1/x")));
+            assert!(!protected.is_protected(Path::new("cfg/XYZ~1.TXT/x")));
+            assert!(!protected.is_protected(Path::new("other/XYZ~1/x")));
+        }
+
+        #[test]
+        fn a_configuration_directory_has_short_name_aliases_too() {
+            let protected = with_config_dir_at("cfg/nanna-state");
+            assert!(protected.is_protected(Path::new("cfg/NANNA-~1/agents/x.toml")));
+            assert!(protected.is_protected(Path::new("CFG/nanna-state./x")));
+            assert!(!protected.is_protected(Path::new("cfg/OTHER~1/x")));
+        }
+    }
+
     #[test]
     fn ordinary_repository_paths_are_not_protected() {
         let protected = protected();
@@ -921,6 +1334,137 @@ mod tests {
         ] {
             assert!(!protected.is_protected(Path::new(path)), "{path}");
             assert_eq!(protected.check(Path::new(path)), Ok(()));
+        }
+    }
+
+    mod unicode_folding {
+        use super::*;
+
+        const NFD: &str = "cafe\u{301}";
+        const PRECOMPOSED: &str = "caf\u{e9}";
+
+        fn with_config(config: &str) -> ProtectedPaths {
+            let root = Path::new("/repo");
+            ProtectedPaths::with_config_dir(root, Some(&root.join(config)))
+        }
+
+        #[test]
+        fn a_decomposed_spelling_matches_a_precomposed_configuration_directory() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            let candidate = format!("cfg/{NFD}/agents/x.toml");
+            let violation = protected.check(Path::new(&candidate)).unwrap_err();
+            assert_eq!(violation.path, candidate);
+            assert_eq!(violation.rule, format!("cfg/{PRECOMPOSED}/**"));
+        }
+
+        #[test]
+        fn a_precomposed_spelling_matches_a_decomposed_configuration_directory() {
+            let config = format!("cfg/{NFD}");
+            let protected = with_config(&config);
+            let candidate = format!("cfg/{PRECOMPOSED}/agents/x.toml");
+            let violation = protected.check(Path::new(&candidate)).unwrap_err();
+            assert_eq!(violation.rule, format!("{config}/**"));
+        }
+
+        #[test]
+        fn the_directory_itself_and_case_variants_match_in_either_spelling() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            assert!(protected.is_protected(Path::new(&format!("cfg/{NFD}"))));
+            assert!(protected.is_protected(Path::new(&format!("CFG/{NFD}/x"))));
+        }
+
+        #[test]
+        fn the_directory_itself_matches_when_the_configuration_directory_is_decomposed() {
+            let protected = with_config(&format!("cfg/{NFD}"));
+            assert!(protected.is_protected(Path::new(&format!("cfg/{PRECOMPOSED}"))));
+        }
+
+        #[test]
+        fn a_configuration_directory_equal_to_the_repository_root_adds_no_rule() {
+            let root = Path::new("/repo");
+            let protected = ProtectedPaths::with_config_dir(root, Some(root));
+            assert_eq!(protected.rules().len(), PROTECTED_PATTERNS.len());
+        }
+
+        #[test]
+        fn combining_marks_are_reordered_canonically() {
+            let protected = with_config("cfg/a\u{323}\u{301}");
+            assert!(protected.is_protected(Path::new("cfg/a\u{301}\u{323}/x")));
+            assert!(protected.is_protected(Path::new("cfg/\u{1ea1}\u{301}/x")));
+        }
+
+        #[test]
+        fn a_decomposed_configuration_directory_under_a_precomposed_root_is_a_rule() {
+            let root = PathBuf::from(format!("/home/{PRECOMPOSED}/repo"));
+            let config = PathBuf::from(format!("/home/{NFD}/repo/cfg"));
+            let protected = ProtectedPaths::with_config_dir(&root, Some(&config));
+            assert!(protected.is_protected(Path::new("cfg/agents/x.toml")));
+            assert_eq!(protected.config_dir(), Some(config.as_path()));
+        }
+
+        #[test]
+        fn a_precomposed_configuration_directory_under_a_decomposed_root_is_a_rule() {
+            let root = PathBuf::from(format!("/home/{NFD}/repo"));
+            let config = PathBuf::from(format!("/home/{PRECOMPOSED}/repo/cfg"));
+            let protected = ProtectedPaths::with_config_dir(&root, Some(&config));
+            assert!(protected.is_protected(Path::new("cfg/agents/x.toml")));
+        }
+
+        #[test]
+        fn rules_and_mount_roots_keep_the_configuration_directory_spelling() {
+            let config = format!("cfg/{NFD}");
+            let protected = with_config(&config);
+            assert!(protected.rules().contains(&format!("{config}/**").as_str()));
+            assert!(protected.mount_roots().contains(&PathBuf::from(&config)));
+        }
+
+        #[test]
+        fn compatibility_singletons_fold_onto_ascii_protected_names() {
+            let protected = protected();
+            for (path, rule) in [
+                ("fla\u{212A}e.nix", "flake.nix"),
+                ("flake.loc\u{212A}", "flake.lock"),
+                (".cargo-hus\u{212A}y/x", ".cargo-husky/**"),
+                ("crates/.nanna/\u{212B}", "**/.nanna/**"),
+            ] {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert_eq!(violation.rule, rule, "{path}");
+                assert_eq!(violation.path, path);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_path_that_is_not_valid_utf8_is_still_matched() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let protected = protected();
+            let inside = Path::new(OsStr::from_bytes(b".nanna/agents/\xff.toml"));
+            assert!(protected.is_protected(inside));
+            let outside = Path::new(OsStr::from_bytes(b"docs/\xff.md"));
+            assert!(!protected.is_protected(outside));
+        }
+
+        #[test]
+        fn compatibility_forms_that_no_file_system_folds_stay_unprotected() {
+            let protected = protected();
+            for path in ["\u{fb02}ake.nix", "\u{ff46}lake.nix", "codecov\u{ff0e}yml"] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn unrelated_non_ascii_names_stay_unprotected() {
+            let protected = with_config(&format!("cfg/{PRECOMPOSED}"));
+            for path in [
+                format!("cfg/{NFD}x/y"),
+                format!("other/{NFD}/y"),
+                format!("{NFD}/cfg/y"),
+                "docs/caf\u{e8}/y".to_string(),
+                "docs/\u{212A}elvin.md".to_string(),
+            ] {
+                assert!(!protected.is_protected(Path::new(&path)), "{path}");
+            }
         }
     }
 
@@ -1353,6 +1897,13 @@ mod tests {
         }
 
         #[test]
+        fn ordinary_names_with_dots_spaces_or_colons_still_pass_the_guard() {
+            let repo = repo_changing(&["src/main.rs.", "docs/a b.md", "notes:flake.nix"], "work");
+            let output = enforce(&repo, "rust-implementer", "stranger", "");
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+        }
+
+        #[test]
         fn matching_is_case_insensitive_and_nested_nanna_directories_are_caught() {
             let repo = repo_changing(&["FLAKE.NIX", "crates/api/.Nanna/agents/x.toml"], "work");
             let stderr = stderr(&enforce(&repo, "", "stranger", "owner"));
@@ -1754,6 +2305,297 @@ mod tests {
             assert_eq!(protected.config_dir(), expected.as_deref());
             assert!(protected.is_protected(Path::new("src/gate.rs")));
             assert!(protected.is_protected(Path::new(".nanna/agents/x.toml")));
+        }
+
+        fn alias_declaration() -> ProtectedPaths {
+            with(&["tools/release-helper.sh", "gate/**", "src/lib.rs"])
+        }
+
+        fn rule_of(protected: &ProtectedPaths, path: &str) -> Option<String> {
+            protected.check(Path::new(path)).err().map(|v| v.rule)
+        }
+
+        #[test]
+        fn trailing_dots_spaces_and_streams_fold_onto_a_declared_path() {
+            let protected = alias_declaration();
+            for (path, rule) in [
+                ("tools/release-helper.sh.", "tools/release-helper.sh"),
+                ("tools/release-helper.sh ", "tools/release-helper.sh"),
+                ("TOOLS./Release-Helper.SH. .", "tools/release-helper.sh"),
+                ("src/lib.rs::$DATA", "src/lib.rs"),
+                ("src/lib.rs:stream", "src/lib.rs"),
+                ("gate./x.rs", "gate/**"),
+                ("gate /sub/x.rs", "gate/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_of_declared_paths_are_refused() {
+            let protected = alias_declaration();
+            for (path, rule) in [
+                ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+                ("tools/RE3F9A~1.SH", "tools/release-helper.sh"),
+                ("TOOLS/relea~12.sh", "tools/release-helper.sh"),
+                ("gate~1/x.rs", "gate/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn short_names_that_cannot_alias_a_declared_path_are_allowed() {
+            let protected = alias_declaration();
+            for path in [
+                "tools/OTHER~1.SH",
+                "tools/RELEAS~1.TXT",
+                "src/RELEAS~1.SH",
+                "tools/release-helper.sh.bak",
+                "tools/release-helper.shx",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn without_a_declaration_the_same_aliases_are_unprotected() {
+            let protected = with(&[]);
+            for path in [
+                "tools/release-helper.sh.",
+                "tools/RELEAS~1.SH",
+                "src/lib.rs::$DATA",
+                "gate~1/x.rs",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_declared_alias_violation_reports_the_written_spelling_and_the_declared_glob() {
+            let protected = alias_declaration();
+            let violation = protected.check(Path::new("tools/RELEAS~1.SH")).unwrap_err();
+            assert_eq!(violation.path, "tools/RELEAS~1.SH");
+            assert_eq!(violation.rule, "tools/release-helper.sh");
+        }
+
+        #[test]
+        fn declared_paths_that_end_in_a_dot_or_space_or_hold_a_colon_are_rejected() {
+            for pattern in [
+                "docs/notes.",
+                "docs/notes ",
+                "docs./x",
+                "docs /x",
+                "docs/**.",
+                "docs/notes.txt:stream",
+                "a:b/c",
+            ] {
+                let text = format!("extra = [\"{pattern}\"]");
+                assert!(
+                    matches!(
+                        ProtectedExtras::parse(&text),
+                        Err(ProtectedConfigError::InvalidPattern { .. })
+                    ),
+                    "{pattern}"
+                );
+            }
+            assert!(ProtectedExtras::parse("extra = [\"docs/notes.txt\", \"dir.d/**\"]").is_ok());
+        }
+
+        #[test]
+        fn a_declared_name_with_characters_windows_replaces_in_short_names_is_matched() {
+            let protected = with_raw(&["tools/a+b+c+d+e.txt", "tools/x;y=z.sh"]);
+            for (path, rule) in [
+                ("tools/A_B_C_~1.TXT", "tools/a+b+c+d+e.txt"),
+                ("tools/X_Y_Z~1.SH", "tools/x;y=z.sh"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+            assert!(!protected.is_protected(Path::new("tools/A_B_X_~1.TXT")));
+        }
+
+        #[test]
+        fn too_many_short_name_spellings_of_a_declared_path_fail_closed() {
+            let protected = with(&["tools/release-helper.sh"]);
+            let many = ["RELEAS~1.SH"; 11].join("/");
+            let violation = protected.check(Path::new(&many)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
+        }
+
+        fn with_raw(globs: &[&str]) -> ProtectedPaths {
+            let quoted: Vec<String> = globs.iter().map(|g| format!("\"{g}\"")).collect();
+            let extras =
+                ProtectedExtras::parse(&format!("extra = [{}]", quoted.join(", "))).unwrap();
+            ProtectedPaths::with_extras(Path::new("/repo"), None, &extras)
+        }
+
+        const NFD_FILE: &str = "src/cafe\u{301}.rs";
+        const NFC_FILE: &str = "src/caf\u{e9}.rs";
+        const NFD_DIR: &str = "docs/cafe\u{301}";
+        const NFC_DIR: &str = "docs/caf\u{e9}";
+
+        #[test]
+        fn a_declared_decomposed_file_matches_its_precomposed_spelling() {
+            let protected = with_raw(&[NFD_FILE]);
+            let violation = protected.check(Path::new(NFC_FILE)).unwrap_err();
+            assert_eq!(violation.rule, NFD_FILE);
+            assert_eq!(violation.path, NFC_FILE);
+            assert!(protected.is_protected(Path::new(NFD_FILE)));
+        }
+
+        #[test]
+        fn a_declared_precomposed_file_matches_its_decomposed_spelling() {
+            let protected = with_raw(&[NFC_FILE]);
+            let violation = protected.check(Path::new(NFD_FILE)).unwrap_err();
+            assert_eq!(violation.rule, NFC_FILE);
+            assert_eq!(violation.path, NFD_FILE);
+        }
+
+        #[test]
+        fn a_declared_directory_matches_either_spelling_of_itself_and_its_contents() {
+            for (declared, candidates) in [
+                (
+                    NFD_DIR,
+                    [NFC_DIR, "docs/caf\u{e9}/x/y.md", "DOCS/caf\u{e9}/x"],
+                ),
+                (
+                    NFC_DIR,
+                    [NFD_DIR, "docs/cafe\u{301}/x/y.md", "DOCS/cafe\u{301}/x"],
+                ),
+            ] {
+                let protected = with_raw(&[&format!("{declared}/**")]);
+                for candidate in candidates {
+                    assert!(
+                        protected.is_protected(Path::new(candidate)),
+                        "{declared} {candidate}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_declared_ascii_name_matches_its_compatibility_singleton() {
+            let protected = with_raw(&["src/key.rs", "ci/**"]);
+            assert!(protected.is_protected(Path::new("src/\u{212A}ey.rs")));
+            assert!(protected.is_protected(Path::new("ci/\u{212A}/x")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_declared_directory_still_matches_a_path_that_is_not_valid_utf8() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let protected = with_raw(&["ci/**"]);
+            assert!(protected.is_protected(Path::new(OsStr::from_bytes(b"ci/\xff.sh"))));
+            assert!(!protected.is_protected(Path::new(OsStr::from_bytes(b"cj/\xff.sh"))));
+        }
+
+        #[test]
+        fn declared_rules_and_mount_roots_keep_the_declared_spelling() {
+            let protected = with_raw(&[NFD_FILE, &format!("{NFC_DIR}/**")]);
+            assert!(protected.rules().contains(&NFD_FILE));
+            assert!(protected
+                .rules()
+                .contains(&format!("{NFC_DIR}/**").as_str()));
+            let roots = protected.mount_roots();
+            assert!(roots.contains(&PathBuf::from(NFD_FILE)));
+            assert!(roots.contains(&PathBuf::from(NFC_DIR)));
+        }
+
+        #[test]
+        fn unrelated_non_ascii_names_stay_unprotected_under_declared_patterns() {
+            let protected = with_raw(&[NFD_FILE, &format!("{NFC_DIR}/**")]);
+            for path in [
+                "src/caf\u{e8}.rs",
+                "docs/cafe\u{301}x/y",
+                "other/cafe\u{301}/y",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        const COMBINED: [&str; 3] = [
+            "docs/caf\u{e9}/**",
+            "src/cafe\u{301}.rs",
+            "docs/r\u{e9}sum\u{e9}-final.txt",
+        ];
+
+        #[test]
+        fn nfd_spellings_with_a_trailing_dot_stream_or_space_match_declared_paths() {
+            let protected = with_raw(&COMBINED);
+            for (path, rule) in [
+                ("docs/cafe\u{301}./x.md", COMBINED[0]),
+                ("docs/cafe\u{301} /x.md", COMBINED[0]),
+                ("src/caf\u{e9}.rs.", COMBINED[1]),
+                ("src/caf\u{e9}.rs ", COMBINED[1]),
+                ("src/caf\u{e9}.rs::$DATA", COMBINED[1]),
+                ("SRC/cafe\u{301}.RS.", COMBINED[1]),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn nfd_short_names_match_declared_non_ascii_paths() {
+            for declared in [
+                "docs/r\u{e9}sum\u{e9}-final.txt",
+                "docs/re\u{301}sume\u{301}-final.txt",
+            ] {
+                let protected = with_raw(&[declared]);
+                for path in [
+                    "docs/re\u{301}sume\u{301}~1.txt",
+                    "docs/r\u{e9}sum\u{e9}~1.txt",
+                    "docs/re\u{301}sume\u{301}~1.txt.",
+                ] {
+                    assert_eq!(
+                        rule_of(&protected, path).as_deref(),
+                        Some(declared),
+                        "{path}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn combined_spellings_that_resemble_but_differ_stay_unprotected() {
+            let protected = with_raw(&COMBINED);
+            for path in [
+                "docs/cafe\u{301}x./y.md",
+                "src/caf\u{e8}.rs.",
+                "docs/re\u{301}sume\u{301}~1.md",
+                "other/re\u{301}sume\u{301}~1.txt",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
+        fn windows_aliases_of_shipped_paths_combine_with_unicode_folds() {
+            let protected = protected();
+            for (path, rule) in [
+                ("fla\u{212A}e.nix.", "flake.nix"),
+                ("fla\u{212A}e.nix ", "flake.nix"),
+                ("FLA\u{212A}EN~1.NIX", "flake.nix"),
+                ("cafe\u{301}/.nanna ./agents/x.toml", "**/.nanna/**"),
+                (".git./cafe\u{301}/config", ".git/**"),
+                (".github./workflows/ci.yml::$DATA", ".github/workflows/**"),
+            ] {
+                assert_eq!(rule_of(&protected, path).as_deref(), Some(rule), "{path}");
+            }
+        }
+
+        #[test]
+        fn a_configuration_directory_combines_both_folds() {
+            let root = Path::new("/repo");
+            let config = root.join("cfg/cafe\u{301}");
+            let protected = ProtectedPaths::with_config_dir(root, Some(&config));
+            for path in [
+                "cfg/caf\u{e9}./agents/x.toml",
+                "cfg/CAF\u{e9}/x",
+                "cfg/cafe\u{301} /x",
+            ] {
+                assert!(protected.is_protected(Path::new(path)), "{path}");
+            }
         }
     }
 }
