@@ -1,0 +1,17 @@
+[identity]
+name = "verifier"
+description = "Runs the repository's declared checks (.nanna/verify.toml) in the dev container and reports a structured pass or fail per check; no model decides the verdict."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Not used: the harness runs the declared checks itself and no model is consulted." }
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = []
+max_effect = "workspace"
+tools = ["run_checks"]
+
+[limits]
+max_iterations = 1
+max_wall_clock_secs = 3600
+max_concurrent = 4
