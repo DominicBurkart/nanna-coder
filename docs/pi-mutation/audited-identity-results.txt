@@ -1,0 +1,15 @@
+submit_spawn stores Unaudited: KILLED
+admit_restored stores Unaudited: KILLED
+catalog resolution mints Audited: KILLED
+second AuditedIdentity constructor: KILLED
+macro-hidden BoundIdentity::Audited: KILLED
+type alias then Alias::split: KILLED
+use AuditedIdentity as AI then AI::split: KILLED
+Self::split in a second token method: KILLED
+AuditedIdentity derives Clone: KILLED
+split becomes pub(crate): KILLED
+qualified path <AuditedIdentity>::split: KILLED
+qualified path <Self>::split in a second token method: KILLED
+cfg_attr hides derive(Clone): KILLED
+absolute-path derive(Clone): KILLED
+manual Clone impl for the token: KILLED

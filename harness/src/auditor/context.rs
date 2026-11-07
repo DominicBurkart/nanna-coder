@@ -2,7 +2,7 @@
 
 use super::AuditError;
 use crate::effects::EffectClass;
-use crate::identity::{AgentIdentity, IdentityCatalog};
+use crate::identity::{AgentIdentity, IdentityCatalog, IdentityError};
 use crate::onboarding::profile::ProjectProfile;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -112,6 +112,28 @@ impl AuditContext {
         out
     }
 
+    /// ```
+    /// use harness::auditor::AuditContext;
+    /// use harness::identity::IdentityCatalog;
+    /// let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/identities");
+    /// let catalog = IdentityCatalog::load(format!("{fixtures}/global")).unwrap();
+    /// let auditor = catalog.get("auditor").unwrap().clone();
+    /// let context = AuditContext::new(catalog, auditor).unwrap();
+    /// let layered = context.with_repo_overrides(format!("{fixtures}/repo")).unwrap();
+    /// assert_eq!(layered.catalog().get("rust-implementer").unwrap().scope.paths, ["api/**"]);
+    /// assert_eq!(context.catalog().get("rust-implementer").unwrap().scope.paths, ["api/**", "shared/**"]);
+    /// ```
+    pub fn with_repo_overrides(
+        &self,
+        repo_root: impl AsRef<std::path::Path>,
+    ) -> Result<Self, IdentityError> {
+        let catalog = IdentityCatalog::clone(&self.catalog).with_repo_overrides(repo_root)?;
+        Ok(Self {
+            catalog: Arc::new(catalog),
+            ..self.clone()
+        })
+    }
+
     /// The identities the planner may spawn.
     pub fn catalog(&self) -> &IdentityCatalog {
         &self.catalog
@@ -164,6 +186,118 @@ max_concurrent = 4
 
     pub(crate) fn context() -> AuditContext {
         AuditContext::new(IdentityCatalog::default(), auditor_identity()).unwrap()
+    }
+
+    const GLOBAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/identities/global"
+    );
+    const REPO: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/identities/repo"
+    );
+
+    fn fixture_context() -> AuditContext {
+        let catalog = IdentityCatalog::load(GLOBAL).unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        AuditContext::new(catalog, auditor).unwrap()
+    }
+
+    fn repo_with_override(name: &str, body: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+        repo
+    }
+
+    fn override_card(name: &str, paths: &str, effect: &str) -> String {
+        format!(
+            r#"
+[identity]
+name = "{name}"
+description = "Override."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = {{ inline = "Override." }}
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = [{paths}]
+max_effect = "{effect}"
+tools = ["read_file"]
+
+[limits]
+max_iterations = 10
+max_wall_clock_secs = 60
+max_concurrent = 1
+"#
+        )
+    }
+
+    #[test]
+    fn repo_overrides_narrow_the_catalog_copy_and_leave_the_original_alone() {
+        let context = fixture_context();
+        let layered = context.with_repo_overrides(REPO).unwrap();
+        let narrowed = layered.catalog().get("rust-implementer").unwrap();
+        assert_eq!(narrowed.scope.paths, ["api/**"]);
+        let base = context.catalog().get("rust-implementer").unwrap();
+        assert_eq!(base.scope.paths, ["api/**", "shared/**"]);
+        assert_eq!(layered.auditor(), context.auditor());
+    }
+
+    #[test]
+    fn a_repo_without_overrides_leaves_the_catalog_unchanged() {
+        let context = fixture_context();
+        let repo = tempfile::tempdir().unwrap();
+        let layered = context.with_repo_overrides(repo.path()).unwrap();
+        assert_eq!(layered.catalog(), context.catalog());
+    }
+
+    #[test]
+    fn a_widening_override_is_refused() {
+        let repo = repo_with_override(
+            "rust-implementer.toml",
+            &override_card(
+                "rust-implementer",
+                r#""api/**", "shared/**", "ui/**""#,
+                "workspace",
+            ),
+        );
+        let err = fixture_context()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(matches!(err, IdentityError::WidensScope { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_override_without_a_global_base_is_refused() {
+        let repo = repo_with_override("ghost.toml", &override_card("ghost", r#""api/**""#, "none"));
+        let err = fixture_context()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(matches!(err, IdentityError::NoBaseIdentity { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_unparseable_override_is_refused() {
+        let repo = repo_with_override("rust-implementer.toml", "not = [valid");
+        let err = fixture_context()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(matches!(err, IdentityError::Parse { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_auditor_cannot_be_overridden() {
+        let repo = repo_with_override("auditor.toml", &override_card("auditor", "", "none"));
+        let err = fixture_context()
+            .with_repo_overrides(repo.path())
+            .unwrap_err();
+        assert!(
+            matches!(err, IdentityError::ProtectedIdentity { .. }),
+            "{err}"
+        );
     }
 
     #[test]

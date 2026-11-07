@@ -1,8 +1,7 @@
-# Ready-to-apply workflow for issue #639. Agents may not write under
-# .github/workflows/**, so a maintainer must copy this file to
-# .github/workflows/protected-paths-guard.yml (and add that path to the
-# repository ruleset's path restriction) for it to run.
-#
+# Maintained template for issue #639. The installed copy is
+# .github/workflows/protected-paths-guard.yml: this file without this
+# leading comment header (a test keeps them byte-identical otherwise).
+
 # A pull request authored by a Nanna identity carries the marker from
 # harness::marker (a `Nanna-Identity: <name>` commit trailer or a
 # `<!-- Nanna-Identity: <name> -->` comment in the PR body). The pattern list mirrors
@@ -12,6 +11,7 @@ name: protected-paths-guard
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -22,9 +22,10 @@ jobs:
     name: guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Detect the Nanna-Identity marker
         id: identity
@@ -111,15 +112,32 @@ jobs:
             "harness/src/leases/**"
             "auto-issue-pr.sh"
             "test-agentic-security.sh"
+            "harness/src/pr_tools.rs"
+            "docs/pr-lifecycle-tools.md"
+            "harness/src/budget.rs"
+            "harness/src/ci_tools.rs"
+            "harness/src/ci_policy.rs"
+            "harness/src/ci_integrity.rs"
+            "harness/src/deploy/template.rs"
+            "harness/src/sandbox_tools.rs"
+            "harness/tests/spawn_gate_structural.rs"
+            "harness/tests/protected_audit_hook_structural.rs"
+            "harness/tests/escalation_sinks_structural.rs"
+            "harness/tests/fixtures/identities/global/auditor.toml"
+            "harness/tests/fixtures/identities/global/prompts/auditor.md"
+            "harness/tests/fixtures/one_track/catalog/auditor.toml"
+            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md"
+            "harness/tests/planner_structural.rs"
           )
           shopt -s nocasematch
           VIOLATIONS=()
+          DIFF_FILE="$(mktemp)"
+          git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA" > "$DIFF_FILE"
           while IFS= read -r -d '' path; do
             [ -z "$path" ] && continue
             for pattern in "${PROTECTED_PATTERNS[@]}"; do
               shell_glob="${pattern//\*\*/*}"
               directory="${shell_glob%/\*}"
-              # shellcheck disable=SC2254
               case "$path" in
                 $shell_glob|$directory)
                   VIOLATIONS+=("$path (rule: $pattern)")
@@ -127,7 +145,7 @@ jobs:
                   ;;
               esac
             done
-          done < <(git diff --name-only -z --no-renames "$BASE_SHA" "$HEAD_SHA")
+          done < "$DIFF_FILE"
 
           if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
             echo "no protected path touched"
