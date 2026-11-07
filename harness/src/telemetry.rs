@@ -389,8 +389,30 @@ impl JsonlExporter {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        options.open(&self.path)
+        #[cfg(not(unix))]
+        {
+            let link = std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_symlink());
+            if link {
+                return Err(std::io::Error::other("refusing to write through a symlink"));
+            }
+        }
+        let file = options.open(&self.path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(
+                "telemetry path is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(file)
     }
 
     fn rotate(&self) -> std::io::Result<()> {
@@ -403,11 +425,6 @@ impl JsonlExporter {
     fn append(&self, lines: Vec<String>) -> Result<(), TelemetryError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
-        }
-        let link = std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_symlink());
-        if link {
-            let reason = "refusing to write telemetry through a symlink".to_string();
-            return Err(TelemetryError::ExportFailed { reason });
         }
         let mut file = self.open()?;
         let mut size = file.metadata()?.len();
@@ -1268,9 +1285,66 @@ mod tests {
                 TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&link, 1 << 20)));
             linked.record_counter("c", 1.0, vec![]);
             let refused = linked.export_all().await;
-            assert!(matches!(refused, Err(TelemetryError::ExportFailed { .. })));
+            assert!(matches!(refused, Err(TelemetryError::Io(_))));
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+            let dangling = dir.path().join("dangling.jsonl");
+            std::os::unix::fs::symlink(dir.path().join("created-through-link"), &dangling).unwrap();
+            let through = JsonlExporter::new(&dangling, 1 << 20);
+            let line = vec!["{}".to_string()];
+            assert!(through.append(line).is_err());
+            assert!(!dir.path().join("created-through-link").exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_file_is_tightened_to_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        exporter.append(vec!["{}".to_string()]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n{}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        let line = || vec!["{}".to_string()];
+        assert!(exporter.append(line()).is_err());
+        let mut reader = std::fs::OpenOptions::new();
+        reader.read(true).custom_flags(libc::O_NONBLOCK);
+        let _held = reader.open(&path).unwrap();
+        let refused = exporter.append(line());
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn events_are_drained_by_each_export_and_never_written_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 20)));
+        telemetry.record_event("only-once", "c", serde_json::json!({}));
+        telemetry.export_all().await.unwrap();
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("only-once").count(), 1);
+        assert!(telemetry.events_buffer.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
