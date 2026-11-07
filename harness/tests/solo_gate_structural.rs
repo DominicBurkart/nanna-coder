@@ -249,6 +249,32 @@ impl Scan {
         }
     }
 
+    fn enter_impl(&mut self, node: &syn::ItemImpl) {
+        let name = type_name(&node.self_ty);
+        if let Some((_, path, _)) = &node.trait_ {
+            if path.segments.last().is_some_and(|s| s.ident == "Tool") {
+                self.tool_impls.push(name.clone());
+            }
+        }
+        self.impl_type.push(name);
+        syn::visit::visit_item_impl(self, node);
+        self.impl_type.pop();
+    }
+
+    fn enter_fn(&mut self, ident: &proc_macro2::Ident, walk: impl FnOnce(&mut Self)) {
+        self.function.push(plain(&ident.to_string()).to_string());
+        self.idents_in_fn.push(Vec::new());
+        walk(self);
+        self.idents_in_fn.pop();
+        self.function.pop();
+    }
+
+    fn note_string(&mut self, literal: &proc_macro2::Literal) {
+        if let Some(value) = string_value(literal) {
+            self.note_literal(value);
+        }
+    }
+
     #[rustfmt::skip]
     fn note_literal(&mut self, value: String) { let (ty, function) = self.site(); self.literals.push((ty, function, value)); }
 }
@@ -273,42 +299,23 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if is_test_only(&node.attrs) {
-            return;
+        if !is_test_only(&node.attrs) {
+            self.enter_impl(node);
         }
-        let name = type_name(&node.self_ty);
-        if let Some((_, path, _)) = &node.trait_ {
-            if path.segments.last().is_some_and(|s| s.ident == "Tool") {
-                self.tool_impls.push(name.clone());
-            }
-        }
-        self.impl_type.push(name);
-        syn::visit::visit_item_impl(self, node);
-        self.impl_type.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_test_only(&node.attrs) {
-            return;
+        if !is_test_only(&node.attrs) {
+            self.enter_fn(&node.sig.ident, |me| syn::visit::visit_item_fn(me, node));
         }
-        self.function
-            .push(plain(&node.sig.ident.to_string()).to_string());
-        self.idents_in_fn.push(Vec::new());
-        syn::visit::visit_item_fn(self, node);
-        self.idents_in_fn.pop();
-        self.function.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_test_only(&node.attrs) {
-            return;
+        if !is_test_only(&node.attrs) {
+            self.enter_fn(&node.sig.ident, |me| {
+                syn::visit::visit_impl_item_fn(me, node)
+            });
         }
-        self.function
-            .push(plain(&node.sig.ident.to_string()).to_string());
-        self.idents_in_fn.push(Vec::new());
-        syn::visit::visit_impl_item_fn(self, node);
-        self.idents_in_fn.pop();
-        self.function.pop();
     }
 
     fn visit_ident(&mut self, node: &'ast proc_macro2::Ident) {
@@ -326,14 +333,11 @@ impl<'ast> Visit<'ast> for Scan {
         let mut tokens = Vec::new();
         flatten(node.tokens.clone(), &mut tokens);
         for token in tokens {
-            match token {
-                TokenTree::Ident(ident) => self.note_ident(plain(&ident.to_string())),
-                TokenTree::Literal(literal) => {
-                    if let Some(value) = string_value(&literal) {
-                        self.note_literal(value);
-                    }
-                }
-                _ => {}
+            if let TokenTree::Ident(ident) = &token {
+                self.note_ident(plain(&ident.to_string()));
+            }
+            if let TokenTree::Literal(literal) = &token {
+                self.note_string(literal);
             }
         }
     }
