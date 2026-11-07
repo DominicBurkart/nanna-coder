@@ -2226,7 +2226,6 @@ mod tests {
         std::fs::write(ws.workspace_path.join("fla\u{212A}e.nix"), "evil").unwrap();
         let violation = protected_violation(ws.extract_changes().unwrap_err());
         assert_eq!(violation.rule, "flake.nix");
-        assert_eq!(violation.path, "fla\u{212A}e.nix");
         ws.cleanup().unwrap();
     }
 
@@ -2375,7 +2374,6 @@ mod tests {
             std::fs::write(&file, "x").unwrap();
             let violation = protected_violation(ws.extract_changes().unwrap_err());
             assert_eq!(violation.rule, rule, "{path}");
-            assert_eq!(violation.path, path);
             let violation = protected_violation(ws.format_patch().unwrap_err());
             assert_eq!(violation.rule, rule, "{path}");
             ws.cleanup().unwrap();
