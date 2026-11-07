@@ -94,7 +94,6 @@ impl RepoPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protected::ProtectedConfigError;
     use std::path::Path;
 
     fn write_policy(base: &Path, bytes: &[u8]) {
@@ -102,11 +101,8 @@ mod tests {
         std::fs::write(base.join(POLICY_FILE), bytes).unwrap();
     }
 
-    fn load_err(base: &Path) -> PolicyError {
-        match RepoPolicy::load(base) {
-            Err(ProtectedConfigError::Policy(e)) => e,
-            other => panic!("expected a policy error, got {other:?}"),
-        }
+    fn load_err(base: &Path) -> String {
+        format!("{:?}", RepoPolicy::load(base).unwrap_err())
     }
 
     fn padded_to(len: usize) -> String {
@@ -174,39 +170,37 @@ mod tests {
     fn a_bad_file_on_disk_refuses_with_a_policy_error_naming_the_file() {
         let dir = tempfile::tempdir().unwrap();
         write_policy(dir.path(), b"human_gate = \"duo\"");
-        let err = load_err(dir.path());
-        assert!(matches!(err, PolicyError::Malformed(_)));
-        assert!(err.to_string().contains(".nanna/policy.toml"));
-        assert!(ProtectedConfigError::Policy(err)
-            .to_string()
-            .contains("is malformed"));
+        assert!(load_err(dir.path()).starts_with("Policy(Malformed("));
+        let shown = RepoPolicy::load(dir.path()).unwrap_err().to_string();
+        assert!(shown.contains(".nanna/policy.toml"), "{shown}");
+        assert!(shown.contains("is malformed"), "{shown}");
     }
 
     #[test]
     fn non_utf8_and_directories_and_symlinks_in_place_are_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         write_policy(dir.path(), &[0xff, 0xfe, b'h']);
-        assert!(matches!(load_err(dir.path()), PolicyError::Unreadable(_)));
+        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(POLICY_FILE)).unwrap();
-        assert!(matches!(load_err(dir.path()), PolicyError::Unreadable(_)));
+        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("elsewhere.toml");
         std::fs::write(&target, "human_gate = \"github\"").unwrap();
         std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join(POLICY_FILE)).unwrap();
-        assert!(matches!(load_err(dir.path()), PolicyError::Unreadable(_)));
+        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".nanna"), "x").unwrap();
-        assert!(matches!(load_err(dir.path()), PolicyError::Unreadable(_)));
+        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
-        assert!(matches!(load_err(&file), PolicyError::Unreadable(_)));
+        assert!(load_err(&file).starts_with("Policy(Unreadable("));
     }
 
     #[test]
@@ -215,7 +209,7 @@ mod tests {
         write_policy(dir.path(), padded_to(MAX_POLICY_BYTES).as_bytes());
         assert_eq!(RepoPolicy::load(dir.path()), Ok(RepoPolicy::solo()));
         write_policy(dir.path(), padded_to(MAX_POLICY_BYTES + 1).as_bytes());
-        assert_eq!(load_err(dir.path()), PolicyError::TooLarge);
+        assert_eq!(load_err(dir.path()), "Policy(TooLarge)");
         assert_eq!(
             RepoPolicy::parse(&padded_to(MAX_POLICY_BYTES + 1)),
             Err(PolicyError::TooLarge)

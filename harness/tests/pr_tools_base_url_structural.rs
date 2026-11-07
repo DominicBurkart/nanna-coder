@@ -5,7 +5,7 @@ use syn::visit::Visit;
 
 const SEAM: &str = "register_granted_at";
 const ENTRY: &str = "register_granted";
-const PUBLIC_ENTRY: &str = "register";
+const PUBLIC_ENTRIES: [&str; 2] = ["register", "register_guarded"];
 const CLIENT: &str = "ReqwestGithubClient";
 const DEFAULT_URL: &str = "GITHUB_API_URL";
 const PARAM: &str = "base_url";
@@ -278,7 +278,7 @@ fn violations(source: &str) -> Vec<String> {
             if function != ENTRY || path.len() != 1 {
                 found.push(format!("`{SEAM}` called from `{function}` via {path:?}"));
             }
-            if args.len() != 5 || args.last().map(String::as_str) != Some(&expected_url.join("::"))
+            if args.len() != 6 || args.last().map(String::as_str) != Some(&expected_url.join("::"))
             {
                 found.push(format!(
                     "`{SEAM}` last argument is not crate::backlog::{DEFAULT_URL}: {args:?}"
@@ -298,7 +298,7 @@ fn violations(source: &str) -> Vec<String> {
                 ));
             }
             let last = params.last().map(|p| p.replace(' ', ""));
-            if params.len() != 5 || last.as_deref() != Some("base_url:&str") {
+            if params.len() != 6 || last.as_deref() != Some("base_url:&str") {
                 found.push(format!(
                     "`{SEAM}` must end with `base_url: &str`: {params:?}"
                 ));
@@ -316,7 +316,7 @@ fn violations(source: &str) -> Vec<String> {
         ));
     }
     for (function, path, _) in &calls.calls {
-        if path.last().is_some_and(|n| n == ENTRY) && function != PUBLIC_ENTRY {
+        if path.last().is_some_and(|n| n == ENTRY) && !PUBLIC_ENTRIES.contains(&function.as_str()) {
             found.push(format!("`{ENTRY}` called from `{function}`"));
         }
     }

@@ -214,7 +214,10 @@ pub trait GithubClient: Send + Sync {
         &self,
         repo: &str,
         head: &str,
-    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError>;
+    ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+        let url = format!("/repos/{repo}/pulls?head={head}");
+        Err(BacklogError::Status { url, status: 501 })
+    }
 
     async fn mark_pull_request_ready(&self, repo: &str, number: u64) -> Result<(), BacklogError>;
 
@@ -482,9 +485,6 @@ pub fn describe_issue(repo: &str, issue: &GithubIssue) -> String {
 ///     }
 ///     async fn get_pull_request(&self, _: &str, _: u64) -> Result<GithubPullRequestDetail, BacklogError> {
 ///         unreachable!("ingestion never reads pull request detail")
-///     }
-///     async fn pull_requests_for_head(&self, _: &str, _: &str) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
-///         unreachable!("ingestion never looks up pull requests by head")
 ///     }
 ///     async fn mark_pull_request_ready(&self, _: &str, _: u64) -> Result<(), BacklogError> {
 ///         unreachable!("ingestion never promotes pull requests")

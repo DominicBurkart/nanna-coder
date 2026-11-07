@@ -231,8 +231,8 @@ impl TaskWorkspace {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
-        let protected =
-            ProtectedPaths::for_repo_with_extras(&workspace_path, &extras).with_policy(policy);
+        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = protected.with_policy(policy);
         Ok(Self {
             workspace_path,
             source_repo: source_repo.to_path_buf(),
@@ -433,8 +433,8 @@ impl TaskWorkspace {
             additional_args.extend(set.container_args());
             env_vars.extend(set.exports().iter().cloned());
         }
-        let protected =
-            ProtectedPaths::for_repo_with_extras(&workspace_path, &extras).with_policy(policy);
+        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = protected.with_policy(policy);
         let shielded = match protected_mounts(&protected, &workspace_path) {
             Ok(shielded) => shielded,
             Err(e) => {
@@ -2344,10 +2344,7 @@ mod tests {
     }
 
     fn is_policy_refusal(err: &WorkspaceError) -> bool {
-        matches!(
-            err,
-            WorkspaceError::ProtectedConfig(ProtectedConfigError::Policy(_))
-        )
+        format!("{err:?}").starts_with("ProtectedConfig(Policy(")
     }
 
     #[test]
@@ -2609,6 +2606,40 @@ mod tests {
             );
         }
         ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_workspace_identity_registries_hand_the_policy_to_promote_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        for container in [false, true] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), b"human_gate = \"solo\"\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-policy-reg"), "HEAD").unwrap();
+            if container {
+                ws.container_handle = Some(Arc::new(ContainerHandle {
+                    name: "test-handle".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                }));
+            }
+            let mut identity = workspace_identity(EffectClass::Repository);
+            identity.scope.tools = vec![
+                "github_pr_promote".parse().unwrap(),
+                "git_push_branch".parse().unwrap(),
+            ];
+            let registry = ws.build_tool_registry_for(&identity).unwrap();
+            let promote = registry.get_tool("github_pr_promote").expect("granted");
+            let err = promote
+                .execute(serde_json::json!({ "pr_number": 7 }))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("human_gate"), "{container}: {err}");
+            ws.cleanup().unwrap();
+        }
     }
 
     #[tokio::test]
