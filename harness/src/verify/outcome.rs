@@ -216,44 +216,8 @@ pub async fn run_verification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::test_support::{raw, timed_out, ScriptedRunner as Scripted};
     use proptest::prelude::*;
-    use std::sync::Mutex;
-
-    struct Scripted(Mutex<Vec<Result<RawRun, String>>>);
-
-    impl Scripted {
-        fn new(runs: Vec<Result<RawRun, String>>) -> Self {
-            Self(Mutex::new(runs.into_iter().rev().collect()))
-        }
-    }
-
-    impl CheckRunner for Scripted {
-        fn run(&self, _command: &str, _timeout: Duration) -> Result<RawRun, String> {
-            self.0
-                .lock()
-                .unwrap()
-                .pop()
-                .expect("scripted run available")
-        }
-    }
-
-    fn raw(code: Option<i32>, stdout: &str, stderr: &str) -> Result<RawRun, String> {
-        Ok(RawRun {
-            exit_code: code,
-            timed_out: false,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-        })
-    }
-
-    fn timed_out() -> Result<RawRun, String> {
-        Ok(RawRun {
-            exit_code: None,
-            timed_out: true,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    }
 
     fn config(names: &[&str]) -> VerifyConfig {
         let text: String = names

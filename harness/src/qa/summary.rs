@@ -28,11 +28,14 @@ pub struct QaSummary {
     pub console_errors: usize,
     /// Host paths of every report and screenshot, in the order written.
     pub artifacts: Vec<String>,
+    /// Outcomes of the repository-declared checks a verifier ran, in order.
+    #[serde(default)]
+    pub checks: Vec<crate::verify::CheckOutcome>,
 }
 
 impl QaSummary {
     pub fn is_empty(&self) -> bool {
-        self.endpoint_runs == 0 && self.browser_runs == 0
+        self.endpoint_runs == 0 && self.browser_runs == 0 && self.checks.is_empty()
     }
 
     pub fn record_endpoints(&mut self, report: &ManifestReport, artifact: &Path) {
