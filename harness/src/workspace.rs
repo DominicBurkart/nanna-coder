@@ -2366,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_policy_that_is_a_directory_or_a_symlink_refuses_to_start_the_task() {
+    fn test_a_policy_that_is_a_directory_refuses_to_start_the_task() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
         std::fs::create_dir_all(source.path().join(".nanna/policy.toml")).unwrap();
@@ -2374,6 +2374,12 @@ mod tests {
             .err()
             .unwrap();
         assert!(is_policy_refusal(&err), "{err:?}");
+        assert_eq!(worktree_count(source.path()), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_policy_that_is_a_symlink_refuses_to_start_the_task() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
         std::fs::write(

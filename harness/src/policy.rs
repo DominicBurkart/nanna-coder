@@ -175,20 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_and_directories_and_symlinks_in_place_are_unreadable() {
+    fn non_utf8_directories_and_misplaced_parents_are_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         write_policy(dir.path(), &[0xff, 0xfe, b'h']);
         assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(POLICY_FILE)).unwrap();
-        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("elsewhere.toml");
-        std::fs::write(&target, "human_gate = \"github\"").unwrap();
-        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-        std::os::unix::fs::symlink(&target, dir.path().join(POLICY_FILE)).unwrap();
         assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
 
         let dir = tempfile::tempdir().unwrap();
@@ -199,6 +192,17 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
         assert!(load_err(&file).starts_with("Policy(Unreadable("));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.toml");
+        std::fs::write(&target, "human_gate = \"github\"").unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(POLICY_FILE)).unwrap();
+        assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
     }
 
     #[test]
