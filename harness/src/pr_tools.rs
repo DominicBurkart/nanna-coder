@@ -4894,6 +4894,63 @@ mod tests {
         }
     }
 
+    const ALIAS_SPELLINGS: [&str; 3] = [
+        "tools/RELEAS~1.SH",
+        "gate~1/x.rs",
+        "tools/release-helper.sh.",
+    ];
+
+    fn alias_declared() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_windows_aliases_of_declared_paths_out_of_the_commit() {
+        let dir = feature_repo();
+        for path in ALIAS_SPELLINGS {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(alias_declared());
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(committed, "ok.txt");
+        let skipped = result["skipped_protected"].as_array().unwrap();
+        assert_eq!(skipped.len(), ALIAS_SPELLINGS.len());
+    }
+
+    #[tokio::test]
+    async fn push_refuses_windows_aliases_of_declared_paths() {
+        for path in ALIAS_SPELLINGS {
+            let fixture = push_fixture();
+            git(
+                fixture.work.path(),
+                &["checkout", "-q", "-b", "feature-alias"],
+            );
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "declared\n\nNanna-Identity: sdlc-dev",
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+                .with_protected(alias_declared());
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                err.to_string().contains("changes protected path"),
+                "{path}: {err}"
+            );
+            assert!(!remote_has(fixture.work.path(), "feature-alias"), "{path}");
+        }
+    }
+
     const UNICODE_SPELLINGS: [(&str, &str); 3] = [
         ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
         ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
@@ -4963,6 +5020,67 @@ mod tests {
                 "{path} {rule}: {err}"
             );
             assert!(!remote_has(fixture.work.path(), "feature-nfc"), "{path}");
+        }
+    }
+
+    const COMBINED_SPELLINGS: [&str; 4] = [
+        "docs/cafe\u{301}./x.md",
+        "src/caf\u{e9}.rs.",
+        "docs/re\u{301}sume\u{301}~1.txt",
+        "fla\u{212A}e.nix.",
+    ];
+
+    fn combined_declared() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_combined_unicode_and_windows_spellings_out_of_the_commit() {
+        let dir = feature_repo();
+        for path in COMBINED_SPELLINGS {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(combined_declared());
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(committed, "ok.txt");
+        let skipped = result["skipped_protected"].as_array().unwrap();
+        assert_eq!(skipped.len(), COMBINED_SPELLINGS.len());
+    }
+
+    #[tokio::test]
+    async fn push_refuses_combined_unicode_and_windows_spellings() {
+        for path in COMBINED_SPELLINGS {
+            let fixture = push_fixture();
+            git(
+                fixture.work.path(),
+                &["checkout", "-q", "-b", "feature-combined"],
+            );
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "declared\n\nNanna-Identity: sdlc-dev",
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+                .with_protected(combined_declared());
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                err.to_string().contains("changes protected path"),
+                "{path}: {err}"
+            );
+            assert!(
+                !remote_has(fixture.work.path(), "feature-combined"),
+                "{path}"
+            );
         }
     }
 

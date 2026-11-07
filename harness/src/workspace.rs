@@ -2218,6 +2218,89 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    fn assert_alias_refused(name: &str, rule: &str) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-alias"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join(name), "evil").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, rule, "{name}");
+        assert_eq!(violation.path, name);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_refuses_a_short_name_of_a_protected_file() {
+        assert_alias_refused("CODECO~1.YML", "codecov.yml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_trailing_dot_and_space_aliases() {
+        assert_alias_refused("flake.nix.", "flake.nix");
+        assert_alias_refused("codecov.yml ", "codecov.yml");
+    }
+
+    const ALIAS_DECLARATION: &str =
+        "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]\n";
+
+    const ALIAS_SPELLINGS: [(&str, &str); 3] = [
+        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+        ("gate~1/x.rs", "gate/**"),
+        ("tools/release-helper.sh.", "tools/release-helper.sh"),
+    ];
+
+    #[test]
+    fn test_windows_aliases_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in ALIAS_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), ALIAS_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_windows_aliases_of_declared_paths_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), ALIAS_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias-write"), "HEAD")
+                .unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in ALIAS_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+            }
+        }
+        ws.cleanup().unwrap();
+    }
+
     #[test]
     fn test_extract_changes_refuses_a_unicode_equivalent_spelling_of_a_protected_file() {
         let source = TempDir::new().unwrap();
@@ -2226,6 +2309,69 @@ mod tests {
         std::fs::write(ws.workspace_path.join("fla\u{212A}e.nix"), "evil").unwrap();
         let violation = protected_violation(ws.extract_changes().unwrap_err());
         assert_eq!(violation.rule, "flake.nix");
+        ws.cleanup().unwrap();
+    }
+
+    const COMBINED_DECLARATION: &str =
+        "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]\n";
+
+    const COMBINED_SPELLINGS: [(&str, &str); 4] = [
+        ("docs/cafe\u{301}./x.md", "docs/caf\u{e9}/**"),
+        ("src/caf\u{e9}.rs.", "src/cafe\u{301}.rs"),
+        (
+            "docs/re\u{301}sume\u{301}~1.txt",
+            "docs/r\u{e9}sum\u{e9}-final.txt",
+        ),
+        ("fla\u{212A}e.nix.", "flake.nix"),
+    ];
+
+    #[test]
+    fn test_combined_unicode_and_windows_spellings_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in COMBINED_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), COMBINED_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-combined"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_combined_unicode_and_windows_spellings_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), COMBINED_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-combined-write"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in COMBINED_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+            }
+        }
         ws.cleanup().unwrap();
     }
 
