@@ -159,6 +159,37 @@ mod tests {
     }
 
     #[test]
+    fn error_wire_shape_is_exactly_the_jsonrpc_shape_with_and_without_data() {
+        let plain = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "bad".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32602, "message": "bad" }
+            })
+        );
+        let with_data = JsonRpcResponse::error_with_data(
+            Some(serde_json::json!(2)),
+            -32602,
+            "refused".to_string(),
+            serde_json::json!({ "failure_kind": "spawn_refused" }),
+        );
+        assert_eq!(
+            serde_json::to_value(&with_data).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32602,
+                    "message": "refused",
+                    "data": { "failure_kind": "spawn_refused" }
+                }
+            })
+        );
+    }
+
+    #[test]
     fn response_roundtrips_through_json() {
         let ok = JsonRpcResponse::success(Some(serde_json::json!(2)), serde_json::json!({"a": 1}));
         let s = serde_json::to_string(&ok).unwrap();
