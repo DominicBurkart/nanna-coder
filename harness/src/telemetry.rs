@@ -382,22 +382,45 @@ impl JsonlExporter {
         }
     }
 
+    fn open(&self) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&self.path)
+    }
+
+    fn rotate(&self) -> std::io::Result<()> {
+        let mut rotated = self.path.clone().into_os_string();
+        rotated.push(".1");
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::rename(&self.path, &rotated)
+    }
+
     fn append(&self, lines: Vec<String>) -> Result<(), TelemetryError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let full = std::fs::metadata(&self.path).is_ok_and(|meta| meta.len() >= self.max_bytes);
-        if full {
-            let mut rotated = self.path.clone().into_os_string();
-            rotated.push(".1");
-            let _ = std::fs::remove_file(&rotated);
-            std::fs::rename(&self.path, &rotated)?;
+        let link = std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_symlink());
+        if link {
+            let reason = "refusing to write telemetry through a symlink".to_string();
+            return Err(TelemetryError::ExportFailed { reason });
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        let mut file = options.open(&self.path)?;
+        let mut file = self.open()?;
+        let mut size = file.metadata()?.len();
         for line in lines {
-            writeln!(file, "{line}")?;
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            if size >= self.max_bytes {
+                self.rotate()?;
+                file = self.open()?;
+                size = 0;
+            }
+            file.write_all(&bytes)?;
+            size += bytes.len() as u64;
         }
         Ok(())
     }
@@ -925,8 +948,7 @@ impl TelemetrySystem {
 
         let metrics = {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            let mut buffered_metrics = metrics.clone();
-            metrics.clear();
+            let mut buffered_metrics = std::mem::take(&mut *metrics);
             let dropped = self.dropped.swap(0, Ordering::Relaxed);
             if dropped > 0 {
                 buffered_metrics.push(dropped_metric(dropped));
@@ -936,9 +958,7 @@ impl TelemetrySystem {
 
         let events = {
             let mut events = self.events_buffer.lock().unwrap();
-            let buffered_events = events.clone();
-            events.clear();
-            buffered_events
+            std::mem::take(&mut *events)
         };
 
         // Export to all configured exporters
@@ -1222,6 +1242,66 @@ mod tests {
             exporter.export_events(events).await,
             Err(TelemetryError::Io(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_file_is_created_private_and_a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 20)));
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("elsewhere.txt");
+            std::fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("linked.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let linked =
+                TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&link, 1 << 20)));
+            linked.record_counter("c", 1.0, vec![]);
+            let refused = linked.export_all().await;
+            assert!(matches!(refused, Err(TelemetryError::ExportFailed { .. })));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_size_cap_is_enforced_per_line_not_per_batch_and_no_line_is_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let rotated = dir.path().join("telemetry.jsonl.1");
+        let exporter = JsonlExporter::new(&path, 600);
+        let events: Vec<CustomEvent> = (0..40)
+            .map(|n| CustomEvent {
+                name: format!("event-{n}"),
+                timestamp: Utc::now(),
+                category: "c".to_string(),
+                attributes: HashMap::new(),
+                data: serde_json::json!({ "n": n }),
+                trace_context: None,
+            })
+            .collect();
+        exporter.export_events(events).await.unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        let previous = std::fs::read_to_string(&rotated).unwrap();
+        let within_cap = current.len() < 600 + 400 && previous.len() < 600 + 400;
+        assert!(within_cap, "a file overshot its cap by a whole batch");
+        for text in [&current, &previous] {
+            assert!(text.ends_with('\n'));
+            for line in text.lines() {
+                let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(parsed.get("event").is_some());
+            }
+        }
+        assert!(current.contains("event-39"));
     }
 
     #[tokio::test]
