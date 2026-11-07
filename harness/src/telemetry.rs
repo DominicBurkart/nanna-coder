@@ -374,6 +374,9 @@ pub struct JsonlExporter {
     max_bytes: u64,
 }
 
+#[cfg(unix)]
+const OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+
 impl JsonlExporter {
     pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
         Self {
@@ -389,7 +392,7 @@ impl JsonlExporter {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            options.custom_flags(OPEN_FLAGS);
         }
         #[cfg(not(unix))]
         {
@@ -408,7 +411,7 @@ impl JsonlExporter {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o777 != 0o600 {
+            if meta.permissions().mode() & 0o077 != 0 {
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
         }
@@ -1309,6 +1312,23 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n{}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_never_widened_and_the_open_flags_are_all_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        exporter.append(vec!["{}".to_string()]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o200);
+        for flag in [libc::O_NOFOLLOW, libc::O_NONBLOCK, libc::O_NOCTTY] {
+            assert_eq!(OPEN_FLAGS & flag, flag);
+        }
     }
 
     #[cfg(unix)]
