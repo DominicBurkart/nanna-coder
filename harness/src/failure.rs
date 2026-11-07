@@ -172,9 +172,9 @@ mod tests {
     #[test]
     fn every_error_type_literal_in_task_rs_is_classified() {
         let source = include_str!("task.rs");
-        let production = source.split("\n#[cfg(test)]\n").next().unwrap();
+        let production = production_part(source);
         let mut seen = HashSet::new();
-        for literal in quoted_words(production) {
+        for literal in quoted_words(&production) {
             let pascal = literal
                 .chars()
                 .next()
@@ -200,6 +200,28 @@ mod tests {
                 "{label} no longer appears in task.rs"
             );
         }
+    }
+
+    fn production_part(source: &str) -> String {
+        source
+            .replace("\r\n", "\n")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn the_production_region_is_found_with_unix_and_windows_line_endings() {
+        assert_eq!(
+            production_part("fn a() {}\n#[cfg(test)]\nmod tests {}\n"),
+            "fn a() {}"
+        );
+        assert_eq!(
+            production_part("fn a() {}\r\n#[cfg(test)]\r\nmod tests {}\r\n"),
+            "fn a() {}"
+        );
+        assert_eq!(production_part("fn a() {}\n"), "fn a() {}\n");
     }
 
     fn quoted_words(source: &str) -> Vec<&str> {
