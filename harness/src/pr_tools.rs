@@ -4900,6 +4900,11 @@ mod tests {
         ("src/\u{212A}ey.rs", "src/key.rs"),
     ];
 
+    fn nfc(s: &str) -> String {
+        use unicode_normalization::UnicodeNormalization;
+        s.nfc().collect()
+    }
+
     fn unicode_declared() -> ProtectedPaths {
         let extras = crate::protected::ProtectedExtras::parse(
             "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]",
@@ -4922,14 +4927,18 @@ mod tests {
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(committed, "ok.txt");
-        let mut skipped: Vec<String> = result["skipped_protected"]
+        let skipped: Vec<String> = result["skipped_protected"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        skipped.sort();
         assert_eq!(skipped.len(), UNICODE_SPELLINGS.len());
+        let mut folded: Vec<String> = skipped.iter().map(|p| nfc(p)).collect();
+        folded.sort();
+        let mut expected: Vec<String> = UNICODE_SPELLINGS.iter().map(|(p, _)| nfc(p)).collect();
+        expected.sort();
+        assert_eq!(folded, expected);
     }
 
     #[tokio::test]
