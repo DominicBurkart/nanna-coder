@@ -1950,6 +1950,10 @@ mod tests {
         std::env::temp_dir().join(format!("nanna-offline-{task_id}"))
     }
 
+    async fn start_refused(_config: ContainerConfig) -> Result<ContainerHandle, ContainerError> {
+        Err(ContainerError::NoRuntimeAvailable)
+    }
+
     fn mock_handle() -> crate::container::ContainerHandle {
         crate::container::ContainerHandle {
             name: "mock-container".to_string(),
@@ -2089,7 +2093,7 @@ mod tests {
             NetworkPolicy::Disabled,
             None,
             &vendorer,
-            |_config: ContainerConfig| async { panic!("the container must not start") },
+            start_refused,
         )
         .await;
 
@@ -2126,7 +2130,7 @@ mod tests {
             NetworkPolicy::Disabled,
             None,
             &vendorer,
-            |_config: ContainerConfig| async { panic!("the container must not start") },
+            start_refused,
         )
         .await;
 
@@ -2153,7 +2157,7 @@ mod tests {
             NetworkPolicy::Disabled,
             None,
             &vendorer,
-            |_config: ContainerConfig| async { Err(ContainerError::NoRuntimeAvailable) },
+            start_refused,
         )
         .await;
 
