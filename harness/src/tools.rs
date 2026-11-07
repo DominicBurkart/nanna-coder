@@ -4964,6 +4964,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_solo_registry_refuses_every_alias_spelling_of_the_declaration_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = ProtectedPaths::for_repo(dir.path()).with_policy(RepoPolicy::solo());
+        let registry = create_tool_registry_guarded(dir.path(), protected);
+        let spellings = [
+            ".nanna./policy.toml",
+            ".nanna /protected.toml",
+            ".nanna/policy.toml.",
+            ".nanna/policy.toml::$DATA",
+            "NANNA~1/POLICY~1.TOML",
+            ".NANNA/Policy.toml",
+            "crates/e\u{301}/.nanna./policy.toml",
+        ];
+        let mut refused = 0;
+        for path in spellings {
+            let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+            let err = registry.execute("write_file", args).await.unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                "{path}: {err:?}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, spellings.len());
+        assert_eq!(registry.denials().len(), spellings.len());
+    }
+
+    #[tokio::test]
     async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cfg/nanna");

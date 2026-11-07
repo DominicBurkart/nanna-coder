@@ -5129,6 +5129,30 @@ mod tests {
         assert!(!bare_has(&fixture, "feature-solo"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn solo_push_refuses_alias_spellings_of_the_policy_file_before_any_lookup() {
+        for path in [
+            ".nanna./policy.toml",
+            ".nanna /policy.toml",
+            "NANNA~1/POLICY~1.TOML",
+        ] {
+            let fixture = github_push_fixture();
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "p\n\nNanna-Identity: sdlc-dev",
+            );
+            let mock = head_listing(vec![]);
+            let tool = solo_push_tool(fixture.work.path(), &mock);
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(err.to_string().contains("protected path"), "{path}: {err}");
+            assert!(mock.calls().is_empty(), "{path}");
+            assert!(!bare_has(&fixture, "feature-solo"), "{path}");
+        }
+    }
+
     #[tokio::test]
     async fn a_scripted_client_that_does_not_fail_lets_a_solo_push_through() {
         let fixture = github_push_fixture();

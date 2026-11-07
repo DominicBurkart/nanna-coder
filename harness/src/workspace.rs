@@ -2721,6 +2721,30 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_alias_spellings_of_the_policy_file_are_refused_when_a_patch_is_extracted() {
+        for path in [
+            ".nanna./policy.toml",
+            ".nanna /policy.toml",
+            "NANNA~1/POLICY~1.TOML",
+        ] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), b"human_gate = \"solo\"\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-policy-alias"), "HEAD")
+                    .unwrap();
+            let target = ws.workspace_path.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "human_gate = \"github\"").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, ".nanna/**", "{path}");
+            assert!(ws.protected().policy().is_solo(), "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
     #[test]
     fn test_the_policy_file_lies_under_a_read_only_mount_root() {
         let source = TempDir::new().unwrap();

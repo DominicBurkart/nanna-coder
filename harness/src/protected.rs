@@ -1915,6 +1915,102 @@ mod tests {
             assert!(!solo.with_policy(RepoPolicy::default()).policy().is_solo());
         }
 
+        const SHIPPED_SPELLINGS: [&str; 9] = [
+            ".nanna./F",
+            ".nanna /F",
+            ".nanna/F.",
+            ".nanna/F ",
+            ".nanna/F::$DATA",
+            "NANNA~1/F",
+            ".NANNA/F",
+            "NANNA~1/F:stream",
+            "NANNA~1./F",
+        ];
+
+        const NESTED_SPELLINGS: [&str; 3] = [
+            "crates/e\u{301}/.nanna/F",
+            "crates/e\u{301}/NANNA~1/F",
+            "crates/\u{e9}/.nanna./F",
+        ];
+
+        fn spelled(template: &str, file: &str) -> String {
+            template.replace('F', file)
+        }
+
+        #[test]
+        fn every_alias_and_normalisation_spelling_of_the_declaration_files_is_protected() {
+            let protected = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            for file in [
+                "policy.toml",
+                "protected.toml",
+                "POLICY~1.TOML",
+                "PROTEC~1.TOM",
+            ] {
+                for template in SHIPPED_SPELLINGS {
+                    let path = spelled(template, file);
+                    let rule = protected.check(Path::new(&path)).unwrap_err().rule;
+                    assert_eq!(rule, ".nanna/**", "{path}");
+                }
+                for template in NESTED_SPELLINGS {
+                    let path = spelled(template, file);
+                    let rule = protected.check(Path::new(&path)).unwrap_err().rule;
+                    assert_eq!(rule, "**/.nanna/**", "{path}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_solo_policy_changes_no_decision_for_any_spelling() {
+            let plain = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            assert!(solo.policy().is_solo());
+            assert_eq!(solo.rules(), plain.rules());
+            let mut counted = 0;
+            for template in SHIPPED_SPELLINGS.iter().chain(NESTED_SPELLINGS.iter()) {
+                let path = spelled(template, "policy.toml");
+                assert_eq!(
+                    solo.check(Path::new(&path)),
+                    plain.check(Path::new(&path)),
+                    "{path}"
+                );
+                counted += 1;
+            }
+            assert_eq!(counted, 12);
+            let deep = format!("{}/NANNA~1/policy.toml", ["a"; 1_100].join("/"));
+            let overflow = solo.check(Path::new(&deep)).unwrap_err();
+            assert_eq!(overflow.rule, ALIAS_OVERFLOW_RULE);
+            assert_eq!(plain.check(Path::new(&deep)), Err(overflow));
+        }
+
+        #[test]
+        fn declared_extras_keep_every_spelling_protected_under_the_solo_policy() {
+            fn rule_of_check(p: &ProtectedPaths, path: &str) -> String {
+                p.check(Path::new(path))
+                    .err()
+                    .map(|v| v.rule)
+                    .unwrap_or_default()
+            }
+            let extras = ProtectedExtras::parse(
+                "extra = [\"src/gate.rs\", \"src/caf\u{e9}.rs\", \"tools/**\"]",
+            )
+            .unwrap();
+            let plain = ProtectedPaths::with_extras(Path::new("/repo"), None, &extras);
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            for (path, rule) in [
+                ("src/gate.rs.", "src/gate.rs"),
+                ("SRC/GATE~1.RS", "src/gate.rs"),
+                ("src/gate.rs::$DATA", "src/gate.rs"),
+                ("src/cafe\u{301}.rs", "src/caf\u{e9}.rs"),
+                ("src/cafe\u{301}.rs ", "src/caf\u{e9}.rs"),
+                ("tools./x.sh", "tools/**"),
+                ("TOOLS~1/x.sh", "tools/**"),
+            ] {
+                assert_eq!(rule_of_check(&solo, path), rule, "{path}");
+                assert_eq!(solo.check(Path::new(path)), plain.check(Path::new(path)));
+            }
+            assert!(solo.check(Path::new("src/other.rs")).is_ok());
+        }
+
         #[test]
         fn the_policy_file_is_protected_like_the_protected_declaration() {
             let protected = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
