@@ -204,9 +204,14 @@ pub struct FailureDiagnostics {
 }
 
 impl FailureDiagnostics {
+    pub fn failure_kind(&self) -> crate::failure::FailureKind {
+        crate::failure::FailureKind::from_error_type(&self.error_type)
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "error_type": self.error_type,
+            "failure_kind": self.failure_kind(),
             "iterations_completed": self.iterations_completed,
             "last_tool_call": self.last_tool_call,
             "partial_changes": self.partial_changes,
@@ -2313,6 +2318,11 @@ max_concurrent = 1
         };
         let json = diag.to_json();
         assert_eq!(json["error_type"], "MaxIterationsExceeded");
+        assert_eq!(json["failure_kind"], "max_iterations");
+        assert_eq!(
+            diag.failure_kind(),
+            crate::failure::FailureKind::MaxIterations
+        );
         assert_eq!(json["iterations_completed"], 100);
     }
 
