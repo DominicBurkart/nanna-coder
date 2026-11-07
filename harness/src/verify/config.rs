@@ -344,6 +344,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn load_refuses_a_declaration_that_is_not_valid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".nanna")).unwrap();
+        std::fs::write(dir.path().join(VERIFY_FILE), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(matches!(
+            VerifyConfig::load(dir.path()),
+            Err(VerifyConfigError::Unreadable(_))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_refuses_a_symlinked_declaration_and_an_unreadable_parent() {

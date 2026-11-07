@@ -20,6 +20,12 @@ impl Drop for Cleanup {
 #[test]
 fn declared_checks_run_in_a_network_less_container_with_exact_exit_codes() {
     let runtime = detect_runtime();
+    let program = runtime.command();
+    let name = format!("nanna-verifier-it-{}", std::process::id());
+    let _cleanup = Cleanup {
+        program,
+        name: name.clone(),
+    };
     let image = std::env::var(IMAGE_VAR).ok().filter(|v| !v.is_empty());
     let Some(image) = image.filter(|_| runtime.is_available()) else {
         eprintln!(
@@ -27,8 +33,6 @@ fn declared_checks_run_in_a_network_less_container_with_exact_exit_codes() {
         );
         return;
     };
-    let program = runtime.command();
-    let name = format!("nanna-verifier-it-{}", std::process::id());
     let started = Command::new(program)
         .args([
             "run",
@@ -42,10 +46,6 @@ fn declared_checks_run_in_a_network_less_container_with_exact_exit_codes() {
         ])
         .output()
         .expect("container runtime starts");
-    let _cleanup = Cleanup {
-        program,
-        name: name.clone(),
-    };
     assert!(
         started.status.success(),
         "{}",

@@ -1,5 +1,7 @@
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::container::ContainerHandle;
@@ -7,6 +9,8 @@ use crate::container::ContainerHandle;
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+const READER_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRun {
@@ -74,26 +78,61 @@ fn wait_failure(program: &str, error: &std::io::Error) -> String {
     format!("cannot wait for `{program}`: {error}")
 }
 
-pub(crate) fn read_tail(mut reader: impl Read) -> String {
-    let mut kept: Vec<u8> = Vec::new();
+fn polled(
+    result: std::io::Result<Option<ExitStatus>>,
+    program: &str,
+) -> Result<Option<ExitStatus>, String> {
+    result.map_err(|e| wait_failure(program, &e))
+}
+
+fn read_into(mut reader: impl Read, sink: &Mutex<Vec<u8>>) {
     let mut chunk = [0u8; 8192];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                kept.extend_from_slice(&chunk[..n]);
-                if kept.len() > 2 * MAX_CAPTURE_BYTES {
-                    let excess = kept.len() - MAX_CAPTURE_BYTES;
-                    kept.drain(..excess);
-                }
-            }
+    while let Ok(n @ 1..) = reader.read(&mut chunk) {
+        let mut kept = sink.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.extend_from_slice(&chunk[..n]);
+        if kept.len() > 2 * MAX_CAPTURE_BYTES {
+            let excess = kept.len() - MAX_CAPTURE_BYTES;
+            kept.drain(..excess);
         }
     }
-    if kept.len() > MAX_CAPTURE_BYTES {
-        let excess = kept.len() - MAX_CAPTURE_BYTES;
-        kept.drain(..excess);
-    }
-    String::from_utf8_lossy(&kept).into_owned()
+}
+
+fn tail_text(sink: &Mutex<Vec<u8>>) -> String {
+    let kept = sink.lock().unwrap_or_else(PoisonError::into_inner);
+    let start = kept.len().saturating_sub(MAX_CAPTURE_BYTES);
+    String::from_utf8_lossy(&kept[start..]).into_owned()
+}
+
+#[cfg(test)]
+pub(crate) fn read_tail(reader: impl Read) -> String {
+    let sink = Mutex::new(Vec::new());
+    read_into(reader, &sink);
+    tail_text(&sink)
+}
+
+struct Capture {
+    sink: Arc<Mutex<Vec<u8>>>,
+    done: Receiver<()>,
+}
+
+fn capture(stream: Option<impl Read + Send + 'static>) -> Option<Capture> {
+    stream.map(|reader| {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let (finished, done) = mpsc::channel();
+        let writer = Arc::clone(&sink);
+        std::thread::spawn(move || {
+            read_into(reader, &writer);
+            let _ = finished.send(());
+        });
+        Capture { sink, done }
+    })
+}
+
+fn collect(capture: Option<Capture>) -> String {
+    capture.map_or_else(String::new, |capture| {
+        let _ = capture.done.recv_timeout(READER_GRACE);
+        tail_text(&capture.sink)
+    })
 }
 
 impl CheckRunner for ProcessCheckRunner {
@@ -106,19 +145,11 @@ impl CheckRunner for ProcessCheckRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot start `{}`: {e}", self.program))?;
-        let stdout = child
-            .stdout
-            .take()
-            .map(|r| std::thread::spawn(move || read_tail(r)));
-        let stderr = child
-            .stderr
-            .take()
-            .map(|r| std::thread::spawn(move || read_tail(r)));
+        let stdout = capture(child.stdout.take());
+        let stderr = capture(child.stderr.take());
         let deadline = Instant::now() + timeout;
         let (exit_code, timed_out) = loop {
-            let waited = child
-                .try_wait()
-                .map_err(|e| wait_failure(&self.program, &e))?;
+            let waited = polled(child.try_wait(), &self.program)?;
             match waited {
                 Some(status) => break (status.code(), false),
                 None if Instant::now() >= deadline => {
@@ -128,9 +159,6 @@ impl CheckRunner for ProcessCheckRunner {
                 }
                 None => std::thread::sleep(POLL_INTERVAL),
             }
-        };
-        let collect = |handle: Option<std::thread::JoinHandle<String>>| {
-            handle.and_then(|h| h.join().ok()).unwrap_or_default()
         };
         Ok(RawRun {
             exit_code,
@@ -180,6 +208,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_signalled_command_has_no_exit_code() {
         let run = host().run("kill -9 $$", LONG).unwrap();
@@ -209,6 +238,48 @@ mod tests {
             .unwrap();
         assert!(run.stdout.len() <= MAX_CAPTURE_BYTES);
         assert!(run.stdout.ends_with("END\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_printed_before_a_timeout_is_kept() {
+        let run = host()
+            .run("echo started; exec sleep 30", Duration::from_secs(1))
+            .unwrap();
+        assert!(run.timed_out);
+        assert_eq!(run.stdout, "started\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_holding_the_pipes_cannot_stall_the_run() {
+        let started = Instant::now();
+        let run = host().run("sleep 6 & echo done", LONG).unwrap();
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.stdout, "done\n");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failed_poll_is_reported_with_the_launcher_name() {
+        let failed = polled(Err(std::io::Error::other("gone")), "docker");
+        assert_eq!(failed, Err("cannot wait for `docker`: gone".to_string()));
+        assert_eq!(polled(Ok(None), "docker"), Ok(None));
+    }
+
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+    }
+
+    #[test]
+    fn a_failing_reader_yields_what_was_read_before_the_error() {
+        assert_eq!(read_tail(Broken), "");
+        let chained = (&b"abc"[..]).chain(Broken);
+        assert_eq!(read_tail(chained), "abc");
     }
 
     #[test]
