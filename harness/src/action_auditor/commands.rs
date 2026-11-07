@@ -7039,5 +7039,7 @@ mod tests {
             "protected path",
         );
         blocked("mv 'nix ' x", "protected path");
+        blocked("rm -rf docs.", "protected path");
+        blocked("rm -rf 'docs '", "protected path");
     }
 }
