@@ -196,6 +196,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_permission_denied_policy_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_policy(dir.path(), b"human_gate = \"solo\"");
+        let path = dir.path().join(POLICY_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let is_root = std::fs::File::open(&path).is_ok();
+        if !is_root {
+            assert!(load_err(dir.path()).starts_with("Policy(Unreadable("));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_symlink_in_place_is_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("elsewhere.toml");
