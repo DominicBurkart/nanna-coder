@@ -415,8 +415,24 @@ enum DeployCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+const RUNTIME_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn run_to_completion<F: std::future::Future>(
+    runtime: tokio::runtime::Runtime,
+    future: F,
+    limit: std::time::Duration,
+) -> F::Output {
+    let outcome = runtime.block_on(future);
+    runtime.shutdown_timeout(limit);
+    outcome
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    run_to_completion(runtime, run(), RUNTIME_SHUTDOWN_LIMIT)
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -2133,6 +2149,7 @@ mod tests {
     struct StuckExporter {
         pause: std::time::Duration,
         panics: bool,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -2150,6 +2167,7 @@ mod tests {
         ) -> Result<(), harness::telemetry::TelemetryError> {
             assert!(!self.panics, "the exporter panicked");
             std::thread::sleep(self.pause);
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
 
@@ -2172,18 +2190,28 @@ mod tests {
         }
     }
 
-    fn stuck(pause_ms: u64, panics: bool) -> std::sync::Arc<harness::telemetry::TelemetrySystem> {
+    type Stuck = (
+        std::sync::Arc<harness::telemetry::TelemetrySystem>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    );
+
+    fn stuck(pause_ms: u64, panics: bool) -> Stuck {
         let pause = std::time::Duration::from_millis(pause_ms);
-        let exporter = StuckExporter { pause, panics };
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exporter = StuckExporter {
+            pause,
+            panics,
+            done: std::sync::Arc::clone(&done),
+        };
         let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
         let telemetry = std::sync::Arc::new(system);
         telemetry.record_counter("pending", 1.0, vec![]);
-        telemetry
+        (telemetry, done)
     }
 
     #[tokio::test]
     async fn a_final_flush_that_hangs_is_abandoned_after_the_limit() {
-        let telemetry = stuck(4000, false);
+        let (telemetry, _) = stuck(4000, false);
         let limit = std::time::Duration::from_millis(100);
         let started = std::time::Instant::now();
         let outcome = finish_within(&telemetry, None, async { 5 }, limit).await;
@@ -2193,7 +2221,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_final_flush_that_panics_does_not_lose_the_outcome() {
-        let telemetry = stuck(0, true);
+        let (telemetry, _) = stuck(0, true);
         let limit = std::time::Duration::from_secs(5);
         let outcome = finish_within(&telemetry, None, async { 6 }, limit).await;
         assert_eq!(outcome, 6);
@@ -2201,11 +2229,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_final_flush_that_completes_is_not_cut_short() {
-        let telemetry = stuck(10, false);
+        let (telemetry, done) = stuck(50, false);
         let limit = std::time::Duration::from_secs(5);
         let outcome = finish_within(&telemetry, None, async { 7 }, limit).await;
         assert_eq!(outcome, 7);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[test]
+    fn a_hung_exporter_cannot_hold_the_process_open_past_the_runtime_limit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (telemetry, _) = stuck(12_000, false);
+        let limit = std::time::Duration::from_millis(100);
+        let finishing = finish_within(&telemetry, None, async { 3 }, limit);
+        let started = std::time::Instant::now();
+        let outcome = run_to_completion(runtime, finishing, std::time::Duration::from_millis(200));
+        assert_eq!(outcome, 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
     }
 
     #[tokio::test]
@@ -2290,6 +2331,7 @@ mod tests {
         let exporter = StuckExporter {
             pause: std::time::Duration::ZERO,
             panics: false,
+            done: std::sync::Arc::default(),
         };
         assert!(exporter.export_traces(vec![]).await.is_ok());
         assert!(exporter.export_events(vec![]).await.is_ok());
