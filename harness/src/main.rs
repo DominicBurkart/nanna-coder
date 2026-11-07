@@ -6,7 +6,7 @@ use harness::identity::IdentityCatalog;
 use harness::tools::ToolRegistry;
 use model::prelude::*;
 use std::io::{self, Write};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // NOTE: `main.rs` binds the workspace entity store to `InMemoryEntityStore`
 // concretely today, but the downstream callers accept any `EntityStore` via
@@ -1792,6 +1792,45 @@ fn build_delegate_task_manager(
     )
 }
 
+const TELEMETRY_FILE: &str = "telemetry.jsonl";
+const TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const TELEMETRY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn export_action_audit(
+    gate: &harness::action_auditor::ActionGate,
+    path: std::path::PathBuf,
+) -> std::sync::Arc<harness::telemetry::TelemetrySystem> {
+    use harness::action_auditor::TelemetrySink;
+    use harness::telemetry::{JsonlExporter, TelemetrySystem};
+    use std::sync::Arc;
+
+    let exporter = JsonlExporter::new(path, TELEMETRY_MAX_BYTES);
+    let system = TelemetrySystem::new()
+        .with_service_name("nanna-coder")
+        .add_exporter(Box::new(exporter));
+    let telemetry = Arc::new(system);
+    let sink = Arc::new(TelemetrySink::new(Arc::clone(&telemetry)));
+    if !gate.set_sink(sink) {
+        warn!("the action gate already had an audit sink; telemetry export is not attached");
+    }
+    telemetry
+}
+
+fn spawn_telemetry_flush(
+    telemetry: std::sync::Arc<harness::telemetry::TelemetrySystem>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        loop {
+            tick.tick().await;
+            if let Err(e) = telemetry.export_all().await {
+                warn!("telemetry export failed: {e}");
+            }
+        }
+    })
+}
+
 async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
@@ -1818,6 +1857,12 @@ async fn run_mcp_server(
         )
         .await?,
     );
+
+    let telemetry = export_action_audit(
+        &task_manager.action_gate(),
+        queue_path.with_file_name(TELEMETRY_FILE),
+    );
+    let _flush = spawn_telemetry_flush(telemetry, TELEMETRY_FLUSH_EVERY);
 
     info!(
         "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
@@ -1874,6 +1919,10 @@ async fn run_delegate(
         model,
         plane.clone(),
     ));
+    let telemetry = export_action_audit(
+        &task_manager.action_gate(),
+        queue_path.with_file_name(TELEMETRY_FILE),
+    );
     let gate = delegate_spawn_gate(
         model,
         provider.clone() as Arc<dyn model::ModelProvider>,
@@ -1915,6 +1964,9 @@ async fn run_delegate(
 
     let result = client.wait_result(&task_id).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Err(e) = telemetry.export_all().await {
+        warn!("telemetry export failed: {e}");
+    }
 
     drop(client);
     let _ = serve_handle.await;
@@ -1923,6 +1975,59 @@ async fn run_delegate(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_action_gate_exports_its_decisions_once_a_sink_is_attached() {
+        use harness::action_auditor::{ActionContext, ActionReview};
+        use harness::effects::EffectClass;
+        use harness::task::TaskId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let manager = harness::task::TaskManager::default();
+        let telemetry = export_action_audit(&manager.action_gate(), path.clone());
+        let review = ActionReview {
+            identity: "rust-implementer".to_string(),
+            task_id: TaskId("t1".to_string()),
+            tool: "write_file".to_string(),
+            args: serde_json::json!({ "content": "sk-live-SECRET" }),
+            effect_class: EffectClass::Repository,
+            prior_actions: vec![],
+        };
+        let context = ActionContext {
+            max_effect: EffectClass::Workspace,
+            window: None,
+            lease: harness::leases::LeaseContext::default(),
+            now: chrono::Utc::now(),
+            task: "",
+        };
+        manager.action_gate().run_gate(&review, &context).await;
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nanna_action_audit_total") && text.contains("action_audit"));
+        assert!(text.contains("\"verdict\":\"block\""));
+        assert!(!text.contains("SECRET"));
+        let second = export_action_audit(&manager.action_gate(), path);
+        assert_eq!(second.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flush_loop_drains_the_telemetry_buffers_on_its_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = harness::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let system = harness::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter));
+        let telemetry = std::sync::Arc::new(system);
+        telemetry.record_counter("c", 1.0, vec![]);
+        let flush = spawn_telemetry_flush(
+            std::sync::Arc::clone(&telemetry),
+            std::time::Duration::from_secs(5),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"c\""));
+        flush.abort();
+    }
+
     use super::*;
     use harness::action_auditor::RULE_ACTION_AUDITOR_NAME;
 
