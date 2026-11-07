@@ -51,11 +51,38 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+pub const MAX_BUFFERED_METRICS: usize = 10_000;
+pub const MAX_BUFFERED_EVENTS: usize = 10_000;
+
+fn push_bounded<T>(buffer: &mut Vec<T>, item: T, cap: usize, dropped: &AtomicU64) {
+    if buffer.len() >= cap {
+        let oldest = (cap / 10).max(1);
+        buffer.drain(..oldest);
+        dropped.fetch_add(oldest as u64, Ordering::Relaxed);
+    }
+    buffer.push(item);
+}
+
+fn dropped_metric(dropped: u64) -> MetricPoint {
+    MetricPoint {
+        name: "nanna_telemetry_dropped_total".to_string(),
+        metric_type: MetricType::Counter,
+        value: dropped as f64,
+        timestamp: Utc::now(),
+        labels: HashMap::new(),
+        unit: None,
+        description: Some("Buffered points dropped because a buffer was full".to_string()),
+    }
+}
 
 /// Telemetry system errors
 #[derive(Error, Debug)]
@@ -335,6 +362,72 @@ pub trait TelemetryExporter: Send + Sync {
     async fn health_check(&self) -> Result<bool, TelemetryError>;
 }
 
+/// ```
+/// use harness::telemetry::JsonlExporter;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let exporter = JsonlExporter::new(dir.path().join("telemetry.jsonl"), 1024 * 1024);
+/// # let _ = exporter;
+/// ```
+pub struct JsonlExporter {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+impl JsonlExporter {
+    pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            max_bytes,
+        }
+    }
+
+    fn append(&self, lines: Vec<String>) -> Result<(), TelemetryError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let full = std::fs::metadata(&self.path).is_ok_and(|meta| meta.len() >= self.max_bytes);
+        if full {
+            let mut rotated = self.path.clone().into_os_string();
+            rotated.push(".1");
+            let _ = std::fs::remove_file(&rotated);
+            std::fs::rename(&self.path, &rotated)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        let mut file = options.open(&self.path)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TelemetryExporter for JsonlExporter {
+    async fn export_traces(&self, _traces: Vec<TraceContext>) -> Result<(), TelemetryError> {
+        Ok(())
+    }
+
+    async fn export_metrics(&self, metrics: Vec<MetricPoint>) -> Result<(), TelemetryError> {
+        let line = |metric: &MetricPoint| serde_json::json!({ "metric": metric }).to_string();
+        self.append(metrics.iter().map(line).collect())
+    }
+
+    async fn export_events(&self, events: Vec<CustomEvent>) -> Result<(), TelemetryError> {
+        let line = |event: &CustomEvent| serde_json::json!({ "event": event }).to_string();
+        self.append(events.iter().map(line).collect())
+    }
+
+    async fn export_system_metrics(&self, _metrics: SystemMetrics) -> Result<(), TelemetryError> {
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool, TelemetryError> {
+        Ok(true)
+    }
+}
+
 /// Prometheus metrics exporter
 pub struct PrometheusExporter {
     /// Endpoint URL
@@ -540,6 +633,8 @@ pub struct TelemetrySystem {
     metrics_buffer: Arc<Mutex<Vec<MetricPoint>>>,
     /// Events buffer
     events_buffer: Arc<Mutex<Vec<CustomEvent>>>,
+    /// Buffered points dropped because a buffer was full
+    dropped: AtomicU64,
     /// Exporters
     exporters: Vec<Box<dyn TelemetryExporter>>,
     /// Is initialized
@@ -556,6 +651,7 @@ impl TelemetrySystem {
             active_traces: Arc::new(Mutex::new(Vec::new())),
             metrics_buffer: Arc::new(Mutex::new(Vec::new())),
             events_buffer: Arc::new(Mutex::new(Vec::new())),
+            dropped: AtomicU64::new(0),
             exporters: Vec::new(),
             initialized: false,
             start_time: Instant::now(),
@@ -715,7 +811,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded counter: {} = {}", name, value);
@@ -740,7 +836,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded gauge: {} = {}", name, value);
@@ -760,7 +856,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded histogram: {} = {:?}", name, duration);
@@ -779,10 +875,16 @@ impl TelemetrySystem {
 
         {
             let mut events = self.events_buffer.lock().unwrap();
-            events.push(event);
+            push_bounded(&mut events, event, MAX_BUFFERED_EVENTS, &self.dropped);
         }
 
         debug!("Recorded event: {} ({})", name, category);
+    }
+
+    /// How many buffered points were dropped since the last export because a
+    /// buffer was full.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Get system uptime
@@ -823,8 +925,12 @@ impl TelemetrySystem {
 
         let metrics = {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            let buffered_metrics = metrics.clone();
+            let mut buffered_metrics = metrics.clone();
             metrics.clear();
+            let dropped = self.dropped.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                buffered_metrics.push(dropped_metric(dropped));
+            }
             buffered_metrics
         };
 
@@ -970,6 +1076,152 @@ mod tests {
         telemetry.record_histogram("test_histogram", Duration::from_millis(100));
 
         assert_eq!(telemetry.get_buffered_metrics_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_metrics_buffer_drops_the_oldest_points_and_counts_them() {
+        let telemetry = TelemetrySystem::new();
+        for n in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_gauge("g", n as f64, vec![]);
+        }
+        let kept = MAX_BUFFERED_METRICS - MAX_BUFFERED_METRICS / 10 + 1;
+        assert_eq!(telemetry.get_buffered_metrics_count(), kept);
+        assert_eq!(
+            telemetry.dropped_count(),
+            (MAX_BUFFERED_METRICS / 10) as u64
+        );
+        let buffer = telemetry.metrics_buffer.lock().unwrap();
+        assert_eq!(buffer[0].value, (MAX_BUFFERED_METRICS / 10) as f64);
+        assert_eq!(buffer[kept - 1].value, MAX_BUFFERED_METRICS as f64);
+    }
+
+    #[tokio::test]
+    async fn a_full_events_buffer_drops_the_oldest_events_and_counts_them() {
+        let telemetry = TelemetrySystem::new();
+        for n in 0..=MAX_BUFFERED_EVENTS {
+            telemetry.record_event("e", "c", serde_json::json!({ "n": n }));
+        }
+        let events = telemetry.events_buffer.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            MAX_BUFFERED_EVENTS - MAX_BUFFERED_EVENTS / 10 + 1
+        );
+        assert_eq!(events[0].data["n"], MAX_BUFFERED_EVENTS / 10);
+        assert_eq!(telemetry.dropped_count(), (MAX_BUFFERED_EVENTS / 10) as u64);
+    }
+
+    #[tokio::test]
+    async fn counters_and_histograms_are_bounded_too() {
+        let telemetry = TelemetrySystem::new();
+        for _ in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_counter("c", 1.0, vec![]);
+            telemetry.record_histogram("h", Duration::from_millis(1));
+        }
+        assert!(telemetry.get_buffered_metrics_count() <= MAX_BUFFERED_METRICS);
+        assert!(telemetry.dropped_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn exporting_reports_the_drops_once_and_resets_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 30)));
+        for n in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_gauge("g", n as f64, vec![]);
+        }
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.dropped_count(), 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nanna_telemetry_dropped_total"));
+        telemetry.record_gauge("g", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(again.matches("nanna_telemetry_dropped_total").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_small_buffer_is_untouched_and_no_drop_metric_is_exported() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.record_event("e", "c", serde_json::json!({}));
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+        assert_eq!(telemetry.dropped_count(), 0);
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_exporter_writes_metrics_and_events_and_rotates_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("telemetry.jsonl");
+        let rotated = dir.path().join("nested").join("telemetry.jsonl.1");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 200)));
+        telemetry.record_counter("c", 1.0, vec![("k", "v")]);
+        telemetry.record_event("e", "cat", serde_json::json!({ "x": 1 }));
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"metric\"") && text.contains("\"event\""));
+        assert!(!rotated.exists());
+        telemetry.record_counter("c2", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        assert!(rotated.exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("c2"));
+        let exporter = JsonlExporter::new(&path, 200);
+        assert!(exporter.export_traces(vec![]).await.is_ok());
+        assert!(exporter.health_check().await.unwrap());
+        let system = crate::monitoring::SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 0,
+                misses: 0,
+                hit_rate: 0.0,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 0.0,
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                memory_usage_percent: 0.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 0,
+                disk_usage_percent: 0.0,
+                load_average: [0.0, 0.0, 0.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        assert!(exporter.export_system_metrics(system).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_exporter_reports_an_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let exporter = JsonlExporter::new(blocker.join("telemetry.jsonl"), 1024);
+        let events = vec![CustomEvent {
+            name: "e".to_string(),
+            timestamp: Utc::now(),
+            category: "c".to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({}),
+            trace_context: None,
+        }];
+        assert!(matches!(
+            exporter.export_events(events).await,
+            Err(TelemetryError::Io(_))
+        ));
     }
 
     #[tokio::test]
