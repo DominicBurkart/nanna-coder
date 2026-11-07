@@ -367,6 +367,7 @@ impl TaskWorkspace {
             image_ref,
             network,
             sidecars,
+            &CargoVendor,
             |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
         )
         .await
@@ -378,36 +379,10 @@ impl TaskWorkspace {
     /// higher-ranked lifetime complications).  Kept separate from
     /// `create_with_container` so the workspace creation and cleanup logic can
     /// be exercised in unit tests without a real container runtime.
-    async fn create_with_container_using<F, Fut>(
-        source_repo: &Path,
-        task_id: &str,
-        branch: &str,
-        image_ref: &str,
-        network: NetworkPolicy,
-        sidecars: Option<SidecarSet>,
-        start_fn: F,
-    ) -> Result<Self, WorkspaceError>
-    where
-        F: FnOnce(ContainerConfig) -> Fut,
-        Fut: std::future::Future<Output = Result<ContainerHandle, ContainerError>>,
-    {
-        Self::create_with_container_vendoring(
-            source_repo,
-            task_id,
-            branch,
-            image_ref,
-            network,
-            sidecars,
-            &CargoVendor,
-            start_fn,
-        )
-        .await
-    }
-
-    /// Like `create_with_container_using`, with the host-side dependency
-    /// vendoring for a network-less container supplied by `vendorer`.
+    /// `vendorer` supplies the host-side dependency vendoring for a
+    /// network-less container.
     #[allow(clippy::too_many_arguments)]
-    async fn create_with_container_vendoring<F, Fut>(
+    async fn create_with_container_using<F, Fut>(
         source_repo: &Path,
         task_id: &str,
         branch: &str,
@@ -1650,6 +1625,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             |_config: crate::container::ContainerConfig| async {
                 Ok(ContainerHandle {
                     name: "mock-container".to_string(),
@@ -1683,6 +1659,7 @@ mod tests {
             "bad-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             |_config: crate::container::ContainerConfig| async {
                 Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
             },
@@ -1711,6 +1688,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             |_config: crate::container::ContainerConfig| async {
                 use crate::container::{ContainerHandle, ContainerRuntime};
                 Ok(ContainerHandle {
@@ -1770,6 +1748,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             Some(set),
+            &CargoVendor,
             |config: ContainerConfig| async move {
                 *seen_in_start.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -1973,7 +1952,7 @@ mod tests {
         let sink = Arc::clone(&seen);
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
 
-        let mut ws = TaskWorkspace::create_with_container_vendoring(
+        let mut ws = TaskWorkspace::create_with_container_using(
             source.path(),
             &id,
             "HEAD",
@@ -2028,7 +2007,7 @@ mod tests {
         let sink = Arc::clone(&seen);
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
 
-        let mut ws = TaskWorkspace::create_with_container_vendoring(
+        let mut ws = TaskWorkspace::create_with_container_using(
             source.path(),
             &id,
             "HEAD",
@@ -2059,7 +2038,7 @@ mod tests {
         let id = unique_id("ws-nomanifest");
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
 
-        let mut ws = TaskWorkspace::create_with_container_vendoring(
+        let mut ws = TaskWorkspace::create_with_container_using(
             source.path(),
             &id,
             "HEAD",
@@ -2085,7 +2064,7 @@ mod tests {
         let id = unique_id("ws-vendorfail");
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, false);
 
-        let result = TaskWorkspace::create_with_container_vendoring(
+        let result = TaskWorkspace::create_with_container_using(
             source.path(),
             &id,
             "HEAD",
@@ -2122,7 +2101,7 @@ mod tests {
         commit_manifest(source.path());
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
 
-        let result = TaskWorkspace::create_with_container_vendoring(
+        let result = TaskWorkspace::create_with_container_using(
             source.path(),
             &unique_id("ws-override"),
             "HEAD",
@@ -2149,7 +2128,7 @@ mod tests {
         let id = unique_id("ws-startfail");
         let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
 
-        let result = TaskWorkspace::create_with_container_vendoring(
+        let result = TaskWorkspace::create_with_container_using(
             source.path(),
             &id,
             "HEAD",
@@ -2185,6 +2164,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Disabled,
             None,
+            &CargoVendor,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -2273,6 +2253,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -3056,6 +3037,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -3226,6 +3208,7 @@ mod tests {
             "mock-image:latest",
             NetworkPolicy::Enabled,
             None,
+            &CargoVendor,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
