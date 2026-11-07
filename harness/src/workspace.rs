@@ -768,7 +768,8 @@ impl TaskWorkspace {
             ),
             None => crate::ci_tools::register(&mut registry, root, identity, context),
         }
-        if let (Some(target), Some(pr)) = (&self.sandbox_target, self.sandbox_pr) {
+        if let Some(target) = &self.sandbox_target {
+            let pr_binding = registry.pr_binding();
             crate::sandbox_tools::register(
                 &mut registry,
                 root,
@@ -781,7 +782,7 @@ impl TaskWorkspace {
                     sandboxes: Arc::clone(&self.sandboxes),
                     accountant: self.budget_accountant(),
                     task_id: self.task_id.clone(),
-                    pr,
+                    pr_binding,
                 },
             );
         }
@@ -1229,26 +1230,18 @@ mod tests {
     }
 
     #[test]
-    fn the_sandbox_tools_need_a_target_a_pull_request_an_exact_grant_and_a_reaching_ceiling() {
+    fn the_sandbox_tools_need_a_target_an_exact_grant_and_a_reaching_ceiling_and_not_a_prebound_pull_request(
+    ) {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
         let both = "\"sandbox_deploy\", \"sandbox_teardown\"";
         let mut bare =
             TaskWorkspace::create(source.path(), &unique_id("ws-sb-bare"), "HEAD").unwrap();
         assert!(sandbox_tool_names(&bare, &ci_identity(both, "sandbox")).is_empty());
-        bare.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
-        assert!(sandbox_tool_names(&bare, &ci_identity(both, "sandbox")).is_empty());
         bare.cleanup().unwrap();
-
-        let mut pr_only =
-            TaskWorkspace::create(source.path(), &unique_id("ws-sb-pr"), "HEAD").unwrap();
-        pr_only.set_sandbox_pr(7);
-        assert!(sandbox_tool_names(&pr_only, &ci_identity(both, "sandbox")).is_empty());
-        pr_only.cleanup().unwrap();
 
         let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sb"), "HEAD").unwrap();
         ws.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
-        ws.set_sandbox_pr(7);
         assert_eq!(
             sandbox_tool_names(&ws, &ci_identity(both, "sandbox")),
             vec!["sandbox_deploy", "sandbox_teardown"]

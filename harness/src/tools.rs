@@ -120,6 +120,7 @@ pub struct ToolRegistry {
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
+    pr_binding: crate::pr_binding::PrBindingCell,
 }
 
 struct ProductionHold {
@@ -165,7 +166,12 @@ impl ToolRegistry {
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
+            pr_binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn pr_binding(&self) -> crate::pr_binding::PrBindingCell {
+        self.pr_binding.clone()
     }
 
     /// Attach an action-review gate: every subsequent call to a tool whose
@@ -427,6 +433,10 @@ impl ToolRegistry {
                 .expect("action prior poisoned")
                 .clone(),
         };
+        let bound_pr = self
+            .action_subject
+            .as_ref()
+            .and_then(|subject| self.pr_binding.number_for(&subject.repo));
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
                 let ctx = ActionContext {
@@ -435,7 +445,7 @@ impl ToolRegistry {
                     lease: LeaseContext {
                         repo: &subject.repo,
                         branch: subject.branch.as_deref(),
-                        pr: subject.pr,
+                        pr: subject.pr.or(bound_pr),
                         environment: subject.environment.as_deref(),
                         image: None,
                         paths: &subject.paths,

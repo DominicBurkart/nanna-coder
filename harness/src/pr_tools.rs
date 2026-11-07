@@ -2076,6 +2076,7 @@ pub struct GithubPrOpenTool {
     workspace_root: PathBuf,
     identity_name: String,
     client: Arc<dyn GithubClient>,
+    binding: crate::pr_binding::PrBindingCell,
 }
 
 impl GithubPrOpenTool {
@@ -2088,7 +2089,13 @@ impl GithubPrOpenTool {
             workspace_root,
             identity_name: identity_name.into(),
             client,
+            binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn with_binding(mut self, binding: crate::pr_binding::PrBindingCell) -> Self {
+        self.binding = binding;
+        self
     }
 }
 
@@ -2145,12 +2152,17 @@ impl Tool for GithubPrOpenTool {
                 "refusing to open a pull request from a branch into itself",
             ));
         }
+        let head_sha = run_git(&self.workspace_root, &["rev-parse", "HEAD"])?;
         let full_body = format!("{body}\n\n{trailer}\n{marker}\n");
         let created = self
             .client
             .create_draft_pull_request(&repo, title, &full_body, &head, &base)
             .await
             .map_err(map_backlog_error)?;
+        let bound = crate::pr_binding::PrBinding::new(&repo, created.number, &head, &head_sha);
+        if let Some(bound) = bound {
+            self.binding.bind(bound);
+        }
         Ok(json!({
             "number": created.number,
             "html_url": created.html_url,
@@ -2647,6 +2659,7 @@ fn register_granted_at(
     granted: &dyn Fn(&str) -> bool,
     base_url: &str,
 ) {
+    let binding = registry.pr_binding();
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client: Arc<dyn GithubClient> =
         Arc::new(crate::backlog::ReqwestGithubClient::new(base_url, token));
@@ -2671,11 +2684,14 @@ fn register_granted_at(
     register_if(
         registry,
         granted,
-        Box::new(GithubPrOpenTool::new(
-            workspace_root.to_path_buf(),
-            identity_name,
-            Arc::clone(&client),
-        )),
+        Box::new(
+            GithubPrOpenTool::new(
+                workspace_root.to_path_buf(),
+                identity_name,
+                Arc::clone(&client),
+            )
+            .with_binding(binding.clone()),
+        ),
     );
     register_if(
         registry,
@@ -3217,6 +3233,111 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
         assert!(err.to_string().contains("422"));
+    }
+
+    fn created(number: u64) -> Option<GithubPullRequestCreated> {
+        Some(GithubPullRequestCreated {
+            number,
+            html_url: format!("https://example.invalid/pr/{number}"),
+            node_id: format!("PR_{number}"),
+        })
+    }
+
+    async fn open_with(
+        dir: &Path,
+        binding: &crate::pr_binding::PrBindingCell,
+        mock: MockGithub,
+        args: Value,
+    ) -> ToolResult<Value> {
+        let tool = GithubPrOpenTool::new(dir.to_path_buf(), "sdlc-dev", Arc::new(mock))
+            .with_binding(binding.clone());
+        tool.execute(args).await
+    }
+
+    fn open_args() -> Value {
+        json!({ "title": "t", "body": "b", "base": "main" })
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_binds_the_pull_request_it_created_from_host_resolved_values() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let mock = MockGithub {
+            created_pr: created(9),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, mock, open_args())
+            .await
+            .unwrap();
+        let bound = binding.get().expect("bound after a successful creation");
+        let sha = run_git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(bound.repo(), "example/repo");
+        assert_eq!(bound.number(), 9);
+        assert_eq!(bound.head_branch(), "feature");
+        assert_eq!(bound.head_sha(), sha);
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_binds_nothing_when_creation_fails_or_arguments_try_to_set_the_binding()
+    {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let failing = MockGithub {
+            fail_status: Some(422),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, failing, open_args())
+            .await
+            .unwrap_err();
+        assert!(binding.get().is_none());
+        for key in ["pr", "number", "pr_number", "head_sha", "repo"] {
+            let mut args = open_args();
+            args[key] = json!(99);
+            let mock = MockGithub {
+                created_pr: created(9),
+                ..Default::default()
+            };
+            let err = open_with(dir.path(), &binding, mock, args)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments { .. }), "{key}");
+            assert!(binding.get().is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_pull_request_does_not_replace_the_first_binding() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        for number in [9, 10] {
+            let mock = MockGithub {
+                created_pr: created(number),
+                ..Default::default()
+            };
+            let opened = open_with(dir.path(), &binding, mock, open_args())
+                .await
+                .unwrap();
+            assert_eq!(opened["number"], json!(number));
+        }
+        assert_eq!(binding.get().unwrap().number(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_created_pull_request_with_an_unusable_number_or_repository_is_not_bound() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let mock = MockGithub {
+            created_pr: created(0),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, mock, open_args())
+            .await
+            .unwrap();
+        assert!(binding.get().is_none());
     }
 
     fn fence(text: &str) -> String {

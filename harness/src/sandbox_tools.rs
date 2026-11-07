@@ -4,6 +4,7 @@ use crate::deploy::{DeployError, DeployTemplate};
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
 use crate::onboarding::fullstack::CHECKS_FILE;
+use crate::pr_binding::{same_repo, PrBindingCell};
 use crate::pr_tools::{
     check_args, definition, fenced_untrusted, object_schema, property, redact_resilient,
     resolve_repo, strip_unprintable, untrusted_notice, Budget,
@@ -29,6 +30,8 @@ pub const SANDBOX_TEARDOWN: &str = "sandbox_teardown";
 pub const TOOL_NAMES: [&str; 2] = [SANDBOX_DEPLOY, SANDBOX_TEARDOWN];
 
 pub const MAX_SANDBOX_MINUTES: f64 = 1_440.0;
+const NO_BOUND_PR: &str =
+    "no pull request of this repository is bound to this task; open one with github_pr_open first";
 pub const ASSUMED_FAILED_DEPLOY_MINUTES: f64 = 10.0;
 const SANDBOX_ENVIRONMENT: &str = "sandbox";
 const MAX_CHECKS: usize = 50;
@@ -337,7 +340,14 @@ fn load_manifest(
     Ok((Manifest::derived(health_path, &[]), MANIFEST_SOURCE_DERIVED))
 }
 
-fn report_json(report: &ManifestReport, omitted: usize, pr: u64, url: &str, source: &str) -> Value {
+fn report_json(
+    report: &ManifestReport,
+    omitted: usize,
+    pr: u64,
+    head_sha: &str,
+    url: &str,
+    source: &str,
+) -> Value {
     let mut budget = Budget::new(TOTAL_CAP);
     let checks: Vec<Value> = report
         .checks
@@ -355,6 +365,7 @@ fn report_json(report: &ManifestReport, omitted: usize, pr: u64, url: &str, sour
     json!({
         "notice": untrusted_notice(),
         "pr_number": pr,
+        "head_sha": head_sha,
         "url": fenced_untrusted(url, URL_CAP, &mut budget),
         "manifest": source,
         "checks": checks,
@@ -398,7 +409,7 @@ pub struct SandboxDeployTool {
     probe: Arc<dyn HttpProbe>,
     sandboxes: Arc<SandboxRegistry>,
     task_id: String,
-    pr: u64,
+    binding: PrBindingCell,
     budget: BudgetContext,
     deploy_lock: tokio::sync::Mutex<()>,
 }
@@ -410,7 +421,7 @@ impl SandboxDeployTool {
         probe: Arc<dyn HttpProbe>,
         sandboxes: Arc<SandboxRegistry>,
         task_id: impl Into<String>,
-        pr: u64,
+        binding: PrBindingCell,
     ) -> Self {
         let task_id = task_id.into();
         let budget = BudgetContext::deny_all(&task_id);
@@ -420,7 +431,7 @@ impl SandboxDeployTool {
             probe,
             sandboxes,
             task_id,
-            pr,
+            binding,
             budget,
             deploy_lock: tokio::sync::Mutex::new(()),
         }
@@ -549,6 +560,14 @@ impl Tool for SandboxDeployTool {
             })?
             .to_string();
         let repo = resolve_repo(&self.workspace_root)?.to_ascii_lowercase();
+        let bound = self
+            .binding
+            .get()
+            .filter(|bound| same_repo(bound.repo(), &repo))
+            .ok_or_else(|| ToolError::ExecutionFailed {
+                message: NO_BOUND_PR.to_string(),
+            })?;
+        let (pr, head_sha) = (bound.number(), bound.head_sha().to_string());
         let _one_deploy_at_a_time = self.deploy_lock.lock().await;
         if self.sandboxes.get(&self.task_id).is_some() {
             return Err(map_sandbox_error(SandboxError::AlreadyDeployed));
@@ -557,7 +576,7 @@ impl Tool for SandboxDeployTool {
         self.charge(&repo).await?;
         let image = format!("{}:{image_tag}", template.target.image_ref());
         let target = Arc::clone(&self.target);
-        let (deploy_repo, pr) = (repo.clone(), self.pr);
+        let deploy_repo = repo.clone();
         let deployed = tokio::task::spawn_blocking(move || target.deploy(&deploy_repo, pr, &image))
             .await
             .map_err(|e| ToolError::ExecutionFailed {
@@ -574,9 +593,14 @@ impl Tool for SandboxDeployTool {
         handle.identity = Some(self.budget.identity.clone());
         self.sandboxes.insert(&self.task_id, handle.clone());
         match self.run_qa(&template, &handle).await {
-            Ok((report, omitted, source)) => {
-                Ok(report_json(&report, omitted, self.pr, &handle.url, source))
-            }
+            Ok((report, omitted, source)) => Ok(report_json(
+                &report,
+                omitted,
+                pr,
+                &head_sha,
+                &handle.url,
+                source,
+            )),
             Err(e) => Err(self.tear_down_after_failed_qa(&handle, e).await),
         }
     }
@@ -722,7 +746,7 @@ pub struct SandboxContext {
     pub sandboxes: Arc<SandboxRegistry>,
     pub accountant: Arc<CostAccountant>,
     pub task_id: String,
-    pub pr: u64,
+    pub pr_binding: PrBindingCell,
 }
 
 #[doc = r#"Registers the sandbox tools an identity names exactly in `scope.tools`; a glob grants nothing.
@@ -758,7 +782,7 @@ register(
         sandboxes: Arc::new(SandboxRegistry::new()),
         accountant: Arc::new(CostAccountant::deny_all(Arc::new(InMemoryBudgetStore::new()))),
         task_id: "t1".to_string(),
-        pr: 7,
+        pr_binding: harness::pr_binding::PrBindingCell::new(),
     },
 );
 assert_eq!(registry.list_tools(), vec!["sandbox_teardown"]);
@@ -785,7 +809,7 @@ pub fn register(
                 Arc::clone(&context.probe),
                 Arc::clone(&context.sandboxes),
                 context.task_id.clone(),
-                context.pr,
+                context.pr_binding.clone(),
             )
             .with_budget(Arc::clone(&context.accountant), identity.name())
             .with_ceiling(identity.budget_limits(BudgetClass::Sandbox)),
@@ -811,6 +835,19 @@ mod tests {
     use crate::sidecar::RunOutput;
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
+
+    const HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn bound_repo(repo: &str, pr: u64) -> PrBindingCell {
+        let cell = PrBindingCell::new();
+        let binding = crate::pr_binding::PrBinding::new(repo, pr, "feat/x", HEAD_SHA).unwrap();
+        cell.bind(binding);
+        cell
+    }
+
+    fn bound(pr: u64) -> PrBindingCell {
+        bound_repo("o/n", pr)
+    }
 
     const DEPLOY_TOML: &str = include_str!("../../tests/fixtures/fullstack/.nanna/deploy.toml");
     const CHECKS: &str = include_str!("../../tests/fixtures/fullstack/CHECKS");
@@ -930,7 +967,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::clone(sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(Arc::clone(accountant), "id")
     }
@@ -1213,7 +1250,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::clone(&sandboxes),
             "t1",
-            7,
+            bound(7),
         );
         assert!(matches!(
             bare.execute(json!({"image_tag": "v1"})).await.unwrap_err(),
@@ -1248,7 +1285,7 @@ mod tests {
                 Arc::new(LoopbackProbe),
                 Arc::new(SandboxRegistry::new()),
                 task,
-                7,
+                bound_repo("owner/name", 7),
             )
             .with_budget(Arc::clone(&accountant), "id");
             outcomes.push((tool.execute(json!({"image_tag": "v1"})).await, target));
@@ -1265,7 +1302,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::new(SandboxRegistry::new()),
             "t9",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id")
         .with_ceiling(BudgetLimits::DENY_ALL);
@@ -1327,7 +1364,7 @@ mod tests {
             Arc::new(ScriptedProbe(500, body)),
             Arc::clone(&sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(accountant, "id");
         let result = tool.execute(json!({"image_tag": "v1"})).await.unwrap();
@@ -1355,7 +1392,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::new(SandboxRegistry::new()),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id");
         let result = tool.execute(json!({"image_tag": "v1"})).await.unwrap();
@@ -1517,7 +1554,7 @@ mod tests {
             sandboxes: Arc::new(SandboxRegistry::new()),
             accountant: unlimited(),
             task_id: "t1".to_string(),
-            pr: 7,
+            pr_binding: bound(7),
         };
         let names = |tools: &str| {
             let identity = identity_with(tools, "sandbox", "");
@@ -1563,7 +1600,7 @@ mod tests {
                 sandboxes: Arc::new(SandboxRegistry::new()),
                 accountant: unlimited(),
                 task_id: "t1".to_string(),
-                pr: 7,
+                pr_binding: bound(7),
             },
         );
         assert_eq!(TOOL_NAMES, ["sandbox_deploy", "sandbox_teardown"]);
@@ -1718,7 +1755,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::clone(&sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id");
         tool.execute(json!({"image_tag": "v1"})).await.unwrap();
@@ -1745,7 +1782,7 @@ mod tests {
                 sandboxes: Arc::new(SandboxRegistry::new()),
                 accountant: Arc::clone(&accountant),
                 task_id: "t1".to_string(),
-                pr: 7,
+                pr_binding: bound(7),
             },
         );
         let deploy = registry.get_tool("sandbox_deploy").unwrap();
@@ -1836,7 +1873,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::clone(&sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id");
         let err = crashing
@@ -1853,7 +1890,7 @@ mod tests {
             Arc::new(PanickingProbe),
             Arc::clone(&sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id");
         let err = blind.execute(json!({"image_tag": "v1"})).await.unwrap_err();
@@ -2064,7 +2101,33 @@ mod tests {
                     sandboxes: Arc::clone(&self.sandboxes),
                     accountant: Arc::clone(&self.accountant),
                     task_id: task_id.to_string(),
-                    pr: 7,
+                    pr_binding: bound(7),
+                },
+            );
+            registry
+                .scoped_for(&identity)
+                .with_action_gate(gate, subject)
+        }
+
+        fn registry_with_its_own_binding(
+            &self,
+            gate: Arc<crate::action_auditor::ActionGate>,
+            subject: crate::tools::ActionSubject,
+        ) -> ToolRegistry {
+            let identity = identity_with("\"sandbox_deploy\", \"sandbox_teardown\"", "sandbox", "");
+            let mut registry = ToolRegistry::new();
+            let pr_binding = registry.pr_binding();
+            register(
+                &mut registry,
+                self.dir.path(),
+                &identity,
+                SandboxContext {
+                    target: Arc::clone(&self.target) as Arc<dyn SandboxTarget>,
+                    probe: Arc::new(LoopbackProbe),
+                    sandboxes: Arc::clone(&self.sandboxes),
+                    accountant: Arc::clone(&self.accountant),
+                    task_id: "t1".to_string(),
+                    pr_binding,
                 },
             );
             registry
@@ -2425,7 +2488,7 @@ mod tests {
                     InMemoryBudgetStore::new(),
                 ))),
                 task_id: "t1".to_string(),
-                pr: 7,
+                pr_binding: bound(7),
             },
         );
         let registry = registry.with_action_gate(gate, subject(Some(7)));
@@ -2551,7 +2614,7 @@ mod tests {
             Arc::new(LoopbackProbe),
             Arc::clone(sandboxes),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(Arc::clone(accountant), "id")
     }
@@ -2671,7 +2734,7 @@ mod tests {
             probe,
             Arc::new(SandboxRegistry::new()),
             "t1",
-            7,
+            bound(7),
         )
         .with_budget(unlimited(), "id");
         tool.execute(json!({"image_tag": "v1"})).await.unwrap()
@@ -2731,7 +2794,7 @@ mod tests {
                 sandboxes: Arc::clone(&sandboxes),
                 accountant: Arc::clone(&accountant),
                 task_id: "t1".to_string(),
-                pr: 7,
+                pr_binding: bound(7),
             },
         );
         backdated(&sandboxes, 12, None);
@@ -2758,5 +2821,148 @@ mod tests {
         assert!(failure_message(err).contains("path must start with"));
         assert!(sandboxes.get("t1").is_none());
         assert_eq!(aged.0.torn_down().len(), 1);
+    }
+
+    fn bind(registry: &ToolRegistry, repo: &str, number: u64) {
+        let binding = crate::pr_binding::PrBinding::new(repo, number, "feat/x", HEAD_SHA).unwrap();
+        assert!(registry.pr_binding().bind(binding));
+    }
+
+    fn denied(err: &ToolError) -> bool {
+        matches!(err, ToolError::ActionDenied(_))
+    }
+
+    #[tokio::test]
+    async fn a_deploy_is_blocked_until_the_task_has_bound_a_pull_request_and_then_runs_for_it() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry_with_its_own_binding(gate, subject(None));
+        let args = json!({"image_tag": "v1"});
+        let err = registry
+            .execute("sandbox_deploy", args.clone())
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err:?}");
+        chain.nothing_happened();
+        bind(&registry, "o/n", 7);
+        let done = registry.execute("sandbox_deploy", args).await.unwrap();
+        assert_eq!(done["pr_number"], 7);
+        assert_eq!(done["head_sha"], HEAD_SHA);
+        assert_eq!(chain.target.deployed().len(), 1);
+        assert_eq!(chain.target.deployed()[0].pr, 7);
+        let held = crate::leases::LeaseStore::snapshot(chain.leases.as_ref()).unwrap();
+        let names: Vec<String> = held.iter().map(|lease| lease.name.to_string()).collect();
+        assert_eq!(names, vec!["sandbox:o/n:7"]);
+    }
+
+    #[tokio::test]
+    async fn a_host_set_number_is_the_one_the_lease_is_keyed_by_even_when_a_binding_exists() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry_with_its_own_binding(gate, subject(Some(9)));
+        bind(&registry, "o/n", 7);
+        registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap();
+        let held = crate::leases::LeaseStore::snapshot(chain.leases.as_ref()).unwrap();
+        let names: Vec<String> = held.iter().map(|lease| lease.name.to_string()).collect();
+        assert_eq!(names, vec!["sandbox:o/n:9"]);
+    }
+
+    #[tokio::test]
+    async fn a_binding_for_another_repository_or_a_lookalike_never_authorises_a_deploy() {
+        for repo in ["other/repo", "o/n.", "O/N/extra", "o/m"] {
+            let chain = Chain::new();
+            let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+            let registry = chain.registry_with_its_own_binding(gate, subject(None));
+            let binding = crate::pr_binding::PrBinding::new(repo, 7, "feat/x", HEAD_SHA);
+            if let Some(binding) = binding {
+                registry.pr_binding().bind(binding);
+            }
+            let err = registry
+                .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+                .await
+                .unwrap_err();
+            assert!(denied(&err), "{repo}: {err:?}");
+            chain.nothing_happened();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_set_number_without_a_matching_binding_still_stops_at_the_tool() {
+        for bound_repo in [None, Some("other/repo")] {
+            let chain = Chain::new();
+            let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+            let registry = chain.registry_with_its_own_binding(gate, subject(Some(7)));
+            if let Some(repo) = bound_repo {
+                bind(&registry, repo, 7);
+            }
+            let err = registry
+                .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+                .await
+                .unwrap_err();
+            assert!(failure_message(err).contains("github_pr_open"));
+            assert!(chain.target.images().is_empty());
+            assert_eq!(
+                chain
+                    .accountant
+                    .task_summary("sb-agent", "t1")
+                    .sandbox
+                    .count,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_arguments_cannot_name_or_replace_the_pull_request() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = chain.registry_with_its_own_binding(gate, subject(None));
+        let keys = ["pr", "pr_number", "number", "repo", "head_sha"];
+        for key in keys {
+            let mut args = json!({"image_tag": "v1"});
+            args[key] = json!(7);
+            let err = registry.execute("sandbox_deploy", args).await.unwrap_err();
+            assert!(denied(&err), "{key}: {err:?}");
+            assert!(registry.pr_binding().get().is_none(), "{key}");
+            assert!(chain.target.images().is_empty(), "{key}");
+        }
+        bind(&registry, "o/n", 7);
+        for key in keys {
+            let mut args = json!({"image_tag": "v1"});
+            args[key] = json!(8);
+            let err = registry.execute("sandbox_deploy", args).await.unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments { .. }), "{key}");
+            assert!(chain.target.images().is_empty(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_tears_down_the_sandbox_a_task_deployed_for_its_bound_pull_request() {
+        let chain = Chain::new();
+        let mut workspace = crate::workspace::TaskWorkspace::create(
+            chain.dir.path(),
+            &format!("bound-{}", uuid_like()),
+            "HEAD",
+        )
+        .unwrap();
+        workspace.set_sandbox_target(Arc::clone(&chain.target) as Arc<dyn SandboxTarget>);
+        workspace.set_cost_accountant(Arc::clone(&chain.accountant));
+        let identity = identity_with("\"sandbox_deploy\", \"sandbox_teardown\"", "sandbox", "");
+        let registry = workspace.build_tool_registry_for(&identity).unwrap();
+        bind(&registry, "o/n", 7);
+        let deploy = registry.get_tool("sandbox_deploy").unwrap();
+        deploy.execute(json!({"image_tag": "v1"})).await.unwrap();
+        assert_eq!(chain.target.deployed().len(), 1);
+        assert!(chain.target.torn_down().is_empty());
+        workspace.cleanup().unwrap();
+        assert_eq!(chain.target.torn_down().len(), 1);
+        assert_eq!(chain.target.torn_down()[0].pr, 7);
+    }
+
+    fn uuid_like() -> String {
+        crate::task::TaskId::new().0
     }
 }
