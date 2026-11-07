@@ -8,6 +8,7 @@ use crate::container::{
     ContainerHandle, NetworkPolicy, ReadOnlyMount,
 };
 use crate::identity::AgentIdentity;
+use crate::offline_cargo::{CargoVendor, OfflineCargo, Vendorer};
 use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
 use crate::onboarding::OnboardingError;
 use crate::protected::{
@@ -114,6 +115,8 @@ pub enum WorkspaceError {
     ContainerSetupFailed(String),
     #[error("Invalid harness/dev-container.toml: {0}")]
     InvalidDevContainerConfig(String),
+    #[error("Offline dependency preparation failed: {0}")]
+    OfflineDependencies(String),
     #[error("Refusing to produce a patch: {0}")]
     ProtectedPath(ProtectedPathViolation),
     #[error("Refusing to start the task: {0}")]
@@ -211,6 +214,7 @@ pub struct TaskWorkspace {
     sandboxes: Arc<crate::sandbox_tools::SandboxRegistry>,
     sandbox_target: Option<Arc<dyn crate::sandbox_tools::SandboxTarget>>,
     sandbox_pr: Option<u64>,
+    offline_cargo: Option<OfflineCargo>,
 }
 
 impl TaskWorkspace {
@@ -254,6 +258,7 @@ impl TaskWorkspace {
             sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
             sandbox_target: None,
             sandbox_pr: None,
+            offline_cargo: None,
         })
     }
 
@@ -386,6 +391,36 @@ impl TaskWorkspace {
         F: FnOnce(ContainerConfig) -> Fut,
         Fut: std::future::Future<Output = Result<ContainerHandle, ContainerError>>,
     {
+        Self::create_with_container_vendoring(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            network,
+            sidecars,
+            &CargoVendor,
+            start_fn,
+        )
+        .await
+    }
+
+    /// Like `create_with_container_using`, with the host-side dependency
+    /// vendoring for a network-less container supplied by `vendorer`.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_container_vendoring<F, Fut>(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        network: NetworkPolicy,
+        sidecars: Option<SidecarSet>,
+        vendorer: &dyn Vendorer,
+        start_fn: F,
+    ) -> Result<Self, WorkspaceError>
+    where
+        F: FnOnce(ContainerConfig) -> Fut,
+        Fut: std::future::Future<Output = Result<ContainerHandle, ContainerError>>,
+    {
         debug_assert!(
             task_id
                 .chars()
@@ -437,8 +472,25 @@ impl TaskWorkspace {
                 return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
             }
         };
-        let read_only_mounts = shielded.mounts;
+        let mut read_only_mounts = shielded.mounts;
         let placeholders = shielded.placeholders;
+
+        let offline_cargo = if network == NetworkPolicy::Disabled {
+            let stage = std::env::temp_dir().join(format!("nanna-offline-{task_id}"));
+            match OfflineCargo::prepare(&workspace_path, &stage, vendorer) {
+                Ok(offline) => offline,
+                Err(e) => {
+                    cleanup_worktree();
+                    return Err(WorkspaceError::OfflineDependencies(e.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(offline) = &offline_cargo {
+            read_only_mounts.extend(offline.mounts().iter().cloned());
+            env_vars.extend(offline.env().iter().cloned());
+        }
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),
@@ -458,6 +510,9 @@ impl TaskWorkspace {
             Ok(h) => h,
             Err(e) => {
                 cleanup_worktree();
+                if let Some(offline) = &offline_cargo {
+                    offline.cleanup();
+                }
                 return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
             }
         };
@@ -486,6 +541,7 @@ impl TaskWorkspace {
             sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
             sandbox_target: None,
             sandbox_pr: None,
+            offline_cargo,
         })
     }
 
@@ -698,6 +754,9 @@ impl TaskWorkspace {
             }
         }
         drop(self.sidecars.take());
+        if let Some(offline) = self.offline_cargo.take() {
+            offline.cleanup();
+        }
         let output = git_cmd(&self.source_repo)
             .args(["worktree", "remove", "--force"])
             .arg(&self.workspace_path)
@@ -1831,6 +1890,279 @@ mod tests {
         ws.cleanup().unwrap();
         assert!(fake.calls().contains(&"rm -f nanna-rm-fails".to_string()));
         assert!(!ws.workspace_path.exists());
+    }
+
+    struct StubVendorer {
+        stdout: String,
+        success: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubVendorer {
+        fn new(stdout: &str, success: bool) -> Self {
+            Self {
+                stdout: stdout.to_string(),
+                success,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Vendorer for StubVendorer {
+        fn vendor(
+            &self,
+            _manifest: &Path,
+            vendor_dir: &Path,
+            _cwd: &Path,
+        ) -> std::io::Result<crate::sidecar::RunOutput> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::create_dir_all(vendor_dir.join("dep"))?;
+            Ok(crate::sidecar::RunOutput {
+                success: self.success,
+                stdout: self.stdout.clone(),
+                stderr: if self.success {
+                    String::new()
+                } else {
+                    "no lock file".to_string()
+                },
+            })
+        }
+    }
+
+    const VENDOR_SNIPPET: &str = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+        [source.vendored-sources]\ndirectory = \"/host/vendor\"\n";
+
+    fn commit_manifest(dir: &Path) {
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        git_cmd(dir).args(["add", "."]).output().unwrap();
+        let out = git_cmd(dir)
+            .args(["commit", "-m", "manifest"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    fn offline_stage(task_id: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("nanna-offline-{task_id}"))
+    }
+
+    fn mock_handle() -> crate::container::ContainerHandle {
+        crate::container::ContainerHandle {
+            name: "mock-container".to_string(),
+            runtime: crate::container::ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_network_less_container_gets_vendored_dependencies_read_only() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        commit_manifest(source.path());
+        let id = unique_id("ws-offline");
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
+
+        let mut ws = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            &vendorer,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(mock_handle())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vendorer.calls(), 1);
+        let config = seen.lock().unwrap().clone().unwrap();
+        assert!(config
+            .env_vars
+            .contains(&("CARGO_NET_OFFLINE".to_string(), "true".to_string())));
+        let stage = offline_stage(&id);
+        let args = config.run_args(&crate::container::ContainerRuntime::Podman, "img");
+        for expected in [
+            format!(
+                "-v={}:{}:ro,z",
+                stage.join("vendor").display(),
+                crate::offline_cargo::CONTAINER_VENDOR_DIR
+            ),
+            format!(
+                "-v={}:{}:ro,z",
+                stage.join("config.toml").display(),
+                crate::offline_cargo::CONTAINER_CARGO_CONFIG
+            ),
+        ] {
+            assert!(args.contains(&expected), "{expected} not in {args:?}");
+        }
+        assert!(args.contains(&"--network=none".to_string()));
+        assert!(stage.is_dir());
+
+        ws.cleanup().unwrap();
+        assert!(!stage.exists());
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_networked_container_is_not_given_vendored_dependencies() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        commit_manifest(source.path());
+        let id = unique_id("ws-online");
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
+
+        let mut ws = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            &vendorer,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(mock_handle())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vendorer.calls(), 0);
+        let config = seen.lock().unwrap().clone().unwrap();
+        assert!(config.env_vars.is_empty());
+        assert!(config.read_only_mounts.iter().all(|m| !m.relabel));
+        assert!(!offline_stage(&id).exists());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_network_less_container_without_a_manifest_vendors_nothing() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let id = unique_id("ws-nomanifest");
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
+
+        let mut ws = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            &vendorer,
+            |_config: ContainerConfig| async { Ok(mock_handle()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vendorer.calls(), 0);
+        assert!(!offline_stage(&id).exists());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_vendoring_refuses_the_task_and_cleans_up() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        commit_manifest(source.path());
+        let id = unique_id("ws-vendorfail");
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, false);
+
+        let result = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            &vendorer,
+            |_config: ContainerConfig| async { panic!("the container must not start") },
+        )
+        .await;
+
+        match result {
+            Err(WorkspaceError::OfflineDependencies(reason)) => {
+                assert!(reason.contains("no lock file"), "{reason}")
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        assert!(!std::env::temp_dir()
+            .join(format!("nanna-task-{id}"))
+            .exists());
+        assert!(!offline_stage(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn test_repo_cargo_source_override_refuses_the_network_less_task() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".cargo")).unwrap();
+        std::fs::write(
+            source.path().join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"x\"\n",
+        )
+        .unwrap();
+        commit_manifest(source.path());
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
+
+        let result = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &unique_id("ws-override"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            &vendorer,
+            |_config: ContainerConfig| async { panic!("the container must not start") },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::OfflineDependencies(_))
+        ));
+        assert_eq!(vendorer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_container_start_failure_removes_the_vendored_stage() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        commit_manifest(source.path());
+        let id = unique_id("ws-startfail");
+        let vendorer = StubVendorer::new(VENDOR_SNIPPET, true);
+
+        let result = TaskWorkspace::create_with_container_vendoring(
+            source.path(),
+            &id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            &vendorer,
+            |_config: ContainerConfig| async { Err(ContainerError::NoRuntimeAvailable) },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceError::ContainerSetupFailed(_))
+        ));
+        assert_eq!(vendorer.calls(), 1);
+        assert!(!offline_stage(&id).exists());
     }
 
     #[tokio::test]
