@@ -181,7 +181,19 @@ fn emit_builds_one_event_and_hands_it_to_the_sink_once() {
 struct Calls {
     locals: Vec<(String, Vec<String>)>,
     calls: Vec<(String, Vec<syn::Expr>, Option<String>)>,
+    paths: Vec<(String, Vec<syn::Expr>)>,
     bound: Option<String>,
+}
+
+fn joined_path(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) => {
+            let segments = path.path.segments.iter();
+            let names: Vec<String> = segments.map(|s| s.ident.to_string()).collect();
+            Some(names.join("::"))
+        }
+        _ => None,
+    }
 }
 
 fn last_segment(expr: &syn::Expr) -> Option<String> {
@@ -212,8 +224,10 @@ impl<'ast> Visit<'ast> for Calls {
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        let path = joined_path(&node.func).unwrap_or_default();
         if let Some(name) = last_segment(&node.func) {
-            let args = node.args.iter().cloned().collect();
+            let args: Vec<syn::Expr> = node.args.iter().cloned().collect();
+            self.paths.push((path, args.clone()));
             self.calls.push((name, args, self.bound.clone()));
         }
         syn::visit::visit_expr_call(self, node);
@@ -239,12 +253,35 @@ fn is_action_gate_of(expr: &syn::Expr, manager: &str) -> bool {
         && last_segment(&call.receiver).as_deref() == Some(manager)
 }
 
-fn attachment_problem(
-    source: &str,
-    function: &str,
-    builder: &str,
+struct Wiring<'a> {
+    function: &'a str,
+    builder: &'a str,
     flushes: bool,
-) -> Option<String> {
+    file: &'a str,
+    work: &'a [&'a str],
+}
+
+fn work_idents(found: &Calls, arg: Option<&syn::Expr>) -> Vec<String> {
+    let Some(arg) = arg else {
+        return Vec::new();
+    };
+    let Some(name) = last_segment(arg) else {
+        return mentions(arg);
+    };
+    let bound: Vec<&Vec<String>> = found
+        .locals
+        .iter()
+        .filter(|(local, _)| *local == name)
+        .map(|(_, idents)| idents)
+        .collect();
+    match bound.as_slice() {
+        [only] => (*only).clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn attachment_problem(source: &str, wiring: &Wiring) -> Option<String> {
+    let function = wiring.function;
     let file = syn::parse_file(source).unwrap();
     let body = file.items.iter().find_map(|item| match item {
         syn::Item::Fn(item) if item.sig.ident == function => Some(item.clone()),
@@ -252,25 +289,45 @@ fn attachment_problem(
     })?;
     let mut found = Calls::default();
     found.visit_item_fn(&body);
-    let manager = found
+    let builds: Vec<&String> = found
         .locals
         .iter()
-        .find(|(_, idents)| idents.iter().any(|ident| ident == builder))
-        .map(|(name, _)| name.clone());
-    let Some(manager) = manager else {
+        .filter(|(_, idents)| idents.iter().any(|ident| ident == wiring.builder))
+        .map(|(name, _)| name)
+        .collect();
+    let [manager] = builds.as_slice() else {
         return Some(format!(
-            "{function} does not bind the manager from {builder}"
+            "{function} must bind the manager from {} exactly once",
+            wiring.builder
         ));
     };
+    let manager = (*manager).clone();
+    let bindings = found.locals.iter().filter(|(name, _)| *name == manager);
+    if bindings.count() != 1 {
+        return Some(format!("{function} rebinds or shadows {manager}"));
+    }
     let export = found.calls.iter().find(|(name, args, _)| {
         name == "export_action_audit"
             && args.first().is_some_and(|a| is_action_gate_of(a, &manager))
+            && args
+                .get(1)
+                .is_some_and(|a| mentions(a).iter().any(|i| i == wiring.file))
     });
     let Some((_, _, Some(telemetry))) = export else {
         return Some(format!(
-            "{function} must bind export_action_audit(&{manager}.action_gate(), ..)"
+            "{function} must bind export_action_audit(&{manager}.action_gate(), .. {} ..)",
+            wiring.file
         ));
     };
+    let flows = found.paths.iter().any(|(path, args)| {
+        path.ends_with("NannaMcpServer::new")
+            && args.first().is_some_and(|a| mentions(a).contains(&manager))
+    });
+    if !flows {
+        return Some(format!(
+            "{function} must hand {manager} to NannaMcpServer::new"
+        ));
+    }
     let finish = found.calls.iter().find(|(name, args, _)| {
         name == "finish_with_flush"
             && args.first().and_then(borrowed_path).as_deref() == Some(telemetry.as_str())
@@ -280,8 +337,16 @@ fn attachment_problem(
             "{function} must end through finish_with_flush(&{telemetry}, ..)"
         ));
     };
+    let work = work_idents(&found, args.get(2));
+    for needle in wiring.work {
+        if !work.iter().any(|ident| ident == needle) {
+            return Some(format!(
+                "{function} must pass the work that runs {needle} to finish_with_flush"
+            ));
+        }
+    }
     let second = args.get(1).map(mentions).unwrap_or_default();
-    if !flushes {
+    if !wiring.flushes {
         return (second != ["None"])
             .then(|| format!("{function} must pass None for the flush task"));
     }
@@ -310,80 +375,119 @@ fn production_main() -> String {
 #[test]
 fn each_cli_gate_gets_the_sink_from_its_own_manager_and_is_flushed_on_every_exit() {
     let main = production_main();
-    let serve = attachment_problem(&main, "run_mcp_server", "build_mcp_task_manager", true);
-    assert_eq!(serve, None);
-    let delegate = attachment_problem(&main, "run_delegate", "build_delegate_task_manager", false);
-    assert_eq!(delegate, None);
+    let serve = Wiring {
+        function: "run_mcp_server",
+        builder: "build_mcp_task_manager",
+        flushes: true,
+        file: "TELEMETRY_FILE",
+        work: &["serve", "shutdown_signal"],
+    };
+    assert_eq!(attachment_problem(&main, &serve), None);
+    let delegate = Wiring {
+        function: "run_delegate",
+        builder: "build_delegate_task_manager",
+        flushes: false,
+        file: "DELEGATE_TELEMETRY_FILE",
+        work: &["submit_task", "wait_result"],
+    };
+    assert_eq!(attachment_problem(&main, &delegate), None);
+}
+
+#[test]
+fn the_shutdown_wait_listens_for_both_interrupt_and_terminate() {
+    let main = production_main();
+    for name in ["interrupt", "terminate"] {
+        assert!(users(&main, name).contains("shutdown_signal"), "{name}");
+    }
+    assert!(users(&main, "shutdown_signal").contains("run_mcp_server"));
 }
 
 #[test]
 fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
     let wrap = |body: &str| format!("async fn run_x() {{ {body} }}");
-    let says = |body: &str, flushes: bool, needle: &str| -> bool {
-        let source = wrap(body);
-        let problem = attachment_problem(&source, "run_x", "build_x_task_manager", flushes);
-        problem.is_some_and(|text| text.contains(needle))
+    let wiring = |flushes: bool| Wiring {
+        function: "run_x",
+        builder: "build_x_task_manager",
+        flushes,
+        file: "FILE",
+        work: &["serve"],
     };
-    let clean = |body: &str, flushes: bool| -> bool {
-        let source = wrap(body);
-        attachment_problem(&source, "run_x", "build_x_task_manager", flushes).is_none()
+    let problem = |body: &str, flushes: bool| attachment_problem(&wrap(body), &wiring(flushes));
+    let says = |body: &str, flushes: bool, needle: &str| -> bool {
+        problem(body, flushes).is_some_and(|text| text.contains(needle))
     };
     let mgr = "let m = build_x_task_manager(a);";
-    let exp = "let t = export_action_audit(&m.action_gate(), p);";
+    let exp = "let t = export_action_audit(&m.action_gate(), q.with_file_name(FILE));";
+    let srv = "let s = NannaMcpServer::new(m, a);";
+    let w = "let w = async { s.serve(r).await };";
     let spawn = "let f = spawn_telemetry_flush(Arc::clone(&t), d);";
-    assert!(clean(
-        &format!("{mgr} {exp} {spawn} finish_with_flush(&t, Some(f), w).await;"),
-        true
-    ));
-    assert!(clean(
-        &format!("{mgr} {exp} finish_with_flush(&t, None, w).await;"),
-        false
-    ));
-    let other = "let t = export_action_audit(&TaskManager::default().action_gate(), p);";
-    assert!(says(
-        &format!("{mgr} {other} {spawn} finish_with_flush(&t, Some(f), w).await;"),
-        true,
-        "export_action_audit"
-    ));
+    let base = format!("{mgr} {exp} {srv} {w}");
+    let flushed = format!("{base} {spawn} finish_with_flush(&t, Some(f), w).await;");
+    assert_eq!(problem(&flushed, true), None);
+    let plain = format!("{base} finish_with_flush(&t, None, w).await;");
+    assert_eq!(problem(&plain, false), None);
+    let inline = format!(
+        "{mgr} {exp} {srv} finish_with_flush(&t, None, async {{ s.serve(r).await }}).await;"
+    );
+    assert_eq!(problem(&inline, false), None);
+    let other = "let t = export_action_audit(&TaskManager::default().action_gate(), q.with_file_name(FILE));";
+    let swapped =
+        format!("{mgr} {other} {srv} {w} {spawn} finish_with_flush(&t, Some(f), w).await;");
+    assert!(says(&swapped, true, "export_action_audit"));
+    let wrong_file = exp.replace("FILE", "OTHER");
+    let wrong = format!("{mgr} {wrong_file} {srv} {w} finish_with_flush(&t, None, w).await;");
+    assert!(says(&wrong, false, "export_action_audit"));
     assert!(says(
         &format!("let m = other(a); {exp}"),
         true,
-        "does not bind"
+        "exactly once"
     ));
-    let dropped = format!("{mgr} {exp} let f = 1; let _ = spawn_telemetry_flush; finish_with_flush(&t, Some(f), w).await;");
+    let twice = format!("{mgr} let n = build_x_task_manager(b); {exp}");
+    assert!(says(&twice, true, "exactly once"));
+    let dropped = format!(
+        "{base} let f = 1; let _ = spawn_telemetry_flush; finish_with_flush(&t, Some(f), w).await;"
+    );
     assert!(says(&dropped, true, "spawned flush task"));
-    assert!(says(&format!("{mgr} {exp}"), false, "finish_with_flush"));
     assert!(says(
-        &format!("{mgr} {exp} finish_with_flush(&u, None, w).await;"),
+        &format!("{mgr} {exp} {srv}"),
         false,
         "finish_with_flush"
     ));
-    assert!(says(
-        &format!("{mgr} {exp} finish_with_flush(t, None, w).await;"),
-        false,
-        "finish_with_flush"
-    ));
-    assert!(says(
-        &format!("{mgr} {exp} finish_with_flush(&t, Some(f), w).await;"),
-        false,
-        "None"
-    ));
-    assert!(says(
-        &format!("{mgr} export_action_audit(&m.action_gate(), p);"),
-        false,
-        "export_action_audit"
-    ));
-    assert!(says(
-        &format!("{mgr} let t = export_action_audit(m.action_gate(), p);"),
-        false,
-        "export_action_audit"
-    ));
-    assert!(says(
-        &format!("{mgr} let t = export_action_audit(&m, p);"),
-        false,
-        "export_action_audit"
-    ));
-    assert!(attachment_problem("fn other() {}", "run_x", "b", true).is_none());
+    for variant in [
+        "finish_with_flush(&u, None, w)",
+        "finish_with_flush(t, None, w)",
+    ] {
+        let text = format!("{base} {variant}.await;");
+        assert!(says(&text, false, "finish_with_flush"), "{variant}");
+    }
+    let some = format!("{base} finish_with_flush(&t, Some(f), w).await;");
+    assert!(says(&some, false, "None"));
+    let bare = format!("{mgr} export_action_audit(&m.action_gate(), q.with_file_name(FILE));");
+    assert!(says(&bare, false, "export_action_audit"));
+    for argument in ["m.action_gate()", "&m"] {
+        let text = exp.replace("&m.action_gate()", argument);
+        let flagged = says(&format!("{mgr} {text}"), false, "export_action_audit");
+        assert!(flagged, "{argument}");
+    }
+    let indirect =
+        format!("{mgr} (pick())(1); {exp} {srv} {w} finish_with_flush(&t, None, w).await;");
+    assert_eq!(problem(&indirect, false), None);
+    let shadowed = format!(
+        "{base} let m = Arc::new(TaskManager::default()); finish_with_flush(&t, None, w).await;"
+    );
+    assert!(says(&shadowed, false, "rebinds"));
+    let detached = format!("{mgr} {exp} let s = NannaMcpServer::new(other, a); {w} finish_with_flush(&t, None, w).await;");
+    assert!(says(&detached, false, "NannaMcpServer::new"));
+    let empty = format!("{base} finish_with_flush(&t, None, async {{ Ok(()) }}).await?; w.await?;");
+    assert!(says(&empty, false, "serve"));
+    let unbound = format!("{mgr} {exp} {srv} {w} finish_with_flush(&t, None, missing).await;");
+    assert!(says(&unbound, false, "serve"));
+    let twice_bound =
+        format!("{base} let w = async {{ Ok(()) }}; finish_with_flush(&t, None, w).await;");
+    assert!(says(&twice_bound, false, "serve"));
+    let missing_arg = format!("{base} finish_with_flush(&t, None).await;");
+    assert!(says(&missing_arg, false, "serve"));
+    assert!(attachment_problem("fn other() {}", &wiring(true)).is_none());
 }
 
 #[derive(Default)]
