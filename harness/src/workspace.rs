@@ -2353,6 +2353,67 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
+    const UNICODE_DECLARATION: &str =
+        "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]\n";
+
+    const UNICODE_SPELLINGS: [(&str, &str); 3] = [
+        ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+        ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
+        ("src/\u{212A}ey.rs", "src/key.rs"),
+    ];
+
+    #[test]
+    fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in UNICODE_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), UNICODE_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), UNICODE_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc-write"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in UNICODE_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+                assert!(!ws.workspace_path.join(path).exists(), "{path}");
+            }
+        }
+        ws.cleanup().unwrap();
+    }
+
     #[test]
     fn test_a_nested_config_directory_is_refused_when_a_patch_is_extracted() {
         let source = TempDir::new().unwrap();

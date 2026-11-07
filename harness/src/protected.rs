@@ -1835,5 +1835,97 @@ mod tests {
             assert!(protected.is_protected(Path::new("src/gate.rs")));
             assert!(protected.is_protected(Path::new(".nanna/agents/x.toml")));
         }
+
+        fn with_raw(globs: &[&str]) -> ProtectedPaths {
+            let quoted: Vec<String> = globs.iter().map(|g| format!("\"{g}\"")).collect();
+            let extras =
+                ProtectedExtras::parse(&format!("extra = [{}]", quoted.join(", "))).unwrap();
+            ProtectedPaths::with_extras(Path::new("/repo"), None, &extras)
+        }
+
+        const NFD_FILE: &str = "src/cafe\u{301}.rs";
+        const NFC_FILE: &str = "src/caf\u{e9}.rs";
+        const NFD_DIR: &str = "docs/cafe\u{301}";
+        const NFC_DIR: &str = "docs/caf\u{e9}";
+
+        #[test]
+        fn a_declared_decomposed_file_matches_its_precomposed_spelling() {
+            let protected = with_raw(&[NFD_FILE]);
+            let violation = protected.check(Path::new(NFC_FILE)).unwrap_err();
+            assert_eq!(violation.rule, NFD_FILE);
+            assert_eq!(violation.path, NFC_FILE);
+            assert!(protected.is_protected(Path::new(NFD_FILE)));
+        }
+
+        #[test]
+        fn a_declared_precomposed_file_matches_its_decomposed_spelling() {
+            let protected = with_raw(&[NFC_FILE]);
+            let violation = protected.check(Path::new(NFD_FILE)).unwrap_err();
+            assert_eq!(violation.rule, NFC_FILE);
+            assert_eq!(violation.path, NFD_FILE);
+        }
+
+        #[test]
+        fn a_declared_directory_matches_either_spelling_of_itself_and_its_contents() {
+            for (declared, candidates) in [
+                (
+                    NFD_DIR,
+                    [NFC_DIR, "docs/caf\u{e9}/x/y.md", "DOCS/caf\u{e9}/x"],
+                ),
+                (
+                    NFC_DIR,
+                    [NFD_DIR, "docs/cafe\u{301}/x/y.md", "DOCS/cafe\u{301}/x"],
+                ),
+            ] {
+                let protected = with_raw(&[&format!("{declared}/**")]);
+                for candidate in candidates {
+                    assert!(
+                        protected.is_protected(Path::new(candidate)),
+                        "{declared} {candidate}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_declared_ascii_name_matches_its_compatibility_singleton() {
+            let protected = with_raw(&["src/key.rs", "ci/**"]);
+            assert!(protected.is_protected(Path::new("src/\u{212A}ey.rs")));
+            assert!(protected.is_protected(Path::new("ci/\u{212A}/x")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_declared_directory_still_matches_a_path_that_is_not_valid_utf8() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let protected = with_raw(&["ci/**"]);
+            assert!(protected.is_protected(Path::new(OsStr::from_bytes(b"ci/\xff.sh"))));
+            assert!(!protected.is_protected(Path::new(OsStr::from_bytes(b"cj/\xff.sh"))));
+        }
+
+        #[test]
+        fn declared_rules_and_mount_roots_keep_the_declared_spelling() {
+            let protected = with_raw(&[NFD_FILE, &format!("{NFC_DIR}/**")]);
+            assert!(protected.rules().contains(&NFD_FILE));
+            assert!(protected
+                .rules()
+                .contains(&format!("{NFC_DIR}/**").as_str()));
+            let roots = protected.mount_roots();
+            assert!(roots.contains(&PathBuf::from(NFD_FILE)));
+            assert!(roots.contains(&PathBuf::from(NFC_DIR)));
+        }
+
+        #[test]
+        fn unrelated_non_ascii_names_stay_unprotected_under_declared_patterns() {
+            let protected = with_raw(&[NFD_FILE, &format!("{NFC_DIR}/**")]);
+            for path in [
+                "src/caf\u{e8}.rs",
+                "docs/cafe\u{301}x/y",
+                "other/cafe\u{301}/y",
+            ] {
+                assert!(!protected.is_protected(Path::new(path)), "{path}");
+            }
+        }
     }
 }

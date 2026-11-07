@@ -1393,6 +1393,34 @@ mod tests {
     }
 
     #[test]
+    fn a_unicode_equivalent_spelling_of_a_declared_path_is_refused() {
+        let ws = workspace();
+        let root = ws.path();
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]",
+        )
+        .unwrap();
+        let protected = ProtectedPaths::with_extras(root, None, &extras);
+        for (path, rule) in [
+            ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+            ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
+            ("src/\u{212A}ey.rs", "src/key.rs"),
+        ] {
+            let violation = protected_error(resolve_path_guarded(
+                None,
+                &protected,
+                "write_file",
+                PathAccess::Write,
+                Path::new(path),
+                root,
+            ));
+            assert_eq!(violation.rule, rule, "{path}");
+            assert_eq!(violation.path, path);
+            assert!(!root.join(path).exists(), "{path}");
+        }
+    }
+
+    #[test]
     fn a_protected_write_is_refused_even_under_a_catch_all_scope() {
         let ws = workspace();
         let root = ws.path();
