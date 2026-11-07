@@ -27,6 +27,7 @@ pub mod onboarding;
 pub mod plan_dispatch;
 pub mod planner;
 pub mod pod;
+pub mod policy;
 pub mod pr_tools;
 pub mod protected;
 pub mod qa;
