@@ -247,6 +247,7 @@ impl AuditHook for NoopAuditHook {}
 pub const ALIAS_OVERFLOW_RULE: &str = "ambiguous short-name path";
 
 const MAX_ALIAS_VARIANTS: usize = 1024;
+const MAX_ALIAS_COMPONENTS: usize = 1024;
 const STREAM_SEPARATOR: char = ':';
 const SHORT_NAME_TILDE: char = '~';
 const SHORT_NAME_WIDTH: usize = 8;
@@ -481,24 +482,41 @@ impl ProtectedPaths {
     pub(crate) fn variants(&self, path: &Path) -> Option<Vec<PathBuf>> {
         let path = fold_path(path);
         let mut variants = vec![path.clone()];
-        let mut spellings: Vec<Vec<OsString>> = vec![Vec::new()];
-        for component in path.components() {
-            let options = match component {
+        let options: Vec<Vec<OsString>> = path
+            .components()
+            .map(|component| match component {
                 Component::Normal(name) => self.component_options(name.to_string_lossy().as_ref()),
                 other => vec![other.as_os_str().to_os_string()],
-            };
-            let mut next = Vec::with_capacity(spellings.len() * options.len());
+            })
+            .collect();
+        let mut count = 1_usize;
+        for choices in &options {
+            count = count.saturating_mul(choices.len());
+            if count > MAX_ALIAS_VARIANTS {
+                return None;
+            }
+        }
+        if count == 1 {
+            let only: PathBuf = options.into_iter().flatten().collect();
+            if only != path {
+                variants.push(only);
+            }
+            return Some(variants);
+        }
+        if options.len() > MAX_ALIAS_COMPONENTS {
+            return None;
+        }
+        let mut spellings: Vec<Vec<OsString>> = vec![Vec::new()];
+        for choices in &options {
+            let mut next = Vec::with_capacity(spellings.len() * choices.len());
             for prefix in &spellings {
-                for option in &options {
+                for option in choices {
                     let mut spelling = prefix.clone();
                     spelling.push(option.clone());
                     next.push(spelling);
                 }
             }
             spellings = next;
-            if spellings.len() > MAX_ALIAS_VARIANTS {
-                return None;
-            }
         }
         variants.extend(spellings.into_iter().map(PathBuf::from_iter));
         Some(variants)
@@ -1138,6 +1156,36 @@ mod tests {
             assert!(!protected.is_protected(Path::new(&at_cap)));
             let over_cap = ["CODECO~1.YML"; 11].join("/");
             let violation = protected.check(Path::new(&over_cap)).unwrap_err();
+            assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
+        }
+
+        #[test]
+        fn a_very_deep_path_with_nothing_aliasable_is_checked_in_linear_time() {
+            let protected = protected();
+            let deep = ["a"; 50_000].join("/");
+            let started = std::time::Instant::now();
+            assert!(protected.check(Path::new(&deep)).is_ok());
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            let variants = protected.variants(Path::new(&deep)).unwrap();
+            assert_eq!(variants.len(), 1);
+        }
+
+        #[test]
+        fn a_deep_path_still_reports_its_folded_spelling_as_a_second_variant() {
+            let protected = protected();
+            let deep = format!("{}/flake.nix.", ["a"; 3_000].join("/"));
+            let variants = protected.variants(Path::new(&deep)).unwrap();
+            assert_eq!(variants.len(), 2);
+            assert!(variants[1].ends_with("flake.nix"));
+        }
+
+        #[test]
+        fn a_deep_path_with_an_aliasable_component_fails_closed_past_the_component_cap() {
+            let protected = protected();
+            let within = format!("{}/CODECO~1.YML", ["a"; 1_000].join("/"));
+            assert!(protected.variants(Path::new(&within)).is_some());
+            let beyond = format!("{}/CODECO~1.YML", ["a"; 1_100].join("/"));
+            let violation = protected.check(Path::new(&beyond)).unwrap_err();
             assert_eq!(violation.rule, ALIAS_OVERFLOW_RULE);
         }
 
