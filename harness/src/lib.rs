@@ -40,6 +40,7 @@ pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+pub mod verify;
 pub mod windows;
 pub mod workspace;
 
