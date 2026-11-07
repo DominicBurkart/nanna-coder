@@ -187,3 +187,18 @@ Planned: agents run on pi inside containers, behind a harness-neutral adapter se
 A task submitted without an identity (`TaskManager::submit`, or `submit_with_identity` with `None`) fails closed: its registry keeps only `EffectClass::None` tools, its container has no network, and a call to any effectful tool is refused and recorded as a `ScopeDenial` attributed to `unscoped`. Effectful work needs a named, registered identity. The backlog sinks refuse a task whose `identity_hint` is missing or not registered at enqueue time. The `nanna chat` and `nanna agent` direct modes and the eval runner do not go through `TaskManager`; they build their own full registry for local interactive use.
 
 `run_command` executes `sh -c` in the dev container, so `scope.paths` and `scope.read_paths` cannot be applied to it. An identity whose `scope.paths` does not include `**`, or that sets `scope.read_paths` at all, never receives `run_command`, even when `scope.tools` names it. Only an identity with `paths = ["**"]` and no `read_paths` can run shell commands, and it is bounded by its effect ceiling and network policy alone. The network reach of a `repository`-ceiling identity holding `run_command` is tracked in #714.
+
+### Verifier identity
+
+An identity whose only tool is `run_checks` (`harness::verify::is_verifier`; the fixture card is `harness/tests/fixtures/identities/global/verifier.toml`) is a verifier. The task never starts an agent loop and consults no model. The harness reads the checks the repository declares in `.nanna/verify.toml` from the base checkout before the worktree exists, then runs each one as a single `sh -c` argument through `<runtime> exec` in the task's dev container, so the host never runs a repository command. The card should use a `workspace` ceiling (no network) and `paths = []`; `.nanna/**` is protected, so the declaration is mounted read-only and an agent cannot change what the checks are. The ref to verify is the `branch` argument of `assign_task`; the verifier extracts no patch.
+
+```toml
+[[check]]
+name = "clippy"
+command = "cargo clippy --all-targets -- -D warnings"
+timeout_secs = 1800
+```
+
+A missing, empty, malformed, oversized (64 KiB, 32 checks) or unknown-key declaration refuses the task with `error_type = "VerifierChecksInvalid"`, so verification never passes vacuously. A repository without the dev container opt-in (`flake.nix` and `.devcontainer/`) fails with `VerifierRequiresContainer`. Every check runs even if an earlier one fails; a check that exceeds its timeout stops the run and the rest are reported `skipped`, because its process may still be running.
+
+Result shape. Each check yields `{name, command, status, exit_code, timeout_secs, duration_ms, output, output_truncated}` with `status` one of `passed`, `failed`, `timed_out`, `skipped` and `output` the last 8 KiB of stdout then stderr. When every check passes the task is `completed` with the outcomes in `qa_summary.checks`. When any check fails or times out the task is `failed` with `error_type = "VerificationFailed"`, the error names the first such check (`check \`clippy\` failed with exit code 101`), `diagnostics.last_tool_call` is that check's record and `diagnostics.tool_call_history` holds one `run_check` record per check whose `result` is the outcome as JSON. If a check cannot be launched at all the task fails with `VerifierExecFailed`. Under `--network=none`, checks that need the network (for example a cold `cargo fetch`) fail until the image or mounts provide the dependencies offline (#1027).

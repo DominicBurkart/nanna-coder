@@ -19,7 +19,8 @@ fn global_catalog_loads_all_fixture_identities() {
             "deployer",
             "incident-responder",
             "pr-shepherd",
-            "rust-implementer"
+            "rust-implementer",
+            "verifier"
         ]
     );
 
@@ -50,6 +51,12 @@ fn global_catalog_loads_all_fixture_identities() {
     assert!(shepherd.allows_tool("github_pr_status"));
     assert!(shepherd.allows_effect(EffectClass::Ci));
     assert!(!shepherd.allows_effect(EffectClass::Sandbox));
+
+    let verifier = catalog.get("verifier").unwrap();
+    assert!(harness::verify::is_verifier(verifier));
+    assert_eq!(verifier.scope.max_effect, EffectClass::Workspace);
+    assert!(verifier.scope.paths.is_empty());
+    assert!(!harness::verify::is_verifier(implementer));
 
     let deployer = catalog.get("deployer").unwrap();
     assert_eq!(deployer.identity.dev_loop, DevLoop::Outer);
@@ -118,7 +125,11 @@ fn fixture_catalog_renders_a_table() {
         lines[2].split_whitespace().collect::<Vec<_>>(),
         vec!["deployer", "outer", "gemma4:e4b", "sandbox"]
     );
-    assert_eq!(lines.len(), 6);
+    assert_eq!(
+        lines[6].split_whitespace().collect::<Vec<_>>(),
+        vec!["verifier", "inner", "gemma4:e4b", "workspace"]
+    );
+    assert_eq!(lines.len(), 7);
 }
 
 #[test]
