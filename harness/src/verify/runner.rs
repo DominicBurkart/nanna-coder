@@ -70,6 +70,10 @@ impl ProcessCheckRunner {
     }
 }
 
+fn wait_failure(program: &str, error: &std::io::Error) -> String {
+    format!("cannot wait for `{program}`: {error}")
+}
+
 pub(crate) fn read_tail(mut reader: impl Read) -> String {
     let mut kept: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -112,15 +116,17 @@ impl CheckRunner for ProcessCheckRunner {
             .map(|r| std::thread::spawn(move || read_tail(r)));
         let deadline = Instant::now() + timeout;
         let (exit_code, timed_out) = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break (status.code(), false),
-                Ok(None) if Instant::now() >= deadline => {
+            let waited = child
+                .try_wait()
+                .map_err(|e| wait_failure(&self.program, &e))?;
+            match waited {
+                Some(status) => break (status.code(), false),
+                None if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
                     break (None, true);
                 }
-                Ok(None) => std::thread::sleep(POLL_INTERVAL),
-                Err(e) => return Err(format!("cannot wait for `{}`: {e}", self.program)),
+                None => std::thread::sleep(POLL_INTERVAL),
             }
         };
         let collect = |handle: Option<std::thread::JoinHandle<String>>| {
@@ -203,6 +209,15 @@ mod tests {
             .unwrap();
         assert!(run.stdout.len() <= MAX_CAPTURE_BYTES);
         assert!(run.stdout.ends_with("END\n"));
+    }
+
+    #[test]
+    fn a_wait_failure_names_the_launcher_and_the_cause() {
+        let error = std::io::Error::other("lost child");
+        assert_eq!(
+            wait_failure("podman", &error),
+            "cannot wait for `podman`: lost child"
+        );
     }
 
     #[test]
