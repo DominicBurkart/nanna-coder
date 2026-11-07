@@ -17,6 +17,7 @@
 //! told, not what it can reach.
 
 use super::{AgentIdentity, IdentityError, LimitsSection};
+use crate::budget::{BudgetClass, BudgetConfig, BudgetLimits};
 
 impl AgentIdentity {
     /// Check that `self` grants no more than `base`: `scope.max_effect` and every
@@ -79,12 +80,52 @@ impl AgentIdentity {
             }
             (Some(own), Some(base)) => subset(name, "scope.read_paths", own, base)?,
         }
-        let (own, base) = (limit_values(self.limits), limit_values(base.limits));
-        for ((field, own), base) in LIMIT_FIELDS.iter().zip(own).zip(base) {
+        let (own_limits, base_limits) = (limit_values(self.limits), limit_values(base.limits));
+        for ((field, own), base) in LIMIT_FIELDS.iter().zip(own_limits).zip(base_limits) {
             at_most(name, field, own, base)?;
         }
-        Ok(())
+        budget_not_wider(name, self, base)
     }
+}
+
+const BUDGET_KEYS: [&str; 4] = [
+    "max_count_per_task",
+    "max_count_per_day",
+    "max_minutes_per_task",
+    "max_minutes_per_day",
+];
+
+fn budget_values(limits: &BudgetLimits) -> [Option<f64>; 4] {
+    [
+        limits.max_count_per_task.map(f64::from),
+        limits.max_count_per_day.map(f64::from),
+        limits.max_minutes_per_task,
+        limits.max_minutes_per_day,
+    ]
+}
+
+fn budget_not_wider(
+    name: &str,
+    own: &AgentIdentity,
+    base: &AgentIdentity,
+) -> Result<(), IdentityError> {
+    let host = BudgetConfig::default();
+    for class in BudgetClass::ALL {
+        let effective = |identity: &AgentIdentity| {
+            budget_values(&host.limits(class).narrowed(&identity.budget_limits(class)))
+        };
+        let (own_values, base_values) = (effective(own), effective(base));
+        for ((key, own), base) in BUDGET_KEYS.iter().zip(own_values).zip(base_values) {
+            if let (Some(own), Some(base)) = (own, base) {
+                if own > base {
+                    let field = format!("limits.{class}.{key}");
+                    let reason = format!("{own} exceeds the base {field} of {base}");
+                    return Err(widens(name, &field, reason));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 const LIMIT_FIELDS: [&str; 3] = [
@@ -405,6 +446,99 @@ mod tests {
             prop_assert!(bottom.narrows(&middle).is_ok());
             prop_assert!(middle.narrows(&base).is_ok());
             prop_assert!(bottom.narrows(&base).is_ok());
+        }
+    }
+
+    fn budgeted(ci: &str, sandbox: &str) -> AgentIdentity {
+        let mut text = example().to_toml_string().unwrap();
+        text.push_str(ci);
+        text.push_str(sandbox);
+        AgentIdentity::from_toml_str(&text, "agents/rust-implementer.toml").unwrap()
+    }
+
+    #[test]
+    fn budget_ceilings_may_be_lowered_but_not_raised_or_dropped() {
+        let base = budgeted("\n[limits.ci]\nmax_count_per_task = 5\n", "");
+        let lower = budgeted("\n[limits.ci]\nmax_count_per_task = 2\n", "");
+        assert!(lower.narrows(&base).is_ok());
+        assert!(base.narrows(&base).is_ok());
+
+        let higher = budgeted("\n[limits.ci]\nmax_count_per_task = 6\n", "");
+        assert_eq!(
+            widened_field(higher.narrows(&base)),
+            "limits.ci.max_count_per_task"
+        );
+
+        let dropped = budgeted("", "");
+        assert_eq!(
+            widened_field(dropped.narrows(&base)),
+            "limits.ci.max_count_per_task"
+        );
+
+        let no_budget_base = budgeted("", "");
+        assert!(base.narrows(&no_budget_base).is_ok());
+    }
+
+    #[test]
+    fn every_budget_dimension_and_class_is_compared() {
+        let base = budgeted(
+            "\n[limits.ci]\nmax_count_per_task = 5\nmax_count_per_day = 50\nmax_minutes_per_task = 100\nmax_minutes_per_day = 200\n",
+            "\n[limits.sandbox]\nmax_count_per_task = 2\nmax_count_per_day = 5\nmax_minutes_per_task = 30\nmax_minutes_per_day = 60\n",
+        );
+        assert!(base.narrows(&base).is_ok());
+        for (field, ci, sandbox) in [
+            (
+                "limits.ci.max_count_per_day",
+                "max_count_per_day = 51",
+                None,
+            ),
+            (
+                "limits.ci.max_minutes_per_task",
+                "max_minutes_per_task = 101",
+                None,
+            ),
+            (
+                "limits.ci.max_minutes_per_day",
+                "max_minutes_per_day = 201",
+                None,
+            ),
+            (
+                "limits.sandbox.max_count_per_task",
+                "",
+                Some("max_count_per_task = 3"),
+            ),
+            (
+                "limits.sandbox.max_count_per_day",
+                "",
+                Some("max_count_per_day = 6"),
+            ),
+            (
+                "limits.sandbox.max_minutes_per_task",
+                "",
+                Some("max_minutes_per_task = 31"),
+            ),
+            (
+                "limits.sandbox.max_minutes_per_day",
+                "",
+                Some("max_minutes_per_day = 61"),
+            ),
+        ] {
+            let mut ci_table = "\n[limits.ci]\nmax_count_per_task = 5\nmax_count_per_day = 50\nmax_minutes_per_task = 100\nmax_minutes_per_day = 200\n".to_string();
+            let mut sandbox_table = "\n[limits.sandbox]\nmax_count_per_task = 2\nmax_count_per_day = 5\nmax_minutes_per_task = 30\nmax_minutes_per_day = 60\n".to_string();
+            if !ci.is_empty() {
+                let key = ci.split(' ').next().unwrap();
+                let start = ci_table.find(key).unwrap();
+                let end = ci_table[start..].find('\n').unwrap() + start;
+                ci_table.replace_range(start..end, ci);
+            }
+            if let Some(change) = sandbox {
+                let key = change.split(' ').next().unwrap();
+                let start = sandbox_table.find(key).unwrap();
+                let end = sandbox_table[start..].find('\n').unwrap() + start;
+                sandbox_table.replace_range(start..end, change);
+            }
+            let local = budgeted(&ci_table, &sandbox_table);
+            assert_eq!(widened_field(local.narrows(&base)), field);
         }
     }
 }

@@ -203,6 +203,28 @@ pub(crate) mod escalation {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
+    pub(crate) fn fenced_block_contains(body: &str, info: &str, needle: &str) -> bool {
+        let lines: Vec<&str> = body.lines().collect();
+        let Some(open) = lines.iter().position(|l| {
+            let ticks = l.chars().take_while(|c| *c == '`').count();
+            ticks >= 3 && l[ticks..].trim() == info
+        }) else {
+            return false;
+        };
+        let ticks = lines[open].chars().take_while(|c| *c == '`').count();
+        let close = lines[open + 1..]
+            .iter()
+            .position(|l| {
+                let run = l.chars().take_while(|c| *c == '`').count();
+                run >= ticks && l[run..].trim().is_empty()
+            })
+            .map(|i| open + 1 + i);
+        match close {
+            Some(close) => lines[open + 1..close].iter().any(|l| l.contains(needle)),
+            None => false,
+        }
+    }
+
     pub(crate) struct CapturingSink {
         pub(crate) seen: Mutex<Vec<Escalation>>,
         fail: bool,
@@ -234,7 +256,7 @@ pub(crate) mod escalation {
             self.seen.lock().unwrap().push(escalation.clone());
             if self.fail {
                 return Err(EscalationError::Status {
-                    url: "capturing".to_string(),
+                    origin: "capturing".to_string(),
                     status: 500,
                 });
             }

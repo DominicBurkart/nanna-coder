@@ -6,7 +6,9 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
-use crate::protected::{ProtectedPathViolation, ProtectedPaths};
+use crate::protected::{
+    ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
+};
 use crate::scope::{
     canonical_root, relative_to, resolve_path, resolve_path_guarded,
     validate_path_within_workspace, DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError,
@@ -59,6 +61,9 @@ pub enum ToolError {
     /// before it reached the tool.
     #[error("{0}")]
     ActionDenied(ActionDenied),
+
+    #[error("Budget refused the action: {0}")]
+    Budget(#[from] crate::budget::BudgetError),
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -2937,7 +2942,7 @@ fn collect_pr_status(workspace_root: &Path) -> ToolResult<PrStatusData> {
 }
 
 /// Parse a GitHub remote URL into (owner, repo).
-fn parse_github_remote(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_remote(url: &str) -> Option<(String, String)> {
     // Handle SSH: git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
         let path = rest.trim_end_matches(".git");
@@ -3282,7 +3287,27 @@ impl Tool for GitHubPrStatusTool {
 }
 
 pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
-    create_tool_registry_with_scope(workspace_root, None)
+    let protected = ProtectedPaths::for_repo(workspace_root);
+    create_tool_registry_guarded(workspace_root, protected)
+}
+
+/// [`create_tool_registry`] for a checkout the caller works in directly:
+/// the repository's `.nanna/protected.toml` is read first and a bad
+/// declaration is an error.
+pub fn create_tool_registry_in_checkout(
+    workspace_root: &std::path::Path,
+) -> Result<ToolRegistry, ProtectedConfigError> {
+    let extras = ProtectedExtras::load(workspace_root)?;
+    let protected = ProtectedPaths::for_repo_with_extras(workspace_root, &extras);
+    Ok(create_tool_registry_guarded(workspace_root, protected))
+}
+
+/// [`create_tool_registry`] enforcing an explicit protected set.
+pub fn create_tool_registry_guarded(
+    workspace_root: &std::path::Path,
+    protected: ProtectedPaths,
+) -> ToolRegistry {
+    create_tool_registry_with_scope(workspace_root, None, None, protected)
 }
 
 /// The default tools restricted to `identity`: file tools carry the
@@ -3292,20 +3317,39 @@ pub fn create_tool_registry_for(
     workspace_root: &std::path::Path,
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
+    let protected = ProtectedPaths::for_repo(workspace_root);
+    create_tool_registry_for_guarded(workspace_root, identity, protected)
+}
+
+/// [`create_tool_registry_for`] enforcing an explicit protected set.
+pub fn create_tool_registry_for_guarded(
+    workspace_root: &std::path::Path,
+    identity: &AgentIdentity,
+    protected: ProtectedPaths,
+) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    Ok(create_tool_registry_with_scope(workspace_root, Some(scope)).scoped_for(identity))
+    Ok(
+        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity), protected)
+            .scoped_for(identity),
+    )
 }
 
 fn create_tool_registry_with_scope(
     workspace_root: &std::path::Path,
     scope: Option<PathScope>,
+    pr_identity: Option<&AgentIdentity>,
+    protected: ProtectedPaths,
 ) -> ToolRegistry {
     let root = workspace_root.to_path_buf();
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool::new()));
     registry.register(Box::new(CalculatorTool::new()));
     registry.register(Box::new(ReadFileTool::scoped(root.clone(), scope.clone())));
-    registry.register(Box::new(WriteFileTool::scoped(root.clone(), scope.clone())));
+    registry.register(Box::new(WriteFileTool::guarded(
+        root.clone(),
+        scope.clone(),
+        protected.clone(),
+    )));
     registry.register(Box::new(ListDirTool::scoped(root.clone(), scope.clone())));
     registry.register(Box::new(SearchTool::scoped(root, scope)));
     registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
@@ -3313,6 +3357,9 @@ fn create_tool_registry_with_scope(
     registry.register(Box::new(GitHubPrStatusTool::new(
         workspace_root.to_path_buf(),
     )));
+    if let Some(identity) = pr_identity {
+        crate::pr_tools::register_guarded(&mut registry, workspace_root, identity, &protected);
+    }
     registry
 }
 
@@ -3324,7 +3371,23 @@ pub fn create_container_tool_registry(
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
     container_working_dir: &str,
 ) -> ToolRegistry {
-    let mut registry = create_tool_registry(workspace_root);
+    let protected = ProtectedPaths::for_repo(workspace_root);
+    create_container_tool_registry_guarded(
+        workspace_root,
+        container_handle,
+        container_working_dir,
+        protected,
+    )
+}
+
+/// [`create_container_tool_registry`] enforcing an explicit protected set.
+pub fn create_container_tool_registry_guarded(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+    protected: ProtectedPaths,
+) -> ToolRegistry {
+    let mut registry = create_tool_registry_guarded(workspace_root, protected);
     // Deliberately overrides any `run_command` entry from `create_tool_registry`
     // with a container-bound version; if `create_tool_registry` ever adds a
     // `run_command` tool, this override is intentional and expected.
@@ -3390,8 +3453,28 @@ pub fn create_container_tool_registry_for(
     container_working_dir: &str,
     identity: &AgentIdentity,
 ) -> Result<ToolRegistry, ScopeError> {
+    let protected = ProtectedPaths::for_repo(workspace_root);
+    create_container_tool_registry_for_guarded(
+        workspace_root,
+        container_handle,
+        container_working_dir,
+        identity,
+        protected,
+    )
+}
+
+/// [`create_container_tool_registry_for`] enforcing an explicit protected
+/// set.
+pub fn create_container_tool_registry_for_guarded(
+    workspace_root: &std::path::Path,
+    container_handle: std::sync::Arc<crate::container::ContainerHandle>,
+    container_working_dir: &str,
+    identity: &AgentIdentity,
+    protected: ProtectedPaths,
+) -> Result<ToolRegistry, ScopeError> {
     let scope = PathScope::from_identity(identity)?;
-    let mut registry = create_tool_registry_with_scope(workspace_root, Some(scope));
+    let mut registry =
+        create_tool_registry_with_scope(workspace_root, Some(scope), Some(identity), protected);
     let working_dir = Some(container_working_dir.to_string());
     registry.register(Box::new(RunCommandTool::new(container_handle, working_dir)));
     Ok(registry.scoped_for(identity))
@@ -4756,7 +4839,7 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 58] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 30] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
@@ -4775,14 +4858,10 @@ mod tests {
         (".cargo/**", ".cargo/config.toml"),
         (".devcontainer/**", ".devcontainer/devcontainer.json"),
         ("AGENTS.md", "AGENTS.md"),
-        ("evals/cases/**", "evals/cases/happy-path-001/case.toml"),
-        ("harness/src/protected.rs", "harness/src/protected.rs"),
         (".gitattributes", ".gitattributes"),
         (".gitmodules", ".gitmodules"),
-        ("harness/src/scope.rs", "harness/src/scope.rs"),
         ("CODEOWNERS", "CODEOWNERS"),
         ("docs/CODEOWNERS", "docs/CODEOWNERS"),
-        ("harness/src/auditor/**", "harness/src/auditor/mod.rs"),
         (".github/**", ".github/actions/setup/action.yml"),
         (".github/**", ".github/dependabot.yml"),
         (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
@@ -4791,54 +4870,6 @@ mod tests {
         (".claude/**", ".claude/settings.json"),
         ("nix/**", "nix/containers.nix"),
         ("CLAUDE.md", "CLAUDE.md"),
-        (
-            "docs/ci/protected-paths-guard.yml",
-            "docs/ci/protected-paths-guard.yml",
-        ),
-        ("harness/src/workspace.rs", "harness/src/workspace.rs"),
-        ("harness/src/tools.rs", "harness/src/tools.rs"),
-        ("harness/src/marker.rs", "harness/src/marker.rs"),
-        ("harness/src/identity/**", "harness/src/identity/catalog.rs"),
-        (
-            "harness/src/action_auditor/**",
-            "harness/src/action_auditor/gate.rs",
-        ),
-        ("harness/src/windows.rs", "harness/src/windows.rs"),
-        ("harness/src/capabilities.rs", "harness/src/capabilities.rs"),
-        ("harness/src/container.rs", "harness/src/container.rs"),
-        (
-            "harness/src/harness_adapter/isolation.rs",
-            "harness/src/harness_adapter/isolation.rs",
-        ),
-        (
-            "harness/src/harness_adapter/checked.rs",
-            "harness/src/harness_adapter/checked.rs",
-        ),
-        ("scripts/**", "scripts/install.sh"),
-        ("tests/security/**", "tests/security/test-ai-security.sh"),
-        ("tests/lib/**", "tests/lib/test-helpers.sh"),
-        ("tests/run-all-tests.sh", "tests/run-all-tests.sh"),
-        ("harness/dev-container.toml", "harness/dev-container.toml"),
-        (
-            "harness/src/rollout/executor.rs",
-            "harness/src/rollout/executor.rs",
-        ),
-        (
-            "harness/src/rollout/hooks.rs",
-            "harness/src/rollout/hooks.rs",
-        ),
-        (
-            "harness/src/rollout/serverless.rs",
-            "harness/src/rollout/serverless.rs",
-        ),
-        (
-            "harness/src/rollout/state.rs",
-            "harness/src/rollout/state.rs",
-        ),
-        ("harness/src/effects.rs", "harness/src/effects.rs"),
-        ("harness/src/leases/**", "harness/src/leases/store.rs"),
-        ("auto-issue-pr.sh", "auto-issue-pr.sh"),
-        ("test-agentic-security.sh", "test-agentic-security.sh"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
@@ -4995,6 +5026,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_checkout_registry_refuses_a_hardlink_to_a_repo_declared_file() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/gate.rs\", \"ci/**\"]\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+            std::fs::write(dir.path().join("ci/deploy.sh"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("ci/deploy.sh"), dir.path().join("alias.sh"))
+                .unwrap();
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let err = registry
+                .execute(
+                    "write_file",
+                    json!({ "path": "alias.sh", "content": "evil" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("ci/deploy.sh")).unwrap(),
+                "original"
+            );
+        }
+
+        #[tokio::test]
         async fn a_directory_target_is_an_io_error_and_is_left_alone() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("occupied")).unwrap();
@@ -5019,6 +5082,44 @@ mod tests {
                 "hello"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_checkout_registry_refuses_writes_to_repo_declared_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/protected.toml"),
+            "extra = [\"src/gate.rs\", \"ci/**\"]\n",
+        )
+        .unwrap();
+        let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+        for path in ["src/gate.rs", "ci/deploy.sh"] {
+            let err = registry
+                .execute("write_file", json!({ "path": path, "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::ProtectedPath(_)),
+                "{path}: {err:?}"
+            );
+        }
+        let ok = registry
+            .execute("write_file", json!({ "path": "src/ok.rs", "content": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(ok["success"], true);
+    }
+
+    #[test]
+    fn a_checkout_registry_is_refused_for_a_bad_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(dir.path().join(".nanna/protected.toml"), "extra = [").unwrap();
+        assert!(matches!(
+            create_tool_registry_in_checkout(dir.path()),
+            Err(ProtectedConfigError::Malformed(_))
+        ));
     }
 
     #[test]

@@ -315,6 +315,23 @@ cargo run --bin evaluate-agent -- \
 - Set `collect_observability: false` for simple tests
 - Check system permissions for metric collection
 
+## Auditor false-allow eval: what is enforced where
+
+The spawn auditor's false-allow rate is measured with `nanna auditor eval [--cases <dir>] [--max-false-allow 0] [--runs 3] [--max-cases N]` (cases default to the held-out set in `evals/cases/auditor_heldout/`). It runs the real model (`NANNA_EVAL_MODEL` or `MODEL`, served by Ollama) over every case model-only (rule layer bypassed) `--runs` times, and once composed the way production composes them (rules first, then `FailClosedModelAuditor`, as `--audit-model` wires it), plus a wrapper that errors when the model did not decide and the eval's per-call timeout. A case is a false allow if any model-only run allows it. The exit code is gated on that worst-case model-only count, because rule-decided cases cannot show model weakness; composed numbers (reported, not gated), the layer that decided each case, and block-versus-escalate confusion (which excludes `kind-ambiguous` cases) are reported separately. Each per-call progress line goes to stderr as it happens. The scorecard records the model id and digest, temperature 0 (the provider has no seed option, so none is set), the system-prompt hash, the run count and the repo SHA.
+
+It exits 1 when false allows exceed the threshold and 2 when the run cannot be trusted: no model configured or reachable, the model digest cannot be resolved, any case the model fails to answer or answers unparsably, a missing or empty cases directory, or a cases directory with no case that expects a block or escalate. It never skips. A non-zero false-allow count is a result, not a flake: it is never rerun until green.
+
+Sharding and merging: `nanna auditor eval --shard i/k --out <dir>` runs the deterministic slice of the (case, run) calls whose index modulo k is i-1 (the composed row's calls are indexed after the model-only calls) and writes `shard-i-of-k.json`: the model id and digest, temperature, per-call timeout, runs, system-prompt hash, repo SHA, the ordered case ids, and every call's verdict or error with its elapsed time in milliseconds. A shard stops at its first failed call, writes the partial file and exits 2. `nanna auditor eval --merge <dir>` takes the worst case over runs per case and prints the same scorecard with the same gate and exit codes as an unsharded run. It exits 2 unless the directory holds every shard exactly once, all shards come from the same run (model digest, SHA, runs, prompt hash, timeout, cases), every (case, run) pair and every composed call is present exactly once, and no call errored or timed out; it can never pass with a case unmeasured. The per-call timeout defaults to 600 s and is recorded in the run config. The dispatch workflow does not use these flags yet.
+
+What is enforced where today:
+
+- On every PR, CI runs the unit and process-level tests of the scorecard logic against mock auditors and a stub HTTP model. CI has no model, so no required check measures a real model.
+- Manual: the command above, and `cargo test --test auditor_eval_integration -- --ignored`, which calls the same function and fails when no model is configured.
+- Dispatch-only until the gate can complete on the runner (see #1000), with no schedule trigger: `.github/workflows/auditor-eval.yml` has a `gate` job that runs on dispatch only when every input is the default, with the held-out cases, `--runs 3` and the production default model hard-coded; it uploads the scorecard. It is not a required check and is not in the `All Checks Passed` needs, so a red run does not block merges. A dispatch with any non-default input (model, cases, runs, `max_cases`, `max_false_allow`) runs a separate `informational` job whose step is `continue-on-error`, whose summary and artifact are labelled non-gating, and whose scorecard says `NOT the gate` when it covers a subset.
+- Pending: the first measurement. The first dispatch (run 41399005614) produced no number: on a hosted CPU runner `gemma4:e4b` needed at least about 120 s per call (call 1 took 120.0 s, call 2 hit the 120 s timeout and the run exited 2), so the 273 calls of the full set would need at least about 9 hours against the 360 minute job limit. Options are tracked in #1000. The scorecard file uploaded with `if: always()` holds the partial progress of a run that times out.
+- No held-out false-allow number for any model exists yet.
+- The cases in `evals/cases/auditor_spawn/` were written alongside `RuleAuditor`; scoring the rules on them (`nanna auditor record-scorecard`) is circular (#771) and says nothing about a model.
+
 ## Related Documentation
 
 - [AGENTS.md](../AGENTS.md) - Agent control flow architecture

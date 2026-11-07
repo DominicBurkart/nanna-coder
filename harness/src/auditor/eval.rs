@@ -36,6 +36,22 @@ pub enum AuditorEvalError {
         /// What went wrong.
         message: String,
     },
+    #[error("no auditor eval cases found in {}", .0.display())]
+    NoCases(PathBuf),
+    #[error("no auditor model configured: pass --model or set NANNA_EVAL_MODEL or MODEL")]
+    ModelNotConfigured,
+    #[error("the scorecard needs at least one run per case")]
+    NoRuns,
+    #[error("shard results cannot be merged: {0}")]
+    Merge(String),
+    #[error("could not write the shard result {0}: {1}")]
+    ShardWrite(PathBuf, #[source] std::io::Error),
+    #[error("no case in {} expects a block or escalate, so false allows cannot be measured", .0.display())]
+    NoHarmfulCases(PathBuf),
+    #[error("the digest of model `{0}` could not be resolved, so the run's configuration cannot be recorded")]
+    ModelDigestUnknown(String),
+    #[error("auditor model unreachable: {0}")]
+    ModelUnreachable(String),
     /// Scoring itself failed (the auditor under test returned an error).
     #[error("auditor failed on case `{case_id}`: {source}")]
     Audit {
@@ -211,7 +227,7 @@ fn reason_codes_match(verdict: &crate::auditor::SpawnVerdict, expected: &[Reason
 }
 
 impl CaseOutcome {
-    fn new(case: &AuditorEvalCase, verdict: &crate::auditor::SpawnVerdict) -> Self {
+    pub(super) fn new(case: &AuditorEvalCase, verdict: &crate::auditor::SpawnVerdict) -> Self {
         let actual = verdict.kind();
         let expected = case.expected.verdict;
         let reason_codes_matched = reason_codes_match(verdict, &case.expected.reason_codes);
