@@ -77,10 +77,12 @@ Phase A, pure, in `AgentIdentity::narrows` (no I/O, so the existing property tes
 | base `[environment]` | override `[environment]` | result |
 |---|---|---|
 | absent | absent | ok |
-| `name = X` | absent | ok, the override inherits X |
+| `name = X` | absent | ok, the override inherits X (the catalog must copy the base environment into the override; see step 1) |
 | `name = X` | `name = X` | ok |
 | absent | `name = X` | rejected: `WidensScope { field: "environment.name" }`; an override cannot introduce an environment where the base runs on the default, because the override then picks the image |
 | `name = X` | `name = Y`, Y != X | deferred to phase B |
+
+The one asymmetry: base on the default image with an override naming an environment is rejected in phase A even though a named environment is narrower than the default. The override would be choosing the image, and phase A cannot prove the relation without a manifest; the same `extends` mechanism of phase B could later allow it (open question 4).
 
 Phase B, at task start, once the repo flake is readable (same point as `scope::check_repo`, before any container exists): a different name Y is accepted only if `manifest(Y).provides` is a string-subset of `manifest(X).provides` and `manifest(Y).extends == Some(X)`. The `extends` declaration is the "declared child" proof: the flake author states the relation and the harness verifies the subset, mirroring the exact-string subset rule of `subset()` in `narrowing.rs`. Transitivity holds because subset and `extends` chains compose, and a proptest pins it alongside `narrowing_is_transitive`.
 
@@ -182,7 +184,7 @@ max_concurrent = 2
 ```toml
 [identity]
 name = "reviewer"
-description = "Reads a pull request diff and posts review findings; never edits the repository."
+description = "Reads a pull request diff and comments on it; never edits the repository."
 loop = "middle"
 model = "gemma4:e4b"
 system_prompt = "prompts/reviewer.md"
@@ -192,7 +194,7 @@ repos = ["github.com/example/repo"]
 paths = []
 read_paths = ["**"]
 max_effect = "repository"
-tools = ["read_file", "search", "list_directory", "git_diff", "git_status", "github_pr_status", "github_pr_comments", "github_issue_read"]
+tools = ["read_file", "search", "list_directory", "git_diff", "git_status", "github_pr_status", "github_pr_comments", "github_issue_read", "github_issue_comment"]
 
 [environment]
 name = "review"
@@ -233,10 +235,10 @@ max_concurrent = 4
 ```toml
 [identity]
 name = "verifier"
-description = "Runs the repository's declared checks in the dev container and reports structured pass/fail."
-loop = "middle"
-model = "none"
-system_prompt = { inline = "Deterministic: no model decides the verdict." }
+description = "Runs the repository's declared checks (.nanna/verify.toml) in the dev container and reports a structured pass or fail per check; no model decides the verdict."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Not used: the harness runs the declared checks itself and no model is consulted." }
 
 [scope]
 repos = ["github.com/example/repo"]
@@ -249,11 +251,11 @@ name = "verify"
 
 [limits]
 max_iterations = 1
-max_wall_clock_secs = 1800
-max_concurrent = 2
+max_wall_clock_secs = 3600
+max_concurrent = 4
 ```
 
-`verify` provides the toolchain the repo's checks invoke (rustfmt, clippy, cargo, nextest) and nothing that can push or call GitHub. The shape of the card (`run_checks` as the only tool, `workspace` ceiling, `paths = []`) follows the fixture in #1032; field values such as `model` and `loop` should be checked against that PR before the fixture lands.
+`verify` provides the toolchain the repo's checks invoke (rustfmt, clippy, cargo, nextest) and nothing that can push or call GitHub. The card is the #1032 fixture (`harness/tests/fixtures/identities/global/verifier.toml` on `feat/1028-verifier`) plus the `[environment]` table.
 
 A repo-local narrowing example for `rust-implementer` (valid under phase A):
 
@@ -306,12 +308,12 @@ Runtime-gated (the existing `#[ignore]` pattern in `harness/tests/dev_container_
 
 Each step is one PR, red tests first. "Hot" marks files the user named as owned by other sessions. Nothing in this plan touches `container.rs` or `protected.rs`: `ContainerConfig` already takes the image as an argument, and every file that carries environment definitions or cards (`flake.nix`, `nix/**`, `.devcontainer/**`, `.nanna/**`) is already in the shipped protected set. The plan does not add or change any workflow or CI file.
 
-1. Schema and phase A narrowing. Files: `harness/src/identity/schema.rs`, `harness/src/identity/narrowing.rs`, `harness/src/identity/mod.rs` (docs and re-export), `harness/tests/fixtures/identities/global/*.toml` (add `[environment]` to `rust-implementer` and `pr-shepherd`). Hot: none. Note that `harness/src/identity/**` is in nanna's own protected declaration, so this PR needs a human author or explicit sign-off for the protected path. Independent of every open PR.
+1. Schema and phase A narrowing. `IdentityCatalog::with_repo_overrides` replaces the base entry with the override wholesale, so an override that omits `[environment]` would otherwise land on the default image, the widest one; the catalog must carry the base environment into the override, with the test "an override omitting `[environment]` runs in the base's environment, never the default". Files: `harness/src/identity/schema.rs`, `harness/src/identity/narrowing.rs`, `harness/src/identity/catalog.rs`, `harness/src/identity/mod.rs` (docs and re-export), `harness/tests/fixtures/identities/global/*.toml` (add `[environment]` to `rust-implementer` and `pr-shepherd`). Hot: none. Note that `harness/src/identity/**` is in nanna's own protected declaration, so this PR needs a human author or explicit sign-off for the protected path. Independent of every open PR.
 2. Manifest and checker. Files: `harness/src/environment.rs` (new), `harness/src/lib.rs` (one `pub mod` line). Hot: none. Pure; can run in parallel with step 1 after the `AgentIdentity` field exists, or against a stub field.
-3. Nix definitions and builder. Files: `nix/containers.nix` (add `mkEnvironment`, nanna's own environments), `flake.nix` (export `devContainerImage-*` and `devContainerManifest-*`), `harness/src/onboarding/flake_template.rs` (generate the five environments, with tests), `image-builder/src/lib.rs` (`build_environment`, `read_manifest`). Hot: none. `nix/**` and `flake.nix` are protected paths. Overlaps `flake_template.rs` with the #1027 follow-up that asks the template to produce the offline setup; sequence after or with it.
+3. Nix definitions and builder. Files: `harness/src/onboarding/flake_template.rs` (generate the five environments and `mkEnvironment` for other repos, with tests), `image-builder/src/lib.rs` (`build_environment`, `read_manifest`); optionally `nix/containers.nix` and `flake.nix` for nanna's own environments, which are not needed for the product (the executable running in other repos). Hot: none. `nix/**` and `flake.nix` are protected paths. Overlaps `flake_template.rs` with the #1027 follow-up that asks the template to produce the offline setup; sequence after or with it.
 4. Runtime wiring and registry. Files: `harness/src/task.rs` (cache key, environment resolution before the container block, new `error_type` labels), `harness/src/workspace.rs` (`build_tool_registry_for` takes the resolved environment), `harness/src/tools.rs` (identity container registry registers `cargo_*` from the resolved set). Hot: `task.rs` and `workspace.rs`. Conflicts with #1031 (`task.rs` hunks near the container block and `create_with_container_vendoring` in `workspace.rs`), #1032 (`task.rs` verifier branch in `TaskRunner::run`, `verify/`) and #1022 (policy solo mode in `task.rs`). Recommended order: #1031, #1032, #1022 merge first, then this step rebases onto them. If the owners prefer the reverse, the minimal seam is a single `resolve_environment(identity, repo) -> Result<Option<ResolvedEnvironment>, _>` call added immediately before the `use_container` block.
 5. Vendoring gate. Files: `harness/src/workspace.rs` (skip `offline_cargo` when the environment provides no cargo capability), `harness/src/offline_cargo.rs` if #1031 has merged. Hot: `workspace.rs`. Strictly after #1031.
-6. New capabilities and the three new cards. Files: `harness/src/capabilities.rs` (`markdown_lint` entry), `harness/src/tools.rs` (its tool), fixtures for `reviewer` and `docs-writer`, `harness/tests/fixtures/identities/global/`. Hot: none beyond `tools.rs` (a protected file in nanna's own declaration, not currently in an open PR's diff).
+6. New capabilities and the three new cards. Files: `harness/src/capabilities.rs` (`markdown_lint` entry), `harness/src/tools.rs` (its tool), fixtures for `reviewer` and `docs-writer` in `harness/tests/fixtures/identities/global/`. Hot: none of the four named; `capabilities.rs` and `tools.rs` are in nanna's own protected declaration but not in an open PR's diff (checked against #1031 and #1032).
 7. Verifier environment. Files: `harness/src/verify/*` and the verifier fixture from #1032. Hot: whichever `task.rs` hunks #1032 owns. Strictly after #1032 merges, owned by its author.
 8. Repo-local `extends` (phase B), only when needed. Files: `harness/src/environment.rs`, `harness/src/task.rs` at the resolution seam from step 4. Hot: `task.rs`, tiny.
 9. Docs. Files: `ARCHITECTURE.md` section, `harness/src/identity/mod.rs` module docs; the configuration reference promoted out of this document. Hot: none.
