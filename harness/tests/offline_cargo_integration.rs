@@ -49,11 +49,7 @@ fn write_crate(root: &Path) {
         .current_dir(root)
         .output()
         .unwrap();
-    assert!(
-        locked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&locked.stderr)
-    );
+    assert!(locked.status.success(), "cargo generate-lockfile failed");
 }
 
 async fn start(workspace: &Path, offline: &OfflineCargo) -> Arc<ContainerHandle> {
@@ -117,13 +113,8 @@ async fn a_network_less_container_builds_a_registry_dependency_from_vendored_sou
 
     let built = run(&registry, "cargo run --offline --quiet").await;
     assert_eq!(built["success"], true, "{built}");
-    assert!(
-        built["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sum=7"),
-        "{built}"
-    );
+    let printed = built["stdout"].as_str().unwrap_or_default();
+    assert!(printed.contains("sum=7"), "{built}");
 
     let vendor_write = run(&registry, "touch /opt/nanna-offline/vendor/planted").await;
     assert_eq!(vendor_write["success"], false, "{vendor_write}");
@@ -135,13 +126,33 @@ async fn a_network_less_container_builds_a_registry_dependency_from_vendored_sou
         "getent hosts crates.io || echo no-network-resolution",
     )
     .await;
-    assert!(
-        network["stdout"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no-network-resolution"),
-        "{network}"
-    );
+    let resolved = network["stdout"].as_str().unwrap_or_default();
+    assert!(resolved.contains("no-network-resolution"), "{network}");
+
+    offline.cleanup();
+    assert!(!stage.exists());
+}
+
+#[test]
+fn a_registry_dependency_is_vendored_on_the_host_into_read_only_container_mounts() {
+    let host = tempfile::tempdir().unwrap();
+    let workspace = host.path().join("repo");
+    write_crate(&workspace);
+    let stage = host.path().join("stage");
+
+    let offline = OfflineCargo::prepare(&workspace, &stage, &CargoVendor)
+        .expect("vendoring should succeed")
+        .expect("the crate has a registry dependency");
+
+    assert!(stage.join("vendor/itoa").is_dir());
+    let config = std::fs::read_to_string(stage.join("config.toml")).unwrap();
+    assert!(config.contains("directory = \"/opt/nanna-offline/vendor\""));
+    assert!(config.contains("offline = true"));
+    let args: Vec<String> = offline.mounts().iter().map(|m| m.run_arg()).collect();
+    assert_eq!(args.len(), 2);
+    assert!(args.iter().all(|arg| arg.ends_with(":ro,z")));
+    let expected_env = vec![("CARGO_NET_OFFLINE".to_string(), "true".to_string())];
+    assert_eq!(offline.env(), expected_env.as_slice());
 
     offline.cleanup();
     assert!(!stage.exists());
@@ -162,9 +173,7 @@ fn a_repo_declaring_its_own_cargo_source_is_refused_before_vendoring() {
 
     let result = OfflineCargo::prepare(&workspace, &stage, &CargoVendor);
 
-    assert!(matches!(
-        result,
-        Err(OfflineCargoError::RepoOverride { .. })
-    ));
+    let refused = matches!(result, Err(OfflineCargoError::RepoOverride { .. }));
+    assert!(refused);
     assert!(!stage.exists());
 }
