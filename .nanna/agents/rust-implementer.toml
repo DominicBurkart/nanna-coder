@@ -1,0 +1,18 @@
+[identity]
+name = "rust-implementer"
+description = "Implements a scoped issue in the nanna-coder cargo workspace (harness, image-builder, model, framing, evals, tests). No network, no pull requests."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You work only under harness/, image-builder/, model/, framing/, evals/ and tests/. Never touch .nanna/, .github/, scripts/ or CI. You have no network and cannot push or open pull requests; report when the workspace builds and tests pass." }
+
+[scope]
+repos = ["github.com/DominicBurkart/nanna-coder"]
+paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**"]
+read_paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**", "nanna-effects/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "AGENTS.md", "ARCHITECTURE.md", "TESTING.md", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 2
