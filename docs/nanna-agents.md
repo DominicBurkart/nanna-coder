@@ -90,9 +90,13 @@ fails to parse. It is not wired into CI.
 ## Containers
 
 Cards carry no container field (DominicBurkart/nanna-coder#1012); the container
-a task runs in is decided by the repository, not the card. This repository has
-`flake.nix` but no `.devcontainer/`, and nanna runs a task in a dev container
-only when both exist. The container model is not bypassed: tools that need the
+a task runs in is decided by the repository, not the card. nanna runs a task in
+a dev container only when the repository has both `flake.nix` and a
+`.devcontainer/` directory; nothing else is read from `.devcontainer/`, and
+`onboard_repo` generates only `flake.nix`. This repository has both
+(`.devcontainer/devcontainer.json` is a minimal marker, `flake.nix` exposes
+`devContainerImage`), so its tasks run through the container model. The
+container model is not bypassed: tools that need the
 container registry, including the `cargo_*` tools, are available only to a task
 run through it.
 
