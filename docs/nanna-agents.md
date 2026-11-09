@@ -31,7 +31,7 @@ nanna's shipped fixtures name `github.com/example/repo`, so they cannot be a
 base for this repository. `.nanna/catalog/` is the authored base.
 Installing it is a human step on the host that runs nanna:
 
-```
+```text
 mkdir -p ~/.config/nanna/agents
 cp -r .nanna/catalog/. ~/.config/nanna/agents/
 ```
@@ -72,7 +72,7 @@ card.
 
 ## Listing
 
-```
+```text
 NANNA_CONFIG_DIR=<dir containing agents/> nanna agents list --repo /path/to/nanna-coder
 ```
 
@@ -82,7 +82,8 @@ tools are in the files above.
 
 ## Verifying scope
 
-`scripts/check_nanna_agents.sh` (needs a `nanna` binary, or `NANNA_BIN`) copies the base
+`scripts/check_nanna_agents.sh` (needs a `nanna` binary, or `NANNA_BIN`) copies
+the base
 catalog to a scratch config directory and runs `nanna agents list --repo .`;
 it exits non-zero when an override widens its base, names an unknown card, or
 fails to parse. It is not wired into CI.
