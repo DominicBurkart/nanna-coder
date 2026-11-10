@@ -39,11 +39,5 @@ min_score = 7
 mode = "draft_pr"
 required_checks = [
   "All Checks Passed",
-  "unit (ubuntu-latest)",
-  "lint (ubuntu-latest)",
-  "security (ubuntu-latest)",
-  "integration (ubuntu-latest)",
-  "integration-container (ubuntu-latest)",
-  "guard",
   "codecov/patch",
 ]
