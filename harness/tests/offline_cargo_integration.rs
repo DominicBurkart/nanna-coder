@@ -3,14 +3,16 @@
 //! A workspace-ceiling task runs with `--network=none`. The host vendors the
 //! repository's registry dependencies, mounts the sources and a generated
 //! source-replacement config read-only, and `cargo run --offline` then builds
-//! a crate that depends on a registry crate inside the container. It also
-//! checks that the mounts cannot be written from the container, that the
-//! network is really off, and that a repository declaring its own cargo
+//! a crate that depends on a vendored dependency inside the container. It
+//! also checks that the mounts cannot be written from the container, that
+//! the network is really off, and that a repository declaring its own cargo
 //! source replacement is refused before anything starts.
 //!
-//! It skips (loudly) when no container runtime is available. It needs the
-//! host to resolve one small registry crate and an image with cargo:
-//! `NANNA_OFFLINE_CARGO_IMAGE` (default `docker.io/library/rust:1-bookworm`).
+//! The dependency is a throwaway git repository created in a temporary
+//! directory, so no test here needs network access (the Nix build sandbox has
+//! none). The container test skips (loudly) when no container runtime is
+//! available and needs an image with cargo: `NANNA_OFFLINE_CARGO_IMAGE`
+//! (default `docker.io/library/rust:1-bookworm`).
 
 mod support;
 
@@ -32,16 +34,47 @@ fn image() -> String {
     std::env::var("NANNA_OFFLINE_CARGO_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
 }
 
-fn write_crate(root: &Path) {
-    std::fs::create_dir_all(root.join("src")).unwrap();
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.com",
+        ])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+}
+
+fn write_crate(root: &Path, dep: &Path) {
+    std::fs::create_dir_all(dep.join("src")).unwrap();
     std::fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nitoa = \"1\"\n",
+        dep.join("Cargo.toml"),
+        "[package]\nname = \"localdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
     std::fs::write(
+        dep.join("src/lib.rs"),
+        "pub fn seven() -> &'static str {\n    \"7\"\n}\n",
+    )
+    .unwrap();
+    git(dep, &["init", "-q"]);
+    git(dep, &["add", "."]);
+    git(dep, &["commit", "-q", "-m", "dependency"]);
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let manifest = format!(
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlocaldep = {{ git = \"file://{}\" }}\n",
+        dep.display()
+    );
+    std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(
         root.join("src/main.rs"),
-        "fn main() { println!(\"sum={}\", itoa::Buffer::new().format(7u32)); }\n",
+        "fn main() { println!(\"sum={}\", localdep::seven()); }\n",
     )
     .unwrap();
     let locked = Command::new("cargo")
@@ -90,19 +123,19 @@ async fn run(registry: &ToolRegistry, command: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_network_less_container_builds_a_registry_dependency_from_vendored_sources() {
+async fn a_network_less_container_builds_a_dependency_from_vendored_sources() {
     if !detect_runtime().is_available() {
         eprintln!("SKIPPED: no container runtime available");
         return;
     }
     let host = tempfile::tempdir().unwrap();
     let workspace = host.path().join("repo");
-    write_crate(&workspace);
+    write_crate(&workspace, &host.path().join("dep"));
     let stage = host.path().join("stage");
 
     let offline = OfflineCargo::prepare(&workspace, &stage, &CargoVendor)
         .expect("vendoring should succeed")
-        .expect("the crate has a registry dependency");
+        .expect("the crate has a vendored dependency");
 
     let handle = start(&workspace, &offline).await;
     let registry = support::allow_gated(create_container_tool_registry(
@@ -134,17 +167,17 @@ async fn a_network_less_container_builds_a_registry_dependency_from_vendored_sou
 }
 
 #[test]
-fn a_registry_dependency_is_vendored_on_the_host_into_read_only_container_mounts() {
+fn a_dependency_is_vendored_on_the_host_into_read_only_container_mounts() {
     let host = tempfile::tempdir().unwrap();
     let workspace = host.path().join("repo");
-    write_crate(&workspace);
+    write_crate(&workspace, &host.path().join("dep"));
     let stage = host.path().join("stage");
 
     let offline = OfflineCargo::prepare(&workspace, &stage, &CargoVendor)
         .expect("vendoring should succeed")
-        .expect("the crate has a registry dependency");
+        .expect("the crate has a vendored dependency");
 
-    assert!(stage.join("vendor/itoa").is_dir());
+    assert!(stage.join("vendor/localdep").is_dir());
     let config = std::fs::read_to_string(stage.join("config.toml")).unwrap();
     assert!(config.contains("directory = \"/opt/nanna-offline/vendor\""));
     assert!(config.contains("offline = true"));
