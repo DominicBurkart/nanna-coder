@@ -6,6 +6,7 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
+use crate::policy::RepoPolicy;
 use crate::protected::{
     ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
 };
@@ -3298,7 +3299,9 @@ pub fn create_tool_registry_in_checkout(
     workspace_root: &std::path::Path,
 ) -> Result<ToolRegistry, ProtectedConfigError> {
     let extras = ProtectedExtras::load(workspace_root)?;
-    let protected = ProtectedPaths::for_repo_with_extras(workspace_root, &extras);
+    let policy = RepoPolicy::load(workspace_root)?;
+    let protected =
+        ProtectedPaths::for_repo_with_extras(workspace_root, &extras).with_policy(policy);
     Ok(create_tool_registry_guarded(workspace_root, protected))
 }
 
@@ -4949,6 +4952,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_registry_refuses_a_write_to_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registries = [
+            create_tool_registry(dir.path()),
+            create_tool_registry_for(dir.path(), &identity).unwrap(),
+            create_tool_registry_in_checkout(dir.path()).unwrap(),
+        ];
+        for registry in registries {
+            for path in [".nanna/policy.toml", "crates/api/.nanna/policy.toml"] {
+                let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+                let err = registry.execute("write_file", args).await.unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                    "{path}: {err:?}"
+                );
+                assert!(!dir.path().join(path).exists(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_solo_registry_refuses_every_alias_spelling_of_the_declaration_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = ProtectedPaths::for_repo(dir.path()).with_policy(RepoPolicy::solo());
+        let registry = create_tool_registry_guarded(dir.path(), protected);
+        let spellings = [
+            ".nanna./policy.toml",
+            ".nanna /protected.toml",
+            ".nanna/policy.toml.",
+            ".nanna/policy.toml::$DATA",
+            "NANNA~1/POLICY~1.TOML",
+            ".NANNA/Policy.toml",
+            "crates/e\u{301}/.nanna./policy.toml",
+        ];
+        let mut refused = 0;
+        for path in spellings {
+            let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+            let err = registry.execute("write_file", args).await.unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                "{path}: {err:?}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, spellings.len());
+        assert_eq!(registry.denials().len(), spellings.len());
+    }
+
+    #[tokio::test]
     async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cfg/nanna");
@@ -5054,6 +5108,62 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("ci/deploy.sh")).unwrap(),
                 "original"
+            );
+        }
+
+        async fn folded_link_outcomes(policy: Option<&str>) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
+            )
+            .unwrap();
+            if let Some(policy) = policy {
+                std::fs::write(dir.path().join(".nanna/policy.toml"), policy).unwrap();
+            }
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let mut outcomes = Vec::new();
+            for name in [
+                "alias.txt",
+                "cafe\u{301}-x.txt.",
+                "src/cafe\u{301}.rs.",
+                "tools/RELEAS~1.SH",
+                "ci/deploy.sh",
+            ] {
+                let file = dir.path().join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "original").unwrap();
+                let partner = dir.path().join("zz-partner.bin");
+                std::fs::remove_file(&partner).ok();
+                std::fs::hard_link(&file, &partner).unwrap();
+                let err = registry
+                    .execute("write_file", json!({ "path": name, "content": "evil" }))
+                    .await
+                    .unwrap_err();
+                match err {
+                    ToolError::ProtectedPath(violation) => outcomes.push(violation.rule),
+                    other => outcomes.push(format!("unexpected: {other:?}")),
+                }
+                assert_eq!(std::fs::read_to_string(&partner).unwrap(), "original");
+            }
+            outcomes
+        }
+
+        #[tokio::test]
+        async fn the_hardlink_refusal_is_identical_under_the_solo_gate_and_without_a_policy_file() {
+            let none = folded_link_outcomes(None).await;
+            let solo = folded_link_outcomes(Some("human_gate = \"solo\"\n")).await;
+            assert_eq!(none, solo);
+            assert_eq!(
+                none,
+                vec![
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    "src/caf\u{e9}.rs".to_string(),
+                    "tools/release-helper.sh".to_string(),
+                    "ci/**".to_string(),
+                ]
             );
         }
 
@@ -5227,6 +5337,34 @@ mod tests {
             create_tool_registry_in_checkout(dir.path()),
             Err(ProtectedConfigError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_checkout_registry_is_refused_for_a_bad_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            create_tool_registry_in_checkout(dir.path()),
+            Err(ProtectedConfigError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn a_checkout_registry_accepts_a_valid_solo_or_missing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
     }
 
     #[test]

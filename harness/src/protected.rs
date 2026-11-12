@@ -18,6 +18,7 @@
 //! at a different repository than the one the auditor approved.
 
 use crate::identity::IdentityCatalog;
+use crate::policy::RepoPolicy;
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -74,6 +75,8 @@ pub const MAX_EXTRAS_ENTRIES: usize = 256;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtectedConfigError {
+    #[error(transparent)]
+    Policy(#[from] crate::policy::PolicyError),
     #[error("`{EXTRAS_FILE}` is unreadable: {0}")]
     Unreadable(String),
     #[error("`{EXTRAS_FILE}` is malformed: {0}")]
@@ -118,6 +121,24 @@ fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
     let mut bounded = std::io::Read::take(reader, MAX_EXTRAS_BYTES as u64 + 1);
     std::io::Read::read_to_string(&mut bounded, &mut text)?;
     Ok(text)
+}
+
+pub(crate) fn declaration_text(base: &Path, file: &str) -> Result<Option<String>, String> {
+    let path = base.join(file);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ProtectedExtras::absent(base)
+                .map(|_| None)
+                .map_err(String::from);
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(meta) if !meta.is_file() => return Err("not a regular file".to_string()),
+        Ok(_) => {}
+    }
+    std::fs::File::open(&path)
+        .and_then(read_bounded)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 fn invalid_pattern(pattern: &str, reason: &str) -> ProtectedConfigError {
@@ -184,21 +205,10 @@ impl ProtectedExtras {
     }
 
     pub fn load(base: &Path) -> Result<Self, ProtectedConfigError> {
-        let unreadable =
-            |e: &dyn std::fmt::Display| ProtectedConfigError::Unreadable(e.to_string());
-        let path = base.join(EXTRAS_FILE);
-        match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Self::absent(base).map_err(|e| unreadable(&e))
-            }
-            Err(e) => return Err(unreadable(&e)),
-            Ok(meta) if !meta.is_file() => return Err(unreadable(&"not a regular file")),
-            Ok(_) => {}
+        match declaration_text(base, EXTRAS_FILE).map_err(ProtectedConfigError::Unreadable)? {
+            Some(text) => Self::parse(&text),
+            None => Ok(Self::default()),
         }
-        let text = std::fs::File::open(&path)
-            .and_then(read_bounded)
-            .map_err(|e| unreadable(&e))?;
-        Self::parse(&text)
     }
 
     fn absent(base: &Path) -> Result<Self, &'static str> {
@@ -429,6 +439,7 @@ pub struct MountRoot {
 pub struct ProtectedPaths {
     rules: Vec<Rule>,
     config_dir: Option<PathBuf>,
+    policy: RepoPolicy,
     literals: Vec<String>,
 }
 
@@ -501,8 +512,18 @@ impl ProtectedPaths {
         Self {
             rules,
             config_dir: config_dir.map(Path::to_path_buf),
+            policy: RepoPolicy::default(),
             literals,
         }
+    }
+
+    pub fn with_policy(mut self, policy: RepoPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> RepoPolicy {
+        self.policy
     }
 
     pub(crate) fn variants(&self, path: &Path) -> Option<Vec<PathBuf>> {
@@ -1945,6 +1966,133 @@ mod tests {
             assert_eq!(written, "name=from-body\n");
             let (_, written) = detect(&plain, &plain.base, &plain.head, "no marker here");
             assert_eq!(written, "name=\n");
+        }
+    }
+
+    mod policy_carriage {
+        use super::*;
+        use crate::policy::RepoPolicy;
+
+        #[test]
+        fn a_protected_set_defaults_to_github_and_carries_the_policy_it_is_given() {
+            let plain = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            assert!(!plain.policy().is_solo());
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            assert!(solo.policy().is_solo());
+            assert_eq!(solo.rules(), plain.rules());
+            assert!(!solo.with_policy(RepoPolicy::default()).policy().is_solo());
+        }
+
+        const SHIPPED_SPELLINGS: [&str; 9] = [
+            ".nanna./F",
+            ".nanna /F",
+            ".nanna/F.",
+            ".nanna/F ",
+            ".nanna/F::$DATA",
+            "NANNA~1/F",
+            ".NANNA/F",
+            "NANNA~1/F:stream",
+            "NANNA~1./F",
+        ];
+
+        const NESTED_SPELLINGS: [&str; 3] = [
+            "crates/e\u{301}/.nanna/F",
+            "crates/e\u{301}/NANNA~1/F",
+            "crates/\u{e9}/.nanna./F",
+        ];
+
+        fn spelled(template: &str, file: &str) -> String {
+            template.replace('F', file)
+        }
+
+        #[test]
+        fn every_alias_and_normalisation_spelling_of_the_declaration_files_is_protected() {
+            let protected = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            for file in [
+                "policy.toml",
+                "protected.toml",
+                "POLICY~1.TOML",
+                "PROTEC~1.TOM",
+            ] {
+                for template in SHIPPED_SPELLINGS {
+                    let path = spelled(template, file);
+                    let rule = protected.check(Path::new(&path)).unwrap_err().rule;
+                    assert_eq!(rule, ".nanna/**", "{path}");
+                }
+                for template in NESTED_SPELLINGS {
+                    let path = spelled(template, file);
+                    let rule = protected.check(Path::new(&path)).unwrap_err().rule;
+                    assert_eq!(rule, "**/.nanna/**", "{path}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_solo_policy_changes_no_decision_for_any_spelling() {
+            let plain = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            assert!(solo.policy().is_solo());
+            assert_eq!(solo.rules(), plain.rules());
+            let mut counted = 0;
+            for template in SHIPPED_SPELLINGS.iter().chain(NESTED_SPELLINGS.iter()) {
+                let path = spelled(template, "policy.toml");
+                assert_eq!(
+                    solo.check(Path::new(&path)),
+                    plain.check(Path::new(&path)),
+                    "{path}"
+                );
+                counted += 1;
+            }
+            assert_eq!(counted, 12);
+            let deep = format!("{}/NANNA~1/policy.toml", ["a"; 1_100].join("/"));
+            let overflow = solo.check(Path::new(&deep)).unwrap_err();
+            assert_eq!(overflow.rule, ALIAS_OVERFLOW_RULE);
+            assert_eq!(plain.check(Path::new(&deep)), Err(overflow));
+        }
+
+        #[test]
+        fn declared_extras_keep_every_spelling_protected_under_the_solo_policy() {
+            fn rule_of_check(p: &ProtectedPaths, path: &str) -> String {
+                p.check(Path::new(path))
+                    .err()
+                    .map(|v| v.rule)
+                    .unwrap_or_default()
+            }
+            let extras = ProtectedExtras::parse(
+                "extra = [\"src/gate.rs\", \"src/caf\u{e9}.rs\", \"tools/**\"]",
+            )
+            .unwrap();
+            let plain = ProtectedPaths::with_extras(Path::new("/repo"), None, &extras);
+            let solo = plain.clone().with_policy(RepoPolicy::solo());
+            for (path, rule) in [
+                ("src/gate.rs.", "src/gate.rs"),
+                ("SRC/GATE~1.RS", "src/gate.rs"),
+                ("src/gate.rs::$DATA", "src/gate.rs"),
+                ("src/cafe\u{301}.rs", "src/caf\u{e9}.rs"),
+                ("src/cafe\u{301}.rs ", "src/caf\u{e9}.rs"),
+                ("tools./x.sh", "tools/**"),
+                ("TOOLS~1/x.sh", "tools/**"),
+            ] {
+                assert_eq!(rule_of_check(&solo, path), rule, "{path}");
+                assert_eq!(solo.check(Path::new(path)), plain.check(Path::new(path)));
+            }
+            assert!(solo.check(Path::new("src/other.rs")).is_ok());
+        }
+
+        #[test]
+        fn the_policy_file_is_protected_like_the_protected_declaration() {
+            let protected = ProtectedPaths::with_config_dir(Path::new("/repo"), None);
+            for path in [
+                ".nanna/policy.toml",
+                ".nanna/protected.toml",
+                "crates/a/.nanna/policy.toml",
+            ] {
+                let violation = protected.check(Path::new(path)).unwrap_err();
+                assert!(
+                    violation.rule.ends_with(".nanna/**"),
+                    "{path}: {violation:?}"
+                );
+            }
         }
     }
 
