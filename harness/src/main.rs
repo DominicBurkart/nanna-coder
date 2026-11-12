@@ -3228,6 +3228,43 @@ mod tests {
     }
 
     #[test]
+    fn the_cli_registry_refuses_a_bad_policy_and_accepts_a_solo_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            registry_for_checkout(dir.path()),
+            Err(harness::protected::ProtectedConfigError::Policy(_))
+        ));
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(registry_for_checkout(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn every_cli_registry_is_built_through_the_checkout_seam() {
+        let source = include_str!("main.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("create_tool_registry("));
+        assert!(!production.contains("create_tool_registry_for("));
+        assert!(!production.contains("create_tool_registry_guarded("));
+        assert_eq!(
+            production
+                .matches("create_tool_registry_in_checkout(")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches("registry_for_checkout(").count(), 4);
+    }
+
+    #[test]
     fn no_production_caller_builds_the_spawn_gate_without_forwarding_a_model() {
         let source = include_str!("main.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
