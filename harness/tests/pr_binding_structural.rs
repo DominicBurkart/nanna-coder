@@ -150,6 +150,15 @@ fn field_names(source: &str, name: &str) -> BTreeSet<String> {
 }
 
 #[test]
+fn owners_are_keyed_by_the_impl_type_and_the_function_name() {
+    let text = "impl Cell { fn bind() { go(); } } impl Tool for Other { fn bind() { go(); } } impl Marker for [u8; 2] { fn run() { go(); } } fn free() { go(); }";
+    assert_eq!(
+        users(text, "go"),
+        expected(&["Cell::bind", "Other::bind", "::run", "free"])
+    );
+}
+
+#[test]
 fn only_the_pull_request_open_tool_binds_a_pull_request() {
     assert_eq!(
         everywhere("bind"),

@@ -2902,6 +2902,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repository_that_cannot_be_normalised_keeps_its_raw_spelling_in_the_lease() {
+        let chain = Chain::new();
+        let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let mut named = subject(Some(7));
+        named.repo = "/work/checkout".to_string();
+        let registry = chain.registry_with_its_own_binding(gate, named);
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(failure_message(err).contains("github_pr_open"));
+        let held = crate::leases::LeaseStore::snapshot(chain.leases.as_ref()).unwrap();
+        let names: Vec<String> = held.iter().map(|lease| lease.name.to_string()).collect();
+        assert_eq!(names, vec!["sandbox:/work/checkout:7"]);
+    }
+
+    #[tokio::test]
     async fn a_workspace_with_a_target_but_no_bound_pull_request_refuses_to_deploy() {
         let chain = Chain::new();
         let mut workspace = crate::workspace::TaskWorkspace::create(
