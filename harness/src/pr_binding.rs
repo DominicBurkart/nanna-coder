@@ -8,6 +8,25 @@ fn plain_part(part: &str) -> bool {
     named && part.bytes().all(allowed)
 }
 
+#[doc = r#"The pull request number a Sandbox lease is keyed by: the host-set number and the bound number must agree. When both exist and differ nothing is offered, so the gate refuses (fail closed) instead of leasing one pull request while the tool deploys another.
+
+```
+use harness::pr_binding::lease_pr;
+
+assert_eq!(lease_pr(None, Some(7)), Some(7));
+assert_eq!(lease_pr(Some(7), None), Some(7));
+assert_eq!(lease_pr(Some(7), Some(7)), Some(7));
+assert_eq!(lease_pr(Some(9), Some(7)), None);
+assert_eq!(lease_pr(None, None), None);
+```
+"#]
+pub fn lease_pr(host: Option<u64>, bound: Option<u64>) -> Option<u64> {
+    match (host, bound) {
+        (Some(host), Some(bound)) if host != bound => None,
+        (host, bound) => host.or(bound),
+    }
+}
+
 #[doc = r#"A repository name reduced to the form two names are compared in: `owner/name`, both parts plain ASCII letters, digits, `-`, `_` or `.`, lower-cased. Anything else (a non-ASCII lookalike, a trailing slash, extra path parts, an empty part) is `None`, so it never equals anything.
 
 ```
@@ -216,6 +235,15 @@ mod tests {
         assert!(!same_repo("o/n", "o/n/"));
         assert!(!same_repo("o/\u{43d}", "o/\u{43d}"));
         assert!(!same_repo("", ""));
+    }
+
+    #[test]
+    fn the_lease_number_needs_the_host_and_the_binding_to_agree() {
+        assert_eq!(lease_pr(None, None), None);
+        assert_eq!(lease_pr(None, Some(7)), Some(7));
+        assert_eq!(lease_pr(Some(7), None), Some(7));
+        assert_eq!(lease_pr(Some(7), Some(7)), Some(7));
+        assert_eq!(lease_pr(Some(9), Some(7)), None);
     }
 
     #[test]

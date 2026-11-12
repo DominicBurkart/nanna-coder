@@ -440,13 +440,18 @@ impl ToolRegistry {
             .and_then(|subject| self.pr_binding.number_for(&subject.repo));
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
+                let lease_repo = match class {
+                    EffectClass::Sandbox => crate::pr_binding::normalised_repo(&subject.repo)
+                        .unwrap_or_else(|| subject.repo.clone()),
+                    _ => subject.repo.clone(),
+                };
                 let ctx = ActionContext {
                     max_effect: subject.max_effect,
                     window: subject.window.as_deref(),
                     lease: LeaseContext {
-                        repo: &subject.repo,
+                        repo: &lease_repo,
                         branch: subject.branch.as_deref(),
-                        pr: subject.pr.or(bound_pr),
+                        pr: crate::pr_binding::lease_pr(subject.pr, bound_pr),
                         environment: subject.environment.as_deref(),
                         image: None,
                         paths: &subject.paths,

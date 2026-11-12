@@ -2856,18 +2856,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_set_number_is_the_one_the_lease_is_keyed_by_even_when_a_binding_exists() {
+    async fn a_host_set_number_that_differs_from_the_binding_is_refused_and_one_that_agrees_deploys(
+    ) {
         let chain = Chain::new();
         let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
         let registry = chain.registry_with_its_own_binding(gate, subject(Some(9)));
         bind(&registry, "o/n", 7);
-        registry
+        let err = registry
+            .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err:?}");
+        chain.nothing_happened();
+        let agreeing = Chain::new();
+        let (gate, _model) = agreeing.modelled_gate(ALWAYS_OPEN, ALLOW);
+        let registry = agreeing.registry_with_its_own_binding(gate, subject(Some(7)));
+        bind(&registry, "o/n", 7);
+        let done = registry
             .execute("sandbox_deploy", json!({"image_tag": "v1"}))
             .await
             .unwrap();
-        let held = crate::leases::LeaseStore::snapshot(chain.leases.as_ref()).unwrap();
+        assert_eq!(done["pr_number"], 7);
+        let held = crate::leases::LeaseStore::snapshot(agreeing.leases.as_ref()).unwrap();
         let names: Vec<String> = held.iter().map(|lease| lease.name.to_string()).collect();
-        assert_eq!(names, vec!["sandbox:o/n:9"]);
+        assert_eq!(names, vec!["sandbox:o/n:7"]);
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_lease_is_keyed_by_the_normalised_repository() {
+        for spelling in ["O/N", "o/N", "o/n"] {
+            let chain = Chain::new();
+            let (gate, _model) = chain.modelled_gate(ALWAYS_OPEN, ALLOW);
+            let mut named = subject(None);
+            named.repo = spelling.to_string();
+            let registry = chain.registry_with_its_own_binding(gate, named);
+            bind(&registry, "o/n", 7);
+            registry
+                .execute("sandbox_deploy", json!({"image_tag": "v1"}))
+                .await
+                .unwrap();
+            let held = crate::leases::LeaseStore::snapshot(chain.leases.as_ref()).unwrap();
+            let names: Vec<String> = held.iter().map(|lease| lease.name.to_string()).collect();
+            assert_eq!(names, vec!["sandbox:o/n:7"], "{spelling}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_a_target_but_no_bound_pull_request_refuses_to_deploy() {
+        let chain = Chain::new();
+        let mut workspace = crate::workspace::TaskWorkspace::create(
+            chain.dir.path(),
+            &format!("unbound-{}", uuid_like()),
+            "HEAD",
+        )
+        .unwrap();
+        workspace.set_sandbox_target(Arc::clone(&chain.target) as Arc<dyn SandboxTarget>);
+        workspace.set_cost_accountant(Arc::clone(&chain.accountant));
+        let identity = identity_with("\"sandbox_deploy\"", "sandbox", "");
+        let registry = workspace.build_tool_registry_for(&identity).unwrap();
+        let deploy = registry.get_tool("sandbox_deploy").unwrap();
+        let err = deploy
+            .execute(json!({"image_tag": "v1"}))
+            .await
+            .unwrap_err();
+        assert!(failure_message(err).contains("github_pr_open"));
+        assert!(chain.target.images().is_empty());
+        assert!(workspace.sandboxes().get(&workspace.task_id).is_none());
+        workspace.cleanup().unwrap();
+        assert!(chain.target.torn_down().is_empty());
     }
 
     #[tokio::test]

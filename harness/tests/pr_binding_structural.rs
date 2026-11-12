@@ -12,6 +12,7 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 
 #[derive(Default)]
 struct Owners {
+    impl_type: Vec<String>,
     stack: Vec<String>,
     idents: BTreeMap<String, Vec<String>>,
 }
@@ -48,9 +49,20 @@ impl<'ast> Visit<'ast> for Owners {
         }
     }
 
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let named = match &*node.self_ty {
+            syn::Type::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
+            _ => None,
+        };
+        self.impl_type.push(named.unwrap_or_default());
+        syn::visit::visit_item_impl(self, node);
+        self.impl_type.pop();
+    }
+
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if !is_cfg_test(&node.attrs) {
-            self.stack.push(node.sig.ident.to_string());
+            let owner = self.impl_type.last().cloned().unwrap_or_default();
+            self.stack.push(format!("{owner}::{}", node.sig.ident));
             syn::visit::visit_impl_item_fn(self, node);
             self.stack.pop();
         }
@@ -142,20 +154,20 @@ fn only_the_pull_request_open_tool_binds_a_pull_request() {
     assert_eq!(
         everywhere("bind"),
         expected(&[
-            "pr_binding.rs: bind",
-            "pr_tools.rs: execute",
+            "pr_binding.rs: PrBindingCell::bind",
+            "pr_tools.rs: GithubPrOpenTool::execute",
             "apprun/ports.rs: port_is_free",
-            "sandbox_tools.rs: deploy",
+            "sandbox_tools.rs: FakeSandboxTarget::deploy",
         ])
     );
     assert_eq!(
         everywhere("PrBinding"),
         expected(&[
             "pr_binding.rs: ",
-            "pr_binding.rs: bind",
-            "pr_binding.rs: get",
-            "pr_binding.rs: slot",
-            "pr_tools.rs: execute",
+            "pr_binding.rs: PrBindingCell::bind",
+            "pr_binding.rs: PrBindingCell::get",
+            "pr_binding.rs: PrBindingCell::slot",
+            "pr_tools.rs: GithubPrOpenTool::execute",
         ])
     );
 }
@@ -163,13 +175,25 @@ fn only_the_pull_request_open_tool_binds_a_pull_request() {
 #[test]
 fn the_binding_is_read_for_a_lease_only_through_the_repository_checked_helper() {
     let tools = source("src/tools.rs");
-    assert_eq!(users(&tools, "number_for"), expected(&["review_action"]));
+    assert_eq!(
+        users(&tools, "number_for"),
+        expected(&["ToolRegistry::review_action"])
+    );
     assert_eq!(
         users(&tools, "pr_binding"),
-        expected(&["", "new", "pr_binding", "review_action"])
+        expected(&[
+            "",
+            "ToolRegistry::new",
+            "ToolRegistry::pr_binding",
+            "ToolRegistry::review_action"
+        ])
     );
     let sandbox = source("src/sandbox_tools.rs");
-    assert!(users(&sandbox, "same_repo").contains("execute"));
+    assert!(users(&sandbox, "same_repo").contains("SandboxDeployTool::execute"));
+    assert_eq!(
+        users(&tools, "lease_pr"),
+        expected(&["ToolRegistry::review_action"])
+    );
 }
 
 #[test]
@@ -360,8 +384,8 @@ fn the_open_tool_and_the_sandbox_tools_share_the_registrys_own_cell() {
     assert!(users(&tools, "pr_binding").contains("register_granted_at"));
     assert!(!users(&tools, "PrBindingCell").contains("register_granted_at"));
     let workspace = source("src/workspace.rs");
-    assert!(users(&workspace, "pr_binding").contains("build_tool_registry_for"));
-    assert!(!users(&workspace, "PrBindingCell").contains("build_tool_registry_for"));
+    assert!(users(&workspace, "pr_binding").contains("TaskWorkspace::build_tool_registry_for"));
+    assert!(!users(&workspace, "PrBindingCell").contains("TaskWorkspace::build_tool_registry_for"));
 }
 
 struct Open {
