@@ -400,6 +400,10 @@ fn the_shutdown_wait_listens_for_both_interrupt_and_terminate() {
         assert!(users(&main, name).contains("shutdown_signal"), "{name}");
     }
     assert!(users(&main, "shutdown_signal").contains("run_mcp_server"));
+    let functions = scan(&main);
+    let in_pair = &functions.idents["shutdown_on"];
+    let count = |name: &str| in_pair.iter().filter(|ident| *ident == name).count();
+    assert_eq!((count("first"), count("second")), (2, 2));
 }
 
 #[test]
