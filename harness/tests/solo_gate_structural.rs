@@ -52,6 +52,7 @@ const TOOL_TABLE: &[(&str, Solo)] = &[
     ("CiLogsTool", Solo::Read),
     ("CiStatusTool", Solo::Read),
     ("CiTriggerTool", Solo::CiWorkflow),
+    ("CoverageReportTool", Solo::Local),
     ("EchoTool", Solo::Local),
     ("GitCommitTool", Solo::Local),
     ("GitDiffTool", Solo::Local),

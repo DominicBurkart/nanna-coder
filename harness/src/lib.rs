@@ -10,6 +10,7 @@ mod ci_integrity;
 pub mod ci_policy;
 pub mod ci_tools;
 pub mod container;
+pub mod coverage_tool;
 pub mod deploy;
 pub mod effects;
 pub mod entities;
