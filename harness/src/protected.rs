@@ -252,6 +252,43 @@ pub struct NoopAuditHook;
 
 impl AuditHook for NoopAuditHook {}
 
+/// The rule reported for a write refused because the target has other hard
+/// links.
+pub const HARDLINK_RULE: &str = "hard link (link count above one)";
+
+/// Whether `metadata` describes a regular file or symlink that other names
+/// also reach. Directories and other file types are never reported: a
+/// directory's link count counts its subdirectories.
+#[cfg(unix)]
+pub fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let file_type = metadata.file_type();
+    judged_link_count(
+        file_type.is_file() || file_type.is_symlink(),
+        metadata.nlink(),
+    )
+}
+
+#[cfg(unix)]
+fn judged_link_count(regular_or_symlink: bool, links: u64) -> bool {
+    regular_or_symlink && links > 1
+}
+
+/// Whether `metadata` describes a file that other names also reach. Link
+/// counts are not available on this platform, so no file is reported.
+#[cfg(not(unix))]
+pub fn is_hardlinked(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The violation for a write to `path`, which has other hard links.
+pub fn hardlink_violation(path: &Path) -> ProtectedPathViolation {
+    ProtectedPathViolation {
+        path: crate::scope::denial_path(path),
+        rule: HARDLINK_RULE.to_string(),
+    }
+}
+
 /// The rule reported for a path with so many short-name components that its
 /// spellings cannot all be enumerated.
 pub const ALIAS_OVERFLOW_RULE: &str = "ambiguous short-name path";
@@ -1636,6 +1673,87 @@ mod tests {
             protected.existing_roots(dir.path()),
             vec![PathBuf::from(".nanna"), PathBuf::from("codecov.yml")]
         );
+    }
+
+    #[cfg(unix)]
+    mod hardlinks {
+        use super::*;
+
+        fn link_count_fixture(links: usize) -> (tempfile::TempDir, std::fs::Metadata) {
+            let dir = tempfile::tempdir().unwrap();
+            let original = dir.path().join("original");
+            std::fs::write(&original, "x").unwrap();
+            for index in 1..links {
+                std::fs::hard_link(&original, dir.path().join(format!("link{index}"))).unwrap();
+            }
+            let metadata = std::fs::symlink_metadata(&original).unwrap();
+            (dir, metadata)
+        }
+
+        #[test]
+        fn a_single_link_is_not_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(1);
+            assert!(!is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn exactly_two_links_is_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(2);
+            assert!(is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn many_links_is_hardlinked() {
+            let (_dir, metadata) = link_count_fixture(5);
+            assert!(is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn only_regular_files_and_symlinks_are_judged_by_their_link_count() {
+            for (judged, links, expected) in [
+                (true, 1, false),
+                (true, 2, true),
+                (true, 9, true),
+                (false, 1, false),
+                (false, 2, false),
+                (false, 9, false),
+            ] {
+                assert_eq!(
+                    judged_link_count(judged, links),
+                    expected,
+                    "{judged} {links}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_directory_with_subdirectories_is_not_hardlinked() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+            for path in [dir.path().to_path_buf(), dir.path().join("a")] {
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                assert!(!is_hardlinked(&metadata));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_symlink_with_other_names_is_hardlinked() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink("target", &link).unwrap();
+            assert!(!is_hardlinked(&std::fs::symlink_metadata(&link).unwrap()));
+            std::fs::hard_link(&link, dir.path().join("second")).unwrap();
+            assert!(is_hardlinked(&std::fs::symlink_metadata(&link).unwrap()));
+        }
+
+        #[test]
+        fn the_hardlink_violation_names_the_path_and_the_fixed_rule() {
+            let violation = hardlink_violation(Path::new("docs/alias.md"));
+            assert_eq!(violation.path, "docs/alias.md");
+            assert_eq!(violation.rule, HARDLINK_RULE);
+            assert!(violation.to_string().contains("docs/alias.md"));
+        }
     }
 
     #[test]
