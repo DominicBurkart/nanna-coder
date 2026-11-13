@@ -43,9 +43,9 @@ Names are exact; inchworm flows reference them verbatim.
 | Name | Loop | Flow step | Writes (`paths`) | Ceiling | Tools |
 | --- | --- | --- | --- | --- | --- |
 | `rust-implementer` | inner | implement | `harness/**`, `image-builder/**`, `model/**`, `framing/**`, `evals/**`, `tests/**` | workspace | `read_file`, `write_file`, `list_directory`, `search`, `git_status`, `git_diff`, `cargo_check`, `cargo_test` |
-| `pr-shepherd` | middle | publish | same trees as `rust-implementer` | repository | the above plus `git_commit`, `git_push_branch`, `github_pr_open`, `github_pr_status`, `github_pr_comments`, `github_pr_promote`, `github_pr_close`, `github_issue_read`, `github_issue_comment` |
+| `pr-shepherd` | middle | publish | same trees as `rust-implementer` | repository | the above plus `git_commit`, `git_push_branch`, `github_pr_open`, `github_pr_status`, `github_pr_comments`, `github_pr_close`, `github_issue_read`, `github_issue_comment` |
 | `reviewer` | middle | review | none | none | `read_file`, `list_directory`, `search`, `git_status`, `git_diff` |
-| `docs-writer` | inner | docs | `docs/**/*.md`, `README.md`, `ARCHITECTURE.md`, `AGENTS.md`, `TESTING.md` | workspace | `read_file`, `write_file`, `list_directory`, `search`, `git_status`, `git_diff` |
+| `docs-writer` | inner | docs | `docs/**/*.md`, `README.md`, `ARCHITECTURE.md`, `TESTING.md` | workspace | `read_file`, `write_file`, `list_directory`, `search`, `git_status`, `git_diff` |
 
 All four read the workspace trees, `nanna-effects/**`, `docs/**`, the root
 `Cargo.toml` and `Cargo.lock`, and the root markdown guides.
@@ -53,9 +53,11 @@ All four read the workspace trees, `nanna-effects/**`, `docs/**`, the root
 `rust-implementer` has no network: its ceiling is workspace and it holds no
 `github_*` or `run_command` tool. `pr-shepherd` is the only card that reaches
 the repository effect class; the pull-request tools it lists are the ones on
-nanna main. `docs-writer` is limited to markdown by using `docs/**/*.md`
+nanna main. `pr-shepherd` has no `github_pr_promote`: nanna-coder has no
+solo gate, and only the maintainer marks its pull requests ready. `docs-writer` is limited to markdown by using `docs/**/*.md`
 instead of `docs/**`, so the yaml, python and evidence files under `docs/` are
-not writable. Because every card restricts paths, none receives `run_command`.
+not writable. `AGENTS.md` is not in its write paths because it is a protected
+file. Because every card restricts paths, none receives `run_command`.
 Tool names are exact because the narrowing check compares strings, so
 `cargo_*` in a base would not cover `cargo_check` in an override.
 
@@ -93,7 +95,9 @@ fails to parse. It is not wired into CI.
 Cards carry no container field (DominicBurkart/nanna-coder#1012); the container
 a task runs in is decided by the repository, not the card. nanna runs a task in
 a dev container only when the repository has both `flake.nix` and a
-`.devcontainer/` directory; nothing else is read from `.devcontainer/`, and
+`.devcontainer/` directory (`harness/src/task.rs` checks only that both paths
+exist, so removing the `.devcontainer/` marker sends this repository's own
+tasks down the non-container path); nothing else is read from `.devcontainer/`, and
 `onboard_repo` generates only `flake.nix`. This repository has both
 (`.devcontainer/devcontainer.json` is a minimal marker, `flake.nix` exposes
 `devContainerImage`), so its tasks run through the container model. The
@@ -103,7 +107,13 @@ run through it.
 
 ## Limits
 
-- nanna applies `.nanna/agents/` only in `nanna agents list --repo`. `mcp-serve`
-  and `delegate` load the global catalog alone, so a running task gets the base
-  card, not the narrowed one (DominicBurkart/nanna-coder#931). Until that is
-  fixed the base catalog is the effective scope.
+- `[limits]` (`max_iterations`, `max_wall_clock_secs`, `max_concurrent`),
+  `model`, `scope.repos` and system prompts are validated at load time but are
+  not enforced at runtime (DominicBurkart/nanna-coder#733, open). Narrowing
+  them in a card documents intent; it does not constrain a running task.
+- Repo-local `.nanna/agents/` overrides are applied by `mcp-serve`, `delegate`
+  and task assignment on nanna main (DominicBurkart/nanna-coder#931, closed by
+  #935; overrides are read from the host working tree, not a git ref). A
+  `nanna` binary built before #935 loads only the global catalog and runs the
+  base card rather than the narrowed one, so keep the base catalog as tight as
+  you need until the installed binary is rebuilt.

@@ -7,7 +7,7 @@ system_prompt = { inline = "You edit only markdown documentation. Verify every c
 
 [scope]
 repos = ["github.com/DominicBurkart/nanna-coder"]
-paths = ["docs/**/*.md", "README.md", "ARCHITECTURE.md", "AGENTS.md", "TESTING.md"]
+paths = ["docs/**/*.md", "README.md", "ARCHITECTURE.md", "TESTING.md"]
 read_paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**", "nanna-effects/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "AGENTS.md", "ARCHITECTURE.md", "TESTING.md", "README.md"]
 max_effect = "workspace"
 tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff"]

@@ -23,7 +23,7 @@ forbid_paths = [
   "codecov.yml",
   ".nanna/**",
   ".inchworm/**",
-  ".github/CODEOWNERS",
+  ".devcontainer/**",
 ]
 
 [[flow.judge]]

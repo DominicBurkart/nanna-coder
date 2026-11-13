@@ -10,7 +10,7 @@ repos = ["github.com/DominicBurkart/nanna-coder"]
 paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**"]
 read_paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**", "nanna-effects/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "AGENTS.md", "ARCHITECTURE.md", "TESTING.md", "README.md"]
 max_effect = "repository"
-tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test", "git_commit", "git_push_branch", "github_pr_open", "github_pr_status", "github_pr_comments", "github_pr_promote", "github_pr_close", "github_issue_read", "github_issue_comment"]
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test", "git_commit", "git_push_branch", "github_pr_open", "github_pr_status", "github_pr_comments", "github_pr_close", "github_issue_read", "github_issue_comment"]
 
 [limits]
 max_iterations = 100
