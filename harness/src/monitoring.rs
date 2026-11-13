@@ -1242,4 +1242,254 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    // --- HealthStatus pure methods ---
+
+    /// Only `Healthy` should report `is_healthy() == true`; all other variants must
+    /// return `false` to ensure callers can safely gate on this predicate.
+    #[test]
+    fn health_status_is_healthy_only_for_healthy_variant() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    /// `requires_attention()` must be `true` for Warning, Degraded, and Unhealthy
+    /// and `false` for Healthy and Unknown so that alerting logic is not triggered
+    /// for steady-state or indeterminate states.
+    #[test]
+    fn health_status_requires_attention_correct_variants() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    // --- AlertSeverity ordering ---
+
+    /// AlertSeverity derives `Ord`, so the enum discriminants must follow the
+    /// intuitive escalation order Info < Warning < Error < Critical.
+    #[test]
+    fn alert_severity_ordering_is_ascending() {
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+    }
+
+    /// The minimum severity must be Info and the maximum must be Critical so that
+    /// callers using `min`/`max` to gate notifications get the right endpoints.
+    #[test]
+    fn alert_severity_min_max() {
+        let severities = [
+            AlertSeverity::Critical,
+            AlertSeverity::Info,
+            AlertSeverity::Error,
+            AlertSeverity::Warning,
+        ];
+        assert_eq!(severities.iter().min().unwrap(), &AlertSeverity::Info);
+        assert_eq!(severities.iter().max().unwrap(), &AlertSeverity::Critical);
+    }
+
+    // --- AlertThresholds defaults ---
+
+    /// The default thresholds must be sensible: latency cap at 5 s, cache hit
+    /// floor at 80%, error rate ceiling at 5%, and resource ceilings at 90%.
+    #[test]
+    fn alert_thresholds_default_values_are_sensible() {
+        let t = AlertThresholds::default();
+        assert_eq!(t.max_latency_ms, 5000);
+        assert!((t.min_cache_hit_rate - 0.8).abs() < f64::EPSILON);
+        assert!((t.max_error_rate - 0.05).abs() < f64::EPSILON);
+        assert!((t.max_cpu_usage - 0.9).abs() < f64::EPSILON);
+        assert!((t.max_memory_usage - 0.9).abs() < f64::EPSILON);
+        assert_eq!(t.health_check_timeout, Duration::from_secs(30));
+    }
+
+    // --- Error recording and error-rate calculation ---
+
+    /// Recording an error event must cause it to appear in the error metrics
+    /// returned by `get_current_metrics`, and the error rate must be calculated
+    /// correctly when there are also recorded requests.
+    #[tokio::test]
+    async fn test_record_error_appears_in_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let event = ErrorEvent {
+            timestamp: Utc::now(),
+            error_type: "TestError".to_string(),
+            message: "something went wrong".to_string(),
+            severity: ErrorSeverity::Warning,
+            component: "test-component".to_string(),
+        };
+        collector.record_error(event).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert_eq!(
+            metrics.error_metrics.errors_by_type.get("TestError"),
+            Some(&1)
+        );
+        // With no requests the error rate should remain 0.0 (division guard).
+        assert!((metrics.error_metrics.error_rate).abs() < f64::EPSILON);
+    }
+
+    /// When both requests and errors are present the error rate must equal
+    /// total_errors / total_request_count (computed across all services).
+    #[tokio::test]
+    async fn test_error_rate_computed_from_requests_and_errors() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        // 2 requests for "svc"
+        collector
+            .record_request_latency("svc", Duration::from_millis(10))
+            .await;
+        collector
+            .record_request_latency("svc", Duration::from_millis(20))
+            .await;
+
+        // 1 error
+        collector
+            .record_error(ErrorEvent {
+                timestamp: Utc::now(),
+                error_type: "E".to_string(),
+                message: "err".to_string(),
+                severity: ErrorSeverity::Error,
+                component: "c".to_string(),
+            })
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        // 1 error / 2 requests = 0.5
+        assert!((metrics.error_metrics.error_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    // --- Model inference recording ---
+
+    /// Model metrics recorded via `record_model_inference` must survive the
+    /// round-trip through `get_current_metrics`.
+    #[tokio::test]
+    async fn test_record_model_inference_persists() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let model_metrics = ModelMetrics {
+            model_name: "test-model".to_string(),
+            tokens_per_second: 42.0,
+            avg_inference_time_ms: 100.0,
+            inference_count: 5,
+            success_rate: 1.0,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.9,
+                consistency: 0.9,
+                accuracy_rate: 0.9,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("test-model", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.model_metrics.contains_key("test-model"));
+        let m = &metrics.model_metrics["test-model"];
+        assert!((m.tokens_per_second - 42.0).abs() < f64::EPSILON);
+    }
+
+    // --- MetricsFormat::Custom error path ---
+
+    /// Requesting export in an unsupported `Custom` format must return an error
+    /// rather than panicking or producing empty output.
+    #[tokio::test]
+    async fn test_custom_metrics_format_returns_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("xml".to_string()))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("xml"));
+    }
+
+    // --- reset_metrics ---
+
+    /// After calling `reset_metrics`, a subsequent `get_current_metrics` must
+    /// return zeroed-out cache counts and an empty request-latency map.
+    #[tokio::test]
+    async fn test_reset_metrics_clears_state() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+        collector.record_cache_hit("k").await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
+
+    // --- Latency percentile edge cases ---
+
+    /// When only one latency sample exists every percentile and the min/max
+    /// must equal that single value.
+    #[tokio::test]
+    async fn test_latency_metrics_single_sample() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("only-svc", Duration::from_millis(123))
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        let lat = &metrics.request_latencies["only-svc"];
+        assert!((lat.avg_latency_ms - 123.0).abs() < f64::EPSILON);
+        assert!((lat.min_latency_ms - 123.0).abs() < f64::EPSILON);
+        assert!((lat.max_latency_ms - 123.0).abs() < f64::EPSILON);
+        assert_eq!(lat.request_count, 1);
+    }
+
+    /// With no cache activity `hit_rate` must be 0.0 (guard against
+    /// division-by-zero in the zero-total branch of `get_cache_metrics`).
+    #[tokio::test]
+    async fn test_cache_metrics_zero_total_returns_zero_rate() {
+        let collector = DefaultMetricsCollector::new();
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!((metrics.cache_metrics.hit_rate).abs() < f64::EPSILON);
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
+
+    // --- MonitoringError display ---
+
+    /// Each `MonitoringError` variant must produce a human-readable `Display`
+    /// string that includes the key context fields, so log messages are useful.
+    #[test]
+    fn monitoring_error_display_contains_context() {
+        let e = MonitoringError::MetricsCollectionFailed {
+            reason: "disk full".to_string(),
+        };
+        assert!(e.to_string().contains("disk full"));
+
+        let e2 = MonitoringError::HealthCheckFailed {
+            component: "ollama".to_string(),
+            reason: "timeout".to_string(),
+        };
+        let s = e2.to_string();
+        assert!(s.contains("ollama"));
+        assert!(s.contains("timeout"));
+
+        let e3 = MonitoringError::AlertSendFailed {
+            reason: "network unreachable".to_string(),
+        };
+        assert!(e3.to_string().contains("network unreachable"));
+    }
 }
