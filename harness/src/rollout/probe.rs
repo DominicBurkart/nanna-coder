@@ -244,17 +244,23 @@ impl HttpProbe for FakeHttpProbe {
 /// Probes over a real HTTP connection with [`reqwest`].
 #[derive(Debug, Clone)]
 pub struct ReqwestProbe {
-    client: reqwest::Client,
+    client: Result<reqwest::Client, String>,
 }
 
 impl ReqwestProbe {
-    /// A probe with a `5s` request timeout.
+    /// A probe with a `5s` request timeout. A client that cannot be built
+    /// does not panic: every probe then fails with a [`HealthError`].
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
+        Self::from_build(
+            reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("static reqwest client config"),
+                .build(),
+        )
+    }
+
+    fn from_build<E: std::fmt::Display>(built: Result<reqwest::Client, E>) -> Self {
+        Self {
+            client: built.map_err(|e| e.to_string()),
         }
     }
 }
@@ -268,9 +274,12 @@ impl Default for ReqwestProbe {
 #[async_trait]
 impl HttpProbe for ReqwestProbe {
     async fn probe(&self, url: &str) -> Result<ProbeResponse, HealthError> {
-        let start = std::time::Instant::now();
-        let response = self
+        let client = self
             .client
+            .as_ref()
+            .map_err(|e| HealthError(format!("{url}: http client unavailable: {e}")))?;
+        let start = std::time::Instant::now();
+        let response = client
             .get(url)
             .send()
             .await
@@ -473,5 +482,41 @@ mod tests {
         let probe = ReqwestProbe::new();
         let err = probe.probe("http://127.0.0.1:1").await.unwrap_err();
         assert!(err.to_string().contains("127.0.0.1:1"));
+    }
+
+    fn unbuildable_probe() -> ReqwestProbe {
+        let build_error = reqwest::Client::new().get("not a url").build().unwrap_err();
+        ReqwestProbe::from_build(Err::<reqwest::Client, _>(build_error))
+    }
+
+    #[tokio::test]
+    async fn unbuildable_client_yields_a_health_error_not_a_panic() {
+        let err = unbuildable_probe()
+            .probe("http://fixture.invalid/health")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("http client unavailable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbuildable_client_is_reported_by_the_health_source_as_total_failure() {
+        let clock = Arc::new(SimulatedClock::new(Utc::now()));
+        let source = EndpointHealthSource::new(
+            "http://fixture.invalid",
+            vec!["/health/v1".to_string()],
+            Arc::new(unbuildable_probe()),
+            clock,
+        );
+        let sample = source.sample(&slot(), Duration::minutes(1)).await.unwrap();
+        assert_eq!(sample.error_rate, 1.0);
+        assert!(sample.endpoint_statuses.is_empty());
+    }
+
+    #[test]
+    fn default_probe_builds_a_working_client() {
+        assert!(ReqwestProbe::default().client.is_ok());
     }
 }
