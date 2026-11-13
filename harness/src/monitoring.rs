@@ -1242,4 +1242,144 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_record_error_and_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let error = ErrorEvent {
+            timestamp: chrono::Utc::now(),
+            error_type: "connection_error".to_string(),
+            message: "Failed to connect".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Error,
+        };
+        collector.record_error(error).await;
+
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3:0.6b".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 120.5,
+            tokens_per_second: 45.0,
+            success_rate: 0.95,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.92,
+                accuracy_rate: 0.88,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 25.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("qwen3:0.6b", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
+        let m = &metrics.model_metrics["qwen3:0.6b"];
+        assert_eq!(m.inference_count, 10);
+        assert!((m.tokens_per_second - 45.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(100))
+            .await;
+        collector.record_cache_hit("k").await;
+
+        collector.reset_metrics().await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.request_latencies.is_empty());
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
+
+    #[tokio::test]
+    async fn test_alert_history_and_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+
+        manager
+            .send_alert("Alert 1", "First alert", AlertSeverity::Info)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 2", "Second alert", AlertSeverity::Warning)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Alert 3", "Third alert", AlertSeverity::Critical)
+            .await
+            .unwrap();
+
+        // History should return most recent first (reversed), limited by count
+        let history = manager.get_alert_history(2).await.unwrap();
+        assert_eq!(history.len(), 2);
+        // Most recent is Alert 3
+        assert_eq!(history[0].title, "Alert 3");
+
+        // Configure thresholds
+        let new_thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            max_cpu_usage: 0.7,
+            max_memory_usage: 0.8,
+            health_check_timeout: Duration::from_secs(10),
+        };
+        manager.configure_thresholds(new_thresholds).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_health_check() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let checks = monitor.comprehensive_health_check().await.unwrap();
+        // Should have at least the system health check
+        assert!(!checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_model_health() {
+        let monitor = DefaultHealthMonitor::new(Duration::from_secs(30));
+        let result = monitor.check_model_health("qwen3:0.6b").await.unwrap();
+        // Model may not be running in CI, so it's Unhealthy or Unknown
+        assert!(matches!(
+            result.status,
+            HealthStatus::Healthy | HealthStatus::Unhealthy | HealthStatus::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_monitoring_system_start_stop() {
+        let mut system = MonitoringSystem::new();
+        // start_monitoring launches a background task; it should not error
+        system.start_monitoring().await.unwrap();
+        // stop_monitoring should cleanly cancel it
+        system.stop_monitoring().await;
+    }
 }
