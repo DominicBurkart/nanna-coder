@@ -6,6 +6,7 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
+use crate::policy::RepoPolicy;
 use crate::protected::{
     ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
 };
@@ -120,6 +121,7 @@ pub struct ToolRegistry {
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
+    pr_binding: crate::pr_binding::PrBindingCell,
 }
 
 struct ProductionHold {
@@ -165,7 +167,12 @@ impl ToolRegistry {
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
+            pr_binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn pr_binding(&self) -> crate::pr_binding::PrBindingCell {
+        self.pr_binding.clone()
     }
 
     /// Attach an action-review gate: every subsequent call to a tool whose
@@ -427,15 +434,24 @@ impl ToolRegistry {
                 .expect("action prior poisoned")
                 .clone(),
         };
+        let bound_pr = self
+            .action_subject
+            .as_ref()
+            .and_then(|subject| self.pr_binding.number_for(&subject.repo));
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
+                let lease_repo = match class {
+                    EffectClass::Sandbox => crate::pr_binding::normalised_repo(&subject.repo)
+                        .unwrap_or_else(|| subject.repo.clone()),
+                    _ => subject.repo.clone(),
+                };
                 let ctx = ActionContext {
                     max_effect: subject.max_effect,
                     window: subject.window.as_deref(),
                     lease: LeaseContext {
-                        repo: &subject.repo,
+                        repo: &lease_repo,
                         branch: subject.branch.as_deref(),
-                        pr: subject.pr,
+                        pr: crate::pr_binding::lease_pr(subject.pr, bound_pr),
                         environment: subject.environment.as_deref(),
                         image: None,
                         paths: &subject.paths,
@@ -3287,7 +3303,9 @@ pub fn create_tool_registry_in_checkout(
     workspace_root: &std::path::Path,
 ) -> Result<ToolRegistry, ProtectedConfigError> {
     let extras = ProtectedExtras::load(workspace_root)?;
-    let protected = ProtectedPaths::for_repo_with_extras(workspace_root, &extras);
+    let policy = RepoPolicy::load(workspace_root)?;
+    let protected =
+        ProtectedPaths::for_repo_with_extras(workspace_root, &extras).with_policy(policy);
     Ok(create_tool_registry_guarded(workspace_root, protected))
 }
 
@@ -4938,6 +4956,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_registry_refuses_a_write_to_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registries = [
+            create_tool_registry(dir.path()),
+            create_tool_registry_for(dir.path(), &identity).unwrap(),
+            create_tool_registry_in_checkout(dir.path()).unwrap(),
+        ];
+        for registry in registries {
+            for path in [".nanna/policy.toml", "crates/api/.nanna/policy.toml"] {
+                let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+                let err = registry.execute("write_file", args).await.unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                    "{path}: {err:?}"
+                );
+                assert!(!dir.path().join(path).exists(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_solo_registry_refuses_every_alias_spelling_of_the_declaration_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = ProtectedPaths::for_repo(dir.path()).with_policy(RepoPolicy::solo());
+        let registry = create_tool_registry_guarded(dir.path(), protected);
+        let spellings = [
+            ".nanna./policy.toml",
+            ".nanna /protected.toml",
+            ".nanna/policy.toml.",
+            ".nanna/policy.toml::$DATA",
+            "NANNA~1/POLICY~1.TOML",
+            ".NANNA/Policy.toml",
+            "crates/e\u{301}/.nanna./policy.toml",
+        ];
+        let mut refused = 0;
+        for path in spellings {
+            let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+            let err = registry.execute("write_file", args).await.unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                "{path}: {err:?}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, spellings.len());
+        assert_eq!(registry.denials().len(), spellings.len());
+    }
+
+    #[tokio::test]
     async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cfg/nanna");
@@ -4987,6 +5056,34 @@ mod tests {
             create_tool_registry_in_checkout(dir.path()),
             Err(ProtectedConfigError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_checkout_registry_is_refused_for_a_bad_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            create_tool_registry_in_checkout(dir.path()),
+            Err(ProtectedConfigError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn a_checkout_registry_accepts_a_valid_solo_or_missing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
     }
 
     #[test]
@@ -5643,6 +5740,70 @@ mod tests {
         let seen = sink.escalations();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].repo, crate::scope::UNSCOPED_IDENTITY);
+    }
+
+    struct LeaseNameRecorder {
+        names: std::sync::Mutex<Vec<(EffectClass, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for LeaseNameRecorder {
+        fn name(&self) -> &str {
+            "lease-name-recorder"
+        }
+
+        async fn review_action(
+            &self,
+            review: &ActionReview,
+            context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            let effect = match review.effect_class {
+                EffectClass::Repository => crate::leases::Effect::Repository,
+                EffectClass::Sandbox => crate::leases::Effect::Sandbox,
+                _ => crate::leases::Effect::Production,
+            };
+            let names = crate::leases::required_leases(effect, &context.lease).unwrap();
+            let joined = names.iter().map(ToString::to_string).collect::<Vec<_>>();
+            self.names
+                .lock()
+                .unwrap()
+                .push((review.effect_class, joined.join(",")));
+            Ok(ActionVerdict::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_sandbox_lease_normalises_the_repository_while_branch_and_deploy_keep_the_raw_spelling(
+    ) {
+        let recorder = Arc::new(LeaseNameRecorder {
+            names: std::sync::Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(ActionGate::new(
+            recorder.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut named = subject(EffectClass::Production);
+        named.repo = "O/N".to_string();
+        named.branch = Some("feat/x".to_string());
+        named.pr = Some(7);
+        named.environment = Some("staging".to_string());
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry.register(StubTool::boxed("sandbox", EffectClass::Sandbox));
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        let registry = registry.with_action_gate(gate, named);
+        for tool in ["push", "sandbox", "deploy"] {
+            registry.execute(tool, json!({})).await.unwrap();
+        }
+        let seen = recorder.names.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (EffectClass::Repository, "branch:O/N:feat/x".to_string()),
+                (EffectClass::Sandbox, "sandbox:o/n:7".to_string()),
+                (EffectClass::Production, "deploy:O/N:staging".to_string()),
+            ]
+        );
     }
 
     fn inspecting_registry(inspector: fn(&str, &Value) -> Result<(), String>) -> ToolRegistry {

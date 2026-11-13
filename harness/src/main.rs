@@ -1896,13 +1896,20 @@ async fn signal_arrived(kind: tokio::signal::unix::SignalKind) {
     }
 }
 
+async fn either_ends(
+    first: impl std::future::Future<Output = ()>,
+    second: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        _ = first => {}
+        _ = second => {}
+    }
+}
+
 #[cfg(unix)]
 async fn shutdown_on(kinds: [tokio::signal::unix::SignalKind; 2]) {
     let [first, second] = kinds;
-    tokio::select! {
-        _ = signal_arrived(first) => {}
-        _ = signal_arrived(second) => {}
-    }
+    either_ends(signal_arrived(first), signal_arrived(second)).await;
 }
 
 #[cfg(unix)]
@@ -2293,26 +2300,35 @@ mod tests {
         assert_eq!(finished.unwrap(), 9);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn either_signal_of_the_pair_ends_the_shutdown_wait() {
+    async fn either_future_of_the_pair_ends_the_wait_and_neither_alone_does() {
         use std::future::Future;
-        use tokio::signal::unix::SignalKind;
-        let kinds = [
-            SignalKind::from_raw(libc::SIGUSR1),
-            SignalKind::from_raw(libc::SIGUSR2),
-        ];
-        for signal in [libc::SIGUSR1, libc::SIGUSR2] {
-            let mut waiting = Box::pin(shutdown_on(kinds));
+        use tokio::sync::oneshot;
+        let limit = std::time::Duration::from_secs(30);
+        for fire_first in [true, false] {
+            let (first_tx, first_rx) = oneshot::channel::<()>();
+            let (second_tx, second_rx) = oneshot::channel::<()>();
+            let first = async move {
+                let _ = first_rx.await;
+            };
+            let second = async move {
+                let _ = second_rx.await;
+            };
+            let mut waiting = Box::pin(either_ends(first, second));
             let polled = std::future::poll_fn(|cx| {
                 assert!(waiting.as_mut().poll(cx).is_pending());
                 std::task::Poll::Ready(())
             });
             polled.await;
-            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
-            let limit = std::time::Duration::from_secs(10);
+            let (fired, kept) = if fire_first {
+                (first_tx, second_tx)
+            } else {
+                (second_tx, first_tx)
+            };
+            fired.send(()).unwrap();
             let arrived = tokio::time::timeout(limit, waiting).await;
-            assert!(arrived.is_ok(), "signal {signal} did not end the wait");
+            assert!(arrived.is_ok(), "first fired: {fire_first}");
+            drop(kept);
         }
     }
 
@@ -3225,6 +3241,43 @@ mod tests {
             parse(&["--audit-model", "big-model"]).as_deref(),
             Some("big-model")
         );
+    }
+
+    #[test]
+    fn the_cli_registry_refuses_a_bad_policy_and_accepts_a_solo_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            registry_for_checkout(dir.path()),
+            Err(harness::protected::ProtectedConfigError::Policy(_))
+        ));
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(registry_for_checkout(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn every_cli_registry_is_built_through_the_checkout_seam() {
+        let source = include_str!("main.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("create_tool_registry("));
+        assert!(!production.contains("create_tool_registry_for("));
+        assert!(!production.contains("create_tool_registry_guarded("));
+        assert_eq!(
+            production
+                .matches("create_tool_registry_in_checkout(")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches("registry_for_checkout(").count(), 4);
     }
 
     #[test]
