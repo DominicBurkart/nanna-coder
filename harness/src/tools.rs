@@ -121,6 +121,7 @@ pub struct ToolRegistry {
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
+    pr_binding: crate::pr_binding::PrBindingCell,
 }
 
 struct ProductionHold {
@@ -166,7 +167,12 @@ impl ToolRegistry {
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
+            pr_binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn pr_binding(&self) -> crate::pr_binding::PrBindingCell {
+        self.pr_binding.clone()
     }
 
     /// Attach an action-review gate: every subsequent call to a tool whose
@@ -428,15 +434,24 @@ impl ToolRegistry {
                 .expect("action prior poisoned")
                 .clone(),
         };
+        let bound_pr = self
+            .action_subject
+            .as_ref()
+            .and_then(|subject| self.pr_binding.number_for(&subject.repo));
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
+                let lease_repo = match class {
+                    EffectClass::Sandbox => crate::pr_binding::normalised_repo(&subject.repo)
+                        .unwrap_or_else(|| subject.repo.clone()),
+                    _ => subject.repo.clone(),
+                };
                 let ctx = ActionContext {
                     max_effect: subject.max_effect,
                     window: subject.window.as_deref(),
                     lease: LeaseContext {
-                        repo: &subject.repo,
+                        repo: &lease_repo,
                         branch: subject.branch.as_deref(),
-                        pr: subject.pr,
+                        pr: crate::pr_binding::lease_pr(subject.pr, bound_pr),
                         environment: subject.environment.as_deref(),
                         image: None,
                         paths: &subject.paths,
@@ -5725,6 +5740,70 @@ mod tests {
         let seen = sink.escalations();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].repo, crate::scope::UNSCOPED_IDENTITY);
+    }
+
+    struct LeaseNameRecorder {
+        names: std::sync::Mutex<Vec<(EffectClass, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for LeaseNameRecorder {
+        fn name(&self) -> &str {
+            "lease-name-recorder"
+        }
+
+        async fn review_action(
+            &self,
+            review: &ActionReview,
+            context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            let effect = match review.effect_class {
+                EffectClass::Repository => crate::leases::Effect::Repository,
+                EffectClass::Sandbox => crate::leases::Effect::Sandbox,
+                _ => crate::leases::Effect::Production,
+            };
+            let names = crate::leases::required_leases(effect, &context.lease).unwrap();
+            let joined = names.iter().map(ToString::to_string).collect::<Vec<_>>();
+            self.names
+                .lock()
+                .unwrap()
+                .push((review.effect_class, joined.join(",")));
+            Ok(ActionVerdict::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_sandbox_lease_normalises_the_repository_while_branch_and_deploy_keep_the_raw_spelling(
+    ) {
+        let recorder = Arc::new(LeaseNameRecorder {
+            names: std::sync::Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(ActionGate::new(
+            recorder.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut named = subject(EffectClass::Production);
+        named.repo = "O/N".to_string();
+        named.branch = Some("feat/x".to_string());
+        named.pr = Some(7);
+        named.environment = Some("staging".to_string());
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry.register(StubTool::boxed("sandbox", EffectClass::Sandbox));
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        let registry = registry.with_action_gate(gate, named);
+        for tool in ["push", "sandbox", "deploy"] {
+            registry.execute(tool, json!({})).await.unwrap();
+        }
+        let seen = recorder.names.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (EffectClass::Repository, "branch:O/N:feat/x".to_string()),
+                (EffectClass::Sandbox, "sandbox:o/n:7".to_string()),
+                (EffectClass::Production, "deploy:O/N:staging".to_string()),
+            ]
+        );
     }
 
     fn inspecting_registry(inspector: fn(&str, &Value) -> Result<(), String>) -> ToolRegistry {
