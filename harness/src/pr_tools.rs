@@ -2078,7 +2078,7 @@ impl Tool for GitCommitTool {
                     "refusing to commit: '{}' is a protected path",
                     escaped(&entry.path)
                 )));
-            } else if entry.worktree != b' ' {
+            } else {
                 if hardlinked_in_worktree(&self.workspace_root, &entry.path) {
                     return Err(failed(format!(
                         "refusing to commit: '{}' has other hard links ({})",
@@ -2086,7 +2086,9 @@ impl Tool for GitCommitTool {
                         crate::protected::HARDLINK_RULE
                     )));
                 }
-                to_stage.push(format!(":(literal){}", entry.path));
+                if entry.worktree != b' ' {
+                    to_stage.push(format!(":(literal){}", entry.path));
+                }
             }
         }
         if !to_stage.is_empty() {
@@ -5555,23 +5557,135 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn linked_repo(alias: &str) -> TempDir {
+        let dir = feature_repo();
+        commit_file(dir.path(), "keep.bin", "original", "partner");
+        let linked = dir.path().join(alias);
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::hard_link(dir.path().join("keep.bin"), linked).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn folded_commit_paths() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"docs/caf\u{e9}/**\", \"tools/release-helper.sh\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn commit_refuses_a_hardlink_reached_through_a_folded_spelling() {
-        for name in ["cafe\u{301}-x.txt.", "tools/RELEAS~1.SH", "plain.txt"] {
-            let dir = feature_repo();
-            let original = dir.path().join("keep.bin");
-            std::fs::write(&original, "original").unwrap();
-            let linked = dir.path().join(name);
-            std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
-            std::fs::hard_link(&original, &linked).unwrap();
+    async fn commit_refuses_an_unprotected_alias_of_a_hardlinked_file() {
+        for name in ["cafe\u{301}-x.txt.", "plain.txt", "tools/OTHER~1.SH"] {
+            let dir = linked_repo(name);
             let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-                .with_protected(combined_declared());
+                .with_protected(folded_commit_paths());
             let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
             assert!(
                 err.to_string().contains("has other hard links"),
                 "{name}: {err}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_leaves_a_folded_protected_alias_out_instead_of_refusing_it_as_a_link() {
+        for name in ["docs/cafe\u{301}./x.md", "tools/RELEAS~1.SH"] {
+            let dir = linked_repo(name);
+            std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+                .with_protected(folded_commit_paths());
+            let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+            assert_eq!(result["committed"], true, "{name}");
+            assert_eq!(
+                result["skipped_protected"].as_array().unwrap().len(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_an_alias_that_is_already_staged() {
+        let dir = linked_repo("alias.txt");
+        git(dir.path(), &["add", "alias.txt"]);
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+        assert_eq!(head_sha(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_nested_git_repository_as_a_hard_link() {
+        let dir = feature_repo();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        git(&nested, &["init", "-q"]);
+        git(&nested, &["config", "user.email", "test@example.com"]);
+        git(&nested, &["config", "user.name", "Test User"]);
+        git(&nested, &["commit", "-q", "--allow-empty", "-m", "nested"]);
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+    }
+
+    #[cfg(unix)]
+    fn nested_repository(dir: &Path, name: &str) {
+        let nested = dir.join(name);
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        git(&nested, &["init", "-q"]);
+        git(&nested, &["config", "user.email", "test@example.com"]);
+        git(&nested, &["config", "user.name", "Test User"]);
+        git(&nested, &["config", "commit.gpgsign", "false"]);
+        git(&nested, &["commit", "-q", "--allow-empty", "-m", "nested"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_staged_gitlink_as_a_hard_link() {
+        let dir = feature_repo();
+        nested_repository(dir.path(), "nested");
+        git(dir.path(), &["add", "nested"]);
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_modified_submodule_as_a_hard_link() {
+        let library = TempDir::new().unwrap();
+        nested_repository(library.path(), ".");
+        let dir = feature_repo();
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                library.path().to_str().unwrap(),
+                "lib",
+            ],
+        );
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["commit", "-q", "-m", "submodule"]);
+        let lib = dir.path().join("lib");
+        git(&lib, &["config", "user.email", "test@example.com"]);
+        git(&lib, &["config", "user.name", "Test User"]);
+        git(&lib, &["config", "commit.gpgsign", "false"]);
+        git(&lib, &["commit", "-q", "--allow-empty", "-m", "moved"]);
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
     }
 
     #[cfg(unix)]

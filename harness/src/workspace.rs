@@ -2340,11 +2340,21 @@ mod tests {
     ];
 
     #[cfg(unix)]
+    fn commit_partner(source: &Path) {
+        std::fs::write(source.join("keep.bin"), "original").unwrap();
+        git_cmd(source).args(["add", "keep.bin"]).output().unwrap();
+        let out = git_cmd(source)
+            .args(["commit", "-m", "partner"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[cfg(unix)]
     fn make_linked_file(root: &Path, name: &str) -> std::io::Result<()> {
         let file = root.join(name);
         std::fs::create_dir_all(file.parent().unwrap())?;
-        std::fs::write(&file, "original")?;
-        std::fs::hard_link(&file, root.join("zz-partner.bin"))
+        std::fs::hard_link(root.join("keep.bin"), file)
     }
 
     #[cfg(unix)]
@@ -2355,6 +2365,7 @@ mod tests {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
             declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
             let hook = Arc::new(RecordingHook {
                 seen: std::sync::Mutex::new(vec![]),
             });
@@ -2380,6 +2391,7 @@ mod tests {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
             declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-fold-link-w"), "HEAD").unwrap();
             make_linked_file(&ws.workspace_path, name).unwrap();
@@ -2400,7 +2412,7 @@ mod tests {
                     matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
                     "{name}: {err:?}"
                 );
-                let partner = std::fs::read_to_string(ws.workspace_path.join("zz-partner.bin"));
+                let partner = std::fs::read_to_string(ws.workspace_path.join("keep.bin"));
                 assert_eq!(partner.unwrap(), "original", "{name}");
             }
             ws.cleanup().unwrap();
@@ -2501,6 +2513,7 @@ mod tests {
                 let source = TempDir::new().unwrap();
                 init_git_repo(source.path());
                 declare(source.path(), FOLDED_LINK_DECLARATION);
+                commit_partner(source.path());
                 if solo {
                     declare_policy(source.path(), b"human_gate = \"solo\"\n");
                 }
@@ -2538,6 +2551,61 @@ mod tests {
                 ws.cleanup().unwrap();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_nested_git_repository_is_not_a_hard_link_violation_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nested"), "HEAD").unwrap();
+        let nested = ws.workspace_path.join("nested");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        init_git_repo(&nested);
+        assert!(ws.extract_changes().unwrap().contains("nested"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_modified_submodule_is_not_a_hard_link_violation_at_extraction() {
+        let library = TempDir::new().unwrap();
+        init_git_repo(library.path());
+        std::fs::create_dir_all(library.path().join("deep/er")).unwrap();
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let add = git_cmd(source.path())
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(library.path())
+            .arg("lib")
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{add:?}");
+        let commit = git_cmd(source.path())
+            .args(["commit", "-m", "submodule"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-submodule"), "HEAD").unwrap();
+        let lib = ws.workspace_path.join("lib");
+        let update = git_cmd(&ws.workspace_path)
+            .args(["-c", "protocol.file.allow=always", "submodule", "update"])
+            .args(["--init"])
+            .output()
+            .unwrap();
+        assert!(update.status.success(), "{update:?}");
+        for args in [
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "-m", "moved"],
+        ] {
+            assert!(git_cmd(&lib).args(args).output().unwrap().status.success());
+        }
+        assert!(ws.extract_changes().unwrap().contains("lib"));
+        ws.cleanup().unwrap();
     }
 
     #[cfg(unix)]

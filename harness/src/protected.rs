@@ -256,11 +256,22 @@ impl AuditHook for NoopAuditHook {}
 /// links.
 pub const HARDLINK_RULE: &str = "hard link (link count above one)";
 
-/// Whether `metadata` describes a file that other names also reach.
+/// Whether `metadata` describes a regular file or symlink that other names
+/// also reach. Directories and other file types are never reported: a
+/// directory's link count counts its subdirectories.
 #[cfg(unix)]
 pub fn is_hardlinked(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    metadata.nlink() > 1
+    let file_type = metadata.file_type();
+    judged_link_count(
+        file_type.is_file() || file_type.is_symlink(),
+        metadata.nlink(),
+    )
+}
+
+#[cfg(unix)]
+fn judged_link_count(regular_or_symlink: bool, links: u64) -> bool {
+    regular_or_symlink && links > 1
 }
 
 /// Whether `metadata` describes a file that other names also reach. Link
@@ -1695,6 +1706,45 @@ mod tests {
         fn many_links_is_hardlinked() {
             let (_dir, metadata) = link_count_fixture(5);
             assert!(is_hardlinked(&metadata));
+        }
+
+        #[test]
+        fn only_regular_files_and_symlinks_are_judged_by_their_link_count() {
+            for (judged, links, expected) in [
+                (true, 1, false),
+                (true, 2, true),
+                (true, 9, true),
+                (false, 1, false),
+                (false, 2, false),
+                (false, 9, false),
+            ] {
+                assert_eq!(
+                    judged_link_count(judged, links),
+                    expected,
+                    "{judged} {links}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_directory_with_subdirectories_is_not_hardlinked() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+            for path in [dir.path().to_path_buf(), dir.path().join("a")] {
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                assert!(!is_hardlinked(&metadata));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_symlink_with_other_names_is_hardlinked() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink("target", &link).unwrap();
+            assert!(!is_hardlinked(&std::fs::symlink_metadata(&link).unwrap()));
+            std::fs::hard_link(&link, dir.path().join("second")).unwrap();
+            assert!(is_hardlinked(&std::fs::symlink_metadata(&link).unwrap()));
         }
 
         #[test]
