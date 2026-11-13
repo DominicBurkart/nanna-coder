@@ -5220,6 +5220,23 @@ mod tests {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_aliasable_name_past_the_component_cap_is_refused_before_the_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            let deep = ["a"; 1_100].join("/");
+            std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": format!("{deep}/CODECO~1.YML"), "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::ALIAS_OVERFLOW_RULE),
+                "{err:?}"
+            );
+        }
+
         #[tokio::test]
         async fn a_symlink_to_a_multiply_linked_file_is_refused_by_the_target_link_count() {
             let dir = tempfile::tempdir().unwrap();
