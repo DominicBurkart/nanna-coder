@@ -1721,10 +1721,10 @@ impl TaskRunner {
                 sidecars,
             )
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| (workspace_error_type(&e), e.to_string()))
         } else {
             TaskWorkspace::create(&queued.repo_path, &task_id.0, &queued.branch)
-                .map_err(|e| e.to_string())
+                .map_err(|e| (workspace_error_type(&e), e.to_string()))
         };
 
         let escalating = Arc::new(crate::escalation::ProtectedPathEscalation::new(
@@ -1735,8 +1735,8 @@ impl TaskRunner {
         let audit: Arc<dyn AuditHook> = explicit.unwrap_or_else(|| escalating.clone());
         let mut workspace = match workspace_result {
             Ok(workspace) => workspace.with_audit_hook(audit),
-            Err(e) => {
-                self.fail(&task_id, e, "WorkspaceCreationFailed").await;
+            Err((error_type, e)) => {
+                self.fail(&task_id, e, error_type).await;
                 return;
             }
         };
@@ -1947,6 +1947,13 @@ pub(crate) fn model_facing_registry(
 
 fn reject(e: crate::leases::LeaseError) -> QueueStoreError {
     QueueStoreError::Rejected(format!("lease recovery failed: {e}"))
+}
+
+fn workspace_error_type(error: &WorkspaceError) -> &'static str {
+    match error {
+        WorkspaceError::OfflineDependencies(_) => "OfflineDependenciesFailed",
+        _ => "WorkspaceCreationFailed",
+    }
 }
 
 /// Stable `error_type` label for an agent failure.
@@ -2469,6 +2476,18 @@ max_concurrent = 1
         assert_eq!(state_error.diagnostics().2, 1);
         assert_eq!(check_failed.diagnostics().2, 2);
         assert_eq!(exceeded.diagnostics().2, 3);
+    }
+
+    #[test]
+    fn test_workspace_error_type_separates_offline_dependency_failures() {
+        assert_eq!(
+            workspace_error_type(&WorkspaceError::OfflineDependencies("x".to_string())),
+            "OfflineDependenciesFailed"
+        );
+        assert_eq!(
+            workspace_error_type(&WorkspaceError::ContainerSetupFailed("x".to_string())),
+            "WorkspaceCreationFailed"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod marker;
 pub mod mcp;
 pub mod monitoring;
 pub mod observability;
+pub mod offline_cargo;
 pub mod onboarding;
 pub mod plan_dispatch;
 pub mod planner;
