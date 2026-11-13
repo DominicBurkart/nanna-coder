@@ -309,6 +309,10 @@ impl TaskWorkspace {
         &self.protected
     }
 
+    pub(crate) fn container_handle(&self) -> Option<&Arc<ContainerHandle>> {
+        self.container_handle.as_ref()
+    }
+
     pub async fn create_with_container(
         source_repo: &Path,
         task_id: &str,
