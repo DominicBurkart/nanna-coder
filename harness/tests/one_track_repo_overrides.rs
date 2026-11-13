@@ -247,7 +247,7 @@ async fn a_widened_one_track_override_fails_the_assignment_closed() {
     let err = handle_assign_task(&params, &manager, &model, &gate(), 20, None)
         .await
         .unwrap_err();
-    assert!(err.contains("widens"), "{err}");
+    assert!(err.message.contains("widens"), "{err}");
     assert!(manager.list().await.is_empty());
 }
 
