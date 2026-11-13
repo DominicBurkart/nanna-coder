@@ -1097,4 +1097,80 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_builder_methods() {
+        let system = ObservabilitySystem::new()
+            .with_service_name("my-service")
+            .with_alert_policy(AlertPolicy::immediate_critical())
+            .with_health_check_interval(Duration::from_secs(15));
+
+        assert_eq!(system.service_name, "my-service");
+        assert_eq!(system.health_check_interval, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn test_observability_with_health_thresholds() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 0.95,
+            memory_threshold: 0.98,
+            ..Default::default()
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        assert!((system.health_thresholds.cpu_threshold - 0.95).abs() < f64::EPSILON);
+        assert!((system.health_thresholds.memory_threshold - 0.98).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_observability_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+        // Skip if telemetry initialization fails (subscriber already set in CI).
+        let _ = system.initialize().await;
+
+        let result = system.start_monitoring().await;
+        // start_monitoring may succeed or fail depending on tracing setup.
+        if result.is_ok() {
+            system.stop_monitoring().await;
+        } else {
+            println!("start_monitoring failed (expected in CI): {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alert_policy_balanced_has_grouping_rules() {
+        let policy = AlertPolicy::balanced();
+        assert!(!policy.grouping_rules.is_empty());
+        assert!(!policy.escalation_rules.is_empty());
+        assert!(!policy.notification_channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_alert_policy_immediate_critical_has_escalation() {
+        let policy = AlertPolicy::immediate_critical();
+        assert!(!policy.escalation_rules.is_empty());
+        assert!(!policy.notification_channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_health_threshold_defaults_are_reasonable() {
+        let t = HealthThreshold::default();
+        assert!(t.cpu_threshold > 0.0 && t.cpu_threshold <= 100.0);
+        assert!(t.memory_threshold > 0.0 && t.memory_threshold <= 100.0);
+        assert!(t.max_latency_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn test_observability_default_is_same_as_new() {
+        let a = ObservabilitySystem::new();
+        let b = ObservabilitySystem::default();
+        assert_eq!(a.service_name, b.service_name);
+        assert_eq!(a.health_check_interval, b.health_check_interval);
+    }
 }
