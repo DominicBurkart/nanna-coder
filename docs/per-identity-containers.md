@@ -574,6 +574,499 @@ It narrows paths, host-side tools (no `git_*`) and limits, and repeats
 capability from `tools` fails the D8 check, so a smaller cargo set needs its
 own subagent and environment.
 
+## Worked example: the cargo dependency reviewer
+
+Ruling, in the user's words: "offline cargo's install can happen when the
+container is built against main. iff new deps are added, a dedicated subagent
+can do a dep review to make sure that it's compliant with the repo's licenses
+and that it passes a security review before the dependency is installed, in an
+environment configured so that malicious code execution cannot lead to a
+security incident or leak, and where computation and memory is bounded and
+external network calls are limited to a small allowlist. This should be a
+default/example nanna subagent specifically for interacting with cargo in rust
+projects."
+
+This section implements that ruling with the schema from D6 to D8. It is the
+reference example of an environment built for hostile input, and of a subagent
+whose capability set is deliberately tiny. Hosts, limits, capability ids and
+commands are proposals. Three things here go beyond the schema above and are
+marked as such: the `[limits]`, `[sandbox]` and `[network]` tables in
+`environment.toml`, the verdict artifact, and the build gate. They are listed
+under "Needs confirmation".
+
+### Lifecycle: dependencies are installed at image build time
+
+1. Installing. The environment image for a Rust repo (`rust-impl`, `rust-fix`,
+   `verify`) is built against the lockfile on `main`. The Containerfile fetches
+   (or vendors) every crate in `Cargo.lock` into the image's offline
+   `CARGO_HOME` and sets `CARGO_NET_OFFLINE=true`. Build runs on the host as
+   the harness's own step (D7), so it may use the network; the agent container
+   never does. Nothing is installed at task time.
+2. Changing. A change that adds or bumps a dependency (a diff to the
+   `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` or
+   `[patch]`/`[replace]` tables, or to the set of `(name, version, checksum)`
+   entries in `Cargo.lock`) first goes through the `cargo-dep-reviewer`
+   subagent. The reviewer reads only the delta against the previously approved
+   lockfile plus the deny policy, and writes a verdict (below).
+3. Gating. Only an `approve` verdict for a dependency lets the image build
+   install it. The build step refuses any lockfile entry whose checksum is not
+   in the approved set. `deny` and `needs-human` leave the dependency
+   uninstalled, so the image does not build with it and no task can compile
+   against it.
+4. Consequence for #1027 and #1031. #1027 stages a host `cargo vendor`
+   directory at task start and mounts it at `/opt/nanna-offline/vendor`, and the
+   work in #1031 refuses a task on a stale or missing `Cargo.lock`. If approved
+   dependencies are already in the image, task-time vendoring is unnecessary
+   for them, and the D11 vendoring gate (step 5) would have little left to
+   gate. This design does not decide that. It is a question for the owners
+   of issues 1027 and 1031: do they keep task-time vendoring for dependencies
+   that have no approved verdict yet (which, with D1's no-fallback rule, would
+   be a second install path that bypasses the reviewer), or retire it in
+   favour of build-time installation? Until they answer, nothing in the
+   migration plan removes their code.
+
+Open point in step 2: the implementer cannot resolve a new lockfile entry
+offline, so someone must produce the proposed `Cargo.lock` delta before the
+reviewer sees it. Options are a harness pre-step that runs `cargo update -p`
+with the same allowlisted egress, or the implementer submitting only a
+`(name, version requirement)` request. Either way the reviewer's input is a
+lockfile, never code the implementer wrote. See "Needs confirmation".
+
+### The card
+
+The card is `cargo-dep-reviewer`. It has no host-side file or git tools beyond
+what the capabilities below expose, no `write_file`, no `git_*`, no `github_*`,
+no `run_command`, and none of `cargo_build`, `cargo_check`, `cargo_test`,
+`cargo_bench` or `cargo_run`. Nothing in its capability set can compile,
+execute a build script, run a test, or run any dependency code.
+
+```toml
+[identity]
+name = "cargo-dep-reviewer"
+description = "Reviews added or bumped Rust dependencies for license compliance, advisories and suspicious build-time code, without executing any of it. Writes a verdict only."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = "prompts/cargo-dep-reviewer.md"
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = []
+read_paths = ["Cargo.toml", "**/Cargo.toml", "Cargo.lock", "deny.toml"]
+max_effect = "workspace"
+tools = [
+  "dep_inventory", "dep_lock_diff", "dep_name_check", "dep_fetch",
+  "dep_read_source", "dep_build_script_scan", "dep_unsafe_scan",
+  "dep_license_check", "dep_advisory_check", "write_verdict",
+]
+
+[environment]
+name = "cargo-dep-review"
+
+[limits]
+max_iterations = 40
+max_wall_clock_secs = 600
+max_concurrent = 2
+```
+
+The ten capability ids are opaque to the harness (D5). Their meaning:
+
+- `dep_inventory`: list every package in `Cargo.lock` with name, version,
+  registry source and checksum, and flag any non-registry source (`git`,
+  `path`, alternative registry). Parses the lockfile itself; does not call
+  cargo.
+- `dep_lock_diff`: compare the proposed lockfile with the previously approved
+  one: added, removed and bumped packages, and the new transitive set each
+  addition drags in.
+- `dep_name_check`: for each new name, report edit distance and common
+  confusions (`-`/`_`, transposition, homoglyphs) against the approved set and
+  a bundled list of popular crate names, and the crate's age and publisher
+  where the index records it.
+- `dep_fetch`: download the `.crate` archives for the new packages through the
+  allowlisted egress, verify each against the lockfile checksum, and unpack
+  them into `/scratch/crates` with size and file-count caps. Unpacking never
+  follows symlinks out of the target directory and never executes anything.
+- `dep_read_source`: print a bounded range of a file from the unpacked crates.
+  This is how the model reads `build.rs` and proc-macro sources.
+- `dep_build_script_scan`: static scan (parse, no compile) of `build.rs` and
+  of crates with `proc-macro = true`: process spawns, network use, filesystem
+  access outside `OUT_DIR`, environment reads, `include!`/`include_bytes!` of
+  paths outside the crate, linker and `cc` flags.
+- `dep_unsafe_scan`: count and locate `unsafe` blocks and `extern` items per
+  new crate (a parse, in the style of cargo-geiger without building).
+- `dep_license_check`: run the repo's `deny.toml` license policy over the new
+  packages.
+- `dep_advisory_check`: check the new packages against the RustSec advisory
+  database, including yanked versions and unmaintained notices.
+- `write_verdict`: write the structured verdict to `/scratch/verdict.json`. It
+  validates the shape and size and is the only way the subagent produces
+  output.
+
+The model's role is bounded on purpose. License, advisory, checksum and
+source-kind outcomes come from deterministic capabilities and the harness
+computes the combined verdict from them: the model can escalate a dependency
+(for example to `needs-human` after reading a suspicious `build.rs`) but cannot
+turn a deterministic `deny` into `approve`. Crate source is attacker-controlled
+text; this rule is what keeps a prompt injection in a README or comment from
+approving anything.
+
+Verdict shape (one object per run, written once):
+
+```json
+{
+  "schema": 1,
+  "lockfile_sha256": "<hash of the proposed Cargo.lock>",
+  "baseline_lockfile_sha256": "<hash of the approved Cargo.lock>",
+  "dependencies": [
+    {
+      "name": "example-crate",
+      "version": "1.2.3",
+      "checksum": "<sha256 from Cargo.lock>",
+      "verdict": "approve | deny | needs-human",
+      "reasons": ["license MIT is allowed by deny.toml"],
+      "evidence": [
+        {"capability": "dep_license_check", "result": "pass"},
+        {"capability": "dep_build_script_scan", "result": "no build.rs"}
+      ]
+    }
+  ]
+}
+```
+
+The harness validates this artifact (schema, size cap, string length caps,
+every dependency in the lockfile delta present exactly once) before anyone
+reads it, and treats a missing, truncated or invalid verdict as not approved.
+
+### The environment
+
+Declaration, at `.nanna/environments/cargo-dep-review/environment.toml`. The
+`[[capability]]` entries are the implementation half of the ten ids above and
+must equal the card's `scope.tools` (D8 rules 2 and 4). `[limits]`,
+`[sandbox]`, `[network]` and `[[input]]` are new keys proposed for this
+example.
+
+```toml
+schema = 1
+name = "cargo-dep-review"
+
+[build]
+containerfile = "Containerfile"
+
+[limits]
+cpus = 1.0
+memory_mb = 1024
+pids = 128
+wall_clock_secs = 600
+tmpfs_mb = 256
+
+[sandbox]
+read_only_root = true
+cap_drop = ["ALL"]
+no_new_privileges = true
+user = "10001:10001"
+env = []
+
+[network]
+mode = "allowlist"
+allow = [
+  "index.crates.io:443",
+  "static.crates.io:443",
+  "github.com:443",
+]
+
+[[input]]
+source = "staged-manifests"
+target = "/input"
+readonly = true
+
+[[capability]]
+id = "dep_inventory"
+description = "List lockfile packages, checksums and source kinds."
+exec = ["nanna-dep", "inventory", "--lock", "/input/Cargo.lock"]
+
+[[capability]]
+id = "dep_lock_diff"
+description = "Diff the proposed lockfile against the approved one."
+exec = ["nanna-dep", "lock-diff", "--new", "/input/Cargo.lock", "--base", "/input/approved/Cargo.lock"]
+
+[[capability]]
+id = "dep_name_check"
+description = "Flag typosquat-like names among new packages."
+exec = ["nanna-dep", "name-check", "--new", "/input/Cargo.lock", "--base", "/input/approved/Cargo.lock"]
+
+[[capability]]
+id = "dep_fetch"
+description = "Download, checksum-verify and unpack new crates without executing them."
+exec = ["nanna-dep", "fetch", "--lock", "/input/Cargo.lock", "--out", "/scratch/crates", "--max-crate-mb", "50", "--max-unpacked-mb", "150"]
+
+[[capability]]
+id = "dep_read_source"
+description = "Print a bounded range of a file from an unpacked crate."
+exec = ["nanna-dep", "read-source", "--root", "/scratch/crates"]
+
+[[capability]]
+id = "dep_build_script_scan"
+description = "Statically scan build.rs and proc-macro crates."
+exec = ["nanna-dep", "scan-build", "--root", "/scratch/crates"]
+
+[[capability]]
+id = "dep_unsafe_scan"
+description = "List unsafe usage in new crates."
+exec = ["nanna-dep", "scan-unsafe", "--root", "/scratch/crates"]
+
+[[capability]]
+id = "dep_license_check"
+description = "Check new packages against the repo's deny.toml license policy."
+exec = ["cargo", "deny", "--frozen", "--manifest-path", "/input/Cargo.toml", "--config", "/input/deny.toml", "check", "licenses"]
+
+[[capability]]
+id = "dep_advisory_check"
+description = "Check new packages against the RustSec advisory database."
+exec = ["nanna-dep", "advisories", "--lock", "/input/Cargo.lock", "--db", "/scratch/advisory-db"]
+
+[[capability]]
+id = "write_verdict"
+description = "Validate and write the verdict artifact."
+exec = ["nanna-dep", "write-verdict", "--out", "/scratch/verdict.json"]
+```
+
+Containerfile sketch (the `rust-impl` image of the same repo is built from
+`main`'s lockfile with its own Containerfile and is not this image):
+
+```dockerfile
+FROM docker.io/library/rust:1-slim-bookworm@sha256:<pinned-digest> AS tools
+RUN cargo install --locked --root /opt/tools \
+      cargo-deny@<pinned> cargo-audit@<pinned>
+COPY nanna-dep/ /src/nanna-dep/
+RUN cargo install --locked --path /src/nanna-dep --root /opt/tools
+
+FROM docker.io/library/debian:bookworm-slim@sha256:<pinned-digest>
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=tools /opt/tools/bin/ /usr/local/bin/
+COPY rustc-info /usr/local/bin/rustc-info
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin reviewer
+ENV CARGO_HOME=/scratch/cargo \
+    CARGO_NET_OFFLINE=true \
+    RUSTC=/usr/local/bin/rustc-info \
+    HTTPS_PROXY=http://egress-proxy:3128
+USER 10001:10001
+WORKDIR /scratch
+CMD ["sleep", "infinity"]
+```
+
+Notes on the sketch:
+
+- `cargo-deny` and cargo need a `rustc` to answer `-vV` and `--print cfg`
+  when they read a manifest. `RUSTC` points at `rustc-info`, a wrapper that
+  answers only those two queries and exits non-zero for anything else, so the
+  image contains no compiler that a capability could reach. This follows D8's
+  caveat: the declaration bounds capabilities, not image contents, and this
+  environment has no `run_command`.
+- Tool versions and base images are pinned by digest so the reviewer itself is
+  reproducible.
+
+Hardening, one key to one container flag, applied by the harness when it
+creates the container and not changeable by the agent:
+
+- Rootless: the harness runs podman rootless; `user` makes the process a
+  non-root user inside it.
+- `read_only_root = true`: `--read-only`. The only writable place is the
+  `/scratch` tmpfs.
+- `cap_drop = ["ALL"]`: `--cap-drop=ALL`, no `--cap-add`.
+- `no_new_privileges = true`: `--security-opt=no-new-privileges`.
+- Default seccomp: no `--security-opt seccomp=` override, so the runtime's
+  default profile applies. No `--privileged`, no devices, no extra namespaces.
+- Mounts: `/input` read-only from a staged copy of the manifests, `Cargo.lock`,
+  the approved lockfile and `deny.toml`. The harness stages only those files
+  (with empty stub targets so cargo can parse the manifests), never the
+  worktree, never `.git`, never `.cargo/config.toml`. `/scratch` is a tmpfs of
+  `tmpfs_mb`. No bind mount is writable.
+- No secrets: `env = []` means the container is created with an empty
+  environment apart from the fixed values in the Containerfile. No `GH_TOKEN`,
+  no registry token, no SSH agent socket, no credential helper, no
+  `~/.cargo/credentials`. The harness does not forward its own environment.
+- Bounds, concrete defaults: `cpus = 1.0` (`--cpus`), `memory_mb = 1024`
+  (`--memory`, with `--memory-swap` equal so swap adds nothing), `pids = 128`
+  (`--pids-limit`), `wall_clock_secs = 600` (the harness kills and removes the
+  container at the deadline, independent of the card's own
+  `max_wall_clock_secs`), `tmpfs_mb = 256` (`--tmpfs /scratch:size=...`).
+  Because a tmpfs is charged to the container's memory cgroup, an oversized
+  crate cannot exceed the memory bound by unpacking to scratch. `nanna-dep
+  fetch` also enforces per-crate caps (50 MiB archive, 150 MiB unpacked, file
+  count) so the usual outcome of an oversized crate is a `needs-human` verdict
+  with the reason `too_large`; the cgroup limit is the backstop, and an
+  out-of-memory kill or timeout is recorded as "not approved".
+
+Network is off unless allowlisted, and the allowlist is enforced outside the
+reviewer process:
+
+- The harness creates a podman network with `--internal` (no route off the
+  host) and attaches the reviewer container to it only. A second container, the
+  egress proxy sidecar, is attached to that network and to a normal one. The
+  reviewer has no DNS resolver of its own and reaches the world only through
+  `HTTPS_PROXY`.
+- The proxy accepts `CONNECT host:443` only, and only for the exact hosts in
+  `allow`; everything else gets a refusal, and it logs every attempt (allowed
+  and denied) to the harness. The proxy runs with the same hardening, belongs
+  to the harness, and its configuration is generated from `[network] allow`,
+  not from anything the reviewer controls.
+- Hosts: `index.crates.io` (sparse index) and `static.crates.io` (crate
+  downloads) for `dep_fetch`; `github.com` only to clone the public
+  `rustsec/advisory-db` repository for `dep_advisory_check`. Advisory data can
+  instead be a snapshot the harness fetches itself and mounts read-only, which
+  removes `github.com` from the allowlist; that is the stricter variant.
+- Alternative to the sidecar: rootless `pasta` outbound rules. They filter by
+  address and port, not hostname, and the crates hosts sit behind a CDN with
+  changing addresses, so the allowlist would be coarse. The proxy is preferred.
+- Because the reviewer is in an internal network, a process that ignores
+  `HTTPS_PROXY` (a direct `connect()`) has no route and fails. That is the
+  property the network test checks.
+
+What the allowlist does not guarantee: the proxy decides by host name, not by
+URL path or content, so any allowed host can be used as a one-way channel by
+anything that already runs inside the container (for example data encoded into
+a request to `static.crates.io`). `github.com` is a broad host: the proxy
+cannot tell `rustsec/advisory-db` from any other repository without terminating
+TLS. A bug in the proxy or in podman's network isolation would break the
+boundary. DNS lookups are done by the proxy for allowed names only.
+
+### How the verdict gates the build
+
+- The reviewer never installs anything. It has no write access to the repo,
+  `CARGO_HOME` is on its own scratch tmpfs, and its only output is the verdict.
+  The harness copies `/scratch/verdict.json` out after the container exits
+  (`podman cp`), validates it, and stores it with the run record.
+- Consumer: the harness's environment image build step. Before building any
+  environment image that contains cargo dependencies, it compares the
+  lockfile's `(name, version, checksum)` set with the repo's approved ledger.
+  Every entry must be in the ledger or have an `approve` verdict whose
+  `lockfile_sha256` matches the lockfile being built. A missing entry fails
+  the build with a distinct error (for example `UnapprovedDependency`), in
+  the same fail-closed posture as D1.
+- On `deny`: the dependency is not installed and the build fails. The verdict
+  and reasons are surfaced to whoever proposed the change (a PR comment posted
+  by the harness, not by the reviewer, which has no GitHub tools). Reversing a
+  `deny` takes a human edit to the repo's policy, not a re-run.
+- On `needs-human`: the build also fails until a human or a repo policy decides.
+  A human decision is an entry in the approved ledger committed through a normal
+  reviewed change. A repo policy is, at most, a declarative rule such as "treat
+  a `needs-human` that carries only the reason `unsafe_present` as approved",
+  stored in protected `.nanna/**` (a human-owned file, per D6). The reviewer
+  subagent never edits the ledger or the policy.
+- The approved ledger (a lockfile-shaped file under `.nanna/`, protected like
+  the environment declarations) is what turns "build against main" into "main
+  contains only reviewed dependencies": merging a dependency change to main
+  is, by construction, a human act that also records the approval.
+
+### Threat model and known non-guarantees
+
+The adversary is a dependency (or a dependency's transitive dependency) whose
+published bytes are malicious, or a lockfile and manifest crafted to mislead
+the tools reading them.
+
+What the design relies on:
+
+- Nothing is executed. No capability compiles, runs `build.rs`, expands a
+  proc-macro, runs a test, or loads a dependency's code. The riskiest steps in
+  Rust supply-chain attacks (`build.rs`, proc-macros, test code) are exactly
+  the ones with no capability. The reviewer only reads bytes, so a malicious
+  crate gets no code execution in any ordinary sense; the attack surface
+  reduces to the parsers and tools that read it (the tar and gzip decoders,
+  the TOML and Rust parsers, `cargo-deny`, `cargo-audit`).
+- Even if one of those tools is exploited, the container has no secrets, no
+  writable mounts besides tmpfs, no capabilities, bounded resources, and a
+  network limited to the proxy allowlist, so the consequence is bounded to
+  wasting the container's time or corrupting its own verdict.
+
+Non-guarantees and residual risks:
+
+- Container escape. A kernel or runtime vulnerability defeats rootless podman
+  with default seccomp; the design reduces the likelihood but does not remove
+  it. Running reviews on a dedicated host or VM is the stronger option and is
+  not required here.
+- A crafted verdict. A compromised tool can write any verdict. The harness
+  limits the damage by computing deterministic outcomes (license, advisory,
+  checksum, source kind) itself where possible and by validating shape, but
+  cannot prove a reviewer's `approve` is honest. The human-merged ledger
+  is the real backstop.
+- Prompt injection. The model reads attacker-controlled text. Only the model's
+  escalation power is open to it (see the card); it cannot override a
+  deterministic `deny`.
+- Malicious data in the lockfile or manifest: path or git sources, alternative
+  registries, `[patch]`, `[source]` replacement, or checksums that point at a
+  different crate than the one named. `dep_inventory` rejects non-registry
+  sources by default, and the staged tree omits `.cargo/config.toml`, but a
+  parser bug in cargo itself reading a hostile `Cargo.toml` remains possible.
+- Advisory database poisoning. The database is fetched from a public repo over
+  the allowlist. A compromised or stale database produces false negatives. The
+  verdict records the database commit; the tool refuses a database older than a
+  configured age (default 7 days); a pinned and signed snapshot is a stronger
+  variant.
+- Review is not proof of safety. A static scan of `build.rs` is heuristic, and
+  a malicious runtime behaviour in a library the repo later executes is not
+  caught by looking at its source for build-time patterns. License and advisory
+  checks only see what is declared and known.
+- Review/install TOCTOU. Between review and install the registry could serve
+  different bytes for the same version. Mitigation: the lockfile pins every
+  package by checksum; the reviewer fetches by that checksum and verifies the
+  digest; the verdict records the checksum; the image build recomputes the
+  checksum of every installed crate and installs only crates whose checksum
+  equals an approved entry. Installed bytes therefore equal reviewed bytes, or
+  the build fails.
+- Allowlist limits (above): host-level only, a possible exfiltration channel
+  for anything already running in the container, and `github.com` is broad.
+- Image contents. For the Containerfile backend nothing proves the image holds
+  only what the declaration says (the existing non-guarantee above). The
+  `rustc-info` wrapper and the absence of `run_command` are what keep a
+  compiler out of reach, not a check by the harness.
+
+### Test plan for the example
+
+Pure tests (no podman) run everywhere; the container tests use the existing
+`#[ignore]` runtime-gated pattern. Each case has a fixture crate in
+`harness/tests/fixtures/dep-review/`.
+
+- Malicious `build.rs`: a crate whose `build.rs` writes a marker file to
+  `/scratch`, touches the network and prints `cargo:rustc-env` lines. Expected:
+  `dep_build_script_scan` reports process, network and filesystem use; the
+  verdict is `deny` or `needs-human`; the marker file never exists, and the
+  run's process list shows no `rustc` or `build-script-build` execution. This
+  is the test that pins "executes nothing".
+- Proc-macro crate that would run code at expansion: the same assertion.
+- License violation: a crate under a licence the fixture `deny.toml` forbids.
+  Expected: `deny` with the licence in `reasons`, regardless of what the model
+  says.
+- Advisory hit: a crate and version with a RustSec advisory (a fixture
+  database snapshot for the pure test). Expected: `deny`; a yanked version
+  likewise; an unmaintained notice yields `needs-human`.
+- Typosquat-like name: `serde_jsn` against an approved `serde_json` and a
+  homoglyph variant. Expected: `needs-human` with the closest legitimate name.
+- Oversized crate: a generated archive over the per-crate cap (`needs-human`,
+  reason `too_large`) and a decompression bomb that bypasses the cap and hits
+  the memory limit. Expected: the container is killed by the cgroup, no verdict
+  or a truncated one, recorded as not approved, host unaffected.
+- Network outside the allowlist: from inside the container, a direct
+  `connect()` to a non-allowlisted address and a proxied `CONNECT` to
+  `example.com:443`. Expected: both fail, the proxy log has the denied entry,
+  and allowed hosts still work. A `dep_fetch` of a crate whose index entry
+  points at another host fails the same way.
+- Hardening: container inspection shows read-only root, empty capability set,
+  `no-new-privileges`, non-root uid, default seccomp, only the expected mounts
+  (read-only `/input`, tmpfs `/scratch`), empty environment (no `GH_TOKEN`),
+  and the configured cpu, memory and pids limits; writes outside `/scratch`
+  fail.
+- Wall clock: a stub tool that sleeps past `wall_clock_secs` is killed and the
+  run is not approved.
+- Schema and registry: the card and declaration resolve (D8) with equal sets;
+  removing any one of the ten ids from either side fails with
+  `CapabilityNotProvided` or `CapabilityNotPermitted`; the card's registry
+  contains no cargo build, run or test tool.
+- Verdict gate: a lockfile entry without an approved checksum fails the image
+  build; a changed checksum for an approved version fails the build
+  (TOCTOU); a verdict for a different `lockfile_sha256` is not accepted;
+  `needs-human` blocks until a ledger entry exists.
+
 ## Test plan
 
 Test names are proposals. Contract tests are written first in each step.
@@ -681,8 +1174,22 @@ not add or change any workflow or CI file.
    module docs; the configuration reference promoted out of this document.
    Hot: none.
 
+8. Cargo dependency reviewer example (see the worked example above). Lands
+   after the environment schema steps: it needs step 1 (card), step 2
+   (declaration and checker, extended with the `[limits]`, `[sandbox]`,
+   `[network]` and `[[input]]` keys), step 3 (Containerfile builder, onboarding
+   for Rust repos) and step 4 (registry runs the declared `exec`). Files: a
+   shipped example card and `cargo-dep-review` environment under
+   `harness/src/onboarding/`, the `nanna-dep` tool crate, the verdict schema and
+   validator, the egress proxy sidecar and network setup, and the
+   approved-ledger check in the image build step in `image-builder/src/lib.rs`.
+   Hot: whichever `task.rs` and `workspace.rs` hunks step 4 touches, and the
+   vendoring question for the owners of 1027 and 1031. The vendoring change
+   (retire or keep task-time vendoring) is not part of this step until they
+   answer.
+
 Steps 1, 2 and 3 can proceed in parallel with the open hot-file PRs. Only
-steps 4, 5 and 6 must wait for them.
+steps 4, 5 and 6 must wait for them. Step 8 waits for steps 1 to 4.
 
 ## Known non-guarantees
 
@@ -721,3 +1228,34 @@ steps 4, 5 and 6 must wait for them.
    `verify.toml` remain a selector over the environment's capabilities?
 5. The `reviewer`, `docs-writer` and `verifier` card values above are
    proposals; confirm ceilings and tool lists.
+6. Schema keys for the dependency reviewer example. The `[limits]` (`cpus`,
+   `memory_mb`, `pids`, `wall_clock_secs`, `tmpfs_mb`), `[sandbox]`
+   (`read_only_root`, `cap_drop`, `no_new_privileges`, `user`, `env`),
+   `[network]` (`mode`, `allow`) and `[[input]]` tables in `environment.toml`
+   are new, and the default values (1 cpu, 1024 MB, 128 pids, 600 s, 256 MB
+   scratch, 50/150 MB crate caps) are proposals. Is a declared network
+   allowlist acceptable at all? D8 says network is derived from the card's
+   ceiling and never an environment property, and the card here has ceiling
+   `workspace`, which means `--network=none`. The example needs a narrow
+   exception (an environment may only move from none to a named allowlist
+   through the proxy, never to open network) or a new ceiling level. Which? And
+   should the sandbox keys be a baseline every environment gets, with
+   environments only able to tighten them?
+7. Lifecycle change for #1027 and #1031. If approved dependencies are installed
+   in the image at build time, task-time vendoring is unnecessary for them. Do
+   the owners of #1027 and #1031 retire it, or keep it for dependencies without
+   a verdict (which would be a second install path)? This document does not
+   decide.
+8. Who consumes the verdict. The design has the image build step consume it
+   against a human-merged approved ledger under protected `.nanna/`, and a
+   human (or a declarative repo policy) decide `needs-human`. Confirm the
+   consumer, the ledger location, and whether any policy auto-approval is
+   allowed at all.
+9. How a branch that adds a dependency gets it. Either the implementer waits
+   for the review and a derived image layer built from the approved delta, or
+   the dependency change merges first and the next image build picks it up.
+   Also who produces the proposed `Cargo.lock` delta offline.
+10. Deterministic-first reviewer. The verdict is computed from deterministic
+    checks and the model may only escalate. Confirm that the model must not be
+    able to turn a `deny` into `approve`, and whether a model should be in the
+    loop at all for the build-script review.
