@@ -18,6 +18,7 @@ pub mod eval;
 pub mod harness_adapter;
 pub mod identity;
 pub mod impact;
+pub mod lean_tool;
 pub mod leases;
 pub mod marker;
 pub mod mcp;
