@@ -3424,6 +3424,13 @@ pub fn create_container_tool_registry_guarded(
             container_handle.clone(),
             wd.clone(),
         )));
+        if crate::kani_tool::manifest_mentions_kani(workspace_root) {
+            registry.register(Box::new(crate::kani_tool::KaniVerifyTool::new(
+                workspace_root.to_path_buf(),
+                container_handle.clone(),
+                container_working_dir,
+            )));
+        }
         let detected = crate::capabilities::detect_capability_locations(workspace_root);
         for (cap, rel) in detected {
             let member_wd = Some(member_working_dir(container_working_dir, &rel));
