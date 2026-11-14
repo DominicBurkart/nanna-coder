@@ -1,0 +1,18 @@
+[identity]
+name = "rust-implementer"
+description = "Implements a scoped issue in the nanna-coder cargo workspace."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = "prompts/rust-implementer.md"
+
+[scope]
+repos = ["github.com/DominicBurkart/nanna-coder"]
+paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**"]
+read_paths = ["harness/**", "image-builder/**", "model/**", "framing/**", "evals/**", "tests/**", "nanna-effects/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "AGENTS.md", "ARCHITECTURE.md", "TESTING.md", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test", "cargo_build"]
+
+[limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4
