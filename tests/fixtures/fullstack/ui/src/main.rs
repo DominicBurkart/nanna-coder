@@ -15,6 +15,11 @@ pub const BUMP_ID: &str = "bump";
 pub const CLICKS_ID: &str = "clicks";
 pub const NAME_ID: &str = "name";
 pub const ECHO_ID: &str = "echo";
+/// DOM id of the button that logs a deliberate `console.error`.
+pub const BOOM_ID: &str = "boom";
+/// Text of the deliberate `console.error`, so a browser test can assert that
+/// the console capture reports it.
+pub const BOOM_MESSAGE: &str = "nanna-fixture-deliberate-error";
 /// Path the page fetches; relative so the api can serve the page.
 pub const GREETING_PATH: &str = "/api/v1/greeting";
 
@@ -29,6 +34,11 @@ pub fn greeting_text(state: Option<&Result<Greeting, String>>) -> String {
         Some(Ok(greeting)) => greeting.message.clone(),
         Some(Err(err)) => format!("error: {err}"),
     }
+}
+
+/// JavaScript run by the `#boom` button.
+pub fn boom_script() -> String {
+    format!("console.error('{BOOM_MESSAGE}')")
 }
 
 pub fn clicks_text(count: u32) -> String {
@@ -64,6 +74,7 @@ fn App() -> Element {
             p { id: GREETING_ID, "{text}" }
             button { id: BUMP_ID, onclick: move |_| count += 1, "bump" }
             p { id: CLICKS_ID, "{clicks}" }
+            button { id: BOOM_ID, onclick: move |_| { document::eval(&boom_script()); }, "boom" }
             textarea { id: NAME_ID, oninput: move |event| name.set(event.value()) }
             p { id: ECHO_ID, "{echo}" }
         }
@@ -91,6 +102,14 @@ mod tests {
         assert_eq!(clicks_text(2), "clicks: 2");
         assert_eq!(echo_text(""), "typed: []");
         assert_eq!(echo_text("abc"), "typed: [abc]");
+    }
+
+    #[test]
+    fn boom_script_logs_the_deliberate_console_error() {
+        assert_eq!(
+            boom_script(),
+            "console.error('nanna-fixture-deliberate-error')"
+        );
     }
 
     #[test]
