@@ -29,7 +29,7 @@ fn tool() -> KaniVerifyTool {
 struct FakePodman {
     _dir: tempfile::TempDir,
     argv_log: PathBuf,
-    saved_path: Option<std::ffi::OsString>,
+    saved_path: std::ffi::OsString,
 }
 
 impl FakePodman {
@@ -50,7 +50,7 @@ impl FakePodman {
         let bin = dir.path().join("podman");
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let saved_path = std::env::var_os("PATH");
+        let saved_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", dir.path());
         Self {
             _dir: dir,
@@ -66,25 +66,18 @@ impl FakePodman {
 
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        match &self.saved_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
+        std::env::set_var("PATH", &self.saved_path);
     }
 }
 
 fn invalid(err: ToolError) -> String {
-    match err {
-        ToolError::InvalidArguments { message } => message,
-        other => panic!("expected InvalidArguments, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    err.to_string()
 }
 
 fn failed(err: ToolError) -> String {
-    match err {
-        ToolError::ExecutionFailed { message } => message,
-        other => panic!("expected ExecutionFailed, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    err.to_string()
 }
 
 #[tokio::test]
@@ -203,13 +196,10 @@ async fn failing_checks_are_clipped() {
 #[serial_test::serial(env_path)]
 async fn no_container_runtime_is_an_execution_error() {
     let dir = tempfile::tempdir().unwrap();
-    let saved = std::env::var_os("PATH");
+    let saved = std::env::var_os("PATH").unwrap_or_default();
     std::env::set_var("PATH", dir.path());
     let outcome = tool().execute(json!({"harness": "check_add"})).await;
-    match saved {
-        Some(path) => std::env::set_var("PATH", path),
-        None => std::env::remove_var("PATH"),
-    }
+    std::env::set_var("PATH", saved);
     assert!(!failed(outcome.unwrap_err()).is_empty());
 }
 
