@@ -501,18 +501,17 @@ pub fn scan_files(
     project: &Path,
     only: Option<&Path>,
 ) -> ToolResult<Vec<FileOffence>> {
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut files = Vec::new();
     match only {
         Some(file) => files.push(file.to_path_buf()),
-        None => collect_lean_files(&root.join(project), &mut files)?,
+        None => collect_lean_files(&base.join(project), &mut files)?,
     }
     files.sort();
-    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut hits = Vec::new();
     for file in files {
         let shown = file
             .strip_prefix(&base)
-            .or_else(|_| file.strip_prefix(root))
             .unwrap_or(&file)
             .display()
             .to_string();

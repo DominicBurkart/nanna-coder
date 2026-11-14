@@ -87,25 +87,18 @@ impl FakePodman {
 
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        match &self.saved_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
+        std::env::set_var("PATH", self.saved_path.clone().unwrap_or_default());
     }
 }
 
 fn invalid(err: ToolError) -> String {
-    match err {
-        ToolError::InvalidArguments { message } => message,
-        other => panic!("expected InvalidArguments, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::InvalidArguments { .. }), "{err:?}");
+    err.to_string()
 }
 
 fn failed(err: ToolError) -> String {
-    match err {
-        ToolError::ExecutionFailed { message } => message,
-        other => panic!("expected ExecutionFailed, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }), "{err:?}");
+    err.to_string()
 }
 
 fn kinds(source: &str) -> Vec<(usize, Forbidden)> {
