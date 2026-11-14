@@ -4118,6 +4118,109 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn qa_click_and_type_evidence_survives_cleanup_in_the_persisted_report() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let store = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46200..=46200,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-click-type",
+            );
+            ws.set_artifact_store(store.path().to_path_buf());
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46200/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46200/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let page = crate::qa::browser::stub::StubPage::new(&[
+                serde_json::json!("complete"),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!("Hello, Nanna"),
+            ]);
+            let calls = Arc::clone(&page.calls);
+            ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let scenario = serde_json::json!({ "steps": [
+                { "step": "goto", "path": "/" },
+                { "step": "click", "selector": "#bump" },
+                { "step": "type", "selector": "#name", "text": "Nanna" },
+                { "step": "expect_text", "selector": "#greeting", "text": "Hello" },
+                { "step": "screenshot", "name": "after-typing" }
+            ] });
+            let browser = registry
+                .execute(
+                    crate::qa::QA_BROWSER_TOOL,
+                    serde_json::json!({ "scenario": scenario }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(browser["passed"], true, "{browser}");
+
+            let summary = ws.persist_qa_summary();
+            let worktree = ws.workspace_path.clone();
+            ws.cleanup().unwrap();
+
+            assert!(!worktree.exists(), "worktree must be gone");
+            assert_eq!(summary.browser_runs, 1);
+            assert_eq!(summary.browser_steps_passed, 5);
+            assert_eq!(summary.browser_steps_failed, 0);
+            let persisted = ws.persisted_qa_dir();
+            assert_eq!(summary.artifacts.len(), 2);
+            for artifact in &summary.artifacts {
+                assert!(Path::new(artifact).starts_with(&persisted), "{artifact}");
+                assert!(Path::new(artifact).is_file(), "{artifact}");
+            }
+            let report_path = persisted.join("browser-1/report.json");
+            assert_eq!(Path::new(&summary.artifacts[0]), report_path.as_path());
+            assert!(persisted.join("browser-1/after-typing.png").is_file());
+            let report: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+            assert_eq!(report["passed"], true);
+            let steps = report["steps"].as_array().unwrap();
+            let outcome = |kind: &str| {
+                steps
+                    .iter()
+                    .find(|s| s["step"]["step"] == kind)
+                    .unwrap_or_else(|| panic!("no {kind} step in {report}"))
+            };
+            let click = outcome("click");
+            assert_eq!(click["step"]["selector"], "#bump");
+            assert_eq!(click["passed"], true);
+            assert_eq!(click["detail"], "clicked `#bump`");
+            let typed = outcome("type");
+            assert_eq!(typed["step"]["selector"], "#name");
+            assert_eq!(typed["step"]["text"], "Nanna");
+            assert_eq!(typed["passed"], true);
+            assert_eq!(typed["detail"], "typed `Nanna` into `#name`");
+            let calls = calls.lock().unwrap().clone();
+            let click_call = format!("evaluate {}", crate::qa::browser::click_expression("#bump"));
+            let type_call = format!(
+                "evaluate {}",
+                crate::qa::browser::type_expression("#name", "Nanna")
+            );
+            assert_eq!(calls.iter().filter(|c| **c == click_call).count(), 1);
+            assert_eq!(calls.iter().filter(|c| **c == type_call).count(), 1);
+        }
+
+        #[tokio::test]
         async fn qa_endpoints_derives_a_manifest_when_the_repo_has_no_checks_file() {
             let source = fixture_repo();
             std::fs::remove_file(source.path().join("CHECKS")).unwrap();
