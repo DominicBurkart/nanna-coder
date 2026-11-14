@@ -315,15 +315,13 @@ impl CoverageReportTool {
     }
 
     fn prefixes(&self) -> Vec<String> {
-        let host = self
-            .workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_root.clone());
-        vec![
+        let root = &self.workspace_root;
+        let mut prefixes = vec![
             self.container_working_dir.clone(),
-            host.display().to_string(),
-            self.workspace_root.display().to_string(),
-        ]
+            root.display().to_string(),
+        ];
+        prefixes.extend(root.canonicalize().map(|p| p.display().to_string()));
+        prefixes
     }
 
     fn run(&self, package: Option<&str>) -> ToolResult<PathBuf> {

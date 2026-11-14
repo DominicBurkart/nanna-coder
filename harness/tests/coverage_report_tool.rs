@@ -65,7 +65,7 @@ fn write_report(dir: &Path, rel: &str, body: &str) {
 struct FakePodman {
     _dir: tempfile::TempDir,
     argv_log: PathBuf,
-    saved_path: Option<std::ffi::OsString>,
+    saved_path: std::ffi::OsString,
 }
 
 impl FakePodman {
@@ -91,7 +91,7 @@ impl FakePodman {
         let bin = dir.path().join("podman");
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let saved_path = std::env::var_os("PATH");
+        let saved_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", dir.path());
         Self {
             _dir: dir,
@@ -107,25 +107,18 @@ impl FakePodman {
 
 impl Drop for FakePodman {
     fn drop(&mut self) {
-        match &self.saved_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
+        std::env::set_var("PATH", &self.saved_path);
     }
 }
 
 fn invalid(err: ToolError) -> String {
-    match err {
-        ToolError::InvalidArguments { message } => message,
-        other => panic!("expected InvalidArguments, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::InvalidArguments { .. }));
+    err.to_string()
 }
 
 fn failed(err: ToolError) -> String {
-    match err {
-        ToolError::ExecutionFailed { message } => message,
-        other => panic!("expected ExecutionFailed, got {other:?}"),
-    }
+    assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    err.to_string()
 }
 
 #[tokio::test]
@@ -174,7 +167,7 @@ async fn tarpaulin_failure_is_an_error_with_redacted_fenced_stderr() {
     let _fake = FakePodman::install(dir.path(), "", false);
     let tool = tool_in(dir.path(), ContainerRuntime::Podman);
     let message = failed(tool.execute(json!({})).await.unwrap_err());
-    assert!(message.starts_with("tarpaulin failed:"));
+    assert!(message.contains("tarpaulin failed:"));
     assert!(!message.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
     assert!(message.contains("&lt;&lt;&lt; boom"));
 }
@@ -215,14 +208,11 @@ async fn a_run_that_writes_no_report_is_an_error() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let saved = std::env::var_os("PATH");
+    let saved = std::env::var_os("PATH").unwrap_or_default();
     std::env::set_var("PATH", stub.path());
     let tool = tool_in(dir.path(), ContainerRuntime::Podman);
     let outcome = tool.execute(json!({})).await;
-    match saved {
-        Some(path) => std::env::set_var("PATH", path),
-        None => std::env::remove_var("PATH"),
-    }
+    std::env::set_var("PATH", saved);
     assert!(failed(outcome.unwrap_err()).contains("No such file"));
 }
 
@@ -323,10 +313,8 @@ async fn report_path_rejects_escapes() {
     let tool = tool_in(dir.path(), ContainerRuntime::None);
     for bad in ["", "/etc/passwd", "../x.json", "a/../../x.json"] {
         let message = invalid(tool.execute(json!({"report_path": bad})).await.unwrap_err());
-        assert!(
-            message.contains("relative path inside the workspace"),
-            "{bad}"
-        );
+        let ok = message.contains("relative path inside the workspace");
+        assert!(ok, "{bad}");
     }
     let message = invalid(
         tool.execute(json!({"report_path": "link/secret.json"}))
@@ -381,9 +369,8 @@ async fn argument_validation() {
     let dir = tempfile::tempdir().unwrap();
     write_report(dir.path(), "r.json", &sample_report());
     let tool = tool_in(dir.path(), ContainerRuntime::None);
-    assert!(
-        invalid(tool.execute(json!({"shell": "x"})).await.unwrap_err()).contains("does not accept")
-    );
+    let message = invalid(tool.execute(json!({"shell": "x"})).await.unwrap_err());
+    assert!(message.contains("does not accept"));
     assert!(invalid(tool.execute(json!(5)).await.unwrap_err()).contains("JSON object"));
     for bad in ["", "-x", "a b", "a;b", "$(x)"] {
         let message = invalid(tool.execute(json!({"package": bad})).await.unwrap_err());
@@ -391,10 +378,8 @@ async fn argument_validation() {
     }
     let long = "a".repeat(101);
     assert!(tool.execute(json!({"package": long})).await.is_err());
-    assert!(
-        invalid(tool.execute(json!({"package": 5})).await.unwrap_err())
-            .contains("must be a string")
-    );
+    let message = invalid(tool.execute(json!({"package": 5})).await.unwrap_err());
+    assert!(message.contains("must be a string"));
     for bad in [json!(0), json!(MAX_FILES + 1), json!("3"), json!(-1)] {
         let message = invalid(
             tool.execute(json!({"report_path": "r.json", "max_files": bad}))
