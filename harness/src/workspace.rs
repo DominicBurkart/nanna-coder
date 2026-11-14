@@ -3772,7 +3772,7 @@ mod tests {
                 assert!(Path::new(artifact).is_file(), "{artifact}");
             }
             let report_path = persisted.join("browser-1/report.json");
-            assert_eq!(summary.artifacts[0], report_path.display().to_string());
+            assert_eq!(Path::new(&summary.artifacts[0]), report_path.as_path());
             assert!(persisted.join("browser-1/after-typing.png").is_file());
             let report: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
