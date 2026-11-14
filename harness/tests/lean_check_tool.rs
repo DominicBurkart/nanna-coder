@@ -424,6 +424,22 @@ async fn failed_build_lists_fenced_errors() {
 
 #[tokio::test]
 #[serial_test::serial(env_path)]
+async fn error_messages_and_paths_are_escaped_and_redacted() {
+    let dir = project(&[]);
+    let _fake = FakePodman::install(
+        "A<b>.lean:1:1: error: <script> token ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
+        "",
+        1,
+    );
+    let result = tool_in(dir.path()).execute(json!({})).await.unwrap();
+    let text = result["errors"].to_string();
+    assert!(text.contains("&lt;script&gt;"));
+    assert!(text.contains("A&lt;b&gt;.lean"));
+    assert!(!text.contains("<script>"));
+}
+
+#[tokio::test]
+#[serial_test::serial(env_path)]
 async fn errors_are_clipped_and_counted() {
     let dir = project(&[]);
     let mut out = String::new();

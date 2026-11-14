@@ -327,7 +327,6 @@ pub fn decide_verdict(exit_ok: bool, errors: usize, offences: usize) -> Verdict 
 pub fn valid_target(target: &str) -> bool {
     !target.is_empty()
         && target.len() <= 200
-        && !target.starts_with('-')
         && !target.contains("..")
         && target.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'@' | b'+')
