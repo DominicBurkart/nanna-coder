@@ -732,7 +732,7 @@ mod tests {
         }
     }
 
-    const MOVED_TO_DECLARATION: [&str; 44] = [
+    const MOVED_TO_DECLARATION: [&str; 45] = [
         "evals/cases/**",
         "harness/src/protected.rs",
         "harness/src/scope.rs",
@@ -777,6 +777,7 @@ mod tests {
         "harness/tests/fixtures/one_track/catalog/auditor.toml",
         "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
         "harness/tests/planner_structural.rs",
+        ".inchworm/**",
     ];
 
     fn declaration_example_path(pattern: &str) -> String {
