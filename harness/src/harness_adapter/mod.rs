@@ -1,6 +1,8 @@
 //! Harness-neutral seam between nanna's agent definitions and the agent
-//! runtimes that execute them. Nothing here runs a runtime yet: the broker,
-//! executor and `TaskRunner` switch are not written, so this module is
+//! runtimes that execute them. Nothing here runs a runtime yet. The seam
+//! (resolve, adapter, isolation policy) is delivered; the host-side `bind` and
+//! `broker` modules exist but nothing calls them: the socket server, the
+//! executor and the `TaskRunner` switch are not written, so this module is
 //! planned infrastructure, not a delivered isolation guarantee.
 //!
 //! An audited spawn ([`Allowed`]) is resolved against
@@ -62,6 +64,14 @@
 //! # }
 //! ```
 
+#[cfg_attr(not(test), expect(dead_code))]
+mod binding;
+#[cfg(test)]
+mod binding_tests;
+#[cfg_attr(not(test), expect(dead_code))]
+mod broker;
+#[cfg(test)]
+mod broker_tests;
 mod checked;
 mod isolation;
 mod pi;
@@ -71,6 +81,10 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use broker::{
+    AuditOutcome, AuditSink, BrokerOutcome, BrokerPolicy, BrokerRequest, BrokerResponse,
+    CallRecord, HaltReason, RingAuditSink, ToolErrorKind, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES,
+};
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
@@ -372,6 +386,8 @@ pub struct ScopeGrant {
     pub paths: Vec<String>,
     /// Readable globs; `None` leaves reads unrestricted inside the worktree.
     pub read_paths: Option<Vec<String>>,
+    /// The identity's tool-name patterns.
+    pub tools: Vec<String>,
 }
 
 /// An audited spawn bound to a task: everything a runtime needs, already
@@ -455,6 +471,12 @@ impl ResolvedAgent {
                 repos: identity.scope.repos.clone(),
                 paths: identity.scope.paths.clone(),
                 read_paths: identity.scope.read_paths.clone(),
+                tools: identity
+                    .scope
+                    .tools
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
             },
             image,
             broker_socket,
@@ -543,6 +565,10 @@ pub struct PlanFile {
 /// other than the broker socket are not expressible here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
+    /// Name of the agent the plan was built for.
+    pub agent: String,
+    /// Model name the runtime is told to use.
+    pub model: String,
     /// Container image.
     pub image: String,
     /// Files to place in the container.

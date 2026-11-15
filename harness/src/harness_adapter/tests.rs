@@ -4,19 +4,22 @@ use crate::identity::AgentIdentity;
 use proptest::prelude::*;
 use std::path::Path;
 
-const SOCKET: &str = "/run/nanna/broker.sock";
+pub(super) const SOCKET: &str = "/run/nanna/broker.sock";
 
-struct Card<'a> {
-    name: &'a str,
-    model: &'a str,
-    paths: &'a str,
-    read_paths: &'a str,
-    effect: &'a str,
-    tools: &'a str,
+pub(super) struct Card<'a> {
+    pub(super) name: &'a str,
+    pub(super) model: &'a str,
+    pub(super) paths: &'a str,
+    pub(super) read_paths: &'a str,
+    pub(super) effect: &'a str,
+    pub(super) tools: &'a str,
+    pub(super) iterations: &'a str,
+    pub(super) repos: &'a str,
+    pub(super) prompt: &'a str,
 }
 
 impl<'a> Card<'a> {
-    fn new(tools: &'a str, effect: &'a str) -> Self {
+    pub(super) fn new(tools: &'a str, effect: &'a str) -> Self {
         Self {
             name: "a",
             model: "gemma4:e4b",
@@ -24,10 +27,13 @@ impl<'a> Card<'a> {
             read_paths: "",
             effect,
             tools,
+            iterations: "7",
+            repos: "[\"r\"]",
+            prompt: "Be careful.",
         }
     }
 
-    fn identity(&self) -> AgentIdentity {
+    pub(super) fn identity(&self) -> AgentIdentity {
         let toml = format!(
             r#"
 [identity]
@@ -35,19 +41,27 @@ name = "{}"
 description = "d"
 loop = "inner"
 model = "{}"
-system_prompt = {{ inline = "Be careful." }}
+system_prompt = {{ inline = "{}" }}
 [scope]
-repos = ["r"]
+repos = {}
 paths = {}
 {}
 max_effect = "{}"
 tools = [{}]
 [limits]
-max_iterations = 7
+max_iterations = {}
 max_wall_clock_secs = 9
 max_concurrent = 2
 "#,
-            self.name, self.model, self.paths, self.read_paths, self.effect, self.tools
+            self.name,
+            self.model,
+            self.prompt,
+            self.repos,
+            self.paths,
+            self.read_paths,
+            self.effect,
+            self.tools,
+            self.iterations
         );
         AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
     }
@@ -73,7 +87,7 @@ fn catalog() -> Vec<CapabilitySpec> {
     .collect()
 }
 
-fn gateway() -> Endpoint {
+pub(super) fn gateway() -> Endpoint {
     Endpoint::new("model-gateway", 11434).unwrap()
 }
 
