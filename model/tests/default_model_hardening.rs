@@ -3,6 +3,7 @@ use model::default_model::*;
 use model::{ChatRequest, ChatResponse, ModelError, ModelInfo, ModelProvider, ModelResult};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 const MODEL_LAYER: &str = "application/vnd.ollama.image.model";
@@ -201,6 +202,7 @@ fn a_manifest_without_a_model_layer_is_rejected_even_with_other_weights() {
     assert!(variant_from_registry("gemma4:x", projector_only, CONFIG).is_err());
 }
 
+#[cfg(target_os = "linux")]
 fn script_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
@@ -213,6 +215,7 @@ fn script_dir() -> std::path::PathBuf {
     dir
 }
 
+#[cfg(target_os = "linux")]
 fn fake_smi(body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = script_dir().join("nvidia-smi");

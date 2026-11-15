@@ -2398,6 +2398,7 @@ mod default_model_startup {
         assert!(err.to_string().contains("no default model"), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     fn serve_registry() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2427,6 +2428,7 @@ mod default_model_startup {
         format!("http://{addr}")
     }
 
+    #[cfg(target_os = "linux")]
     fn all_gemma_pulled() -> Runtime {
         pulled(&[
             "gemma4:e2b",
