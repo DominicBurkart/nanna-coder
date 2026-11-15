@@ -29,20 +29,24 @@
 mod commands;
 mod context;
 mod export;
+mod fail_closed;
 mod gate;
 mod llm;
 mod log;
 mod review;
+mod routing;
 mod rules;
 mod verdict;
 
 pub use context::ActionContext;
 pub(crate) use export::plain;
 pub use export::{ActionAuditEvent, ActionAuditSink, NullSink, TelemetrySink};
+pub use fail_closed::{FailClosedActionAuditor, ACTION_AUDIT_TIMEOUT};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{ActionAuditLog, ActionAuditLogEntry};
 pub use review::ActionReview;
+pub use routing::{is_message_tool, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS};
 pub(crate) use rules::RUN_COMMAND_TOOL;
 pub use rules::{RuleActionAuditor, RULE_ACTION_AUDITOR_NAME};
 pub use verdict::ActionVerdict;
@@ -63,6 +67,12 @@ pub enum ActionAuditError {
     /// An action audit log entry could not be (de)serialized.
     #[error("action audit log entry serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
+    /// The auditor did not answer within its timeout.
+    #[error("action auditor did not answer within {secs}s")]
+    Timeout {
+        /// The timeout that elapsed, in whole seconds.
+        secs: u64,
+    },
 }
 
 /// Reviews a proposed effectful tool call.
