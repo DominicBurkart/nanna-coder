@@ -28,16 +28,6 @@ fn ok(body: impl Into<Vec<u8>>) -> Reply {
     }
 }
 
-fn not_found() -> Reply {
-    Reply {
-        status: 404,
-        headers: Vec::new(),
-        body: b"{}".to_vec(),
-        unannounced_length: false,
-        split_at: None,
-    }
-}
-
 type Seen = Arc<Mutex<Vec<String>>>;
 
 fn spawn_stub(handler: impl Fn(&str) -> Reply + Send + 'static) -> (String, Seen) {
@@ -94,7 +84,7 @@ fn good_registry() -> (String, Seen) {
         } else if path.contains("/manifests/") {
             ok(manifest(CONFIG.len(), 0))
         } else {
-            not_found()
+            unreachable!("only manifests and blobs are requested: {path}")
         }
     })
 }
@@ -605,4 +595,45 @@ async fn a_config_blob_redirect_to_an_ip_literal_is_refused_before_any_request()
         .await
         .unwrap_err();
     assert!(err.to_string().contains("IP address"), "{err}");
+}
+
+#[tokio::test]
+async fn a_manifest_that_is_not_utf8_is_rejected() {
+    let (url, _) = spawn_stub(|_| ok(vec![0xff, 0xfe, 0xfd]));
+    let err = OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not UTF-8"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_nvidia_smi_that_cannot_be_spawned_for_another_reason_is_a_probe_error() {
+    let _guard = smi_lock();
+    let err = probe_device_with("nvidia\0smi", Duration::from_secs(1)).unwrap_err();
+    assert!(err.to_string().contains("cannot run"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_default_probe_reads_this_machine() {
+    let _guard = smi_lock();
+    let cap = probe_device().unwrap();
+    assert!(cap.ram_bytes > 0);
+}
+
+#[test]
+fn probe_errors_name_the_action_the_program_and_the_platform() {
+    let io = std::io::Error::other("boom");
+    let text = smi_error("nvidia-smi", "wait for", &io).to_string();
+    assert!(
+        text.contains("cannot wait for nvidia-smi") && text.contains("boom"),
+        "{text}"
+    );
+    let text = meminfo_error(&io).to_string();
+    assert!(
+        text.contains(std::env::consts::OS) && text.contains("/proc/meminfo"),
+        "{text}"
+    );
 }

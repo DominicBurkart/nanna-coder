@@ -151,11 +151,7 @@ fn query_nvidia_smi(
         {
             return Ok(None)
         }
-        Err(e) => {
-            return Err(ModelError::Unknown {
-                message: format!("cannot run {program}: {e}"),
-            })
-        }
+        Err(e) => return Err(smi_error(program, "run", &e)),
     };
     let mut stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -167,12 +163,15 @@ fn query_nvidia_smi(
     });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
+        let polled = child
+            .try_wait()
+            .map_err(|e| smi_error(program, "wait for", &e))?;
+        match polled {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Ok(None) => {
+            None => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ModelError::Unknown {
@@ -182,15 +181,38 @@ fn query_nvidia_smi(
                     ),
                 });
             }
-            Err(e) => {
-                return Err(ModelError::Unknown {
-                    message: format!("cannot wait for {program}: {e}"),
-                })
-            }
         }
     };
     let text = reader.join().unwrap_or_default();
     Ok(status.success().then(|| parse_nvidia_smi(&text)).flatten())
+}
+
+/// Error for a `nvidia-smi` that could not be run or polled.
+///
+/// ```
+/// let e = std::io::Error::other("boom");
+/// let text = model::default_model::smi_error("nvidia-smi", "run", &e).to_string();
+/// assert!(text.contains("cannot run nvidia-smi") && text.contains("boom"));
+/// ```
+pub fn smi_error(program: &str, action: &str, e: &std::io::Error) -> ModelError {
+    ModelError::Unknown {
+        message: format!("cannot {action} {program}: {e}"),
+    }
+}
+
+/// Error for an unreadable `/proc/meminfo`, naming the platform.
+///
+/// ```
+/// let e = std::io::Error::other("nope");
+/// assert!(model::default_model::meminfo_error(&e).to_string().contains("this platform is"));
+/// ```
+pub fn meminfo_error(e: &std::io::Error) -> ModelError {
+    ModelError::Unknown {
+        message: format!(
+            "device probing needs /proc/meminfo (supported on Linux; this platform is {}): {e}",
+            std::env::consts::OS
+        ),
+    }
 }
 
 fn read_amd_vram() -> Option<u64> {
@@ -220,12 +242,7 @@ pub fn probe_device_with(
     nvidia_smi: &str,
     timeout: std::time::Duration,
 ) -> Result<DeviceCapacity, ModelError> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|e| ModelError::Unknown {
-        message: format!(
-            "device probing needs /proc/meminfo (supported on Linux; this platform is {}): {e}",
-            std::env::consts::OS
-        ),
-    })?;
+    let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|e| meminfo_error(&e))?;
     let gpu = match query_nvidia_smi(nvidia_smi, timeout)? {
         Some(vram) => Some((Accel::Cuda, vram)),
         None => read_amd_vram().map(|vram| (Accel::Rocm, vram)),
@@ -470,22 +487,22 @@ impl VariantCatalog for OllamaRegistryCatalog {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut variants = Vec::new();
-        let mut last_error = None;
+        let mut last_error = ModelError::ServiceUnavailable {
+            message: "no Gemma 4 tags to query".into(),
+        };
         for tag in GEMMA4_TAGS {
             match fetch_variant(&client, &base, tag).await {
                 Ok(variant) => variants.push(variant),
                 Err(e) => {
                     tracing::warn!("skipping gemma4:{tag}: {e}");
-                    last_error = Some(e);
+                    last_error = e;
                 }
             }
         }
-        match (variants.is_empty(), last_error) {
-            (true, Some(e)) => Err(e),
-            (true, None) => Err(ModelError::ServiceUnavailable {
-                message: "no Gemma 4 tags to query".into(),
-            }),
-            _ => Ok(variants),
+        if variants.is_empty() {
+            Err(last_error)
+        } else {
+            Ok(variants)
         }
     }
 }
@@ -594,10 +611,7 @@ fn redirect_refusal(origin: &reqwest::Url, target: &reqwest::Url) -> Option<&'st
     if target.port().is_some() {
         return Some("the target uses a non-default port");
     }
-    let Some(host) = target.host_str() else {
-        return Some("the target host is not a DNS name");
-    };
-    let host = host.trim_end_matches('.');
+    let host = target.host_str().unwrap_or_default().trim_end_matches('.');
     let ip_literal = host
         .trim_start_matches('[')
         .trim_end_matches(']')

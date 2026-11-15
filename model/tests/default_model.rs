@@ -178,6 +178,8 @@ fn param_counts_parse() {
     assert_eq!(parse_params("31b"), Some(31_000_000_000));
     assert_eq!(parse_params("25.2B"), Some(25_200_000_000));
     assert_eq!(parse_params("270M"), Some(270_000_000));
+    assert_eq!(parse_params("500K"), Some(500_000));
+    assert_eq!(parse_params("1.5T"), Some(1_500_000_000_000));
     assert_eq!(parse_params(" 8B "), Some(8_000_000_000));
     for bad in ["", "B", "abc", "-3B", "NaNB", "8", "8X", "infB", "1e400B"] {
         assert_eq!(parse_params(bad), None, "accepted {bad:?}");
