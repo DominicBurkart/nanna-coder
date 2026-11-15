@@ -133,6 +133,9 @@ const SERIAL_ENV_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_co
 
 #[cfg(test)]
 fn require_serial_env_locks(is_locked: impl Fn(&str) -> bool) {
+    if std::thread::current().name() == Some("tokio-runtime-worker") {
+        return;
+    }
     for key in SERIAL_ENV_KEYS {
         if !is_locked(key) {
             panic!(
@@ -954,6 +957,13 @@ mod tests {
     #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     fn require_serial_env_locks_accepts_the_real_serial_locks() {
         require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn require_serial_env_locks_exempts_tokio_worker_threads() {
+        tokio::spawn(async { require_serial_env_locks(|_| false) })
+            .await
+            .unwrap();
     }
 
     #[test]
