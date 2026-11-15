@@ -1,0 +1,18 @@
+[identity]
+name = "sample-app-api"
+description = "Implements a scoped change in the sample-app api tree."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = "prompts/sample-app-api.md"
+
+[scope]
+repos = ["github.com/example/sample-app"]
+paths = ["api/**"]
+read_paths = ["api/**", "ui/**", "shared/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test", "cargo_build"]
+
+[limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4
