@@ -105,6 +105,11 @@ enum Commands {
         /// (falls back to NANNA_PLANNER_MODEL; without either the tool is off)
         #[arg(long)]
         planner_model: Option<String>,
+        #[arg(
+            long,
+            help = "Run audited tasks on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_GATEWAY_SOCKET); off unless given"
+        )]
+        pi_route: bool,
     },
     /// Delegate a coding task through the MCP Tasks protocol.
     ///
@@ -134,6 +139,11 @@ enum Commands {
         /// Name of the agent identity the task runs under
         #[arg(short, long)]
         identity: String,
+        #[arg(
+            long,
+            help = "Run the task on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_GATEWAY_SOCKET); off unless given"
+        )]
+        pi_route: bool,
     },
     /// Pull open GitHub issues into the persistent task queue
     ///
@@ -534,12 +544,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_iterations,
             planner_model,
+            pi_route,
         } => {
             let from_env = std::env::var("NANNA_PLANNER_MODEL").ok();
             let planner = planner_model
                 .or(from_env)
                 .filter(|name| !name.trim().is_empty());
-            run_mcp_server(&model, max_iterations, planner).await?;
+            run_mcp_server(&model, max_iterations, planner, pi_route).await?;
         }
         Commands::Delegate {
             description,
@@ -549,6 +560,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             ttl_ms,
             identity,
+            pi_route,
         } => {
             run_delegate(
                 &description,
@@ -558,6 +570,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_iterations,
                 ttl_ms,
                 &identity,
+                pi_route,
             )
             .await?;
         }
@@ -1808,6 +1821,27 @@ fn build_delegate_task_manager(
     )
 }
 
+fn pi_route_from_env(
+    enabled: bool,
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    Ok(pi_route_with(enabled, &|key| std::env::var_os(key))?)
+}
+
+fn pi_route_with(
+    enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<harness::harness_adapter::PiRoute>, harness::harness_adapter::PiRouteError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let route = harness::harness_adapter::PiRoute::from_lookup(
+        lookup,
+        std::sync::Arc::new(harness::harness_adapter::UnwiredPiExecutor),
+    )?;
+    warn!("the pi route is on and its executor is not wired: every audited task fails closed");
+    Ok(Some(route))
+}
+
 const TELEMETRY_FILE: &str = "telemetry.jsonl";
 const DELEGATE_TELEMETRY_FILE: &str = "telemetry-delegate.jsonl";
 const TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -1933,6 +1967,7 @@ async fn run_mcp_server(
     model: &str,
     max_iterations: usize,
     planner_model: Option<String>,
+    pi_route: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
@@ -1953,7 +1988,8 @@ async fn run_mcp_server(
             plane.clone(),
             &catalog,
         )
-        .await?,
+        .await?
+        .with_pi_route(pi_route_from_env(pi_route)?),
     );
 
     let telemetry = export_action_audit(
@@ -2001,6 +2037,7 @@ async fn run_mcp_server(
 /// in-process server as a client over an in-memory duplex. This dogfoods the
 /// exact wire protocol external orchestrators use, without spawning a child
 /// process.
+#[allow(clippy::too_many_arguments)]
 async fn run_delegate(
     description: &str,
     repo_path: &std::path::Path,
@@ -2009,6 +2046,7 @@ async fn run_delegate(
     max_iterations: usize,
     ttl_ms: Option<u64>,
     identity: &str,
+    pi_route: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
@@ -2018,11 +2056,10 @@ async fn run_delegate(
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
     let plane = resolve_escalation_plane(&queue_path)?;
-    let task_manager = Arc::new(build_delegate_task_manager(
-        provider.clone(),
-        model,
-        plane.clone(),
-    ));
+    let task_manager = Arc::new(
+        build_delegate_task_manager(provider.clone(), model, plane.clone())
+            .with_pi_route(pi_route_from_env(pi_route)?),
+    );
     let telemetry = export_action_audit(
         &task_manager.action_gate(),
         queue_path.with_file_name(DELEGATE_TELEMETRY_FILE),
@@ -3241,6 +3278,57 @@ mod tests {
             parse(&["--audit-model", "big-model"]).as_deref(),
             Some("big-model")
         );
+    }
+
+    #[test]
+    fn the_pi_route_is_off_unless_the_flag_is_passed() {
+        let serve = |extra: &[&str]| {
+            let mut args = vec!["nanna", "mcp-serve"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::McpServe { pi_route, .. } => pi_route,
+                _ => panic!("not mcp-serve"),
+            }
+        };
+        let delegate = |extra: &[&str]| {
+            let mut args = vec![
+                "nanna",
+                "delegate",
+                "-d",
+                "task",
+                "-r",
+                "/tmp/x",
+                "-i",
+                "rust-implementer",
+            ];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Delegate { pi_route, .. } => pi_route,
+                _ => panic!("not delegate"),
+            }
+        };
+        assert!(!serve(&[]));
+        assert!(serve(&["--pi-route"]));
+        assert!(!delegate(&[]));
+        assert!(delegate(&["--pi-route"]));
+    }
+
+    #[test]
+    fn the_pi_route_needs_the_flag_and_host_configuration() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_GATEWAY_SOCKET_ENV => Some(std::ffi::OsString::from(
+                "/run/user/1000/nanna/gateway.sock",
+            )),
+            _ => None,
+        };
+        assert!(pi_route_with(false, &configured).unwrap().is_none());
+        assert!(pi_route_with(false, &|_| None).unwrap().is_none());
+        assert!(pi_route_with(true, &configured).unwrap().is_some());
+        assert!(pi_route_with(true, &|_| None).is_err());
     }
 
     #[test]

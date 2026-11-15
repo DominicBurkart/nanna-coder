@@ -110,6 +110,8 @@ struct Scan {
     calls: BTreeMap<String, usize>,
     item_uses: BTreeSet<String>,
     field_writes: BTreeSet<String>,
+    pi_route_writes: BTreeSet<String>,
+    pi_route_calls: BTreeMap<String, usize>,
     functions: BTreeSet<String>,
     sequences: BTreeMap<String, Calls>,
     audit_tokens: BTreeSet<String>,
@@ -130,6 +132,13 @@ impl Scan {
 
     fn record_call(&mut self, name: &str) {
         let name = plain(name);
+        if name == "with_pi_route" {
+            let function = self.function.last().cloned().unwrap_or_default();
+            *self
+                .pi_route_calls
+                .entry(format!("{}: {function} uses {name}", self.file))
+                .or_default() += 1;
+        }
         let Some(function) = self.function.last().cloned() else {
             if dispatch_name(name) {
                 self.item_uses
@@ -335,6 +344,11 @@ impl<'ast> Visit<'ast> for Scan {
         if node.method == "write" {
             if let syn::Expr::Field(field) = &*node.receiver {
                 if let syn::Member::Named(member) = &field.member {
+                    if member == "pi_route" {
+                        let function = self.function.last().cloned().unwrap_or_default();
+                        self.pi_route_writes
+                            .insert(format!("{}: {function} writes {member}", self.file));
+                    }
                     if member == "escalations" || member == "escalator" {
                         let function = self.function.last().cloned().unwrap_or_default();
                         self.field_writes
@@ -1196,6 +1210,7 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "identities",
             "image_cache",
             "leases",
+            "pi_route",
             "progress",
             "providers",
             "sink",
@@ -1203,6 +1218,45 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "tasks",
         ]),
         "TaskRunner gained or lost a field: if it keeps per-task state, check that it is cleaned up on terminal status, then update this list"
+    );
+}
+
+#[test]
+fn the_pi_route_is_host_configuration_written_only_by_its_builder() {
+    assert_eq!(
+        union(|scan| &scan.pi_route_writes),
+        expected(&["task.rs: TaskManager::with_pi_route writes pi_route"])
+    );
+}
+
+#[test]
+fn only_the_command_line_entry_point_calls_the_pi_route_builder() {
+    assert_eq!(
+        union_counts(|scan| &scan.pi_route_calls),
+        counts(&[
+            ("main.rs: run_delegate uses with_pi_route", 1),
+            ("main.rs: run_mcp_server uses with_pi_route", 1),
+        ]),
+        "something other than main.rs now enables the pi route: it must stay an operator decision, never a request, card or repo setting"
+    );
+}
+
+#[test]
+fn the_pi_route_scanners_see_writes_and_calls_and_skip_test_code() {
+    let scan = scan_source(
+        "x.rs",
+        "impl A { fn builder(self) { *self.runner.pi_route.write().unwrap() = None; } fn other(self) { *self.runner.ci_client.write().unwrap() = None; } fn go(m: M) { m.with_pi_route(r); M::with_pi_route(m, r); dbg!(m.with_pi_route(r)); } } #[cfg(test)] mod t { fn go(m: M) { m.with_pi_route(r); *m.pi_route.write().unwrap() = None; } } fn free() { with_pi_route(); }",
+    );
+    assert_eq!(
+        scan.pi_route_writes,
+        expected(&["x.rs: A::builder writes pi_route"])
+    );
+    assert_eq!(
+        scan.pi_route_calls,
+        counts(&[
+            ("x.rs: A::go uses with_pi_route", 3),
+            ("x.rs: free uses with_pi_route", 1),
+        ])
     );
 }
 
