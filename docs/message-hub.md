@@ -639,20 +639,26 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
 - **No plaintext message content in audit output.** The args of `msg_send`, `session_set_note` and `sessions_query` are the message, note or query itself. Before any append, `ActionAuditLog` (and the registry's in-memory `action_reviews`, which end up in task results) replaces them with `{redacted, keys (only the argument names the tool itself defines, from `known_arguments`; any other key is `?`, because key names are agent-controlled and can be a secret), bytes, hash}` (`redact_for_log`). The hash is the non-cryptographic 64-bit `content_hash`: it lets a reader confirm a guess of the exact content, it neither recovers it nor attests integrity. Telemetry events and escalation evidence carry no args by construction. Every other tool's entries are byte-identical to before. A test plants a token-shaped string and asserts it appears in none of the audit file, telemetry output, escalation evidence or error returned to the agent.
 - **Never silently redacting message bodies** (decision D3). Redaction changes meaning, and the sender learns nothing from it. Summaries *are* redacted, because they have no sender to inform.
 
-### 8.3 Rules layer (`harness/src/hub/audit/rules.rs`)
+### 8.3 Rules layer (`harness/src/action_auditor/message_rules.rs`)
+
+The module lives under `action_auditor` until `harness/src/hub/` exists on main, and moves to `harness/src/hub/audit/rules.rs` with the hub. It takes plain strings, not `OutboundReview`: `RuleMessageAuditor::review(subject, body, window: &[&str]) -> RulesOutcome`, where `window` is the sender's recent outbound bodies to the same recipient, oldest first. `review_field(text) -> Option<Reason>` is the §3.3 write-time check; the caller withholds the field on `Some`.
 
 Rules are checked in this order:
 1. Size and shape: subject ≤120 characters, body ≤8 KiB, valid UTF-8, no NUL.
-2. Unprintable, bidi or zero-width characters lead to `Block(PromptInjection)`.
-3. `redact_resilient(strip_unprintable(body)) != body` leads to `Block(SecretLeak)`.
+2. Unprintable, bidi or zero-width characters lead to `Block(PromptInjection)`. `\r\n` is allowed, a lone `\r` is not. A word of three or more characters that mixes ASCII letters with Cyrillic or Greek letters (homoglyph spelling) leads to the same block.
+3. With `clean = strip_unprintable(text)`, `redact_resilient(clean) != clean` leads to `Block(SecretLeak)`. The comparison is against the stripped text, so a body that merely contains `\r\n` is not a leak; stripped characters are rule 2's business.
 4. PEM blocks, `-----BEGIN … PRIVATE KEY-----` and ssh key prefixes lead to `Block(SecretLeak)`.
 5. Entropy: any token of 24 characters or more drawn from the base64/hex/urlsafe alphabets with Shannon entropy ≥ 4.0 bits/char (base64) or ≥ 3.0 (hex) leads to `Block(SecretLeak)`.
    - Allowlist: git SHAs (40 hex characters in a sha-shaped context), UUIDs, and `sha256:` digests.
-   - Thresholds are tuned against the held-out set in §9.
-6. Decoding: base64 and hex runs of 32 characters or more are decoded once, and rules 3–5 are re-run on the result.
+   - A candidate token is a maximal run of `[A-Za-z0-9+/_-]` with leading and trailing `-`, `_` and `/` removed. Purely numeric tokens and path-like tokens (two or more `/` and every segment low in capitals and digits) are skipped. A run that contains an allowlisted segment (a SHA after `/commit/`) is evaluated without that segment.
+   - A token without a digit, `+` or `/` (an identifier such as `snake_case_name` or `CamelCaseName`) needs `letters_only_bits` = 4.5 instead of 4.0.
+   - Thresholds are tuned only against the dev split `evals/cases/message_dev` (the sweep is in the PR for #1065). The held-out set of §11 belongs to #1067 and is never consulted for tuning.
+6. Decoding: base64 and hex runs of 32 characters or more are decoded once, and rules 3–5 are re-run on the result, as is `injection_findings` (so an encoded injection is a `PromptInjection` block). Decoded text is not decoded again.
 7. `auditor::rules::injection_findings(body)` and `injection_findings(subject)`.
-8. The sliding window: rules 3–6 are run over the concatenation of the sender's outbound window to the same recipient.
-9. Paths matching `SECRET_MARKERS` (`action_auditor/commands.rs:117`) mentioned *together with* content-looking text lead to `Escalate`. A bare mention of a path goes to the model as a signal.
+8. The sliding window: rules 3–6 are run over the last 8 KiB of the sender's outbound window to the same recipient, concatenated with no separator, followed by the new body.
+9. Paths matching `SECRET_MARKERS` (`action_auditor/commands.rs`, widened to `pub(super)`) mentioned *together with* content-looking text lead to `Quarantine(SecretLeak)` (the outbound `Escalate`). A marker counts only at a path boundary (`process.env` and `object.keys` do not match `.env` and `.key`). Content-looking text is a code fence, three or more `key=value` lines, or a token of 16 or more characters with a digit and entropy of 3.5 or more that is not allowlisted. A bare mention goes to the model as a `RuleSignal::CredentialPathMentioned`.
+
+A rule `Block` is final: `RulesOutcome::combine(model_verdict)` returns it unchanged; a rule `Quarantine` can only be kept or merged with the model's reasons. Reasons carry the rule number and place, never the matched text. `EntropyThresholds` with a non-finite value falls back to its default and `min_len` is raised to at least 8, so a bad configuration cannot disable rule 5.
 
 ### 8.4 Model layer (`harness/src/hub/audit/llm.rs`)
 
@@ -748,6 +754,12 @@ impl ActionAuditor for RoutingActionAuditor {
        before returning Escalate. A failed write is still Escalate, but is logged (`tracing::error`) and a reason
        line "quarantine record not written" is appended so the human sees it. */
 }
+
+// action_auditor/message_rules.rs (#1065, re-exported from action_auditor): MessageVerdict (above),
+// RuleSignal, RulesOutcome { verdict, signals } with combine(model_verdict), EntropyThresholds
+// { min_len, base64_bits, hex_bits, letters_only_bits }, and RuleMessageAuditor::{new, with_thresholds,
+// review(subject, body, window: &[&str]), review_field(text) -> Option<Reason>}. The MessageAuditor trait,
+// OutboundReview and InboundReview arrive with #1066.
 
 // auditor/verdict.rs: ReasonCode gains SecretLeak and CrossScopeSteering.
 // ReasonCode::ALL grows to 12; the auditor_heldout manifest/digests in
@@ -914,7 +926,7 @@ Dependencies and known limits:
 | Pagination | Proptest: across a snapshot, the concatenation of pages equals the ranked list, with no duplicates or skips, under concurrent inserts and status changes. A cursor is never usable by another owner or root. `n <= 20` gives no cursor. Groups appear only when `n > 20`. Kani: page index arithmetic never goes out of bounds. |
 | Visibility | Every hub read with a foreign-root or unknown id returns an identical `NotVisible`, including the error text (oracle test). |
 | Reach | Table test over `none/lineage/root` × relation; `narrows()` rejects widening `message_reach`. |
-| Audit rules | Unit per rule. A held-out set `evals/cases/message_heldout/*.toml` holds ≥ 60 cases: ≥ 20 deliver, ≥ 20 block, ≥ 10 quarantine, ≥ 15 adversarial (split secrets, base64/rot13, homoglyphs, zero-width, confused deputy, collusion, fake approvals). Each case has an expected verdict per layer. `harness/tests/message_heldout_cases.rs` asserts **zero false deliver** for the rules layer and a frozen manifest with digests, mirroring `auditor_heldout_cases.rs`. |
+| Audit rules | Unit per rule. A dev split `evals/cases/message_dev/*.toml` (≥ 30 cases, tokens generated at test time) is the only data entropy thresholds are tuned on. A held-out set `evals/cases/message_heldout/*.toml` holds ≥ 60 cases: ≥ 20 deliver, ≥ 20 block, ≥ 10 quarantine, ≥ 15 adversarial (split secrets, base64/rot13, homoglyphs, zero-width, confused deputy, collusion, fake approvals). Each case has an expected verdict per layer. `harness/tests/message_heldout_cases.rs` asserts **zero false deliver** for the rules layer and a frozen manifest with digests, mirroring `auditor_heldout_cases.rs`. |
 | Model auditor | An offline scripted provider covers prompt fencing, fence forgery, unparsable output (Quarantine) and timeout (Quarantine with `ModelFailure`). Live-model scoring reuses the `model_eval`-style binary flag (`--cases evals/cases/message_heldout --max-false-allow 0`), run by humans or the release session, with **no new workflow**. |
 | Gate wiring | `msg_send` with no gate attached is refused. `RoutingActionAuditor` leaves non-message tools unchanged (regression on existing gate tests). The fixed `inspects_content` list is pinned. |
 | Single door | The `syn` structural test from §9.3. The librarian registry contains exactly `index_search` and `index_read`. |

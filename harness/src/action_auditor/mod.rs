@@ -33,6 +33,7 @@ mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+mod message_rules;
 mod review;
 mod routing;
 mod rules;
@@ -45,6 +46,9 @@ pub use fail_closed::{FailClosedActionAuditor, ACTION_AUDIT_TIMEOUT};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
+pub use message_rules::{
+    EntropyThresholds, MessageVerdict, RuleMessageAuditor, RuleSignal, RulesOutcome,
+};
 pub use review::ActionReview;
 pub use routing::{
     is_message_tool, known_arguments, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS,
