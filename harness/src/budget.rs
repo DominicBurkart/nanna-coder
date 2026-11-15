@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -798,6 +798,7 @@ pub struct CostAccountant {
     store: Arc<dyn BudgetStore>,
     config: BudgetConfig,
     escalator: Option<Arc<Escalator>>,
+    telemetry: OnceLock<Arc<crate::telemetry::TelemetrySystem>>,
 }
 
 impl CostAccountant {
@@ -810,7 +811,47 @@ impl CostAccountant {
             store,
             config,
             escalator: None,
+            telemetry: OnceLock::new(),
         }
+    }
+
+    #[doc = r#"Attach the telemetry system that receives the budget counters after every charge or minutes record; the first attachment wins and a later one is refused.
+
+```
+use harness::budget::{BudgetClass, CostAccountant, InMemoryBudgetStore};
+use harness::budget::BudgetConfig;
+use harness::telemetry::TelemetrySystem;
+use std::sync::Arc;
+
+let accountant = CostAccountant::new(Arc::new(InMemoryBudgetStore::new()), BudgetConfig::default());
+let telemetry = Arc::new(TelemetrySystem::new());
+assert!(accountant.set_telemetry(Arc::clone(&telemetry)));
+assert!(!accountant.set_telemetry(Arc::new(TelemetrySystem::new())));
+assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+```"#]
+    pub fn set_telemetry(&self, telemetry: Arc<crate::telemetry::TelemetrySystem>) -> bool {
+        self.telemetry.set(telemetry).is_ok()
+    }
+
+    fn emit(
+        &self,
+        ceiling: &BudgetLimits,
+        identity: &str,
+        task_id: &str,
+        class: BudgetClass,
+        now: DateTime<Utc>,
+    ) {
+        let Some(telemetry) = self.telemetry.get() else {
+            return;
+        };
+        crate::budget_export::BudgetObservation {
+            identity: identity.to_string(),
+            class,
+            task: self.store.task_usage(identity, task_id, class),
+            day: self.store.day_usage(identity, class, now.date_naive()),
+            limits: self.config.limits(class).narrowed(ceiling),
+        }
+        .record(telemetry);
     }
 
     pub fn with_escalator(mut self, escalator: Arc<Escalator>) -> Self {
@@ -875,6 +916,22 @@ impl CostAccountant {
         class: BudgetClass,
         now: DateTime<Utc>,
     ) -> Result<BudgetReport, BudgetError> {
+        let decided = self
+            .decide_charge(ceiling, identity, task_id, repo, class, now)
+            .await;
+        self.emit(ceiling, identity, task_id, class, now);
+        decided
+    }
+
+    async fn decide_charge(
+        &self,
+        ceiling: &BudgetLimits,
+        identity: &str,
+        task_id: &str,
+        repo: &str,
+        class: BudgetClass,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetReport, BudgetError> {
         let limits = self.config.limits(class).narrowed(ceiling);
         let key = ChargeKey {
             identity,
@@ -901,6 +958,20 @@ impl CostAccountant {
         minutes: f64,
         now: DateTime<Utc>,
     ) -> Result<BudgetReport, BudgetError> {
+        let decided = self.apply_minutes_sync(identity, task_id, repo, class, minutes, now);
+        self.emit(&BudgetLimits::UNLIMITED, identity, task_id, class, now);
+        decided
+    }
+
+    fn apply_minutes_sync(
+        &self,
+        identity: &str,
+        task_id: &str,
+        repo: &str,
+        class: BudgetClass,
+        minutes: f64,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetReport, BudgetError> {
         let key = ChargeKey {
             identity,
             task_id,
@@ -913,6 +984,22 @@ impl CostAccountant {
     }
 
     pub async fn record_minutes(
+        &self,
+        identity: &str,
+        task_id: &str,
+        repo: &str,
+        class: BudgetClass,
+        minutes: f64,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetReport, BudgetError> {
+        let decided = self
+            .apply_minutes(identity, task_id, repo, class, minutes, now)
+            .await;
+        self.emit(&BudgetLimits::UNLIMITED, identity, task_id, class, now);
+        decided
+    }
+
+    async fn apply_minutes(
         &self,
         identity: &str,
         task_id: &str,
@@ -2566,5 +2653,246 @@ mod tests {
                 .minutes,
             0.5
         );
+    }
+
+    type Captured = Arc<Mutex<Vec<crate::telemetry::MetricPoint>>>;
+
+    fn observed(
+        config: BudgetConfig,
+    ) -> (
+        CostAccountant,
+        Arc<crate::telemetry::TelemetrySystem>,
+        Captured,
+    ) {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let system = crate::telemetry::TelemetrySystem::new()
+            .add_exporter(Box::new(MetricCapture(Arc::clone(&captured))));
+        let telemetry = Arc::new(system);
+        let accountant = accountant(config);
+        assert!(accountant.set_telemetry(Arc::clone(&telemetry)));
+        (accountant, telemetry, captured)
+    }
+
+    fn value_of(
+        points: &[crate::telemetry::MetricPoint],
+        name: &str,
+        scope: &str,
+        kind: &str,
+    ) -> Option<f64> {
+        let found = points
+            .iter()
+            .find(|m| m.name == name && m.labels["scope"] == scope && m.labels["kind"] == kind);
+        found.map(|m| m.value)
+    }
+
+    fn count_limit(per_task: u32, per_day: u32) -> BudgetConfig {
+        let limits = BudgetLimits {
+            max_count_per_task: Some(per_task),
+            max_count_per_day: Some(per_day),
+            ..BudgetLimits::UNLIMITED
+        };
+        BudgetConfig {
+            ci: limits,
+            sandbox: limits,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charge_exports_spent_limit_and_remaining_for_its_class_only() {
+        let (accountant, telemetry, captured) = observed(count_limit(3, 10));
+        let class = BudgetClass::Ci;
+        accountant
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .unwrap();
+        accountant
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .unwrap();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert!(points.iter().all(|m| m.labels["class"] == "ci"));
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_spent", "task", "count"),
+            Some(2.0)
+        );
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_limit", "task", "count"),
+            Some(3.0)
+        );
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_remaining", "task", "count"),
+            Some(1.0)
+        );
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_remaining", "day", "count"),
+            Some(8.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_charge_is_exported_as_sandbox() {
+        let (accountant, telemetry, captured) = observed(count_limit(3, 10));
+        let class = BudgetClass::Sandbox;
+        accountant
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .unwrap();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert!(!points.is_empty() && points.iter().all(|m| m.labels["class"] == "sandbox"));
+    }
+
+    #[tokio::test]
+    async fn a_denied_charge_is_exported_with_nothing_remaining_and_the_same_result() {
+        let (watched, telemetry, captured) = observed(count_limit(1, 10));
+        let plain = accountant(count_limit(1, 10));
+        let class = BudgetClass::Ci;
+        for _ in 0..2 {
+            let with = watched.charge_count("id", "t1", "o/n", class, now()).await;
+            let without = plain.charge_count("id", "t1", "o/n", class, now()).await;
+            assert_eq!(with, without);
+        }
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_spent", "task", "count"),
+            Some(1.0)
+        );
+        assert_eq!(
+            value_of(&points[8..], "nanna_budget_remaining", "task", "count"),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_minutes_exports_the_minutes_counters_even_when_it_is_refused() {
+        let (accountant, telemetry, captured) = observed(BudgetConfig::default());
+        let class = BudgetClass::Ci;
+        accountant
+            .record_minutes("id", "t1", "o/n", class, 7.5, now())
+            .await
+            .unwrap();
+        accountant
+            .record_minutes_sync("id", "t1", "o/n", class, 2.5, now())
+            .unwrap();
+        accountant
+            .record_minutes_sync("id", "t1", "o/n", class, f64::NAN, now())
+            .unwrap_err();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert_eq!(points.len(), 3 * 12);
+        assert_eq!(
+            value_of(&points[..12], "nanna_budget_spent", "task", "minutes"),
+            Some(7.5)
+        );
+        assert_eq!(
+            value_of(&points[12..24], "nanna_budget_spent", "task", "minutes"),
+            Some(10.0)
+        );
+        assert_eq!(
+            value_of(&points[24..], "nanna_budget_remaining", "day", "minutes"),
+            Some(590.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlimited_dimension_exports_spent_only() {
+        let (accountant, telemetry, captured) = observed(BudgetConfig::UNLIMITED);
+        let class = BudgetClass::Ci;
+        accountant
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .unwrap();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert_eq!(points.len(), 4);
+        assert!(points.iter().all(|m| m.name == "nanna_budget_spent"));
+    }
+
+    #[tokio::test]
+    async fn the_exported_labels_are_exactly_the_four_bounded_ones_and_never_the_task_or_repo() {
+        let (accountant, telemetry, captured) = observed(count_limit(3, 10));
+        let identity = "agent with spaces/and@odd\nchars";
+        accountant
+            .charge_count(
+                identity,
+                "secret-task-id",
+                "secret/repo",
+                BudgetClass::Ci,
+                now(),
+            )
+            .await
+            .unwrap();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        let allowed: std::collections::BTreeSet<&str> =
+            ["class", "identity", "kind", "scope"].into_iter().collect();
+        for point in &points {
+            let keys: std::collections::BTreeSet<&str> =
+                point.labels.keys().map(String::as_str).collect();
+            assert_eq!(keys, allowed);
+            assert_eq!(point.labels["identity"], "agent?with?spaces?and?odd?chars");
+            assert!(!format!("{point:?}").contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_charges_cannot_grow_the_telemetry_buffer_past_its_cap() {
+        let (accountant, telemetry, _) = observed(BudgetConfig::UNLIMITED);
+        let flood = crate::telemetry::MAX_BUFFERED_METRICS;
+        for _ in 0..flood {
+            accountant
+                .charge_count("id", "t1", "o/n", BudgetClass::Ci, now())
+                .await
+                .unwrap();
+        }
+        assert!(telemetry.get_buffered_metrics_count() <= crate::telemetry::MAX_BUFFERED_METRICS);
+        assert!(telemetry.dropped_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn overshooting_minutes_report_zero_remaining_never_negative() {
+        let (accountant, telemetry, captured) = observed(BudgetConfig::default());
+        let class = BudgetClass::Ci;
+        accountant
+            .record_minutes("id", "t1", "o/n", class, 400.0, now())
+            .await
+            .unwrap();
+        telemetry.export_all().await.unwrap();
+        let points = captured.lock().unwrap().clone();
+        assert_eq!(
+            value_of(&points, "nanna_budget_spent", "task", "minutes"),
+            Some(400.0)
+        );
+        assert_eq!(
+            value_of(&points, "nanna_budget_remaining", "task", "minutes"),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn the_first_telemetry_attachment_wins() {
+        let (accountant, _, _) = observed(BudgetConfig::UNLIMITED);
+        let second = Arc::new(crate::telemetry::TelemetrySystem::new());
+        assert!(!accountant.set_telemetry(Arc::clone(&second)));
+        accountant
+            .record_minutes_sync("id", "t1", "o/n", BudgetClass::Ci, 1.0, now())
+            .unwrap();
+        assert_eq!(second.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_accountant_without_telemetry_still_decides() {
+        let silent = accountant(count_limit(1, 10));
+        let class = BudgetClass::Ci;
+        silent
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .unwrap();
+        assert!(silent
+            .charge_count("id", "t1", "o/n", class, now())
+            .await
+            .is_err());
     }
 }
