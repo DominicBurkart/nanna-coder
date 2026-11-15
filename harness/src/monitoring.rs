@@ -1242,4 +1242,168 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_record_error_appears_in_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        let error = ErrorEvent {
+            timestamp: chrono::Utc::now(),
+            error_type: "timeout".to_string(),
+            message: "connection timed out".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Error,
+        };
+        collector.record_error(error).await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert_eq!(metrics.error_metrics.recent_errors.len(), 1);
+        assert_eq!(metrics.error_metrics.recent_errors[0].error_type, "timeout");
+    }
+
+    #[tokio::test]
+    async fn test_record_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+        let model_metrics = ModelMetrics {
+            model_name: "llama3".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 250.0,
+            tokens_per_second: 40.0,
+            success_rate: 0.99,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.88,
+                accuracy_rate: 0.92,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 4096.0,
+                avg_cpu_percent: 0.75,
+                gpu_utilization_percent: Some(0.9),
+            },
+        };
+        collector
+            .record_model_inference("llama3", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert!(metrics.model_metrics.contains_key("llama3"));
+        assert_eq!(metrics.model_metrics["llama3"].inference_count, 10);
+    }
+
+    #[tokio::test]
+    async fn test_alert_history_with_limit() {
+        let manager = DefaultAlertManager::new();
+
+        for i in 0..5 {
+            manager
+                .send_alert(&format!("Alert {}", i), "description", AlertSeverity::Info)
+                .await
+                .unwrap();
+        }
+
+        let history = manager.get_alert_history(3).await.unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_variants() {
+        let manager = DefaultAlertManager::new();
+
+        manager
+            .send_alert("Critical alert", "desc", AlertSeverity::Critical)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Error alert", "desc", AlertSeverity::Error)
+            .await
+            .unwrap();
+        manager
+            .send_alert("Info alert", "desc", AlertSeverity::Info)
+            .await
+            .unwrap();
+
+        let active = manager.get_active_alerts().await.unwrap();
+        assert_eq!(active.len(), 3);
+
+        let severities: Vec<_> = active.iter().map(|a| &a.severity).collect();
+        assert!(severities.contains(&&AlertSeverity::Critical));
+        assert!(severities.contains(&&AlertSeverity::Error));
+        assert!(severities.contains(&&AlertSeverity::Info));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_nonexistent_alert_is_error() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("nonexistent-id").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let new_thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.5,
+            max_error_rate: 0.1,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.85,
+            health_check_timeout: Duration::from_secs(10),
+        };
+        manager.configure_thresholds(new_thresholds).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Critical > AlertSeverity::Error);
+        assert!(AlertSeverity::Error > AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning > AlertSeverity::Info);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_errors_tracked_in_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        for _ in 0..3 {
+            collector
+                .record_error(ErrorEvent {
+                    timestamp: chrono::Utc::now(),
+                    error_type: "io_error".to_string(),
+                    message: "disk write failed".to_string(),
+                    component: "storage".to_string(),
+                    severity: ErrorSeverity::Critical,
+                })
+                .await;
+        }
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 3);
+        assert_eq!(metrics.error_metrics.errors_by_type["io_error"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_zero_cache_requests_hit_rate() {
+        let collector = DefaultMetricsCollector::new();
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.cache_metrics.hit_rate, 0.0);
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+    }
 }
