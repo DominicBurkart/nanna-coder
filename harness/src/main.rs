@@ -95,9 +95,13 @@ enum Commands {
     },
     /// Run as an MCP server over stdio
     McpServe {
-        /// The model to use for agent tasks
-        #[arg(short, long, default_value = "qwen3:0.6b")]
-        model: String,
+        /// The default model, also the auditor model (falls back to NANNA_MODEL;
+        /// without either, the largest Gemma 4 variant this device can run)
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Model that audits spawns and actions (defaults to the default model)
+        #[arg(long)]
+        audit_model: Option<String>,
         /// Maximum agent iterations per task
         #[arg(long, default_value = "100")]
         max_iterations: usize,
@@ -125,6 +129,10 @@ enum Commands {
         /// The model to use; must be the identity's model (default: the identity's model)
         #[arg(short, long)]
         model: Option<String>,
+        /// Model that audits spawns and actions (defaults to the default model:
+        /// NANNA_MODEL, else the largest Gemma 4 variant this device can run)
+        #[arg(long)]
+        audit_model: Option<String>,
         /// Maximum agent iterations
         #[arg(long, default_value = "100")]
         max_iterations: usize,
@@ -162,7 +170,7 @@ enum Commands {
         model: String,
         #[arg(
             long,
-            help = "Model that reviews each candidate spawn after the rules (rules-only when absent)"
+            help = "Model that reviews each candidate spawn after the rules (defaults to --model)"
         )]
         audit_model: Option<String>,
         /// Maximum agent iterations per task
@@ -532,6 +540,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::McpServe {
             model,
+            audit_model,
             max_iterations,
             planner_model,
         } => {
@@ -539,13 +548,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let planner = planner_model
                 .or(from_env)
                 .filter(|name| !name.trim().is_empty());
-            run_mcp_server(&model, max_iterations, planner).await?;
+            run_mcp_server(model, audit_model, max_iterations, planner).await?;
         }
         Commands::Delegate {
             description,
             repo_path,
             branch,
             model,
+            audit_model,
             max_iterations,
             ttl_ms,
             identity,
@@ -554,7 +564,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &description,
                 &repo_path,
                 &branch,
-                model.as_deref(),
+                (model.as_deref(), audit_model.as_deref()),
                 max_iterations,
                 ttl_ms,
                 &identity,
@@ -573,6 +583,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_per_repo,
             queue_path,
         } => {
+            let audit_model = audit_model.unwrap_or_else(|| model.clone());
             run_backlog_sync(
                 harness::backlog::BacklogConfig {
                     sources: vec![harness::backlog::BacklogSource {
@@ -587,7 +598,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     max_per_repo,
                 },
                 queue_path,
-                audit_model.as_deref(),
+                Some(audit_model.as_str()),
             )
             .await?;
         }
@@ -1679,6 +1690,55 @@ fn build_spawn_gate(
     Ok(SpawnGate::with_hook(spawn_auditor, log, context, hook))
 }
 
+fn configured_model(flag: Option<String>) -> Option<model::default_model::ModelConfig> {
+    flag.or_else(|| std::env::var("NANNA_MODEL").ok())
+        .map(|name| model::default_model::ModelConfig { name })
+}
+
+async fn startup_model(
+    configured: Option<model::default_model::ModelConfig>,
+    probe: impl FnOnce() -> model::ModelResult<model::default_model::DeviceCapacity>,
+    catalog: &dyn model::default_model::VariantCatalog,
+) -> model::ModelResult<model::default_model::DefaultModel> {
+    use model::default_model::{resolve_default_model, DefaultModel};
+    if let Some(config) = configured.filter(|c| !c.name.trim().is_empty()) {
+        return Ok(DefaultModel::Configured(config));
+    }
+    let capacity = probe().map_err(|e| model::ModelError::InvalidConfig {
+        message: format!(
+            "no default model is configured and the device could not be probed ({e}); configure one with --model or NANNA_MODEL"
+        ),
+    })?;
+    resolve_default_model(None, &capacity, catalog).await
+}
+
+async fn resolve_startup_model(
+    configured: Option<model::default_model::ModelConfig>,
+) -> model::ModelResult<model::default_model::DefaultModel> {
+    use model::default_model::{
+        probe_device, DefaultModel, OllamaRegistryCatalog, DEFAULT_REGISTRY_URL,
+    };
+    let catalog = OllamaRegistryCatalog::new(DEFAULT_REGISTRY_URL);
+    let resolved = startup_model(configured, probe_device, &catalog).await?;
+    match &resolved {
+        DefaultModel::Configured(config) => info!("default model: {} (configured)", config.name),
+        DefaultModel::AutoGemma4(variant) => info!(
+            "no default model configured: auto-selected {} ({} parameters, needs {} bytes)",
+            variant.tag, variant.params, variant.min_memory_bytes
+        ),
+    }
+    Ok(resolved)
+}
+
+fn auditor_model(
+    explicit: Option<String>,
+    default_model: &model::default_model::DefaultModel,
+) -> String {
+    explicit
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| default_model.name().to_string())
+}
+
 fn queue_spawn_gate(
     audit_model: Option<&str>,
     provider: std::sync::Arc<dyn model::ModelProvider>,
@@ -1939,13 +1999,17 @@ async fn shutdown_signal() {
 }
 
 async fn run_mcp_server(
-    model: &str,
+    model: Option<String>,
+    audit_model: Option<String>,
     max_iterations: usize,
     planner_model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
+    let default_model = resolve_startup_model(configured_model(model)).await?;
+    let model = auditor_model(audit_model, &default_model);
+    let model = model.as_str();
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
@@ -2015,7 +2079,7 @@ async fn run_delegate(
     description: &str,
     repo_path: &std::path::Path,
     branch: &str,
-    model: Option<&str>,
+    (model, audit_model): (Option<&str>, Option<&str>),
     max_iterations: usize,
     ttl_ms: Option<u64>,
     identity: &str,
@@ -2024,13 +2088,15 @@ async fn run_delegate(
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
+    let default_model = resolve_startup_model(configured_model(model.map(str::to_string))).await?;
+    let audit = auditor_model(audit_model.map(str::to_string), &default_model);
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
     let queue_path = resolve_queue_path(None)?;
     let plane = resolve_escalation_plane(&queue_path)?;
     let task_manager = Arc::new(build_delegate_task_manager(
         provider.clone(),
-        model,
+        Some(audit.as_str()),
         plane.clone(),
     ));
     let telemetry = export_action_audit(
@@ -2040,7 +2106,7 @@ async fn run_delegate(
     export_budget(&task_manager.cost_accountant(), &telemetry);
     let session = async {
         let gate = delegate_spawn_gate(
-            model,
+            Some(audit.as_str()),
             provider.clone() as Arc<dyn model::ModelProvider>,
             &queue_path,
             &load_identities(),
@@ -2086,6 +2152,105 @@ async fn run_delegate(
         Ok::<(), Box<dyn std::error::Error>>(())
     };
     finish_with_flush(&telemetry, None, session).await
+}
+
+#[cfg(test)]
+mod default_model_startup {
+    use crate::{auditor_model, startup_model};
+    use model::default_model::{
+        Accel, DefaultModel, DeviceCapacity, FixtureCatalog, ModelConfig, ModelVariant,
+    };
+
+    fn catalog() -> FixtureCatalog {
+        FixtureCatalog {
+            variants: vec![ModelVariant {
+                tag: "gemma4:e4b".into(),
+                params: 8_000_000_000,
+                min_memory_bytes: 6 << 30,
+            }],
+            fail: false,
+        }
+    }
+
+    fn device(ram_gib: u64) -> model::ModelResult<DeviceCapacity> {
+        Ok(DeviceCapacity {
+            ram_bytes: ram_gib << 30,
+            vram_bytes: None,
+            accel: Accel::Cpu,
+        })
+    }
+
+    fn named(name: &str) -> Option<ModelConfig> {
+        Some(ModelConfig { name: name.into() })
+    }
+
+    #[tokio::test]
+    async fn a_configured_model_starts_without_probing_the_device() {
+        let resolved = startup_model(
+            named("qwen3:0.6b"),
+            || panic!("probe must not run"),
+            &catalog(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.name(), "qwen3:0.6b");
+    }
+
+    #[tokio::test]
+    async fn no_model_and_a_device_that_fits_auto_selects_gemma4() {
+        let resolved = startup_model(None, || device(16), &catalog())
+            .await
+            .unwrap();
+        assert!(matches!(resolved, DefaultModel::AutoGemma4(_)));
+        assert_eq!(resolved.name(), "gemma4:e4b");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_when_no_model_is_configured_and_nothing_fits() {
+        let err = startup_model(None, || device(2), &catalog())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no default model"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_when_the_device_cannot_be_probed() {
+        let probe = || {
+            Err(model::ModelError::Unknown {
+                message: "no meminfo".into(),
+            })
+        };
+        let err = startup_model(None, probe, &catalog()).await.unwrap_err();
+        assert!(err.to_string().contains("no default model"), "{err}");
+        assert!(err.to_string().contains("--model"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_when_the_catalog_is_down() {
+        let down = FixtureCatalog {
+            fail: true,
+            ..catalog()
+        };
+        assert!(startup_model(None, || device(64), &down).await.is_err());
+    }
+
+    #[test]
+    fn auditors_default_to_the_default_model_unless_one_is_configured() {
+        let default_model = DefaultModel::AutoGemma4(ModelVariant {
+            tag: "gemma4:e4b".into(),
+            params: 1,
+            min_memory_bytes: 1,
+        });
+        assert_eq!(auditor_model(None, &default_model), "gemma4:e4b");
+        assert_eq!(
+            auditor_model(Some("judge:1b".into()), &default_model),
+            "judge:1b"
+        );
+        assert_eq!(
+            auditor_model(Some("  ".into()), &default_model),
+            "gemma4:e4b"
+        );
+    }
 }
 
 #[cfg(test)]
