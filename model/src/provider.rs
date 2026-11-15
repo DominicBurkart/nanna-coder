@@ -112,4 +112,74 @@ mod tests {
         provider.health_check().await.unwrap();
         assert_eq!(provider.provider_name(), "mock");
     }
+
+    #[test]
+    fn test_model_error_display_model_not_found() {
+        let err = ModelError::ModelNotFound {
+            model: "llama3".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("llama3"));
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn test_model_error_display_invalid_config() {
+        let err = ModelError::InvalidConfig {
+            message: "bad base url".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("bad base url"));
+        assert!(msg.contains("Invalid configuration"));
+    }
+
+    #[test]
+    fn test_model_error_display_service_unavailable() {
+        let err = ModelError::ServiceUnavailable {
+            message: "ollama is down".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("ollama is down"));
+        assert!(msg.contains("unavailable"));
+    }
+
+    #[test]
+    fn test_model_error_display_rate_limit() {
+        let err = ModelError::RateLimit;
+        let msg = format!("{}", err);
+        assert!(msg.contains("Rate limit"));
+    }
+
+    #[test]
+    fn test_model_error_display_authentication() {
+        let err = ModelError::Authentication;
+        let msg = format!("{}", err);
+        assert!(msg.contains("Authentication"));
+    }
+
+    #[test]
+    fn test_model_error_display_unknown() {
+        let err = ModelError::Unknown {
+            message: "something unexpected".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("something unexpected"));
+        assert!(msg.contains("Unknown error"));
+    }
+
+    #[test]
+    fn test_model_error_debug() {
+        let err = ModelError::RateLimit;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("RateLimit"));
+    }
+
+    #[test]
+    fn test_serialization_error_from_serde() {
+        let serde_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let err = ModelError::Serialization(serde_err);
+        let msg = format!("{}", err);
+        assert!(msg.contains("Serialization error"));
+    }
 }
