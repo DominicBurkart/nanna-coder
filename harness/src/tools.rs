@@ -492,6 +492,7 @@ impl ToolRegistry {
 
     fn inspects_content(&self, name: &str) -> bool {
         name == crate::action_auditor::RUN_COMMAND_TOOL
+            || crate::action_auditor::is_message_tool(name)
     }
 
     async fn escalate_denial(&self, tool: &str, denied: &ActionDenied) {
@@ -6213,6 +6214,136 @@ mod tests {
             crate::auditor::VerdictKind::Escalate,
             "the logged verdict must reflect the escalation, not the auditor's raw block"
         );
+    }
+
+    const CONTENT_INSPECTED: [&str; 4] = [
+        "run_command",
+        "msg_send",
+        "session_set_note",
+        "sessions_query",
+    ];
+
+    fn message_registry(
+        auditor: Option<Arc<dyn crate::action_auditor::ActionAuditor>>,
+    ) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in ["msg_send", "session_set_note", "sessions_query"] {
+            registry.register(StubTool::boxed(name, EffectClass::None));
+        }
+        match auditor {
+            Some(a) => registry.with_action_gate(
+                Arc::new(ActionGate::new(
+                    a,
+                    crate::action_auditor::ActionAuditLog::in_memory(),
+                )),
+                subject(EffectClass::Production),
+            ),
+            None => registry,
+        }
+    }
+
+    #[test]
+    fn the_content_inspected_list_is_pinned() {
+        let registry = ToolRegistry::new();
+        let inspected: Vec<&str> = [
+            "run_command",
+            "msg_send",
+            "msg_recv",
+            "session_set_note",
+            "sessions_query",
+            "sessions_list",
+            "session_describe",
+            "sessions_tree",
+            "write_file",
+            "read_file",
+            "",
+        ]
+        .into_iter()
+        .filter(|n| registry.inspects_content(n))
+        .collect();
+        assert_eq!(inspected, CONTENT_INSPECTED);
+        assert_eq!(
+            crate::action_auditor::MESSAGE_TOOLS,
+            ["msg_send", "session_set_note", "sessions_query"]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_tools_with_no_gate_attached_are_refused() {
+        for name in crate::action_auditor::MESSAGE_TOOLS {
+            let registry = message_registry(None);
+            let err = registry.execute(name, json!({})).await.unwrap_err();
+            match err {
+                ToolError::ActionDenied(ActionDenied::Block { reasons }) => assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.detail.contains("no action auditor configured")),
+                    "{name}"
+                ),
+                other => panic!("{name}: expected a block, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn message_tools_run_under_an_allow_auditor_and_are_reviewed_at_none() {
+        let registry = message_registry(Some(Arc::new(AllowAuditor)));
+        for name in crate::action_auditor::MESSAGE_TOOLS {
+            let out = registry.execute(name, json!({})).await.unwrap();
+            assert_eq!(out["class"], "none", "{name}");
+        }
+        let reviews = registry.action_reviews();
+        assert_eq!(reviews.len(), 3);
+        assert!(reviews
+            .iter()
+            .all(|r| r.review.effect_class == EffectClass::None));
+    }
+
+    #[tokio::test]
+    async fn message_tools_are_denied_under_block_and_escalate_auditors() {
+        for name in crate::action_auditor::MESSAGE_TOOLS {
+            let blocked = message_registry(Some(Arc::new(CountingAuditor::new())));
+            let escalated = message_registry(Some(Arc::new(EscalatingAuditor)));
+            assert!(matches!(
+                blocked.execute(name, json!({})).await.unwrap_err(),
+                ToolError::ActionDenied(ActionDenied::Block { .. })
+            ));
+            assert!(matches!(
+                escalated.execute(name, json!({})).await.unwrap_err(),
+                ToolError::ActionDenied(ActionDenied::Escalate { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_third_message_tool_denial_escalates_with_repeated_denials() {
+        let registry = message_registry(Some(Arc::new(CountingAuditor::new())));
+        for _ in 0..2 {
+            assert!(matches!(
+                registry.execute("msg_send", json!({})).await.unwrap_err(),
+                ToolError::ActionDenied(ActionDenied::Block { .. })
+            ));
+        }
+        match registry.execute("msg_send", json!({})).await.unwrap_err() {
+            ToolError::ActionDenied(ActionDenied::Escalate { reasons }) => assert!(reasons
+                .iter()
+                .any(|r| r.code == crate::auditor::ReasonCode::RepeatedDenials)),
+            other => panic!("expected escalation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scope_denied_message_tool_never_reaches_the_auditor() {
+        let auditor = Arc::new(CountingAuditor::new());
+        let registry = ToolRegistry::new().with_action_gate(
+            Arc::new(ActionGate::new(
+                auditor.clone(),
+                crate::action_auditor::ActionAuditLog::in_memory(),
+            )),
+            subject(EffectClass::Production),
+        );
+        assert!(registry.execute("msg_send", json!({})).await.is_err());
+        assert_eq!(auditor.calls(), 0);
     }
 
     #[tokio::test]
