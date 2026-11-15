@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 
 const CATALOG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/one_track/catalog"
+    "/tests/fixtures/sample_app/catalog"
 );
 const OVERRIDES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/one_track/repo/.nanna/agents"
+    "/tests/fixtures/sample_app/repo/.nanna/agents"
 );
 
 struct Script(Mutex<Vec<ChatResponse>>);
@@ -105,7 +105,7 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(out.status.success(), "{args:?}: {out:?}");
 }
 
-fn one_track_repo(with_overrides: bool) -> tempfile::TempDir {
+fn sample_app_repo(with_overrides: bool) -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     for args in [
         vec!["init", "-q"],
@@ -117,7 +117,7 @@ fn one_track_repo(with_overrides: bool) -> tempfile::TempDir {
             "remote",
             "add",
             "origin",
-            "https://github.com/1-Track/one_track.git",
+            "https://github.com/example/sample-app.git",
         ],
     ] {
         git(repo.path(), &args);
@@ -164,17 +164,17 @@ fn read(path: &str) -> ChatResponse {
 }
 
 #[tokio::test]
-async fn a_scoped_task_for_one_track_is_denied_writes_outside_the_narrowed_paths() {
-    let repo = one_track_repo(true);
+async fn a_scoped_task_for_sample_app_is_denied_writes_outside_the_narrowed_paths() {
+    let repo = sample_app_repo(true);
     let (result, _, _) = run(
         repo.path(),
-        "one-track-api",
+        "sample-app-api",
         vec![
             write("api/src/new.rs"),
             write("ui/src/app.rs"),
             write("shared/src/lib.rs"),
             write("Cargo.toml"),
-            write(".nanna/agents/one-track-api.toml"),
+            write(".nanna/agents/sample-app-api.toml"),
         ],
     )
     .await;
@@ -188,23 +188,23 @@ async fn a_scoped_task_for_one_track_is_denied_writes_outside_the_narrowed_paths
     assert!(result
         .denials
         .iter()
-        .all(|denial| denial.identity == "one-track-api"));
+        .all(|denial| denial.identity == "sample-app-api"));
 }
 
 #[tokio::test]
 async fn the_repo_override_narrows_reads_the_global_card_grants() {
-    let narrowed = one_track_repo(true);
-    let plain = one_track_repo(false);
+    let narrowed = sample_app_repo(true);
+    let plain = sample_app_repo(false);
     let calls = || vec![read("ui/src/app.rs")];
 
-    let (without, _, _) = run(plain.path(), "one-track-api", calls()).await;
+    let (without, _, _) = run(plain.path(), "sample-app-api", calls()).await;
     assert!(
         without.denials.is_empty(),
         "the global card reads ui/: {:?}",
         without.denials
     );
 
-    let (with, _, _) = run(narrowed.path(), "one-track-api", calls()).await;
+    let (with, _, _) = run(narrowed.path(), "sample-app-api", calls()).await;
     assert_eq!(with.denials.len(), 1, "{:?}", with.denials);
     assert!(matches!(
         with.denials[0].reason,
@@ -213,11 +213,11 @@ async fn the_repo_override_narrows_reads_the_global_card_grants() {
 }
 
 #[tokio::test]
-async fn the_one_track_reviewer_cannot_write_at_all() {
-    let repo = one_track_repo(true);
+async fn the_sample_app_reviewer_cannot_write_at_all() {
+    let repo = sample_app_repo(true);
     let (result, _, _) = run(
         repo.path(),
-        "one-track-reviewer",
+        "sample-app-reviewer",
         vec![write("api/src/new.rs"), read("api/Cargo.toml")],
     )
     .await;
@@ -230,9 +230,9 @@ async fn the_one_track_reviewer_cannot_write_at_all() {
 }
 
 #[tokio::test]
-async fn a_widened_one_track_override_fails_the_assignment_closed() {
-    let repo = one_track_repo(true);
-    let path = repo.path().join(".nanna/agents/one-track-api.toml");
+async fn a_widened_sample_app_override_fails_the_assignment_closed() {
+    let repo = sample_app_repo(true);
+    let path = repo.path().join(".nanna/agents/sample-app-api.toml");
     let widened = std::fs::read_to_string(&path)
         .unwrap()
         .replace(r#"paths = ["api/**"]"#, r#"paths = ["api/**", "ui/**"]"#);
@@ -242,7 +242,7 @@ async fn a_widened_one_track_override_fails_the_assignment_closed() {
     let params = json!({
         "description": "Change the api.",
         "repo_path": repo.path().to_str().unwrap(),
-        "identity": "one-track-api",
+        "identity": "sample-app-api",
     });
     let err = handle_assign_task(&params, &manager, &model, &gate(), 20, None)
         .await
