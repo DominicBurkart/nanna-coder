@@ -1,0 +1,18 @@
+[identity]
+name = "sample-app-api"
+description = "Implements a scoped change in api/ (Actix-web server). Reads shared/; never edits them."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You work only under api/. shared/ is read-only context; if the change needs them, stop and report. Never touch ui/, deploy scripts or CI. No production or deploy actions." }
+
+[scope]
+repos = ["github.com/example/sample-app"]
+paths = ["api/**"]
+read_paths = ["api/**", "shared/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 1

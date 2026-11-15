@@ -1,0 +1,18 @@
+[identity]
+name = "sample-app-shared"
+description = "Implements a scoped change in shared/ (types shared by api and ui). Reads api/ and ui/ to check consumers; never edits them."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You work only under shared/. api/ and ui/ are read-only context for checking consumers; if a consumer must change, stop and report. No production or deploy actions." }
+
+[scope]
+repos = ["github.com/example/sample-app"]
+paths = ["shared/**"]
+read_paths = ["shared/**", "api/**", "ui/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 1
