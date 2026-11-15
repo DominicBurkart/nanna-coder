@@ -124,26 +124,32 @@ fn module_base(file: &str) -> String {
     join_path(&[dir, if owns_dir { stem } else { String::new() }])
 }
 
+fn is_exact_test_file_module(module: &syn::ItemMod) -> bool {
+    let exact = module.content.is_none() && is_cfg_test(&module.attrs);
+    exact && !module.attrs.iter().any(|attr| attr.path().is_ident("path"))
+}
+
 fn cfg_test_file_modules(file: &str, source: &str) -> Vec<String> {
     let base = module_base(file);
-    let declared = syn::parse_file(source)
-        .unwrap()
-        .items
-        .into_iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(module)
-                if module.content.is_none()
-                    && is_cfg_test(&module.attrs)
-                    && !module.attrs.iter().any(|attr| attr.path().is_ident("path")) =>
-            {
-                Some(module.ident.to_string())
-            }
-            _ => None,
-        });
-    declared
-        .flat_map(|name| [format!("{name}.rs"), format!("{name}/mod.rs")])
-        .map(|child| join_path(&[base.clone(), child]))
-        .collect()
+    let mut skipped = BTreeSet::new();
+    let mut kept = BTreeSet::new();
+    for item in syn::parse_file(source).unwrap().items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let name = module.ident.to_string();
+        if is_exact_test_file_module(&module) {
+            skipped.insert(name);
+        } else {
+            kept.insert(name);
+        }
+    }
+    let mut files = Vec::new();
+    for name in skipped.difference(&kept) {
+        files.push(join_path(&[base.clone(), format!("{name}.rs")]));
+        files.push(join_path(&[base.clone(), format!("{name}/mod.rs")]));
+    }
+    files
 }
 
 fn production_from(sources: Vec<(String, String)>) -> Vec<Idents> {
@@ -268,12 +274,16 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         ("z.rs", "fn f() { TaskWorkspace; }"),
         (
             "a/mod.rs",
-            "#[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] #[path = \"p.rs\"] mod w; #[cfg(test)] mod inline { } #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
+            "fn helper() {} #[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] #[path = \"p.rs\"] mod w; #[cfg(test)] mod inline { } #[cfg(test)] mod t2; #[cfg(not(test))] mod t2; #[cfg(test)] mod t3; mod t3; #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
         ),
         ("a/t.rs", "fn f() { TaskWorkspace; }"),
         ("a/u.rs", "fn f() { TaskWorkspace; }"),
         ("a/v.rs", "fn f() { TaskWorkspace; }"),
         ("a/p.rs", "fn f() { TaskWorkspace; }"),
+        ("a/w.rs", "fn f() { TaskWorkspace; }"),
+        ("a/inline.rs", "fn f() { TaskWorkspace; }"),
+        ("a/t2.rs", "fn f() { TaskWorkspace; }"),
+        ("a/t3.rs", "fn f() { TaskWorkspace; }"),
         ("a/ya.rs", "fn f() { TaskWorkspace; }"),
         ("a/yb.rs", "fn f() { TaskWorkspace; }"),
         ("a/yc.rs", "fn f() { TaskWorkspace; }"),
@@ -291,7 +301,18 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         .filter_map(|(entry, _)| entry.strip_suffix(": TaskWorkspace").map(str::to_string))
         .collect();
     let expected: BTreeSet<String> = [
-        "a/p.rs", "a/u.rs", "a/v.rs", "a/ya.rs", "a/yb.rs", "a/yc.rs", "a/yd.rs", "c.rs",
+        "a/inline.rs",
+        "a/p.rs",
+        "a/t2.rs",
+        "a/t3.rs",
+        "a/u.rs",
+        "a/v.rs",
+        "a/w.rs",
+        "a/ya.rs",
+        "a/yb.rs",
+        "a/yc.rs",
+        "a/yd.rs",
+        "c.rs",
     ]
     .iter()
     .map(|file| file.to_string())
@@ -306,4 +327,28 @@ fn the_cfg_test_match_is_exact() {
         cfg_test_file_modules("a/mod.rs", "#[cfg(test)] mod t;"),
         vec!["a/t.rs".to_string(), "a/t/mod.rs".to_string()]
     );
+}
+
+#[test]
+fn a_module_name_declared_both_as_test_and_otherwise_is_never_skipped() {
+    let source = "#[cfg(test)] mod t; #[cfg(not(test))] mod t;";
+    assert!(cfg_test_file_modules("a/mod.rs", source).is_empty());
+    let unconditional = "#[cfg(test)] mod t; mod t;";
+    assert!(cfg_test_file_modules("a/mod.rs", unconditional).is_empty());
+    let inline_twin = "#[cfg(test)] mod t; mod t { }";
+    assert!(cfg_test_file_modules("a/mod.rs", inline_twin).is_empty());
+}
+
+#[test]
+fn an_inline_test_module_never_skips_a_file_of_the_same_name() {
+    assert!(cfg_test_file_modules("a/mod.rs", "#[cfg(test)] mod inline { }").is_empty());
+    assert!(is_exact_test_file_module(
+        &syn::parse_str("#[cfg(test)] mod m;").unwrap()
+    ));
+    assert!(!is_exact_test_file_module(
+        &syn::parse_str("#[cfg(test)] mod m { }").unwrap()
+    ));
+    assert!(!is_exact_test_file_module(
+        &syn::parse_str("#[cfg(test)] #[path = \"p.rs\"] mod m;").unwrap()
+    ));
 }
