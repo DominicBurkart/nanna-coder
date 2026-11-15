@@ -83,7 +83,9 @@ not an agent, and it is the "active root session" in the requirements.
   - `RootId::Mcp(uuid)` comes from `assign_task`'s `mcp-<uuid>` parent.
   - `RootId::Plan(id)` comes from `plan_task`'s `plan-…` id.
   - `RootId::Backlog { repo, issue }` comes from backlog sinks.
-  - `RootId::Cli(uuid)` comes from `delegate`.
+  - `delegate` has no root of its own: it drives an in-process MCP server and calls `assign_task`, so its parent id is `mcp-<uuid>` and it gets an `Mcp` root. There is no `Cli` root (implemented in #1060).
+  - A parent id that is none of the above and names no known task becomes `RootId::Legacy(new task id)`: its own root, no peers. A malformed `mcp-`, `plan-` or `backlog-` id is refused (fail closed).
+  - Backlog roots are keyed by `(repo, issue)` only. Two runs on the same issue share a root and can see each other's sessions and messages; this is intended (see §10, limits).
 - **Parent.** The real `SessionId` of the spawning agent, or `None` 
 when the parent is the root. Today every spawn's parent is the root 
 (depth 1). The model supports any depth so that agent-initiated spawns 
@@ -97,34 +99,37 @@ peers.
 
 ```rust
 /// A spawned subagent's id. Same value as its TaskId.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, 
-#Serialize, Deserialize)]
+/// Clone, not Copy: TaskId wraps a String. TaskId gains PartialOrd, Ord.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SessionId(TaskId);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Serialize is derived; Deserialize goes through validation, so a stored
+/// root cannot carry a plan id or backlog repo the constructors would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RootId {
     Mcp { id: Uuid },
     Plan { id: String },          // validated: [a-z0-9-]{1,80}
-    Backlog { repo: String, issue: u64 },
-    Cli { id: Uuid },
+    Backlog { repo: String, issue: u64 }, // repo is owner/name: parts [A-Za-z0-9._-], not . or .., <= 140 bytes
     Legacy { task: TaskId },
 }
 
 /// Where a session sits. Private fields: only `Lineage::root_child` and
 /// `Lineage::child_of` construct it, so depth and root are always consistent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deserialize re-checks consistency: depth 1 iff no parent, depth in 1..=MAX_DEPTH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Lineage { root: RootId, parent: Option<SessionId>, depth: u8 }
 
-impl Lineage { pub fn root_child(root: RootId) -> Self; // depth 1 pub 
-    fn child_of(parent: SessionId, parent_lineage: &Lineage) -> 
-    Result<Self, LineageError>; // depth+1, MAX_DEPTH=8 pub fn 
-    root(&self) -> &RootId; pub fn parent(&self) -> Option<SessionId>; 
+impl Lineage {
+    pub fn root_child(root: RootId) -> Self; // depth 1
+    pub fn child_of(parent: SessionId, parent_lineage: &Lineage) -> Result<Self, LineageError>; // depth+1, MAX_DEPTH=8
+    pub fn root(&self) -> &RootId;
+    pub fn parent(&self) -> Option<&SessionId>;
     pub fn depth(&self) -> u8;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum LineageError { #[error("lineage deeper than {0}")] TooDeep(u8) }
+pub enum LineageError { TooDeep(u8), InvalidPlanId, InvalidBacklog, InvalidRoot, Inconsistent } // also Clone
 
 /// The only authority the hub accepts for "who is calling". / Built 
 //by TaskManager from the spawn gate's proof. Not Clone outside the 
@@ -132,19 +137,27 @@ pub enum LineageError { #[error("lineage deeper than {0}")] TooDeep(u8) }
 pub struct SessionBinding { session: SessionId, lineage: Lineage, 
 identity: Arc<AgentIdentity> }
 
-impl SessionBinding { pub(crate) fn bind(allowed: &Allowed, task: 
-    TaskId, lineage: Lineage) -> Self; pub fn session(&self) -> 
-    SessionId; pub fn lineage(&self) -> &Lineage; pub fn 
-    identity(&self) -> &AgentIdentity;
+impl SessionBinding {
+    // named from_proof, not bind: tests/pr_binding_structural.rs flags any fn named bind
+    pub(crate) fn from_proof(allowed: &Allowed, task: TaskId, lineage: Lineage) -> Self;
+    pub fn session(&self) -> &SessionId;
+    pub fn lineage(&self) -> &Lineage;
+    pub fn identity(&self) -> &AgentIdentity;
 }
+// tests/session_binding_structural.rs pins from_proof to zero production call sites;
+// the issue that wires it (#1069) must update that pin deliberately.
 ```
 
 Changes to existing code:
 - `Task` and `QueuedTask` gain `lineage: Option<Lineage>`. It is `#[serde(default)]`, so old `queue.jsonl` files still load.
-- `AuditedIdentity::split` returns `(identity, subtask, lineage)`. The lineage is derived from `SpawnRequest.parent_task.id`:
-  - `mcp-…` maps to `Mcp`;
+- `AuditedIdentity::split(allowed, lookup)` returns `(request, identity, Result<Option<Lineage>, LineageError>)`; `lookup` maps a known `TaskId` to its lineage. It stays private. The lineage is derived from `SpawnRequest.parent_task.id`:
+  - `mcp-<uuid>` maps to `Mcp`;
   - `plan-…` maps to `Plan`;
-  - a known `TaskId` maps to `child_of`.
+  - `backlog-<owner/name>#<n>` maps to `Backlog`;
+  - a known `TaskId` maps to `child_of` (`TooDeep` makes `submit_spawn` return `SpawnRefused::Lineage`);
+  - anything else is `Ok(None)` and `register` gives the task `Legacy(its id)`.
+- `Task.lineage` is always `Some` once registered. `submit_audited` refuses (task `Failed`, error type `LineageInconsistent`) an entry whose carried lineage disagrees with the one derived from its proof; the backlog sinks refuse it earlier with `BacklogError::Lineage`. `backlog_sync` skips a source whose repo cannot be a root, records each of its issues as refused, and continues with the other sources.
+- `Task`/`QueuedTask` skip serializing an absent lineage, so entries without one stay byte-identical to the old format.
 - Every call site is updated: `submit_spawn`, `PlanRun` via `ChildRunner`, `StoreSink`, `ManagerSink`, and restore.
 
 ### 3.3 Session records (`harness/src/hub/session.rs`)
@@ -878,6 +891,7 @@ sequenceDiagram
 Dependencies and known limits:
 - **Long-running pi sessions need the executor** (#924 roadmap). Until then, sessions live only as long as `AgentLoop`'s `max_iterations`.
 - **Idle limits:** an agent sitting in `WaitingOnMessages` must still count against `max_wall_clock_secs`. Enforcement waits on #733. Until then, the hub caps a single long-poll at 60 s and a session's cumulative wait at 30 minutes, then returns `idle_limit: true`.
+- **Backlog roots are shared per issue.** `RootId::Backlog { repo, issue }` has no run discriminator, so two runs on the same issue share a root and, once §5 exists, can see each other's sessions and messages. This is intended: the issue is the unit of work.
 - **Single process:** the hub covers one nanna host process. Multi-process sharing is out of scope (§4, single writer).
 - **#962 must carry `TaskId` and `SessionBinding`** into `Broker::for_agent`. Today the broker knows only `Allowed` and `ResolvedAgent`.
 
