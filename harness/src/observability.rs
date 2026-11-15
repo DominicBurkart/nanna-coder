@@ -1097,4 +1097,63 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_with_alert_policy() {
+        let policy = AlertPolicy::immediate_critical();
+        let system = ObservabilitySystem::new().with_alert_policy(policy);
+        // Alert policy is stored in config; verify system is still usable
+        let status = system.get_comprehensive_status().await.unwrap();
+        assert!(matches!(
+            status.overall_health,
+            HealthStatus::Healthy
+                | HealthStatus::Warning
+                | HealthStatus::Unhealthy
+                | HealthStatus::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_with_health_thresholds() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 0.9,
+            memory_threshold: 0.9,
+            disk_threshold: 0.9,
+            max_latency_ms: 5000,
+            min_cache_hit_rate: 0.3,
+            max_error_rate: 0.2,
+            container_timeout: Duration::from_secs(10),
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        let status = system.get_comprehensive_status().await.unwrap();
+        assert!(matches!(
+            status.overall_health,
+            HealthStatus::Healthy
+                | HealthStatus::Warning
+                | HealthStatus::Unhealthy
+                | HealthStatus::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_observability_system_default() {
+        let system = ObservabilitySystem::default();
+        let status = system.get_comprehensive_status().await.unwrap();
+        assert!(matches!(
+            status.overall_health,
+            HealthStatus::Healthy
+                | HealthStatus::Warning
+                | HealthStatus::Unhealthy
+                | HealthStatus::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+        system.start_monitoring().await.unwrap();
+        system.stop_monitoring().await;
+        // Calling stop again when already stopped is a no-op
+        system.stop_monitoring().await;
+    }
 }
