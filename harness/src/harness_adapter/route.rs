@@ -366,7 +366,9 @@ mod tests {
     #[test]
     fn the_container_name_is_deterministic_per_task() {
         assert_eq!(pi_container_name("t-1"), "nanna-pi-t-1");
-        assert_eq!(PiContainerGuard::arm("nanna-pi-t-1").name(), "nanna-pi-t-1");
+        let guard = PiContainerGuard::arm("nanna-pi-t-1");
+        assert_eq!(guard.name(), "nanna-pi-t-1");
+        std::mem::forget(guard);
     }
 
     #[tokio::test]

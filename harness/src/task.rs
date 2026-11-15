@@ -4571,6 +4571,7 @@ mod identity_tests {
 
     #[tokio::test]
     async fn test_verifier_without_an_injected_runner_launches_through_the_container_runtime() {
+        let _held = crate::test_support::hold_path_async().await;
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let config = crate::verify::VerifyConfig::parse(TWO_CHECKS).unwrap();
         let handle = Arc::new(crate::container::ContainerHandle {
@@ -8587,9 +8588,7 @@ mod pi_route_tests {
         let repo = repo.display().to_string();
         fake.calls()
             .into_iter()
-            .filter(|call| {
-                call.contains(&id.0) || call.contains(&repo) || call.contains("nanna-pi-")
-            })
+            .filter(|call| call.contains(&id.0) || call.contains(&repo))
             .collect()
     }
 
