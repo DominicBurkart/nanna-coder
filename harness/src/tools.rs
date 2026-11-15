@@ -1079,7 +1079,18 @@ impl Tool for WriteFileTool {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&safe_path, content)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&safe_path)?;
+        if crate::protected::is_hardlinked(&file.metadata()?) {
+            return Err(ToolError::ProtectedPath(
+                crate::protected::hardlink_violation(path),
+            ));
+        }
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
 
         Ok(json!({
             "path": path_str,
@@ -5018,6 +5029,293 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
+    }
+
+    #[cfg(unix)]
+    mod hardlink_writes {
+        use super::*;
+
+        fn tool_in(dir: &std::path::Path) -> WriteFileTool {
+            let protected = crate::protected::ProtectedPaths::with_config_dir(dir, None);
+            WriteFileTool::guarded(dir.to_path_buf(), None, protected)
+        }
+
+        #[tokio::test]
+        async fn a_hardlink_to_a_protected_file_cannot_be_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("flake.nix"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("flake.nix"), dir.path().join("alias.txt")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "alias.txt", "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.path == "alias.txt" && v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("flake.nix")).unwrap(),
+                "original"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+                "original"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_hardlink_write_does_not_truncate_the_shared_inode() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            let result = tool_in(dir.path())
+                .execute(json!({ "path": "b.txt", "content": "" }))
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_file_with_one_link_is_still_overwritten() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("plain.txt"), "old content that is long").unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "plain.txt", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("plain.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_checkout_registry_refuses_a_hardlink_to_a_repo_declared_file() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/gate.rs\", \"ci/**\"]\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+            std::fs::write(dir.path().join("ci/deploy.sh"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("ci/deploy.sh"), dir.path().join("alias.sh"))
+                .unwrap();
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let err = registry
+                .execute(
+                    "write_file",
+                    json!({ "path": "alias.sh", "content": "evil" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("ci/deploy.sh")).unwrap(),
+                "original"
+            );
+        }
+
+        async fn folded_link_outcomes(policy: Option<&str>) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
+            )
+            .unwrap();
+            if let Some(policy) = policy {
+                std::fs::write(dir.path().join(".nanna/policy.toml"), policy).unwrap();
+            }
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let mut outcomes = Vec::new();
+            for name in [
+                "alias.txt",
+                "cafe\u{301}-x.txt.",
+                "src/cafe\u{301}.rs.",
+                "tools/RELEAS~1.SH",
+                "ci/deploy.sh",
+            ] {
+                let file = dir.path().join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "original").unwrap();
+                let partner = dir.path().join("zz-partner.bin");
+                std::fs::remove_file(&partner).ok();
+                std::fs::hard_link(&file, &partner).unwrap();
+                let err = registry
+                    .execute("write_file", json!({ "path": name, "content": "evil" }))
+                    .await
+                    .unwrap_err();
+                match err {
+                    ToolError::ProtectedPath(violation) => outcomes.push(violation.rule),
+                    other => outcomes.push(format!("unexpected: {other:?}")),
+                }
+                assert_eq!(std::fs::read_to_string(&partner).unwrap(), "original");
+            }
+            outcomes
+        }
+
+        #[tokio::test]
+        async fn the_hardlink_refusal_is_identical_under_the_solo_gate_and_without_a_policy_file() {
+            let none = folded_link_outcomes(None).await;
+            let solo = folded_link_outcomes(Some("human_gate = \"solo\"\n")).await;
+            assert_eq!(none, solo);
+            assert_eq!(
+                none,
+                vec![
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    "src/caf\u{e9}.rs".to_string(),
+                    "tools/release-helper.sh".to_string(),
+                    "ci/**".to_string(),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hardlinked_file_deep_in_the_tree_is_refused_by_the_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            let deep = ["a"; 100].join("/");
+            std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
+            let file = format!("{deep}/f.txt");
+            std::fs::write(dir.path().join(&file), "original").unwrap();
+            std::fs::hard_link(dir.path().join(&file), dir.path().join("zz.bin")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": file, "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_checkout_registry_refuses_hardlinks_reached_through_folded_spellings() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
+            )
+            .unwrap();
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            for (name, rule) in [
+                ("alias.txt", crate::protected::HARDLINK_RULE),
+                ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
+                ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
+                ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+            ] {
+                let file = dir.path().join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "original").unwrap();
+                let partner = dir.path().join("zz-partner.bin");
+                std::fs::remove_file(&partner).ok();
+                std::fs::hard_link(&file, &partner).unwrap();
+                let err = registry
+                    .execute("write_file", json!({ "path": name, "content": "evil" }))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule == rule),
+                    "{name}: {err:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&partner).unwrap(), "original");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_aliasable_name_past_the_component_cap_is_refused_before_the_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            let deep = ["a"; 1_100].join("/");
+            std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": format!("{deep}/CODECO~1.YML"), "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::ALIAS_OVERFLOW_RULE),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_symlink_to_a_multiply_linked_file_is_refused_by_the_target_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            std::os::unix::fs::symlink("a.txt", dir.path().join("sym")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "sym", "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_hardlink_to_a_symlink_writes_to_the_single_link_target() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("target.txt"), "old").unwrap();
+            std::os::unix::fs::symlink("target.txt", dir.path().join("sym")).unwrap();
+            std::fs::hard_link(dir.path().join("sym"), dir.path().join("sym-two")).unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sym-two", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_directory_target_is_an_io_error_and_is_left_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("occupied")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "occupied", "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Io(_)), "{err:?}");
+            assert!(dir.path().join("occupied").is_dir());
+        }
+
+        #[tokio::test]
+        async fn a_new_file_is_created_with_the_content() {
+            let dir = tempfile::tempdir().unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sub/new.txt", "content": "hello" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["bytes_written"], 5);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("sub/new.txt")).unwrap(),
+                "hello"
+            );
+        }
     }
 
     #[tokio::test]

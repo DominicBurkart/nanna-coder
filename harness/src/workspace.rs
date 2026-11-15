@@ -843,13 +843,24 @@ impl TaskWorkspace {
 
     fn refuse_protected_changes(&self) -> Result<(), WorkspaceError> {
         for path in self.changed_paths()? {
-            if let Err(violation) = self.protected.check(Path::new(&path)) {
+            let violation = self
+                .protected
+                .check(Path::new(&path))
+                .err()
+                .or_else(|| self.hardlink_violation(&path));
+            if let Some(violation) = violation {
                 self.audit
                     .on_protected_path_violation(&self.task_id, &violation);
                 return Err(WorkspaceError::ProtectedPath(violation));
             }
         }
         Ok(())
+    }
+
+    fn hardlink_violation(&self, path: &str) -> Option<ProtectedPathViolation> {
+        let metadata = std::fs::symlink_metadata(self.workspace_path.join(path)).ok()?;
+        crate::protected::is_hardlinked(&metadata)
+            .then(|| crate::protected::hardlink_violation(Path::new(path)))
     }
 
     /// The staged diff against `HEAD`, refused with
@@ -2213,6 +2224,412 @@ mod tests {
         assert_eq!(violation.path, "codecov.yml");
         let paths = ws.changed_paths().unwrap();
         assert_eq!(paths, vec!["README.md", "codecov.yml", "windows.toml"]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_a_hardlinked_path_without_listing_the_target() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let task_id = unique_id("ws-hardlink");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "innocuous.txt");
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![(task_id, violation)]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn link_declared_file(ws: &TaskWorkspace) -> std::io::Result<()> {
+        std::fs::create_dir_all(ws.workspace_path.join("src"))?;
+        std::fs::write(ws.workspace_path.join("src/gate.rs"), "original")?;
+        std::fs::hard_link(
+            ws.workspace_path.join("src/gate.rs"),
+            ws.workspace_path.join("alias.txt"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_hardlink_to_a_repo_declared_file_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl"), "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        link_declared_file(&ws).unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "alias.txt");
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_hardlink_to_a_repo_declared_file_cannot_be_written_through_by_either_registry()
+    {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl-write"), "HEAD").unwrap();
+        link_declared_file(&ws).unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            let err = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "alias.txt", "content": "evil" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::tools::ToolError::ProtectedPath(ref v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            let original = std::fs::read_to_string(ws.workspace_path.join("src/gate.rs")).unwrap();
+            assert_eq!(original, "original");
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    const FOLDED_LINK_DECLARATION: &str =
+        "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n";
+
+    #[cfg(unix)]
+    const FOLDED_LINK_CASES: [(&str, &str); 4] = [
+        ("alias.txt", crate::protected::HARDLINK_RULE),
+        ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
+        ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
+        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+    ];
+
+    #[cfg(unix)]
+    fn commit_partner(source: &Path) {
+        std::fs::write(source.join("keep.bin"), "original").unwrap();
+        git_cmd(source).args(["add", "keep.bin"]).output().unwrap();
+        let out = git_cmd(source)
+            .args(["commit", "-m", "partner"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[cfg(unix)]
+    fn make_linked_file(root: &Path, name: &str) -> std::io::Result<()> {
+        let file = root.join(name);
+        std::fs::create_dir_all(file.parent().unwrap())?;
+        std::fs::hard_link(root.join("keep.bin"), file)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hardlinked_files_reached_through_folded_spellings_are_refused_when_a_patch_is_extracted(
+    ) {
+        for (name, rule) in FOLDED_LINK_CASES {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
+            let hook = Arc::new(RecordingHook {
+                seen: std::sync::Mutex::new(vec![]),
+            });
+            let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-fold-link"), "HEAD")
+                .unwrap()
+                .with_audit_hook(hook.clone());
+            make_linked_file(&ws.workspace_path, name).unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{name}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{name}");
+            assert_eq!(hook.seen.lock().unwrap().len(), 2, "{name}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlinked_files_reached_through_folded_spellings_are_refused_by_both_registries()
+    {
+        use crate::effects::EffectClass;
+        for (name, rule) in FOLDED_LINK_CASES {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-fold-link-w"), "HEAD").unwrap();
+            make_linked_file(&ws.workspace_path, name).unwrap();
+            let identity = workspace_identity(EffectClass::Workspace);
+            let registries = [
+                ws.build_tool_registry(),
+                ws.build_tool_registry_for(&identity).unwrap(),
+            ];
+            for registry in registries {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": name, "content": "evil" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{name}: {err:?}"
+                );
+                let partner = std::fs::read_to_string(ws.workspace_path.join("keep.bin"));
+                assert_eq!(partner.unwrap(), "original", "{name}");
+            }
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn objects_are_hardlinked(repo: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir(repo.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|dir| dir.file_name().len() == 2)
+            .flat_map(|dir| std::fs::read_dir(dir.path()).unwrap().flatten())
+            .any(|object| object.metadata().unwrap().nlink() > 1)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_workspace_of_a_local_clone_with_hardlinked_objects_has_no_false_refusals() {
+        use crate::effects::EffectClass;
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let clone_parent = TempDir::new().unwrap();
+        let clone = clone_parent.path().join("clone");
+        let out = git_cmd(clone_parent.path())
+            .args(["clone", "-q"])
+            .arg(origin.path())
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(objects_are_hardlinked(&clone));
+        let mut ws = TaskWorkspace::create(&clone, &unique_id("ws-clone"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        for registry in [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ] {
+            let ok = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "src/ordinary.rs", "content": "fn main() {}" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            let overwrite = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "README.md", "content": "# changed" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(overwrite["success"], true);
+        }
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("src/ordinary.rs"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_hardlink_to_a_symlink_is_refused_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-hl"), "HEAD").unwrap();
+        let link = ws.workspace_path.join("link-one");
+        std::os::unix::fs::symlink("README.md", &link).unwrap();
+        std::fs::hard_link(&link, ws.workspace_path.join("link-two")).unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_symlink_to_a_multiply_linked_file_is_judged_by_the_target_not_the_symlink() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-t"), "HEAD").unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared.txt");
+        std::fs::write(&target, "shared").unwrap();
+        std::fs::hard_link(&target, outside.path().join("other.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, ws.workspace_path.join("only-a-symlink")).unwrap();
+        assert!(ws.extract_changes().unwrap().contains("only-a-symlink"));
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlink_refusal_composes_with_the_solo_gate_at_extraction_and_both_registries() {
+        use crate::effects::EffectClass;
+        for solo in [false, true] {
+            for (name, rule) in FOLDED_LINK_CASES {
+                let source = TempDir::new().unwrap();
+                init_git_repo(source.path());
+                declare(source.path(), FOLDED_LINK_DECLARATION);
+                commit_partner(source.path());
+                if solo {
+                    declare_policy(source.path(), b"human_gate = \"solo\"\n");
+                }
+                let hook = Arc::new(RecordingHook {
+                    seen: std::sync::Mutex::new(vec![]),
+                });
+                let mut ws =
+                    TaskWorkspace::create(source.path(), &unique_id("ws-solo-link"), "HEAD")
+                        .unwrap()
+                        .with_audit_hook(hook.clone());
+                assert_eq!(ws.protected().policy().is_solo(), solo);
+                make_linked_file(&ws.workspace_path, name).unwrap();
+                let identity = workspace_identity(EffectClass::Workspace);
+                for registry in [
+                    ws.build_tool_registry(),
+                    ws.build_tool_registry_for(&identity).unwrap(),
+                ] {
+                    let err = registry
+                        .execute(
+                            "write_file",
+                            serde_json::json!({ "path": name, "content": "evil" }),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                        "solo={solo} {name}: {err:?}"
+                    );
+                }
+                let violation = protected_violation(ws.extract_changes().unwrap_err());
+                assert_eq!(violation.rule, rule, "solo={solo} {name}");
+                let violation = protected_violation(ws.format_patch().unwrap_err());
+                assert_eq!(violation.rule, rule, "solo={solo} {name}");
+                assert_eq!(hook.seen.lock().unwrap().len(), 2, "solo={solo} {name}");
+                ws.cleanup().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_nested_git_repository_is_not_a_hard_link_violation_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nested"), "HEAD").unwrap();
+        let nested = ws.workspace_path.join("nested");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        init_git_repo(&nested);
+        assert!(ws.extract_changes().unwrap().contains("nested"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_modified_submodule_is_not_a_hard_link_violation_at_extraction() {
+        let library = TempDir::new().unwrap();
+        init_git_repo(library.path());
+        std::fs::create_dir_all(library.path().join("deep/er")).unwrap();
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let add = git_cmd(source.path())
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(library.path())
+            .arg("lib")
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{add:?}");
+        let commit = git_cmd(source.path())
+            .args(["commit", "-m", "submodule"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-submodule"), "HEAD").unwrap();
+        let lib = ws.workspace_path.join("lib");
+        let update = git_cmd(&ws.workspace_path)
+            .args(["-c", "protocol.file.allow=always", "submodule", "update"])
+            .args(["--init"])
+            .output()
+            .unwrap();
+        assert!(update.status.success(), "{update:?}");
+        for args in [
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "-m", "moved"],
+        ] {
+            assert!(git_cmd(&lib).args(args).output().unwrap().status.success());
+        }
+        assert!(ws.extract_changes().unwrap().contains("lib"));
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_format_patch_refuses_a_hardlinked_path_and_commits_nothing() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-fp"), "HEAD").unwrap();
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        assert_eq!(commit_count(&ws.workspace_path), 1);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_deleted_path_and_single_link_files_are_not_hardlink_violations() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-ok"), "HEAD").unwrap();
+        std::fs::remove_file(ws.workspace_path.join("README.md")).unwrap();
+        std::fs::write(ws.workspace_path.join("fresh.txt"), "one link").unwrap();
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("fresh.txt"));
+        assert!(diff.contains("README.md"));
         ws.cleanup().unwrap();
     }
 
@@ -3698,6 +4115,109 @@ mod tests {
             assert_eq!(summary.browser_runs, 1);
             assert_eq!(summary.artifacts.len(), 2);
             ws.cleanup().unwrap();
+        }
+
+        #[tokio::test]
+        async fn qa_click_and_type_evidence_survives_cleanup_in_the_persisted_report() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let store = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46200..=46200,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-click-type",
+            );
+            ws.set_artifact_store(store.path().to_path_buf());
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46200/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46200/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let page = crate::qa::browser::stub::StubPage::new(&[
+                serde_json::json!("complete"),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!("Hello, Nanna"),
+            ]);
+            let calls = Arc::clone(&page.calls);
+            ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let scenario = serde_json::json!({ "steps": [
+                { "step": "goto", "path": "/" },
+                { "step": "click", "selector": "#bump" },
+                { "step": "type", "selector": "#name", "text": "Nanna" },
+                { "step": "expect_text", "selector": "#greeting", "text": "Hello" },
+                { "step": "screenshot", "name": "after-typing" }
+            ] });
+            let browser = registry
+                .execute(
+                    crate::qa::QA_BROWSER_TOOL,
+                    serde_json::json!({ "scenario": scenario }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(browser["passed"], true, "{browser}");
+
+            let summary = ws.persist_qa_summary();
+            let worktree = ws.workspace_path.clone();
+            ws.cleanup().unwrap();
+
+            assert!(!worktree.exists(), "worktree must be gone");
+            assert_eq!(summary.browser_runs, 1);
+            assert_eq!(summary.browser_steps_passed, 5);
+            assert_eq!(summary.browser_steps_failed, 0);
+            let persisted = ws.persisted_qa_dir();
+            assert_eq!(summary.artifacts.len(), 2);
+            for artifact in &summary.artifacts {
+                assert!(Path::new(artifact).starts_with(&persisted), "{artifact}");
+                assert!(Path::new(artifact).is_file(), "{artifact}");
+            }
+            let report_path = persisted.join("browser-1/report.json");
+            assert_eq!(Path::new(&summary.artifacts[0]), report_path.as_path());
+            assert!(persisted.join("browser-1/after-typing.png").is_file());
+            let report: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+            assert_eq!(report["passed"], true);
+            let steps = report["steps"].as_array().unwrap();
+            let outcome = |kind: &str| {
+                steps
+                    .iter()
+                    .find(|s| s["step"]["step"] == kind)
+                    .unwrap_or_else(|| panic!("no {kind} step in {report}"))
+            };
+            let click = outcome("click");
+            assert_eq!(click["step"]["selector"], "#bump");
+            assert_eq!(click["passed"], true);
+            assert_eq!(click["detail"], "clicked `#bump`");
+            let typed = outcome("type");
+            assert_eq!(typed["step"]["selector"], "#name");
+            assert_eq!(typed["step"]["text"], "Nanna");
+            assert_eq!(typed["passed"], true);
+            assert_eq!(typed["detail"], "typed `Nanna` into `#name`");
+            let calls = calls.lock().unwrap().clone();
+            let click_call = format!("evaluate {}", crate::qa::browser::click_expression("#bump"));
+            let type_call = format!(
+                "evaluate {}",
+                crate::qa::browser::type_expression("#name", "Nanna")
+            );
+            assert_eq!(calls.iter().filter(|c| **c == click_call).count(), 1);
+            assert_eq!(calls.iter().filter(|c| **c == type_call).count(), 1);
         }
 
         #[tokio::test]

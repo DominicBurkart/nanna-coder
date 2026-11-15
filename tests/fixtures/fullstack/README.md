@@ -20,7 +20,11 @@ root workspace.
 The page also has a `#bump` button that increments the count shown in
 `#clicks` (`clicks: N`) and a `#name` textarea whose value is echoed in `#echo`
 (`typed: [value]`), so a browser test can observe that `click` and `type` ran
-the page's own handlers.
+the page's own handlers. A `#boom` button runs
+`console.error('nanna-fixture-deliberate-error')`, so a browser test can click
+it and assert that the `qa_browser` console capture reports that text (a
+console error the fixture produces on purpose, not one that depends on the
+browser's automatic `favicon.ico` request).
 
 `CHECKS` lists these paths one per line for smoke tests.
 
