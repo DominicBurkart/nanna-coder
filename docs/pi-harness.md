@@ -16,7 +16,7 @@ integrating the result.
    selects an identity, the spawn gate allows it, nanna resolves it into a
    launch plan, runs pi in a container, integrates the resulting patch and
    returns it through the unchanged MCP `tasks/result` shape.
-2. **one_track and nanna together, no agent calling nanna.** The same path,
+2. **An external scheduler or bridge and nanna together, no agent calling nanna.** The same path,
    with the scheduler/bridge as the caller. Nothing in the seam depends on who
    submitted the task.
 
@@ -60,7 +60,7 @@ and full access to whatever it runs on, so the guarantee is built around it:
 | No secrets | the environment is an exact (name, value) allowlist (`HOME`, `PI_CODING_AGENT_DIR`, `NANNA_BROKER_SOCKET`, `NANNA_CAPABILITIES`); there is no secret-name heuristic; the model `apiKey` is a placeholder |
 | Fixed hardening | privileges, Linux capabilities and devices are not expressible in a plan; the executor will fix them (non-root, read-only root, all caps dropped, no-new-privileges). **Not implemented yet.** |
 | Fail closed | `Unsupported` for empty capability sets or unrepresentable capability names; `ResolveError::InvalidModel`, `InvalidImage` and `InvalidBrokerSocket` for a bad model name, image reference or socket path; a plan that drops the agent's scope, limits or audited repository is rejected |
-| Verified lockdown | **Planned.** After start the executor compares the runtime's reported tool set to the plan with `verify_runtime_tools` and aborts on any difference. Nothing calls it yet. |
+| Verified lockdown | **Planned.** After start the executor reports the runtime's tool set to `Broker::arm`, which compares it to the plan with `verify_runtime_tools` and refuses to arm on any difference. `arm` is implemented in the broker layer; nothing starts a runtime or calls it yet. |
 
 `IsolationPolicy` encodes the rows that a plan can express. The property test
 `plans_always_satisfy_isolation` and `narrower_identity_never_widens_the_plan`
@@ -128,8 +128,8 @@ so a plan reaches an executor only through that chain (transitively; the
 executor does not itself inspect the proof). The prompt and repository label
 come from the audited request. Checking that the working repository on disk
 names the audited repository, as `TaskManager::submit_spawn` does, is the
-executor's job. The broker and executor are not written yet; this list is their
-contract and is reviewed before code.
+executor's job. The broker's decision logic is implemented in the broker layer
+(below) but is connected to nothing; the executor is not written yet.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
 tools that cannot honour path scope (`run_command` for path-restricted
@@ -148,12 +148,84 @@ capability satisfies the identity's tool patterns and effect ceiling
 tests cover the same-name exploit, different `paths`/`read_paths`, and a
 deliberately widened grant.
 
+## The broker (broker layer: implemented, connected to nothing)
+
+`harness_adapter/broker.rs` and `bind.rs` implement the broker's decision logic.
+Nothing serves a socket or starts it; that is the executor's job.
+
+**The registry is built by the runner's own constructor and cannot be
+supplied.** `ResolvedAgent::bind_workspace(&Allowed, &TaskWorkspace,
+ModelFacingLayers)` runs the checks `TaskManager::submit_spawn` runs
+(`names_repo`, then `check_repo` against the identity's `scope.repos`), builds
+the registry with `model_facing_registry` (identity scope or the read-only
+unscoped registry, then the production hold, the action gate and the escalator,
+exactly what `TaskRunner` installs), and asserts that the registry offers
+exactly the agent's capabilities with the effect classes the agent was resolved
+with. The result is a `BoundWorkspace` whose constructor is private and which
+records the whole audited identity, the audited repository and the capability
+set. `Broker::for_agent(&Allowed, &ResolvedAgent, BoundWorkspace, policy, sink)`
+refuses an agent that differs from the audit in any of: name, repositories,
+write and read paths, tool patterns, ceiling, limits, model, system prompt, task
+prompt or audited repository, and refuses a `BoundWorkspace` built for a
+different audited spawn or agent. No API accepts a registry or a closure.
+Derive the agent's grant from the same registry
+(`ScopedCapabilities::scope(model_facing_registry(...)?, identity)`) or
+`bind_workspace` refuses with `CapabilityMismatch`.
+
+- **Armed once.** `Broker` has no `handle`. `Broker::arm` consumes it and
+  returns an `ArmedBroker`, the only type that serves, so a rejected arm leaves
+  nothing behind (compile_fail doctest). `arm` checks that the plan names this
+  agent, audited repository, model, image, limits, scope, broker socket and
+  capability set, that every exposed capability is one the broker serves, and
+  that the tools the started runtime reports (for pi, `toolsAdded`) equal the
+  plan's. The model already holds its tools before the check, so nothing is
+  served until it passes.
+- **Halt stops everything.** A `ProductionHeld` result, or an action-gate
+  `Escalate`, sets the halt flag inside the decision and the broker then serves
+  nothing (`task_halted`). Calls already running when the flag is set complete.
+  The runtime is told a fixed notice; the repository, incident id, summary and
+  findings stay host-side in the returned `HaltReason`. An `Escalate` has
+  already been delivered by the registry's escalator; the broker only halts. An
+  action-gate `Block` returns to the agent as a typed `action_blocked` error.
+- **The gate is reached for Repository-class tools only.** `ToolRegistry::execute`
+  runs the action review for calls of class `Repository` or higher, and for
+  `run_command`'s content; a `Workspace`-class call such as `write_file` reaches
+  its tool with no action review, by design. The broker's policy serves only
+  `Workspace`-class and lower, so in production the gate is reached through the
+  broker only by `run_command`. The gate path is tested with a `Repository`-class
+  tool under a widened test policy.
+- **Fail closed on effects.** `BrokerPolicy` defaults to `Workspace` and can be
+  widened only inside the crate. A plan that exposes anything above it cannot
+  arm (`ExposedNotServed`), so an identity with a `ci`, `sandbox` or
+  `production` ceiling cannot run on this broker until windows and leases are
+  handled and the policy is widened in that change.
+- **Errors.** `ToolError` is mapped with an exhaustive match and no wildcard, so
+  a new variant breaks the build until it is mapped (this already caught
+  `ActionDenied`). A reply over `MAX_OUTPUT_BYTES` (bytes of its JSON text) is
+  replaced by an error; the tool has already run when that happens. A request
+  line over `MAX_REQUEST_BYTES` is rejected before it is parsed.
+- **Audit.** Each call is recorded through an `AuditSink` the executor injects
+  (default: a bounded in-memory ring of 10,000 that counts drops). A record holds
+  two sequence numbers, `started` (call order, assigned when the call begins)
+  and `completed` (completion order, assigned when it finishes), the requested
+  name (escaped and cut at a character boundary), the size of the arguments, a
+  fingerprint of them, the effect class and the outcome, which is `Aborted` if
+  the tool panicked or the call was dropped. It holds no argument content. The
+  fingerprint is the crate's FNV-1a `content_hash`: for correlation only, not a
+  cryptographic digest. The existing `auditor::AuditLog` records spawn reviews,
+  not tool calls, so it does not fit.
+
+Not done: serving the socket, the executor, releasing leases on every exit
+path, windows and leases in the broker, a durable audit sink, and a SHA-256
+(a new dependency needing the user's approval). The broker has not been run
+against pi.
+
 ## Runtime handshake
 
 A runtime that silently ignores a lockdown flag fails open, and
 `IsolationPolicy` cannot see argv semantics. After start, the executor must
 query the runtime's registered tools (pi RPC) and abort the run unless
-`verify_runtime_tools(plan, reported)` succeeds. The comparison function exists and is tested; it has no caller yet. **Lockdown is not verified until the executor calls it against real pi** (`NANNA_PI_BIN` integration test, a blocker for merging the executor).
+`verify_runtime_tools(plan, reported)` succeeds. The comparison function exists and is tested, and in the broker layer `Broker::arm` calls it; nothing calls `arm` yet. **Lockdown is not verified until the executor arms the broker against real pi** (`NANNA_PI_BIN` integration test, a blocker for merging the executor).
 
 ## Limits and scope are carried, not yet enforced
 
@@ -169,7 +241,7 @@ Implemented: broker-socket, gateway, capability, env (exact name and value),
 file-path, image, scope, limits and audited-repository checks in
 `IsolationPolicy`; image, model-name and broker-socket-path validation in
 `resolve`; `Allowed`-bound prompt and repository; fail-closed `Unsupported`;
-handshake comparison (no caller yet).
+handshake comparison (called by `Broker::arm` in the broker layer; nothing calls `arm` yet).
 
 Not implemented yet, all executor work: non-root user, read-only root
 filesystem, dropped Linux capabilities, `no-new-privileges`, and network
@@ -183,14 +255,18 @@ drift. The plan carries a single `gateway` endpoint, so there is no
 
 ## Status of this change
 
-Landed: `harness_adapter` (types, `IsolationPolicy`, `PiAdapter`, handshake
-comparison), and the corrective hardening of it: private-field `ResolvedAgent`
-built from an `Allowed` spawn proof, with the prompt (the audited subtask) and
-repository label taken from the audit; `CheckedPlan`; a stricter `Endpoint`;
-image, model-name and broker-socket validation; an exact env allowlist; one
-broker socket and one gateway; and removal of unused API (`HarnessKind`,
-`PlanNetwork`, `Mount`, the operator-configured endpoint constructor and
-`withhold_above`, which return with the executor).
+Landed on `main`: the interface layer (#812) and its hardening (#871):
+`harness_adapter` (types, `IsolationPolicy`, `PiAdapter`, handshake comparison),
+private-field `ResolvedAgent` built from an `Allowed` spawn proof with the
+prompt and repository label taken from the audit, `CheckedPlan`, a stricter
+`Endpoint`, image, model-name and broker-socket validation, an exact env
+allowlist, one broker socket and one gateway, and removal of unused API
+(`HarnessKind`, `PlanNetwork`, `Mount`, the operator-configured endpoint
+constructor and `withhold_above`, which return with the executor). Also on
+`main`: the real-pi container spike evidence (#877).
+
+In review, stacked on the shared-registry change (#929): the broker layer
+described above (`bind.rs`, `broker.rs`).
 
 Merge rule: the next merge to main makes pi runnable end to end for at least one
 inner-loop identity, behind these isolation checks, with the real-pi test
@@ -200,14 +276,13 @@ slice lands on its own.
 
 Not yet done (in order):
 
-1. Broker, per the contract above and the real-pi constraints (refuse every call
-   until `toolsAdded` has been verified; capabilities above Workspace withheld
-   until windows and leases are handled; the per-action gate itself is on main
-   since #876).
+1. Windows and leases in the broker (the per-action gate is on main since #876
+   and is installed through `model_facing_registry`), so the Workspace-only
+   policy can be widened.
 2. Executor trait plus a container executor (hardening above) with a fake for
    tests; RPC event parsing (`agent_settled`, tool events) into the existing
    `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
-   the one_track bridge fixtures (golden-JSON test); lease release on every exit
+   the external bridge's fixtures (golden-JSON test); lease release on every exit
    path. Blocked on the real-pi integration test below.
 3. Packaging: pi 1.2.0 as a pinned flake input (`github:earendil-works/pi`) with
    a lock hash and `npm install --ignore-scripts`, built into the agent image
@@ -242,29 +317,47 @@ Known gaps, tracked here and not yet fixed:
   executor slice must resolve at dispatch time and carry the `ResolvedAgent` (or
   an equivalent audited launch spec) through the queue: one audit is one launch
   (a by-value consume), and a caller-supplied identity is never accepted.
-- A `ResolvedAgent::bind_workspace(repo_path)` that runs `names_repo` and
-  `check_repo` from the stored scope, so the executor cannot reimplement them.
-  `resolve` does not assert that the audited repository is within
-  `scope.repos`, and the audited repository may be a path.
+- `resolve` does not assert that the audited repository is within
+  `scope.repos`, and the audited repository may be a path. In the broker layer
+  `ResolvedAgent::bind_workspace` runs `names_repo` and `check_repo` against the
+  real workspace, so the executor must go through it and not reimplement the
+  checks. `bind_workspace` accepts any `TaskWorkspace`, including a host-only
+  one; the executor must pass the container workspace when `flake.nix` and
+  `.devcontainer` exist (the runner's own choice).
 - The executor must detect all three pi failure signals (prompt `success:
   false`, a final `stopReason: "error"`, the deadline) and map each to a
   `FailureDiagnostics.error_type`, with the golden-JSON test; see "Real-pi
   findings".
 - Carry the parent task id for audit-log correlation. The worktree path and
   branch are executor inputs obtained only through `bind_workspace`.
-- New broker work is only windows and leases and the audit log. The per-action
-  gate is on main (#876) and is installed through `model_facing_registry`. Path
+- New broker work still to do is windows and leases and a durable audit sink.
+  The per-action gate is on main (#876) and is installed through
+  `model_facing_registry`. Path
   scope and protected paths are already enforced inside the scoped file tools,
   and `ToolRegistry::execute` already does lookup, the production hold and
   denial recording; the broker must not reimplement them, and must build its
   registry with the path-scope-aware constructors.
 
-- A `CheckedPlan` does not remember its agent or repository, so a plan for one
-  agent could be handed to a broker built for another. The broker handle and
-  plan must be matched at the executor entry point.
-- `ScopedCapabilities::scope` accepts any registry and does not check path
-  scoping; the contract (the registry must come from `create_*_registry_for`)
-  must be documented and tested at the broker.
+- In the broker layer a plan names its agent, model, image, scope and audited
+  repository, and `Broker::arm` refuses a plan that differs from the broker's.
+- `ScopedCapabilities::scope` still accepts any registry and does not check path
+  scoping by itself. The broker layer closes this where it matters:
+  `bind_workspace` builds the registry itself and asserts that it offers exactly
+  the agent's capabilities and effect classes, and the broker accepts only that
+  `BoundWorkspace`.
+- `model_facing_registry` is a convention until a test fails when a
+  model-facing registry is built another way: `main.rs` `Commands::Agent` and
+  `eval/runner.rs` build their own registries (#921, #922).
+- The audit fingerprint is a non-cryptographic FNV-1a hash for correlation; a
+  durable sink is an executor decision, and a real SHA-256 needs a new
+  dependency, which needs the user's approval.
+- Public items with no caller outside the broker layer and tests, which the
+  executor slice can narrow: everything exported from `broker.rs` and `bind.rs`,
+  and `ResolvedAgent::bind_workspace`. They are `pub` rather than `pub(crate)`
+  because `pub(crate)` would make `dead_code` fire without a caller, and no lint
+  suppression is allowed.
+- Mutation evidence for the broker layer: `docs/pi-mutation/` (the script and
+  the results).
 - Model-name charset and length cap beyond the current option/whitespace/
   control-character checks.
 - The extension's reply cap counts UTF-16 units, not bytes; a `null` reply needs
