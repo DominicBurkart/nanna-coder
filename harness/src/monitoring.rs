@@ -1242,4 +1242,187 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[tokio::test]
+    async fn test_health_status_helpers() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[tokio::test]
+    async fn test_record_error_and_model_inference() {
+        let mut collector = DefaultMetricsCollector::new();
+
+        let error = ErrorEvent {
+            timestamp: chrono::Utc::now(),
+            error_type: "network".to_string(),
+            message: "connection timeout".to_string(),
+            component: "ollama".to_string(),
+            severity: ErrorSeverity::Error,
+        };
+        collector.record_error(error).await;
+
+        let model_metrics = ModelMetrics {
+            model_name: "qwen3:0.6b".to_string(),
+            inference_count: 10,
+            avg_inference_time_ms: 42.0,
+            tokens_per_second: 100.0,
+            success_rate: 0.99,
+            quality_scores: QualityMetrics {
+                avg_coherence: 0.9,
+                avg_relevance: 0.85,
+                consistency: 0.8,
+                accuracy_rate: 0.95,
+            },
+            resource_usage: ModelResourceUsage {
+                peak_memory_mb: 512.0,
+                avg_cpu_percent: 30.0,
+                gpu_utilization_percent: None,
+            },
+        };
+        collector
+            .record_model_inference("qwen3:0.6b", model_metrics)
+            .await;
+
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.error_metrics.total_errors, 1);
+        assert!(metrics.model_metrics.contains_key("qwen3:0.6b"));
+    }
+
+    #[tokio::test]
+    async fn test_export_metrics_custom_format_returns_error() {
+        let collector = DefaultMetricsCollector::new();
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("my-format".to_string()))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("my-format"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("svc", Duration::from_millis(50))
+            .await;
+        collector.record_cache_hit("k").await;
+
+        let before = collector.get_current_metrics().await.unwrap();
+        assert_eq!(before.cache_metrics.hits, 1);
+
+        collector.reset_metrics().await;
+
+        let after = collector.get_current_metrics().await.unwrap();
+        assert_eq!(after.cache_metrics.hits, 0);
+        assert!(after.request_latencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_check_interval() {
+        let mut monitor = DefaultHealthMonitor::new(Duration::from_secs(60));
+        monitor.set_check_interval(Duration::from_secs(30));
+        // Verify the monitor still works correctly after changing interval
+        let result = monitor.check_system_health().await.unwrap();
+        assert_eq!(result.status, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_alert_severity_variants() {
+        let manager = DefaultAlertManager::new();
+
+        let id_info = manager
+            .send_alert("Info alert", "details", AlertSeverity::Info)
+            .await
+            .unwrap();
+        let id_err = manager
+            .send_alert("Error alert", "details", AlertSeverity::Error)
+            .await
+            .unwrap();
+        let id_crit = manager
+            .send_alert("Critical alert", "details", AlertSeverity::Critical)
+            .await
+            .unwrap();
+
+        let history = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(history.len(), 3);
+
+        // All three are unacknowledged active alerts
+        let active = manager.get_active_alerts().await.unwrap();
+        assert_eq!(active.len(), 3);
+
+        // Verify severity ordering
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+
+        // IDs are non-empty and distinct
+        assert!(!id_info.is_empty());
+        assert!(!id_err.is_empty());
+        assert!(!id_crit.is_empty());
+        assert_ne!(id_info, id_err);
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_alert_not_found() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("nonexistent-id").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_configure_thresholds() {
+        let mut manager = DefaultAlertManager::new();
+        let thresholds = AlertThresholds {
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            max_cpu_usage: 0.8,
+            max_memory_usage: 0.7,
+            health_check_timeout: Duration::from_secs(15),
+        };
+        manager.configure_thresholds(thresholds).await.unwrap();
+        // After configuring, the manager should still function
+        let active = manager.get_active_alerts().await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_alert_history_with_limit() {
+        let manager = DefaultAlertManager::new();
+        for i in 0..5 {
+            manager
+                .send_alert(
+                    &format!("Alert {}", i),
+                    "details",
+                    AlertSeverity::Warning,
+                )
+                .await
+                .unwrap();
+        }
+        let history_all = manager.get_alert_history(10).await.unwrap();
+        assert_eq!(history_all.len(), 5);
+
+        let history_limited = manager.get_alert_history(3).await.unwrap();
+        assert_eq!(history_limited.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_monitoring() {
+        let mut system = MonitoringSystem::new();
+        system.start_monitoring().await.unwrap();
+        // Background task is running; stop it cleanly
+        system.stop_monitoring().await;
+        // Calling stop again when not running is a no-op
+        system.stop_monitoring().await;
+    }
 }

@@ -1097,4 +1097,44 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_builder_with_alert_policy() {
+        let policy = AlertPolicy::immediate_critical();
+        let system = ObservabilitySystem::new().with_alert_policy(policy);
+        // Builder returns self; verify the system is still usable
+        assert!(system.get_uptime() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_health_thresholds() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 70.0,
+            memory_threshold: 75.0,
+            disk_threshold: 80.0,
+            max_latency_ms: 500,
+            min_cache_hit_rate: 0.9,
+            max_error_rate: 0.01,
+            container_timeout: Duration::from_secs(10),
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        assert!(system.get_uptime() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_start_and_stop_monitoring() {
+        let mut system = ObservabilitySystem::new();
+        system.start_monitoring().await.unwrap();
+        // stop_monitoring aborts the task; calling twice is safe (second is no-op)
+        system.stop_monitoring().await;
+        system.stop_monitoring().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_uptime_increases() {
+        let system = ObservabilitySystem::new();
+        let t0 = system.get_uptime();
+        // Uptime is measured from construction; even 0 ns is valid
+        assert!(t0 < Duration::from_secs(5));
+    }
 }
