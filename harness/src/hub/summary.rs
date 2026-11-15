@@ -63,7 +63,6 @@ impl TryFrom<String> for Summary {
 
 const ELLIPSIS: char = '\u{2026}';
 const WITHHELD: &str = "[summary withheld]";
-const MAX_ROUNDS: usize = 8;
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -99,16 +98,11 @@ fn pipeline(raw: &str) -> String {
     truncate_chars(&collapse_whitespace(&redacted))
 }
 
-fn settle(raw: &str, step: impl Fn(&str) -> String) -> String {
-    let mut current = step(raw);
-    for _ in 0..MAX_ROUNDS {
-        let next = step(&current);
-        if next == current {
-            return current;
-        }
-        current = next;
+fn finish(candidate: String) -> String {
+    match violation(&candidate) {
+        None => candidate,
+        Some(_) => WITHHELD.to_string(),
     }
-    WITHHELD.to_string()
 }
 
 impl Summary {
@@ -134,7 +128,7 @@ impl Summary {
     /// ```
     pub fn compose(identity: &str, status_label: &str, text: &str) -> Summary {
         let raw = format!("{identity} [{status_label}] {text}");
-        Summary(settle(&raw, pipeline))
+        Summary(finish(pipeline(&raw)))
     }
 
     /// The validated text.
@@ -313,16 +307,21 @@ mod tests {
     }
 
     #[test]
-    fn a_pipeline_that_never_settles_is_replaced_by_the_withheld_constant() {
-        let out = settle("seed", |s| format!("{s}x"));
-        assert_eq!(out, WITHHELD);
-        assert_eq!(Summary::try_from(out.clone()).unwrap().as_str(), out);
-    }
-
-    #[test]
-    fn a_pipeline_that_settles_after_several_rounds_returns_the_fixed_point() {
-        let out = settle("aaaa", |s| s.strip_suffix('a').unwrap_or(s).to_string());
-        assert_eq!(out, "");
+    fn finish_withholds_every_kind_of_invalid_candidate_and_keeps_valid_ones() {
+        for bad in [
+            "x".repeat(180),
+            "a\u{202e}b".to_string(),
+            "token=abc".to_string(),
+            "a  b".to_string(),
+        ] {
+            assert_eq!(finish(bad), WITHHELD);
+        }
+        assert_eq!(finish("fine text".to_string()), "fine text");
+        assert!(violation(WITHHELD).is_none());
+        assert_eq!(
+            Summary::try_from(WITHHELD.to_string()).unwrap().as_str(),
+            WITHHELD
+        );
     }
 
     #[test]
