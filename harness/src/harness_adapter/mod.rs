@@ -66,6 +66,7 @@ mod checked;
 mod isolation;
 mod pi;
 mod pi_extension;
+mod route;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
@@ -74,6 +75,11 @@ mod tests;
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
+pub(crate) use route::{pi_container_name, PiContainerGuard};
+pub use route::{
+    PiExecutor, PiLaunch, PiLimits, PiRoute, PiRouteError, UnwiredPiExecutor,
+    PI_GATEWAY_SOCKET_ENV, PI_IMAGE_ENV,
+};
 
 use crate::auditor::Allowed;
 use crate::effects::EffectClass;
