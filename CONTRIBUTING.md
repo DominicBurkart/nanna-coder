@@ -12,7 +12,7 @@ See [TESTING.md](./TESTING.md).
 
 ## License
 
-All contributions fall under the [project license](./LICENSE).
+All contributions fall under the project license ([MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE)).
 
 ## GitHub Issues
 
