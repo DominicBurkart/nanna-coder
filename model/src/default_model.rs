@@ -143,7 +143,19 @@ fn query_nvidia_smi(
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(e) => {
+            return Err(ModelError::Unknown {
+                message: format!("cannot run {program}: {e}"),
+            })
+        }
     };
     let mut stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {

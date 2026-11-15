@@ -218,6 +218,14 @@ fn a_manifest_without_a_model_layer_is_rejected_even_with_other_weights() {
 }
 
 #[cfg(target_os = "linux")]
+static SMI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn smi_lock() -> std::sync::MutexGuard<'static, ()> {
+    SMI_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(target_os = "linux")]
 fn script_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
@@ -242,6 +250,7 @@ fn fake_smi(body: &str) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_working_nvidia_smi_gives_cuda_capacity() {
+    let _guard = smi_lock();
     let smi = fake_smi("echo 8192");
     let cap = probe_device_with(&smi, Duration::from_secs(5)).unwrap();
     assert_eq!(cap.accel, Accel::Cuda);
@@ -251,6 +260,7 @@ fn a_working_nvidia_smi_gives_cuda_capacity() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_hung_nvidia_smi_is_killed_and_refused_promptly() {
+    let _guard = smi_lock();
     let smi = fake_smi("exec sleep 30");
     let started = Instant::now();
     let err = probe_device_with(&smi, Duration::from_millis(300)).unwrap_err();
@@ -261,6 +271,7 @@ fn a_hung_nvidia_smi_is_killed_and_refused_promptly() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_absent_nvidia_smi_is_not_an_error() {
+    let _guard = smi_lock();
     let cap = probe_device_with("/nonexistent/nvidia-smi", Duration::from_secs(1)).unwrap();
     assert_ne!(cap.accel, Accel::Cuda);
 }
@@ -268,6 +279,7 @@ fn an_absent_nvidia_smi_is_not_an_error() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failing_nvidia_smi_counts_as_no_nvidia_gpu() {
+    let _guard = smi_lock();
     let smi = fake_smi("exit 9");
     let cap = probe_device_with(&smi, Duration::from_secs(5)).unwrap();
     assert_ne!(cap.accel, Accel::Cuda);
