@@ -395,19 +395,23 @@ pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 /// Largest registry config blob accepted.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-fn registry_base(url: &str) -> Result<String, ModelError> {
-    let bad = |why: &str| ModelError::InvalidConfig {
-        message: format!("registry URL rejected: {why}"),
-    };
-    let parsed = reqwest::Url::parse(url).map_err(|_| bad("not a URL"))?;
-    let loopback = parsed.host_str().is_some_and(|host| {
+fn is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
         host == "localhost"
             || host
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
-    });
+    })
+}
+
+fn registry_base(url: &str) -> Result<String, ModelError> {
+    let bad = |why: &str| ModelError::InvalidConfig {
+        message: format!("registry URL rejected: {why}"),
+    };
+    let parsed = reqwest::Url::parse(url).map_err(|_| bad("not a URL"))?;
+    let loopback = is_loopback(&parsed);
     match parsed.scheme() {
         "https" => {}
         "http" if loopback => {}
@@ -501,10 +505,7 @@ async fn fetch_variant(
             message: format!("registry manifest for gemma4:{tag} has no usable config digest"),
         })?;
     let declared = parsed.pointer("/config/size").and_then(|s| s.as_u64());
-    let response = client
-        .get(format!("{base}/v2/library/gemma4/blobs/{digest}"))
-        .send()
-        .await?;
+    let response = get_blob(client, &format!("{base}/v2/library/gemma4/blobs/{digest}")).await?;
     let config = read_capped(response, MAX_CONFIG_BYTES, "config blob").await?;
     if declared != Some(config.len() as u64) {
         return Err(ModelError::Unknown {
@@ -544,4 +545,27 @@ pub async fn ensure_runnable(
             ),
         })
     }
+}
+
+async fn get_blob(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, ModelError> {
+    let first = client.get(url).send().await?;
+    if !first.status().is_redirection() {
+        return Ok(first);
+    }
+    let refuse = |why: &str| ModelError::Unknown {
+        message: format!("registry redirect refused: {why}"),
+    };
+    let origin = reqwest::Url::parse(url).map_err(|_| refuse("unparsable registry URL"))?;
+    let target = first
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|location| origin.join(location).ok())
+        .ok_or_else(|| refuse("no usable Location header"))?;
+    let allowed = target.scheme() == "https"
+        || (target.scheme() == "http" && is_loopback(&target) && is_loopback(&origin));
+    if !allowed {
+        return Err(refuse("the target is not https"));
+    }
+    Ok(client.get(target).send().await?)
 }

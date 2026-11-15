@@ -3,8 +3,9 @@ use model::default_model::*;
 use model::{ChatRequest, ChatResponse, ModelError, ModelInfo, ModelProvider, ModelResult};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const MODEL_LAYER: &str = "application/vnd.ollama.image.model";
 const CONFIG: &str = r#"{"model_type":"7.5B"}"#;
@@ -14,6 +15,7 @@ struct Reply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     unannounced_length: bool,
+    split_at: Option<usize>,
 }
 
 fn ok(body: impl Into<Vec<u8>>) -> Reply {
@@ -22,6 +24,7 @@ fn ok(body: impl Into<Vec<u8>>) -> Reply {
         headers: Vec::new(),
         body: body.into(),
         unannounced_length: false,
+        split_at: None,
     }
 }
 
@@ -31,6 +34,7 @@ fn not_found() -> Reply {
         headers: Vec::new(),
         body: b"{}".to_vec(),
         unannounced_length: false,
+        split_at: None,
     }
 }
 
@@ -59,7 +63,17 @@ fn spawn_stub(handler: impl Fn(&str) -> Reply + Send + 'static) -> (String, Seen
             }
             out.push_str("\r\n");
             let _ = stream.write_all(out.as_bytes());
-            let _ = stream.write_all(&reply.body);
+            match reply.split_at {
+                Some(at) if at < reply.body.len() => {
+                    let _ = stream.write_all(&reply.body[..at]);
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = stream.write_all(&reply.body[at..]);
+                }
+                _ => {
+                    let _ = stream.write_all(&reply.body);
+                }
+            }
         }
     });
     (format!("http://{addr}"), seen)
@@ -138,6 +152,7 @@ async fn a_redirect_is_not_followed() {
         headers: vec![("location".into(), location.clone())],
         body: Vec::new(),
         unannounced_length: false,
+        split_at: None,
     });
     let err = OllamaRegistryCatalog::new(url)
         .gemma4_variants()
@@ -389,4 +404,183 @@ async fn an_oversized_config_blob_without_a_declared_length_is_cut_off_while_str
         .await
         .unwrap_err();
     assert!(err.to_string().contains("exceeds"), "{err}");
+}
+
+fn padded_config(total: usize) -> String {
+    let base = r#"{"model_type":"7.5B","pad":""}"#.len();
+    format!(
+        r#"{{"model_type":"7.5B","pad":"{}"}}"#,
+        "x".repeat(total - base)
+    )
+}
+
+fn padded_manifest(config_size: usize, total: usize) -> String {
+    let base = manifest(config_size, 0).len();
+    manifest(config_size, total - base)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    Manifest,
+    Config,
+}
+
+async fn fetch_with_body_of(
+    target: Target,
+    length: usize,
+    announce: bool,
+    split_at: Option<usize>,
+) -> Result<Vec<ModelVariant>, ModelError> {
+    let (manifest_body, config_body) = match target {
+        Target::Manifest => (padded_manifest(CONFIG.len(), length), CONFIG.to_string()),
+        Target::Config => {
+            let config = padded_config(length);
+            (manifest(config.len(), 0), config)
+        }
+    };
+    let (url, _) = spawn_stub(move |path| {
+        let (body, wanted) = if path.contains("/blobs/") {
+            (config_body.clone(), matches!(target, Target::Config))
+        } else {
+            (manifest_body.clone(), matches!(target, Target::Manifest))
+        };
+        Reply {
+            unannounced_length: !announce && wanted,
+            split_at: split_at.filter(|_| wanted),
+            ..ok(body)
+        }
+    });
+    OllamaRegistryCatalog::new(url).gemma4_variants().await
+}
+
+fn cap_of(target: Target) -> usize {
+    match target {
+        Target::Manifest => MAX_MANIFEST_BYTES,
+        Target::Config => MAX_CONFIG_BYTES,
+    }
+}
+
+#[tokio::test]
+async fn a_body_of_exactly_the_cap_is_accepted() {
+    for target in [Target::Manifest, Target::Config] {
+        let cap = cap_of(target);
+        for announce in [true, false] {
+            for split in [None, Some(cap - 7)] {
+                let got = fetch_with_body_of(target, cap, announce, split).await;
+                assert!(
+                    got.is_ok(),
+                    "{target:?} announce={announce} split={split:?}: {got:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_body_one_byte_over_the_cap_is_rejected() {
+    for target in [Target::Manifest, Target::Config] {
+        let cap = cap_of(target);
+        for announce in [true, false] {
+            for split in [None, Some(cap - 7), Some(cap)] {
+                let err = fetch_with_body_of(target, cap + 1, announce, split)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("exceeds"),
+                    "{target:?} announce={announce} split={split:?}: {err}"
+                );
+            }
+        }
+    }
+}
+
+fn redirect_to(location: String) -> Reply {
+    Reply {
+        status: 307,
+        headers: vec![("location".into(), location)],
+        body: Vec::new(),
+        unannounced_length: false,
+        split_at: None,
+    }
+}
+
+fn registry_redirecting_blobs_to(target: String, config_size: usize) -> String {
+    let (url, _) = spawn_stub(move |path| {
+        if path.contains("/blobs/") {
+            redirect_to(target.clone())
+        } else {
+            ok(manifest(config_size, 0))
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_config_blob_redirect_to_a_storage_host_is_followed_once() {
+    let (storage, seen) = spawn_stub(|_| ok(CONFIG));
+    let url = registry_redirecting_blobs_to(format!("{storage}/data?sig=1"), CONFIG.len());
+    let variants = OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .unwrap();
+    assert_eq!(variants.len(), GEMMA4_TAGS.len());
+    assert!(seen.lock().unwrap().iter().all(|p| p.starts_with("/data")));
+}
+
+#[tokio::test]
+async fn a_config_blob_redirect_to_plain_http_on_another_host_is_refused() {
+    let url =
+        registry_redirecting_blobs_to("http://storage.example.invalid/data".into(), CONFIG.len());
+    let err = OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("redirect"), "{err}");
+}
+
+#[tokio::test]
+async fn a_second_redirect_is_not_followed() {
+    let (last, last_seen) = spawn_stub(|_| ok(CONFIG));
+    let hop = format!("{last}/final");
+    let (storage, _) = spawn_stub(move |_| redirect_to(hop.clone()));
+    let url = registry_redirecting_blobs_to(format!("{storage}/data"), CONFIG.len());
+    assert!(OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .is_err());
+    assert!(last_seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_redirected_config_blob_is_still_size_capped_and_length_checked() {
+    let big = padded_config(MAX_CONFIG_BYTES + 1);
+    let (storage, _) = spawn_stub(move |_| ok(big.clone()));
+    let url = registry_redirecting_blobs_to(format!("{storage}/data"), MAX_CONFIG_BYTES + 1);
+    let err = OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds"), "{err}");
+
+    let (storage, _) = spawn_stub(|_| ok(CONFIG));
+    let url = registry_redirecting_blobs_to(format!("{storage}/data"), CONFIG.len() + 1);
+    assert!(OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn a_manifest_redirect_is_still_never_followed() {
+    let (target, seen) = good_registry();
+    let url = {
+        let location = format!("{target}/v2/library/gemma4/manifests/e4b");
+        let (url, _) = spawn_stub(move |_| redirect_to(location.clone()));
+        url
+    };
+    assert!(OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .is_err());
+    assert!(seen.lock().unwrap().is_empty());
 }
