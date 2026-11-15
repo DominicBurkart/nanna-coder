@@ -82,14 +82,14 @@ fn users(source: &str, name: &str) -> BTreeSet<String> {
     found.map(|(function, _)| function.clone()).collect()
 }
 
-#[derive(Default)]
-struct Finder {
+struct Finder<'a> {
+    name: &'a str,
     body: Option<syn::Block>,
 }
 
-impl<'ast> Visit<'ast> for Finder {
+impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if node.sig.ident == "run_gate" {
+        if node.sig.ident == self.name {
             self.body = Some(node.block.clone());
         }
     }
@@ -104,14 +104,21 @@ fn called_method(expr: &syn::Expr) -> Option<String> {
 }
 
 fn run_gate_problem(source: &str) -> Option<String> {
+    decision_problem(source, "run_gate", "decide")
+}
+
+fn decision_problem(source: &str, function: &str, decider: &str) -> Option<String> {
     let file = syn::parse_file(source).unwrap();
-    let mut finder = Finder::default();
+    let mut finder = Finder {
+        name: function,
+        body: None,
+    };
     finder.visit_file(&file);
     let Some(body) = finder.body else {
-        return Some("run_gate is missing".to_string());
+        return Some(format!("{function} is missing"));
     };
     let [first, second, last] = body.stmts.as_slice() else {
-        return Some("run_gate must be exactly three statements".to_string());
+        return Some(format!("{function} must be exactly three statements"));
     };
     let syn::Stmt::Local(local) = first else {
         return Some("the first statement must bind the decision".to_string());
@@ -120,8 +127,8 @@ fn run_gate_problem(source: &str) -> Option<String> {
         return Some("the decision must be bound to a plain name".to_string());
     };
     let decided = called_method(&local.init.as_ref()?.expr);
-    if decided.as_deref() != Some("decide") {
-        return Some("the decision must come from `decide`".to_string());
+    if decided.as_deref() != Some(decider) {
+        return Some(format!("the decision must come from `{decider}`"));
     }
     let emitted = match second {
         syn::Stmt::Expr(expr, Some(_)) => called_method(expr),
@@ -131,10 +138,12 @@ fn run_gate_problem(source: &str) -> Option<String> {
         return Some("the second statement must call `emit`".to_string());
     }
     let syn::Stmt::Expr(syn::Expr::Path(returned), None) = last else {
-        return Some("run_gate must return the bound decision".to_string());
+        return Some(format!("{function} must return the bound decision"));
     };
     if !returned.path.is_ident(&bound.ident) {
-        return Some("run_gate must return exactly the value it emitted".to_string());
+        return Some(format!(
+            "{function} must return exactly the value it emitted"
+        ));
     }
     None
 }
@@ -253,6 +262,18 @@ fn is_action_gate_of(expr: &syn::Expr, manager: &str) -> bool {
         && last_segment(&call.receiver).as_deref() == Some(manager)
 }
 
+fn is_cost_accountant_of(expr: &syn::Expr, manager: &str) -> bool {
+    let syn::Expr::Reference(reference) = expr else {
+        return false;
+    };
+    let syn::Expr::MethodCall(call) = &*reference.expr else {
+        return false;
+    };
+    call.method == "cost_accountant"
+        && call.args.is_empty()
+        && last_segment(&call.receiver).as_deref() == Some(manager)
+}
+
 struct Wiring<'a> {
     function: &'a str,
     builder: &'a str,
@@ -319,6 +340,18 @@ fn attachment_problem(source: &str, wiring: &Wiring) -> Option<String> {
             wiring.file
         ));
     };
+    let budget = found.calls.iter().any(|(name, args, _)| {
+        name == "export_budget"
+            && args
+                .first()
+                .is_some_and(|a| is_cost_accountant_of(a, &manager))
+            && args.get(1).and_then(borrowed_path).as_deref() == Some(telemetry.as_str())
+    });
+    if !budget {
+        return Some(format!(
+            "{function} must call export_budget(&{manager}.cost_accountant(), &{telemetry})"
+        ));
+    }
     let flows = found.paths.iter().any(|(path, args)| {
         path.ends_with("NannaMcpServer::new")
             && args.first().is_some_and(|a| mentions(a).contains(&manager))
@@ -422,24 +455,25 @@ fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
     };
     let mgr = "let m = build_x_task_manager(a);";
     let exp = "let t = export_action_audit(&m.action_gate(), q.with_file_name(FILE));";
+    let bud = "export_budget(&m.cost_accountant(), &t);";
     let srv = "let s = NannaMcpServer::new(m, a);";
     let w = "let w = async { s.serve(r).await };";
     let spawn = "let f = spawn_telemetry_flush(Arc::clone(&t), d);";
-    let base = format!("{mgr} {exp} {srv} {w}");
+    let base = format!("{mgr} {exp} {bud} {srv} {w}");
     let flushed = format!("{base} {spawn} finish_with_flush(&t, Some(f), w).await;");
     assert_eq!(problem(&flushed, true), None);
     let plain = format!("{base} finish_with_flush(&t, None, w).await;");
     assert_eq!(problem(&plain, false), None);
     let inline = format!(
-        "{mgr} {exp} {srv} finish_with_flush(&t, None, async {{ s.serve(r).await }}).await;"
+        "{mgr} {exp} {bud} {srv} finish_with_flush(&t, None, async {{ s.serve(r).await }}).await;"
     );
     assert_eq!(problem(&inline, false), None);
     let other = "let t = export_action_audit(&TaskManager::default().action_gate(), q.with_file_name(FILE));";
     let swapped =
-        format!("{mgr} {other} {srv} {w} {spawn} finish_with_flush(&t, Some(f), w).await;");
+        format!("{mgr} {other} {bud} {srv} {w} {spawn} finish_with_flush(&t, Some(f), w).await;");
     assert!(says(&swapped, true, "export_action_audit"));
     let wrong_file = exp.replace("FILE", "OTHER");
-    let wrong = format!("{mgr} {wrong_file} {srv} {w} finish_with_flush(&t, None, w).await;");
+    let wrong = format!("{mgr} {wrong_file} {bud} {srv} {w} finish_with_flush(&t, None, w).await;");
     assert!(says(&wrong, false, "export_action_audit"));
     assert!(says(
         &format!("let m = other(a); {exp}"),
@@ -453,10 +487,22 @@ fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
     );
     assert!(says(&dropped, true, "spawned flush task"));
     assert!(says(
-        &format!("{mgr} {exp} {srv}"),
+        &format!("{mgr} {exp} {bud} {srv}"),
         false,
         "finish_with_flush"
     ));
+    for faked in [
+        "",
+        "export_budget(&other.cost_accountant(), &t);",
+        "export_budget(&m.cost_accountant(), &u);",
+        "export_budget(&m.cost_accountant(), t);",
+        "export_budget(m.cost_accountant(), &t);",
+        "export_budget(&m.budget(), &t);",
+        "export_budget(&Fresh::new().cost_accountant(), &t);",
+    ] {
+        let text = format!("{mgr} {exp} {faked} {srv} {w} finish_with_flush(&t, None, w).await;");
+        assert!(says(&text, false, "export_budget"), "{faked}");
+    }
     for variant in [
         "finish_with_flush(&u, None, w)",
         "finish_with_flush(t, None, w)",
@@ -474,17 +520,18 @@ fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
         assert!(flagged, "{argument}");
     }
     let indirect =
-        format!("{mgr} (pick())(1); {exp} {srv} {w} finish_with_flush(&t, None, w).await;");
+        format!("{mgr} (pick())(1); {exp} {bud} {srv} {w} finish_with_flush(&t, None, w).await;");
     assert_eq!(problem(&indirect, false), None);
     let shadowed = format!(
         "{base} let m = Arc::new(TaskManager::default()); finish_with_flush(&t, None, w).await;"
     );
     assert!(says(&shadowed, false, "rebinds"));
-    let detached = format!("{mgr} {exp} let s = NannaMcpServer::new(other, a); {w} finish_with_flush(&t, None, w).await;");
+    let detached = format!("{mgr} {exp} {bud} let s = NannaMcpServer::new(other, a); {w} finish_with_flush(&t, None, w).await;");
     assert!(says(&detached, false, "NannaMcpServer::new"));
     let empty = format!("{base} finish_with_flush(&t, None, async {{ Ok(()) }}).await?; w.await?;");
     assert!(says(&empty, false, "serve"));
-    let unbound = format!("{mgr} {exp} {srv} {w} finish_with_flush(&t, None, missing).await;");
+    let unbound =
+        format!("{mgr} {exp} {bud} {srv} {w} finish_with_flush(&t, None, missing).await;");
     assert!(says(&unbound, false, "serve"));
     let twice_bound =
         format!("{base} let w = async {{ Ok(()) }}; finish_with_flush(&t, None, w).await;");
@@ -727,5 +774,74 @@ fn the_scanner_attributes_idents_to_functions_and_skips_test_code() {
     assert_eq!(
         users(text, "append"),
         expected(&["decide", "nested", "other"])
+    );
+}
+
+const BUDGET_DECISIONS: [(&str, &str); 3] = [
+    ("charge_count_within", "decide_charge"),
+    ("record_minutes", "apply_minutes"),
+    ("record_minutes_sync", "apply_minutes_sync"),
+];
+
+#[test]
+fn every_budget_decision_path_decides_emits_and_returns_the_value_it_emitted() {
+    let budget = source("src/budget.rs");
+    for (function, decider) in BUDGET_DECISIONS {
+        assert_eq!(
+            decision_problem(&budget, function, decider),
+            None,
+            "{function}"
+        );
+    }
+}
+
+#[test]
+fn the_budget_emit_is_reached_only_from_the_decision_paths() {
+    let budget = source("src/budget.rs");
+    let paths: Vec<&str> = BUDGET_DECISIONS
+        .iter()
+        .map(|(function, _)| *function)
+        .collect();
+    assert_eq!(
+        users(&budget, "emit"),
+        expected(&paths)
+            .into_iter()
+            .chain(["emit".to_string()])
+            .collect()
+    );
+    assert_eq!(users(&budget, "BudgetObservation"), expected(&["emit"]));
+}
+
+#[test]
+fn the_budget_counters_are_exported_only_through_the_one_telemetry_attachment_in_main() {
+    let main = production_main();
+    assert_eq!(users(&main, "set_telemetry"), expected(&["export_budget"]));
+    assert_eq!(
+        users(&main, "export_budget"),
+        expected(&["export_budget", "run_delegate", "run_mcp_server"])
+    );
+}
+
+#[test]
+fn the_checker_flags_every_way_a_budget_decision_could_skip_the_emit() {
+    let wrap = |body: &str| format!("impl A {{ pub async fn charge(&self) -> R {{ {body} }} }}");
+    let problem = |body: &str| decision_problem(&wrap(body), "charge", "decide_charge");
+    let good = "let decided = self.decide_charge(a).await; self.emit(a); decided";
+    assert_eq!(problem(good), None);
+    let missing = problem("let decided = self.decide_charge(a).await; decided");
+    assert!(missing.unwrap().contains("three statements"));
+    let swapped = problem("self.emit(a); let decided = self.decide_charge(a).await; decided");
+    assert!(swapped.unwrap().contains("bind the decision"));
+    let inline = problem("let decided = self.store.try_charge(a); self.emit(a); decided");
+    assert!(inline.unwrap().contains("`decide_charge`"));
+    let early = problem("let decided = self.decide_charge(a).await?; self.emit(a); decided");
+    assert!(early.unwrap().contains("`decide_charge`"));
+    let skipped = problem("let decided = self.decide_charge(a).await; self.log(a); decided");
+    assert!(skipped.unwrap().contains("`emit`"));
+    let other = problem("let decided = self.decide_charge(a).await; self.emit(a); other");
+    assert!(other.unwrap().contains("exactly the value"));
+    assert_eq!(
+        decision_problem("fn x() {}", "charge", "decide_charge").unwrap(),
+        "charge is missing"
     );
 }
