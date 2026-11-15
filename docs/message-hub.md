@@ -621,7 +621,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
 ### 8.2 Pipeline
 
 - **Outbound** (at `msg_send`, `session_set_note` and `sessions_query`, inside `ToolRegistry::execute`):
-  1. `RoutingActionAuditor` dispatches by tool name. Message tools go to `MessageAuditor::review_outbound`; everything else goes to the existing action auditor, unchanged.
+  1. `RoutingActionAuditor` dispatches by tool name only. Message tools go to the router (`MessageAuditor::review_outbound` once the hub exists) and are blocked if the router is gone or declines them; everything else goes to the existing action auditor, unchanged, whatever the router claims.
   2. Rules run, and their `Block` cannot be overridden by the model.
   3. `ModelMessageAuditor` runs.
   4. `FailClosedMessageAuditor` applies a 30 s timeout.
@@ -636,6 +636,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
 | `Block` | `ActionDenied::Block`; the agent sees reason codes only, never the matched text; the 3rd denial escalates via `RepeatedDenials` | Withheld; the sender is notified with the reason code |
 | `Quarantine` | `ActionDenied::Escalate`; the sender halts; the message is stored `Quarantined`; the Escalator is notified (`Severity::Blocked`, `EscalationSource::Auditor`) | Quarantined and escalated |
 
+- **No plaintext message content in audit output.** The args of `msg_send`, `session_set_note` and `sessions_query` are the message, note or query itself. Before any append, `ActionAuditLog` (and the registry's in-memory `action_reviews`, which end up in task results) replaces them with `{redacted, keys (only the argument names the tool itself defines, from `known_arguments`; any other key is `?`, because key names are agent-controlled and can be a secret), bytes, hash}` (`redact_for_log`). The hash is the non-cryptographic 64-bit `content_hash`: it lets a reader confirm a guess of the exact content, it neither recovers it nor attests integrity. Telemetry events and escalation evidence carry no args by construction. Every other tool's entries are byte-identical to before. A test plants a token-shaped string and asserts it appears in none of the audit file, telemetry output, escalation evidence or error returned to the agent.
 - **Never silently redacting message bodies** (decision D3). Redaction changes meaning, and the sender learns nothing from it. Summaries *are* redacted, because they have no sender to inform.
 
 ### 8.3 Rules layer (`harness/src/hub/audit/rules.rs`)
@@ -716,16 +717,36 @@ pub struct ModelMessageAuditor { /* provider, model; runs RuleMessageAuditor fir
 pub struct FailClosedMessageAuditor<A> { inner: A, timeout: Duration }       // error/timeout → rules re-run + Quarantine(ModelFailure)
 
 /// Generic action-side wrapper (fills the existing gap: only spawns had one).
+/// A plain timeout (default 60 s, `with_timeout`): an inner error is returned unchanged and a timeout becomes
+/// `ActionAuditError::Timeout { timeout: Duration }`. `ActionGate` maps every `Err` to Block, so neither can be an Allow.
+/// It does not re-run rules or fabricate a verdict (unlike `FailClosedMessageAuditor`).
+/// Wired at the production gate construction sites in `task.rs` (`default_action_gate`, `TaskManager::action_policy_gate`).
 pub struct FailClosedActionAuditor<A: ActionAuditor> { inner: A, timeout: Duration }
 
-/// Dispatches message tools to the MessageAuditor (via a hub-provided OutboundReview builder), all other tools to `default`.
-/// Holds the hub as `Weak` to break the cycle hub → librarian → TaskManager → registry → gate → hub.
-/// If upgrading the `Weak` fails (hub dropped), the verdict is Block (fail closed).
-pub struct RoutingActionAuditor { messages: Arc<dyn MessageAuditor>, hub: Weak<MessageHub>, default: Arc<dyn ActionAuditor> }
+pub const MESSAGE_TOOLS: [&str; 3] = ["msg_send", "session_set_note", "sessions_query"];
+pub fn is_message_tool(tool: &str) -> bool;
+
+/// The seam the hub implements (the hub and `MessageAuditor` land in later PRs).
+#[async_trait]
+pub trait OutboundRouter: Send + Sync {
+    fn handles(&self, tool: &str) -> bool;
+    async fn review(&self, r: &ActionReview, c: &ActionContext<'_>) -> Result<ActionVerdict, ActionAuditError>;
+    async fn on_quarantine(&self, r: &ActionReview, reasons: &[Reason]) -> Result<(), ActionAuditError>;
+}
+
+/// Routing is decided by tool NAME only (`is_message_tool`):
+///   - a message tool goes to the router, and is BLOCKED if the router is gone (the `Weak` fails to upgrade)
+///     or does not `handles` it. It is never sent to `default`: the default rule auditor allows `None`-class
+///     calls, so a fall-through would let a message out with no content review;
+///   - every other tool goes to `default`, unchanged, whatever `handles` says (a router can never take over
+///     a non-message tool).
+/// Holds the router as `Weak` to break the cycle hub → librarian → TaskManager → registry → gate → hub.
+pub struct RoutingActionAuditor { router: Weak<dyn OutboundRouter>, default: Arc<dyn ActionAuditor> }
 impl ActionAuditor for RoutingActionAuditor {
-    /* Deliver→Allow, Block→Block, Quarantine→Escalate.
-       Auditors stay pure: on Quarantine the router calls hub.record_outbound_quarantine
-       (the only write) before returning Escalate; a failed write is still Escalate. */
+    /* Router verdicts pass through (Deliver→Allow, Block→Block, Quarantine→Escalate).
+       Auditors stay pure: when the router returns Escalate, `on_quarantine` is called once (the only write)
+       before returning Escalate. A failed write is still Escalate, but is logged (`tracing::error`) and a reason
+       line "quarantine record not written" is appended so the human sees it. */
 }
 
 // auditor/verdict.rs: ReasonCode gains SecretLeak and CrossScopeSteering.
