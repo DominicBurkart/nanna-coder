@@ -14,6 +14,8 @@ use harness::container::{
 };
 use harness::effects::EffectClass;
 use harness::identity::AgentIdentity;
+mod support;
+
 use harness::tools::create_container_tool_registry_for;
 use serde_json::json;
 use std::sync::Arc;
@@ -92,8 +94,9 @@ async fn run_command_under_a_workspace_ceiling_cannot_reach_the_network() {
     assert_eq!(network, NetworkPolicy::Disabled);
 
     let handle = start(network).await;
-    let registry =
-        create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap();
+    let registry = support::allow_gated(
+        create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap(),
+    );
     assert!(registry.get_tool("run_command").is_some());
     assert!(registry.get_tool("github_pr_status").is_none());
 
@@ -122,8 +125,9 @@ async fn run_command_under_a_repository_ceiling_keeps_its_network_interface() {
     assert_eq!(network, NetworkPolicy::Enabled);
 
     let handle = start(network).await;
-    let registry =
-        create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap();
+    let registry = support::allow_gated(
+        create_container_tool_registry_for(workspace.path(), handle, "/", &identity).unwrap(),
+    );
 
     let interfaces = interfaces(&registry).await;
     assert!(

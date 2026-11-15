@@ -1,4 +1,6 @@
 use super::{DeployError, DEPLOY_DIR, DEPLOY_FILE_NAME};
+use crate::ci_policy::CiPolicy;
+use crate::impact::BlastRadius;
 use crate::windows;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -381,6 +383,7 @@ struct RawTemplate {
     health: Option<RawHealth>,
     rollback: Option<RawRollback>,
     shadow: Option<RawShadow>,
+    ci: Option<CiPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,6 +461,7 @@ pub struct DeployTemplate {
     pub rollback: Rollback,
     /// The `[shadow]` section, if present.
     pub shadow: Option<Shadow>,
+    pub ci: CiPolicy,
 }
 
 impl DeployTemplate {
@@ -544,11 +548,31 @@ impl DeployTemplate {
         }
     }
 
+    /// The effective risk class for a change with this blast radius.
+    ///
+    /// ```
+    /// use harness::deploy::{DeployTemplate, RiskClass};
+    /// use harness::impact::BlastRadius;
+    ///
+    /// let template = DeployTemplate::parse(
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"staging\"]\n[risk]\nclass = \"derived\"\n[risk.thresholds]\ninternal = 10\nedge = 50\n[rollout]\nstrategy = \"gradual\"\nsteps = [10, 50, 100]\nmin_step_duration = \"8h\"\n",
+    /// )
+    /// .unwrap();
+    /// let radius = BlastRadius { score: 60, ..BlastRadius::default() };
+    /// assert_eq!(template.resolve_risk_for(&radius).unwrap(), RiskClass::Edge);
+    /// ```
+    pub fn resolve_risk_for(&self, radius: &BlastRadius) -> Result<RiskClass, DeployError> {
+        self.resolve_risk(Some(radius.score))
+    }
+
     fn parse_named(toml_src: &str, file: &Path) -> Result<Self, DeployError> {
         let raw: RawTemplate = toml::from_str(toml_src).map_err(|source| DeployError::Parse {
             file: file.to_path_buf(),
             source,
         })?;
+        let ci = raw.ci.unwrap_or_default();
+        ci.ensure_non_production()
+            .map_err(|e| invalid(file, "ci", e.to_string()))?;
         let template = Self {
             file: file.to_path_buf(),
             target: convert_target(file, raw.target)?,
@@ -565,6 +589,7 @@ impl DeployTemplate {
                     retain_for: Duration::zero(),
                 }),
             shadow: raw.shadow.map(|s| convert_shadow(file, s)).transpose()?,
+            ci,
         };
         template.validate()?;
         Ok(template)
@@ -1143,6 +1168,77 @@ compare = ["status", "latency"]
     }
 
     #[test]
+    fn a_ci_section_that_can_reach_production_is_rejected_at_load() {
+        for section in [
+            "[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nallowed = [\"sandbox\", \"production\"]\n",
+            "[ci.workflows.\"deploy.yml\".inputs.environment]\ntype = \"string\"\n",
+            "[ci.workflows.\"deploy.yml\".inputs.ENV]\ntype = \"string\"\nallowed = [\"Prod\"]\n",
+            "[ci.workflows.\"release-production.yml\"]\n",
+            "[ci.workflows.\"ci.yml \"]\n",
+        ] {
+            let src = format!("{FIXTURE}\n{section}");
+            let err = DeployTemplate::parse(&src).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidField { field: "ci", .. }),
+                "{section}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_free_form_string_input_is_rejected_at_load() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.deploy_to]\ntype = \"string\"\n"
+        );
+        let err = DeployTemplate::parse(&src).unwrap_err();
+        assert!(
+            matches!(err, DeployError::InvalidField { field: "ci", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_ci_section_limited_to_non_production_environments_loads() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"deploy.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\", \"Staging\"]\n"
+        );
+        assert!(DeployTemplate::parse(&src).is_ok());
+    }
+
+    #[test]
+    fn ci_section_defaults_to_denying_every_workflow() {
+        let t = DeployTemplate::parse(FIXTURE).unwrap();
+        assert_eq!(t.ci, CiPolicy::deny_all());
+    }
+
+    #[test]
+    fn ci_section_declares_allowlisted_workflows_and_input_schemas() {
+        let src = format!(
+            "{FIXTURE}\n[ci.workflows.\"ci.yml\"]\n\n[ci.workflows.\"sandbox.yml\".inputs.env]\ntype = \"string\"\nrequired = true\nallowed = [\"sandbox\"]\n"
+        );
+        let t = DeployTemplate::parse(&src).unwrap();
+        assert!(t.ci.permits("ci.yml"));
+        assert!(t.ci.permits("sandbox.yml"));
+        assert!(!t.ci.permits("release.yml"));
+        assert!(t
+            .ci
+            .validate_dispatch("sandbox.yml", &serde_json::json!({"env": "production"}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_ci_section_is_refused() {
+        for section in [
+            "[ci]\nallow_all = true\n",
+            "[ci.workflows.\"ci.yml\"]\nbypass = true\n",
+            "[ci.workflows.\"ci.yml\".inputs.k]\ntype = \"boolean\"\nextra = 1\n",
+        ] {
+            let src = format!("{FIXTURE}\n{section}");
+            assert!(DeployTemplate::parse(&src).is_err(), "{section}");
+        }
+    }
+
+    #[test]
     fn rejects_bad_shadow() {
         let enabled = FIXTURE
             .replace(
@@ -1263,6 +1359,47 @@ compare = ["status", "latency"]
         assert_eq!(t.resolve_risk(Some(u32::MAX)).unwrap(), RiskClass::Core);
         assert_eq!(t.highest_risk(), RiskClass::Core);
         assert_eq!(thresholds.highest(), RiskClass::Core);
+    }
+
+    #[test]
+    fn derived_class_is_chosen_from_an_analyzed_blast_radius() {
+        use crate::assets::AssetGraph;
+        use crate::impact::ImpactAnalyzer;
+
+        let graph = AssetGraph::parse(
+            "[concern.content]\nweight = 3\n[concern.revenue]\nweight = 40\n[asset.\"db.notes\"]\nkind = \"table\"\nconcerns = [\"content\"]\n[asset.\"db.orders\"]\nkind = \"table\"\nconcerns = [\"revenue\"]\n[asset.\"http.POST /checkout\"]\nkind = \"endpoint\"\nconcerns = [\"revenue\"]\nreads = [\"db.orders\"]\n",
+        )
+        .unwrap();
+        let analyzer = ImpactAnalyzer::new(&graph);
+        let t = DeployTemplate::parse(&derived(DERIVED)).unwrap();
+        let notes = analyzer.radius_of_assets(["db.notes"]);
+        let orders = analyzer.radius_of_assets(["db.orders"]);
+        assert_eq!(notes.score, 3);
+        assert_eq!(orders.score, 60);
+        assert_eq!(
+            t.resolve_risk_for(&BlastRadius::default()).unwrap(),
+            RiskClass::Unused
+        );
+        assert_eq!(t.resolve_risk_for(&notes).unwrap(), RiskClass::Unused);
+        assert_eq!(t.resolve_risk_for(&orders).unwrap(), RiskClass::Edge);
+        let plan = t.plan_with_score("sandbox", Some(orders.score)).unwrap();
+        assert_eq!(plan.risk_class, RiskClass::Edge);
+    }
+
+    #[test]
+    fn derived_class_never_decreases_as_the_score_grows() {
+        let t = DeployTemplate::parse(&derived(DERIVED)).unwrap();
+        let mut previous = RiskClass::Unused;
+        for score in (0..400).chain([u32::MAX]) {
+            let class = t
+                .resolve_risk_for(&BlastRadius {
+                    score,
+                    ..BlastRadius::default()
+                })
+                .unwrap();
+            assert!(class >= previous);
+            previous = class;
+        }
     }
 
     #[test]

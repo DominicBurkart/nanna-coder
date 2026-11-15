@@ -8,6 +8,8 @@
 //! dependencies pre-built into a fixed `CARGO_TARGET_DIR`, so the test only
 //! pays for compiling the fixture crates themselves.
 
+mod support;
+
 use harness::apprun::{Limits, DEFAULT_PORT_RANGE};
 use harness::apprun::{PortAllocator, APP_LOGS_TOOL, APP_START_TOOL, APP_STOP_TOOL};
 use harness::container::{detect_runtime, ContainerRuntime};
@@ -357,7 +359,7 @@ fn registry_with(name: &'static str, reply: Value) -> ToolRegistry {
         reply,
         seen: std::sync::Mutex::new(vec![]),
     }));
-    registry
+    support::allow_gated(registry)
 }
 
 #[tokio::test]

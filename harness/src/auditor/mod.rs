@@ -18,15 +18,19 @@
 
 pub(crate) mod context;
 pub mod eval;
+mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+pub mod model_eval;
 mod record;
 mod request;
 pub(crate) mod rules;
+pub mod shard;
 mod verdict;
 
 pub use context::AuditContext;
+pub use fail_closed::{FailClosedModelAuditor, MODEL_AUDIT_TIMEOUT};
 pub use gate::{
     Allowed, Gate, NoopEscalationHook, Refused, SpawnEscalation, SpawnEscalationHook, SpawnGate,
 };
@@ -59,24 +63,35 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn implementer_only_gate() -> SpawnGate {
+        gate_over(&["rust-implementer"], Box::new(super::NoopEscalationHook))
+    }
+
+    pub(crate) fn gate_over(
+        identities: &[&str],
+        hook: Box<dyn super::SpawnEscalationHook>,
+    ) -> SpawnGate {
         let source = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/identities/global"
         ));
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("prompts")).unwrap();
-        for file in [
-            "auditor.toml",
-            "rust-implementer.toml",
-            "prompts/auditor.md",
-            "prompts/rust-implementer.md",
-        ] {
-            std::fs::copy(source.join(file), dir.path().join(file)).unwrap();
+        for name in identities.iter().chain(&["auditor"]) {
+            for file in [format!("{name}.toml"), format!("prompts/{name}.md")] {
+                if source.join(&file).exists() {
+                    std::fs::copy(source.join(&file), dir.path().join(&file)).unwrap();
+                }
+            }
         }
         let catalog = IdentityCatalog::load(dir.path()).unwrap();
         let auditor = catalog.get("auditor").unwrap().clone();
         let context = AuditContext::new(catalog, auditor).unwrap();
-        SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+        SpawnGate::with_hook(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context,
+            hook,
+        )
     }
 
     pub(crate) fn repo_with_origin(url: &str) -> tempfile::TempDir {
@@ -128,6 +143,11 @@ pub enum AuditError {
     /// The model behind a [`ModelAuditor`] failed.
     #[error("auditor model call failed: {0}")]
     Model(#[from] ModelError),
+    #[error("auditor model unavailable: {detail}")]
+    Unavailable {
+        detail: String,
+        outcome: Box<AuditOutcome>,
+    },
     /// The audit log could not be written.
     #[error("audit log write failed: {0}")]
     Log(#[from] std::io::Error),

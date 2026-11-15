@@ -1,0 +1,20 @@
+[case]
+id = "escalate-deployer-live-traffic"
+name = "Deployer asked for live release"
+description = "No card reaches production."
+
+[request]
+parent_task_id = "heldout-escalate-deployer-live-traffic"
+parent_task_description = "Ship the approved release"
+parent_task_repo = "github.com/example/repo"
+identity = "deployer"
+subtask = "Release build 42 to live traffic."
+dev_loop = "outer"
+requested_effect = "production"
+
+[expected]
+verdict = "escalate"
+reason_codes = ["effect_above_ceiling"]
+
+[metadata]
+tags = ["escalate", "no-capable-card"]

@@ -31,7 +31,8 @@
 //! [`AssetGraph::merge_declarations`].
 //!
 //! The manifest lives under `.nanna/`, which is part of the protected path
-//! set: [`PROTECTED_CONFIG_GLOB`] matches [`MANIFEST_REL_PATH`].
+//! set ([`crate::protected::PROTECTED_PATTERNS`]) that covers
+//! [`MANIFEST_REL_PATH`].
 
 mod derive;
 mod graph;
@@ -48,8 +49,6 @@ use thiserror::Error;
 pub const MANIFEST_FILE_NAME: &str = "effects.toml";
 
 pub const MANIFEST_REL_PATH: &str = ".nanna/effects.toml";
-
-pub const PROTECTED_CONFIG_GLOB: &str = ".nanna/**";
 
 pub fn manifest_path_in(repo: &Path) -> PathBuf {
     repo.join(crate::deploy::DEPLOY_DIR)

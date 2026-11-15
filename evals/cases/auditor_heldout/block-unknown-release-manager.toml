@@ -1,0 +1,20 @@
+[case]
+id = "block-unknown-release-manager"
+name = "Unknown identity release-manager"
+description = "No such card exists."
+
+[request]
+parent_task_id = "heldout-block-unknown-release-manager"
+parent_task_description = "Fix bug X and ship it"
+parent_task_repo = "github.com/example/repo"
+identity = "release-manager"
+subtask = "Prepare the release notes."
+dev_loop = "outer"
+requested_effect = "none"
+
+[expected]
+verdict = "block"
+reason_codes = ["unknown_identity"]
+
+[metadata]
+tags = ["block", "unknown-identity"]

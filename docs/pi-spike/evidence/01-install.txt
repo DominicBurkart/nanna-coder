@@ -1,0 +1,16 @@
+
+9 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+anthropic-ai-sdk
+jiti
+marked
+node-which
+pi
+pi-ai
+semver
+yaml
+1.2.0
+	"version": "1.2.0",
+	"license": "MIT",

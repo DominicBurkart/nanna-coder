@@ -642,6 +642,7 @@ fn assert_fake_exec_output(result: &Value, argv: &str, command: &str) {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_build_execute_success_path_covered() {
     use harness::tools::CargoBuildTool;
     let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -657,6 +658,7 @@ async fn cargo_build_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_test_execute_success_path_covered() {
     use harness::tools::CargoTestTool;
     let tool = CargoTestTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -668,6 +670,7 @@ async fn cargo_test_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_check_execute_success_path_covered() {
     use harness::tools::CargoCheckTool;
     let tool = CargoCheckTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -679,6 +682,7 @@ async fn cargo_check_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_bench_execute_success_path_covered() {
     use harness::tools::CargoBenchTool;
     let tool = CargoBenchTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -690,6 +694,7 @@ async fn cargo_bench_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_run_execute_success_path_covered() {
     use harness::tools::CargoRunTool;
     let tool = CargoRunTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -705,6 +710,7 @@ async fn cargo_run_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_deny_execute_success_path_covered() {
     use harness::tools::CargoDenyTool;
     let tool = CargoDenyTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -720,6 +726,7 @@ async fn cargo_deny_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_audit_execute_success_path_covered() {
     use harness::tools::CargoAuditTool;
     let tool = CargoAuditTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -731,6 +738,7 @@ async fn cargo_audit_execute_success_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_build_nonzero_exit_reports_failure_not_success() {
     use harness::tools::CargoBuildTool;
     let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -747,6 +755,7 @@ async fn cargo_build_nonzero_exit_reports_failure_not_success() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_build_rejects_option_like_package() {
     use harness::tools::CargoBuildTool;
     let tool = CargoBuildTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -758,6 +767,7 @@ async fn cargo_build_rejects_option_like_package() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn cargo_test_rejects_option_like_filter() {
     use harness::tools::CargoTestTool;
     let tool = CargoTestTool::new(fake_podman_handle(), Some("/workspace".to_string()));
@@ -856,6 +866,7 @@ async fn trunk_build_execute_error_path_covered() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn trunk_build_execute_success_path_runs_in_member_dir() {
     let dir = full_stack_workspace();
     let registry =
@@ -874,6 +885,7 @@ async fn trunk_build_execute_success_path_runs_in_member_dir() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn trunk_build_release_flag_is_forwarded() {
     let tool = TrunkBuildTool::new(fake_podman_handle(), None);
     let result = tool.execute(json!({"release": "true"})).await.unwrap();
@@ -912,6 +924,7 @@ async fn sqlx_migrate_rejects_unknown_command() {
 }
 
 #[tokio::test]
+#[serial_test::serial(env_path)]
 async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
     let dir = full_stack_workspace();
     let registry =

@@ -3,9 +3,10 @@
 
 use super::{
     AuditContext, AuditError, AuditLog, AuditOutcome, AuditRecord, Auditor, CardSuggestion, Reason,
-    ReasonCode, SpawnRequest, SpawnVerdict, VerdictKind,
+    ReasonCode, SpawnRequest, SpawnVerdict, TaskSummary, VerdictKind,
 };
-use crate::identity::AgentIdentity;
+use crate::effects::EffectClass;
+use crate::identity::{AgentIdentity, DevLoop};
 use async_trait::async_trait;
 use std::fmt;
 
@@ -22,13 +23,56 @@ use std::fmt;
 /// that proposed the spawn can manufacture one, or substitute a different
 /// catalog's copy of the identity.
 ///
-/// `Allowed`'s fields are private, so a spawn cannot be authorized by
-/// writing a struct literal directly:
+/// Each way of building an `Allowed` outside this module is a compile error.
+/// A struct literal is refused because every field is private:
 ///
-/// ```compile_fail
-/// use harness::auditor::Allowed;
+/// ```compile_fail,E0451
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// # let request: SpawnRequest = todo!();
+/// # let identity: AgentIdentity = todo!();
+/// let _ = Allowed {
+///     request,
+///     identity,
+///     repo: String::new(),
+///     model: String::new(),
+/// };
+/// ```
 ///
-/// let _ = Allowed { request: todo!(), identity: todo!() };
+/// The internal constructor is private:
+///
+/// ```compile_fail,E0624
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// # let request: SpawnRequest = todo!();
+/// # let identity: AgentIdentity = todo!();
+/// let _ = Allowed::new(request, identity);
+/// ```
+///
+/// There is no `Default`:
+///
+/// ```compile_fail,E0599
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let _ = Allowed::default();
+/// ```
+///
+/// A proof cannot be duplicated, so one audit cannot authorise several
+/// spawns:
+///
+/// ```compile_fail,E0599
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let allowed: Allowed = todo!();
+/// let _ = allowed.clone();
+/// ```
+///
+/// And it cannot be deserialized from attacker-controlled data:
+///
+/// ```compile_fail,E0277
+/// # use harness::auditor::{Allowed, SpawnRequest};
+/// # use harness::identity::AgentIdentity;
+/// let _ = serde_json::from_str::<Allowed>("{}");
 /// ```
 #[derive(Debug)]
 pub struct Allowed {
@@ -136,6 +180,13 @@ pub trait SpawnEscalationHook: Send + Sync {
     async fn on_escalate(&self, escalation: &SpawnEscalation);
 }
 
+#[async_trait]
+impl SpawnEscalationHook for Box<dyn SpawnEscalationHook> {
+    async fn on_escalate(&self, escalation: &SpawnEscalation) {
+        (**self).on_escalate(escalation).await
+    }
+}
+
 /// [`SpawnEscalationHook`] that does nothing; the default for [`Gate::new`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoopEscalationHook;
@@ -143,6 +194,10 @@ pub struct NoopEscalationHook;
 #[async_trait]
 impl SpawnEscalationHook for NoopEscalationHook {
     async fn on_escalate(&self, _escalation: &SpawnEscalation) {}
+}
+
+fn log_write_failed(error: &AuditError) {
+    tracing::error!(%error, "audit log write failed for an unavailable auditor");
 }
 
 /// Runs a [`SpawnRequest`] through an [`Auditor`], logs the outcome, and
@@ -229,8 +284,21 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
         request: SpawnRequest,
         context: &AuditContext,
     ) -> Result<Allowed, Refused> {
-        let audited = self.auditor.audit_spawn(&request, context).await;
-        let outcome = audited.map_err(Refused::AuditFailed)?;
+        let outcome = match self.auditor.audit_spawn(&request, context).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let AuditError::Unavailable { outcome, .. } = &error {
+                    if let Err(log_error) = self.log.append(&request, outcome) {
+                        log_write_failed(&log_error);
+                    }
+                    if outcome.verdict.kind() == VerdictKind::Escalate {
+                        self.notify_escalation(&request, &outcome.verdict, &outcome.record)
+                            .await;
+                    }
+                }
+                return Err(Refused::AuditFailed(error));
+            }
+        };
         let outcome = reconcile_with_catalog(&request, context, outcome);
         self.log
             .append(&request, &outcome)
@@ -281,17 +349,47 @@ impl<A: Auditor, H: SpawnEscalationHook> Gate<A, H> {
 /// neither reach the task manager without an [`Allowed`] proof nor audit
 /// against a catalog of its own choosing.
 pub struct SpawnGate {
-    gate: Gate<Box<dyn Auditor>>,
+    gate: Gate<Box<dyn Auditor>, Box<dyn SpawnEscalationHook>>,
     context: AuditContext,
 }
 
 impl SpawnGate {
     /// A gate over `auditor`, appending to `log`, reviewing against `context`.
     pub fn new(auditor: Box<dyn Auditor>, log: AuditLog, context: AuditContext) -> Self {
+        Self::with_hook(auditor, log, context, Box::new(NoopEscalationHook))
+    }
+
+    pub fn with_hook(
+        auditor: Box<dyn Auditor>,
+        log: AuditLog,
+        context: AuditContext,
+        hook: Box<dyn SpawnEscalationHook>,
+    ) -> Self {
         Self {
-            gate: Gate::new(auditor, log),
+            gate: Gate::with_hook(auditor, log, hook),
             context,
         }
+    }
+
+    pub fn request(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
+    pub fn request_with_caller(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        effect: Option<EffectClass>,
+        dev_loop: Option<DevLoop>,
+    ) -> SpawnRequest {
+        let catalog = self.context.catalog();
+        SpawnRequest::derive_tightened(catalog, parent_task, identity, subtask, effect, dev_loop)
     }
 
     /// The context every request is reviewed against.
@@ -307,6 +405,49 @@ impl SpawnGate {
     /// [`Gate::check`] against this gate's own context.
     pub async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
         self.gate.check(request, &self.context).await
+    }
+
+    pub(crate) fn for_repo(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<RepoSpawnGate<'_>, crate::identity::IdentityError> {
+        let context = self.context.with_repo_overrides(repo_root)?;
+        Ok(RepoSpawnGate {
+            gate: self,
+            context,
+        })
+    }
+}
+
+pub(crate) struct RepoSpawnGate<'a> {
+    gate: &'a SpawnGate,
+    context: AuditContext,
+}
+
+impl RepoSpawnGate<'_> {
+    pub(crate) fn request(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+    ) -> SpawnRequest {
+        SpawnRequest::derive(self.context.catalog(), parent_task, identity, subtask)
+    }
+
+    pub(crate) fn request_with_caller(
+        &self,
+        parent_task: TaskSummary,
+        identity: impl Into<String>,
+        subtask: impl Into<String>,
+        effect: Option<EffectClass>,
+        dev_loop: Option<DevLoop>,
+    ) -> SpawnRequest {
+        let catalog = self.context.catalog();
+        SpawnRequest::derive_tightened(catalog, parent_task, identity, subtask, effect, dev_loop)
+    }
+
+    pub(crate) async fn check(&self, request: SpawnRequest) -> Result<Allowed, Refused> {
+        self.gate.gate.check(request, &self.context).await
     }
 }
 
@@ -468,16 +609,6 @@ mod tests {
         assert_eq!(gate.log().entries().unwrap().len(), 0);
     }
 
-    #[test]
-    fn allowed_proof_has_no_public_constructor() {
-        let request = fitting();
-        let identity = crate::identity::example();
-        let allowed = Allowed::new(request.clone(), identity.clone());
-        assert_eq!(allowed.request(), &request);
-        assert_eq!(allowed.identity().name(), identity.name());
-        assert_eq!(allowed.into_parts(), (request, identity));
-    }
-
     struct AlwaysAllows;
 
     #[async_trait]
@@ -549,6 +680,69 @@ mod tests {
         assert_eq!(spawn_gate.log().entries().unwrap().len(), 2);
     }
 
+    #[test]
+    fn request_with_caller_only_tightens_what_the_text_derives() {
+        let spawn_gate = SpawnGate::new(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context(true),
+        );
+        let parent = || TaskSummary::new("t", "d", "github.com/example/repo");
+        let raised = spawn_gate.request_with_caller(
+            parent(),
+            "rust-implementer",
+            "Add a test.",
+            Some(EffectClass::Production),
+            None,
+        );
+        assert_eq!(raised.requested_effect, EffectClass::Production);
+        let held = spawn_gate.request_with_caller(
+            parent(),
+            "rust-implementer",
+            "Deploy build 42 to production.",
+            Some(EffectClass::Workspace),
+            Some(DevLoop::Inner),
+        );
+        assert_eq!(held.requested_effect, EffectClass::Production);
+        assert_eq!(held.dev_loop, DevLoop::Outer);
+        let plain =
+            spawn_gate.request_with_caller(parent(), "rust-implementer", "Add a test.", None, None);
+        assert_eq!(plain.requested_effect, EffectClass::None);
+        assert_eq!(plain.dev_loop, DevLoop::Inner);
+    }
+
+    #[tokio::test]
+    async fn spawn_gate_with_hook_notifies_on_escalation_only() {
+        use std::sync::Arc;
+        struct Shared(Arc<RecordingHook>);
+        #[async_trait]
+        impl SpawnEscalationHook for Shared {
+            async fn on_escalate(&self, escalation: &SpawnEscalation) {
+                self.0.on_escalate(escalation).await
+            }
+        }
+        let hook = Arc::new(RecordingHook::default());
+        let spawn_gate = SpawnGate::with_hook(
+            Box::new(RuleAuditor::new()),
+            AuditLog::in_memory(),
+            context(true),
+            Box::new(Shared(Arc::clone(&hook))),
+        );
+        spawn_gate.check(fitting()).await.unwrap();
+        assert!(hook.seen.lock().unwrap().is_empty());
+        let escalated = spawn_gate.request(
+            TaskSummary::new("t", "d", "github.com/example/repo"),
+            "deployer",
+            "Deploy build 42 to the production environment.",
+        );
+        let refused = spawn_gate.check(escalated).await.unwrap_err();
+        match refused {
+            Refused::Verdict { verdict, .. } => assert_eq!(verdict.kind(), VerdictKind::Escalate),
+            other => panic!("expected Verdict, got {other:?}"),
+        }
+        assert_eq!(hook.seen.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_boxed_auditor_delegates_every_method() {
         let boxed: Box<dyn Auditor> = Box::new(RuleAuditor::new());
@@ -570,5 +764,28 @@ mod tests {
         let allowed = Allowed::new(fitting(), identity);
         assert_eq!(allowed.repo(), fitting().parent_task.repo);
         assert_eq!(allowed.model(), "gemma4:e4b");
+    }
+
+    #[test]
+    fn a_repo_gate_derives_requests_from_the_layered_identity() {
+        use crate::auditor::test_support::fixture_gate;
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let narrowed = include_str!(
+            "../../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml"
+        )
+        .replace(r#"loop = "inner""#, r#"loop = "middle""#);
+        std::fs::write(dir.join("rust-implementer.toml"), narrowed).unwrap();
+        let parent = || TaskSummary::new("t", "d", "github.com/example/repo");
+        let spawn_gate = fixture_gate();
+        let base = spawn_gate.request(parent(), "rust-implementer", "Add a test.");
+        assert_eq!(base.dev_loop, DevLoop::Inner);
+        let repo_gate = spawn_gate.for_repo(repo.path()).unwrap();
+        let plain = repo_gate.request(parent(), "rust-implementer", "Add a test.");
+        assert_eq!(plain.dev_loop, DevLoop::Middle);
+        let caller =
+            repo_gate.request_with_caller(parent(), "rust-implementer", "Add a test.", None, None);
+        assert_eq!(caller.dev_loop, DevLoop::Middle);
     }
 }

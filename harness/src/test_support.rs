@@ -193,3 +193,89 @@ mod fake {
 
 #[cfg(unix)]
 pub(crate) use fake::FakePodman;
+
+pub(crate) mod escalation {
+    use crate::escalation::{
+        DeliveryOutcome, DeliveryReceipt, Escalation, EscalationError, EscalationLog,
+        EscalationSink, Escalator,
+    };
+    use crate::leases::SystemClock;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) fn fenced_block_contains(body: &str, info: &str, needle: &str) -> bool {
+        let lines: Vec<&str> = body.lines().collect();
+        let Some(open) = lines.iter().position(|l| {
+            let ticks = l.chars().take_while(|c| *c == '`').count();
+            ticks >= 3 && l[ticks..].trim() == info
+        }) else {
+            return false;
+        };
+        let ticks = lines[open].chars().take_while(|c| *c == '`').count();
+        let close = lines[open + 1..]
+            .iter()
+            .position(|l| {
+                let run = l.chars().take_while(|c| *c == '`').count();
+                run >= ticks && l[run..].trim().is_empty()
+            })
+            .map(|i| open + 1 + i);
+        match close {
+            Some(close) => lines[open + 1..close].iter().any(|l| l.contains(needle)),
+            None => false,
+        }
+    }
+
+    pub(crate) struct CapturingSink {
+        pub(crate) seen: Mutex<Vec<Escalation>>,
+        fail: bool,
+    }
+
+    impl CapturingSink {
+        pub(crate) fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                fail,
+            })
+        }
+
+        pub(crate) fn escalations(&self) -> Vec<Escalation> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl EscalationSink for Arc<CapturingSink> {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn deliver(
+            &self,
+            escalation: &Escalation,
+        ) -> Result<DeliveryReceipt, EscalationError> {
+            self.seen.lock().unwrap().push(escalation.clone());
+            if self.fail {
+                return Err(EscalationError::Status {
+                    origin: "capturing".to_string(),
+                    status: 500,
+                });
+            }
+            Ok(DeliveryReceipt {
+                sink: "capturing".to_string(),
+                reference: escalation.title(),
+                outcome: DeliveryOutcome::Posted,
+            })
+        }
+    }
+
+    pub(crate) fn escalator(sink: &Arc<CapturingSink>) -> (Arc<Escalator>, Arc<EscalationLog>) {
+        let log = Arc::new(EscalationLog::in_memory());
+        let escalator = Escalator::new(
+            Arc::clone(&log),
+            Arc::new(Arc::clone(sink)),
+            Arc::new(SystemClock),
+            chrono::Duration::minutes(10),
+        );
+        (Arc::new(escalator), log)
+    }
+}

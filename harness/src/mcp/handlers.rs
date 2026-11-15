@@ -5,7 +5,7 @@
 //! work (`assign_task`, `onboard_repo`), and the mappers that turn an internal
 //! [`Task`] into its MCP Tasks wire representation.
 
-use crate::auditor::{SpawnGate, SpawnRequest, TaskSummary};
+use crate::auditor::{SpawnGate, TaskSummary};
 use crate::effects::EffectClass;
 use crate::identity::DevLoop;
 use crate::onboarding::DeterministicOnboarder;
@@ -79,29 +79,31 @@ pub async fn handle_assign_task(
         .to_string();
 
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
-    let card = spawn_gate.context().catalog().get(&identity);
-    let dev_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
-        Some(value) => value.parse::<DevLoop>().map_err(|e| e.to_string())?,
-        None => card.map_or(DevLoop::Inner, |card| card.identity.dev_loop),
+    let repo_gate = spawn_gate
+        .for_repo(&repo_path)
+        .map_err(|e| format!("repo-local identity overrides rejected: {e}"))?;
+    let caller_loop = match params.get("dev_loop").and_then(|v| v.as_str()) {
+        Some(value) => Some(value.parse::<DevLoop>().map_err(|e| e.to_string())?),
+        None => None,
     };
-    let requested_effect = match params.get("requested_effect").and_then(|v| v.as_str()) {
-        Some(value) => value.parse::<EffectClass>().map_err(|e| e.to_string())?,
-        None => card.map_or(EffectClass::None, |card| card.scope.max_effect),
+    let caller_effect = match params.get("requested_effect").and_then(|v| v.as_str()) {
+        Some(value) => Some(value.parse::<EffectClass>().map_err(|e| e.to_string())?),
+        None => None,
     };
     let repo =
         crate::scope::origin_slug(&repo_path).unwrap_or_else(|| repo_path.display().to_string());
-    let request = SpawnRequest {
-        parent_task: TaskSummary::new(
+    let request = repo_gate.request_with_caller(
+        TaskSummary::new(
             format!("mcp-{}", uuid::Uuid::new_v4()),
             description.clone(),
             repo,
         ),
         identity,
-        subtask: description,
-        dev_loop,
-        requested_effect,
-    };
-    let allowed = spawn_gate
+        description,
+        caller_effect,
+        caller_loop,
+    );
+    let allowed = repo_gate
         .check(request)
         .await
         .map_err(|refused| refused.to_string())?;
@@ -356,9 +358,12 @@ mod tests {
             files_modified: vec!["a.rs".to_string()],
             tool_calls_made: vec![],
             denials: vec![],
+            action_audit: vec![],
             iterations: 3,
             model_used: "mock".to_string(),
+            blast_radius: None,
             qa_summary: crate::qa::QaSummary::default(),
+            budget: Default::default(),
         }
     }
 
@@ -372,6 +377,7 @@ mod tests {
             last_agent_state: None,
             conversation_snapshot: None,
             denials: vec![],
+            action_audit: vec![],
         }
     }
 
@@ -538,7 +544,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assign_task_escalates_a_production_request_and_queues_nothing() {
+    async fn test_assign_task_blocks_a_production_request_from_an_inner_loop_card_and_queues_nothing(
+    ) {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
@@ -559,7 +566,10 @@ mod tests {
         assert!(manager.list().await.is_empty());
         let log = gate.log().entries().unwrap();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Escalate);
+        assert_eq!(log[0].verdict.kind(), crate::auditor::VerdictKind::Block);
+        let codes: Vec<_> = log[0].verdict.reasons().iter().map(|r| r.code).collect();
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
     }
 
     #[tokio::test]
@@ -607,6 +617,129 @@ mod tests {
             );
         }
         assert!(manager.list().await.is_empty());
+    }
+
+    async fn refused_request(
+        gate: &SpawnGate,
+        description: &str,
+        effect: Option<&str>,
+        dev_loop: Option<&str>,
+    ) -> crate::auditor::SpawnRequest {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let mut request = params(repo.path(), "rust-implementer", description);
+        if let Some(effect) = effect {
+            request["requested_effect"] = serde_json::json!(effect);
+        }
+        if let Some(dev_loop) = dev_loop {
+            request["dev_loop"] = serde_json::json!(dev_loop);
+        }
+        let err = assign(&manager, &provider, gate, request)
+            .await
+            .unwrap_err();
+        assert!(err.contains("spawn refused"), "{err}");
+        assert!(manager.list().await.is_empty());
+        let log = gate.log().entries().unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.verdict.kind(), crate::auditor::VerdictKind::Block);
+        last.request.clone()
+    }
+
+    fn last_codes(gate: &SpawnGate) -> Vec<crate::auditor::ReasonCode> {
+        let log = gate.log().entries().unwrap();
+        log.last()
+            .unwrap()
+            .verdict
+            .reasons()
+            .iter()
+            .map(|r| r.code)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_workspace_but_the_text_implies_production(
+    ) {
+        let gate = implementer_only_gate();
+        let request = refused_request(
+            &gate,
+            "Deploy build 42 to production for all users.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert_eq!(request.dev_loop, DevLoop::Outer);
+        let codes = last_codes(&gate);
+        assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+        assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_when_the_caller_says_production_but_the_text_implies_workspace(
+    ) {
+        let gate = fixture_gate();
+        let request =
+            refused_request(&gate, "Add a test.", Some("production"), Some("inner")).await;
+        assert_eq!(request.requested_effect, EffectClass::Production);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_never_lets_a_lower_caller_effect_loosen_the_derived_one() {
+        for lower in ["none", "workspace", "repository", "ci"] {
+            let gate = implementer_only_gate();
+            let request = refused_request(
+                &gate,
+                "Deploy build 42 to production for all users.",
+                Some(lower),
+                None,
+            )
+            .await;
+            assert_eq!(request.requested_effect, EffectClass::Production, "{lower}");
+            assert_eq!(request.dev_loop, DevLoop::Outer, "{lower}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_caller_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(&gate, "Add a test.", None, Some("middle")).await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert_eq!(request.requested_effect, EffectClass::None);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_blocks_a_loop_mismatch_from_the_derived_side_alone() {
+        let gate = fixture_gate();
+        let request = refused_request(
+            &gate,
+            "Re-run CI on the PR.",
+            Some("workspace"),
+            Some("inner"),
+        )
+        .await;
+        assert_eq!(request.dev_loop, DevLoop::Middle);
+        assert!(last_codes(&gate).contains(&crate::auditor::ReasonCode::LoopMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_allows_agreeing_caller_and_text_within_the_ceiling() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        request["dev_loop"] = serde_json::json!("inner");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        let log = gate.log().entries().unwrap();
+        assert!(log[0].verdict.is_allow());
+        assert_eq!(log[0].request.requested_effect, EffectClass::Workspace);
+        assert_eq!(log[0].request.dev_loop, DevLoop::Inner);
     }
 
     #[tokio::test]
@@ -670,6 +803,221 @@ mod tests {
         let log = gate.log().entries().unwrap();
         assert_eq!(log.len(), 1);
         assert!(log[0].verdict.is_allow());
+    }
+
+    fn write_call(path: &str) -> ChatResponse {
+        use model::types::{FunctionCall, ToolCall};
+        ChatResponse {
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function: FunctionCall {
+                            name: "write_file".to_string(),
+                            arguments: serde_json::json!({"path": path, "content": "x"}),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: None,
+        }
+    }
+
+    fn writing_provider(paths: &[&str]) -> Arc<dyn ModelProvider> {
+        let mut responses = vec![stop_response("Plan: execute the task")];
+        responses.extend(paths.iter().map(|path| write_call(path)));
+        responses.push(stop_response("performed"));
+        responses.push(stop_response("COMPLETE - task done"));
+        MockProvider::new(responses)
+    }
+
+    fn install_override(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    fn fixture_override() -> &'static str {
+        include_str!("../../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml")
+    }
+
+    fn card_with(paths: &str, effect: &str) -> String {
+        format!(
+            r#"
+[identity]
+name = "rust-implementer"
+description = "Override."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = {{ inline = "Override." }}
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = [{paths}]
+max_effect = "{effect}"
+tools = ["read_file", "write_file"]
+
+[limits]
+max_iterations = 10
+max_wall_clock_secs = 60
+max_concurrent = 1
+"#
+        )
+    }
+
+    async fn run_writes(repo: &Path, paths: &[&str]) -> crate::task::TaskResult {
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(paths);
+        let gate = fixture_gate();
+        let mut request = params(repo, "rust-implementer", "Add a test.");
+        request["model"] = serde_json::json!("gemma4:e4b");
+        let id = assign(&manager, &provider, &gate, request).await.unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        manager.get_result(&id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_without_repo_overrides_runs_the_global_card() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let result = run_writes(repo.path(), &["api/a.rs", "shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 0);
+        assert_eq!(result.files_modified, ["api/a.rs", "shared/b.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_applies_the_repos_narrowing_override() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(repo.path(), "rust-implementer.toml", fixture_override());
+        let result = run_writes(repo.path(), &["api/a.rs", "shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 1);
+        assert_eq!(result.denials[0].tool, "write_file");
+        assert_eq!(result.files_modified, ["api/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_defaults_come_from_the_narrowed_card() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**""#, "none"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let id = assign(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await
+        .unwrap();
+        let status = manager.wait_terminal(&id).await.unwrap();
+        assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        assert!(gate.log().entries().unwrap()[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_audits_a_request_above_the_narrowed_ceiling() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**""#, "none"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+        request["requested_effect"] = serde_json::json!("workspace");
+        let err = assign(&manager, &provider, &gate, request)
+            .await
+            .unwrap_err();
+        assert!(err.contains("spawn refused"), "{err}");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_fails_closed_on_a_widening_override() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        install_override(
+            repo.path(),
+            "rust-implementer.toml",
+            &card_with(r#""api/**", "shared/**", "ui/**""#, "repository"),
+        );
+        let manager = Arc::new(TaskManager::default());
+        let provider = writing_provider(&[]);
+        let gate = fixture_gate();
+        let err = assign(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("repo-local identity overrides"), "{err}");
+        assert!(err.contains("widens"), "{err}");
+        assert!(manager.list().await.is_empty());
+        assert!(gate.log().entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_fails_closed_on_an_invalid_override_file() {
+        for (name, body, expect) in [
+            (
+                "ghost.toml",
+                card_with(r#""api/**""#, "none").replace("rust-implementer", "ghost"),
+                "no global identity",
+            ),
+            (
+                "rust-implementer.toml",
+                "not = [valid".to_string(),
+                "overrides",
+            ),
+            (
+                "auditor.toml",
+                card_with("", "none").replace("rust-implementer", "auditor"),
+                "protected",
+            ),
+        ] {
+            let repo = repo_with_origin("https://github.com/example/repo.git");
+            install_override(repo.path(), name, &body);
+            let manager = Arc::new(TaskManager::default());
+            let provider = writing_provider(&[]);
+            let gate = fixture_gate();
+            let err = assign(
+                &manager,
+                &provider,
+                &gate,
+                params(repo.path(), "rust-implementer", "Add a test."),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("repo-local identity overrides"),
+                "{name}: {err}"
+            );
+            assert!(err.contains(expect), "{name}: {err}");
+            assert!(manager.list().await.is_empty());
+            assert!(gate.log().entries().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_reads_overrides_from_the_tasks_repo_only() {
+        let narrowed = repo_with_origin("https://github.com/example/repo.git");
+        install_override(narrowed.path(), "rust-implementer.toml", fixture_override());
+        let plain = repo_with_origin("https://github.com/example/repo.git");
+        let result = run_writes(plain.path(), &["shared/b.rs"]).await;
+        assert_eq!(result.denial_count(), 0);
+        assert_eq!(result.files_modified, ["shared/b.rs"]);
     }
 
     #[tokio::test]

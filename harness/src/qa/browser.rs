@@ -16,8 +16,9 @@
 //! ] }
 //! ```
 //!
-//! `goto` loads `path` on the frontend URL and waits for the document to be
-//! complete; `expect_text` waits until the first element matching the CSS
+//! `goto` loads `path` on the frontend URL, waits for the document to be
+//! complete and then for the dioxus root (`#main`) to have rendered a child,
+//! failing with a mount timeout otherwise; `expect_text` waits until the first element matching the CSS
 //! `selector` has `text` in its text content, so a wasm frontend that
 //! renders after a fetch is given time to do so; `click` and `type` act on
 //! the first matching element (`type` sets the value and dispatches `input`
@@ -61,6 +62,8 @@ pub const DEFAULT_CHROMIUM_BINARY: &str = "chromium";
 pub const DEFAULT_BROWSER_TIMEOUT_SECS: u64 = 120;
 /// How long `goto` and `expect_text` wait for the page.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+/// CSS selector of the element a dioxus web app mounts into.
+pub const DEFAULT_MOUNT_SELECTOR: &str = "#main";
 /// Interval between polls while waiting.
 pub const DEFAULT_POLL: Duration = Duration::from_millis(100);
 /// Viewport of the headless browser.
@@ -68,6 +71,7 @@ pub const WINDOW_SIZE: (u32, u32) = (1280, 800);
 /// Longest text quoted in a step detail.
 const DETAIL_CHARS: usize = 200;
 const MAX_SCREENSHOT_NAME: usize = 64;
+const MAX_MOUNT_SELECTOR_CHARS: usize = 200;
 
 /// One action of a scenario.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,12 +101,55 @@ pub enum ScenarioError {
     FirstStepNotGoto,
     #[error("step {index}: {message}")]
     Step { index: usize, message: String },
+    #[error("mount selector is not valid: {0}")]
+    Mount(String),
 }
 
 /// The steps of a scenario in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserScenario {
     pub steps: Vec<Step>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_mount",
+        serialize_with = "serialize_mount",
+        skip_serializing_if = "MountWait::is_default"
+    )]
+    pub mount: MountWait,
+}
+
+/// What `goto` waits for after the document is complete. Absent in the
+/// scenario JSON means [`MountWait::Default`] (the dioxus root,
+/// [`DEFAULT_MOUNT_SELECTOR`], which is what every full-stack-profile
+/// frontend renders into); `null` or `""` disables the wait for pages not
+/// mounted by a wasm app; a string is the selector to wait for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MountWait {
+    #[default]
+    Default,
+    Disabled,
+    Selector(String),
+}
+
+impl MountWait {
+    fn is_default(&self) -> bool {
+        matches!(self, MountWait::Default)
+    }
+}
+
+fn deserialize_mount<'de, D: serde::Deserializer<'de>>(d: D) -> Result<MountWait, D::Error> {
+    Ok(match Option::<String>::deserialize(d)? {
+        None => MountWait::Disabled,
+        Some(s) if s.is_empty() => MountWait::Disabled,
+        Some(s) => MountWait::Selector(s),
+    })
+}
+
+fn serialize_mount<S: serde::Serializer>(mount: &MountWait, s: S) -> Result<S::Ok, S::Error> {
+    match mount {
+        MountWait::Default | MountWait::Disabled => s.serialize_none(),
+        MountWait::Selector(selector) => s.serialize_str(selector),
+    }
 }
 
 impl BrowserScenario {
@@ -132,8 +179,27 @@ impl BrowserScenario {
         for (index, step) in self.steps.iter().enumerate() {
             validate_step(step).map_err(|message| ScenarioError::Step { index, message })?;
         }
+        if let MountWait::Selector(selector) = &self.mount {
+            validate_mount_selector(selector).map_err(ScenarioError::Mount)?;
+        }
         Ok(())
     }
+}
+
+fn validate_mount_selector(selector: &str) -> Result<(), String> {
+    if selector.trim().is_empty() {
+        return Err("a blank selector; use null or \"\" to disable the wait".to_string());
+    }
+    if selector.chars().any(char::is_control) {
+        return Err(format!(
+            "`{}` contains a control character",
+            selector.escape_debug()
+        ));
+    }
+    if selector.chars().count() > MAX_MOUNT_SELECTOR_CHARS {
+        return Err(format!("longer than {MAX_MOUNT_SELECTOR_CHARS} characters"));
+    }
+    Ok(())
 }
 
 fn validate_step(step: &Step) -> Result<(), String> {
@@ -187,6 +253,13 @@ pub fn type_expression(selector: &str, text: &str) -> String {
     let sel = Value::String(selector.to_string());
     let val = Value::String(text.to_string());
     format!("(function(){{var e=document.querySelector({sel});if(e===null){{return false;}}e.focus();e.value={val};e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()")
+}
+
+/// JavaScript evaluating to `true` once the first element matching
+/// `selector` exists and has rendered at least one child element.
+pub fn mount_expression(selector: &str) -> String {
+    let sel = Value::String(selector.to_string());
+    format!("(function(){{var e=document.querySelector({sel});return e!==null&&e.childElementCount>0;}})()")
 }
 
 /// JavaScript evaluating to the document's ready state.
@@ -407,6 +480,7 @@ pub struct ScenarioRunner {
     screenshot_dir: PathBuf,
     wait: Duration,
     poll: Duration,
+    mount_selector: Option<String>,
 }
 
 impl ScenarioRunner {
@@ -416,7 +490,15 @@ impl ScenarioRunner {
             screenshot_dir: screenshot_dir.to_path_buf(),
             wait: DEFAULT_WAIT,
             poll: DEFAULT_POLL,
+            mount_selector: Some(DEFAULT_MOUNT_SELECTOR.to_string()),
         }
+    }
+
+    /// The element `goto` waits to have rendered a child before it passes;
+    /// `None` skips the wait for pages that are not mounted by a wasm app.
+    pub fn with_mount_selector(mut self, selector: Option<&str>) -> Self {
+        self.mount_selector = selector.map(str::to_string);
+        self
     }
 
     /// How long readiness and text expectations are polled, and how often.
@@ -445,11 +527,22 @@ impl ScenarioRunner {
                 return report;
             }
         };
+        let mount = match &scenario.mount {
+            MountWait::Default => self.mount_selector.clone(),
+            MountWait::Disabled => None,
+            MountWait::Selector(selector) => Some(selector.clone()),
+        };
         let mut index = 0;
         let mut fatal_stop = false;
         while index < scenario.steps.len() && !fatal_stop {
             let step = &scenario.steps[index];
-            let outcome = self.run_step(page.as_mut(), frontend_url, step, &mut report.screenshots);
+            let outcome = self.run_step(
+                page.as_mut(),
+                frontend_url,
+                step,
+                mount.as_deref(),
+                &mut report.screenshots,
+            );
             report.console_errors.extend(page.drain_console_errors());
             let (passed, detail, fatal) = match outcome {
                 Ok((passed, detail)) => (passed, detail, false),
@@ -477,6 +570,7 @@ impl ScenarioRunner {
         page: &mut dyn BrowserPage,
         frontend_url: &str,
         step: &Step,
+        mount: Option<&str>,
         screenshots: &mut Vec<PathBuf>,
     ) -> Result<(bool, String), BrowserError> {
         match step {
@@ -484,17 +578,29 @@ impl ScenarioRunner {
                 let url = join_url(frontend_url, path);
                 page.goto(&url)?;
                 let ready = self.wait_for(page, READY_STATE_EXPRESSION, |v| v == "complete")?;
-                Ok(match ready {
-                    Ok(_) => (true, format!("loaded {url}")),
-                    Err(state) => (
+                if let Err(state) = ready {
+                    return Ok((
                         false,
                         format!(
                             "{url} not complete within {:?}: document is {}",
                             self.wait,
                             describe(&state)
                         ),
-                    ),
-                })
+                    ));
+                }
+                if let Some(selector) = mount {
+                    let mounted = self.wait_for(page, &mount_expression(selector), |v| {
+                        *v == Value::Bool(true)
+                    })?;
+                    if mounted.is_err() {
+                        return Err(BrowserError::MountTimeout {
+                            url,
+                            selector: selector.to_string(),
+                            wait: self.wait,
+                        });
+                    }
+                }
+                Ok((true, format!("loaded {url}")))
             }
             Step::ExpectText { selector, text } => {
                 let expression = text_expression(selector);
@@ -565,7 +671,9 @@ impl ScenarioRunner {
 fn step_level(error: &BrowserError) -> bool {
     matches!(
         error,
-        BrowserError::Script { .. } | BrowserError::Navigation { .. }
+        BrowserError::Script { .. }
+            | BrowserError::Navigation { .. }
+            | BrowserError::MountTimeout { .. }
     )
 }
 
@@ -885,6 +993,7 @@ mod tests {
         let mut page = StubPage::new(&[
             json!("loading"),
             json!("complete"),
+            json!(true),
             json!("loading"),
             json!("Hello from the fixture"),
             json!(true),
@@ -928,7 +1037,8 @@ mod tests {
         assert_eq!(calls[0], "goto http://app:1/");
         assert_eq!(calls[1], "evaluate document.readyState");
         assert_eq!(calls[2], "evaluate document.readyState");
-        assert!(calls[3]
+        assert_eq!(calls[3], format!("evaluate {}", mount_expression("#main")));
+        assert!(calls[4]
             .starts_with("evaluate (function(){var e=document.querySelector(\"#greeting\")"));
         assert_eq!(calls.last().unwrap(), "close");
         assert_eq!(calls.iter().filter(|c| *c == "screenshot").count(), 1);
@@ -1009,7 +1119,7 @@ mod tests {
         assert_eq!(report.steps[3].detail, "no element matches `#missing`");
         assert!(report.render_text().ends_with("scenario failed"));
 
-        let mut page = StubPage::new(&[json!("complete")]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
         page.fallback = json!("  goodbye \n world  ");
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
@@ -1024,7 +1134,7 @@ mod tests {
         assert!(report.steps[0].passed);
         assert!(!report.passed);
 
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
             { "step": "goto", "path": "/" },
@@ -1038,7 +1148,7 @@ mod tests {
     #[test]
     fn runner_continues_after_step_level_errors_and_stops_on_browser_failures() {
         let dir = TempDir::new().unwrap();
-        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true), json!(true)]);
         page.navigation_error = Some("net::ERR_CONNECTION_REFUSED".to_string());
         let driver = StubDriver::new(vec![page]);
         let scenario = steps_of(json!([
@@ -1078,7 +1188,7 @@ mod tests {
         );
         assert!(report.steps[1].passed);
 
-        let mut page = StubPage::new(&[json!("complete")]);
+        let mut page = StubPage::new(&[json!("complete"), json!(true)]);
         page.screenshot = Err("target closed".to_string());
         page.close_error = true;
         let driver = StubDriver::new(vec![page]);
@@ -1120,7 +1230,7 @@ mod tests {
 
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
-        let page = StubPage::new(&[json!("complete")]);
+        let page = StubPage::new(&[json!("complete"), json!(true)]);
         let scenario = steps_of(
             json!([{ "step": "goto", "path": "/" }, { "step": "screenshot", "name": "s" }]),
         );
@@ -1326,5 +1436,194 @@ mod tests {
         assert_eq!(describe(&json!("s")), "`s`");
         assert_eq!(describe(&json!(3)), "3");
         assert_eq!(describe(&Value::Null), "null");
+    }
+
+    #[test]
+    fn goto_waits_for_the_root_to_mount_after_ready_state_complete() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete"), json!(false), json!(false), json!(true)]);
+        let calls = Arc::clone(&page.calls);
+        let scenario = steps_of(json!([{ "step": "goto", "path": "/" }]));
+        let report = fast(StubDriver::new(vec![page]), dir.path()).run("http://app", &scenario);
+        assert!(report.passed, "{}", report.render_text());
+        let calls = calls.lock().unwrap().clone();
+        let mounts: Vec<&String> = calls
+            .iter()
+            .filter(|c| **c == format!("evaluate {}", mount_expression("#main")))
+            .collect();
+        assert_eq!(mounts.len(), 3, "{calls:?}");
+        assert_eq!(calls.last().unwrap(), "close");
+    }
+
+    #[test]
+    fn goto_does_not_pass_while_the_root_is_unmounted() {
+        let dir = TempDir::new().unwrap();
+        let mut page = StubPage::new(&[json!("complete")]);
+        page.fallback = json!(false);
+        let scenario = steps_of(
+            json!([{ "step": "goto", "path": "/" }, { "step": "click", "selector": "#b" }]),
+        );
+        let report = ScenarioRunner::new(StubDriver::new(vec![page]), dir.path())
+            .with_wait(Duration::from_millis(20), Duration::from_millis(1))
+            .run("http://app", &scenario);
+        assert!(!report.passed);
+        assert!(!report.steps[0].passed);
+        assert_eq!(
+            report.steps[0].detail,
+            "http://app/ did not mount `#main` within 20ms"
+        );
+        assert_eq!(report.steps.len(), 2);
+    }
+
+    #[test]
+    fn run_step_returns_a_typed_mount_timeout() {
+        let dir = TempDir::new().unwrap();
+        let mut page = StubPage::new(&[json!("complete")]);
+        page.fallback = json!(false);
+        let runner = ScenarioRunner::new(StubDriver::new(vec![]), dir.path())
+            .with_wait(Duration::from_millis(5), Duration::ZERO);
+        let err = runner
+            .run_step(
+                &mut page,
+                "http://app",
+                &Step::Goto {
+                    path: "/x".to_string(),
+                },
+                Some("#app"),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        match err {
+            BrowserError::MountTimeout {
+                url,
+                selector,
+                wait,
+            } => {
+                assert_eq!(url, "http://app/x");
+                assert_eq!(selector, "#app");
+                assert_eq!(wait, Duration::from_millis(5));
+            }
+            other => panic!("expected MountTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goto_skips_the_mount_wait_when_no_selector_is_configured() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete")]);
+        let calls = Arc::clone(&page.calls);
+        let scenario = steps_of(json!([{ "step": "goto", "path": "/" }]));
+        let report = fast(StubDriver::new(vec![page]), dir.path())
+            .with_mount_selector(None)
+            .run("http://app", &scenario);
+        assert!(report.passed);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn mount_expression_quotes_the_selector_and_requires_a_rendered_child() {
+        let expression = mount_expression("div[id=\"x\"]");
+        assert!(
+            expression.contains("querySelector(\"div[id=\\\"x\\\"]\")"),
+            "{expression}"
+        );
+        assert!(expression.contains("e!==null&&e.childElementCount>0"));
+    }
+
+    fn scenario_with_mount(mount: Value) -> BrowserScenario {
+        BrowserScenario::from_value(json!({
+            "mount": mount,
+            "steps": [{ "step": "goto", "path": "/" }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mount_field_parses_absent_null_empty_and_selector() {
+        let absent = steps_of(json!([{ "step": "goto", "path": "/" }]));
+        assert_eq!(absent.mount, MountWait::Default);
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("mount")
+            .is_none());
+        assert_eq!(scenario_with_mount(json!(null)).mount, MountWait::Disabled);
+        assert_eq!(scenario_with_mount(json!("")).mount, MountWait::Disabled);
+        let custom = scenario_with_mount(json!("#app"));
+        assert_eq!(custom.mount, MountWait::Selector("#app".to_string()));
+        let back: BrowserScenario =
+            serde_json::from_value(serde_json::to_value(&custom).unwrap()).unwrap();
+        assert_eq!(back, custom);
+        let disabled: BrowserScenario =
+            serde_json::from_value(serde_json::to_value(scenario_with_mount(json!(null))).unwrap())
+                .unwrap();
+        assert_eq!(disabled.mount, MountWait::Disabled);
+    }
+
+    #[test]
+    fn invalid_mount_selectors_are_typed_scenario_errors() {
+        for bad in [json!("   "), json!("a\nb"), json!("x".repeat(201))] {
+            let err = BrowserScenario::from_value(json!({
+                "mount": bad,
+                "steps": [{ "step": "goto", "path": "/" }]
+            }))
+            .unwrap_err();
+            assert!(matches!(err, ScenarioError::Mount(_)), "{bad}: {err}");
+            assert!(err.to_string().starts_with("mount selector is not valid: "));
+        }
+        let err = BrowserScenario::from_value(json!({
+            "mount": 5,
+            "steps": [{ "step": "goto", "path": "/" }]
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ScenarioError::Json(_)));
+    }
+
+    #[test]
+    fn a_non_dioxus_scenario_does_not_wait_for_a_mount() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete")]);
+        let calls = Arc::clone(&page.calls);
+        let report = fast(StubDriver::new(vec![page]), dir.path())
+            .run("http://app", &scenario_with_mount(json!(null)));
+        assert!(report.passed, "{}", report.render_text());
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|c| c.contains("childElementCount")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_scenario_selector_replaces_the_default_mount_selector() {
+        let dir = TempDir::new().unwrap();
+        let page = StubPage::new(&[json!("complete"), json!(false), json!(true)]);
+        let calls = Arc::clone(&page.calls);
+        let report = fast(StubDriver::new(vec![page]), dir.path())
+            .run("http://app", &scenario_with_mount(json!("#app")));
+        assert!(report.passed, "{}", report.render_text());
+        let calls = calls.lock().unwrap().clone();
+        let custom = format!("evaluate {}", mount_expression("#app"));
+        let default = format!("evaluate {}", mount_expression("#main"));
+        assert_eq!(
+            calls.iter().filter(|c| **c == custom).count(),
+            2,
+            "{calls:?}"
+        );
+        assert!(!calls.contains(&default), "{calls:?}");
+    }
+
+    #[test]
+    fn a_scenario_selector_that_never_mounts_times_out_naming_it() {
+        let dir = TempDir::new().unwrap();
+        let mut page = StubPage::new(&[json!("complete")]);
+        page.fallback = json!(false);
+        let report = ScenarioRunner::new(StubDriver::new(vec![page]), dir.path())
+            .with_wait(Duration::from_millis(10), Duration::from_millis(1))
+            .run("http://app", &scenario_with_mount(json!("#app")));
+        assert!(!report.passed);
+        assert_eq!(
+            report.steps[0].detail,
+            "http://app/ did not mount `#app` within 10ms"
+        );
     }
 }

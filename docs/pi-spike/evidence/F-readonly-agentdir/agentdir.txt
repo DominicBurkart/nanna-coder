@@ -1,0 +1,7 @@
+total 12
+drwxr-xr-x. 1 root root  94 Oct 15 17:55 .
+drwxr-xr-x. 1 root root  34 Oct 15 17:55 ..
+-rw-r--r--. 1 root root  32 Oct 15 17:55 SYSTEM.md
+-rw-r--r--. 1 root root 161 Oct 15 17:55 capabilities.json
+drwxr-xr-x. 1 root root  42 Oct 15 17:55 extensions
+-rw-r--r--. 1 root root 139 Oct 15 17:55 models.json

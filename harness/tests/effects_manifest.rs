@@ -1,6 +1,8 @@
-use glob::Pattern;
-use harness::assets::{manifest_path_in, AssetGraph, MANIFEST_REL_PATH, PROTECTED_CONFIG_GLOB};
-use std::path::PathBuf;
+use harness::assets::{manifest_path_in, AssetGraph, MANIFEST_REL_PATH};
+use harness::protected::ProtectedPaths;
+use harness::tools::{create_tool_registry, ToolError};
+use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod orders_module {
@@ -179,9 +181,7 @@ fn touches_of_an_undeclared_asset_is_a_validation_error() {
 }
 
 #[test]
-fn manifest_path_is_covered_by_the_protected_config_glob() {
-    let glob = Pattern::new(PROTECTED_CONFIG_GLOB).unwrap();
-    assert!(glob.matches(MANIFEST_REL_PATH));
+fn manifest_path_is_the_manifest_rel_path_under_the_repo() {
     let repo = PathBuf::from("/repo");
     assert_eq!(
         manifest_path_in(&repo)
@@ -191,4 +191,59 @@ fn manifest_path_is_covered_by_the_protected_config_glob() {
             .unwrap(),
         MANIFEST_REL_PATH
     );
+}
+
+#[test]
+fn manifest_path_is_refused_by_the_real_protected_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let protected = ProtectedPaths::with_config_dir(repo.path(), None);
+    let violation = protected
+        .check(Path::new(MANIFEST_REL_PATH))
+        .expect_err("the effects manifest must be protected");
+    assert_eq!(violation.path, MANIFEST_REL_PATH);
+    assert_eq!(violation.rule, ".nanna/**");
+    assert!(protected.is_protected(Path::new(MANIFEST_REL_PATH)));
+}
+
+#[test]
+fn paths_outside_the_protected_set_are_not_protected() {
+    let repo = tempfile::tempdir().unwrap();
+    let protected = ProtectedPaths::with_config_dir(repo.path(), None);
+    assert!(protected.check(Path::new("src/effects.toml")).is_ok());
+    assert!(!protected.is_protected(Path::new("effects.toml")));
+}
+
+#[tokio::test]
+async fn write_file_refuses_the_manifest_with_the_typed_error() {
+    let repo = tempfile::tempdir().unwrap();
+    let registry = create_tool_registry(repo.path());
+    let err = registry
+        .execute(
+            "write_file",
+            json!({ "path": MANIFEST_REL_PATH, "content": "tampered" }),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::ProtectedPath(violation) => {
+            assert_eq!(violation.path, MANIFEST_REL_PATH);
+            assert_eq!(violation.rule, ".nanna/**");
+        }
+        other => panic!("expected ProtectedPath, got {other:?}"),
+    }
+    assert!(!repo.path().join(MANIFEST_REL_PATH).exists());
+}
+
+#[tokio::test]
+async fn write_file_allows_a_path_outside_the_protected_set() {
+    let repo = tempfile::tempdir().unwrap();
+    let registry = create_tool_registry(repo.path());
+    registry
+        .execute(
+            "write_file",
+            json!({ "path": "notes/effects.toml", "content": "ok" }),
+        )
+        .await
+        .unwrap();
+    assert!(repo.path().join("notes/effects.toml").exists());
 }

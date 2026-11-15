@@ -29,19 +29,30 @@ pub enum ReasonCode {
     UnknownIdentity,
     /// The requested effect exceeds the identity's `scope.max_effect`.
     EffectAboveCeiling,
+    /// The action's target availability window is not open.
+    WindowClosed,
+    /// The action's required coordination lease could not be held.
+    LeaseUnavailable,
+    /// The task has accumulated repeated denials.
+    RepeatedDenials,
     /// Anything else, described in the reason detail.
     Other,
+    ModelFailure,
 }
 
 impl ReasonCode {
     /// Every code, in declaration order.
-    pub const ALL: [ReasonCode; 6] = [
+    pub const ALL: [ReasonCode; 10] = [
         ReasonCode::ScopeCreep,
         ReasonCode::LoopMismatch,
         ReasonCode::PromptInjection,
         ReasonCode::UnknownIdentity,
         ReasonCode::EffectAboveCeiling,
+        ReasonCode::WindowClosed,
+        ReasonCode::LeaseUnavailable,
+        ReasonCode::RepeatedDenials,
         ReasonCode::Other,
+        ReasonCode::ModelFailure,
     ];
 
     /// Stable snake_case name, identical to the serde representation.
@@ -52,7 +63,11 @@ impl ReasonCode {
             ReasonCode::PromptInjection => "prompt_injection",
             ReasonCode::UnknownIdentity => "unknown_identity",
             ReasonCode::EffectAboveCeiling => "effect_above_ceiling",
+            ReasonCode::WindowClosed => "window_closed",
+            ReasonCode::LeaseUnavailable => "lease_unavailable",
+            ReasonCode::RepeatedDenials => "repeated_denials",
             ReasonCode::Other => "other",
+            ReasonCode::ModelFailure => "model_failure",
         }
     }
 }

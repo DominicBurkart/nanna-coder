@@ -1,0 +1,18 @@
+[identity]
+name = "one-track-shared"
+description = "Implements a scoped change in shared/ (core types and graph algorithms used by api and ui). Reads api/ and ui/ to check consumers; never edits them."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "You work only under shared/. api/, ui/, cli/ and e2ee/ are read-only context for checking consumers; if a consumer must change, stop and report. No production or deploy actions." }
+
+[scope]
+repos = ["github.com/1-Track/one_track"]
+paths = ["shared/**"]
+read_paths = ["shared/**", "api/**", "ui/**", "e2ee/**", "cli/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "architecture.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test"]
+
+[limits]
+max_iterations = 100
+max_wall_clock_secs = 1800
+max_concurrent = 1

@@ -8,6 +8,7 @@
 //! A tool that can reach several classes (a shell runner, for example)
 //! declares the *maximum* class it can reach and is treated as that class.
 
+use crate::impact::BlastRadius;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -116,12 +117,36 @@ impl EffectClass {
 pub struct EffectRecord {
     /// Blast radius declared by the tool at the time of the call.
     pub class: EffectClass,
+    /// What the call reaches in the repository's state-asset graph, when the
+    /// repository declares one and the call writes a path or runs a deploy or
+    /// CI action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius: Option<BlastRadius>,
 }
 
 impl EffectRecord {
     /// Attribute a call to `class`.
     pub const fn new(class: EffectClass) -> Self {
-        Self { class }
+        Self {
+            class,
+            blast_radius: None,
+        }
+    }
+
+    /// Attach the call's blast radius.
+    ///
+    /// ```
+    /// use harness::effects::{EffectClass, EffectRecord};
+    /// use harness::impact::BlastRadius;
+    ///
+    /// let record = EffectRecord::new(EffectClass::Sandbox).with_blast_radius(BlastRadius::default());
+    /// let json = serde_json::to_value(&record).unwrap();
+    /// assert_eq!(json["class"], "sandbox");
+    /// assert_eq!(json["blast_radius"]["score"], 0);
+    /// ```
+    pub fn with_blast_radius(mut self, blast_radius: BlastRadius) -> Self {
+        self.blast_radius = Some(blast_radius);
+        self
     }
 }
 
