@@ -253,7 +253,7 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default()
     }
 
     pub(crate) fn broker_socket(&self, task_id: &str) -> PathBuf {
-        self.broker_dir.join(format!("{task_id}.sock"))
+        PathBuf::from(format!("{}/{task_id}.sock", self.broker_dir.display()))
     }
 
     pub fn limits(&self) -> PiLimits {
