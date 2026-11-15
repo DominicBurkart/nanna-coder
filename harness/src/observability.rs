@@ -1097,4 +1097,142 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    fn make_alert(
+        component: &str,
+        title: &str,
+        severity: AlertSeverity,
+    ) -> crate::monitoring::Alert {
+        crate::monitoring::Alert {
+            id: "test-alert-1".to_string(),
+            title: title.to_string(),
+            description: "Test alert description".to_string(),
+            severity,
+            component: component.to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        }
+    }
+
+    #[test]
+    fn test_determine_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("container-worker-1", "Health degraded", AlertSeverity::Warning);
+        let category = system.determine_alert_category(&alert);
+        assert_eq!(category, AlertCategory::ContainerHealth);
+    }
+
+    #[test]
+    fn test_determine_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("model-llama", "Quality drop", AlertSeverity::Error);
+        let category = system.determine_alert_category(&alert);
+        assert_eq!(category, AlertCategory::ModelQuality);
+    }
+
+    #[test]
+    fn test_determine_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Performance degradation detected", AlertSeverity::Warning);
+        let category = system.determine_alert_category(&alert);
+        assert_eq!(category, AlertCategory::Performance);
+    }
+
+    #[test]
+    fn test_determine_alert_category_resources() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Resource exhaustion warning", AlertSeverity::Warning);
+        let category = system.determine_alert_category(&alert);
+        assert_eq!(category, AlertCategory::Resources);
+    }
+
+    #[test]
+    fn test_determine_alert_category_availability_fallback() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("disk", "Disk nearly full", AlertSeverity::Info);
+        let category = system.determine_alert_category(&alert);
+        assert_eq!(category, AlertCategory::Availability);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_critical() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Critical issue", AlertSeverity::Critical);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Performance);
+        // Critical base (100) + Performance (+10) -> capped at 100
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_security_boost() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("auth", "Auth failure", AlertSeverity::Error);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Security);
+        // Error base (75) + Security (+30) = 105 -> capped at 100
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_info_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("service", "Service check", AlertSeverity::Info);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Availability);
+        // Info base (25) + Availability (+20) = 45
+        assert_eq!(score, 45);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_warning_no_boost() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("model", "Quality warning", AlertSeverity::Warning);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::ModelQuality);
+        // Warning base (50) + no boost for ModelQuality = 50
+        assert_eq!(score, 50);
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_container_health() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("container", "Unhealthy", AlertSeverity::Error);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.contains("container")));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("api", "Slow response", AlertSeverity::Warning);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.contains("resource") || a.contains("Scale")));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_model_quality() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("model", "Low quality", AlertSeverity::Warning);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.contains("model")));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_fallback() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("network", "Network issue", AlertSeverity::Warning);
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Availability);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.contains("logs") || a.contains("issue")));
+    }
+
+    #[test]
+    fn test_get_uptime_increases() {
+        let system = ObservabilitySystem::new();
+        let uptime1 = system.get_uptime();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let uptime2 = system.get_uptime();
+        assert!(uptime2 >= uptime1);
+    }
 }
