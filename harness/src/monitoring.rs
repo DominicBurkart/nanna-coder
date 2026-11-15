@@ -1242,4 +1242,108 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[test]
+    fn test_alert_severity_ordering() {
+        assert!(AlertSeverity::Info < AlertSeverity::Warning);
+        assert!(AlertSeverity::Warning < AlertSeverity::Error);
+        assert!(AlertSeverity::Error < AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn test_error_severity_ordering() {
+        assert!(ErrorSeverity::Info < ErrorSeverity::Warning);
+        assert!(ErrorSeverity::Warning < ErrorSeverity::Error);
+        assert!(ErrorSeverity::Error < ErrorSeverity::Critical);
+    }
+
+    #[test]
+    fn test_alert_thresholds_default() {
+        let thresholds = AlertThresholds::default();
+        assert_eq!(thresholds.max_latency_ms, 5000);
+        assert_eq!(thresholds.min_cache_hit_rate, 0.8);
+        assert_eq!(thresholds.max_error_rate, 0.05);
+        assert_eq!(thresholds.max_cpu_usage, 0.9);
+        assert_eq!(thresholds.max_memory_usage, 0.9);
+        assert_eq!(thresholds.health_check_timeout, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_export_custom_format_returns_error() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("test", Duration::from_millis(100))
+            .await;
+        let result = collector
+            .export_metrics(MetricsFormat::Custom("myformat".to_string()))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("myformat"));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_nonexistent_alert_returns_error() {
+        let manager = DefaultAlertManager::new();
+        let result = manager.acknowledge_alert("nonexistent-id").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cache_metrics_from_scratch() {
+        let collector = DefaultMetricsCollector::new();
+        let metrics = collector.get_current_metrics().await.unwrap();
+        assert_eq!(metrics.cache_metrics.hits, 0);
+        assert_eq!(metrics.cache_metrics.misses, 0);
+        assert_eq!(metrics.cache_metrics.hit_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_reset_metrics_clears_all_data() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector
+            .record_request_latency("test", Duration::from_millis(100))
+            .await;
+        collector.record_cache_hit("key1").await;
+        collector.record_cache_miss("key2").await;
+
+        let metrics_before = collector.get_current_metrics().await.unwrap();
+        assert!(!metrics_before.request_latencies.is_empty());
+        assert_eq!(metrics_before.cache_metrics.hits, 1);
+
+        collector.reset_metrics().await;
+
+        let metrics_after = collector.get_current_metrics().await.unwrap();
+        assert!(metrics_after.request_latencies.is_empty());
+        assert_eq!(metrics_after.cache_metrics.hits, 0);
+        assert_eq!(metrics_after.cache_metrics.misses, 0);
+        assert_eq!(metrics_after.cache_metrics.hit_rate, 0.0);
+    }
+
+    #[test]
+    fn test_container_status_variants_distinct() {
+        assert_ne!(ContainerStatus::Running, ContainerStatus::Starting);
+        assert_ne!(ContainerStatus::Starting, ContainerStatus::Stopping);
+        assert_ne!(ContainerStatus::Stopping, ContainerStatus::Stopped);
+        assert_ne!(ContainerStatus::Stopped, ContainerStatus::Failed);
+        assert_ne!(ContainerStatus::Failed, ContainerStatus::Unknown);
+    }
 }
