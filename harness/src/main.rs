@@ -1867,6 +1867,15 @@ fn export_action_audit(
     telemetry
 }
 
+fn export_budget(
+    accountant: &harness::budget::CostAccountant,
+    telemetry: &std::sync::Arc<harness::telemetry::TelemetrySystem>,
+) {
+    if !accountant.set_telemetry(std::sync::Arc::clone(telemetry)) {
+        warn!("the cost accountant already had a telemetry system; budget export is not attached");
+    }
+}
+
 fn spawn_telemetry_flush(
     telemetry: std::sync::Arc<harness::telemetry::TelemetrySystem>,
     period: std::time::Duration,
@@ -1996,6 +2005,7 @@ async fn run_mcp_server(
         &task_manager.action_gate(),
         queue_path.with_file_name(TELEMETRY_FILE),
     );
+    export_budget(&task_manager.cost_accountant(), &telemetry);
     let flush = spawn_telemetry_flush(Arc::clone(&telemetry), TELEMETRY_FLUSH_EVERY);
 
     info!(
@@ -2064,6 +2074,7 @@ async fn run_delegate(
         &task_manager.action_gate(),
         queue_path.with_file_name(DELEGATE_TELEMETRY_FILE),
     );
+    export_budget(&task_manager.cost_accountant(), &telemetry);
     let session = async {
         let gate = delegate_spawn_gate(
             model,
@@ -2149,6 +2160,25 @@ mod tests {
         assert!(!text.contains("SECRET"));
         let second = export_action_audit(&manager.action_gate(), path);
         assert_eq!(second.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_cost_accountant_exports_its_budget_counters_once_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let manager = harness::task::TaskManager::default();
+        let telemetry = export_action_audit(&manager.action_gate(), path.clone());
+        let accountant = manager.cost_accountant();
+        export_budget(&accountant, &telemetry);
+        let class = harness::budget::BudgetClass::Ci;
+        let _ = accountant
+            .charge_count("rust-implementer", "t1", "o/n", class, chrono::Utc::now())
+            .await;
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nanna_budget_spent") && text.contains("\"class\":\"ci\""));
+        assert!(!text.contains("\"t1\""));
+        export_budget(&accountant, &telemetry);
     }
 
     #[tokio::test]
