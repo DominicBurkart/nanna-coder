@@ -1579,7 +1579,6 @@ impl TaskRunner {
         Ok(())
     }
 
-    /// Mark a task `Failed` before any agent iteration ran.
     async fn verify_checks(
         &self,
         task_id: &TaskId,
@@ -1612,6 +1611,7 @@ impl TaskRunner {
         }
     }
 
+    /// Mark a task `Failed` before any agent iteration ran.
     async fn fail(&self, task_id: &TaskId, error: String, error_type: &str) {
         self.progress.write().await.remove(task_id);
         self.set_status(

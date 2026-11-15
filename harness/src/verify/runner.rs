@@ -20,25 +20,25 @@ pub struct RawRun {
     pub stderr: String,
 }
 
-/// Executes one check command and reports how it ended. Implementations
-/// must run the command inside the dev container; the host never runs
-/// repository-declared commands.
+#[doc = r#"Executes one check command and reports how it ended. Implementations
+must run the command inside the dev container; the host never runs
+repository-declared commands."#]
 pub trait CheckRunner: Send + Sync {
     fn run(&self, command: &str, timeout: Duration) -> Result<RawRun, String>;
 }
 
-/// Runs `sh -c <command>` through a launcher that executes inside a
-/// container, such as `podman exec -w /workspace <name>`.
-///
-/// ```
-/// use harness::verify::{CheckRunner, ProcessCheckRunner};
-/// use std::time::Duration;
-///
-/// let runner = ProcessCheckRunner::new("env", vec![]);
-/// let run = runner.run("echo hi", Duration::from_secs(10)).unwrap();
-/// assert_eq!(run.exit_code, Some(0));
-/// assert_eq!(run.stdout, "hi\n");
-/// ```
+#[doc = r#"Runs `sh -c <command>` through a launcher that executes inside a
+container, such as `podman exec -w /workspace <name>`.
+
+```
+use harness::verify::{CheckRunner, ProcessCheckRunner};
+use std::time::Duration;
+
+let runner = ProcessCheckRunner::new("env", vec![]);
+let run = runner.run("echo hi", Duration::from_secs(10)).unwrap();
+assert_eq!(run.exit_code, Some(0));
+assert_eq!(run.stdout, "hi\n");
+```"#]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCheckRunner {
     program: String,

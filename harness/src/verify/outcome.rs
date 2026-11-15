@@ -21,27 +21,27 @@ pub enum CheckStatus {
     Skipped,
 }
 
-/// How one declared check ended: its name and command, status, exit code
-/// (`None` when it timed out, was signalled or never ran), duration and the
-/// tail of its combined output.
-///
-/// ```
-/// use harness::verify::{CheckOutcome, CheckStatus};
-///
-/// let outcome = CheckOutcome {
-///     name: "clippy".into(),
-///     command: "cargo clippy".into(),
-///     status: CheckStatus::Failed,
-///     exit_code: Some(101),
-///     timeout_secs: 900,
-///     duration_ms: 42,
-///     output: "error: ...".into(),
-///     output_truncated: false,
-/// };
-/// assert_eq!(outcome.failure_message(), "check `clippy` failed with exit code 101");
-/// let json = serde_json::to_value(&outcome).unwrap();
-/// assert_eq!(json["status"], "failed");
-/// ```
+#[doc = r#"How one declared check ended: its name and command, status, exit code
+(`None` when it timed out, was signalled or never ran), duration and the
+tail of its combined output.
+
+```
+use harness::verify::{CheckOutcome, CheckStatus};
+
+let outcome = CheckOutcome {
+    name: "clippy".into(),
+    command: "cargo clippy".into(),
+    status: CheckStatus::Failed,
+    exit_code: Some(101),
+    timeout_secs: 900,
+    duration_ms: 42,
+    output: "error: ...".into(),
+    output_truncated: false,
+};
+assert_eq!(outcome.failure_message(), "check `clippy` failed with exit code 101");
+let json = serde_json::to_value(&outcome).unwrap();
+assert_eq!(json["status"], "failed");
+```"#]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckOutcome {
     pub name: String,
@@ -128,27 +128,27 @@ pub fn passed_summary(outcomes: &[CheckOutcome]) -> String {
     format!("{passed}/{} checks passed", outcomes.len())
 }
 
-/// Runs every declared check in order and returns one outcome per check. A
-/// failing check does not stop the rest, so the report is complete; a check
-/// that times out stops the run and marks the remaining checks skipped,
-/// because its process may still be running in the container.
-///
-/// ```
-/// use harness::verify::{run_checks, CheckRunner, CheckStatus, RawRun, VerifyConfig};
-/// use std::time::Duration;
-///
-/// struct Fixed(i32);
-/// impl CheckRunner for Fixed {
-///     fn run(&self, _: &str, _: Duration) -> Result<RawRun, String> {
-///         Ok(RawRun { exit_code: Some(self.0), timed_out: false, stdout: "ok".into(), stderr: String::new() })
-///     }
-/// }
-///
-/// let config = VerifyConfig::parse("[[check]]\nname = \"a\"\ncommand = \"true\"\n").unwrap();
-/// let outcomes = run_checks(&config, &Fixed(1)).unwrap();
-/// assert_eq!(outcomes[0].status, CheckStatus::Failed);
-/// assert_eq!(outcomes[0].exit_code, Some(1));
-/// ```
+#[doc = r#"Runs every declared check in order and returns one outcome per check. A
+failing check does not stop the rest, so the report is complete; a check
+that times out stops the run and marks the remaining checks skipped,
+because its process may still be running in the container.
+
+```
+use harness::verify::{run_checks, CheckRunner, CheckStatus, RawRun, VerifyConfig};
+use std::time::Duration;
+
+struct Fixed(i32);
+impl CheckRunner for Fixed {
+    fn run(&self, _: &str, _: Duration) -> Result<RawRun, String> {
+        Ok(RawRun { exit_code: Some(self.0), timed_out: false, stdout: "ok".into(), stderr: String::new() })
+    }
+}
+
+let config = VerifyConfig::parse("[[check]]\nname = \"a\"\ncommand = \"true\"\n").unwrap();
+let outcomes = run_checks(&config, &Fixed(1)).unwrap();
+assert_eq!(outcomes[0].status, CheckStatus::Failed);
+assert_eq!(outcomes[0].exit_code, Some(1));
+```"#]
 pub fn run_checks(
     config: &VerifyConfig,
     runner: &dyn CheckRunner,
