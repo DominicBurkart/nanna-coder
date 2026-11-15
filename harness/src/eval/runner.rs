@@ -29,7 +29,7 @@ use crate::eval::swebench::{load_swebench_dataset, materialize, SWEBenchError, S
 use crate::eval::swebench_verify::{
     verify_predictions, InstanceVerdict, Prediction, VerifyConfig, VerifyError,
 };
-use crate::tools::create_tool_registry;
+use crate::tools::create_tool_registry_in_checkout;
 use model::config::OllamaConfig;
 use model::ollama::OllamaProvider;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,8 @@ pub enum EvalRunnerError {
     Agent(#[from] crate::agent::AgentError),
     #[error("Eval case error: {0}")]
     EvalCase(#[from] EvalCaseError),
+    #[error("Refusing to start the agent: {0}")]
+    ProtectedConfig(#[from] crate::protected::ProtectedConfigError),
     #[error("Model provider error: {0}")]
     ModelProvider(String),
     #[error("Timeout after {0:?}")]
@@ -410,7 +412,7 @@ async fn run_agent_in_process(
         model_name: config.model_name.clone(),
     };
 
-    let tool_registry = create_tool_registry(work_dir);
+    let tool_registry = create_tool_registry_in_checkout(work_dir)?;
     let entity_store = crate::entities::InMemoryEntityStore::new();
 
     // Create LLM provider so the agent uses the tool-calling loop
@@ -528,7 +530,17 @@ async fn run_agent_subprocess(
 }
 
 fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
-    if let Ok(p) = std::env::var("NANNA_HARNESS_BIN") {
+    locate_nanna_binary_in(
+        std::env::var("NANNA_HARNESS_BIN").ok(),
+        std::env::var_os("PATH"),
+    )
+}
+
+fn locate_nanna_binary_in(
+    env_bin: Option<String>,
+    search_path: Option<std::ffi::OsString>,
+) -> Result<PathBuf, EvalRunnerError> {
+    if let Some(p) = env_bin {
         let path = PathBuf::from(p);
         // Reject directories: `path.exists()` alone matches a bare dir,
         // and the subsequent `cmd.output()` would then fail with a cryptic
@@ -540,7 +552,8 @@ fn locate_nanna_binary() -> Result<PathBuf, EvalRunnerError> {
         }
         return Ok(path);
     }
-    which::which("nanna").map_err(|_| EvalRunnerError::BinaryNotFound)
+    let cwd = std::env::current_dir().map_err(|_| EvalRunnerError::BinaryNotFound)?;
+    which::which_in("nanna", search_path, cwd).map_err(|_| EvalRunnerError::BinaryNotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1171,7 @@ mod tests {
             tool_calls_made: vec![],
             conversation_snapshot: vec![],
             denials: vec![],
+            action_audit: vec![],
             token_usage: Some(TokenUsage {
                 prompt_tokens: 5,
                 completion_tokens: 6,
@@ -1183,6 +1197,7 @@ mod tests {
             tool_calls_made: vec![],
             conversation_snapshot: vec![],
             denials: vec![],
+            action_audit: vec![],
             token_usage: None,
         };
         assert!(AgentOutcome::InProcess(r).token_usage().is_none());
@@ -1697,25 +1712,37 @@ tags = ["{tag}"]
         assert_eq!(result.token_usage.total_tokens, 12);
     }
 
-    #[tokio::test]
-    #[serial_test::serial(nanna_harness_bin_env)]
-    async fn locate_nanna_binary_falls_back_to_which_when_env_unset() {
-        let key = "NANNA_HARNESS_BIN";
-        let saved_bin = std::env::var(key).ok();
-        std::env::remove_var(key);
-        let saved_path = std::env::var("PATH").ok();
+    #[test]
+    fn locate_nanna_binary_falls_back_to_which_when_env_unset() {
         let empty_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PATH", empty_dir.path());
-        let result = locate_nanna_binary();
-        match saved_bin {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        match saved_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        let result = locate_nanna_binary_in(None, Some(empty_dir.path().into()));
         assert!(matches!(result, Err(EvalRunnerError::BinaryNotFound)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_nanna_binary_finds_nanna_on_the_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nanna");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        let found = locate_nanna_binary_in(None, Some(dir.path().into())).unwrap();
+        assert_eq!(found.file_name().unwrap(), "nanna");
+    }
+
+    #[test]
+    fn locate_nanna_binary_prefers_the_env_override_over_the_search_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fake-nanna");
+        std::fs::write(&bin, "x").unwrap();
+        let found = locate_nanna_binary_in(
+            Some(bin.to_str().unwrap().to_string()),
+            Some(std::ffi::OsString::new()),
+        )
+        .unwrap();
+        assert_eq!(found, bin);
     }
 
     #[test]
@@ -3288,6 +3315,45 @@ timeout_secs = 5
             resolved,
             PathBuf::from("/tmp/evals/datasets/swebench-verified-sample.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn run_agent_in_process_refuses_a_bad_protected_declaration_in_the_work_dir() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work_dir.path().join(".nanna")).unwrap();
+        std::fs::write(work_dir.path().join(".nanna/protected.toml"), "extra = [").unwrap();
+        let outcome = run_agent_in_process(
+            work_dir.path(),
+            &sample_eval_case(),
+            &EvalRunnerConfig::default(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(outcome, Err(EvalRunnerError::ProtectedConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn run_agent_in_process_refuses_a_bad_policy_in_the_work_dir() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work_dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            work_dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        let outcome = run_agent_in_process(
+            work_dir.path(),
+            &sample_eval_case(),
+            &EvalRunnerConfig::default(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(EvalRunnerError::ProtectedConfig(
+                crate::protected::ProtectedConfigError::Policy(_)
+            ))
+        ));
     }
 
     fn sample_eval_case() -> EvalCase {

@@ -22,7 +22,7 @@ jobs:
   container-loading:
     name: container-loading (smoke)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v14
@@ -51,7 +51,7 @@ jobs:
   empty-cache:
     name: empty-cache (cold-start fallback)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v14

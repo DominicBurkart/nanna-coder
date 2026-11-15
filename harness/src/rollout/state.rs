@@ -152,6 +152,10 @@ pub struct RolloutRecord {
     pub created_at: DateTime<Utc>,
     /// When the record last changed.
     pub updated_at: DateTime<Utc>,
+    /// How many transitions of this rollout the log held when this record
+    /// was read or last appended; never serialised, so older logs stay valid.
+    #[serde(skip)]
+    pub revision: u64,
 }
 
 impl RolloutRecord {
@@ -178,6 +182,7 @@ impl RolloutRecord {
             breach: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -482,7 +487,7 @@ pub(crate) mod tests {
         let r = record("production");
         assert_eq!(
             r.lease_name().unwrap(),
-            LeaseName::deploy("app", "production")
+            LeaseName::deploy("registry.example.invalid/ns/app", "production")
         );
         let mut odd = record("sandbox");
         odd.plan.lease = "branch:app:main".into();

@@ -32,7 +32,10 @@ pub use adapter::{
     Swapped, TargetAdapter,
 };
 pub use escalator_hook::EscalatorHook;
-pub use executor::{fake_executor, run_simulated, RolloutConfig, RolloutExecutor};
+pub use executor::{
+    enforcement, fake_executor, release_halted_lease, release_halted_lease_cli, run_simulated,
+    RolloutConfig, RolloutExecutor,
+};
 pub use health::{
     check_health, EvidenceSample, FakeHealthSource, HealthBreach, HealthError, HealthObservation,
     HealthSample, HealthSource, HealthThreshold, EVIDENCE_CAP,
@@ -76,6 +79,16 @@ pub enum RolloutError {
     /// No rollout with this id is in the log.
     #[error("unknown rollout `{0}`")]
     UnknownRollout(String),
+    /// Another writer moved the rollout since it was read.
+    #[error("rollout {id} changed concurrently: expected {expected}, found {actual}")]
+    Conflict {
+        /// Rollout concerned.
+        id: String,
+        /// State the writer read, `created` when it expected no record.
+        expected: String,
+        /// State the log holds now, `created` when it holds no record.
+        actual: String,
+    },
     /// The requested state does not follow the current one.
     #[error("rollout {id} cannot move from {from} to {to}")]
     InvalidTransition {
@@ -116,6 +129,9 @@ pub enum RolloutError {
         /// The missing step index.
         step: usize,
     },
+    /// A lease release for a rollout that is not halted.
+    #[error("rollout {0} is not halted; only a halted rollout's lease is released by hand")]
+    NotHalted(String),
     /// A roll-forward without the pull request that justifies it.
     #[error("roll-forward requires a linked pull request reference")]
     PrRequired,

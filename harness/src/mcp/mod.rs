@@ -1,7 +1,9 @@
 pub mod client;
 pub mod handlers;
 pub mod jsonrpc;
+pub mod plan;
 
+use crate::auditor::SpawnGate;
 use crate::task::{TaskId, TaskManager};
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use model::provider::ModelProvider;
@@ -12,23 +14,45 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 pub struct NannaMcpServer {
     task_manager: Arc<TaskManager>,
     provider: Arc<dyn ModelProvider>,
-    default_model: String,
+    spawn_gate: SpawnGate,
     default_max_iterations: usize,
+    planner_model: Option<String>,
+    plans: Arc<plan::PlanRegistry>,
 }
 
 impl NannaMcpServer {
+    /// A server whose `assign_task` dispatches only spawns that
+    /// `spawn_gate` allowed. The identity card chooses the model, so there
+    /// is no server-wide default model.
     pub fn new(
         task_manager: Arc<TaskManager>,
         provider: Arc<dyn ModelProvider>,
-        default_model: String,
+        spawn_gate: SpawnGate,
         default_max_iterations: usize,
     ) -> Self {
         Self {
             task_manager,
             provider,
-            default_model,
+            spawn_gate,
             default_max_iterations,
+            planner_model: None,
+            plans: Arc::new(plan::PlanRegistry::default()),
         }
+    }
+
+    /// ```
+    /// use harness::mcp::NannaMcpServer;
+    /// # use harness::task::TaskManager;
+    /// # use std::sync::Arc;
+    /// # fn build(provider: Arc<dyn model::ModelProvider>, gate: harness::auditor::SpawnGate) {
+    /// let server = NannaMcpServer::new(Arc::new(TaskManager::default()), provider, gate, 10)
+    ///     .with_planner("planner-model");
+    /// # let _ = server;
+    /// # }
+    /// ```
+    pub fn with_planner(mut self, model: impl Into<String>) -> Self {
+        self.planner_model = Some(model.into());
+        self
     }
 
     /// Serve the MCP protocol over a reader/writer pair.
@@ -151,6 +175,14 @@ impl NannaMcpServer {
     }
 
     fn tool_list(&self) -> Value {
+        let mut tools = self.base_tool_list();
+        if let (Some(_), Some(list)) = (&self.planner_model, tools.as_array_mut()) {
+            list.push(plan::tool_definition());
+        }
+        tools
+    }
+
+    fn base_tool_list(&self) -> Value {
         serde_json::json!([
             {
                 "name": "assign_task",
@@ -177,6 +209,14 @@ impl NannaMcpServer {
                         "max_iterations": {
                             "type": "integer",
                             "description": "Maximum agent iterations (default: server default)"
+                        },
+                        "requested_effect": {
+                            "type": "string",
+                            "description": "Effect class the task is expected to reach (none, workspace, repository, ci, sandbox, production). The auditor refuses it when it exceeds the identity's ceiling. Defaults to the identity's ceiling."
+                        },
+                        "dev_loop": {
+                            "type": "string",
+                            "description": "Development loop the task belongs to (inner, middle, outer). The auditor refuses a loop other than the identity's. Defaults to the identity's loop."
                         },
                         "identity": {
                             "type": "string",
@@ -240,7 +280,7 @@ impl NannaMcpServer {
                     &tool_params,
                     &self.task_manager,
                     &self.provider,
-                    &self.default_model,
+                    &self.spawn_gate,
                     self.default_max_iterations,
                     requested_ttl,
                 )
@@ -250,6 +290,38 @@ impl NannaMcpServer {
                         JsonRpcResponse::success(id, serde_json::json!({ "task": task_wire }))
                     }
                     Err(msg) => JsonRpcResponse::error(id, -32602, msg),
+                }
+            }
+            "plan_task" => {
+                let Some(planner_model) = self.planner_model.as_deref() else {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "Tool 'plan_task' is not enabled on this server".to_string(),
+                    );
+                };
+                if task_field.is_none() {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "Tool 'plan_task' requires task augmentation (include a `task` field). \
+                         Retrieve results via tasks/result."
+                            .to_string(),
+                    );
+                }
+                let env = plan::PlanTaskEnv {
+                    task_manager: &self.task_manager,
+                    provider: &self.provider,
+                    spawn_gate: &self.spawn_gate,
+                    registry: &self.plans,
+                    planner_model,
+                    default_max_iterations: self.default_max_iterations,
+                };
+                match plan::handle_plan_task(&tool_params, &env).await {
+                    Ok(task_wire) => {
+                        JsonRpcResponse::success(id, serde_json::json!({ "task": task_wire }))
+                    }
+                    Err(error) => JsonRpcResponse::error(id, error.code(), error.to_string()),
                 }
             }
             // `onboard_repo` does not support task augmentation
@@ -298,6 +370,12 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            return match self.plans.view(&task_id.0) {
+                Ok(view) => JsonRpcResponse::success(id, plan::view_to_wire(&task_id.0, &view)),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         match self.task_manager.poll(&task_id).await {
             Some(task) => JsonRpcResponse::success(id, handlers::task_to_wire(&task)),
             None => JsonRpcResponse::error(
@@ -315,6 +393,15 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            return match self.plans.wait_finished(&task_id.0).await {
+                Ok((status, result)) => JsonRpcResponse::success(
+                    id,
+                    plan::result_to_call_tool_result(&task_id.0, status, &result),
+                ),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         // wait_terminal returns the terminal status directly (or None for an
         // unknown task id), so no second lookup is needed.
         match self.task_manager.wait_terminal(&task_id).await {
@@ -338,7 +425,10 @@ impl NannaMcpServer {
     /// as `_meta.leases.error` rather than hidden.
     async fn handle_tasks_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let tasks = self.task_manager.list().await;
-        let wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
+        let mut wire: Vec<Value> = tasks.iter().map(handlers::task_to_wire).collect();
+        for (plan_id, view) in self.plans.views() {
+            wire.push(plan::view_to_wire(&plan_id, &view));
+        }
         let queue = self.task_manager.queue_metrics().await.to_json();
         let leases = match self.task_manager.lease_snapshot() {
             Ok(snapshot) => snapshot.to_json(),
@@ -360,6 +450,16 @@ impl NannaMcpServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
+        if plan::is_plan_id(&task_id.0) {
+            let cancelled = self
+                .plans
+                .cancel(&task_id.0)
+                .and_then(|()| self.plans.view(&task_id.0));
+            return match cancelled {
+                Ok(view) => JsonRpcResponse::success(id, plan::view_to_wire(&task_id.0, &view)),
+                Err(error) => JsonRpcResponse::error(id, -32602, error.to_string()),
+            };
+        }
         // Distinguish "not found" from "already terminal": both surface as
         // -32602 per the spec, but with different messages.
         match self.task_manager.cancel(&task_id).await {
@@ -399,7 +499,7 @@ mod tests {
         NannaMcpServer::new(
             Arc::new(TaskManager::default()),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         )
     }
@@ -636,16 +736,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_assign_task_with_task_returns_create_task_result() {
-        let server = make_server();
-        // repo_path "/tmp" is not a git repo, so the worker fails at workspace
-        // creation (no model call), but the immediate CreateTaskResult is
+        let server = NannaMcpServer::new(
+            Arc::new(TaskManager::new(0)),
+            Arc::new(NoopProvider),
+            crate::auditor::test_support::fixture_gate(),
+            100,
+        );
+        // The audited spawn is queued and the immediate CreateTaskResult is
         // returned synchronously with status "working".
         let resp = server
             .handle_request(tools_call(
                 11,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": { "ttl": 5000 }
                 }),
             ))
@@ -845,7 +949,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(TaskManager::new(0)),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let empty = server
@@ -858,7 +962,7 @@ mod tests {
                 19,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))
@@ -999,7 +1103,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(manager),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let listed = server
@@ -1020,7 +1124,7 @@ mod tests {
         let server = NannaMcpServer::new(
             Arc::new(TaskManager::new(0)),
             Arc::new(NoopProvider),
-            "qwen3:0.6b".to_string(),
+            crate::auditor::test_support::fixture_gate(),
             100,
         );
         let created = server
@@ -1028,7 +1132,7 @@ mod tests {
                 23,
                 serde_json::json!({
                     "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp", "identity": "rust-implementer" },
+                    "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" },
                     "task": {}
                 }),
             ))

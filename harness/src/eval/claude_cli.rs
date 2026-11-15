@@ -525,6 +525,24 @@ mod tests {
         dir
     }
 
+    async fn run_stub(
+        runner: &ClaudeCodeRunner,
+        cwd: &std::path::Path,
+    ) -> Result<ClaudeCodeRun, ClaudeCodeError> {
+        let mut attempts = 0;
+        loop {
+            match runner.run("hello", cwd).await {
+                Err(ClaudeCodeError::Spawn(message))
+                    if message.contains("Text file busy") && attempts < 100 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     // The four subprocess tests below must run sequentially: parallel
     // `posix_spawn` calls inherit each other's writable fds to stub
     // binaries, producing ETXTBSY when those still-open-for-write fds
@@ -539,7 +557,7 @@ mod tests {
         );
         let runner = ClaudeCodeRunner::new().with_claude_bin(stub.path().join("claude"));
         let repo = tempfile::tempdir().unwrap();
-        let run = runner.run("hello", repo.path()).await.unwrap();
+        let run = run_stub(&runner, repo.path()).await.unwrap();
         assert_eq!(run.result.as_deref(), Some("ok"));
         assert_eq!(run.prompt_tokens, 12);
         assert_eq!(run.completion_tokens, 3);
@@ -568,7 +586,7 @@ mod tests {
         }
         let runner = ClaudeCodeRunner::new().with_claude_bin(&path);
         let repo = tempfile::tempdir().unwrap();
-        let err = runner.run("hello", repo.path()).await.unwrap_err();
+        let err = run_stub(&runner, repo.path()).await.unwrap_err();
         match err {
             ClaudeCodeError::NonZeroExit { code, stderr } => {
                 assert_eq!(code, 7);
@@ -585,7 +603,7 @@ mod tests {
         let runner = ClaudeCodeRunner::new()
             .with_claude_bin("/var/empty/definitely-not-a-real-claude-binary");
         let repo = tempfile::tempdir().unwrap();
-        let err = runner.run("hello", repo.path()).await.unwrap_err();
+        let err = run_stub(&runner, repo.path()).await.unwrap_err();
         assert!(matches!(err, ClaudeCodeError::Spawn(_)));
     }
 
@@ -611,7 +629,7 @@ mod tests {
 
         let runner = ClaudeCodeRunner::new().with_claude_bin(&path);
         let repo = tempfile::tempdir().unwrap();
-        let err = runner.run("hello", repo.path()).await.unwrap_err();
+        let err = run_stub(&runner, repo.path()).await.unwrap_err();
         assert!(matches!(err, ClaudeCodeError::ParseOutput(_)));
     }
 
@@ -641,7 +659,7 @@ mod tests {
         }
         let runner = ClaudeCodeRunner::new().with_claude_bin(&path);
         let repo = tempfile::tempdir().unwrap();
-        let run = runner.run("hello", repo.path()).await.unwrap();
+        let run = run_stub(&runner, repo.path()).await.unwrap();
         assert!(run.is_error);
         assert_eq!(run.prompt_tokens, 50);
         assert_eq!(run.exit_status, 1);

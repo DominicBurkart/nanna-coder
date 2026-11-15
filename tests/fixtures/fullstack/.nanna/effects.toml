@@ -1,0 +1,29 @@
+[concern.availability]
+weight = 6
+description = "The fixture must keep answering its health and greeting probes."
+
+[concern.content]
+weight = 3
+description = "Greeting text shown to users."
+
+[asset."db.greetings"]
+kind = "table"
+concerns = ["content"]
+owners = ["migrations/**"]
+
+[asset."http.GET /api/v1/greeting"]
+kind = "endpoint"
+concerns = ["availability", "content"]
+owners = ["api/src/**"]
+reads = ["db.greetings"]
+
+[asset."http.GET /health/v1"]
+kind = "endpoint"
+concerns = ["availability"]
+owners = ["api/src/**"]
+
+[asset."ui.greeting_page"]
+kind = "endpoint"
+concerns = ["availability", "content"]
+owners = ["ui/**"]
+reads = ["http.GET /api/v1/greeting"]

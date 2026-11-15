@@ -51,11 +51,38 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+pub const MAX_BUFFERED_METRICS: usize = 10_000;
+pub const MAX_BUFFERED_EVENTS: usize = 10_000;
+
+fn push_bounded<T>(buffer: &mut Vec<T>, item: T, cap: usize, dropped: &AtomicU64) {
+    if buffer.len() >= cap {
+        let oldest = (cap / 10).max(1);
+        buffer.drain(..oldest);
+        dropped.fetch_add(oldest as u64, Ordering::Relaxed);
+    }
+    buffer.push(item);
+}
+
+fn dropped_metric(dropped: u64) -> MetricPoint {
+    MetricPoint {
+        name: "nanna_telemetry_dropped_total".to_string(),
+        metric_type: MetricType::Counter,
+        value: dropped as f64,
+        timestamp: Utc::now(),
+        labels: HashMap::new(),
+        unit: None,
+        description: Some("Buffered points dropped because a buffer was full".to_string()),
+    }
+}
 
 /// Telemetry system errors
 #[derive(Error, Debug)]
@@ -335,6 +362,115 @@ pub trait TelemetryExporter: Send + Sync {
     async fn health_check(&self) -> Result<bool, TelemetryError>;
 }
 
+/// ```
+/// use harness::telemetry::JsonlExporter;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let exporter = JsonlExporter::new(dir.path().join("telemetry.jsonl"), 1024 * 1024);
+/// # let _ = exporter;
+/// ```
+pub struct JsonlExporter {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+#[cfg(unix)]
+const OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+
+impl JsonlExporter {
+    pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            max_bytes,
+        }
+    }
+
+    fn open(&self) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(OPEN_FLAGS);
+        }
+        #[cfg(not(unix))]
+        {
+            let link = std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_symlink());
+            if link {
+                return Err(std::io::Error::other("refusing to write through a symlink"));
+            }
+        }
+        let file = options.open(&self.path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(
+                "telemetry path is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(file)
+    }
+
+    fn rotate(&self) -> std::io::Result<()> {
+        let mut rotated = self.path.clone().into_os_string();
+        rotated.push(".1");
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::rename(&self.path, &rotated)
+    }
+
+    fn append(&self, lines: Vec<String>) -> Result<(), TelemetryError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = self.open()?;
+        let mut size = file.metadata()?.len();
+        for line in lines {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            if size >= self.max_bytes {
+                self.rotate()?;
+                file = self.open()?;
+                size = 0;
+            }
+            file.write_all(&bytes)?;
+            size += bytes.len() as u64;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TelemetryExporter for JsonlExporter {
+    async fn export_traces(&self, _traces: Vec<TraceContext>) -> Result<(), TelemetryError> {
+        Ok(())
+    }
+
+    async fn export_metrics(&self, metrics: Vec<MetricPoint>) -> Result<(), TelemetryError> {
+        let line = |metric: &MetricPoint| serde_json::json!({ "metric": metric }).to_string();
+        self.append(metrics.iter().map(line).collect())
+    }
+
+    async fn export_events(&self, events: Vec<CustomEvent>) -> Result<(), TelemetryError> {
+        let line = |event: &CustomEvent| serde_json::json!({ "event": event }).to_string();
+        self.append(events.iter().map(line).collect())
+    }
+
+    async fn export_system_metrics(&self, _metrics: SystemMetrics) -> Result<(), TelemetryError> {
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool, TelemetryError> {
+        Ok(true)
+    }
+}
+
 /// Prometheus metrics exporter
 pub struct PrometheusExporter {
     /// Endpoint URL
@@ -540,6 +676,8 @@ pub struct TelemetrySystem {
     metrics_buffer: Arc<Mutex<Vec<MetricPoint>>>,
     /// Events buffer
     events_buffer: Arc<Mutex<Vec<CustomEvent>>>,
+    /// Buffered points dropped because a buffer was full
+    dropped: AtomicU64,
     /// Exporters
     exporters: Vec<Box<dyn TelemetryExporter>>,
     /// Is initialized
@@ -556,6 +694,7 @@ impl TelemetrySystem {
             active_traces: Arc::new(Mutex::new(Vec::new())),
             metrics_buffer: Arc::new(Mutex::new(Vec::new())),
             events_buffer: Arc::new(Mutex::new(Vec::new())),
+            dropped: AtomicU64::new(0),
             exporters: Vec::new(),
             initialized: false,
             start_time: Instant::now(),
@@ -715,7 +854,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded counter: {} = {}", name, value);
@@ -740,7 +879,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded gauge: {} = {}", name, value);
@@ -760,7 +899,7 @@ impl TelemetrySystem {
 
         {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            metrics.push(metric);
+            push_bounded(&mut metrics, metric, MAX_BUFFERED_METRICS, &self.dropped);
         }
 
         debug!("Recorded histogram: {} = {:?}", name, duration);
@@ -779,10 +918,16 @@ impl TelemetrySystem {
 
         {
             let mut events = self.events_buffer.lock().unwrap();
-            events.push(event);
+            push_bounded(&mut events, event, MAX_BUFFERED_EVENTS, &self.dropped);
         }
 
         debug!("Recorded event: {} ({})", name, category);
+    }
+
+    /// How many buffered points were dropped since the last export because a
+    /// buffer was full.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Get system uptime
@@ -823,16 +968,17 @@ impl TelemetrySystem {
 
         let metrics = {
             let mut metrics = self.metrics_buffer.lock().unwrap();
-            let buffered_metrics = metrics.clone();
-            metrics.clear();
+            let mut buffered_metrics = std::mem::take(&mut *metrics);
+            let dropped = self.dropped.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                buffered_metrics.push(dropped_metric(dropped));
+            }
             buffered_metrics
         };
 
         let events = {
             let mut events = self.events_buffer.lock().unwrap();
-            let buffered_events = events.clone();
-            events.clear();
-            buffered_events
+            std::mem::take(&mut *events)
         };
 
         // Export to all configured exporters
@@ -970,6 +1116,286 @@ mod tests {
         telemetry.record_histogram("test_histogram", Duration::from_millis(100));
 
         assert_eq!(telemetry.get_buffered_metrics_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_metrics_buffer_drops_the_oldest_points_and_counts_them() {
+        let telemetry = TelemetrySystem::new();
+        for n in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_gauge("g", n as f64, vec![]);
+        }
+        let kept = MAX_BUFFERED_METRICS - MAX_BUFFERED_METRICS / 10 + 1;
+        assert_eq!(telemetry.get_buffered_metrics_count(), kept);
+        assert_eq!(
+            telemetry.dropped_count(),
+            (MAX_BUFFERED_METRICS / 10) as u64
+        );
+        let buffer = telemetry.metrics_buffer.lock().unwrap();
+        assert_eq!(buffer[0].value, (MAX_BUFFERED_METRICS / 10) as f64);
+        assert_eq!(buffer[kept - 1].value, MAX_BUFFERED_METRICS as f64);
+    }
+
+    #[tokio::test]
+    async fn a_full_events_buffer_drops_the_oldest_events_and_counts_them() {
+        let telemetry = TelemetrySystem::new();
+        for n in 0..=MAX_BUFFERED_EVENTS {
+            telemetry.record_event("e", "c", serde_json::json!({ "n": n }));
+        }
+        let events = telemetry.events_buffer.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            MAX_BUFFERED_EVENTS - MAX_BUFFERED_EVENTS / 10 + 1
+        );
+        assert_eq!(events[0].data["n"], MAX_BUFFERED_EVENTS / 10);
+        assert_eq!(telemetry.dropped_count(), (MAX_BUFFERED_EVENTS / 10) as u64);
+    }
+
+    #[tokio::test]
+    async fn counters_and_histograms_are_bounded_too() {
+        let telemetry = TelemetrySystem::new();
+        for _ in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_counter("c", 1.0, vec![]);
+            telemetry.record_histogram("h", Duration::from_millis(1));
+        }
+        assert!(telemetry.get_buffered_metrics_count() <= MAX_BUFFERED_METRICS);
+        assert!(telemetry.dropped_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn exporting_reports_the_drops_once_and_resets_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 30)));
+        for n in 0..=MAX_BUFFERED_METRICS {
+            telemetry.record_gauge("g", n as f64, vec![]);
+        }
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.dropped_count(), 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nanna_telemetry_dropped_total"));
+        telemetry.record_gauge("g", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(again.matches("nanna_telemetry_dropped_total").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_small_buffer_is_untouched_and_no_drop_metric_is_exported() {
+        let telemetry = TelemetrySystem::new();
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.record_event("e", "c", serde_json::json!({}));
+        assert_eq!(telemetry.get_buffered_metrics_count(), 1);
+        assert_eq!(telemetry.dropped_count(), 0);
+        telemetry.export_all().await.unwrap();
+        assert_eq!(telemetry.get_buffered_metrics_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_exporter_writes_metrics_and_events_and_rotates_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("telemetry.jsonl");
+        let rotated = dir.path().join("nested").join("telemetry.jsonl.1");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 200)));
+        telemetry.record_counter("c", 1.0, vec![("k", "v")]);
+        telemetry.record_event("e", "cat", serde_json::json!({ "x": 1 }));
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"metric\"") && text.contains("\"event\""));
+        assert!(!rotated.exists());
+        telemetry.record_counter("c2", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        assert!(rotated.exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("c2"));
+        let exporter = JsonlExporter::new(&path, 200);
+        assert!(exporter.export_traces(vec![]).await.is_ok());
+        assert!(exporter.health_check().await.unwrap());
+        let system = crate::monitoring::SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: HashMap::new(),
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: 0,
+                misses: 0,
+                hit_rate: 0.0,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 0.0,
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                memory_usage_percent: 0.0,
+                available_disk_bytes: 0,
+                total_disk_bytes: 0,
+                disk_usage_percent: 0.0,
+                load_average: [0.0, 0.0, 0.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate: 0.0,
+                recent_errors: Vec::new(),
+            },
+        };
+        assert!(exporter.export_system_metrics(system).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_exporter_reports_an_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let exporter = JsonlExporter::new(blocker.join("telemetry.jsonl"), 1024);
+        let events = vec![CustomEvent {
+            name: "e".to_string(),
+            timestamp: Utc::now(),
+            category: "c".to_string(),
+            attributes: HashMap::new(),
+            data: serde_json::json!({}),
+            trace_context: None,
+        }];
+        assert!(matches!(
+            exporter.export_events(events).await,
+            Err(TelemetryError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_jsonl_file_is_created_private_and_a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 20)));
+        telemetry.record_counter("c", 1.0, vec![]);
+        telemetry.export_all().await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("elsewhere.txt");
+            std::fs::write(&target, b"keep").unwrap();
+            let link = dir.path().join("linked.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let linked =
+                TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&link, 1 << 20)));
+            linked.record_counter("c", 1.0, vec![]);
+            let refused = linked.export_all().await;
+            assert!(matches!(refused, Err(TelemetryError::Io(_))));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+            let dangling = dir.path().join("dangling.jsonl");
+            std::os::unix::fs::symlink(dir.path().join("created-through-link"), &dangling).unwrap();
+            let through = JsonlExporter::new(&dangling, 1 << 20);
+            let line = vec!["{}".to_string()];
+            assert!(through.append(line).is_err());
+            assert!(!dir.path().join("created-through-link").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_file_is_tightened_to_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        exporter.append(vec!["{}".to_string()]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n{}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_never_widened_and_the_open_flags_are_all_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        exporter.append(vec!["{}".to_string()]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o200);
+        for flag in [libc::O_NOFOLLOW, libc::O_NONBLOCK, libc::O_NOCTTY] {
+            assert_eq!(OPEN_FLAGS & flag, flag);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let exporter = JsonlExporter::new(&path, 1 << 20);
+        let line = || vec!["{}".to_string()];
+        assert!(exporter.append(line()).is_err());
+        let mut reader = std::fs::OpenOptions::new();
+        reader.read(true).custom_flags(libc::O_NONBLOCK);
+        let _held = reader.open(&path).unwrap();
+        let refused = exporter.append(line());
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn events_are_drained_by_each_export_and_never_written_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry =
+            TelemetrySystem::new().add_exporter(Box::new(JsonlExporter::new(&path, 1 << 20)));
+        telemetry.record_event("only-once", "c", serde_json::json!({}));
+        telemetry.export_all().await.unwrap();
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("only-once").count(), 1);
+        assert!(telemetry.events_buffer.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_size_cap_is_enforced_per_line_not_per_batch_and_no_line_is_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let rotated = dir.path().join("telemetry.jsonl.1");
+        let exporter = JsonlExporter::new(&path, 600);
+        let events: Vec<CustomEvent> = (0..40)
+            .map(|n| CustomEvent {
+                name: format!("event-{n}"),
+                timestamp: Utc::now(),
+                category: "c".to_string(),
+                attributes: HashMap::new(),
+                data: serde_json::json!({ "n": n }),
+                trace_context: None,
+            })
+            .collect();
+        exporter.export_events(events).await.unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        let previous = std::fs::read_to_string(&rotated).unwrap();
+        let within_cap = current.len() < 600 + 400 && previous.len() < 600 + 400;
+        assert!(within_cap, "a file overshot its cap by a whole batch");
+        for text in [&current, &previous] {
+            assert!(text.ends_with('\n'));
+            for line in text.lines() {
+                let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(parsed.get("event").is_some());
+            }
+        }
+        assert!(current.contains("event-39"));
     }
 
     #[tokio::test]

@@ -1,17 +1,103 @@
+use crate::apprun::{
+    register_app_tools, stop_app, AppContext, AppSpec, Limits, PortAllocator, RunningApps,
+    DEFAULT_POLL_INTERVAL,
+};
+use crate::budget::{CostAccountant, InMemoryBudgetStore};
 use crate::container::{
-    start_container_with_fallback, ContainerConfig, ContainerError, ContainerHandle, NetworkPolicy,
+    cleanup_container, start_container_with_fallback, ContainerConfig, ContainerError,
+    ContainerHandle, NetworkPolicy, ReadOnlyMount,
 };
 use crate::identity::AgentIdentity;
+use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
+use crate::onboarding::OnboardingError;
+use crate::policy::RepoPolicy;
+use crate::protected::{
+    AuditHook, NoopAuditHook, ProtectedConfigError, ProtectedExtras, ProtectedPathViolation,
+    ProtectedPaths,
+};
+use crate::qa::{
+    persist_qa_artifacts, register_qa_tools, trunk_asset_roots, BrowserDriver, ChromiumDriver,
+    ContainerProbe, HttpProbe, Manifest, ProcessSpawner, QaContext, QaLedger, QaSummary,
+    ARTIFACT_DIR, DEFAULT_POLL, DEFAULT_WAIT, QA_DIR,
+};
 use crate::scope::ScopeError;
+use crate::sidecar::{CommandRunner, SidecarSet, SystemRunner};
 use crate::tools::{
-    create_container_tool_registry, create_container_tool_registry_for, create_tool_registry,
-    create_tool_registry_for, ToolRegistry, CONTAINER_WORKSPACE_DIR,
+    create_container_tool_registry_for_guarded, create_container_tool_registry_guarded,
+    create_tool_registry_for_guarded, create_tool_registry_guarded, ToolRegistry,
+    CONTAINER_WORKSPACE_DIR,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::warn;
+
+const DEV_CONTAINER_CONFIG: &str = include_str!("../dev-container.toml");
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevContainerConfig {
+    cargo_home: String,
+    tmp_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevContainerPaths {
+    pub cargo_home: String,
+    pub tmp_dir: String,
+}
+
+fn require_posix_absolute(key: &str, value: &str) -> Result<(), WorkspaceError> {
+    if !value.starts_with('/') {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "{key} must be an absolute path, got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_dev_container(src: &str) -> Result<DevContainerPaths, WorkspaceError> {
+    let config: DevContainerConfig = toml::from_str(src)
+        .map_err(|e| WorkspaceError::InvalidDevContainerConfig(e.to_string()))?;
+    require_posix_absolute("cargo_home", &config.cargo_home)?;
+    require_posix_absolute("tmp_dir", &config.tmp_dir)?;
+    if config.tmp_dir.ends_with('/') {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "tmp_dir must name a directory below the root without a trailing slash, got {:?}",
+            config.tmp_dir
+        )));
+    }
+    let inside = config.cargo_home == config.tmp_dir
+        || config
+            .cargo_home
+            .strip_prefix(config.tmp_dir.as_str())
+            .is_some_and(|rest| rest.starts_with('/'));
+    if !inside {
+        return Err(WorkspaceError::InvalidDevContainerConfig(format!(
+            "cargo_home {:?} must be inside tmp_dir {:?}",
+            config.cargo_home, config.tmp_dir
+        )));
+    }
+    Ok(DevContainerPaths {
+        cargo_home: config.cargo_home,
+        tmp_dir: config.tmp_dir,
+    })
+}
+
+/// Paths inside the dev container that the harness makes writable, read from
+/// the shared `harness/dev-container.toml`.
+///
+/// ```
+/// let paths = harness::workspace::dev_container_paths().unwrap();
+/// assert_eq!(paths.cargo_home, "/tmp/cargo");
+/// assert_eq!(paths.tmp_dir, "/tmp");
+/// assert!(paths.cargo_home.starts_with(&paths.tmp_dir));
+/// ```
+pub fn dev_container_paths() -> Result<DevContainerPaths, WorkspaceError> {
+    parse_dev_container(DEV_CONTAINER_CONFIG)
+}
 
 #[derive(Error, Debug)]
 pub enum WorkspaceError {
@@ -27,8 +113,31 @@ pub enum WorkspaceError {
     FormatPatchFailed(String),
     #[error("Container setup failed: {0}")]
     ContainerSetupFailed(String),
+    #[error("Invalid harness/dev-container.toml: {0}")]
+    InvalidDevContainerConfig(String),
+    #[error("Refusing to produce a patch: {0}")]
+    ProtectedPath(ProtectedPathViolation),
+    #[error("Refusing to start the task: {0}")]
+    ProtectedConfig(#[from] ProtectedConfigError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn default_artifact_store() -> PathBuf {
+    std::env::temp_dir().join("nanna-task-artifacts")
+}
+
+fn sanitize_task_dir(task_id: &str) -> String {
+    task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn git_cmd(cwd: &Path) -> Command {
@@ -49,16 +158,66 @@ fn git_cmd(cwd: &Path) -> Command {
     cmd
 }
 
+/// The `-v` argument that mounts the worktree at [`CONTAINER_WORKSPACE_DIR`].
+/// The `:z` option relabels the directory for SELinux hosts (where the
+/// container could otherwise only read it) and is ignored elsewhere.
+pub fn worktree_mount_arg(workspace_path: &Path) -> String {
+    format!(
+        "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+        workspace_path.display()
+    )
+}
+
+/// What the full-stack profile tells the app and QA tools about a worktree.
+struct FullStackApp {
+    profile: FullStackRust,
+    spec: AppSpec,
+    asset_roots: Vec<String>,
+}
+
+fn detect_full_stack(workspace_path: &Path) -> Result<Option<FullStackApp>, OnboardingError> {
+    let Some(profile) = FullStackRust::detect(workspace_path)? else {
+        return Ok(None);
+    };
+    let spec = AppSpec::from_profile(&profile, workspace_path, CONTAINER_WORKSPACE_DIR)?;
+    let asset_roots = trunk_asset_roots(&workspace_path.join(&profile.frontend.path))?;
+    Ok(Some(FullStackApp {
+        profile,
+        spec,
+        asset_roots,
+    }))
+}
+
 pub struct TaskWorkspace {
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
     pub task_id: String,
     container_handle: Option<Arc<crate::container::ContainerHandle>>,
+    sidecars: Option<SidecarSet>,
+    apps: Arc<RunningApps>,
+    port_allocator: Arc<PortAllocator>,
+    app_runner: Arc<dyn CommandRunner>,
+    app_limits: Limits,
+    extra_app_env: Vec<(String, String)>,
+    qa_probe: Option<Arc<dyn HttpProbe>>,
+    qa_driver: Option<Arc<dyn BrowserDriver>>,
+    qa_ledger: Arc<QaLedger>,
+    artifact_store: PathBuf,
     cleaned_up: bool,
+    protected: ProtectedPaths,
+    audit: Arc<dyn AuditHook>,
+    placeholders: Vec<PathBuf>,
+    cost_accountant: Option<Arc<CostAccountant>>,
+    ci_client: Option<Arc<dyn crate::backlog::GithubActionsClient>>,
+    sandboxes: Arc<crate::sandbox_tools::SandboxRegistry>,
+    sandbox_target: Option<Arc<dyn crate::sandbox_tools::SandboxTarget>>,
+    sandbox_pr: Option<u64>,
 }
 
 impl TaskWorkspace {
     pub fn create(source_repo: &Path, task_id: &str, branch: &str) -> Result<Self, WorkspaceError> {
+        let extras = ProtectedExtras::load(source_repo)?;
+        let policy = RepoPolicy::load(source_repo)?;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -72,13 +231,82 @@ impl TaskWorkspace {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
+        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = protected.with_policy(policy);
         Ok(Self {
             workspace_path,
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: None,
+            sidecars: None,
+            apps: Arc::new(RunningApps::new()),
+            port_allocator: PortAllocator::shared(),
+            app_runner: Arc::new(SystemRunner),
+            app_limits: Limits::default(),
+            extra_app_env: Vec::new(),
+            qa_probe: None,
+            qa_driver: None,
+            qa_ledger: Arc::new(QaLedger::new()),
+            artifact_store: default_artifact_store(),
             cleaned_up: false,
+            protected,
+            audit: Arc::new(NoopAuditHook),
+            placeholders: Vec::new(),
+            cost_accountant: None,
+            ci_client: None,
+            sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
         })
+    }
+
+    pub fn set_cost_accountant(&mut self, accountant: Arc<CostAccountant>) {
+        self.cost_accountant = Some(accountant);
+    }
+
+    pub fn set_sandbox_target(&mut self, target: Arc<dyn crate::sandbox_tools::SandboxTarget>) {
+        self.sandbox_target = Some(target);
+    }
+
+    pub fn set_sandbox_pr(&mut self, pr: u64) {
+        self.sandbox_pr = Some(pr);
+    }
+
+    pub fn bind_sandbox_pr(&mut self, subject: &crate::tools::ActionSubject) {
+        if let Some(pr) = subject.pr {
+            self.sandbox_pr = Some(pr);
+        }
+    }
+
+    pub fn sandbox_pr(&self) -> Option<u64> {
+        self.sandbox_pr
+    }
+
+    pub fn sandboxes(&self) -> Arc<crate::sandbox_tools::SandboxRegistry> {
+        Arc::clone(&self.sandboxes)
+    }
+
+    pub(crate) fn set_ci_client(&mut self, client: Arc<dyn crate::backlog::GithubActionsClient>) {
+        self.ci_client = Some(client);
+    }
+
+    pub(crate) fn budget_accountant(&self) -> Arc<CostAccountant> {
+        self.cost_accountant.clone().unwrap_or_else(|| {
+            Arc::new(CostAccountant::deny_all(Arc::new(
+                InMemoryBudgetStore::new(),
+            )))
+        })
+    }
+
+    /// Deliver protected-path violations to `hook` instead of dropping them.
+    pub fn with_audit_hook(mut self, hook: Arc<dyn AuditHook>) -> Self {
+        self.audit = hook;
+        self
+    }
+
+    /// The protected set this workspace enforces on patches and mounts.
+    pub fn protected(&self) -> &ProtectedPaths {
+        &self.protected
     }
 
     pub async fn create_with_container(
@@ -87,9 +315,14 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
     ) -> Result<Self, WorkspaceError> {
-        let network = NetworkPolicy::Enabled;
-        Self::create_with_container_networked(source_repo, task_id, branch, image_ref, network)
-            .await
+        Self::create_with_container_networked(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            NetworkPolicy::Enabled,
+        )
+        .await
     }
 
     /// Like [`TaskWorkspace::create_with_container`], with the dev
@@ -102,12 +335,36 @@ impl TaskWorkspace {
         image_ref: &str,
         network: NetworkPolicy,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_container_and_sidecars(
+            source_repo,
+            task_id,
+            branch,
+            image_ref,
+            network,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_with_container_networked`], but the dev container
+    /// joins the network of an already started [`SidecarSet`] and receives
+    /// the environment the sidecars export (for example `DATABASE_URL`). The
+    /// workspace owns the set and tears it down in [`Self::cleanup`].
+    pub async fn create_with_container_and_sidecars(
+        source_repo: &Path,
+        task_id: &str,
+        branch: &str,
+        image_ref: &str,
+        network: NetworkPolicy,
+        sidecars: Option<SidecarSet>,
+    ) -> Result<Self, WorkspaceError> {
         Self::create_with_container_using(
             source_repo,
             task_id,
             branch,
             image_ref,
             network,
+            sidecars,
             |config: ContainerConfig| async move { start_container_with_fallback(&config).await },
         )
         .await
@@ -125,6 +382,7 @@ impl TaskWorkspace {
         branch: &str,
         image_ref: &str,
         network: NetworkPolicy,
+        sidecars: Option<SidecarSet>,
         start_fn: F,
     ) -> Result<Self, WorkspaceError>
     where
@@ -137,6 +395,9 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
+        let extras = ProtectedExtras::load(source_repo)?;
+        let policy = RepoPolicy::load(source_repo)?;
+        let tmp_dir = dev_container_paths()?.tmp_dir;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
             .args([
@@ -163,10 +424,26 @@ impl TaskWorkspace {
         };
 
         let container_name = format!("nanna-task-{}", task_id);
-        let additional_args = vec![format!(
-            "-v={}:{CONTAINER_WORKSPACE_DIR}",
-            workspace_path.display()
-        )];
+        let mut additional_args = vec![
+            worktree_mount_arg(&workspace_path),
+            format!("--tmpfs={tmp_dir}:rw,mode=1777"),
+        ];
+        let mut env_vars = vec![];
+        if let Some(set) = &sidecars {
+            additional_args.extend(set.container_args());
+            env_vars.extend(set.exports().iter().cloned());
+        }
+        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = protected.with_policy(policy);
+        let shielded = match protected_mounts(&protected, &workspace_path) {
+            Ok(shielded) => shielded,
+            Err(e) => {
+                cleanup_worktree();
+                return Err(WorkspaceError::ContainerSetupFailed(e.to_string()));
+            }
+        };
+        let read_only_mounts = shielded.mounts;
+        let placeholders = shielded.placeholders;
 
         let config = ContainerConfig {
             base_image: image_ref.to_string(),
@@ -176,9 +453,10 @@ impl TaskWorkspace {
             model_to_pull: None,
             startup_timeout: Duration::from_secs(30),
             health_check_timeout: Duration::from_secs(10),
-            env_vars: vec![],
+            env_vars,
             additional_args,
             network,
+            read_only_mounts,
         };
 
         let handle = match start_fn(config).await {
@@ -194,22 +472,240 @@ impl TaskWorkspace {
             source_repo: source_repo.to_path_buf(),
             task_id: task_id.to_string(),
             container_handle: Some(Arc::new(handle)),
+            sidecars,
+            apps: Arc::new(RunningApps::new()),
+            port_allocator: PortAllocator::shared(),
+            app_runner: Arc::new(SystemRunner),
+            app_limits: Limits::default(),
+            extra_app_env: Vec::new(),
+            qa_probe: None,
+            qa_driver: None,
+            qa_ledger: Arc::new(QaLedger::new()),
+            artifact_store: default_artifact_store(),
             cleaned_up: false,
+            protected,
+            audit: Arc::new(NoopAuditHook),
+            placeholders,
+            cost_accountant: None,
+            ci_client: None,
+            sandboxes: Arc::new(crate::sandbox_tools::SandboxRegistry::new()),
+            sandbox_target: None,
+            sandbox_pr: None,
         })
     }
 
+    /// Environment the sidecars export into the dev container, empty when
+    /// the workspace has no sidecars.
+    pub fn sidecar_env(&self) -> &[(String, String)] {
+        self.sidecars.as_ref().map_or(&[], |s| s.exports())
+    }
+
+    /// Extra environment for the application process, exported after the
+    /// sidecar variables (a repository hook such as `FIXTURE_BREAK_ROUTE=1`).
+    /// Call before [`Self::build_tool_registry`]: it bakes the environment
+    /// into the tool context it returns, so a later call here has no effect
+    /// on a registry already built.
+    pub fn set_app_env(&mut self, env: Vec<(String, String)>) {
+        self.extra_app_env = env;
+    }
+
+    /// The application environment: sidecar exports, then the extra
+    /// variables from [`TaskWorkspace::set_app_env`].
+    pub fn app_env(&self) -> Vec<(String, String)> {
+        let mut env = self.sidecar_env().to_vec();
+        env.extend(self.extra_app_env.iter().cloned());
+        env
+    }
+
+    /// Probe the `qa_endpoints` tool requests with (a stub in tests);
+    /// default: `curl` inside the dev container. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_qa_probe(&mut self, probe: Arc<dyn HttpProbe>) {
+        self.qa_probe = Some(probe);
+    }
+
+    /// Browser the `qa_browser` tool drives (a stub in tests); default:
+    /// headless Chromium inside the dev container. Like
+    /// [`Self::set_app_env`], call before [`Self::build_tool_registry`].
+    pub fn set_qa_driver(&mut self, driver: Arc<dyn BrowserDriver>) {
+        self.qa_driver = Some(driver);
+    }
+
+    /// Totals of the QA the task's tools have run so far.
+    pub fn qa_summary(&self) -> QaSummary {
+        self.qa_ledger.snapshot()
+    }
+
+    /// Directory under which each task's QA evidence is kept after the
+    /// worktree is removed; default `<temp>/nanna-task-artifacts`.
+    pub fn set_artifact_store(&mut self, root: PathBuf) {
+        self.artifact_store = root;
+    }
+
+    /// Where this task's QA evidence lives once persisted:
+    /// `<artifact store>/<task id>/qa`.
+    pub fn persisted_qa_dir(&self) -> PathBuf {
+        self.artifact_store
+            .join(sanitize_task_dir(&self.task_id))
+            .join(QA_DIR)
+    }
+
+    /// Copy the QA evidence out of the worktree into the task-scoped
+    /// artifact store and return the QA totals with artifact paths pointing
+    /// at the copies. Call before [`Self::cleanup`], which deletes the
+    /// worktree. When the copy fails the error is logged and the totals keep
+    /// their worktree paths.
+    pub fn persist_qa_summary(&self) -> QaSummary {
+        let summary = self.qa_summary();
+        if summary.artifacts.is_empty() {
+            return summary;
+        }
+        let dest = self.persisted_qa_dir();
+        match persist_qa_artifacts(&self.workspace_path, &dest) {
+            Ok(Some(_)) => summary
+                .rebase_artifacts(&self.workspace_path.join(ARTIFACT_DIR).join(QA_DIR), &dest),
+            Ok(None) => summary,
+            Err(e) => {
+                warn!(
+                    "task {}: could not persist QA artifacts to {}: {e}",
+                    self.task_id,
+                    dest.display()
+                );
+                summary
+            }
+        }
+    }
+
+    /// Limits for the app tools; `None` restores the defaults.
+    pub fn set_app_limits(&mut self, limits: Option<Limits>) {
+        self.app_limits = limits.unwrap_or_default();
+    }
+
+    pub fn app_limits(&self) -> Limits {
+        self.app_limits
+    }
+
+    /// Runner the app tools use for container commands (a stub in tests).
+    pub fn set_app_runner(&mut self, runner: Arc<dyn CommandRunner>) {
+        self.app_runner = runner;
+    }
+
+    /// Allocator the app tools take the backend port from.
+    pub fn set_port_allocator(&mut self, allocator: Arc<PortAllocator>) {
+        self.port_allocator = allocator;
+    }
+
+    /// Applications started for this task, shared with its tool registries.
+    pub fn running_apps(&self) -> Arc<RunningApps> {
+        Arc::clone(&self.apps)
+    }
+
+    /// App tool context when the workspace runs in a container and holds a
+    /// full-stack Rust workspace; `None` otherwise. A profile that cannot be
+    /// read is logged and treated as absent so the remaining tools still
+    /// register.
+    fn app_context(&self) -> Option<(FullStackApp, AppContext)> {
+        let handle = self.container_handle.as_ref()?;
+        let app = match detect_full_stack(&self.workspace_path) {
+            Ok(Some(app)) => app,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(
+                    "task {}: full-stack profile unreadable, app tools skipped: {e}",
+                    self.task_id
+                );
+                return None;
+            }
+        };
+        let ctx = AppContext {
+            task_id: self.task_id.clone(),
+            handle: Arc::clone(handle),
+            runner: Arc::clone(&self.app_runner),
+            apps: Arc::clone(&self.apps),
+            ports: Arc::clone(&self.port_allocator),
+            spec: app.spec.clone(),
+            env: self.app_env(),
+            limits: self.app_limits,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+        };
+        Some((app, ctx))
+    }
+
+    /// QA tool context next to the app tools: the repository manifest (or
+    /// one derived from the profile), the injected or container-backed
+    /// probe and browser, and the shared ledger.
+    fn qa_context(&self, app: &FullStackApp, ctx: &AppContext) -> QaContext {
+        let handle = Arc::clone(&ctx.handle);
+        let runner = Arc::clone(&ctx.runner);
+        let probe: Arc<dyn HttpProbe> = match &self.qa_probe {
+            Some(probe) => Arc::clone(probe),
+            None => Arc::new(ContainerProbe::new(Arc::clone(&handle), runner)),
+        };
+        let driver: Arc<dyn BrowserDriver> = match &self.qa_driver {
+            Some(driver) => Arc::clone(driver),
+            None => Arc::new(ChromiumDriver::new(handle, Arc::new(ProcessSpawner))),
+        };
+        QaContext {
+            task_id: self.task_id.clone(),
+            apps: Arc::clone(&self.apps),
+            workspace_root: self.workspace_path.clone(),
+            manifest_path: self.workspace_path.join(CHECKS_FILE),
+            derived: Manifest::derived(app.profile.health_path(), &app.asset_roots),
+            probe,
+            driver,
+            ledger: Arc::clone(&self.qa_ledger),
+            wait: DEFAULT_WAIT,
+            poll: DEFAULT_POLL,
+        }
+    }
+
+    fn stop_forgotten_app(&self, handle: &ContainerHandle) {
+        let stopped = stop_app(self.app_runner.as_ref(), handle, &self.apps, &self.task_id);
+        match stopped {
+            Ok(Some(app)) => warn!(
+                "task {}: app pid {} was still running at cleanup",
+                self.task_id, app.instance.pid
+            ),
+            Ok(None) => {}
+            Err(e) => warn!("task {}: could not stop app at cleanup: {e}", self.task_id),
+        }
+    }
+
+    /// Remove the worktree, the dev container and any sidecars, stopping
+    /// the application first if the agent left it running.
+    ///
+    /// The dev container is removed explicitly rather than through the last
+    /// `Arc<ContainerHandle>` drop, because tool registries built from this
+    /// workspace keep their own reference to the handle and may outlive it;
+    /// the sidecar network can only be removed once the container has left it.
     pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
         if self.cleaned_up {
             return Ok(());
         }
-        drop(self.container_handle.take());
+        if let Some(target) = &self.sandbox_target {
+            crate::sandbox_tools::teardown_forgotten(
+                target,
+                &self.sandboxes,
+                &self.budget_accountant(),
+                &self.task_id,
+                crate::scope::UNSCOPED_IDENTITY,
+            );
+        }
+        if let Some(handle) = self.container_handle.take() {
+            self.stop_forgotten_app(&handle);
+            if handle.needs_cleanup {
+                if let Err(e) = cleanup_container(&handle) {
+                    warn!(
+                        "dev container cleanup for task {} failed: {e}",
+                        self.task_id
+                    );
+                }
+            }
+        }
+        drop(self.sidecars.take());
         let output = git_cmd(&self.source_repo)
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                self.workspace_path.to_str().expect("non-UTF8 path"),
-            ])
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.workspace_path)
             .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -223,37 +719,93 @@ impl TaskWorkspace {
     /// when a container handle is present, plain otherwise.
     pub fn build_tool_registry(&self) -> ToolRegistry {
         if let Some(handle) = &self.container_handle {
-            create_container_tool_registry(
+            let mut registry = create_container_tool_registry_guarded(
                 &self.workspace_path,
                 Arc::clone(handle),
                 CONTAINER_WORKSPACE_DIR,
-            )
+                self.protected.clone(),
+            );
+            if let Some((app, ctx)) = self.app_context() {
+                register_qa_tools(&mut registry, self.qa_context(&app, &ctx));
+                register_app_tools(&mut registry, ctx);
+            }
+            registry
         } else {
-            create_tool_registry(&self.workspace_path)
+            create_tool_registry_guarded(&self.workspace_path, self.protected.clone())
         }
     }
 
     /// The registry for this workspace restricted to `identity`: only tools
     /// in `scope.tools` at or below `scope.max_effect`, with file tools
     /// confined to `scope.paths` / `scope.read_paths`. `run_command` is
-    /// present only with a container and a ceiling of at least `workspace`.
+    /// present only with a container, a ceiling of at least `workspace` and
+    /// an identity that does not restrict paths (see
+    /// [`AgentIdentity::restricts_paths`]).
     pub fn build_tool_registry_for(
         &self,
         identity: &AgentIdentity,
     ) -> Result<ToolRegistry, ScopeError> {
         let root = &self.workspace_path;
-        match &self.container_handle {
+        let mut registry = match &self.container_handle {
             Some(handle) => {
                 let handle = Arc::clone(handle);
-                create_container_tool_registry_for(root, handle, CONTAINER_WORKSPACE_DIR, identity)
+                create_container_tool_registry_for_guarded(
+                    root,
+                    handle,
+                    CONTAINER_WORKSPACE_DIR,
+                    identity,
+                    self.protected.clone(),
+                )
             }
-            None => create_tool_registry_for(root, identity),
+            None => create_tool_registry_for_guarded(root, identity, self.protected.clone()),
+        }?;
+        let context = crate::ci_tools::CiContext {
+            accountant: self.budget_accountant(),
+            task_id: self.task_id.clone(),
+        };
+        match &self.ci_client {
+            Some(client) => crate::ci_tools::register_with_client(
+                &mut registry,
+                root,
+                identity,
+                context,
+                Arc::clone(client),
+            ),
+            None => crate::ci_tools::register(&mut registry, root, identity, context),
         }
+        if let Some(target) = &self.sandbox_target {
+            let pr_binding = registry.pr_binding();
+            crate::sandbox_tools::register(
+                &mut registry,
+                root,
+                identity,
+                crate::sandbox_tools::SandboxContext {
+                    target: Arc::clone(target),
+                    probe: Arc::new(crate::sandbox_tools::HostHttpProbe::new(Arc::new(
+                        crate::sidecar::SystemRunner,
+                    ))),
+                    sandboxes: Arc::clone(&self.sandboxes),
+                    accountant: self.budget_accountant(),
+                    task_id: self.task_id.clone(),
+                    pr_binding,
+                },
+            );
+        }
+        Ok(registry.scoped_for(identity))
     }
 
+    /// Stage every change except the harness artefacts under
+    /// [`ARTIFACT_DIR`], which are evidence for the task result, not part
+    /// of the patch.
     fn stage_all(&self) -> Result<(), WorkspaceError> {
+        let exclude = format!(":(exclude){ARTIFACT_DIR}");
+        let excludes = self
+            .placeholders
+            .iter()
+            .map(|path| format!(":(exclude,literal){}", path.display()));
         let add_output = git_cmd(&self.workspace_path)
-            .args(["add", "--all"])
+            .args(["add", "--all", "--", ".", &exclude])
+            .args(excludes)
             .output()?;
         if !add_output.status.success() {
             let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
@@ -262,8 +814,60 @@ impl TaskWorkspace {
         Ok(())
     }
 
+    /// The worktree-relative paths staged for the patch, sorted, with
+    /// renames reported as a deletion and an addition.
+    pub fn changed_paths(&self) -> Result<Vec<String>, WorkspaceError> {
+        let output = git_cmd(&self.workspace_path)
+            .args([
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "HEAD",
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(WorkspaceError::ExtractChangesFailed(stderr));
+        }
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let mut paths: Vec<String> = listing
+            .split(' ')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn refuse_protected_changes(&self) -> Result<(), WorkspaceError> {
+        for path in self.changed_paths()? {
+            let violation = self
+                .protected
+                .check(Path::new(&path))
+                .err()
+                .or_else(|| self.hardlink_violation(&path));
+            if let Some(violation) = violation {
+                self.audit
+                    .on_protected_path_violation(&self.task_id, &violation);
+                return Err(WorkspaceError::ProtectedPath(violation));
+            }
+        }
+        Ok(())
+    }
+
+    fn hardlink_violation(&self, path: &str) -> Option<ProtectedPathViolation> {
+        let metadata = std::fs::symlink_metadata(self.workspace_path.join(path)).ok()?;
+        crate::protected::is_hardlinked(&metadata)
+            .then(|| crate::protected::hardlink_violation(Path::new(path)))
+    }
+
+    /// The staged diff against `HEAD`, refused with
+    /// [`WorkspaceError::ProtectedPath`] when it touches a protected path.
     pub fn extract_changes(&self) -> Result<String, WorkspaceError> {
         self.stage_all()?;
+        self.refuse_protected_changes()?;
         let output = git_cmd(&self.workspace_path)
             .args(["diff", "--cached", "HEAD"])
             .output()?;
@@ -274,8 +878,12 @@ impl TaskWorkspace {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// The staged changes as an apply-ready patch, `None` when there are
+    /// none, and refused with [`WorkspaceError::ProtectedPath`] before
+    /// anything is committed when they touch a protected path.
     pub fn format_patch(&self) -> Result<Option<String>, WorkspaceError> {
         self.stage_all()?;
+        self.refuse_protected_changes()?;
 
         let check_output = git_cmd(&self.workspace_path)
             .args(["diff", "--cached", "--quiet"])
@@ -317,6 +925,67 @@ impl TaskWorkspace {
             Ok(Some(patch))
         }
     }
+}
+
+/// The read-only mounts that shield every protected root of a worktree, and
+/// the empty files created so those roots exist to be mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedMounts {
+    /// One read-only bind mount per protected root.
+    pub mounts: Vec<ReadOnlyMount>,
+    /// Worktree-relative files that did not exist and were created empty
+    /// as mount points; they are excluded from the staged patch.
+    pub placeholders: Vec<PathBuf>,
+}
+
+/// Make every protected root of `workspace_path` exist, then mount each
+/// read-only, so a shell in the container cannot create or change anything
+/// under it even when the root was absent when the container started.
+/// Missing directory roots are created empty; missing file roots are
+/// created as empty placeholder files and reported in
+/// [`ProtectedMounts::placeholders`].
+///
+/// ```
+/// use harness::protected::ProtectedPaths;
+/// use harness::workspace::protected_mounts;
+///
+/// let workspace = tempfile::tempdir().unwrap();
+/// let protected = ProtectedPaths::with_config_dir(workspace.path(), None);
+/// let shielded = protected_mounts(&protected, workspace.path()).unwrap();
+/// assert!(workspace.path().join(".nanna").is_dir());
+/// assert!(workspace.path().join("codecov.yml").is_file());
+/// assert!(shielded.placeholders.iter().any(|p| p.ends_with("codecov.yml")));
+/// assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
+/// ```
+pub fn protected_mounts(
+    protected: &ProtectedPaths,
+    workspace_path: &Path,
+) -> Result<ProtectedMounts, WorkspaceError> {
+    let mut mounts = Vec::new();
+    let mut placeholders = Vec::new();
+    for root in protected.mount_targets() {
+        let host = workspace_path.join(&root.path);
+        if host.symlink_metadata().is_err() {
+            if root.directory {
+                std::fs::create_dir_all(&host)?;
+            } else {
+                if let Some(parent) = host.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&host)?;
+                placeholders.push(root.path.clone());
+            }
+        }
+        let container = PathBuf::from(format!(
+            "{CONTAINER_WORKSPACE_DIR}/{}",
+            crate::scope::denial_path(&root.path)
+        ));
+        mounts.push(ReadOnlyMount::new(host, container));
+    }
+    Ok(ProtectedMounts {
+        mounts,
+        placeholders,
+    })
 }
 
 impl Drop for TaskWorkspace {
@@ -417,6 +1086,389 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_changes_excludes_qa_artifacts() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-artifact-exclude"), "HEAD")
+                .unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna-artifacts/qa")).unwrap();
+        std::fs::write(
+            ws.workspace_path
+                .join(".nanna-artifacts/qa/endpoints-1.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(ws.workspace_path.join("tracked.txt"), "hello").unwrap();
+
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("tracked.txt"), "{diff}");
+        assert!(
+            !diff.contains(".nanna-artifacts"),
+            "QA artefacts must not enter the patch: {diff}"
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn qa_artifacts_survive_worktree_cleanup_and_summary_points_at_the_copies() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-persist"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let artifacts = crate::qa::QaArtifacts::new(&ws.workspace_path);
+        let report_path = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report_path, "{\"ok\":true}").unwrap();
+        let browser = artifacts.next_browser_dir().unwrap();
+        let shot = browser.join("home.png");
+        std::fs::write(&shot, [9u8, 9]).unwrap();
+        ws.qa_ledger.record_endpoints(
+            &crate::qa::ManifestReport {
+                base_url: "http://app".to_string(),
+                checks: vec![],
+                passed: 0,
+                failed: 0,
+            },
+            &report_path,
+        );
+        ws.qa_ledger.record_browser(
+            &crate::qa::BrowserReport {
+                frontend_url: "http://app".to_string(),
+                steps: vec![],
+                passed: true,
+                screenshots: vec![shot.clone()],
+                console_errors: vec![],
+            },
+            &browser.join("report.json"),
+        );
+
+        let summary = ws.persist_qa_summary();
+        let worktree = ws.workspace_path.clone();
+        ws.cleanup().unwrap();
+
+        assert!(!worktree.exists(), "worktree must be gone");
+        assert_eq!(summary.artifacts.len(), 3);
+        let persisted = store.path().join(&ws.task_id).join("qa");
+        assert_eq!(ws.persisted_qa_dir(), persisted);
+        for artifact in &summary.artifacts {
+            assert!(
+                Path::new(artifact).starts_with(&persisted),
+                "{artifact} is not under {}",
+                persisted.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(persisted.join("browser-1/home.png")).unwrap(),
+            [9u8, 9]
+        );
+        assert!(Path::new(&summary.artifacts[0]).exists());
+        assert!(Path::new(&summary.artifacts[2]).exists());
+    }
+
+    fn record_empty_endpoint_report(ws: &mut TaskWorkspace, report_path: &Path) {
+        ws.qa_ledger.record_endpoints(
+            &crate::qa::ManifestReport {
+                base_url: "http://app".to_string(),
+                checks: vec![],
+                passed: 0,
+                failed: 0,
+            },
+            report_path,
+        );
+    }
+
+    fn ci_identity(tools: &str, max_effect: &str) -> AgentIdentity {
+        let src = format!(
+            "[identity]\nname = \"ci-agent\"\ndescription = \"d\"\nloop = \"middle\"\nmodel = \"m\"\nsystem_prompt = {{ inline = \"p\" }}\n\n[scope]\nrepos = [\"github.com/o/n\"]\npaths = [\"**\"]\nmax_effect = \"{max_effect}\"\ntools = [{tools}]\n\n[limits]\nmax_iterations = 10\nmax_wall_clock_secs = 60\nmax_concurrent = 1\n"
+        );
+        AgentIdentity::from_toml_str(&src, "agents/ci-agent.toml").unwrap()
+    }
+
+    fn ci_tool_names(ws: &TaskWorkspace, identity: &AgentIdentity) -> Vec<String> {
+        let registry = ws.build_tool_registry_for(identity).unwrap();
+        let mut names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .filter(|name| name.starts_with("ci_"))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_identity_registry_carries_the_ci_tools_only_for_exact_grants_within_the_ceiling() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-ci"), "HEAD").unwrap();
+        ws.set_cost_accountant(Arc::new(CostAccountant::deny_all(Arc::new(
+            InMemoryBudgetStore::new(),
+        ))));
+        let all = "\"ci_trigger\", \"ci_status\", \"ci_logs\"";
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "ci")),
+            vec!["ci_logs", "ci_status", "ci_trigger"]
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "repository")),
+            vec!["ci_logs", "ci_status"]
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity(all, "workspace")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity("\"ci_*\"", "ci")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ci_tool_names(&ws, &ci_identity("\"ci_status\"", "ci")),
+            vec!["ci_status"]
+        );
+        let registry = ws.build_tool_registry_for(&ci_identity(all, "ci")).unwrap();
+        assert_eq!(registry.identity(), Some("ci-agent"));
+        ws.cleanup().unwrap();
+    }
+
+    fn sandbox_tool_names(ws: &TaskWorkspace, identity: &AgentIdentity) -> Vec<String> {
+        let registry = ws.build_tool_registry_for(identity).unwrap();
+        let mut names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .filter(|name| name.starts_with("sandbox_"))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_sandbox_tools_need_a_target_an_exact_grant_and_a_reaching_ceiling_and_not_a_prebound_pull_request(
+    ) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let both = "\"sandbox_deploy\", \"sandbox_teardown\"";
+        let mut bare =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-bare"), "HEAD").unwrap();
+        assert!(sandbox_tool_names(&bare, &ci_identity(both, "sandbox")).is_empty());
+        bare.cleanup().unwrap();
+
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sb"), "HEAD").unwrap();
+        ws.set_sandbox_target(Arc::new(crate::sandbox_tools::FakeSandboxTarget::new()));
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity(both, "sandbox")),
+            vec!["sandbox_deploy", "sandbox_teardown"]
+        );
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity("\"sandbox_teardown\"", "sandbox")),
+            vec!["sandbox_teardown"]
+        );
+        assert!(
+            sandbox_tool_names(&ws, &ci_identity("\"sandbox_*\", \"*\"", "sandbox")).is_empty()
+        );
+        assert!(sandbox_tool_names(&ws, &ci_identity(both, "ci")).is_empty());
+        assert_eq!(
+            sandbox_tool_names(&ws, &ci_identity(both, "production")).len(),
+            2
+        );
+        assert!(sandbox_tool_names(&ws, &ci_identity(both, "repository")).is_empty());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cleanup_tears_down_a_forgotten_sandbox_and_records_its_lifetime_against_the_stamped_identity(
+    ) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-clean"), "HEAD").unwrap();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn crate::sandbox_tools::SandboxTarget>);
+        let task_id = ws.task_id.clone();
+        ws.sandboxes().insert(
+            &task_id,
+            crate::sandbox_tools::SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 7,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: chrono::Utc::now() - chrono::Duration::minutes(12),
+                identity: Some("stamped".to_string()),
+            },
+        );
+        ws.cleanup().unwrap();
+        assert_eq!(target.torn_down().len(), 1);
+        assert!(accountant.task_summary("stamped", &task_id).sandbox.minutes >= 12.0);
+    }
+
+    #[tokio::test]
+    async fn the_registered_sandbox_tools_share_the_workspace_registry_and_unstamped_handles_fall_back_to_the_unscoped_identity(
+    ) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let target = Arc::new(crate::sandbox_tools::FakeSandboxTarget::new());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-share"), "HEAD").unwrap();
+        let accountant = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&accountant));
+        ws.set_sandbox_target(Arc::clone(&target) as Arc<dyn crate::sandbox_tools::SandboxTarget>);
+        ws.set_sandbox_pr(7);
+        let task_id = ws.task_id.clone();
+        let handle = || crate::sandbox_tools::SandboxHandle {
+            repo: "o/n".to_string(),
+            pr: 7,
+            url: "http://127.0.0.1:1".to_string(),
+            deployed_at: chrono::Utc::now() - chrono::Duration::minutes(3),
+            identity: None,
+        };
+        ws.sandboxes().insert(&task_id, handle());
+        let registry = ws
+            .build_tool_registry_for(&ci_identity("\"sandbox_teardown\"", "sandbox"))
+            .unwrap();
+        let tool = registry.get_tool("sandbox_teardown").unwrap();
+        let done = tool.execute(serde_json::json!({})).await.unwrap();
+        assert_eq!(done["torn_down"], true);
+        assert!(ws.sandboxes().get(&task_id).is_none());
+        assert_eq!(target.torn_down().len(), 1);
+
+        ws.sandboxes().insert(&task_id, handle());
+        ws.cleanup().unwrap();
+        assert!(
+            accountant
+                .task_summary(crate::scope::UNSCOPED_IDENTITY, &task_id)
+                .sandbox
+                .minutes
+                >= 3.0
+        );
+    }
+
+    #[test]
+    fn cleanup_without_a_sandbox_target_leaves_a_registered_handle_alone() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-sb-none"), "HEAD").unwrap();
+        let task_id = ws.task_id.clone();
+        ws.sandboxes().insert(
+            &task_id,
+            crate::sandbox_tools::SandboxHandle {
+                repo: "o/n".to_string(),
+                pr: 7,
+                url: "http://127.0.0.1:1".to_string(),
+                deployed_at: chrono::Utc::now(),
+                identity: None,
+            },
+        );
+        ws.cleanup().unwrap();
+        assert!(ws.sandboxes().get(&task_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_no_accountant_charges_a_deny_all_one_and_an_installed_one_is_used() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-ci-bare"), "HEAD").unwrap();
+        let denied = ws
+            .budget_accountant()
+            .charge_count(
+                "id",
+                "t1",
+                "o/n",
+                crate::budget::BudgetClass::Ci,
+                chrono::Utc::now(),
+            )
+            .await;
+        assert!(denied.is_err());
+        let open = Arc::new(CostAccountant::new(
+            Arc::new(InMemoryBudgetStore::new()),
+            crate::budget::BudgetConfig::UNLIMITED,
+        ));
+        ws.set_cost_accountant(Arc::clone(&open));
+        assert!(Arc::ptr_eq(&ws.budget_accountant(), &open));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn persist_qa_summary_keeps_worktree_paths_when_no_artifact_directory_exists() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-nodir"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let report_path = ws
+            .workspace_path
+            .join(".nanna-artifacts/qa/endpoints-1.json");
+        record_empty_endpoint_report(&mut ws, &report_path);
+
+        let summary = ws.persist_qa_summary();
+
+        assert_eq!(
+            summary.artifacts,
+            vec![report_path.to_string_lossy().into_owned()]
+        );
+        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn persist_qa_summary_keeps_worktree_paths_when_the_copy_fails() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let blocker = store.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-copyfail"), "HEAD").unwrap();
+        ws.set_artifact_store(blocker.clone());
+        let artifacts = crate::qa::QaArtifacts::new(&ws.workspace_path);
+        let report_path = artifacts.next_endpoint_report().unwrap();
+        std::fs::write(&report_path, "{}").unwrap();
+        record_empty_endpoint_report(&mut ws, &report_path);
+
+        let summary = ws.persist_qa_summary();
+
+        assert_eq!(
+            summary.artifacts,
+            vec![report_path.to_string_lossy().into_owned()]
+        );
+        assert!(!ws.persisted_qa_dir().exists());
+        assert!(report_path.exists());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn persist_qa_summary_without_qa_runs_leaves_the_store_untouched() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let store = TempDir::new().unwrap();
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-qa-none"), "HEAD").unwrap();
+        ws.set_artifact_store(store.path().to_path_buf());
+        let summary = ws.persist_qa_summary();
+        assert!(summary.is_empty());
+        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn task_artifact_directory_names_are_sanitised() {
+        assert_eq!(sanitize_task_dir("a-b_c1"), "a-b_c1");
+        assert_eq!(sanitize_task_dir("../x/y"), "___x_y");
+    }
+
+    #[test]
     fn test_format_patch_produces_apply_ready_output() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
@@ -470,9 +1522,9 @@ mod tests {
         ws2.cleanup().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_create_with_container_no_runtime() {
+    async fn assert_container_setup_fails_without_runtime() {
         use crate::container::detect_runtime;
+        let _path = crate::test_support::hold_path_async().await;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
@@ -496,6 +1548,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_with_container_no_runtime() {
+        assert_container_setup_fails_without_runtime().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_create_with_container_no_runtime_is_stable_while_a_runtime_appears_on_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let installer = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let fake = crate::test_support::FakePodman::install_async(None).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    drop(fake);
+                    tokio::time::sleep(std::time::Duration::from_millis(6)).await;
+                }
+            })
+        };
+
+        let mut failures = Vec::new();
+        for _ in 0..100 {
+            if let Err(e) = tokio::spawn(assert_container_setup_fails_without_runtime()).await {
+                failures.push(e.to_string());
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        installer.await.unwrap();
+        assert!(
+            failures.is_empty(),
+            "no-runtime assertion raced a runtime on PATH: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_with_container_using_ok_path() {
         use crate::container::{ContainerHandle, ContainerRuntime};
 
@@ -508,6 +1599,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Ok(ContainerHandle {
                     name: "mock-container".to_string(),
@@ -540,6 +1632,7 @@ mod tests {
             "HEAD",
             "bad-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 Err::<_, ContainerError>(ContainerError::NoRuntimeAvailable)
             },
@@ -567,6 +1660,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Enabled,
+            None,
             |_config: crate::container::ContainerConfig| async {
                 use crate::container::{ContainerHandle, ContainerRuntime};
                 Ok(ContainerHandle {
@@ -586,6 +1680,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_with_container_using_sidecars_injects_env_and_network() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::sidecar::{PostgresSidecar, ReadinessConfig, SidecarSet};
+        use std::sync::Mutex;
+
+        struct RecordingRunner;
+        impl crate::sidecar::CommandRunner for RecordingRunner {
+            fn run(&self, _: &str, _: &[String]) -> std::io::Result<crate::sidecar::RunOutput> {
+                Ok(crate::sidecar::RunOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-sidecars");
+        let specs = vec![PostgresSidecar::with_password(&task_id, "pw").spec()];
+        let set = SidecarSet::start(
+            ContainerRuntime::Podman,
+            Arc::new(RecordingRunner),
+            &task_id,
+            &specs,
+            ReadinessConfig::default(),
+        )
+        .await
+        .unwrap();
+        let expected_network = format!("--network={}", set.network_name());
+        let seen = Arc::new(Mutex::new(None));
+        let seen_in_start = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            Some(set),
+            |config: ContainerConfig| async move {
+                *seen_in_start.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().take().unwrap();
+        assert!(config.additional_args.contains(&expected_network));
+        let mount = format!("-v={}:/workspace:z", ws.workspace_path.display());
+        assert_eq!(
+            config.additional_args[0], mount,
+            "worktree mount is relabelled"
+        );
+        assert_eq!(worktree_mount_arg(Path::new("/w")), "-v=/w:/workspace:z");
+        assert_eq!(config.env_vars, specs[0].exports);
+        assert_eq!(ws.sidecar_env(), specs[0].exports.as_slice());
+        ws.cleanup().unwrap();
+        assert!(ws.sidecars.is_none());
+        assert!(ws.sidecar_env().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_removes_container_even_when_registry_holds_a_reference() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-stub"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: true,
+        }));
+        let registry = ws.build_tool_registry();
+        ws.cleanup().unwrap();
+        assert!(ws.container_handle.is_none());
+        assert!(registry.get_tool("run_command").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_tolerates_container_removal_failure() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-fail"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: format!("nanna-no-such-container-{}", Uuid::new_v4()),
+            runtime: ContainerRuntime::Docker,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_create_with_container_starts_through_the_runtime_and_cleans_up() {
+        let fake = crate::test_support::FakePodman::install_async(None).await;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let task_id = unique_id("ws-create-container");
+        let mut ws = TaskWorkspace::create_with_container(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+        )
+        .await
+        .unwrap();
+        assert!(ws.sidecar_env().is_empty());
+        let mount = format!(
+            "-v={}:{CONTAINER_WORKSPACE_DIR}:z",
+            ws.workspace_path.display()
+        );
+        let calls = fake.calls();
+        let run = calls
+            .iter()
+            .find(|c| c.starts_with(&format!("run -d --name nanna-task-{task_id}")))
+            .expect("run call recorded");
+        assert!(run.contains(&mount), "{run}");
+        assert!(run.ends_with("mock-image:latest"), "{run}");
+        ws.cleanup().unwrap();
+        assert!(fake
+            .calls()
+            .contains(&format!("rm -f nanna-task-{task_id}")));
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_tolerates_failing_container_removal() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let fake = crate::test_support::FakePodman::install(Some("rm -f"));
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-cleanup-rm-fails"), "HEAD")
+                .unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "nanna-rm-fails".to_string(),
+            runtime: ContainerRuntime::Podman,
+            port: None,
+            needs_cleanup: true,
+        }));
+        ws.cleanup().unwrap();
+        assert!(fake.calls().contains(&"rm -f nanna-rm-fails".to_string()));
+        assert!(!ws.workspace_path.exists());
+    }
+
+    #[tokio::test]
     async fn test_create_with_container_using_passes_the_network_policy() {
         use crate::container::{ContainerHandle, ContainerRuntime};
 
@@ -600,6 +1857,7 @@ mod tests {
             "HEAD",
             "mock-image:latest",
             NetworkPolicy::Disabled,
+            None,
             move |config: ContainerConfig| async move {
                 *sink.lock().unwrap() = Some(config);
                 Ok(ContainerHandle {
@@ -617,12 +1875,110 @@ mod tests {
         assert_eq!(config.network, NetworkPolicy::Disabled);
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
         assert!(args.iter().any(|a| a == "--network=none"));
-        assert!(args.iter().any(|a| a.ends_with(CONTAINER_WORKSPACE_DIR)));
+        assert!(args.iter().any(|a| a.contains(CONTAINER_WORKSPACE_DIR)));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_parse_dev_container_accepts_a_cargo_home_inside_the_tmp_dir() {
+        let paths =
+            parse_dev_container("cargo_home = \"/opt/t/cargo\"\ntmp_dir = \"/opt/t\"\n").unwrap();
+        assert_eq!(paths.cargo_home, "/opt/t/cargo");
+        assert_eq!(paths.tmp_dir, "/opt/t");
+        let same = parse_dev_container("cargo_home = \"/opt/t\"\ntmp_dir = \"/opt/t\"\n").unwrap();
+        assert_eq!(same.cargo_home, same.tmp_dir);
+    }
+
+    #[test]
+    fn test_parse_dev_container_rejects_invalid_config() {
+        for src in [
+            "",
+            "tmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"",
+            "cargo_home = \"relative/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"C:\\\\cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"C:/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"\\\\cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = 3\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"C:/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"\\\\tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/tmp/\"",
+            "cargo_home = \"/\"\ntmp_dir = \"/\"",
+            "cargo_home = \"/tmp/\"\ntmp_dir = \"/tmp/\"",
+            "cargo_home = \"/tmp2/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/var/cargo\"\ntmp_dir = \"/tmp\"",
+            "cargo_home = \"/tmp/cargo\"\ntmp_dir = \"/tmp\"\nextra = 1",
+            "not toml at all =",
+        ] {
+            let err = parse_dev_container(src).unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::InvalidDevContainerConfig(_)),
+                "{src:?} -> {err:?}"
+            );
+            assert!(err.to_string().contains("dev-container.toml"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_shipped_dev_container_config_parses_to_the_tmp_paths() {
+        let paths = dev_container_paths().unwrap();
+        assert_eq!(paths.cargo_home, "/tmp/cargo");
+        assert_eq!(paths.tmp_dir, "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_gives_the_tmp_dir_a_world_writable_tmpfs() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-cargohome"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = config.run_args(&runtime, "mock-image:latest");
+            let tmpfs: Vec<&String> = args.iter().filter(|a| a.starts_with("--tmpfs=")).collect();
+            assert_eq!(
+                tmpfs,
+                vec![&format!(
+                    "--tmpfs={}:rw,mode=1777",
+                    dev_container_paths().unwrap().tmp_dir
+                )],
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "--privileged"));
+        }
         ws.cleanup().unwrap();
     }
 
     #[tokio::test]
     async fn test_create_with_container_fails_without_an_image() {
+        let _path = crate::test_support::hold_path_async().await;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
 
@@ -635,10 +1991,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(result, Err(WorkspaceError::ContainerSetupFailed(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
         let default_network = TaskWorkspace::create_with_container(
             source.path(),
             &unique_id("ws-default-network"),
@@ -646,10 +2003,14 @@ mod tests {
             "nonexistent-image-for-nanna-tests:none",
         )
         .await;
-        assert!(matches!(
-            default_network,
-            Err(WorkspaceError::ContainerSetupFailed(_))
-        ));
+        assert!(
+            matches!(
+                default_network,
+                Err(WorkspaceError::ContainerSetupFailed(_))
+            ),
+            "{:?}",
+            default_network.as_ref().err()
+        );
     }
 
     fn workspace_identity(ceiling: crate::effects::EffectClass) -> AgentIdentity {
@@ -768,5 +2129,2171 @@ mod tests {
         assert!(registry.get_tool("read_file").is_some());
 
         ws.cleanup().unwrap();
+    }
+
+    struct RecordingHook {
+        seen: std::sync::Mutex<Vec<(String, ProtectedPathViolation)>>,
+    }
+
+    impl AuditHook for RecordingHook {
+        fn on_protected_path_violation(&self, task_id: &str, violation: &ProtectedPathViolation) {
+            let entry = (task_id.to_string(), violation.clone());
+            self.seen.lock().unwrap().push(entry);
+        }
+    }
+
+    fn commit_count(dir: &Path) -> usize {
+        let out = git_cmd(dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    fn protected_violation(err: WorkspaceError) -> ProtectedPathViolation {
+        match err {
+            WorkspaceError::ProtectedPath(violation) => violation,
+            other => panic!("expected ProtectedPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_changes_refuses_a_patch_touching_an_identity_file() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let task_id = unique_id("ws-protected");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        std::fs::write(ws.workspace_path.join("src.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna/agents")).unwrap();
+        std::fs::write(ws.workspace_path.join(".nanna/agents/x.toml"), "[identity]").unwrap();
+
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, ".nanna/agents/x.toml");
+        assert_eq!(violation.rule, ".nanna/**");
+        assert_eq!(
+            violation.to_string(),
+            "`.nanna/agents/x.toml` is protected by rule `.nanna/**`: Nanna may not modify its own configuration"
+        );
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![(task_id, violation)]);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_format_patch_refuses_and_commits_nothing() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-fp"), "HEAD").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws.workspace_path.join(".github/workflows/ci.yml"),
+            "on: push",
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, ".github/workflows/**");
+        assert_eq!(commit_count(&ws.workspace_path), 1);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_deleting_a_tracked_protected_file_is_refused() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::write(source.path().join("codecov.yml"), "coverage: {}").unwrap();
+        git_cmd(source.path()).args(["add", "."]).output().unwrap();
+        git_cmd(source.path())
+            .args(["commit", "-m", "add codecov"])
+            .output()
+            .unwrap();
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-del"), "HEAD").unwrap();
+        std::fs::remove_file(ws.workspace_path.join("codecov.yml")).unwrap();
+        std::fs::rename(
+            ws.workspace_path.join("README.md"),
+            ws.workspace_path.join("windows.toml"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "codecov.yml");
+        let paths = ws.changed_paths().unwrap();
+        assert_eq!(paths, vec!["README.md", "codecov.yml", "windows.toml"]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_a_hardlinked_path_without_listing_the_target() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let task_id = unique_id("ws-hardlink");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "innocuous.txt");
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![(task_id, violation)]);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn link_declared_file(ws: &TaskWorkspace) -> std::io::Result<()> {
+        std::fs::create_dir_all(ws.workspace_path.join("src"))?;
+        std::fs::write(ws.workspace_path.join("src/gate.rs"), "original")?;
+        std::fs::hard_link(
+            ws.workspace_path.join("src/gate.rs"),
+            ws.workspace_path.join("alias.txt"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_hardlink_to_a_repo_declared_file_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl"), "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        link_declared_file(&ws).unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "alias.txt");
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_hardlink_to_a_repo_declared_file_cannot_be_written_through_by_either_registry()
+    {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl-write"), "HEAD").unwrap();
+        link_declared_file(&ws).unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            let err = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "alias.txt", "content": "evil" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::tools::ToolError::ProtectedPath(ref v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            let original = std::fs::read_to_string(ws.workspace_path.join("src/gate.rs")).unwrap();
+            assert_eq!(original, "original");
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    const FOLDED_LINK_DECLARATION: &str =
+        "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n";
+
+    #[cfg(unix)]
+    const FOLDED_LINK_CASES: [(&str, &str); 4] = [
+        ("alias.txt", crate::protected::HARDLINK_RULE),
+        ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
+        ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
+        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+    ];
+
+    #[cfg(unix)]
+    fn commit_partner(source: &Path) {
+        std::fs::write(source.join("keep.bin"), "original").unwrap();
+        git_cmd(source).args(["add", "keep.bin"]).output().unwrap();
+        let out = git_cmd(source)
+            .args(["commit", "-m", "partner"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[cfg(unix)]
+    fn make_linked_file(root: &Path, name: &str) -> std::io::Result<()> {
+        let file = root.join(name);
+        std::fs::create_dir_all(file.parent().unwrap())?;
+        std::fs::hard_link(root.join("keep.bin"), file)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hardlinked_files_reached_through_folded_spellings_are_refused_when_a_patch_is_extracted(
+    ) {
+        for (name, rule) in FOLDED_LINK_CASES {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
+            let hook = Arc::new(RecordingHook {
+                seen: std::sync::Mutex::new(vec![]),
+            });
+            let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-fold-link"), "HEAD")
+                .unwrap()
+                .with_audit_hook(hook.clone());
+            make_linked_file(&ws.workspace_path, name).unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{name}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{name}");
+            assert_eq!(hook.seen.lock().unwrap().len(), 2, "{name}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlinked_files_reached_through_folded_spellings_are_refused_by_both_registries()
+    {
+        use crate::effects::EffectClass;
+        for (name, rule) in FOLDED_LINK_CASES {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), FOLDED_LINK_DECLARATION);
+            commit_partner(source.path());
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-fold-link-w"), "HEAD").unwrap();
+            make_linked_file(&ws.workspace_path, name).unwrap();
+            let identity = workspace_identity(EffectClass::Workspace);
+            let registries = [
+                ws.build_tool_registry(),
+                ws.build_tool_registry_for(&identity).unwrap(),
+            ];
+            for registry in registries {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": name, "content": "evil" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{name}: {err:?}"
+                );
+                let partner = std::fs::read_to_string(ws.workspace_path.join("keep.bin"));
+                assert_eq!(partner.unwrap(), "original", "{name}");
+            }
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn objects_are_hardlinked(repo: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir(repo.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|dir| dir.file_name().len() == 2)
+            .flat_map(|dir| std::fs::read_dir(dir.path()).unwrap().flatten())
+            .any(|object| object.metadata().unwrap().nlink() > 1)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_workspace_of_a_local_clone_with_hardlinked_objects_has_no_false_refusals() {
+        use crate::effects::EffectClass;
+        let origin = TempDir::new().unwrap();
+        init_git_repo(origin.path());
+        let clone_parent = TempDir::new().unwrap();
+        let clone = clone_parent.path().join("clone");
+        let out = git_cmd(clone_parent.path())
+            .args(["clone", "-q"])
+            .arg(origin.path())
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(objects_are_hardlinked(&clone));
+        let mut ws = TaskWorkspace::create(&clone, &unique_id("ws-clone"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        for registry in [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ] {
+            let ok = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "src/ordinary.rs", "content": "fn main() {}" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            let overwrite = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "README.md", "content": "# changed" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(overwrite["success"], true);
+        }
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("src/ordinary.rs"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_hardlink_to_a_symlink_is_refused_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-hl"), "HEAD").unwrap();
+        let link = ws.workspace_path.join("link-one");
+        std::os::unix::fs::symlink("README.md", &link).unwrap();
+        std::fs::hard_link(&link, ws.workspace_path.join("link-two")).unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_symlink_to_a_multiply_linked_file_is_judged_by_the_target_not_the_symlink() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-sym-t"), "HEAD").unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared.txt");
+        std::fs::write(&target, "shared").unwrap();
+        std::fs::hard_link(&target, outside.path().join("other.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, ws.workspace_path.join("only-a-symlink")).unwrap();
+        assert!(ws.extract_changes().unwrap().contains("only-a-symlink"));
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlink_refusal_composes_with_the_solo_gate_at_extraction_and_both_registries() {
+        use crate::effects::EffectClass;
+        for solo in [false, true] {
+            for (name, rule) in FOLDED_LINK_CASES {
+                let source = TempDir::new().unwrap();
+                init_git_repo(source.path());
+                declare(source.path(), FOLDED_LINK_DECLARATION);
+                commit_partner(source.path());
+                if solo {
+                    declare_policy(source.path(), b"human_gate = \"solo\"\n");
+                }
+                let hook = Arc::new(RecordingHook {
+                    seen: std::sync::Mutex::new(vec![]),
+                });
+                let mut ws =
+                    TaskWorkspace::create(source.path(), &unique_id("ws-solo-link"), "HEAD")
+                        .unwrap()
+                        .with_audit_hook(hook.clone());
+                assert_eq!(ws.protected().policy().is_solo(), solo);
+                make_linked_file(&ws.workspace_path, name).unwrap();
+                let identity = workspace_identity(EffectClass::Workspace);
+                for registry in [
+                    ws.build_tool_registry(),
+                    ws.build_tool_registry_for(&identity).unwrap(),
+                ] {
+                    let err = registry
+                        .execute(
+                            "write_file",
+                            serde_json::json!({ "path": name, "content": "evil" }),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                        "solo={solo} {name}: {err:?}"
+                    );
+                }
+                let violation = protected_violation(ws.extract_changes().unwrap_err());
+                assert_eq!(violation.rule, rule, "solo={solo} {name}");
+                let violation = protected_violation(ws.format_patch().unwrap_err());
+                assert_eq!(violation.rule, rule, "solo={solo} {name}");
+                assert_eq!(hook.seen.lock().unwrap().len(), 2, "solo={solo} {name}");
+                ws.cleanup().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_nested_git_repository_is_not_a_hard_link_violation_at_extraction() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nested"), "HEAD").unwrap();
+        let nested = ws.workspace_path.join("nested");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        init_git_repo(&nested);
+        assert!(ws.extract_changes().unwrap().contains("nested"));
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_modified_submodule_is_not_a_hard_link_violation_at_extraction() {
+        let library = TempDir::new().unwrap();
+        init_git_repo(library.path());
+        std::fs::create_dir_all(library.path().join("deep/er")).unwrap();
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let add = git_cmd(source.path())
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(library.path())
+            .arg("lib")
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{add:?}");
+        let commit = git_cmd(source.path())
+            .args(["commit", "-m", "submodule"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-submodule"), "HEAD").unwrap();
+        let lib = ws.workspace_path.join("lib");
+        let update = git_cmd(&ws.workspace_path)
+            .args(["-c", "protocol.file.allow=always", "submodule", "update"])
+            .args(["--init"])
+            .output()
+            .unwrap();
+        assert!(update.status.success(), "{update:?}");
+        for args in [
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["commit", "--allow-empty", "-m", "moved"],
+        ] {
+            assert!(git_cmd(&lib).args(args).output().unwrap().status.success());
+        }
+        assert!(ws.extract_changes().unwrap().contains("lib"));
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_format_patch_refuses_a_hardlinked_path_and_commits_nothing() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-fp"), "HEAD").unwrap();
+        std::fs::hard_link(
+            ws.workspace_path.join(".git"),
+            ws.workspace_path.join("innocuous.txt"),
+        )
+        .unwrap();
+
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
+        assert_eq!(commit_count(&ws.workspace_path), 1);
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_deleted_path_and_single_link_files_are_not_hardlink_violations() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-hl-ok"), "HEAD").unwrap();
+        std::fs::remove_file(ws.workspace_path.join("README.md")).unwrap();
+        std::fs::write(ws.workspace_path.join("fresh.txt"), "one link").unwrap();
+        let diff = ws.extract_changes().unwrap();
+        assert!(diff.contains("fresh.txt"));
+        assert!(diff.contains("README.md"));
+        ws.cleanup().unwrap();
+    }
+
+    fn assert_alias_refused(name: &str, rule: &str) {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-alias"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join(name), "evil").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, rule, "{name}");
+        assert_eq!(violation.path, name);
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_refuses_a_short_name_of_a_protected_file() {
+        assert_alias_refused("CODECO~1.YML", "codecov.yml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_changes_refuses_trailing_dot_and_space_aliases() {
+        assert_alias_refused("flake.nix.", "flake.nix");
+        assert_alias_refused("codecov.yml ", "codecov.yml");
+    }
+
+    const ALIAS_DECLARATION: &str =
+        "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]\n";
+
+    const ALIAS_SPELLINGS: [(&str, &str); 3] = [
+        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+        ("gate~1/x.rs", "gate/**"),
+        ("tools/release-helper.sh.", "tools/release-helper.sh"),
+    ];
+
+    #[test]
+    fn test_windows_aliases_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in ALIAS_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), ALIAS_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_windows_aliases_of_declared_paths_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), ALIAS_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias-write"), "HEAD")
+                .unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in ALIAS_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+            }
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_extract_changes_refuses_a_unicode_equivalent_spelling_of_a_protected_file() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nfc"), "HEAD").unwrap();
+        std::fs::write(ws.workspace_path.join("fla\u{212A}e.nix"), "evil").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, "flake.nix");
+        ws.cleanup().unwrap();
+    }
+
+    const COMBINED_DECLARATION: &str =
+        "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]\n";
+
+    const COMBINED_SPELLINGS: [(&str, &str); 4] = [
+        ("docs/cafe\u{301}./x.md", "docs/caf\u{e9}/**"),
+        ("src/caf\u{e9}.rs.", "src/cafe\u{301}.rs"),
+        (
+            "docs/re\u{301}sume\u{301}~1.txt",
+            "docs/r\u{e9}sum\u{e9}-final.txt",
+        ),
+        ("fla\u{212A}e.nix.", "flake.nix"),
+    ];
+
+    #[test]
+    fn test_combined_unicode_and_windows_spellings_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in COMBINED_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), COMBINED_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-combined"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_combined_unicode_and_windows_spellings_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), COMBINED_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-combined-write"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in COMBINED_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+            }
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_unprotected_changes_still_produce_patches_and_call_no_hook() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-ok"), "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        std::fs::write(ws.workspace_path.join("docs.md"), "fine").unwrap();
+        assert!(ws.extract_changes().unwrap().contains("docs.md"));
+        assert!(ws.format_patch().unwrap().is_some());
+        assert!(hook.seen.lock().unwrap().is_empty());
+        ws.cleanup().unwrap();
+    }
+
+    const DECLARATION: &str = "extra = [\"src/gate.rs\", \"tools/**\"]\n";
+
+    fn declare(source: &Path, body: &str) {
+        std::fs::create_dir_all(source.join(".nanna")).unwrap();
+        std::fs::write(source.join(".nanna/protected.toml"), body).unwrap();
+    }
+
+    fn worktree_count(dir: &Path) -> usize {
+        let out = git_cmd(dir)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count()
+    }
+
+    const BAD_DECLARATIONS: [&str; 4] = [
+        "extra = [",
+        "extra = [\"a\"]\nremove = [\".git/**\"]",
+        "extra = [\"../outside\"]",
+        "extra = [\"src/*.rs\"]",
+    ];
+
+    #[test]
+    fn test_a_bad_declaration_refuses_to_start_the_task_and_adds_no_worktree() {
+        for body in BAD_DECLARATIONS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), body);
+            let id = unique_id("ws-bad-decl");
+            let err = TaskWorkspace::create(source.path(), &id, "HEAD")
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, WorkspaceError::ProtectedConfig(_)),
+                "{body}: {err:?}"
+            );
+            assert!(!std::env::temp_dir()
+                .join(format!("nanna-task-{id}"))
+                .exists());
+            assert_eq!(worktree_count(source.path()), 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn test_an_unreadable_declaration_refuses_to_start_the_task() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".nanna/protected.toml")).unwrap();
+        let err = TaskWorkspace::create(source.path(), &unique_id("ws-dir-decl"), "HEAD")
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                WorkspaceError::ProtectedConfig(ProtectedConfigError::Unreadable(_))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(worktree_count(source.path()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_bad_declaration_refuses_to_start_a_container_task_and_adds_no_worktree() {
+        for body in BAD_DECLARATIONS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), body);
+            let err = workspace_capturing_config(source.path(), "ws-bad-decl-c")
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, WorkspaceError::ProtectedConfig(_)),
+                "{body}: {err:?}"
+            );
+            assert_eq!(worktree_count(source.path()), 1, "{body}");
+        }
+    }
+
+    fn declare_policy(source: &Path, body: &[u8]) {
+        std::fs::create_dir_all(source.join(".nanna")).unwrap();
+        std::fs::write(source.join(".nanna/policy.toml"), body).unwrap();
+    }
+
+    fn oversized_policy() -> Vec<u8> {
+        let mut body = b"human_gate = \"solo\"\n".to_vec();
+        body.resize(crate::policy::MAX_POLICY_BYTES + 1, b'\n');
+        body
+    }
+
+    fn bad_policies() -> Vec<Vec<u8>> {
+        vec![
+            b"human_gate = \"duo\"".to_vec(),
+            b"human_gate = ".to_vec(),
+            b"human_gate = \"solo\"\nextra = []".to_vec(),
+            vec![0xff, 0xfe, 0x00],
+            oversized_policy(),
+        ]
+    }
+
+    fn is_policy_refusal(err: &WorkspaceError) -> bool {
+        format!("{err:?}").starts_with("ProtectedConfig(Policy(")
+    }
+
+    #[test]
+    fn test_a_bad_policy_refuses_to_start_the_task_and_adds_no_worktree() {
+        for body in bad_policies() {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), &body);
+            let id = unique_id("ws-bad-policy");
+            let err = TaskWorkspace::create(source.path(), &id, "HEAD")
+                .err()
+                .unwrap();
+            assert!(is_policy_refusal(&err), "{err:?}");
+            assert!(!std::env::temp_dir()
+                .join(format!("nanna-task-{id}"))
+                .exists());
+            assert_eq!(worktree_count(source.path()), 1);
+        }
+    }
+
+    #[test]
+    fn test_a_policy_that_is_a_directory_refuses_to_start_the_task() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".nanna/policy.toml")).unwrap();
+        let err = TaskWorkspace::create(source.path(), &unique_id("ws-dir-policy"), "HEAD")
+            .err()
+            .unwrap();
+        assert!(is_policy_refusal(&err), "{err:?}");
+        assert_eq!(worktree_count(source.path()), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_policy_that_is_a_symlink_refuses_to_start_the_task() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::write(
+            source.path().join("elsewhere.toml"),
+            "human_gate = \"github\"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.path().join(".nanna")).unwrap();
+        std::os::unix::fs::symlink(
+            source.path().join("elsewhere.toml"),
+            source.path().join(".nanna/policy.toml"),
+        )
+        .unwrap();
+        let err = TaskWorkspace::create(source.path(), &unique_id("ws-link-policy"), "HEAD")
+            .err()
+            .unwrap();
+        assert!(is_policy_refusal(&err), "{err:?}");
+        assert_eq!(worktree_count(source.path()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_bad_policy_refuses_to_start_a_container_task_and_adds_no_worktree() {
+        for body in bad_policies() {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), &body);
+            let err = workspace_capturing_config(source.path(), "ws-bad-policy-c")
+                .await
+                .err()
+                .unwrap();
+            assert!(is_policy_refusal(&err), "{err:?}");
+            assert_eq!(worktree_count(source.path()), 1);
+        }
+    }
+
+    #[test]
+    fn test_without_a_policy_file_the_task_has_github_semantics() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-no-policy"), "HEAD").unwrap();
+        assert!(!ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_the_policy_is_taken_from_the_base_checkout_before_the_task_runs() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-policy-base"), "HEAD").unwrap();
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        std::fs::remove_file(source.path().join(".nanna/policy.toml")).unwrap();
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_container_task_carries_the_base_checkouts_policy() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-policy-c")
+            .await
+            .unwrap();
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-nopolicy-c")
+            .await
+            .unwrap();
+        assert!(!ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_repo_declared_paths_are_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let task_id = unique_id("ws-decl-extract");
+        let mut ws = TaskWorkspace::create(source.path(), &task_id, "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        assert!(!ws.workspace_path.join(".nanna").exists());
+        std::fs::create_dir_all(ws.workspace_path.join("src")).unwrap();
+        std::fs::write(ws.workspace_path.join("src/gate.rs"), "x").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, "src/gate.rs");
+        assert_eq!(violation.rule, "src/gate.rs");
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.rule, "src/gate.rs");
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        ws.cleanup().unwrap();
+    }
+
+    const UNICODE_DECLARATION: &str =
+        "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]\n";
+
+    const UNICODE_SPELLINGS: [(&str, &str); 3] = [
+        ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
+        ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
+        ("src/\u{212A}ey.rs", "src/key.rs"),
+    ];
+
+    #[test]
+    fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+        for (path, rule) in UNICODE_SPELLINGS {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare(source.path(), UNICODE_DECLARATION);
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc"), "HEAD").unwrap();
+            let file = ws.workspace_path.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            let violation = protected_violation(ws.format_patch().unwrap_err());
+            assert_eq!(violation.rule, rule, "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), UNICODE_DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc-write"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for (path, rule) in UNICODE_SPELLINGS {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(ref v) if v.rule == rule),
+                    "{path}: {err:?}"
+                );
+                assert!(!ws.workspace_path.join(path).exists(), "{path}");
+            }
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_a_rewritten_policy_file_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare_policy(source.path(), b"human_gate = \"solo\"\n");
+        let hook = Arc::new(RecordingHook {
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-policy-extract"), "HEAD")
+            .unwrap()
+            .with_audit_hook(hook.clone());
+        declare_policy(&ws.workspace_path, b"human_gate = \"github\"\n");
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.path, ".nanna/policy.toml");
+        assert_eq!(violation.rule, ".nanna/**");
+        let violation = protected_violation(ws.format_patch().unwrap_err());
+        assert_eq!(violation.path, ".nanna/policy.toml");
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        assert!(ws.protected().policy().is_solo());
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_alias_spellings_of_the_policy_file_are_refused_when_a_patch_is_extracted() {
+        for path in [
+            ".nanna./policy.toml",
+            ".nanna /policy.toml",
+            "NANNA~1/POLICY~1.TOML",
+        ] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), b"human_gate = \"solo\"\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-policy-alias"), "HEAD")
+                    .unwrap();
+            let target = ws.workspace_path.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "human_gate = \"github\"").unwrap();
+            let violation = protected_violation(ws.extract_changes().unwrap_err());
+            assert_eq!(violation.rule, ".nanna/**", "{path}");
+            assert!(ws.protected().policy().is_solo(), "{path}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_the_policy_file_lies_under_a_read_only_mount_root() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-policy-mount"), "HEAD").unwrap();
+        let roots = ws.protected().mount_roots();
+        let policy = Path::new(".nanna/policy.toml");
+        assert!(
+            roots.iter().any(|root| policy.starts_with(root)),
+            "{roots:?}"
+        );
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_a_nested_config_directory_is_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-nested-nanna"), "HEAD").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join("crates/api/.nanna/agents")).unwrap();
+        std::fs::write(
+            ws.workspace_path.join("crates/api/.nanna/agents/x.toml"),
+            "[identity]",
+        )
+        .unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, "**/.nanna/**");
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_repo_declared_directories_are_refused_when_a_patch_is_extracted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-dir"), "HEAD").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join("tools/deep")).unwrap();
+        std::fs::write(ws.workspace_path.join("tools/deep/x.sh"), "x").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, "tools/**");
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_without_a_declaration_the_same_paths_extract_normally() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-no-decl"), "HEAD").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join("src")).unwrap();
+        std::fs::write(ws.workspace_path.join("src/gate.rs"), "x").unwrap();
+        assert!(ws.extract_changes().unwrap().contains("src/gate.rs"));
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_the_declaration_is_taken_from_the_base_checkout_before_the_task_runs() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-base"), "HEAD").unwrap();
+        declare(&ws.workspace_path, "extra = []\n");
+        std::fs::remove_file(source.path().join(".nanna/protected.toml")).unwrap();
+        assert!(ws.protected().is_protected(Path::new("src/gate.rs")));
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_repo_declared_write_file_is_refused_by_both_registries() {
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-write"), "HEAD").unwrap();
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            for path in ["src/gate.rs", "tools/deep/x.sh"] {
+                let err = registry
+                    .execute(
+                        "write_file",
+                        serde_json::json!({ "path": path, "content": "x" }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, crate::tools::ToolError::ProtectedPath(_)),
+                    "{path}: {err:?}"
+                );
+                assert!(!ws.workspace_path.join(path).exists(), "{path}");
+            }
+            let ok = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "src/ok.rs", "content": "x" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_repo_declared_write_file_is_refused_by_both_container_registries() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-decl-write-c"), "HEAD").unwrap();
+        ws.container_handle = Some(Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        }));
+        let identity = workspace_identity(EffectClass::Workspace);
+        let registries = [
+            ws.build_tool_registry(),
+            ws.build_tool_registry_for(&identity).unwrap(),
+        ];
+        for registry in registries {
+            let err = registry
+                .execute(
+                    "write_file",
+                    serde_json::json!({ "path": "src/gate.rs", "content": "x" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::tools::ToolError::ProtectedPath(_)),
+                "{err:?}"
+            );
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_workspace_identity_registries_hand_the_policy_to_promote_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        for container in [false, true] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            declare_policy(source.path(), b"human_gate = \"solo\"\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-policy-reg"), "HEAD").unwrap();
+            if container {
+                ws.container_handle = Some(Arc::new(ContainerHandle {
+                    name: "test-handle".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                }));
+            }
+            let mut identity = workspace_identity(EffectClass::Repository);
+            identity.scope.tools = vec![
+                "github_pr_promote".parse().unwrap(),
+                "git_push_branch".parse().unwrap(),
+            ];
+            let registry = ws.build_tool_registry_for(&identity).unwrap();
+            let promote = registry.get_tool("github_pr_promote").expect("granted");
+            let err = promote
+                .execute(serde_json::json!({ "pr_number": 7 }))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("human_gate"), "{container}: {err}");
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_workspace_identity_registries_hand_the_declared_set_to_commit_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::effects::EffectClass;
+        for container in [false, true] {
+            let source = TempDir::new().unwrap();
+            init_git_repo(source.path());
+            let bare = TempDir::new().unwrap();
+            git_cmd(bare.path())
+                .args(["init", "--bare", "-q"])
+                .output()
+                .unwrap();
+            for args in [
+                vec!["branch", "-M", "main"],
+                vec!["remote", "add", "origin", bare.path().to_str().unwrap()],
+                vec!["push", "-q", "origin", "main"],
+                vec![
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            ] {
+                let out = git_cmd(source.path()).args(&args).output().unwrap();
+                assert!(out.status.success(), "{args:?}");
+            }
+            declare(source.path(), "extra = [\"ci/**\"]\n");
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-decl-git"), "HEAD").unwrap();
+            git_cmd(&ws.workspace_path)
+                .args(["checkout", "-q", "-b", "feature-ws"])
+                .output()
+                .unwrap();
+            if container {
+                ws.container_handle = Some(Arc::new(ContainerHandle {
+                    name: "test-handle".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                }));
+            }
+            let mut identity = workspace_identity(EffectClass::Repository);
+            identity.scope.tools = vec![
+                "git_commit".parse().unwrap(),
+                "git_push_branch".parse().unwrap(),
+            ];
+            let registry = ws.build_tool_registry_for(&identity).unwrap();
+            std::fs::create_dir_all(ws.workspace_path.join("ci")).unwrap();
+            std::fs::write(ws.workspace_path.join("ci/deploy.sh"), "x").unwrap();
+            std::fs::write(ws.workspace_path.join("ok.txt"), "ok").unwrap();
+            let commit = registry.get_tool("git_commit").expect("git_commit granted");
+            let result = commit
+                .execute(serde_json::json!({ "subject": "x" }))
+                .await
+                .unwrap();
+            assert_eq!(
+                result["skipped_protected"],
+                serde_json::json!(["ci/deploy.sh"])
+            );
+            git_cmd(&ws.workspace_path)
+                .args(["add", "ci/deploy.sh"])
+                .output()
+                .unwrap();
+            git_cmd(&ws.workspace_path)
+                .args([
+                    "commit",
+                    "-q",
+                    "-m",
+                    "d\n\nNanna-Identity: rust-implementer",
+                ])
+                .output()
+                .unwrap();
+            let push = registry
+                .get_tool("git_push_branch")
+                .expect("git_push_branch granted");
+            let err = push.execute(serde_json::json!({})).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("changes protected path 'ci/deploy.sh'"),
+                "container={container}: {err}"
+            );
+            ws.cleanup().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_declared_roots_are_created_and_mounted_read_only() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        declare(source.path(), DECLARATION);
+        let (mut ws, config) = workspace_capturing_config(source.path(), "ws-decl-mounts")
+            .await
+            .unwrap();
+        let root = ws.workspace_path.clone();
+        for declared in ["src/gate.rs", "tools"] {
+            let host = root.join(declared);
+            assert!(
+                config.read_only_mounts.iter().any(|m| m.host == host),
+                "{declared} not mounted"
+            );
+        }
+        assert!(root.join("tools").is_dir());
+        let gate = std::fs::metadata(root.join("src/gate.rs")).unwrap();
+        assert!(gate.is_file() && gate.len() == 0);
+        assert!(ws.placeholders.contains(&PathBuf::from("src/gate.rs")));
+        assert_eq!(ws.extract_changes().unwrap(), "");
+        ws.cleanup().unwrap();
+    }
+
+    const PLACEHOLDER_FILES: [&str; 13] = [
+        "codecov.yml",
+        "windows.toml",
+        "tarpaulin.toml",
+        "deny.toml",
+        "flake.nix",
+        "flake.lock",
+        "AGENTS.md",
+        ".gitattributes",
+        ".gitmodules",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+        ".envrc",
+        "CLAUDE.md",
+    ];
+
+    fn sorted_placeholder_files() -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = PLACEHOLDER_FILES.iter().map(PathBuf::from).collect();
+        files.sort();
+        files
+    }
+
+    fn every_protected_root_mount(root: &Path) -> Vec<ReadOnlyMount> {
+        [
+            ".nanna",
+            ".git",
+            "codecov.yml",
+            "windows.toml",
+            "tarpaulin.toml",
+            "deny.toml",
+            "flake.nix",
+            "flake.lock",
+            ".githooks",
+            ".cargo",
+            ".devcontainer",
+            "AGENTS.md",
+            ".gitattributes",
+            ".gitmodules",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            ".github",
+            ".cargo-husky",
+            ".envrc",
+            ".config",
+            ".claude",
+            "nix",
+            "CLAUDE.md",
+        ]
+        .iter()
+        .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
+        .collect()
+    }
+
+    async fn workspace_capturing_config(
+        source: &Path,
+        id: &str,
+    ) -> Result<(TaskWorkspace, ContainerConfig), WorkspaceError> {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let ws = TaskWorkspace::create_with_container_using(
+            source,
+            &unique_id(id),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await?;
+        let config = seen.lock().unwrap().clone().unwrap();
+        Ok((ws, config))
+    }
+
+    #[tokio::test]
+    async fn test_protected_roots_absent_at_container_start_are_created_and_mounted() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, config) = workspace_capturing_config(source.path(), "ws-absent")
+            .await
+            .unwrap();
+        let root = ws.workspace_path.clone();
+
+        assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
+        assert!(root.join(".nanna").is_dir());
+        assert!(root.join(".github").is_dir());
+        for dir in [
+            ".github",
+            ".cargo-husky",
+            ".config",
+            ".claude",
+            "nix",
+            ".githooks",
+            ".cargo",
+            ".devcontainer",
+        ] {
+            assert!(root.join(dir).is_dir(), "{dir}");
+        }
+        for file in PLACEHOLDER_FILES {
+            let meta = std::fs::metadata(root.join(file)).unwrap();
+            assert!(meta.is_file() && meta.len() == 0, "{file}");
+        }
+        let mut placeholders = ws.placeholders.clone();
+        placeholders.sort();
+        assert_eq!(placeholders, sorted_placeholder_files());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_task_that_touches_nothing_extracts_a_clean_patch_despite_placeholders() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-clean")
+            .await
+            .unwrap();
+
+        assert_eq!(ws.extract_changes().unwrap(), "");
+        assert!(ws.changed_paths().unwrap().is_empty());
+        assert!(ws.format_patch().unwrap().is_none());
+
+        std::fs::write(ws.workspace_path.join("docs.md"), "fine").unwrap();
+        let patch = ws.extract_changes().unwrap();
+        assert!(patch.contains("docs.md"));
+        assert!(!patch.contains("codecov.yml"));
+        assert_eq!(ws.changed_paths().unwrap(), vec!["docs.md"]);
+        assert!(ws.format_patch().unwrap().is_some());
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_edits_under_a_protected_root_are_still_refused_with_placeholders_present() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let (mut ws, _config) = workspace_capturing_config(source.path(), "ws-edit")
+            .await
+            .unwrap();
+        std::fs::write(ws.workspace_path.join(".nanna/agents.toml"), "x").unwrap();
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, ".nanna/**");
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_unpreparable_protected_root_fails_container_setup_and_removes_the_worktree() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::write(source.path().join("docs"), "not a directory").unwrap();
+        git_cmd(source.path()).args(["add", "."]).output().unwrap();
+        git_cmd(source.path())
+            .args(["commit", "-m", "docs is a file"])
+            .output()
+            .unwrap();
+
+        let result = workspace_capturing_config(source.path(), "ws-unpreparable").await;
+        let err = result.err().expect("setup must fail");
+        assert!(
+            matches!(&err, WorkspaceError::ContainerSetupFailed(_)),
+            "{err:?}"
+        );
+        let listing = git_cmd(source.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains("ws-unpreparable"));
+    }
+
+    #[test]
+    fn test_protected_mounts_leave_existing_roots_untouched() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna/agents")).unwrap();
+        std::fs::write(dir.path().join(".nanna/agents/x.toml"), "keep").unwrap();
+        std::fs::write(dir.path().join("codecov.yml"), "coverage: {}").unwrap();
+        let protected = ProtectedPaths::with_config_dir(dir.path(), None);
+
+        let shielded = protected_mounts(&protected, dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".nanna/agents/x.toml")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("codecov.yml")).unwrap(),
+            "coverage: {}"
+        );
+        let mut placeholders = shielded.placeholders.clone();
+        placeholders.sort();
+        assert_eq!(
+            placeholders,
+            sorted_placeholder_files()
+                .into_iter()
+                .filter(|path| path != Path::new("codecov.yml"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
+    }
+
+    #[test]
+    fn test_protected_mounts_report_an_unwritable_parent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("docs"), "file").unwrap();
+        let protected = ProtectedPaths::with_config_dir(dir.path(), None);
+        let err = protected_mounts(&protected, dir.path()).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_with_container_using_mounts_protected_roots_read_only() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".nanna/agents")).unwrap();
+        std::fs::write(source.path().join(".nanna/agents/x.toml"), "").unwrap();
+        std::fs::write(source.path().join("codecov.yml"), "coverage: {}").unwrap();
+        git_cmd(source.path()).args(["add", "."]).output().unwrap();
+        git_cmd(source.path())
+            .args(["commit", "-m", "config"])
+            .output()
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-ro"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        let root = ws.workspace_path.clone();
+        assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
+        let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
+        let workspace_mount = args
+            .iter()
+            .position(|a| a.ends_with(":/workspace:z"))
+            .unwrap();
+        let ro_mount = args
+            .iter()
+            .position(|a| a.ends_with("/workspace/.nanna:ro"))
+            .unwrap();
+        assert!(ro_mount > workspace_mount);
+        if let Some(config_dir) = ws.protected().config_dir() {
+            let config_dir = config_dir.to_string_lossy().into_owned();
+            assert!(args.iter().all(|a| !a.contains(&config_dir)), "{args:?}");
+        }
+        ws.cleanup().unwrap();
+    }
+
+    #[test]
+    fn test_changed_paths_reports_a_git_failure() {
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-broken"), "HEAD").unwrap();
+        let git_file = ws.workspace_path.join(".git");
+        let original = std::fs::read(&git_file).unwrap();
+        std::fs::write(&git_file, "gitdir: /nonexistent/worktree").unwrap();
+
+        let err = ws.changed_paths().unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::ExtractChangesFailed(_)),
+            "{err:?}"
+        );
+
+        std::fs::write(&git_file, original).unwrap();
+        ws.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_changed_paths_reports_the_unquoted_name_of_a_non_ascii_protected_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        let mut ws =
+            TaskWorkspace::create(source.path(), &unique_id("ws-nonascii"), "HEAD").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b".nanna/agents/\xc3\xa9.toml");
+        let dir = ws.workspace_path.join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(ws.workspace_path.join(name), "[identity]").unwrap();
+        git_cmd(&ws.workspace_path)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+
+        let paths = ws.changed_paths().unwrap();
+        assert!(
+            paths.iter().any(|p| p == ".nanna/agents/\u{e9}.toml"),
+            "expected an unquoted non-ASCII path, got {paths:?}"
+        );
+        let violation = protected_violation(ws.extract_changes().unwrap_err());
+        assert_eq!(violation.rule, ".nanna/**");
+        ws.cleanup().unwrap();
+    }
+
+    mod apps {
+        use super::*;
+        use crate::apprun::{
+            AppInstance, Limits, PortAllocator, RunningApps, APP_LOGS_TOOL, APP_START_TOOL,
+            APP_STOP_TOOL,
+        };
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        use crate::sidecar::{CommandRunner, RunOutput};
+        use std::sync::Mutex;
+
+        const BUILD_JSON: &str = r#"{"reason":"compiler-artifact","executable":"/t/debug/api"}"#;
+
+        struct HealthyRunner {
+            scripts: Mutex<Vec<String>>,
+        }
+
+        impl HealthyRunner {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    scripts: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn scripts(&self) -> Vec<String> {
+                self.scripts.lock().unwrap().clone()
+            }
+        }
+
+        impl CommandRunner for HealthyRunner {
+            fn run(&self, _: &str, args: &[String]) -> std::io::Result<RunOutput> {
+                let last = args.last().cloned().unwrap_or_default();
+                self.scripts.lock().unwrap().push(args.join(" "));
+                let stdout = if args.iter().any(|a| a == "cargo") {
+                    BUILD_JSON
+                } else if last.contains("nohup") {
+                    "99\n"
+                } else {
+                    ""
+                };
+                Ok(RunOutput {
+                    success: true,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn copy_dir_all(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if name == "target" || name == "dist" || name == ".git" {
+                    continue;
+                }
+                let target = dst.join(&name);
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir_all(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        fn fixture_repo() -> TempDir {
+            let source = TempDir::new().unwrap();
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/fullstack");
+            copy_dir_all(&fixture, source.path());
+            init_git_repo(source.path());
+            source
+        }
+
+        fn stub_handle() -> Arc<ContainerHandle> {
+            Arc::new(ContainerHandle {
+                name: "app-test-container".to_string(),
+                runtime: ContainerRuntime::Podman,
+                port: None,
+                needs_cleanup: false,
+            })
+        }
+
+        fn fullstack_workspace(
+            source: &Path,
+            runner: Arc<HealthyRunner>,
+            allocator: Arc<PortAllocator>,
+            prefix: &str,
+        ) -> TaskWorkspace {
+            let mut ws = TaskWorkspace::create(source, &unique_id(prefix), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            ws.set_app_runner(runner);
+            ws.set_port_allocator(allocator);
+            ws
+        }
+
+        #[test]
+        fn app_tools_registered_only_for_full_stack_profile_in_a_container() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-host"), "HEAD").unwrap();
+            let registry = ws.build_tool_registry();
+            assert!(
+                registry.get_tool(APP_START_TOOL).is_none(),
+                "no container, no app tools"
+            );
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            for name in [APP_START_TOOL, APP_STOP_TOOL, APP_LOGS_TOOL] {
+                assert!(registry.get_tool(name).is_some(), "{name} missing");
+            }
+            for name in [crate::qa::QA_ENDPOINTS_TOOL, crate::qa::QA_BROWSER_TOOL] {
+                assert!(registry.get_tool(name).is_some(), "{name} missing");
+            }
+            assert!(registry.get_tool("trunk_build").is_some());
+            ws.cleanup().unwrap();
+
+            let plain = TempDir::new().unwrap();
+            init_git_repo(plain.path());
+            let mut ws =
+                TaskWorkspace::create(plain.path(), &unique_id("ws-apps-plain"), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            assert!(
+                registry.get_tool(APP_START_TOOL).is_none(),
+                "plain repo has no app tools"
+            );
+            for name in [crate::qa::QA_ENDPOINTS_TOOL, crate::qa::QA_BROWSER_TOOL] {
+                assert!(
+                    registry.get_tool(name).is_none(),
+                    "plain repo has no {name}"
+                );
+            }
+            assert!(registry.get_tool("run_command").is_some());
+            ws.cleanup().unwrap();
+        }
+
+        #[test]
+        fn malformed_manifest_skips_app_tools_but_keeps_the_registry() {
+            let source = fixture_repo();
+            std::fs::write(source.path().join("Cargo.toml"), "[workspace\n").unwrap();
+            git_cmd(source.path())
+                .args(["commit", "-qam", "break"])
+                .output()
+                .unwrap();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-broken"), "HEAD").unwrap();
+            ws.container_handle = Some(stub_handle());
+            let registry = ws.build_tool_registry();
+            assert!(registry.get_tool(APP_START_TOOL).is_none());
+            assert!(registry.get_tool(crate::qa::QA_ENDPOINTS_TOOL).is_none());
+            assert!(registry.get_tool(crate::qa::QA_BROWSER_TOOL).is_none());
+            assert!(registry.get_tool("run_command").is_some());
+            ws.cleanup().unwrap();
+        }
+
+        #[tokio::test]
+        async fn cleanup_stops_a_forgotten_app_and_releases_its_port() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                43000..=43001,
+                leases.path(),
+                |_| true,
+            ));
+            let runner = HealthyRunner::new();
+            let mut ws = fullstack_workspace(
+                source.path(),
+                Arc::clone(&runner),
+                Arc::clone(&allocator),
+                "ws-apps-forgot",
+            );
+            ws.set_app_limits(Some(Limits {
+                max_wall_clock_secs: 30,
+            }));
+            let registry = ws.build_tool_registry();
+            let started = registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(started["port"], 43000);
+            assert_eq!(started["pid"], 99);
+            assert!(
+                runner
+                    .scripts()
+                    .iter()
+                    .any(|s| s.ends_with("timeout 30 trunk build")),
+                "limits reach the tools: {:?}",
+                runner.scripts()
+            );
+            let apps = ws.running_apps();
+            assert_eq!(apps.len(), 1);
+            assert_eq!(apps.get(&ws.task_id).map(|a| a.pid), Some(99));
+            ws.cleanup().unwrap();
+            assert!(
+                runner
+                    .scripts()
+                    .iter()
+                    .any(|s| s.ends_with("sh -c kill 99")),
+                "cleanup kills the app: {:?}",
+                runner.scripts()
+            );
+            assert!(apps.is_empty());
+            assert!(allocator.held().is_empty());
+            assert!(!ws.workspace_path.exists());
+        }
+
+        #[tokio::test]
+        async fn two_workspaces_get_distinct_ports() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                44000..=44009,
+                leases.path(),
+                |_| true,
+            ));
+            let mut a = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-apps-a",
+            );
+            let mut b = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-apps-b",
+            );
+            let ra = a.build_tool_registry();
+            let rb = b.build_tool_registry();
+            let (sa, sb) = tokio::join!(
+                ra.execute(APP_START_TOOL, serde_json::Value::Null),
+                rb.execute(APP_START_TOOL, serde_json::Value::Null)
+            );
+            let (sa, sb) = (sa.unwrap(), sb.unwrap());
+            assert_ne!(sa["port"], sb["port"]);
+            assert_ne!(sa["base_url"], sb["base_url"]);
+            assert_eq!(allocator.held().len(), 2);
+            a.cleanup().unwrap();
+            assert_eq!(allocator.held().len(), 1);
+            b.cleanup().unwrap();
+            assert!(allocator.held().is_empty());
+        }
+
+        #[test]
+        fn cleanup_tolerates_a_failing_stop() {
+            struct Broken;
+            impl CommandRunner for Broken {
+                fn run(&self, _: &str, _: &[String]) -> std::io::Result<RunOutput> {
+                    Err(std::io::Error::other("no runtime"))
+                }
+            }
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                45000..=45000,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-brokenstop"), "HEAD")
+                    .unwrap();
+            ws.container_handle = Some(stub_handle());
+            ws.set_app_runner(Arc::new(Broken));
+            let lease = allocator.allocate(&ws.task_id).unwrap();
+            ws.running_apps().insert(
+                AppInstance::local(&ws.task_id, lease.port(), 7, "/l"),
+                lease,
+            );
+            ws.cleanup().unwrap();
+            assert!(!ws.workspace_path.exists());
+        }
+
+        struct StubHttpProbe {
+            responses: std::collections::HashMap<String, (u16, String)>,
+        }
+
+        impl crate::qa::HttpProbe for StubHttpProbe {
+            fn get(&self, url: &str) -> Result<crate::qa::ProbeResponse, crate::qa::ProbeError> {
+                self.responses
+                    .get(url)
+                    .map(|(status, body)| crate::qa::ProbeResponse {
+                        status: *status,
+                        body: body.clone(),
+                    })
+                    .ok_or_else(|| crate::qa::ProbeError::Request {
+                        url: url.to_string(),
+                        detail: "unscripted request".to_string(),
+                    })
+            }
+        }
+
+        #[tokio::test]
+        async fn qa_tools_run_against_the_started_app_using_the_repository_manifest() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46000..=46000,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-checks",
+            );
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46000/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46000/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46000/api/v1/greeting".to_string(),
+                (200, "Hello from the full-stack fixture".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let page = crate::qa::browser::stub::StubPage::new(&[
+                serde_json::json!("complete"),
+                serde_json::json!(true),
+                serde_json::json!("Hello from the full-stack fixture"),
+            ]);
+            ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let endpoints = registry
+                .execute(crate::qa::QA_ENDPOINTS_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(endpoints["manifest"], "CHECKS");
+            assert_eq!(endpoints["all_passed"], true, "{endpoints}");
+            let scenario = serde_json::json!({ "steps": [
+                { "step": "goto", "path": "/" },
+                { "step": "expect_text", "selector": "#greeting", "text": "Hello" }
+            ] });
+            let browser = registry
+                .execute(
+                    crate::qa::QA_BROWSER_TOOL,
+                    serde_json::json!({ "scenario": scenario }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(browser["passed"], true, "{browser}");
+            let summary = ws.qa_summary();
+            assert_eq!(summary.endpoint_runs, 1);
+            assert_eq!(summary.browser_runs, 1);
+            assert_eq!(summary.artifacts.len(), 2);
+            ws.cleanup().unwrap();
+        }
+
+        #[tokio::test]
+        async fn qa_click_and_type_evidence_survives_cleanup_in_the_persisted_report() {
+            let source = fixture_repo();
+            let leases = TempDir::new().unwrap();
+            let store = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46200..=46200,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-click-type",
+            );
+            ws.set_artifact_store(store.path().to_path_buf());
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46200/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46200/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let page = crate::qa::browser::stub::StubPage::new(&[
+                serde_json::json!("complete"),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!(true),
+                serde_json::json!("Hello, Nanna"),
+            ]);
+            let calls = Arc::clone(&page.calls);
+            ws.set_qa_driver(crate::qa::browser::stub::StubDriver::new(vec![page]));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let scenario = serde_json::json!({ "steps": [
+                { "step": "goto", "path": "/" },
+                { "step": "click", "selector": "#bump" },
+                { "step": "type", "selector": "#name", "text": "Nanna" },
+                { "step": "expect_text", "selector": "#greeting", "text": "Hello" },
+                { "step": "screenshot", "name": "after-typing" }
+            ] });
+            let browser = registry
+                .execute(
+                    crate::qa::QA_BROWSER_TOOL,
+                    serde_json::json!({ "scenario": scenario }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(browser["passed"], true, "{browser}");
+
+            let summary = ws.persist_qa_summary();
+            let worktree = ws.workspace_path.clone();
+            ws.cleanup().unwrap();
+
+            assert!(!worktree.exists(), "worktree must be gone");
+            assert_eq!(summary.browser_runs, 1);
+            assert_eq!(summary.browser_steps_passed, 5);
+            assert_eq!(summary.browser_steps_failed, 0);
+            let persisted = ws.persisted_qa_dir();
+            assert_eq!(summary.artifacts.len(), 2);
+            for artifact in &summary.artifacts {
+                assert!(Path::new(artifact).starts_with(&persisted), "{artifact}");
+                assert!(Path::new(artifact).is_file(), "{artifact}");
+            }
+            let report_path = persisted.join("browser-1/report.json");
+            assert_eq!(Path::new(&summary.artifacts[0]), report_path.as_path());
+            assert!(persisted.join("browser-1/after-typing.png").is_file());
+            let report: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+            assert_eq!(report["passed"], true);
+            let steps = report["steps"].as_array().unwrap();
+            let outcome = |kind: &str| {
+                steps
+                    .iter()
+                    .find(|s| s["step"]["step"] == kind)
+                    .unwrap_or_else(|| panic!("no {kind} step in {report}"))
+            };
+            let click = outcome("click");
+            assert_eq!(click["step"]["selector"], "#bump");
+            assert_eq!(click["passed"], true);
+            assert_eq!(click["detail"], "clicked `#bump`");
+            let typed = outcome("type");
+            assert_eq!(typed["step"]["selector"], "#name");
+            assert_eq!(typed["step"]["text"], "Nanna");
+            assert_eq!(typed["passed"], true);
+            assert_eq!(typed["detail"], "typed `Nanna` into `#name`");
+            let calls = calls.lock().unwrap().clone();
+            let click_call = format!("evaluate {}", crate::qa::browser::click_expression("#bump"));
+            let type_call = format!(
+                "evaluate {}",
+                crate::qa::browser::type_expression("#name", "Nanna")
+            );
+            assert_eq!(calls.iter().filter(|c| **c == click_call).count(), 1);
+            assert_eq!(calls.iter().filter(|c| **c == type_call).count(), 1);
+        }
+
+        #[tokio::test]
+        async fn qa_endpoints_derives_a_manifest_when_the_repo_has_no_checks_file() {
+            let source = fixture_repo();
+            std::fs::remove_file(source.path().join("CHECKS")).unwrap();
+            git_cmd(source.path())
+                .args(["commit", "-qam", "drop checks"])
+                .output()
+                .unwrap();
+            let leases = TempDir::new().unwrap();
+            let allocator = Arc::new(PortAllocator::with_probe(
+                46100..=46100,
+                leases.path(),
+                |_| true,
+            ));
+            let mut ws = fullstack_workspace(
+                source.path(),
+                HealthyRunner::new(),
+                Arc::clone(&allocator),
+                "ws-qa-derived",
+            );
+            let mut responses = std::collections::HashMap::new();
+            responses.insert(
+                "http://127.0.0.1:46100/".to_string(),
+                (200u16, "<html>".to_string()),
+            );
+            responses.insert(
+                "http://127.0.0.1:46100/health/v1".to_string(),
+                (200, "{\"status\":\"ok\"}".to_string()),
+            );
+            ws.set_qa_probe(Arc::new(StubHttpProbe { responses }));
+            let registry = ws.build_tool_registry();
+            registry
+                .execute(APP_START_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            let endpoints = registry
+                .execute(crate::qa::QA_ENDPOINTS_TOOL, serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(endpoints["manifest"], "derived");
+            assert_eq!(endpoints["passed"], 2, "{endpoints}");
+            assert_eq!(endpoints["all_passed"], true, "{endpoints}");
+            ws.cleanup().unwrap();
+        }
+
+        #[test]
+        fn app_env_appends_extra_vars_after_sidecar_exports() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-app-env"), "HEAD").unwrap();
+            assert!(ws.app_env().is_empty());
+            ws.set_app_env(vec![("FIXTURE_BREAK_ROUTE".to_string(), "1".to_string())]);
+            assert_eq!(
+                ws.app_env(),
+                vec![("FIXTURE_BREAK_ROUTE".to_string(), "1".to_string())]
+            );
+            ws.cleanup().unwrap();
+        }
+
+        #[test]
+        fn app_limits_default_when_unset() {
+            let source = fixture_repo();
+            let mut ws =
+                TaskWorkspace::create(source.path(), &unique_id("ws-apps-limits"), "HEAD").unwrap();
+            assert_eq!(ws.app_limits(), Limits::default());
+            ws.set_app_limits(Some(Limits {
+                max_wall_clock_secs: 5,
+            }));
+            assert_eq!(ws.app_limits().max_wall_clock_secs, 5);
+            ws.set_app_limits(None);
+            assert_eq!(ws.app_limits(), Limits::default());
+            assert!(Arc::ptr_eq(&ws.running_apps(), &ws.running_apps()));
+            let _: &RunningApps = &ws.running_apps();
+            ws.cleanup().unwrap();
+        }
     }
 }

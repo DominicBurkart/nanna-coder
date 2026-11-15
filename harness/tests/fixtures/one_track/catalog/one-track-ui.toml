@@ -1,0 +1,18 @@
+[identity]
+name = "one-track-ui"
+description = "Implements a scoped change in the one_track ui tree."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = "prompts/one-track-ui.md"
+
+[scope]
+repos = ["github.com/1-Track/one_track"]
+paths = ["ui/**"]
+read_paths = ["api/**", "ui/**", "shared/**", "e2ee/**", "cli/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "CLAUDE.md", "architecture.md"]
+max_effect = "workspace"
+tools = ["read_file", "write_file", "list_directory", "search", "git_status", "git_diff", "cargo_check", "cargo_test", "cargo_build", "trunk_build"]
+
+[limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4

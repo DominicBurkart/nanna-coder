@@ -77,6 +77,9 @@ pub struct LeaseContext<'a> {
     pub pr: Option<u64>,
     /// Environment rolled out to, for production effects.
     pub environment: Option<&'a str>,
+    /// Image rolled out, for production effects. When set the deploy lease
+    /// is [`LeaseName::deploy_image`], the key rollout plans use.
+    pub image: Option<&'a str>,
     /// Path globs the action edits; a non-empty set adds a `paths` lease to
     /// every effect at or above `Repository`.
     pub paths: &'a [String],
@@ -92,7 +95,7 @@ pub struct LeaseContext<'a> {
 /// use harness::leases::{required_leases, Effect, LeaseContext, LeaseError, LeaseName};
 ///
 /// let paths = vec!["src/**".to_string()];
-/// let ctx = LeaseContext { repo: "example/repo", branch: Some("main"), pr: Some(7), environment: Some("prod"), paths: &paths };
+/// let ctx = LeaseContext { repo: "example/repo", branch: Some("main"), pr: Some(7), environment: Some("prod"), image: None, paths: &paths };
 ///
 /// assert!(required_leases(Effect::Local, &ctx).unwrap().is_empty());
 /// assert_eq!(
@@ -115,7 +118,11 @@ pub fn required_leases(effect: Effect, ctx: &LeaseContext) -> Result<Vec<LeaseNa
         Effect::Repository => LeaseName::branch(ctx.repo, ctx.branch.ok_or(missing("branch"))?),
         Effect::Sandbox => LeaseName::sandbox(ctx.repo, ctx.pr.ok_or(missing("pr"))?),
         Effect::Production => {
-            LeaseName::deploy(ctx.repo, ctx.environment.ok_or(missing("environment"))?)
+            let environment = ctx.environment.ok_or(missing("environment"))?;
+            match ctx.image {
+                Some(image) => LeaseName::deploy_image(ctx.repo, image, environment),
+                None => LeaseName::deploy(ctx.repo, environment),
+            }
         }
     };
     let mut names = vec![primary];
@@ -136,6 +143,7 @@ mod tests {
             branch: Some("feat/x"),
             pr: Some(12),
             environment: Some("staging"),
+            image: None,
             paths,
         }
     }
@@ -156,6 +164,27 @@ mod tests {
         assert_eq!(
             required_leases(Effect::Production, &c).unwrap(),
             vec![LeaseName::deploy("example/repo", "staging")]
+        );
+    }
+
+    #[test]
+    fn an_image_keys_the_production_lease_by_repo_and_image() {
+        let none: Vec<String> = vec![];
+        let with_image = LeaseContext {
+            image: Some("app"),
+            ..ctx(&none)
+        };
+        assert_eq!(
+            required_leases(Effect::Production, &with_image).unwrap(),
+            vec![LeaseName::deploy_image("example/repo", "app", "staging")]
+        );
+        let other_repo = LeaseContext {
+            repo: "example/other",
+            ..with_image
+        };
+        assert_ne!(
+            required_leases(Effect::Production, &other_repo).unwrap(),
+            required_leases(Effect::Production, &with_image).unwrap()
         );
     }
 

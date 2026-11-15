@@ -313,6 +313,7 @@ async fn test_enhanced_containerized_ollama_qwen3() {
         env_vars: vec![],
         additional_args: vec![],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     // Start container with smart fallback
@@ -729,6 +730,7 @@ async fn test_container_configuration() {
         ],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     assert_eq!(custom_config.base_image, "custom/image:latest");
@@ -772,6 +774,7 @@ async fn test_e2e_container_to_validated_inference() {
         env_vars: vec![("OLLAMA_MODELS".to_string(), "/models".to_string())],
         additional_args: vec!["--memory".to_string(), "2g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1061,6 +1064,7 @@ async fn test_e2e_multi_model_comparison() {
             env_vars: vec![],
             additional_args: vec![],
             network: harness::container::NetworkPolicy::Enabled,
+            read_only_mounts: vec![],
         };
 
         let _container_handle = match start_container_with_fallback(&config).await {
@@ -1178,6 +1182,7 @@ async fn test_e2e_performance_and_reliability() {
         ],
         additional_args: vec!["--memory".to_string(), "4g".to_string()],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1767,6 +1772,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         env_vars: vec![],
         additional_args: vec![],
         network: harness::container::NetworkPolicy::Enabled,
+        read_only_mounts: vec![],
     };
 
     let container_handle = match start_container_with_fallback(&config).await {
@@ -1910,6 +1916,63 @@ fn init_test_git_repo(dir: &Path) {
     );
 }
 
+const AUDITED_REPO: &str = "github.com/example/repo";
+const AUDITED_MODEL: &str = "gemma4:e4b";
+
+async fn submit_audited(
+    manager: &TaskManager,
+    subtask: &str,
+    repo_path: std::path::PathBuf,
+    max_iterations: usize,
+    provider: Arc<dyn ModelProvider>,
+) -> harness::task::TaskId {
+    use harness::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    use harness::identity::{DevLoop, IdentityCatalog};
+
+    let has_origin = git_cmd_clean(&repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    if !has_origin {
+        let remote = git_cmd_clean(&repo_path)
+            .args(["remote", "add", "origin", "git@github.com:example/repo.git"])
+            .output()
+            .unwrap();
+        assert!(remote.status.success());
+    }
+    let catalog = IdentityCatalog::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/identities/global"
+    ))
+    .unwrap();
+    let auditor = catalog.get("auditor").unwrap().clone();
+    let context = AuditContext::new(catalog, auditor).unwrap();
+    let request = SpawnRequest {
+        parent_task: TaskSummary::new("parent", "Parent task", AUDITED_REPO),
+        identity: "rust-implementer".to_string(),
+        subtask: subtask.to_string(),
+        dev_loop: DevLoop::Inner,
+        requested_effect: harness::effects::EffectClass::Workspace,
+    };
+    let allowed = Gate::new(RuleAuditor::new(), AuditLog::in_memory())
+        .check(request, &context)
+        .await
+        .unwrap();
+    manager
+        .submit_spawn(
+            allowed,
+            repo_path,
+            "HEAD".to_string(),
+            AUDITED_MODEL.to_string(),
+            max_iterations,
+            provider,
+        )
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn test_e2e_task_lifecycle_success() {
     let repo_dir = tempfile::TempDir::new().unwrap();
@@ -1920,16 +1983,14 @@ async fn test_e2e_task_lifecycle_success() {
         wrap_with_state_machine_responses(vec![make_stop_response("Task completed successfully")]),
     ));
 
-    let task_id = manager
-        .submit(
-            "Echo hello world".to_string(),
-            repo_dir.path().to_path_buf(),
-            "HEAD".to_string(),
-            "test-model".to_string(),
-            10,
-            Arc::clone(&provider),
-        )
-        .await;
+    let task_id = submit_audited(
+        &manager,
+        "Echo hello world",
+        repo_dir.path().to_path_buf(),
+        10,
+        Arc::clone(&provider),
+    )
+    .await;
 
     let final_status = timeout(Duration::from_secs(10), manager.wait_terminal(&task_id))
         .await
@@ -1942,7 +2003,7 @@ async fn test_e2e_task_lifecycle_success() {
         final_status
     );
     if let TaskStatus::Completed { result, .. } = final_status {
-        assert_eq!(result.model_used, "test-model");
+        assert_eq!(result.model_used, AUDITED_MODEL);
         assert!(result
             .result_summary
             .contains("Task completed successfully"));
@@ -1957,16 +2018,14 @@ async fn test_e2e_task_lifecycle_failure() {
     let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(vec![]));
 
-    let task_id = manager
-        .submit(
-            "A task that will fail".to_string(),
-            repo_dir.path().to_path_buf(),
-            "HEAD".to_string(),
-            "test-model".to_string(),
-            0,
-            Arc::clone(&provider),
-        )
-        .await;
+    let task_id = submit_audited(
+        &manager,
+        "A task that will fail",
+        repo_dir.path().to_path_buf(),
+        0,
+        Arc::clone(&provider),
+    )
+    .await;
 
     let final_status = timeout(Duration::from_secs(10), manager.wait_terminal(&task_id))
         .await
@@ -1999,16 +2058,14 @@ async fn test_e2e_task_working_before_terminal_then_result() {
         wrap_with_state_machine_responses(vec![make_stop_response("done")]),
     ));
 
-    let task_id = manager
-        .submit(
-            "Queued task".to_string(),
-            repo_dir.path().to_path_buf(),
-            "HEAD".to_string(),
-            "test-model".to_string(),
-            10,
-            Arc::clone(&provider),
-        )
-        .await;
+    let task_id = submit_audited(
+        &manager,
+        "Queued task",
+        repo_dir.path().to_path_buf(),
+        10,
+        Arc::clone(&provider),
+    )
+    .await;
 
     // With zero permits the worker cannot run: the task is non-terminal.
     let task = manager.poll(&task_id).await.expect("task should exist");
@@ -2037,26 +2094,16 @@ async fn test_e2e_multiple_concurrent_tasks_complete_independently() {
     ));
 
     let repo_path = repo_dir.path().to_path_buf();
-    let task_id_a = manager
-        .submit(
-            "Task A".to_string(),
-            repo_path.clone(),
-            "HEAD".to_string(),
-            "test-model".to_string(),
-            10,
-            Arc::clone(&provider_a),
-        )
-        .await;
-    let task_id_b = manager
-        .submit(
-            "Task B".to_string(),
-            repo_path,
-            "HEAD".to_string(),
-            "test-model".to_string(),
-            10,
-            Arc::clone(&provider_b),
-        )
-        .await;
+    let task_id_a = submit_audited(
+        &manager,
+        "Task A",
+        repo_path.clone(),
+        10,
+        Arc::clone(&provider_a),
+    )
+    .await;
+    let task_id_b =
+        submit_audited(&manager, "Task B", repo_path, 10, Arc::clone(&provider_b)).await;
 
     assert_ne!(task_id_a, task_id_b);
 

@@ -1,0 +1,20 @@
+[case]
+id = "block-effect-above-ceiling"
+name = "Requested effect exceeds the card's ceiling, another card covers it"
+description = "rust-implementer is capped at repository; the planner asked for ci, which pr-shepherd already covers."
+
+[request]
+parent_task_id = "task-8"
+parent_task_description = "Keep PR #42 green"
+parent_task_repo = "github.com/example/repo"
+identity = "rust-implementer"
+subtask = "Run the full CI matrix for the branch."
+dev_loop = "inner"
+requested_effect = "ci"
+
+[expected]
+verdict = "block"
+reason_codes = ["effect_above_ceiling"]
+
+[metadata]
+tags = ["block", "scope-creep"]

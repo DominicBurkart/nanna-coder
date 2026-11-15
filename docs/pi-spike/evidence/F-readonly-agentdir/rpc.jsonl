@@ -1,0 +1,1 @@
+{"id":"task","type":"response","command":"prompt","success":false,"error":"Credential store read failed for nanna: EROFS: read-only file system, open '/nanna/pi/auth.json'"}

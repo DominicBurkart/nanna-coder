@@ -118,6 +118,14 @@
             (pkgs.lib.hasSuffix "\.toml" path) ||
             (pkgs.lib.hasSuffix "\.lock" path) ||
             (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
+            (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci.yml" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
+            (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
+            (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
+            (pkgs.lib.hasInfix "/docs/" path) ||
+            (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
             (type == "directory");
         };
 
@@ -216,12 +224,14 @@
 
         # Checks for CI/CD
         checks = {
+          dev-container-cmd = containers.devContainerCmdCheck;
+
           # Workspace-wide checks
           workspace-test = craneLib.cargoTest {
             inherit src;
             cargoArtifacts = packages.cargoArtifacts;
             buildInputs = packages.commonBuildInputs;
-            nativeBuildInputs = packages.commonNativeBuildInputs;
+            nativeBuildInputs = packages.commonNativeBuildInputs ++ [ pkgs.jq ];
             cargoTestCommand = "cargo test --workspace";
           };
 
@@ -252,7 +262,7 @@
 
           workspace-coverage = pkgs.runCommand "cargo-tarpaulin-coverage" {
             buildInputs = [ pkgs.cargo-tarpaulin rustToolchain ] ++ packages.commonBuildInputs;
-            nativeBuildInputs = packages.commonNativeBuildInputs;
+            nativeBuildInputs = packages.commonNativeBuildInputs ++ [ pkgs.jq ];
           } ''
             cd ${src}
             export CARGO_HOME=$(mktemp -d)
@@ -303,6 +313,14 @@
               (pkgs.lib.hasSuffix "\.toml" path) ||
               (pkgs.lib.hasSuffix "\.lock" path) ||
               (pkgs.lib.hasInfix "/tests/fixtures/" path) ||
+              (pkgs.lib.hasSuffix "/.github/CODEOWNERS" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci.yml" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci-gate.sh" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
+              (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
+              (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
+              (pkgs.lib.hasInfix "/docs/" path) ||
+              (pkgs.lib.hasInfix "/evals/scorecards/" path) ||
               (type == "directory");
           };
 
@@ -317,6 +335,7 @@
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+            nativeCheckInputs = [ pkgs.jq ];
             cargoBuildCommand = "cargo build --workspace --release";
             cargoCheckCommand = "cargo check --workspace";
             cargoTestCommand = "cargo test --workspace";
@@ -326,6 +345,7 @@
             inherit src cargoArtifacts;
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+            nativeCheckInputs = [ pkgs.jq ];
             cargoBuildCommand = "cargo build --release --bin nanna";
             cargoCheckCommand = "cargo check --bin nanna";
             cargoTestCommand = "cargo test --package harness";
@@ -347,6 +367,7 @@
                     inherit src cargoArtifacts;
                     buildInputs = commonBuildInputs;
                     nativeBuildInputs = commonNativeBuildInputs;
+                    nativeCheckInputs = [ pkgs.jq ];
                     cargoBuildCommand = "cargo build --release --bin nanna";
                     installPhase = ''
                       mkdir -p $out/bin
@@ -403,6 +424,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
@@ -418,6 +440,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin
@@ -433,6 +456,7 @@
               inherit src cargoArtifacts;
               buildInputs = commonBuildInputs;
               nativeBuildInputs = commonNativeBuildInputs;
+              nativeCheckInputs = [ pkgs.jq ];
               cargoBuildCommand = "cargo build --release --bin nanna";
               installPhase = ''
                 mkdir -p $out/bin

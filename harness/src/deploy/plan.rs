@@ -1,9 +1,11 @@
 use super::template::{DeployTemplate, Health, RiskClass, Rollback, Shadow, Strategy};
-use super::{is_production_env, DeployError};
-use crate::windows::WINDOWS_FILE_NAME;
+use super::{is_production_env, repo_identity, DeployError};
+use crate::leases::LeaseName;
+use crate::windows::WindowSet;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
@@ -19,7 +21,107 @@ pub enum Precondition {
     LeaseHeld(String),
 }
 
+/// The kind of a [`Precondition`], without its argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreconditionKind {
+    /// [`Precondition::WindowOpen`].
+    Window,
+    /// [`Precondition::HealthOk`].
+    Health,
+    /// [`Precondition::LeaseHeld`].
+    Lease,
+}
+
+impl PreconditionKind {
+    /// Every kind.
+    pub const ALL: [PreconditionKind; 3] = [
+        PreconditionKind::Window,
+        PreconditionKind::Health,
+        PreconditionKind::Lease,
+    ];
+
+    /// Name used in output.
+    pub const fn name(self) -> &'static str {
+        match self {
+            PreconditionKind::Window => "window",
+            PreconditionKind::Health => "health",
+            PreconditionKind::Lease => "lease",
+        }
+    }
+}
+
+/// Which precondition kinds the run path evaluates, which decides whether
+/// plan output is labelled advisory.
+///
+/// ```
+/// use harness::deploy::{Enforcement, PreconditionKind};
+///
+/// assert!(Enforcement::of(|_| true).is_complete());
+/// let partial = Enforcement::of(|kind| kind != PreconditionKind::Lease);
+/// assert!(!partial.is_complete());
+/// assert_eq!(partial.unenforced(), [PreconditionKind::Lease]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Enforcement {
+    window: bool,
+    health: bool,
+    lease: bool,
+}
+
+impl Enforcement {
+    /// Enforcement as decided by `enforced` for each kind.
+    pub fn of(enforced: impl Fn(PreconditionKind) -> bool) -> Self {
+        Self {
+            window: enforced(PreconditionKind::Window),
+            health: enforced(PreconditionKind::Health),
+            lease: enforced(PreconditionKind::Lease),
+        }
+    }
+
+    /// Whether `kind` is evaluated before each step.
+    pub fn enforces(&self, kind: PreconditionKind) -> bool {
+        match kind {
+            PreconditionKind::Window => self.window,
+            PreconditionKind::Health => self.health,
+            PreconditionKind::Lease => self.lease,
+        }
+    }
+
+    /// The kinds that are declared but not evaluated.
+    pub fn unenforced(&self) -> Vec<PreconditionKind> {
+        PreconditionKind::ALL
+            .into_iter()
+            .filter(|kind| !self.enforces(*kind))
+            .collect()
+    }
+
+    /// True when every kind is evaluated, so output needs no advisory label.
+    pub fn is_complete(&self) -> bool {
+        self.unenforced().is_empty()
+    }
+
+    fn label(&self) -> Option<String> {
+        let names = self
+            .unenforced()
+            .into_iter()
+            .map(PreconditionKind::name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        (!self.is_complete())
+            .then(|| format!("advisory only: {names} preconditions are declared, not enforced"))
+    }
+}
+
 impl Precondition {
+    /// The kind of this precondition.
+    pub fn kind(&self) -> PreconditionKind {
+        match self {
+            Precondition::WindowOpen(_) => PreconditionKind::Window,
+            Precondition::HealthOk => PreconditionKind::Health,
+            Precondition::LeaseHeld(_) => PreconditionKind::Lease,
+        }
+    }
+
     fn to_json(&self) -> Value {
         match self {
             Precondition::WindowOpen(name) => json!({ "window_open": name }),
@@ -121,7 +223,7 @@ pub struct DeployPlan {
     pub risk_class: RiskClass,
     /// Strategy the steps implement.
     pub strategy: Strategy,
-    /// Coordination lease every step requires, `deploy:<repo>:<env>`.
+    /// Coordination lease every step requires, `deploy:<repo>/<image>:<env>`.
     pub lease: String,
     /// Health gates polled while a step bakes, when the template has `[health]`.
     pub health: Option<Health>,
@@ -135,12 +237,12 @@ pub struct DeployPlan {
 }
 
 impl DeployPlan {
-    /// The lease name guarding deployments of `repo` to `env`: `deploy:<repo>:<env>`.
-    ///
-    /// The template has no repository identity of its own, so plans use
-    /// `target.image` as `<repo>`.
-    pub fn lease_name(repo: &str, env: &str) -> String {
-        format!("deploy:{repo}:{env}")
+    /// The lease name guarding deployments of `image` from `repo` to `env`:
+    /// `deploy:<repo>/<image>:<env>`, built by [`LeaseName::deploy_image`] so
+    /// it is the same key [`required_leases`](crate::leases::required_leases)
+    /// produces for a production effect.
+    pub fn lease_name(repo: &str, image: &str, env: &str) -> String {
+        LeaseName::deploy_image(repo, image, env).to_string()
     }
 
     /// Sum of every step's hold and bake time.
@@ -164,10 +266,20 @@ impl DeployPlan {
     /// assert!(text.contains("2. retire         hold 2d"));
     /// ```
     pub fn render_text(&self) -> String {
+        self.render_text_with(&crate::rollout::enforcement())
+    }
+
+    /// [`DeployPlan::render_text`] for a given [`Enforcement`]: the advisory
+    /// line appears exactly when some precondition kind is not enforced.
+    pub fn render_text_with(&self, enforcement: &Enforcement) -> String {
         let mut out = format!(
-            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\nadvisory only: preconditions are declared, not enforced (#650, #737, #734)\n",
+            "deploy plan: {} -> {}\nrisk class: {} | strategy: {} | lease: {}\n",
             self.image, self.environment, self.risk_class, self.strategy, self.lease
         );
+        if let Some(label) = enforcement.label() {
+            out.push_str(&label);
+            out.push('\n');
+        }
         for step in &self.steps {
             let requires = step
                 .preconditions
@@ -202,11 +314,22 @@ impl DeployPlan {
     /// let json = template.plan("sandbox").unwrap().to_json();
     /// assert_eq!(json["strategy"], "instant");
     /// assert_eq!(json["steps"][0]["traffic_percent"], 100);
-    /// assert_eq!(json["steps"][0]["preconditions"][0]["lease_held"], "deploy:app:sandbox");
+    /// assert_eq!(json["steps"][0]["preconditions"][0]["lease_held"], "deploy:registry.example.invalid/ns/app:sandbox");
     /// ```
     pub fn to_json(&self) -> Value {
+        self.to_json_with(&crate::rollout::enforcement())
+    }
+
+    /// [`DeployPlan::to_json`] for a given [`Enforcement`]: `advisory` and
+    /// `unenforced` are present exactly when some precondition kind is not
+    /// enforced; `enforcement` always reports each kind.
+    pub fn to_json_with(&self, enforcement: &Enforcement) -> Value {
         let mut value = json!({
-            "advisory": true,
+            "enforcement": {
+                "window": enforcement.enforces(PreconditionKind::Window),
+                "health": enforcement.enforces(PreconditionKind::Health),
+                "lease": enforcement.enforces(PreconditionKind::Lease),
+            },
             "environment": self.environment,
             "image": self.image,
             "risk_class": self.risk_class.name(),
@@ -216,6 +339,14 @@ impl DeployPlan {
             "total_min_duration_seconds": self.total_min_duration().num_seconds(),
             "steps": self.steps.iter().map(DeployStep::to_json).collect::<Vec<_>>(),
         });
+        if !enforcement.is_complete() {
+            value["advisory"] = json!(true);
+            value["unenforced"] = json!(enforcement
+                .unenforced()
+                .into_iter()
+                .map(PreconditionKind::name)
+                .collect::<Vec<_>>());
+        }
         if let Some(shadow) = &self.shadow {
             value["shadow"] = json!({
                 "mirror_percent": shadow.mirror_percent,
@@ -237,30 +368,28 @@ impl DeployPlan {
 /// `score` resolves a derived risk class; a static class ignores it. This
 /// does not check `rollout.windows` against a real [`WindowSet`]: a template
 /// naming a window that does not exist anywhere is accepted. Prefer
-/// [`plan_for_repo_checked`], which validates against a co-located
-/// `windows.toml` when one is present.
+/// [`plan_for_repo_checked`], which validates against the host's windows.
 pub fn plan_for_repo(
     repo: &Path,
     env: &str,
     score: Option<u32>,
 ) -> Result<DeployPlan, DeployError> {
-    DeployTemplate::load_from_repo(repo)?.plan_with_score(env, score)
+    let template = DeployTemplate::load_from_repo(repo)?;
+    let identity = repo_identity(repo).unwrap_or_else(|| template.target.registry.clone());
+    template.plan_for(&identity, env, score)
 }
 
-/// Load `<repo>/.nanna/deploy.toml`, validate `rollout.windows` against
-/// `<repo>/.nanna/windows.toml` when that file exists, and plan a rollout.
+/// Load `<repo>/.nanna/deploy.toml`, validate `rollout.windows` against the
+/// host's windows file ([`host_windows`]) and plan a rollout.
 ///
-/// This is what the `nanna deploy plan` CLI command uses. The result is
-/// advisory only: `windows.toml` lives in the target repository, which agents
-/// can write, so this check must not be read as an enforced gate until the
-/// executor (#650), lease enforcement (#737) and the windows fix (#734) land.
-/// It does catch a `rollout.windows` naming a window that will never open.
-/// When no `windows.toml` is co-located with the template, window names are
-/// not checked, matching [`plan_for_repo`] (Nanna's own window set may live
-/// outside the target repository).
+/// The windows are read from `$NANNA_CONFIG_DIR` (else the XDG config
+/// directory), never from the repository: a `<repo>/.nanna/windows.toml` is
+/// ignored. A production plan that names a window while the host has no
+/// windows file is refused.
 ///
 /// ```
-/// use harness::deploy::{plan_for_repo_checked, DeployError};
+/// use harness::deploy::{plan_for_repo_with_windows, DeployError};
+/// use harness::windows::WindowSet;
 ///
 /// let dir = tempfile::tempdir().unwrap();
 /// std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
@@ -269,12 +398,11 @@ pub fn plan_for_repo(
 ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"instant\"\nwindows = \"not-a-real-window\"\n",
 /// )
 /// .unwrap();
-/// std::fs::write(
-///     dir.path().join(".nanna/windows.toml"),
+/// let host = WindowSet::parse(
 ///     "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
 /// )
 /// .unwrap();
-/// let err = plan_for_repo_checked(dir.path(), "sandbox", None).unwrap_err();
+/// let err = plan_for_repo_with_windows(dir.path(), "sandbox", None, Some(&host)).unwrap_err();
 /// assert!(matches!(err, DeployError::InvalidField { field: "rollout.windows", .. }));
 /// ```
 pub fn plan_for_repo_checked(
@@ -282,18 +410,42 @@ pub fn plan_for_repo_checked(
     env: &str,
     score: Option<u32>,
 ) -> Result<DeployPlan, DeployError> {
+    plan_for_repo_checked_from(repo, env, score, &|key: &str| -> Option<OsString> {
+        std::env::var_os(key)
+    })
+}
+
+pub(super) fn plan_for_repo_checked_from(
+    repo: &Path,
+    env: &str,
+    score: Option<u32>,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<DeployPlan, DeployError> {
+    let windows = super::host_windows_from(lookup)?;
+    plan_for_repo_with_windows(repo, env, score, windows.as_ref())
+}
+
+/// [`plan_for_repo_checked`] against an already loaded host window set.
+/// `None` means the host has no windows: a production plan naming a window
+/// is then refused with [`DeployError::HostWindowsMissing`].
+pub fn plan_for_repo_with_windows(
+    repo: &Path,
+    env: &str,
+    score: Option<u32>,
+    windows: Option<&WindowSet>,
+) -> Result<DeployPlan, DeployError> {
     let template = DeployTemplate::load_from_repo(repo)?;
-    let windows_path = repo.join(super::DEPLOY_DIR).join(WINDOWS_FILE_NAME);
-    if windows_path.is_file() {
-        let windows = crate::windows::WindowSet::load(&windows_path).map_err(|source| {
-            DeployError::WindowSet {
-                path: windows_path,
-                source,
-            }
-        })?;
-        template.validate_against(&windows)?;
+    match (windows, template.rollout.windows.as_ref()) {
+        (Some(windows), _) => template.validate_against(windows)?,
+        (None, Some(window)) if is_production_env(env) => {
+            return Err(DeployError::HostWindowsMissing {
+                window: window.clone(),
+            })
+        }
+        (None, _) => {}
     }
-    template.plan_with_score(env, score)
+    let identity = repo_identity(repo).unwrap_or_else(|| template.target.registry.clone());
+    template.plan_for(&identity, env, score)
 }
 
 impl fmt::Display for DeployPlan {
@@ -343,7 +495,7 @@ impl DeployTemplate {
     /// assert_eq!(
     ///     plan.steps[0].preconditions,
     ///     [
-    ///         Precondition::LeaseHeld("deploy:app:production".into()),
+    ///         Precondition::LeaseHeld("deploy:registry.example.invalid/ns/app:production".into()),
     ///         Precondition::WindowOpen("business-hours".into()),
     ///         Precondition::HealthOk,
     ///     ]
@@ -373,6 +525,30 @@ impl DeployTemplate {
         env: &str,
         score: Option<u32>,
     ) -> Result<DeployPlan, DeployError> {
+        self.plan_for(&self.target.registry, env, score)
+    }
+
+    /// Build the plan for `env` with the deploy lease keyed by `repo` (an
+    /// `owner/name` identity) and the template's image, so repositories that
+    /// share an image name do not share a lease. [`DeployTemplate::plan`]
+    /// uses the target registry as `repo` when no repository is known.
+    ///
+    /// ```
+    /// use harness::deploy::DeployTemplate;
+    ///
+    /// let template = DeployTemplate::parse(
+    ///     "[target]\nkind = \"container-registry+serverless\"\nregistry = \"registry.example.invalid/ns\"\nimage = \"app\"\nenvironments = [\"sandbox\"]\n[risk]\nclass = \"unused\"\n[rollout]\nstrategy = \"instant\"\n",
+    /// )
+    /// .unwrap();
+    /// let plan = template.plan_for("example/repo", "sandbox", None).unwrap();
+    /// assert_eq!(plan.lease, "deploy:example/repo/app:sandbox");
+    /// ```
+    pub fn plan_for(
+        &self,
+        repo: &str,
+        env: &str,
+        score: Option<u32>,
+    ) -> Result<DeployPlan, DeployError> {
         self.validate()?;
         if !self.target.environments.iter().any(|e| e == env) {
             return Err(DeployError::UnknownEnvironment {
@@ -381,7 +557,7 @@ impl DeployTemplate {
             });
         }
         let risk_class = self.resolve_risk(score)?;
-        let lease = DeployPlan::lease_name(&self.target.image, env);
+        let lease = DeployPlan::lease_name(repo, &self.target.image, env);
         let mut preconditions = vec![Precondition::LeaseHeld(lease.clone())];
         if is_production_env(env) {
             preconditions.extend(self.rollout.windows.clone().map(Precondition::WindowOpen));
@@ -489,7 +665,10 @@ mod tests {
         assert_eq!(plan.image, "registry.example.invalid/ns/fullstack-fixture");
         assert_eq!(plan.risk_class, RiskClass::Edge);
         assert_eq!(plan.strategy, Strategy::Gradual);
-        assert_eq!(plan.lease, "deploy:fullstack-fixture:production");
+        assert_eq!(
+            plan.lease,
+            "deploy:registry.example.invalid/ns/fullstack-fixture:production"
+        );
         assert_eq!(percents(&plan), [10, 50, 100]);
         assert_eq!(kinds(&plan), [StepKind::Traffic; 3]);
         assert_eq!(
@@ -502,7 +681,9 @@ mod tests {
             assert_eq!(
                 step.preconditions,
                 [
-                    Precondition::LeaseHeld("deploy:fullstack-fixture:production".into()),
+                    Precondition::LeaseHeld(
+                        "deploy:registry.example.invalid/ns/fullstack-fixture:production".into()
+                    ),
                     Precondition::WindowOpen("business-hours".into()),
                     Precondition::HealthOk
                 ]
@@ -551,12 +732,17 @@ mod tests {
             .unwrap()
             .plan("staging")
             .unwrap();
-        assert_eq!(plan.lease, "deploy:fullstack-fixture:staging");
+        assert_eq!(
+            plan.lease,
+            "deploy:registry.example.invalid/ns/fullstack-fixture:staging"
+        );
         for step in &plan.steps {
             assert_eq!(
                 step.preconditions,
                 [
-                    Precondition::LeaseHeld("deploy:fullstack-fixture:staging".into()),
+                    Precondition::LeaseHeld(
+                        "deploy:registry.example.invalid/ns/fullstack-fixture:staging".into()
+                    ),
                     Precondition::HealthOk
                 ]
             );
@@ -573,7 +759,9 @@ mod tests {
         assert_eq!(plan.steps[0].bake_time, Duration::zero());
         assert_eq!(
             plan.steps[0].preconditions,
-            [Precondition::LeaseHeld("deploy:app:sandbox".into())]
+            [Precondition::LeaseHeld(
+                "deploy:r.invalid/app:sandbox".into()
+            )]
         );
         assert_eq!(plan.total_min_duration(), Duration::zero());
     }
@@ -676,8 +864,8 @@ mod tests {
     #[test]
     fn lease_names_follow_the_documented_form() {
         assert_eq!(
-            DeployPlan::lease_name("app", "production"),
-            "deploy:app:production"
+            DeployPlan::lease_name("example/repo", "app", "production"),
+            "deploy:example/repo/app:production"
         );
     }
 
@@ -690,11 +878,10 @@ mod tests {
             .render_text();
         let expected = "\
 deploy plan: registry.example.invalid/ns/fullstack-fixture -> production
-risk class: edge | strategy: gradual | lease: deploy:fullstack-fixture:production
-advisory only: preconditions are declared, not enforced (#650, #737, #734)
-  1. traffic 10%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
-  2. traffic 50%    hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
-  3. traffic 100%   hold 8h     bake 30m    requires: lease-held(deploy:fullstack-fixture:production), window-open(business-hours), health-ok
+risk class: edge | strategy: gradual | lease: deploy:registry.example.invalid/ns/fullstack-fixture:production
+  1. traffic 10%    hold 8h     bake 30m    requires: lease-held(deploy:registry.example.invalid/ns/fullstack-fixture:production), window-open(business-hours), health-ok
+  2. traffic 50%    hold 8h     bake 30m    requires: lease-held(deploy:registry.example.invalid/ns/fullstack-fixture:production), window-open(business-hours), health-ok
+  3. traffic 100%   hold 8h     bake 30m    requires: lease-held(deploy:registry.example.invalid/ns/fullstack-fixture:production), window-open(business-hours), health-ok
 minimum total: 1d 1h 30m
 ";
         assert_eq!(text, expected);
@@ -720,8 +907,8 @@ minimum total: 1d 1h 30m
         .plan("sandbox")
         .unwrap()
         .render_text();
-        assert!(bg.contains("  1. swap           hold 1h     bake 30m    requires: lease-held(deploy:app:sandbox), health-ok\n"), "{bg}");
-        assert!(bg.contains("  2. retire         hold 2d     bake 0m     requires: lease-held(deploy:app:sandbox), health-ok\n"), "{bg}");
+        assert!(bg.contains("  1. swap           hold 1h     bake 30m    requires: lease-held(deploy:registry.example.invalid/ns/app:sandbox), health-ok\n"), "{bg}");
+        assert!(bg.contains("  2. retire         hold 2d     bake 0m     requires: lease-held(deploy:registry.example.invalid/ns/app:sandbox), health-ok\n"), "{bg}");
         let shadow = template(
             "unused",
             "shadow-then-gradual",
@@ -732,7 +919,7 @@ minimum total: 1d 1h 30m
         .plan("sandbox")
         .unwrap()
         .render_text();
-        assert!(shadow.contains("  1. shadow 7%      hold 0m     bake 30m    requires: lease-held(deploy:app:sandbox), health-ok\n"), "{shadow}");
+        assert!(shadow.contains("  1. shadow 7%      hold 0m     bake 30m    requires: lease-held(deploy:registry.example.invalid/ns/app:sandbox), health-ok\n"), "{shadow}");
         assert!(shadow.ends_with("minimum total: 1h\n"), "{shadow}");
     }
 
@@ -762,12 +949,19 @@ minimum total: 1d 1h 30m
             "[shadow]\nenabled = true\nmirror_percent = 15\ncompare = [\"status\", \"latency\"]\n",
         );
         let json = t.plan("production").unwrap().to_json();
-        assert_eq!(json["advisory"], true);
+        assert!(json.get("advisory").is_none());
+        assert_eq!(
+            json["enforcement"],
+            serde_json::json!({"window": true, "health": true, "lease": true})
+        );
         assert_eq!(json["environment"], "production");
         assert_eq!(json["image"], "registry.example.invalid/ns/app");
         assert_eq!(json["risk_class"], "core");
         assert_eq!(json["strategy"], "shadow-then-gradual");
-        assert_eq!(json["lease"], "deploy:app:production");
+        assert_eq!(
+            json["lease"],
+            "deploy:registry.example.invalid/ns/app:production"
+        );
         assert_eq!(json["total_min_duration_seconds"], 8 * 86_400 + 4 * 3_600);
         let steps = json["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 8);
@@ -782,7 +976,7 @@ minimum total: 1d 1h 30m
         assert_eq!(steps[1]["bake_time_seconds"], 1_800);
         assert_eq!(
             steps[1]["preconditions"],
-            serde_json::json!([{"lease_held": "deploy:app:production"}, {"window_open": "business-hours"}, "health_ok"])
+            serde_json::json!([{"lease_held": "deploy:registry.example.invalid/ns/app:production"}, {"window_open": "business-hours"}, "health_ok"])
         );
         let bg = template(
             "internal",
@@ -814,51 +1008,43 @@ minimum total: 1d 1h 30m
             Err(DeployError::Io { .. })
         ));
         let pretty = plan.to_json_pretty();
-        assert!(
-            pretty.starts_with("{\n  \"advisory\": true,\n  \"environment\": \"staging\""),
-            "{pretty}"
-        );
+        assert!(pretty.starts_with("{\n  \"enforcement\": {"), "{pretty}");
         assert_eq!(
             serde_json::from_str::<Value>(&pretty).unwrap(),
             plan.to_json()
         );
     }
 
-    #[test]
-    fn checked_skips_window_validation_without_a_windows_file() {
+    fn repo_with_fixture() -> tempfile::TempDir {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".nanna")).unwrap();
         std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
-        let plan = plan_for_repo_checked(repo.path(), "staging", None).unwrap();
-        assert_eq!(plan.environment, "staging");
+        repo
+    }
+
+    fn host_windows(names: &[&str]) -> WindowSet {
+        let src = names
+            .iter()
+            .map(|name| format!("[[window]]\nname = \"{name}\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n"))
+            .collect::<String>();
+        WindowSet::parse(&src).unwrap()
     }
 
     #[test]
-    fn checked_accepts_a_known_window() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
-        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
-        std::fs::write(
-            repo.path().join(".nanna/windows.toml"),
-            "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
-        )
-        .unwrap();
-        let plan = plan_for_repo_checked(repo.path(), "staging", None).unwrap();
-        assert_eq!(plan.environment, "staging");
+    fn checked_accepts_a_window_the_host_defines() {
+        let repo = repo_with_fixture();
+        let host = host_windows(&["business-hours"]);
+        let plan =
+            plan_for_repo_with_windows(repo.path(), "production", None, Some(&host)).unwrap();
+        assert_eq!(plan.environment, "production");
     }
 
     #[test]
-    fn checked_rejects_an_unknown_window() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
-        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
-        std::fs::write(
-            repo.path().join(".nanna/windows.toml"),
-            "[[window]]\nname = \"after-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
-        )
-        .unwrap();
+    fn checked_rejects_a_window_the_host_does_not_define() {
+        let repo = repo_with_fixture();
+        let host = host_windows(&["after-hours"]);
         assert!(matches!(
-            plan_for_repo_checked(repo.path(), "staging", None),
+            plan_for_repo_with_windows(repo.path(), "staging", None, Some(&host)),
             Err(DeployError::InvalidField {
                 field: "rollout.windows",
                 ..
@@ -867,18 +1053,238 @@ minimum total: 1d 1h 30m
     }
 
     #[test]
-    fn checked_reports_a_malformed_windows_file() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repo.path().join(".nanna")).unwrap();
-        std::fs::write(repo.path().join(".nanna/deploy.toml"), FIXTURE).unwrap();
+    fn production_without_host_windows_fails_closed() {
+        let repo = repo_with_fixture();
+        let err = plan_for_repo_with_windows(repo.path(), "production", None, None).unwrap_err();
+        assert!(
+            matches!(&err, DeployError::HostWindowsMissing { window } if window == "business-hours"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("NANNA_CONFIG_DIR"), "{err}");
+    }
+
+    #[test]
+    fn non_production_without_host_windows_still_plans() {
+        let repo = repo_with_fixture();
+        let plan = plan_for_repo_with_windows(repo.path(), "staging", None, None).unwrap();
+        assert_eq!(plan.environment, "staging");
+    }
+
+    #[test]
+    fn a_repo_local_windows_file_is_ignored() {
+        let repo = repo_with_fixture();
         std::fs::write(
             repo.path().join(".nanna/windows.toml"),
-            "not valid toml [[[",
+            "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"00:00\"\nend = \"23:59\"\napplies_to = [\"production\"]\n",
         )
         .unwrap();
-        let err = plan_for_repo_checked(repo.path(), "staging", None).unwrap_err();
+        let none = |_: &str| -> Option<std::ffi::OsString> { None };
+        assert!(matches!(
+            plan_for_repo_checked_from(repo.path(), "production", None, &none),
+            Err(DeployError::HostWindowsMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_reads_windows_from_the_host_config_dir() {
+        let repo = repo_with_fixture();
+        let config = tempfile::tempdir().unwrap();
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            (key == "NANNA_CONFIG_DIR").then(|| config.path().into())
+        };
+        assert!(matches!(
+            plan_for_repo_checked_from(repo.path(), "production", None, &lookup),
+            Err(DeployError::HostWindowsMissing { .. })
+        ));
+        std::fs::write(
+            config.path().join("windows.toml"),
+            "[[window]]\nname = \"business-hours\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n",
+        )
+        .unwrap();
+        let plan = plan_for_repo_checked_from(repo.path(), "production", None, &lookup).unwrap();
+        assert_eq!(plan.environment, "production");
+    }
+
+    #[test]
+    fn checked_reports_a_malformed_host_windows_file() {
+        let repo = repo_with_fixture();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(config.path().join("windows.toml"), "not valid toml [[[").unwrap();
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            (key == "NANNA_CONFIG_DIR").then(|| config.path().into())
+        };
+        let err = plan_for_repo_checked_from(repo.path(), "staging", None, &lookup).unwrap_err();
         assert!(matches!(err, DeployError::WindowSet { .. }), "{err:?}");
         assert!(err.to_string().contains("windows.toml"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_config_dir_env)]
+    fn plan_for_repo_checked_reads_windows_from_nanna_config_dir() {
+        let repo = repo_with_fixture();
+        let config = tempfile::tempdir().unwrap();
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("NANNA_CONFIG_DIR", v),
+                    None => std::env::remove_var("NANNA_CONFIG_DIR"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var_os("NANNA_CONFIG_DIR"));
+        std::env::set_var("NANNA_CONFIG_DIR", config.path());
+        let window = |name: &str| {
+            format!("[[window]]\nname = \"{name}\"\ntimezone = \"UTC\"\ndays = [\"mon\"]\nstart = \"09:00\"\nend = \"17:00\"\napplies_to = [\"production\"]\n")
+        };
+        let missing = plan_for_repo_checked(repo.path(), "production", None);
+        std::fs::write(config.path().join("windows.toml"), window("after-hours")).unwrap();
+        let wrong = plan_for_repo_checked(repo.path(), "staging", None);
+        std::fs::write(config.path().join("windows.toml"), window("business-hours")).unwrap();
+        let right = plan_for_repo_checked(repo.path(), "production", None);
+        let loaded = crate::deploy::host_windows().unwrap();
+        assert!(matches!(
+            missing,
+            Err(DeployError::HostWindowsMissing { .. })
+        ));
+        assert!(matches!(
+            wrong,
+            Err(DeployError::InvalidField {
+                field: "rollout.windows",
+                ..
+            })
+        ));
+        assert_eq!(right.unwrap().environment, "production");
+        assert!(loaded.unwrap().window("business-hours").is_some());
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn the_lease_is_keyed_by_repo_and_image_not_the_image_basename() {
+        let template = DeployTemplate::parse(FIXTURE).unwrap();
+        let one = template.plan_for("example/one", "staging", None).unwrap();
+        let two = template.plan_for("example/two", "staging", None).unwrap();
+        let again = template.plan_for("example/one", "staging", None).unwrap();
+        assert_eq!(one.lease, "deploy:example/one/fullstack-fixture:staging");
+        assert_ne!(one.lease, two.lease);
+        assert_eq!(one.lease, again.lease);
+        let store = crate::leases::InMemoryLeaseStore::default();
+        let lease = |plan: &DeployPlan| {
+            let Precondition::LeaseHeld(name) = &plan.steps[0].preconditions[0] else {
+                panic!("first precondition is the lease");
+            };
+            assert_eq!(*name, plan.lease);
+            crate::rollout::RolloutRecord::new("r", plan.clone(), "i:2", "i:1", chrono::Utc::now())
+                .lease_name()
+                .unwrap()
+        };
+        let now = chrono::Utc::now();
+        let ttl = Duration::hours(1);
+        use crate::leases::LeaseStore;
+        store.acquire(&lease(&one), "a", ttl, now).unwrap();
+        assert!(store.acquire(&lease(&again), "b", ttl, now).is_err());
+        assert!(store.acquire(&lease(&two), "b", ttl, now).is_ok());
+    }
+
+    #[test]
+    fn the_plan_lease_is_the_one_the_production_effect_requires() {
+        let template = DeployTemplate::parse(FIXTURE).unwrap();
+        let plan = template
+            .plan_for("example/one", "production", None)
+            .unwrap();
+        let ctx = crate::leases::LeaseContext {
+            repo: "example/one",
+            environment: Some("production"),
+            image: Some("fullstack-fixture"),
+            ..crate::leases::LeaseContext::default()
+        };
+        let required =
+            crate::leases::required_leases(crate::leases::Effect::Production, &ctx).unwrap();
+        assert_eq!(required[0].to_string(), plan.lease);
+    }
+
+    #[test]
+    fn plans_from_a_repo_use_its_origin_identity_else_the_registry() {
+        let repo = repo_with_fixture();
+        let plan = plan_for_repo(repo.path(), "staging", None).unwrap();
+        assert_eq!(
+            plan.lease,
+            "deploy:registry.example.invalid/ns/fullstack-fixture:staging"
+        );
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@example.invalid:Org/service.git",
+            ],
+        );
+        let plan = plan_for_repo(repo.path(), "staging", None).unwrap();
+        assert_eq!(plan.lease, "deploy:Org/service/fullstack-fixture:staging");
+        let host = host_windows(&["business-hours"]);
+        let checked =
+            plan_for_repo_with_windows(repo.path(), "staging", None, Some(&host)).unwrap();
+        assert_eq!(checked.lease, plan.lease);
+    }
+
+    #[test]
+    fn the_advisory_label_tracks_exactly_what_is_enforced() {
+        let plan = DeployTemplate::parse(FIXTURE)
+            .unwrap()
+            .plan("production")
+            .unwrap();
+        for mask in 0u8..8 {
+            let enforcement = Enforcement::of(|kind| {
+                mask & (1
+                    << PreconditionKind::ALL
+                        .iter()
+                        .position(|k| *k == kind)
+                        .unwrap())
+                    != 0
+            });
+            let text = plan.render_text_with(&enforcement);
+            let json = plan.to_json_with(&enforcement);
+            let all = mask == 7;
+            assert_eq!(enforcement.is_complete(), all);
+            assert_eq!(text.contains("advisory only"), !all, "{mask}: {text}");
+            assert_eq!(json.get("advisory").is_some(), !all, "{mask}: {json}");
+            assert_eq!(json.get("unenforced").is_some(), !all, "{mask}: {json}");
+            for kind in PreconditionKind::ALL {
+                let named = enforcement.unenforced().contains(&kind);
+                assert_eq!(json["enforcement"][kind.name()], !named);
+                if !all {
+                    assert_eq!(text.lines().nth(2).unwrap().contains(kind.name()), named);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_executor_enforces_every_precondition_kind_so_output_is_not_advisory() {
+        let plan = DeployTemplate::parse(FIXTURE)
+            .unwrap()
+            .plan("production")
+            .unwrap();
+        assert!(crate::rollout::enforcement().is_complete());
+        assert!(!plan.render_text().contains("advisory"));
+        assert!(plan.to_json().get("advisory").is_none());
+        for kind in PreconditionKind::ALL {
+            assert!(crate::rollout::RolloutExecutor::evaluates(kind));
+        }
+        for precondition in &plan.steps[0].preconditions {
+            assert!(crate::rollout::enforcement().enforces(precondition.kind()));
+        }
     }
 
     #[test]
@@ -891,7 +1297,9 @@ minimum total: 1d 1h 30m
         assert_eq!(
             plan.steps[0].preconditions,
             [
-                Precondition::LeaseHeld("deploy:fullstack-fixture:Production".into()),
+                Precondition::LeaseHeld(
+                    "deploy:registry.example.invalid/ns/fullstack-fixture:Production".into()
+                ),
                 Precondition::WindowOpen("business-hours".into()),
                 Precondition::HealthOk
             ]
@@ -989,6 +1397,22 @@ minimum total: 1d 1h 30m
                 prop_assert!(plan.steps.iter().enumerate().all(|(i, s)| s.index == i));
                 prop_assert!(plan.steps.len() >= template.rollout.steps.len());
                 prop_assert_eq!(plan.to_json()["steps"].as_array().unwrap().len(), plan.steps.len());
+            }
+        }
+    }
+
+    #[test]
+    fn unlisted_environment_names_get_production_preconditions() {
+        for env in ["prod", "live", "canary"] {
+            let src = FIXTURE.replace("\"production\"", &format!("\"{env}\""));
+            let plan = DeployTemplate::parse(&src).unwrap().plan(env).unwrap();
+            for step in &plan.steps {
+                assert!(
+                    step.preconditions
+                        .iter()
+                        .any(|p| matches!(p, Precondition::WindowOpen(_))),
+                    "{env}"
+                );
             }
         }
     }

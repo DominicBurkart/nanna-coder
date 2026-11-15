@@ -24,7 +24,7 @@ const CARGO_FLAKE_TEMPLATE: &str = r#"{
         pkgs = import nixpkgs { inherit system overlays; };
 
         rustToolchain = pkgs.rust-bin.stable."__RUST_VERSION__".default.override {
-          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
+          extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];__RUST_TARGETS__
         };
 
         nix2containerPkgs = nix2container.packages.${system};
@@ -83,13 +83,25 @@ fn generate_cargo_flake(profile: &ProjectProfile) -> Result<String, OnboardingEr
         .unwrap_or(DEFAULT_RUST_VERSION);
 
     let packages_str = profile.nix_packages.join("\n          ");
+    let targets_str = render_rust_targets(&profile.rust_targets);
 
     let flake = CARGO_FLAKE_TEMPLATE
         .replace("__PROJECT_NAME__", &profile.project_name)
         .replace("__RUST_VERSION__", rust_version)
+        .replace("__RUST_TARGETS__", &targets_str)
         .replace("__PACKAGES__", &packages_str);
 
     Ok(flake)
+}
+
+/// Render the `targets = [ ... ];` line of the toolchain override, or an
+/// empty string when no extra targets are requested.
+fn render_rust_targets(targets: &[String]) -> String {
+    if targets.is_empty() {
+        return String::new();
+    }
+    let quoted: Vec<String> = targets.iter().map(|t| format!("\"{t}\"")).collect();
+    format!("\n          targets = [ {} ];", quoted.join(" "))
 }
 
 #[cfg(test)]
@@ -115,8 +127,38 @@ mod tests {
                 "pkgs.cacert".to_string(),
             ],
             rust_version: Some(DEFAULT_RUST_VERSION.to_string()),
+            rust_targets: vec![],
             extra_env_vars: vec![],
         }
+    }
+
+    #[test]
+    fn generated_flake_omits_targets_line_by_default() {
+        let profile = minimal_cargo_profile("myapp");
+        let flake = generate_flake(&profile).unwrap();
+        assert!(!flake.contains("targets ="));
+        assert!(flake.contains(
+            "extensions = [ \"rust-src\" \"rustfmt\" \"clippy\" \"rust-analyzer\" ];\n        };"
+        ));
+    }
+
+    #[test]
+    fn generated_flake_adds_rust_targets_to_toolchain_override() {
+        let mut profile = minimal_cargo_profile("webapp");
+        profile.rust_targets = vec!["wasm32-unknown-unknown".to_string()];
+        let flake = generate_flake(&profile).unwrap();
+        assert!(flake.contains(
+            "extensions = [ \"rust-src\" \"rustfmt\" \"clippy\" \"rust-analyzer\" ];\n          targets = [ \"wasm32-unknown-unknown\" ];\n        };"
+        ));
+    }
+
+    #[test]
+    fn render_rust_targets_quotes_every_target() {
+        assert_eq!(render_rust_targets(&[]), "");
+        assert_eq!(
+            render_rust_targets(&["a".to_string(), "b".to_string()]),
+            "\n          targets = [ \"a\" \"b\" ];"
+        );
     }
 
     #[test]

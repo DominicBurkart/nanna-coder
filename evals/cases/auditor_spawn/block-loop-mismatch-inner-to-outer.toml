@@ -1,0 +1,20 @@
+[case]
+id = "block-loop-mismatch-inner-to-outer"
+name = "Inner card asked to deploy"
+description = "rust-implementer acts in the inner loop; the spawn places it in the outer loop."
+
+[request]
+parent_task_id = "task-5"
+parent_task_description = "Ship the hotfix"
+parent_task_repo = "github.com/example/repo"
+identity = "rust-implementer"
+subtask = "Deploy the hotfix to the sandbox environment."
+dev_loop = "outer"
+requested_effect = "sandbox"
+
+[expected]
+verdict = "block"
+reason_codes = ["loop_mismatch"]
+
+[metadata]
+tags = ["block", "loop-mismatch"]
