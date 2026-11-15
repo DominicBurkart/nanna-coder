@@ -178,11 +178,50 @@ mod tests {
         assert!(matches!(result, Err(ImageBuilderError::InvalidConfig(_))));
     }
 
+    /// `build_image` must reject `ImageType::Release` with `InvalidConfig`.
+    /// Without this case the `Sandbox` test alone is the only signal that
+    /// the catch-all arm is wired correctly — a future refactor that special-
+    /// cased `Release` would silently regress.
+    #[test]
+    fn test_build_image_release_type_is_rejected() {
+        let config = ImageBuildConfig {
+            image_type: ImageType::Release,
+            ..ImageBuildConfig::default()
+        };
+        match build_image(&config) {
+            Err(ImageBuilderError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("Dev"),
+                    "error should mention which image type is supported, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_build_dev_container_missing_flake() {
         let dir = tempfile::tempdir().unwrap();
         let result = build_dev_container(dir.path());
         assert!(matches!(result, Err(ImageBuilderError::InvalidConfig(_))));
+    }
+
+    /// The `InvalidConfig` message for a missing `flake.nix` should name the
+    /// file by name so callers can act on it (the harness onboarding flow
+    /// keys off this exact contract).
+    #[test]
+    fn test_build_dev_container_missing_flake_message_names_flake() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = build_dev_container(dir.path()).expect_err("missing flake must error");
+        match err {
+            ImageBuilderError::InvalidConfig(msg) => {
+                assert!(
+                    msg.contains("flake.nix"),
+                    "error should mention flake.nix by name, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 
     #[test]
@@ -211,5 +250,74 @@ mod tests {
         f.write_all(b"{}").unwrap();
         let result = validate_image(f.path());
         assert!(result.unwrap());
+    }
+
+    /// An empty file is not a valid image — `read` returns 0 bytes and the
+    /// `n > 0 && buf[0] == b'{'` check must short-circuit on the length
+    /// rather than panicking on the uninitialised `buf[0]`.
+    #[test]
+    fn test_validate_image_empty_file_is_invalid() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        // File is created empty; do not write anything.
+        let result = validate_image(f.path()).unwrap();
+        assert!(!result, "empty file should be reported as invalid");
+    }
+
+    /// A non-empty file whose first byte is not `{` (e.g. a stray binary
+    /// blob, a YAML manifest, or plain text) must be rejected. This locks
+    /// in the contract that `validate_image` recognises only the JSON
+    /// container-spec produced by nix2container.
+    #[test]
+    fn test_validate_image_non_json_file_is_invalid() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"not json content").unwrap();
+        let result = validate_image(f.path()).unwrap();
+        assert!(!result, "file not starting with '{{' must be rejected");
+    }
+
+    /// First byte of `[` (also valid JSON, but not the object form
+    /// nix2container emits) must still be rejected — only `{` counts.
+    #[test]
+    fn test_validate_image_json_array_first_byte_is_invalid() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"[1,2,3]").unwrap();
+        let result = validate_image(f.path()).unwrap();
+        assert!(
+            !result,
+            "JSON array (first byte '[') must not pass validation"
+        );
+    }
+
+    /// A directory containing at least one entry is treated as a valid
+    /// store-path-style image output (nix sometimes produces a directory
+    /// with `manifest.json` plus layer blobs).
+    #[test]
+    fn test_validate_image_non_empty_directory_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        let result = validate_image(dir.path()).unwrap();
+        assert!(result, "directory with entries should validate");
+    }
+
+    /// An empty directory is not a usable image output.
+    #[test]
+    fn test_validate_image_empty_directory_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = validate_image(dir.path()).unwrap();
+        assert!(!result, "empty directory should be reported as invalid");
+    }
+
+    /// On Unix, a dangling symlink (target does not exist) hits the
+    /// `!image_path.exists()` early return because `Path::exists` follows
+    /// symlinks. This pins the documented behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_image_dangling_symlink_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("dangling");
+        let target = dir.path().join("does-not-exist");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let result = validate_image(&link).unwrap();
+        assert!(!result, "dangling symlink should be reported as invalid");
     }
 }
