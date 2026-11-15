@@ -81,7 +81,6 @@ pub enum RootId {
     Mcp { id: Uuid },
     Plan { id: String },
     Backlog { repo: String, issue: u64 },
-    Cli { id: Uuid },
     Legacy { task: TaskId },
 }
 
@@ -91,7 +90,6 @@ enum RootWire {
     Mcp { id: Uuid },
     Plan { id: String },
     Backlog { repo: String, issue: u64 },
-    Cli { id: Uuid },
     Legacy { task: TaskId },
 }
 
@@ -140,10 +138,6 @@ impl RootId {
         Ok(Self::Backlog { repo, issue })
     }
 
-    pub fn cli(id: Uuid) -> Self {
-        Self::Cli { id }
-    }
-
     pub fn legacy(task: TaskId) -> Self {
         Self::Legacy { task }
     }
@@ -157,7 +151,6 @@ impl TryFrom<RootWire> for RootId {
             RootWire::Mcp { id } => Ok(Self::mcp(id)),
             RootWire::Plan { id } => Self::plan(id),
             RootWire::Backlog { repo, issue } => Self::backlog(repo, issue),
-            RootWire::Cli { id } => Ok(Self::cli(id)),
             RootWire::Legacy { task } => Ok(Self::legacy(task)),
         }
     }
@@ -204,8 +197,10 @@ struct LineageWire {
 impl<'de> Deserialize<'de> for Lineage {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = LineageWire::deserialize(deserializer)?;
-        let consistent =
-            (1..=MAX_DEPTH).contains(&wire.depth) && (wire.depth == 1) == wire.parent.is_none();
+        let consistent = matches!(
+            (wire.depth, &wire.parent),
+            (1, None) | (2..=MAX_DEPTH, Some(_))
+        );
         if !consistent {
             return Err(serde::de::Error::custom(LineageError::Inconsistent));
         }
@@ -414,7 +409,8 @@ mod tests {
             let parent = if has_parent { r#","parent":"p""# } else { r#","parent":null"# };
             let json = format!(r#"{{"root":{{"kind":"mcp","id":"00000000-0000-0000-0000-000000000000"}}{parent},"depth":{depth}}}"#);
             let ok = serde_json::from_str::<Lineage>(&json).is_ok();
-            let consistent = (1..=MAX_DEPTH).contains(&depth) && (depth == 1) == !has_parent;
+            let consistent = (depth == 1 && !has_parent)
+                || ((2..=MAX_DEPTH).contains(&depth) && has_parent);
             prop_assert_eq!(ok, consistent);
         }
     }
@@ -483,10 +479,6 @@ mod tests {
             (
                 RootId::backlog("o/r", 3).unwrap(),
                 r#"{"kind":"backlog","repo":"o/r","issue":3}"#,
-            ),
-            (
-                RootId::cli(nil),
-                r#"{"kind":"cli","id":"00000000-0000-0000-0000-000000000000"}"#,
             ),
             (RootId::legacy(tid("t")), r#"{"kind":"legacy","task":"t"}"#),
         ];
