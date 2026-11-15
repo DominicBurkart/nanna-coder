@@ -64,7 +64,6 @@
 //! # }
 //! ```
 
-#[cfg_attr(not(test), expect(dead_code))]
 mod binding;
 #[cfg(test)]
 mod binding_tests;

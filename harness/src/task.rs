@@ -8357,7 +8357,7 @@ mod impact_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod pi_route_tests {
     use super::scheduler_tests::{git_repo, wait_for};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};

@@ -301,6 +301,7 @@ impl Drop for PiContainerGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::FakePodman;
 
     fn digest() -> String {
@@ -445,6 +446,7 @@ mod tests {
         std::mem::forget(guard);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_guard_force_removes_the_named_container() {
         let fake = FakePodman::install_async(None).await;
