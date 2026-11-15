@@ -497,6 +497,7 @@ fn the_attachment_checker_flags_each_way_the_wiring_could_be_faked() {
         "export_budget(&m.cost_accountant(), &u);",
         "export_budget(&m.cost_accountant(), t);",
         "export_budget(m.cost_accountant(), &t);",
+        "export_budget(&m, &t);",
         "export_budget(&m.budget(), &t);",
         "export_budget(&Fresh::new().cost_accountant(), &t);",
     ] {
