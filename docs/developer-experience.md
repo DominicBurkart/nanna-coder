@@ -362,58 +362,18 @@ podman exec -it container-name bash
 
 ## IDE Integration
 
-### VS Code Setup
+For rust-analyzer (VS Code, Neovim, etc.), enable all cargo features and use clippy on save:
 
-#### Recommended Extensions
-- **rust-analyzer**: Rust language server
-- **CodeLLDB**: Debugging support
-- **Better TOML**: Cargo.toml syntax highlighting
-- **Nix IDE**: Nix language support
-
-#### Settings Configuration
 ```json
 {
-  "rust-analyzer.server.path": "rust-analyzer",
   "rust-analyzer.cargo.features": "all",
   "rust-analyzer.checkOnSave.command": "clippy",
   "rust-analyzer.cargo.buildScripts.enable": true
 }
 ```
 
-### Neovim Setup
-
-#### Required Plugins
-- **nvim-lspconfig**: LSP configuration
-- **rust-tools.nvim**: Enhanced Rust support
-- **nvim-cmp**: Completion engine
-- **telescope.nvim**: Fuzzy finder
-
 ## Best Practices
 
-### Code Quality
-1. **Always run `dev-check` before committing**
-2. **Use `dev-test watch` for TDD workflow**
-3. **Keep dependencies up to date with `cargo outdated`**
-4. **Run security audits with `cargo audit`**
-
-### Performance
-1. **Use `cache-warm` for faster builds**
-2. **Leverage incremental compilation with `dev-build`**
-3. **Use `cargo nextest` for faster test execution**
-4. **Profile with `cargo bench` for performance-critical code**
-
-### Container Development
-1. **Use pre-built test containers when possible**
-2. **Clean up containers regularly with `dev-clean`**
-3. **Monitor resource usage with `container-logs`**
-4. **Test with multiple model configurations**
-
-### Git Workflow
-1. **Let pre-commit hooks enforce quality**
-2. **Use meaningful commit messages**
-3. **Test thoroughly before pushing**
-4. **Leverage branch protection with required checks**
-
----
-
-For additional help or feature requests, consult the project documentation or create an issue in the repository.
+- Run `dev-check` before committing; pre-commit hooks enforce formatting, clippy, tests, audit, deny, and coverage.
+- Use `dev-test watch` for TDD; `cargo nextest` for parallel execution; `cache-warm` to prime the binary cache.
+- Clean up containers regularly with `dev-clean`; use pre-built test containers when available.

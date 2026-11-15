@@ -117,38 +117,9 @@ nix build .#nanna-coder
 nix run .#cache-analytics
 ```
 
-## Cache Strategy
+## Cache strategy
 
-### What Gets Cached
-
-**High Priority (Always cached):**
-- Rust dependencies (cargo artifacts)
-- Test containers (small, frequently used)
-- Build artifacts (binaries)
-
-**Medium Priority (Cached when space available):**
-- Cross-compilation outputs
-- Development tools
-
-**Low Priority (Excluded from Cachix):**
-- Source tarballs (filtered out)
-- Large model files (downloaded on-demand)
-- nixpkgs tarballs (already cached upstream)
-
-### Push Filter Rationale
-
-```yaml
-pushFilter: "(-source$|nixpkgs\\.tar\\.gz$)"
-```
-
-**Excludes:**
-- `*-source` derivations (save bandwidth)
-- `nixpkgs.tar.gz` files (redundant with upstream cache)
-
-**Includes:**
-- Compiled binaries
-- Container images
-- Build dependencies
+See [binary-cache-strategy.md](./binary-cache-strategy.md) for the cache priority matrix and push-filter rationale.
 
 ## Performance Expectations
 
@@ -266,44 +237,6 @@ nix run .#setup-cache
 1. Get the correct public key from [app.cachix.org](https://app.cachix.org/cache/nanna-coder).
 2. Update the `publicKey` in `flake.nix` (search for `nanna-coder.cachix.org`).
 3. Update local config: `nix run .#setup-cache`.
-
-## Cost Analysis
-
-### Cachix Free Tier
-
-**Limits:**
-- 5 GB storage
-- 10 GB/month bandwidth
-
-**Recommended for:**
-- Small projects
-- Open source projects
-- Personal development
-
-### Cachix Pro
-
-**Features:**
-- Unlimited storage
-- Unlimited bandwidth
-- Priority support
-
-**Recommended for:**
-- Large projects (>5GB artifacts)
-- High traffic projects
-- Enterprise use
-
-### Cost Comparison
-
-| Solution | Storage | Bandwidth | Cost |
-|----------|---------|-----------|------|
-| GitHub Actions Cache | 10GB | Unlimited | Free |
-| Cachix Free | 5GB | 10GB/month | Free |
-| Cachix Pro | Unlimited | Unlimited | $29/month |
-
-**Optimization Tips:**
-- Use `pushFilter` to exclude large artifacts
-- Monitor bandwidth with cache-analytics
-- Consider hybrid approach for very large projects
 
 ## Migration Checklist
 

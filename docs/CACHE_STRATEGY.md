@@ -123,31 +123,17 @@ Monitor cache contents and statistics at:
   - Monitor cache hit rates
   - Manage cache retention policies
 
-## Cache Size Management
+## What gets cached
 
-### Storage Capacity
+Cachix has unlimited storage and handles retention automatically (no manual GC).
 
-- **Cachix Binary Cache**: Unlimited storage
-- **No Size Constraints**: Unlike GitHub Actions cache (10GB limit), Cachix allows unrestricted caching
-- **Automatic Management**: Cachix handles cache retention and cleanup automatically
-- **No Manual GC Required**: No need to manage garbage collection or size limits
+| Tier | Examples | Approx size |
+|------|----------|-------------|
+| High value (always cached) | Rust toolchain, cargo deps, container base layers | ~2.3 GB |
+| Medium value (conditional) | Test binaries, build artifacts | ~500 MB |
+| Excluded | `-source` derivations, `nixpkgs.tar.gz`, temp files | — |
 
-### What Gets Cached
-
-✅ **High Value (Always Cached)**
-- Rust toolchain (1.84.0) - ~1.5GB, rarely changes
-- Cargo dependencies - ~500MB-1GB, changes occasionally
-- Container base layers - ~800MB, stable
-
-✅ **Medium Value (Conditionally Cached)**
-- Test binaries - ~200MB per job, changes with code
-- Build artifacts - ~300MB, changes frequently
-
-❌ **Excluded (Never Cached)**
-- Source tarballs (`-source` suffix)
-- nixpkgs archives (`nixpkgs.tar.gz`)
-- Temporary build files
-- Git repository data
+See [binary-cache-strategy.md](./binary-cache-strategy.md) for the priority matrix.
 
 ## Performance Metrics
 
@@ -317,50 +303,9 @@ grep "name: nanna-coder" .github/workflows/*.yml
      gh secret set CACHIX_AUTH
      ```
 
-## Migration Guide
+## History
 
-### From GitHub Actions Cache to Cachix
-
-The migration from GitHub Actions cache to Cachix provides:
-- **Unlimited storage** vs 10GB GitHub Actions limit
-- **Faster cache restoration** via CDN distribution
-- **Better reliability** with dedicated binary cache infrastructure
-- **Enhanced monitoring** via Cachix dashboard
-
-Migration steps:
-1. Configure `CACHIX_AUTH` repository secret
-2. Update workflows to use `cachix/cachix-action@v15`
-3. Change cache key prefix from `nix-v3-deps-` to `cachix-v1-deps-`
-4. Remove GitHub Actions cache configuration (e.g., `gc-max-store-size`)
-
-First build after migration:
-- Cachix cache will be empty initially
-- `prebuild-deps` job populates Cachix with dependencies
-- Subsequent builds pull from Cachix automatically
-- Old GitHub Actions cache can be safely ignored/deleted
-
-### Rollback Procedure
-
-If issues arise with Cachix:
-
-1. Revert to GitHub Actions cache:
-   ```bash
-   git revert <cachix-migration-commit>
-   ```
-
-2. Or temporarily disable Cachix:
-   ```yaml
-   # Comment out cachix-action steps in workflows
-   # - uses: cachix/cachix-action@v15
-   #   with:
-   #     name: nanna-coder
-   #     authToken: '${{ secrets.CACHIX_AUTH }}'
-   ```
-
-3. Monitor rollback impact:
-   - Builds will be slower without cache
-   - Consider increasing GitHub Actions cache allocation
-   - Re-enable cache warming workflow
+Migration from `cache-nix-action` to Cachix is documented in [cachix-migration.md](./cachix-migration.md); the pre-Cachix interim period is documented in [cache-migration-guide.md](./cache-migration-guide.md).
 
 ## References
 
@@ -368,4 +313,4 @@ If issues arise with Cachix:
 - [Cachix GitHub Action](https://github.com/cachix/cachix-action)
 - [Nanna Coder Cachix Dashboard](https://nanna-coder.cachix.org)
 - [GitHub Actions Cache Documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows)
-- [Issue #18: Cache Strategy Evaluation](https://github.com/DominicBurkart/nanna-coder/issues/18)
+- [Issue #18: Cache Strategy Evaluation](https://github.com/dominicburkart/nanna-coder/issues/18)

@@ -27,7 +27,7 @@ Nanna pod, and pulls the Gemma 4 model. The script prints a clear notification
 before each step that requires `sudo`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DominicBurkart/nanna-coder/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dominicburkart/nanna-coder/main/scripts/install.sh | bash
 ```
 
 Useful flags (pass after `bash -s --` for the curl form):
@@ -52,7 +52,7 @@ curl http://localhost:11434/api/tags   # ollama API
 Prerequisites: Nix with flakes enabled, optionally Cachix for faster builds.
 
 ```bash
-git clone https://github.com/DominicBurkart/nanna-coder.git
+git clone https://github.com/dominicburkart/nanna-coder.git
 cd nanna-coder
 
 # Enter development environment

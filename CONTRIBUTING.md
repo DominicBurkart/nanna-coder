@@ -4,7 +4,7 @@ Thank you for your interest in contributing!
 
 ## Dev Setup
 
-See [README.md](./README.md#quick-start). Detailed contributor setup is tracked in [#175](https://github.com/DominicBurkart/nanna-coder/issues/175).
+See [README.md](./README.md#quick-start). Detailed contributor setup is tracked in [#175](https://github.com/dominicburkart/nanna-coder/issues/175).
 
 ## Testing
 
@@ -12,7 +12,7 @@ See [TESTING.md](./TESTING.md).
 
 ## License
 
-All contributions fall under the [project license](./LICENSE).
+All contributions are dual-licensed under [MIT](./LICENSE-MIT) and [Apache-2.0](./LICENSE-APACHE).
 
 ## GitHub Issues
 
