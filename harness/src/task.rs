@@ -422,7 +422,7 @@ fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
         DEFAULT_ACTION_LEASE_TTL,
     );
     Arc::new(ActionGate::new(
-        Arc::new(auditor),
+        Arc::new(crate::action_auditor::FailClosedActionAuditor::new(auditor)),
         crate::action_auditor::ActionAuditLog::in_memory(),
     ))
 }
@@ -899,17 +899,23 @@ impl TaskManager {
     ) -> Arc<ActionGate> {
         let windows = Arc::new(windows);
         let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
-            Some((provider, name)) => Arc::new(crate::action_auditor::ModelActionAuditor::new(
-                provider,
-                name,
-                windows,
-                leases,
-                DEFAULT_ACTION_LEASE_TTL,
-            )),
-            None => Arc::new(crate::action_auditor::RuleActionAuditor::new(
-                windows,
-                leases,
-                DEFAULT_ACTION_LEASE_TTL,
+            Some((provider, name)) => {
+                Arc::new(crate::action_auditor::FailClosedActionAuditor::new(
+                    crate::action_auditor::ModelActionAuditor::new(
+                        provider,
+                        name,
+                        windows,
+                        leases,
+                        DEFAULT_ACTION_LEASE_TTL,
+                    ),
+                ))
+            }
+            None => Arc::new(crate::action_auditor::FailClosedActionAuditor::new(
+                crate::action_auditor::RuleActionAuditor::new(
+                    windows,
+                    leases,
+                    DEFAULT_ACTION_LEASE_TTL,
+                ),
             )),
         };
         Arc::new(ActionGate::new(auditor, log))
@@ -6390,6 +6396,66 @@ mod identity_tests {
 
         let unconfigured = action_windows_from(&|_| None);
         assert_eq!(unconfigured.windows().count(), 0);
+    }
+
+    struct HangingProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for HangingProvider {
+        async fn chat(
+            &self,
+            _request: model::types::ChatRequest,
+        ) -> model::ModelResult<model::types::ChatResponse> {
+            std::future::pending().await
+        }
+        async fn list_models(&self) -> model::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> model::ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "hanging"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_production_action_policy_gate_blocks_when_the_model_auditor_hangs() {
+        let leases: Arc<dyn LeaseStore> = Arc::new(crate::leases::InMemoryLeaseStore::default());
+        let gate = TaskManager::action_policy_gate(
+            leases,
+            crate::windows::WindowSet::default(),
+            Some((Arc::new(HangingProvider), "auditor-model".to_string())),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        );
+        let review = crate::action_auditor::ActionReview {
+            identity: "rust-implementer".to_string(),
+            task_id: TaskId("t1".to_string()),
+            tool: "github_pr_status".to_string(),
+            args: serde_json::json!({}),
+            effect_class: crate::effects::EffectClass::Repository,
+            prior_actions: vec![],
+        };
+        let ctx = crate::action_auditor::ActionContext {
+            max_effect: crate::effects::EffectClass::Production,
+            window: None,
+            lease: crate::leases::LeaseContext::default(),
+            now: chrono::Utc::now(),
+            task: "",
+        };
+        let started = tokio::time::Instant::now();
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            gate.run_gate(&review, &ctx),
+        )
+        .await
+        .expect("the production gate must bound a hung model auditor itself");
+        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Block);
+        assert!(!verdict.is_allow());
+        assert_eq!(
+            started.elapsed(),
+            crate::action_auditor::ACTION_AUDIT_TIMEOUT
+        );
     }
 
     #[tokio::test]
