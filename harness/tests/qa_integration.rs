@@ -5,10 +5,10 @@
 //!
 //! The dev image is the [`apprun_integration`] stand-in plus headless
 //! Chromium (the package the generated flake adds for this profile).
-//! `qa_browser`'s console-error evidence comes from Chromium's own
-//! automatic `GET /favicon.ico` request, which the fixture's static file
-//! service 404s (no file exists under `ui/dist`); no fixture change was
-//! needed to produce it.
+//! `qa_browser`'s console-error evidence comes from the fixture's `#boom`
+//! button, which runs a deliberate `console.error`; the scenario clicks it and
+//! the test asserts the reported text. These tests run locally and are not a
+//! required CI job.
 
 use harness::apprun::{Limits, APP_START_TOOL};
 use harness::container::{detect_runtime, ContainerRuntime};
@@ -42,6 +42,7 @@ const COLD_BUILD_LIMIT: Limits = Limits {
 };
 
 const REQUIRE_RUNTIME_ENV: &str = "NANNA_REQUIRE_RUNTIME";
+const DELIBERATE_CONSOLE_ERROR: &str = "nanna-fixture-deliberate-error";
 
 fn runtime_gate(available: bool, require: Option<&str>) -> Result<(), String> {
     if available {
@@ -161,8 +162,8 @@ fn build_dev_image(
 #[serial_test::parallel(env_path)]
 async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !require_runtime_or_skip(&runtime) {
+        eprintln!("SKIPPED: no container runtime available");
         return;
     }
     build_dev_image(&SystemRunner, &runtime).unwrap();
@@ -208,6 +209,7 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
     let scenario = json!({ "steps": [
         { "step": "goto", "path": "/" },
         { "step": "expect_text", "selector": "#greeting", "text": "Hello from the full-stack fixture" },
+        { "step": "click", "selector": "#boom" },
         { "step": "screenshot", "name": "home" }
     ] });
     let browser = tool(&registry, QA_BROWSER_TOOL, json!({ "scenario": scenario })).await;
@@ -222,11 +224,11 @@ async fn qa_tools_reject_calls_before_app_start_then_check_and_mount_the_fixture
     );
     let console_errors = browser["console_errors"].as_array().unwrap();
     assert!(
-        console_errors.iter().any(|e| e["url"]
-            .as_str()
-            .is_some_and(|url| url.ends_with("/favicon.ico"))
-            && e["text"].as_str().is_some_and(|t| t.contains("404"))),
-        "the browser's automatic favicon.ico request must 404 and be reported: {browser}"
+        console_errors.iter().any(|e| e["source"] == "console"
+            && e["text"]
+                .as_str()
+                .is_some_and(|t| t.contains(DELIBERATE_CONSOLE_ERROR))),
+        "the fixture's deliberate console.error must be reported: {browser}"
     );
 
     let summary = ws.qa_summary();
@@ -291,6 +293,21 @@ async fn container_browser_click_and_type_change_the_fixture_page_state() {
 }
 
 #[test]
+fn fixture_source_carries_the_deliberate_console_error_trigger() {
+    let source = std::fs::read_to_string(fixture_root().join("ui/src/main.rs")).unwrap();
+    assert!(
+        source.contains(&format!(
+            "pub const BOOM_MESSAGE: &str = \"{DELIBERATE_CONSOLE_ERROR}\";"
+        )),
+        "the fixture must define the deliberate error text"
+    );
+    assert!(source.contains("pub const BOOM_ID: &str = \"boom\";"));
+    assert!(source.contains("format!(\"console.error('{BOOM_MESSAGE}')\")"));
+    assert!(source.contains("button { id: BOOM_ID, onclick:"));
+    assert!(source.contains("document::eval(&boom_script())"));
+}
+
+#[test]
 fn runtime_gate_passes_when_a_runtime_is_available() {
     assert_eq!(runtime_gate(true, Some("1")), Ok(()));
     assert_eq!(runtime_gate(true, None), Ok(()));
@@ -332,8 +349,8 @@ fn enforce_runtime_panics_when_required_and_absent() {
 #[serial_test::parallel(env_path)]
 async fn qa_endpoints_reports_the_broken_route_with_its_response_snippet() {
     let runtime = detect_runtime();
-    if !runtime.is_available() {
-        eprintln!("No container runtime available, skipping test");
+    if !require_runtime_or_skip(&runtime) {
+        eprintln!("SKIPPED: no container runtime available");
         return;
     }
     build_dev_image(&SystemRunner, &runtime).unwrap();

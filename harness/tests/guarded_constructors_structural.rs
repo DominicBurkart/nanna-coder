@@ -3,20 +3,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
-const TYPE_CONSTRUCTORS: [(&str, &str); 6] = [
+const TYPE_CONSTRUCTORS: [(&str, &str); 7] = [
     ("ProtectedPaths", "for_repo"),
     ("ProtectedPaths", "with_config_dir"),
     ("WriteFileTool", "scoped"),
     ("WriteFileTool", "new"),
     ("GitCommitTool", "new"),
     ("GitPushBranchTool", "new"),
+    ("GithubPrPromoteTool", "new"),
 ];
 
-const GUARDED_TYPES: [&str; 4] = [
+const GUARDED_TYPES: [&str; 5] = [
     "ProtectedPaths",
     "WriteFileTool",
     "GitCommitTool",
     "GitPushBranchTool",
+    "GithubPrPromoteTool",
 ];
 
 const FREE_CONSTRUCTORS: [&str; 4] = [
@@ -49,12 +51,7 @@ const SHIPPED_ONLY_SITES: [(&str, &str, &str); 13] = [
         "ProtectedPaths::for_repo",
     ),
     ("src/pr_tools.rs", "new", "ProtectedPaths::for_repo"),
-    ("src/pr_tools.rs", "register_guarded", "GitCommitTool::new"),
-    (
-        "src/pr_tools.rs",
-        "register_guarded",
-        "GitPushBranchTool::new",
-    ),
+    ("src/pr_tools.rs", "register", "ProtectedPaths::for_repo"),
     (
         "src/pr_tools.rs",
         "register_granted_at",
@@ -64,6 +61,11 @@ const SHIPPED_ONLY_SITES: [(&str, &str, &str); 13] = [
         "src/pr_tools.rs",
         "register_granted_at",
         "GitPushBranchTool::new",
+    ),
+    (
+        "src/pr_tools.rs",
+        "register_granted_at",
+        "GithubPrPromoteTool::new",
     ),
     (
         "src/action_auditor/commands.rs",
@@ -438,6 +440,7 @@ fn a_production_call_to_each_constructor_is_flagged() {
         "WriteFileTool::new(root)",
         "GitCommitTool::new(root, n)",
         "GitPushBranchTool::new(root, n)",
+        "GithubPrPromoteTool::new(root, n, c)",
     ] {
         let source = format!("fn leak() {{ let _ = {call}; }}");
         assert_eq!(unguarded_sites("src/leak.rs", &source).len(), 1, "{call}");

@@ -6,6 +6,7 @@ use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
+use crate::policy::RepoPolicy;
 use crate::protected::{
     ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
 };
@@ -120,6 +121,7 @@ pub struct ToolRegistry {
     action_denial_count: Mutex<usize>,
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
+    pr_binding: crate::pr_binding::PrBindingCell,
 }
 
 struct ProductionHold {
@@ -165,7 +167,12 @@ impl ToolRegistry {
             action_denial_count: Mutex::new(0),
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
+            pr_binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn pr_binding(&self) -> crate::pr_binding::PrBindingCell {
+        self.pr_binding.clone()
     }
 
     /// Attach an action-review gate: every subsequent call to a tool whose
@@ -427,15 +434,24 @@ impl ToolRegistry {
                 .expect("action prior poisoned")
                 .clone(),
         };
+        let bound_pr = self
+            .action_subject
+            .as_ref()
+            .and_then(|subject| self.pr_binding.number_for(&subject.repo));
         let verdict = match (&self.action_gate, &self.action_subject) {
             (Some(gate), Some(subject)) => {
+                let lease_repo = match class {
+                    EffectClass::Sandbox => crate::pr_binding::normalised_repo(&subject.repo)
+                        .unwrap_or_else(|| subject.repo.clone()),
+                    _ => subject.repo.clone(),
+                };
                 let ctx = ActionContext {
                     max_effect: subject.max_effect,
                     window: subject.window.as_deref(),
                     lease: LeaseContext {
-                        repo: &subject.repo,
+                        repo: &lease_repo,
                         branch: subject.branch.as_deref(),
-                        pr: subject.pr,
+                        pr: crate::pr_binding::lease_pr(subject.pr, bound_pr),
                         environment: subject.environment.as_deref(),
                         image: None,
                         paths: &subject.paths,
@@ -1063,7 +1079,18 @@ impl Tool for WriteFileTool {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&safe_path, content)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&safe_path)?;
+        if crate::protected::is_hardlinked(&file.metadata()?) {
+            return Err(ToolError::ProtectedPath(
+                crate::protected::hardlink_violation(path),
+            ));
+        }
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
 
         Ok(json!({
             "path": path_str,
@@ -3287,7 +3314,9 @@ pub fn create_tool_registry_in_checkout(
     workspace_root: &std::path::Path,
 ) -> Result<ToolRegistry, ProtectedConfigError> {
     let extras = ProtectedExtras::load(workspace_root)?;
-    let protected = ProtectedPaths::for_repo_with_extras(workspace_root, &extras);
+    let policy = RepoPolicy::load(workspace_root)?;
+    let protected =
+        ProtectedPaths::for_repo_with_extras(workspace_root, &extras).with_policy(policy);
     Ok(create_tool_registry_guarded(workspace_root, protected))
 }
 
@@ -4938,6 +4967,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_registry_refuses_a_write_to_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = identity_with(EffectClass::Workspace, &["write_file"]);
+        identity.scope.paths = vec!["**".to_string()];
+        let registries = [
+            create_tool_registry(dir.path()),
+            create_tool_registry_for(dir.path(), &identity).unwrap(),
+            create_tool_registry_in_checkout(dir.path()).unwrap(),
+        ];
+        for registry in registries {
+            for path in [".nanna/policy.toml", "crates/api/.nanna/policy.toml"] {
+                let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+                let err = registry.execute("write_file", args).await.unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                    "{path}: {err:?}"
+                );
+                assert!(!dir.path().join(path).exists(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_solo_registry_refuses_every_alias_spelling_of_the_declaration_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = ProtectedPaths::for_repo(dir.path()).with_policy(RepoPolicy::solo());
+        let registry = create_tool_registry_guarded(dir.path(), protected);
+        let spellings = [
+            ".nanna./policy.toml",
+            ".nanna /protected.toml",
+            ".nanna/policy.toml.",
+            ".nanna/policy.toml::$DATA",
+            "NANNA~1/POLICY~1.TOML",
+            ".NANNA/Policy.toml",
+            "crates/e\u{301}/.nanna./policy.toml",
+        ];
+        let mut refused = 0;
+        for path in spellings {
+            let args = json!({ "path": path, "content": "human_gate = \"github\"" });
+            let err = registry.execute("write_file", args).await.unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v) if v.rule.ends_with(".nanna/**")),
+                "{path}: {err:?}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, spellings.len());
+        assert_eq!(registry.denials().len(), spellings.len());
+    }
+
+    #[tokio::test]
     async fn write_file_scoped_with_an_explicit_protected_set_refuses_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cfg/nanna");
@@ -4949,6 +5029,293 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ProtectedPath(v) if v.rule == "cfg/nanna/**"));
+    }
+
+    #[cfg(unix)]
+    mod hardlink_writes {
+        use super::*;
+
+        fn tool_in(dir: &std::path::Path) -> WriteFileTool {
+            let protected = crate::protected::ProtectedPaths::with_config_dir(dir, None);
+            WriteFileTool::guarded(dir.to_path_buf(), None, protected)
+        }
+
+        #[tokio::test]
+        async fn a_hardlink_to_a_protected_file_cannot_be_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("flake.nix"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("flake.nix"), dir.path().join("alias.txt")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "alias.txt", "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.path == "alias.txt" && v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("flake.nix")).unwrap(),
+                "original"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+                "original"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_hardlink_write_does_not_truncate_the_shared_inode() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            let result = tool_in(dir.path())
+                .execute(json!({ "path": "b.txt", "content": "" }))
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_file_with_one_link_is_still_overwritten() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("plain.txt"), "old content that is long").unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "plain.txt", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("plain.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_checkout_registry_refuses_a_hardlink_to_a_repo_declared_file() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/gate.rs\", \"ci/**\"]\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+            std::fs::write(dir.path().join("ci/deploy.sh"), "original").unwrap();
+            std::fs::hard_link(dir.path().join("ci/deploy.sh"), dir.path().join("alias.sh"))
+                .unwrap();
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let err = registry
+                .execute(
+                    "write_file",
+                    json!({ "path": "alias.sh", "content": "evil" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("ci/deploy.sh")).unwrap(),
+                "original"
+            );
+        }
+
+        async fn folded_link_outcomes(policy: Option<&str>) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
+            )
+            .unwrap();
+            if let Some(policy) = policy {
+                std::fs::write(dir.path().join(".nanna/policy.toml"), policy).unwrap();
+            }
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            let mut outcomes = Vec::new();
+            for name in [
+                "alias.txt",
+                "cafe\u{301}-x.txt.",
+                "src/cafe\u{301}.rs.",
+                "tools/RELEAS~1.SH",
+                "ci/deploy.sh",
+            ] {
+                let file = dir.path().join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "original").unwrap();
+                let partner = dir.path().join("zz-partner.bin");
+                std::fs::remove_file(&partner).ok();
+                std::fs::hard_link(&file, &partner).unwrap();
+                let err = registry
+                    .execute("write_file", json!({ "path": name, "content": "evil" }))
+                    .await
+                    .unwrap_err();
+                match err {
+                    ToolError::ProtectedPath(violation) => outcomes.push(violation.rule),
+                    other => outcomes.push(format!("unexpected: {other:?}")),
+                }
+                assert_eq!(std::fs::read_to_string(&partner).unwrap(), "original");
+            }
+            outcomes
+        }
+
+        #[tokio::test]
+        async fn the_hardlink_refusal_is_identical_under_the_solo_gate_and_without_a_policy_file() {
+            let none = folded_link_outcomes(None).await;
+            let solo = folded_link_outcomes(Some("human_gate = \"solo\"\n")).await;
+            assert_eq!(none, solo);
+            assert_eq!(
+                none,
+                vec![
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    crate::protected::HARDLINK_RULE.to_string(),
+                    "src/caf\u{e9}.rs".to_string(),
+                    "tools/release-helper.sh".to_string(),
+                    "ci/**".to_string(),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hardlinked_file_deep_in_the_tree_is_refused_by_the_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            let deep = ["a"; 100].join("/");
+            std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
+            let file = format!("{deep}/f.txt");
+            std::fs::write(dir.path().join(&file), "original").unwrap();
+            std::fs::hard_link(dir.path().join(&file), dir.path().join("zz.bin")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": file, "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_checkout_registry_refuses_hardlinks_reached_through_folded_spellings() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+            std::fs::write(
+                dir.path().join(".nanna/protected.toml"),
+                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
+            )
+            .unwrap();
+            let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
+            for (name, rule) in [
+                ("alias.txt", crate::protected::HARDLINK_RULE),
+                ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
+                ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
+                ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+            ] {
+                let file = dir.path().join(name);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "original").unwrap();
+                let partner = dir.path().join("zz-partner.bin");
+                std::fs::remove_file(&partner).ok();
+                std::fs::hard_link(&file, &partner).unwrap();
+                let err = registry
+                    .execute("write_file", json!({ "path": name, "content": "evil" }))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, ToolError::ProtectedPath(v) if v.rule == rule),
+                    "{name}: {err:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&partner).unwrap(), "original");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_aliasable_name_past_the_component_cap_is_refused_before_the_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            let deep = ["a"; 1_100].join("/");
+            std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": format!("{deep}/CODECO~1.YML"), "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::ALIAS_OVERFLOW_RULE),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_symlink_to_a_multiply_linked_file_is_refused_by_the_target_link_count() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "shared").unwrap();
+            std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+            std::os::unix::fs::symlink("a.txt", dir.path().join("sym")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "sym", "content": "evil" }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ToolError::ProtectedPath(v)
+                    if v.rule == crate::protected::HARDLINK_RULE),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "shared"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_hardlink_to_a_symlink_writes_to_the_single_link_target() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("target.txt"), "old").unwrap();
+            std::os::unix::fs::symlink("target.txt", dir.path().join("sym")).unwrap();
+            std::fs::hard_link(dir.path().join("sym"), dir.path().join("sym-two")).unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sym-two", "content": "new" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["success"], true);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+                "new"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_directory_target_is_an_io_error_and_is_left_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("occupied")).unwrap();
+            let err = tool_in(dir.path())
+                .execute(json!({ "path": "occupied", "content": "x" }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::Io(_)), "{err:?}");
+            assert!(dir.path().join("occupied").is_dir());
+        }
+
+        #[tokio::test]
+        async fn a_new_file_is_created_with_the_content() {
+            let dir = tempfile::tempdir().unwrap();
+            let ok = tool_in(dir.path())
+                .execute(json!({ "path": "sub/new.txt", "content": "hello" }))
+                .await
+                .unwrap();
+            assert_eq!(ok["bytes_written"], 5);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("sub/new.txt")).unwrap(),
+                "hello"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4987,6 +5354,34 @@ mod tests {
             create_tool_registry_in_checkout(dir.path()),
             Err(ProtectedConfigError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_checkout_registry_is_refused_for_a_bad_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            create_tool_registry_in_checkout(dir.path()),
+            Err(ProtectedConfigError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn a_checkout_registry_accepts_a_valid_solo_or_missing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"solo\"",
+        )
+        .unwrap();
+        assert!(create_tool_registry_in_checkout(dir.path()).is_ok());
     }
 
     #[test]
@@ -5643,6 +6038,70 @@ mod tests {
         let seen = sink.escalations();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].repo, crate::scope::UNSCOPED_IDENTITY);
+    }
+
+    struct LeaseNameRecorder {
+        names: std::sync::Mutex<Vec<(EffectClass, String)>>,
+    }
+
+    #[async_trait]
+    impl crate::action_auditor::ActionAuditor for LeaseNameRecorder {
+        fn name(&self) -> &str {
+            "lease-name-recorder"
+        }
+
+        async fn review_action(
+            &self,
+            review: &ActionReview,
+            context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, crate::action_auditor::ActionAuditError> {
+            let effect = match review.effect_class {
+                EffectClass::Repository => crate::leases::Effect::Repository,
+                EffectClass::Sandbox => crate::leases::Effect::Sandbox,
+                _ => crate::leases::Effect::Production,
+            };
+            let names = crate::leases::required_leases(effect, &context.lease).unwrap();
+            let joined = names.iter().map(ToString::to_string).collect::<Vec<_>>();
+            self.names
+                .lock()
+                .unwrap()
+                .push((review.effect_class, joined.join(",")));
+            Ok(ActionVerdict::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_sandbox_lease_normalises_the_repository_while_branch_and_deploy_keep_the_raw_spelling(
+    ) {
+        let recorder = Arc::new(LeaseNameRecorder {
+            names: std::sync::Mutex::new(Vec::new()),
+        });
+        let gate = Arc::new(ActionGate::new(
+            recorder.clone(),
+            crate::action_auditor::ActionAuditLog::in_memory(),
+        ));
+        let mut named = subject(EffectClass::Production);
+        named.repo = "O/N".to_string();
+        named.branch = Some("feat/x".to_string());
+        named.pr = Some(7);
+        named.environment = Some("staging".to_string());
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("push", EffectClass::Repository));
+        registry.register(StubTool::boxed("sandbox", EffectClass::Sandbox));
+        registry.register(StubTool::boxed("deploy", EffectClass::Production));
+        let registry = registry.with_action_gate(gate, named);
+        for tool in ["push", "sandbox", "deploy"] {
+            registry.execute(tool, json!({})).await.unwrap();
+        }
+        let seen = recorder.names.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (EffectClass::Repository, "branch:O/N:feat/x".to_string()),
+                (EffectClass::Sandbox, "sandbox:o/n:7".to_string()),
+                (EffectClass::Production, "deploy:O/N:staging".to_string()),
+            ]
+        );
     }
 
     fn inspecting_registry(inspector: fn(&str, &Value) -> Result<(), String>) -> ToolRegistry {

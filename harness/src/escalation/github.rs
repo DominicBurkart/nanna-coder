@@ -191,6 +191,14 @@ pub(super) mod tests {
             unreachable!("escalation delivery never reads pull request detail")
         }
 
+        async fn pull_requests_for_head(
+            &self,
+            _repo: &str,
+            _head: &str,
+        ) -> Result<Vec<crate::backlog::GithubPullRequestDetail>, BacklogError> {
+            Ok(vec![])
+        }
+
         async fn mark_pull_request_ready(
             &self,
             _repo: &str,
@@ -246,6 +254,16 @@ pub(super) mod tests {
         .with_evidence(vec![
             "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789".to_string()
         ])
+    }
+
+    #[tokio::test]
+    async fn the_mock_lists_no_pull_requests_by_head() {
+        let mock = MockGithub::default();
+        assert!(mock
+            .pull_requests_for_head("o/r", "b")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
