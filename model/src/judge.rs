@@ -94,11 +94,13 @@ impl JudgeConfig {
 
     /// Calculate delay for retry attempt with exponential backoff and jitter
     pub fn calculate_retry_delay(&self, attempt: u32) -> Duration {
-        let base_delay = Duration::from_millis(self.base_delay_ms);
-        let exponential_delay = base_delay * 2_u32.pow(attempt);
-        let max_delay = Duration::from_millis(self.max_delay_ms);
-
-        let delay = exponential_delay.min(max_delay);
+        // Clamp the exponent to 63 to prevent u64 overflow in the left-shift.
+        // Any attempt >= 63 would produce a value far above max_delay_ms anyway,
+        // so the cap below will reduce it regardless.
+        let exponent = 2_u64.pow(attempt.min(63));
+        let raw_ms = self.base_delay_ms.saturating_mul(exponent);
+        let capped_ms = raw_ms.min(self.max_delay_ms);
+        let delay = Duration::from_millis(capped_ms);
 
         // Add jitter to prevent thundering herd
         if self.jitter_factor > 0.0 {
@@ -230,7 +232,7 @@ impl fmt::Display for ValidationResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ValidationResult::Success { message, metrics } => {
-                write!(f, "✅ SUCCESS: {} ({})", message, metrics)
+                write!(f, "\u{2705} SUCCESS: {} ({})", message, metrics)
             }
             ValidationResult::Warning {
                 message,
@@ -239,7 +241,7 @@ impl fmt::Display for ValidationResult {
             } => {
                 write!(
                     f,
-                    "⚠️  WARNING: {} ({}) - Suggestions: {}",
+                    "\u{26a0}\u{fe0f}  WARNING: {} ({}) - Suggestions: {}",
                     message,
                     metrics,
                     suggestions.join(", ")
@@ -253,7 +255,7 @@ impl fmt::Display for ValidationResult {
             } => {
                 write!(
                     f,
-                    "❌ FAILURE: {} - Error: {} - Suggestions: {}",
+                    "\u{274c} FAILURE: {} - Error: {} - Suggestions: {}",
                     message,
                     error_details,
                     suggestions.join(", ")
@@ -758,7 +760,7 @@ mod tests {
         };
 
         let display = format!("{}", success);
-        assert!(display.contains("✅ SUCCESS"));
+        assert!(display.contains("\u{2705} SUCCESS"));
         assert!(display.contains("Test passed"));
     }
 
