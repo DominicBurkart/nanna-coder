@@ -1097,4 +1097,60 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_default() {
+        let system = ObservabilitySystem::default();
+        assert_eq!(system.service_name, "nanna-coder");
+    }
+
+    #[tokio::test]
+    async fn test_with_service_name() {
+        let system = ObservabilitySystem::new().with_service_name("my-service");
+        assert_eq!(system.service_name, "my-service");
+    }
+
+    #[tokio::test]
+    async fn test_with_alert_policy() {
+        let policy = AlertPolicy::immediate_critical();
+        let system = ObservabilitySystem::new().with_alert_policy(policy);
+        assert!(!system.alert_policy.escalation_rules.is_empty());
+        assert!(!system.alert_policy.notification_channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_with_health_thresholds() {
+        let thresholds = HealthThreshold {
+            cpu_threshold: 90.0,
+            memory_threshold: 95.0,
+            disk_threshold: 98.0,
+            max_latency_ms: 5000,
+            min_cache_hit_rate: 0.5,
+            max_error_rate: 0.1,
+            container_timeout: Duration::from_secs(60),
+        };
+        let system = ObservabilitySystem::new().with_health_thresholds(thresholds);
+        assert_eq!(system.health_thresholds.cpu_threshold, 90.0);
+        assert_eq!(system.health_thresholds.max_latency_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_with_health_check_interval() {
+        let system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(120));
+        assert_eq!(system.health_check_interval, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn test_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_stop_monitoring_no_task() {
+        let mut system = ObservabilitySystem::new();
+        system.stop_monitoring().await;
+    }
 }
