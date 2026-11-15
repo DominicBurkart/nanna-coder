@@ -248,8 +248,7 @@ pub struct ReqwestProbe {
 }
 
 impl ReqwestProbe {
-    /// A probe with a `5s` request timeout. A client that cannot be built
-    /// does not panic: every probe then fails with a [`HealthError`].
+    /// A probe with a `5s` request timeout.
     pub fn new() -> Self {
         Self::from_build(
             reqwest::Client::builder()
