@@ -774,8 +774,8 @@ mod tests {
         "harness/tests/escalation_sinks_structural.rs",
         "harness/tests/fixtures/identities/global/auditor.toml",
         "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        "harness/tests/fixtures/one_track/catalog/auditor.toml",
-        "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+        "harness/tests/fixtures/sample_app/catalog/auditor.toml",
+        "harness/tests/fixtures/sample_app/catalog/prompts/auditor.md",
         "harness/tests/planner_structural.rs",
         ".inchworm/**",
     ];
@@ -992,8 +992,8 @@ mod tests {
             "evals/cases/auditor_spawn/catalog/auditor.toml",
             "harness/tests/fixtures/identities/global/auditor.toml",
             "harness/tests/fixtures/identities/global/prompts/auditor.md",
-            "harness/tests/fixtures/one_track/catalog/auditor.toml",
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/fixtures/sample_app/catalog/auditor.toml",
+            "harness/tests/fixtures/sample_app/catalog/prompts/auditor.md",
         ] {
             assert!(found.iter().any(|file| file == expected), "{expected}");
         }
@@ -1320,10 +1320,10 @@ mod tests {
             "other/harness/tests/fixtures/identities/global/auditor.toml",
             "harness/tests/fixtures/identities/global/prompts/auditor.md.bak",
             "other/harness/tests/fixtures/identities/global/prompts/auditor.md",
-            "harness/tests/fixtures/one_track/catalog/auditor.toml.bak",
-            "other/harness/tests/fixtures/one_track/catalog/auditor.toml",
-            "harness/tests/fixtures/one_track/catalog/prompts/auditor.md.bak",
-            "other/harness/tests/fixtures/one_track/catalog/prompts/auditor.md",
+            "harness/tests/fixtures/sample_app/catalog/auditor.toml.bak",
+            "other/harness/tests/fixtures/sample_app/catalog/auditor.toml",
+            "harness/tests/fixtures/sample_app/catalog/prompts/auditor.md.bak",
+            "other/harness/tests/fixtures/sample_app/catalog/prompts/auditor.md",
             "harness/tests/planner_structural.rs.bak",
             "other/harness/tests/planner_structural.rs",
             "harness/src/pr_tool.rs",

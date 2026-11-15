@@ -19,7 +19,7 @@ integrating the result.
    selects an identity, the spawn gate allows it, nanna resolves it into a
    launch plan, runs pi in a container, integrates the resulting patch and
    returns it through the unchanged MCP `tasks/result` shape.
-2. **one_track and nanna together, no agent calling nanna.** The same path,
+2. **A scheduler or bridge as the caller, no agent calling nanna.** The same path,
    with the scheduler/bridge as the caller. Nothing in the seam depends on who
    submitted the task.
 
@@ -262,7 +262,7 @@ Not yet done (in order):
 2. Executor trait plus a container executor (hardening above) with a fake for
    tests; RPC event parsing (`agent_settled`, tool events) into the existing
    `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
-   the one_track bridge fixtures (golden-JSON test); lease release on every exit
+   the bridge fixtures (golden-JSON test); lease release on every exit
    path. Blocked on the real-pi integration test below.
 3. Packaging: pi 1.2.0 as a pinned flake input (`github:earendil-works/pi`) with
    a lock hash and `npm install --ignore-scripts`, built into the agent image
